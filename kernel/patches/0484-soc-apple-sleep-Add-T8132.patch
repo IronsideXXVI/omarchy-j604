@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 02:20:52 +0000
+Subject: [PATCH] soc: apple: sleep: Add T8132
+
+Describe the T8132 (M4) PMGR sleep-state counters, sleep exit times and
+AP wake source registers for apple-sleep, so that the J604 can log which
+SoC sleep state a system suspend reached and suspend-to-RAM can arm its
+wake sources.
+
+The values come from the J604's own ADT (macOS 27.2 runtime capture):
+/arm-io/pmgr "events" lists SLP_DDR, AWAKE, SLP_S2R and DEEP_WAIT with
+counter slots 61/60, 63/62, 65/64 and 67/66 (entry/residency, the same
+odd/even pairing as T6020's 43/42 ... 49/48) and the S2R_WK_TIME and
+DDR_WK_TIME slots 64 and 66; T8132 has no SYS_* events. Its
+"ap-wake-sources" names bits up to 229, so eight mask words. T8132 has
+two CPU clusters, so two CPM gating words. The register layout within
+each block is taken from T6020: the ADT puts the wake block, the event
+counter block and the wake-time block at the same offsets from PMGR and
+PMGR_AON as T6020 has them. Which mask bits exist beyond the ADT's list
+is not known yet, so every bit of the eight words is treated as valid.
+
+Nothing changes unless the device tree has an apple,t8132-pmgr-sleep
+node; the s2idle stages stay off unless apple_sleep.stages is set.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ .../bindings/power/apple,pmgr-sleep.yaml      | 61 +++++++++++++++----
+ drivers/soc/apple/apple-sleep.c               | 41 +++++++++++++
+ 2 files changed, 89 insertions(+), 13 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/power/apple,pmgr-sleep.yaml b/Documentation/devicetree/bindings/power/apple,pmgr-sleep.yaml
+index 50903b0c81..17dd8d1770 100644
+--- a/Documentation/devicetree/bindings/power/apple,pmgr-sleep.yaml
++++ b/Documentation/devicetree/bindings/power/apple,pmgr-sleep.yaml
+@@ -26,25 +26,17 @@ properties:
+     pattern: "^power-management@[0-9a-f]+$"
+ 
+   compatible:
+-    const: apple,t6020-pmgr-sleep
++    enum:
++      - apple,t6020-pmgr-sleep
++      - apple,t8132-pmgr-sleep
+ 
+   reg:
+     minItems: 1
+-    items:
+-      - description: PMGR sleep-state event counters
+-      - description: always-on GPU fabric configuration
+-      - description: CPM control and power domain gating
+-      - description: AP wake source masks and latched wake sources
+-      - description: PMGR counters holding the sleep exit times
++    maxItems: 5
+ 
+   reg-names:
+     minItems: 1
+-    items:
+-      - const: events
+-      - const: aon-gfx
+-      - const: cpm
+-      - const: wake
+-      - const: wake-time
++    maxItems: 5
+ 
+   apple,pmgr:
+     $ref: /schemas/types.yaml#/definitions/phandle
+@@ -102,6 +94,49 @@ dependentRequired:
+   apple,soc-clusters: [ "apple,pmgr" ]
+   apple,afr-dependents: [ "apple,afr-domain" ]
+ 
++allOf:
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: apple,t6020-pmgr-sleep
++    then:
++      properties:
++        reg:
++          items:
++            - description: PMGR sleep-state event counters
++            - description: always-on GPU fabric configuration
++            - description: CPM control and power domain gating
++            - description: AP wake source masks and latched wake sources
++            - description: PMGR counters holding the sleep exit times
++        reg-names:
++          items:
++            - const: events
++            - const: aon-gfx
++            - const: cpm
++            - const: wake
++            - const: wake-time
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: apple,t8132-pmgr-sleep
++    then:
++      description:
++        No always-on GPU fabric or CPM range is described on T8132; their
++        registers are not known there.
++      properties:
++        reg:
++          items:
++            - description: PMGR sleep-state event counters
++            - description: AP wake source masks and latched wake sources
++            - description: PMGR counters holding the sleep exit times
++        reg-names:
++          items:
++            - const: events
++            - const: wake
++            - const: wake-time
++
+ additionalProperties: false
+ 
+ examples:
+diff --git a/drivers/soc/apple/apple-sleep.c b/drivers/soc/apple/apple-sleep.c
+index 9f8b04f599..37accaccb8 100644
+--- a/drivers/soc/apple/apple-sleep.c
++++ b/drivers/soc/apple/apple-sleep.c
+@@ -1016,8 +1016,49 @@ static const struct apple_sleep_hw t6020_sleep_hw = {
+ 	.wake_valid = t6020_wake_valid,
+ };
+ 
++/*
++ * T8132 (M4). Counter slots from the J604 ADT (/arm-io/pmgr "events" and
++ * "wake-time-events" style records): SLP_DDR 61/60, AWAKE 63/62, SLP_S2R
++ * 65/64, DEEP_WAIT 67/66, S2R_WK_TIME 64, DDR_WK_TIME 66; T8132 has no
++ * SYS_* events. The ADT lists AP wake source bits up to 229, so eight mask
++ * words. Two CPU clusters, so two CPM gating words. Register layouts are
++ * taken to match T6020 (the J604 ADT places the wake, event counter and
++ * wake-time blocks at the T6020 offsets from PMGR and PMGR_AON).
++ */
++static const struct apple_sleep_event t8132_events[] = {
++	{ "SLP_DDR", 61, 60 },
++	{ "AWAKE", 63, 62 },
++	{ "SLP_S2R", 65, 64 },
++	{ "DEEP_WAIT", 67, 66 },
++};
++
++static const struct apple_sleep_wake_time t8132_wake_times[] = {
++	{ "DDR_WK_TIME", 66 },
++	{ "S2R_WK_TIME", 64 },
++};
++
++static const u32 t8132_wake_valid[] = {
++	0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
++	0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
++};
++
++static const struct apple_sleep_hw t8132_sleep_hw = {
++	.events = t8132_events,
++	.n_events = ARRAY_SIZE(t8132_events),
++	.wake_times = t8132_wake_times,
++	.n_wake_times = ARRAY_SIZE(t8132_wake_times),
++	.cluster_base = 0x8000,
++	.n_cpm = 2,
++	.cpm_gating = 0x30,
++	.wake_mask = 0xc,
++	.wake_latched = 0x30,
++	.n_wake = ARRAY_SIZE(t8132_wake_valid),
++	.wake_valid = t8132_wake_valid,
++};
++
+ static const struct of_device_id apple_sleep_of_match[] = {
+ 	{ .compatible = "apple,t6020-pmgr-sleep", .data = &t6020_sleep_hw },
++	{ .compatible = "apple,t8132-pmgr-sleep", .data = &t8132_sleep_hw },
+ 	{}
+ };
+ 

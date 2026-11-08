@@ -1,0 +1,4451 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eryk Wieliczko <eryk@wieliczko.ninja>
+Date: Tue, 20 Oct 2026 23:05:29 +0200
+Subject: [PATCH] drm/apple: integrate T8132 IOMFB as a common DCP backend
+
+Keep display components, atomic state and framebuffer ownership in appledrm
+while adding the qualified IOMFB 26.6 wire backend. Snapshot bounded
+callback inputs and retain uncertain scanout until exact successor
+receipts.
+
+Generated-by: Codex
+Assisted-by: Codex:GPT-6
+Signed-off-by: Eryk Wieliczko <eryk@wieliczko.ninja>
+[ryan: rebased onto 7.3 integration/aurora; the linear-only modifier
+list is format_modifiers_no_ix there]
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+[dylan: Kconfig: DRM_APPLE_DCP_T8132 added next to omacom's
+ DRM_APPLE_DCP_T6030_AUDIO. dcp_backlight.c: kept omacom's
+ dcp_backlight_presents_nits() and the v14.7 panel-nits paths and ORed in
+ iomfb_is_m4(), matching the resolution on integration/aurora.]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/Kconfig              |   18 +
+ drivers/gpu/drm/apple/Makefile             |    1 +
+ drivers/gpu/drm/apple/apple_drv.c          |  164 ++-
+ drivers/gpu/drm/apple/connector.c          |    6 +
+ drivers/gpu/drm/apple/dcp-fabric.c         |    3 +
+ drivers/gpu/drm/apple/dcp-internal.h       |   26 +
+ drivers/gpu/drm/apple/dcp-m4-callback.h    |  209 +++
+ drivers/gpu/drm/apple/dcp-m4-frame.h       |  371 +++++
+ drivers/gpu/drm/apple/dcp-m4-memory.h      |  129 ++
+ drivers/gpu/drm/apple/dcp-m4-profile.h     |   40 +
+ drivers/gpu/drm/apple/dcp-m4-property.h    |  253 ++++
+ drivers/gpu/drm/apple/dcp-m4-protocol.h    |  210 +++
+ drivers/gpu/drm/apple/dcp-m4-timing.h      |  223 +++
+ drivers/gpu/drm/apple/dcp-m4-transaction.h |  246 ++++
+ drivers/gpu/drm/apple/dcp.c                |  166 ++-
+ drivers/gpu/drm/apple/dcp.h                |    3 +
+ drivers/gpu/drm/apple/dcp_backlight.c      |   20 +-
+ drivers/gpu/drm/apple/iomfb.c              |   65 +-
+ drivers/gpu/drm/apple/iomfb_m4.c           | 1422 ++++++++++++++++++++
+ drivers/gpu/drm/apple/iomfb_m4.h           |   58 +
+ drivers/gpu/drm/apple/iomfb_m4_present.h   |   37 +
+ drivers/gpu/drm/apple/plane.c              |   64 +
+ drivers/gpu/drm/apple/plane.h              |    4 +
+ drivers/gpu/drm/apple/version_utils.h      |    2 +
+ 24 files changed, 3694 insertions(+), 46 deletions(-)
+ create mode 100644 drivers/gpu/drm/apple/dcp-m4-callback.h
+ create mode 100644 drivers/gpu/drm/apple/dcp-m4-frame.h
+ create mode 100644 drivers/gpu/drm/apple/dcp-m4-memory.h
+ create mode 100644 drivers/gpu/drm/apple/dcp-m4-profile.h
+ create mode 100644 drivers/gpu/drm/apple/dcp-m4-property.h
+ create mode 100644 drivers/gpu/drm/apple/dcp-m4-protocol.h
+ create mode 100644 drivers/gpu/drm/apple/dcp-m4-timing.h
+ create mode 100644 drivers/gpu/drm/apple/dcp-m4-transaction.h
+ create mode 100644 drivers/gpu/drm/apple/iomfb_m4.c
+ create mode 100644 drivers/gpu/drm/apple/iomfb_m4.h
+ create mode 100644 drivers/gpu/drm/apple/iomfb_m4_present.h
+
+diff --git a/drivers/gpu/drm/apple/Kconfig b/drivers/gpu/drm/apple/Kconfig
+index 0675e5ac1b..85eb4b496d 100644
+--- a/drivers/gpu/drm/apple/Kconfig
++++ b/drivers/gpu/drm/apple/Kconfig
+@@ -41,6 +41,24 @@ config DRM_APPLE_DCP_T6030_AUDIO
+ 	  DCP is driven unchanged. Say N to build the audio and element
+ 	  parser code exactly as before.
+ 
++config DRM_APPLE_DCP_T8132
++	bool "MacBook Air M4 (J713) internal panel"
++	depends on DRM_APPLE
++	depends on APPLE_DART=y && APPLE_DART_J713_DCP
++	depends on APPLE_PMP=y || APPLE_PMP=DRM_APPLE
++	select APERTURE_HELPERS
++	help
++	  Lets the common Apple display driver adopt the J713 (T8132)
++	  internal display coprocessor and its display subsystem. The
++	  inherited firmware session uses the IOMFB 26.6 interface, while
++	  planes, CRTCs, connectors and DMA GEM use the common DRM driver.
++
++	  The boot loader must publish the qualified firmware reservations
++	  and inherited display DART mappings. The retained session cannot
++	  be unloaded or reset; its backing stays pinned until reboot.
++	  Load appledrm explicitly before the GPU, with its alias autoload
++	  disabled, after guarded admission of the inherited display DARTs.
++
+ config DRM_APPLE_DEBUG
+ 	bool "Enable additional driver debugging"
+ 	depends on DRM_APPLE
+diff --git a/drivers/gpu/drm/apple/Makefile b/drivers/gpu/drm/apple/Makefile
+index 98c95bf006..58437ccff2 100644
+--- a/drivers/gpu/drm/apple/Makefile
++++ b/drivers/gpu/drm/apple/Makefile
+@@ -15,6 +15,7 @@ appledrm-y += iomfb_v12_3.o
+ appledrm-y += iomfb_v13_3.o
+ appledrm-y += iomfb_v14_7_tpl.o
+ appledrm-y += iomfb_v14_7.o iomfb_v14_7_link.o
++appledrm-$(CONFIG_DRM_APPLE_DCP_T8132) += iomfb_m4.o
+ appledrm-y += iomfb_h17p.o
+ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_h17p_test.o parser_test.o
+ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_resume_test.o
+diff --git a/drivers/gpu/drm/apple/apple_drv.c b/drivers/gpu/drm/apple/apple_drv.c
+index 2324a8acd4..fdbe0de078 100644
+--- a/drivers/gpu/drm/apple/apple_drv.c
++++ b/drivers/gpu/drm/apple/apple_drv.c
+@@ -46,6 +46,7 @@
+ #include "apple_resume.h"
+ #include "dcp.h"
+ #include "plane.h"
++#include "iomfb_m4.h"
+ 
+ #define DRIVER_NAME     "apple"
+ #define DRIVER_DESC     "Apple display controller DRM driver"
+@@ -323,12 +324,18 @@ static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
+ 		}
+ 	}
+ 
+-	if (crtc->state->event && !crtc->state->active) {
++	if (iomfb_is_m4(platform_get_drvdata(apple_crtc->dcp)) &&
++	    iomfb_m4_error(platform_get_drvdata(apple_crtc->dcp))) {
++		dcp_drm_crtc_error(apple_crtc, crtc_state, -EIO);
++		return;
++	}
++
++	if (crtc_state->event && !crtc_state->active) {
+ 		spin_lock_irq(&crtc->dev->event_lock);
+-		drm_crtc_send_vblank_event(crtc, crtc->state->event);
++		drm_crtc_send_vblank_event(crtc, crtc_state->event);
+ 		spin_unlock_irq(&crtc->dev->event_lock);
+ 
+-		crtc->state->event = NULL;
++		crtc_state->event = NULL;
+ 	}
+ }
+ 
+@@ -336,13 +343,14 @@ static void apple_crtc_atomic_begin(struct drm_crtc *crtc,
+ 				    struct drm_atomic_commit *commit)
+ {
+ 	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
++	struct drm_crtc_state *new = drm_atomic_get_new_crtc_state(commit, crtc);
+ 	unsigned long flags;
+ 
+-	if (crtc->state->event) {
++	if (new->event) {
+ 		spin_lock_irqsave(&crtc->dev->event_lock, flags);
+-		apple_crtc->event = crtc->state->event;
++		apple_crtc->event = new->event;
+ 		spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+-		crtc->state->event = NULL;
++		new->event = NULL;
+ 	}
+ }
+ 
+@@ -375,7 +383,7 @@ static int apple_crtc_set_crc_source(struct drm_crtc *crtc, const char *source)
+ 	int ret = apple_crtc_parse_crc_source(source, &enabled);
+ 
+ 	if (!ret)
+-		dcp_set_crc(crtc, enabled);
++		ret = dcp_set_crc(crtc, enabled);
+ 
+ 	return ret;
+ }
+@@ -385,6 +393,12 @@ static int apple_crtc_verify_crc_source(struct drm_crtc *crtc,
+ 					size_t *values_cnt)
+ {
+ 	bool enabled;
++	struct apple_dcp *dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
++
++	if (iomfb_is_m4(dcp)) {
++		*values_cnt = 0;
++		return source ? -EOPNOTSUPP : 0;
++	}
+ 
+ 	if (apple_crtc_parse_crc_source(source, &enabled) < 0) {
+ 		pr_warn("dcp: Invalid CRC source name %s\n", source);
+@@ -401,6 +415,12 @@ static const char * const apple_crtc_crc_sources[] = {"auto"};
+ static const char *const * apple_crtc_get_crc_sources(struct drm_crtc *crtc,
+ 						      size_t *count)
+ {
++	struct apple_dcp *dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
++
++	if (iomfb_is_m4(dcp)) {
++		*count = 0;
++		return NULL;
++	}
+ 	*count = ARRAY_SIZE(apple_crtc_crc_sources);
+ 	return apple_crtc_crc_sources;
+ }
+@@ -677,14 +697,20 @@ static int apple_probe_per_dcp(struct device *dev,
+ 		if (dcp_fw_compat_is_14_7(dcp))
+ 			break;
+ 		plane_type = (zpos == 0) ? DRM_PLANE_TYPE_PRIMARY : DRM_PLANE_TYPE_OVERLAY;
+-		interchange = supports_interchange &&
+-			      (zpos <= 1 || surf != top_surf);
+-
+-		planes[zpos] = apple_plane_init(drm, 1U << num, surf,
+-						supports_l10r,
+-						supports_xrgb2101010,
+-						plane_type, interchange);
+-
++		if (iomfb_is_m4(dcp_data)) {
++			if (zpos || surf)
++				return dev_err_probe(dev, -EINVAL,
++						     "T8132 panel needs surface 0 only\n");
++			planes[zpos] = apple_plane_init_v26_6(drm, 1U << num, surf);
++		} else {
++			interchange = supports_interchange &&
++				      (zpos <= 1 || surf != top_surf);
++
++			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
++							supports_l10r,
++							supports_xrgb2101010,
++							plane_type, interchange);
++		}
+ 		if (IS_ERR(planes[zpos]))
+ 			return PTR_ERR(planes[zpos]);
+ 
+@@ -710,7 +736,9 @@ static int apple_probe_per_dcp(struct device *dev,
+ 		return ret;
+ 
+ 	drm_crtc_helper_add(&crtc->base, &apple_crtc_helper_funcs);
+-	drm_crtc_enable_color_mgmt(&crtc->base, 0, true, 0);
++	/* T8132 has no qualified CTM transaction. */
++	if (!iomfb_is_m4(dcp_data))
++		drm_crtc_enable_color_mgmt(&crtc->base, 0, true, 0);
+ 
+ 	crtc->dcp = dcp;
+ 	*crtc_mask = drm_crtc_mask(&crtc->base);
+@@ -882,6 +910,41 @@ err:
+ 	return ret;
+ }
+ 
++#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
++/*
++ * The J713 loader describes the boot framebuffer only as a simple-framebuffer
++ * node; its display subsystem has no "framebuffer" memory region.  Take the
++ * aperture from the single available simple-framebuffer.
++ */
++static bool apple_boot_fb_only(struct device *dev)
++{
++	return (of_device_is_compatible(dev->of_node, "apple,t8132-display-subsystem") ||
++		of_device_is_compatible(dev->of_node, "apple,t8132-display-diagnostics")) &&
++	       of_property_match_string(dev->of_node, "memory-region-names",
++					"framebuffer") < 0;
++}
++
++static int apple_get_boot_fb_resource(struct device *dev, struct resource *fb_r)
++{
++	struct device_node *np;
++	int found = 0, ret = -ENODEV;
++
++	for_each_compatible_node(np, NULL, "simple-framebuffer") {
++		if (!of_device_is_available(np))
++			continue;
++		if (++found > 1) {
++			of_node_put(np);
++			dev_err(dev, "more than one boot framebuffer\n");
++			return -EINVAL;
++		}
++		ret = of_address_to_resource(np, 0, fb_r);
++	}
++	if (ret)
++		dev_err(dev, "no boot framebuffer aperture: %d\n", ret);
++	return ret;
++}
++#endif
++
+ static const struct of_device_id apple_dcp_id_tbl[] = {
+ 	{ .compatible = "apple,dcp" },
+ 	{ .compatible = "apple,dcpext" },
+@@ -889,6 +952,9 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
+ 	{ .compatible = "apple,t6030-dcp" },
+ 	{ .compatible = "apple,t8122-dcp" },
+ 	{ .compatible = "apple,t6031-dcp" },
++#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
++	{ .compatible = "apple,t8132-dcp" },
++#endif
+ 	{},
+ };
+ 
+@@ -1025,6 +1091,12 @@ static int apple_drm_init_dcp(struct device *dev)
+ 		 */
+ 		if (ret)
+ 			dev_warn(dev, "DCP[%d] not ready: %d\n", i, ret);
++		/*
++		 * The J713 panel is only taken over from a started session:
++		 * without it the boot framebuffer (simpledrm) stays.
++		 */
++		if (ret && iomfb_is_m4(platform_get_drvdata(dcp[i])))
++			return ret;
+ 	}
+ 
+ 	/*
+@@ -1048,14 +1120,21 @@ static int apple_drm_init(struct device *dev)
+ {
+ 	struct apple_drm_private *apple;
+ 	struct resource fb_r;
++	struct drm_crtc *crtc;
+ 	resource_size_t fb_size;
++	bool retained_modeset = false;
+ 	int ret;
+ 
+ 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = apple_get_fb_resource(dev, "framebuffer", &fb_r);
++#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
++	if (apple_boot_fb_only(dev))
++		ret = apple_get_boot_fb_resource(dev, &fb_r);
++	else
++#endif
++		ret = apple_get_fb_resource(dev, "framebuffer", &fb_r);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1066,13 +1145,9 @@ static int apple_drm_init(struct device *dev)
+ 
+ 	dev_set_drvdata(dev, apple);
+ 
+-	ret = component_bind_all(dev, apple);
+-	if (ret)
+-		return ret;
+-
+ 	ret = drmm_mode_config_init(&apple->drm);
+ 	if (ret)
+-		goto err_components;
++		return ret;
+ 
+ 	/*
+ 	 * IOMFB::UPPipeDCP_H13P::verify_surfaces produces the error "plane
+@@ -1094,23 +1169,53 @@ static int apple_drm_init(struct device *dev)
+ 	apple->drm.mode_config.funcs = &apple_mode_config_funcs;
+ 	apple->drm.mode_config.helper_private = &apple_mode_config_helpers;
+ 
++	ret = component_bind_all(dev, apple);
++	if (ret)
++		return ret;
++
+ 	ret = apple_drm_init_dcp(dev);
+ 	if (ret)
+ 		goto err_unbind;
+ 
+ 	drm_mode_config_reset(&apple->drm);
++	if (IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)) {
++		drm_for_each_crtc(crtc, &apple->drm) {
++			if (iomfb_is_m4(platform_get_drvdata(to_apple_crtc(crtc)->dcp))) {
++				retained_modeset = true;
++				break;
++			}
++		}
++	}
+ 
++	/* Registration makes KMS visible before the first destructive T8132
++	 * swap. Hold the modeset locks across activation so an early userspace
++	 * commit cannot race the retained startup surface.
++	 */
++	if (retained_modeset)
++		drm_modeset_lock_all(&apple->drm);
+ 	fb_size = fb_r.end - fb_r.start + 1;
+ 	ret = aperture_remove_conflicting_devices(fb_r.start, fb_size,
+ 						  apple_drm_driver.name);
+ 	if (ret) {
+ 		dev_err(dev, "Failed remove fb: %d\n", ret);
+-		goto err_unbind;
++		goto err_unlock;
+ 	}
+ 
+ 	ret = drm_dev_register(&apple->drm, 0);
+ 	if (ret)
+-		goto err_unbind;
++		goto err_unlock;
++	if (retained_modeset) {
++		drm_for_each_crtc(crtc, &apple->drm) {
++			ret = dcp_activate(to_apple_crtc(crtc)->dcp);
++			if (ret) {
++				drm_modeset_unlock_all(&apple->drm);
++				drm_dev_unregister(&apple->drm);
++				goto err_unbind;
++			}
++		}
++	}
++	if (retained_modeset)
++		drm_modeset_unlock_all(&apple->drm);
+ 
+ 	/* the fabric keeps order only once registered: catch up on probe */
+ 	dcp_typec_reorder();
+@@ -1126,14 +1231,14 @@ static int apple_drm_init(struct device *dev)
+ 
+ 	return 0;
+ 
++err_unlock:
++	if (retained_modeset)
++		drm_modeset_unlock_all(&apple->drm);
+ err_unbind:
+ 	apple_drm_quiesce_connectors(&apple->drm);
+ 	component_unbind_all(dev, NULL);
+ 	dcp_unlink(&apple->drm);
+ 	return ret;
+-err_components:
+-	component_unbind_all(dev, NULL);
+-	return ret;
+ }
+ 
+ static void apple_drm_uninit(struct device *dev)
+@@ -1237,6 +1342,11 @@ static const struct of_device_id of_match[] = {
+ 	{ .compatible = "apple,t6030-display-subsystem" },
+ 	{ .compatible = "apple,t8122-display-subsystem" },
+ 	{ .compatible = "apple,t6031-display-subsystem" },
++#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
++	{ .compatible = "apple,t8132-display-subsystem" },
++	/* Accept the qualified handoff emitted by the existing boot loader. */
++	{ .compatible = "apple,t8132-display-diagnostics" },
++#endif
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, of_match);
+diff --git a/drivers/gpu/drm/apple/connector.c b/drivers/gpu/drm/apple/connector.c
+index 5918084483..2434eba065 100644
+--- a/drivers/gpu/drm/apple/connector.c
++++ b/drivers/gpu/drm/apple/connector.c
+@@ -15,6 +15,7 @@
+ #include <drm/drm_managed.h>
+ 
+ #include "dcp-internal.h"
++#include "iomfb_m4.h"
+ 
+ void apple_connector_edid_init(struct apple_connector *connector)
+ {
+@@ -141,6 +142,11 @@ static void dcp_afk_debugfs_root(struct platform_device *pdev, int ep, struct de
+ void apple_connector_debugfs_init(struct drm_connector *connector, struct dentry *root)
+ {
+ 	struct apple_connector *apple_con = to_apple_connector(connector);
++	struct apple_dcp *dcp = apple_con->dcp ?
++		platform_get_drvdata(apple_con->dcp) : NULL;
++
++	if (dcp && iomfb_is_m4(dcp))
++		iomfb_m4_debugfs_init(dcp, root);
+ 
+         debugfs_create_file("ColorElements", 0444, root, apple_con,
+                             &chunk_color_fops);
+diff --git a/drivers/gpu/drm/apple/dcp-fabric.c b/drivers/gpu/drm/apple/dcp-fabric.c
+index 29321f8032..975db300e1 100644
+--- a/drivers/gpu/drm/apple/dcp-fabric.c
++++ b/drivers/gpu/drm/apple/dcp-fabric.c
+@@ -27,6 +27,7 @@
+ #include "dcpext_scanout.h"
+ #include "ibootep.h"
+ #include "dcp-internal.h"
++#include "iomfb_m4.h"
+ #include "parser.h"
+ 
+ static bool tiled_split = true;
+@@ -4040,6 +4041,8 @@ void dcp_link(struct platform_device *pdev, struct apple_crtc *crtc,
+ 		dcp->connector = connector;
+ 		dcp->connector_type = dcp->fixed_connector_type;
+ 	}
++	if (iomfb_is_m4(dcp))
++		WRITE_ONCE(connector->connected, !iomfb_m4_error(dcp) && dcp->active);
+ }
+ 
+ /* Called after component unbind has drained all firmware callbacks. The
+diff --git a/drivers/gpu/drm/apple/dcp-internal.h b/drivers/gpu/drm/apple/dcp-internal.h
+index 3eac22a57a..0e17635b6c 100644
+--- a/drivers/gpu/drm/apple/dcp-internal.h
++++ b/drivers/gpu/drm/apple/dcp-internal.h
+@@ -39,6 +39,8 @@
+ 
+ #define DCP_MAX_PLANES 4
+ 
++struct apple_dcp;
++struct iomfb_m4;
+ struct apple_dcp_afkep;
+ struct dcp_method_entry;
+ 
+@@ -220,6 +222,8 @@ struct dcpext_scanout;
+ struct dcp_hdmi;
+ 
+ struct apple_dcp {
++	/* Generation-specific wire/transaction state, sharing the common KMS owner. */
++	struct iomfb_m4 *v26_6;
+ 	/* An adopted session has no confirmed firmware DMA stop boundary. */
+ 	bool retain_dma;
+ 	bool quiescing;
+@@ -648,6 +652,28 @@ struct apple_dcp {
+ 	struct dcp_hdmi *hdmi;
+ };
+ 
++/* T8132 firmware uses its own wire codec, with the common DRM/KMS owner. */
++static inline bool iomfb_is_m4(const struct apple_dcp *dcp)
++{
++	return IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132) &&
++	       dcp->fw_compat == DCP_FIRMWARE_M4;
++}
++
++/* Presents carry nits; one serialized IOMFB owner. */
++static inline bool dcp_presents_nits(const struct apple_dcp *dcp)
++{
++	return (dcp->fw_compat == DCP_FIRMWARE_H17P &&
++		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
++	       iomfb_is_m4(dcp);
++}
++
++/* An adopted firmware session that fails stop and is never torn down. */
++static inline bool dcp_fail_stop(const struct apple_dcp *dcp)
++{
++	return dcp->fw_compat == DCP_FIRMWARE_H17P ||
++	       iomfb_is_m4(dcp);
++}
++
+ void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected);
+ void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected);
+ void dcp_firmware_metadata_announced(struct apple_dcp *dcp);
+diff --git a/drivers/gpu/drm/apple/dcp-m4-callback.h b/drivers/gpu/drm/apple/dcp-m4-callback.h
+new file mode 100644
+index 0000000000..08249a9f25
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-m4-callback.h
+@@ -0,0 +1,209 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++#ifndef APPLE_DCP_M4_CALLBACK_H
++#define APPLE_DCP_M4_CALLBACK_H
++
++#include <linux/errno.h>
++#include <linux/kernel.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/unaligned.h>
++#include "dcp-m4-profile.h"
++
++/* All hooks execute under the serialized transaction owner, never in IRQ context. */
++struct dcp_m4_callback_ops {
++	int (*call)(void *cookie, unsigned int method, bool remote,
++		    const void *input, u32 input_size, void *output, u32 output_size);
++	int (*swap_done)(void *cookie, u32 id);
++	/* Copy the bounded name and compute/retain any digest before packet ACK/reuse. */
++	int (*event)(void *cookie, const char *name, const void *dictionary, size_t size);
++	int (*property)(void *cookie, unsigned int method, const void *input, void *output);
++	int (*memory)(void *cookie, unsigned int method, const void *input, void *output);
++};
++
++struct dcp_m4_callback_shape {
++	u16 method;
++	u16 input;
++	u16 output;
++};
++
++static inline int dcp_m4_callback_result(int ret)
++{
++	return ret > 0 ? -EPROTO : ret;
++}
++
++/* Exact qualified J713 shapes. An absent behavior hook is failure, never an ACK. */
++static const struct dcp_m4_callback_shape dcp_m4_callbacks[] = {
++	{0, 0, 4}, {1, 0, 4}, {3, 4, 60}, {6, 84, 80},
++	{100, 0, 0}, {101, 0, 4}, {102, 68, 0}, {104, 68, 0}, {107, 64, 0},
++	{108, 0, 4}, {109, 0, 4}, {110, 0, 4}, {111, 0, 4}, {112, 0, 4}, {113, 0, 4},
++	{114, 4164, 4100}, {121, 0, 4}, {122, 0, 4}, {123, 0, 4},
++	{125, 100, 36}, {127, 4, 4}, {128, 4104, 4}, {129, 64, 4},
++	{201, 12, 16}, {206, 0, 4}, {207, 0, 4}, {300, 16, 0},
++	{400, 76, 3076}, {401, 80, 12}, {406, 72, 0}, {408, 8, 8},
++	{413, 4168, 4}, {414, 80, 4}, {415, 76, 4}, {451, 20, 28}, {454, 4, 4},
++	{552, 4164, 4}, {561, 4164, 4}, {563, 76, 4}, {565, 72, 4}, {567, 128, 4},
++	{575, 88, 76}, {576, 4, 0}, {582, 8, 4}, {588, 0, 0}, {590, 1840, 0}, {599, 0, 0},
++};
++
++static inline int dcp_m4_callback_method(u32 tag)
++{
++	unsigned int method = 0;
++
++	if ((tag & 0xff) != 'D')
++		return -EPROTO;
++	for (unsigned int shift = 8; shift < 32; shift += 8) {
++		u8 digit = tag >> shift;
++
++		if (digit < '0' || digit > '9')
++			return -EPROTO;
++		method = method * 10 + digit - '0';
++	}
++	return method;
++}
++
++static inline int dcp_m4_callback_shape(u32 tag, u32 input, u32 output)
++{
++	int method = dcp_m4_callback_method(tag);
++
++	const struct dcp_m4_callback_shape *table = dcp_m4_callbacks;
++	unsigned int count = ARRAY_SIZE(dcp_m4_callbacks);
++
++	if (method < 0)
++		return method;
++	for (unsigned int i = 0; i < count; i++)
++		if (table[i].method == method)
++			return input == table[i].input &&
++				output == table[i].output ? method : -EMSGSIZE;
++	return -EOPNOTSUPP;
++}
++
++static inline int dcp_m4_nested_call(const struct dcp_m4_callback_ops *ops, void *cookie,
++				    bool remote, unsigned int method, bool input_one,
++				    int expected)
++{
++	u8 input[4], output[4] = {0};
++	int ret;
++
++	if (!ops->call)
++		return -EOPNOTSUPP;
++	put_unaligned_le32(1, input);
++	/* expected: -1 no output, -2 four-byte output of any value. */
++	ret = ops->call(cookie, method, remote, input_one ? input : NULL, input_one ? 4 : 0,
++			expected == -1 ? NULL : output, expected == -1 ? 0 : 4);
++	if (ret)
++		return ret < 0 ? ret : -EPROTO;
++	if (expected >= 0 && get_unaligned_le32(output) != (u32)expected)
++		return -EPROTO;
++	return 0;
++}
++
++/*
++ * The transaction layer has already located and owns non-overlapping packet
++ * input/output spans. It must poison the session on any error here, and send an
++ * ACK only after successful dispatch and device-visible output publication.
++ */
++static inline int dcp_m4_callback_dispatch(const struct dcp_m4_callback_ops *ops, void *cookie,
++					 u32 tag, bool remote, const void *input, u32 input_size,
++					 void *output, u32 output_size)
++{
++	const u8 *in = input;
++	u8 *out = output;
++	int method, ret;
++	u32 value;
++
++	method = dcp_m4_callback_shape(tag, input_size, output_size);
++	if (method < 0)
++		return method;
++	if (!ops || (input_size && !input) || (output_size && !output))
++		return -EINVAL;
++	if (output_size)
++		memset(out, 0, output_size);
++
++	switch (method) {
++	case 0: case 1: case 108: case 109: case 110: case 111: case 112: case 113:
++		put_unaligned_le32(1, out);
++		return 0;
++	case 3:
++		put_unaligned_le32(1, out + 56); /* Decline optional bandwidth service. */
++		return 0;
++	case 6:
++		if (!(in[80] & 1))
++			memcpy(out, in, 80);
++		return 0;
++	case 575:
++		if (!(in[84] & 1))
++			memcpy(out, in + 8, 76);
++		return 0;
++	case 300: case 406: case 576: case 588:
++		return 0;
++	case 122: case 123: case 582:
++		return 0; /* False, not an unimplemented service returning success. */
++	case 101:
++		put_unaligned_le32(dcp_m4_pf->boot_stride, out);
++		return 0;
++	case 125:
++		value = get_unaligned_le32(in + 64);
++		if (value > 8)
++			return -EINVAL;
++		memcpy(out, in + 68, value * 4);
++		return 0;
++	case 408:
++		value = get_unaligned_le32(in + 4);
++		if (memcmp(in, "VORP", 4) || value > 1)
++			return -EINVAL;
++		put_unaligned_le64(value ? 24000000 : 48000000, out);
++		return 0;
++	case 590:
++		value = get_unaligned_le32(in);
++		if (!value)
++			return -EPROTO;
++		return ops->swap_done ? dcp_m4_callback_result(ops->swap_done(cookie, value)) :
++			-EOPNOTSUPP;
++	case 599:
++		return dcp_m4_nested_call(ops, cookie, remote, 412, false, 1);
++	case 100:
++		return dcp_m4_nested_call(ops, cookie, remote, 390, false, 0);
++	case 206: case 207:
++		ret = dcp_m4_nested_call(ops, cookie, remote, method == 206 ? 131 : 132, false, 0);
++		if (ret)
++			return ret;
++		put_unaligned_le32(1, out);
++		return 0;
++	case 121:
++		ret = dcp_m4_nested_call(ops, cookie, remote, 389, false, -1);
++		if (!ret)
++			ret = dcp_m4_nested_call(ops, cookie, remote, 446, false, 1);
++		if (!ret)
++			ret = dcp_m4_nested_call(ops, cookie, remote, 29, false, -1);
++		if (!ret)
++			ret = dcp_m4_nested_call(ops, cookie, remote, 468, true, -1);
++		if (!ret)
++			ret = dcp_m4_nested_call(ops, cookie, remote, 0, true, 1);
++		if (!ret)
++			ret = dcp_m4_nested_call(ops, cookie, remote, 465, false, 1);
++		if (ret)
++			return ret;
++		put_unaligned_le32(1, out);
++		return 0;
++	case 114:
++		if (!memchr(in, 0, 64) || in[4160] > 1 || (!in[4160] && in[64] != 'd'))
++			return -EINVAL;
++		if (!ops->event)
++			return -EOPNOTSUPP;
++		ret = ops->event(cookie, (const char *)in, (in[4160] & 1) ? NULL : in + 64,
++				(in[4160] & 1) ? 0 : 4096);
++		if (ret)
++			return ret < 0 ? ret : -EPROTO;
++		if (!(in[4160] & 1))
++			memcpy(out, in + 64, 4096);
++		return 0;
++	case 201: case 451: case 454:
++		return ops->memory ?
++			dcp_m4_callback_result(ops->memory(cookie, method, input, output)) : -EOPNOTSUPP;
++	default:
++		return ops->property ?
++			dcp_m4_callback_result(ops->property(cookie, method, input, output)) : -EOPNOTSUPP;
++	}
++}
++
++#endif
+diff --git a/drivers/gpu/drm/apple/dcp-m4-frame.h b/drivers/gpu/drm/apple/dcp-m4-frame.h
+new file mode 100644
+index 0000000000..5ea5dc47f6
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-m4-frame.h
+@@ -0,0 +1,371 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++#ifndef APPLE_DCP_M4_FRAME_H
++#define APPLE_DCP_M4_FRAME_H
++
++#include <linux/bits.h>
++#include <linux/errno.h>
++#include <linux/limits.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/unaligned.h>
++#include "dcp-m4-profile.h"
++
++/* Qualified firmware-26.6.2 swap and physical panel dimensions. */
++#define DCP_M4_SWAP_SIZE		(dcp_m4_pf->swap_size)
++#define DCP_M4_SURFACE_SIZE	0x22cU
++#define DCP_M4_PANEL_WIDTH	(dcp_m4_pf->panel_width)
++#define DCP_M4_PANEL_HEIGHT	(dcp_m4_pf->panel_height)
++
++/* Used only after matching firmware-advertised preferred physical timing. */
++enum dcp_m4_frame_format {
++	DCP_M4_XRGB8888,
++	DCP_M4_ARGB8888,
++};
++
++struct dcp_m4_frame {
++	u64 dva;
++	u64 backing_size;
++	u32 width;
++	u32 height;
++	u32 stride;
++	enum dcp_m4_frame_format format;
++};
++
++static inline int dcp_m4_frame_check(const struct dcp_m4_frame *frame)
++{
++	u64 size = (u64)frame->stride * frame->height;
++
++	if (frame->width != DCP_M4_PANEL_WIDTH || frame->height != DCP_M4_PANEL_HEIGHT ||
++	    frame->stride < DCP_M4_PANEL_WIDTH * 4 || frame->stride % 64 ||
++	    !size || size > 0xffffffffULL || frame->backing_size < size ||
++	    !frame->dva || frame->dva % 0x4000 || frame->dva >= (1ULL << 42) ||
++	    size > (1ULL << 42) - frame->dva ||
++	    (frame->format != DCP_M4_XRGB8888 && frame->format != DCP_M4_ARGB8888))
++		return -EINVAL;
++	return 0;
++}
++
++/* Display-consumer DMA aperture: the 64-GiB DART range at its 1-TiB alias. */
++#define DCP_M4_SCANOUT_BASE	(1ULL << 40)
++#define DCP_M4_SCANOUT_SIZE	(1ULL << 36)
++
++/* Accumulate one mapped DMA segment; only one exactly contiguous extent qualifies. */
++static inline int dcp_m4_extent_add(u64 *start, u64 *length, u64 addr, u64 size)
++{
++	if (!size)
++		return -EINVAL;
++	if (!*length) {
++		if (size > U64_MAX - addr)
++			return -ERANGE;
++		*start = addr;
++		*length = size;
++		return 0;
++	}
++	/* Invariant: start + length never wraps. */
++	if (addr != *start + *length || size > U64_MAX - addr)
++		return -ERANGE;
++	*length += size;
++	return 0;
++}
++
++/* A client mapping must cover the needed bytes inside the SID0 aperture. */
++static inline int dcp_m4_direct_extent(u64 dva, u64 mapped, u64 needed)
++{
++	if (!dva || dva % 0x4000 || !needed || mapped < needed ||
++	    dva < DCP_M4_SCANOUT_BASE || dva - DCP_M4_SCANOUT_BASE >= DCP_M4_SCANOUT_SIZE ||
++	    mapped > DCP_M4_SCANOUT_SIZE - (dva - DCP_M4_SCANOUT_BASE))
++		return -ERANGE;
++	return 0;
++}
++
++/* Describe a qualified client framebuffer at its SID0 DVA; no CPU access. */
++static inline int dcp_m4_direct_frame(struct dcp_m4_frame *frame, u64 dva, u64 mapped,
++				      u32 width, u32 height, u32 pitch, bool alpha)
++{
++	*frame = (struct dcp_m4_frame) {
++		.dva = dva, .backing_size = mapped, .width = width, .height = height,
++		.stride = pitch, .format = alpha ? DCP_M4_ARGB8888 : DCP_M4_XRGB8888,
++	};
++	if (dcp_m4_direct_extent(dva, mapped, (u64)pitch * height))
++		return -ERANGE;
++	return dcp_m4_frame_check(frame);
++}
++
++/* Exact single-layer fixture, not an ABI for tiled or compressed surfaces. */
++static inline void dcp_m4_surface_encode(u8 *surface, const struct dcp_m4_frame *frame)
++{
++	u32 size = frame->stride * frame->height;
++
++	memset(surface, 0, DCP_M4_SURFACE_SIZE);
++	surface[2] = frame->format == DCP_M4_XRGB8888;
++	put_unaligned_le32(1, surface + 3);
++	put_unaligned_le32(1, surface + 7);
++	put_unaligned_le32(0x42475241, surface + 0x0b);
++	surface[0x13] = 13;
++	surface[0x14] = 12;
++	put_unaligned_le32(frame->stride, surface + 0x15);
++	put_unaligned_le16(1, surface + 0x19);
++	surface[0x1b] = 1;
++	surface[0x1c] = 1;
++	put_unaligned_le32(frame->width, surface + 0x21);
++	put_unaligned_le32(frame->height, surface + 0x25);
++	put_unaligned_le32(size, surface + 0x29);
++	put_unaligned_le32(1, surface + 0x35);
++	put_unaligned_le64(1, surface + 0x51);
++	put_unaligned_le32(frame->width, surface + 0x59);
++	put_unaligned_le32(frame->height, surface + 0x5d);
++	put_unaligned_le32(frame->stride, surface + 0x69);
++	put_unaligned_le32(size, surface + 0x6d);
++	put_unaligned_le16(4, surface + 0x71);
++	surface[0x73] = 1;
++	surface[0x74] = 1;
++	put_unaligned_le64(1, surface + 0x149);
++}
++
++/* Encode an integer development brightness without floating-point operations. */
++static inline u64 dcp_m4_nits_binary64(u32 nits)
++{
++	unsigned int bit = 0;
++
++	if (!nits)
++		return 0;
++	while ((nits >> bit) > 1)
++		bit++;
++	return ((u64)(1023 + bit) << 52) | ((u64)(nits - (1U << bit)) << (52 - bit));
++}
++
++/*
++ * External outputs: any qualified size up to 3840x2160, same surface layout.
++ * The frame must already be described at its wire DVA in an owned mapping.
++ */
++static inline int dcp_m4_frame_check_ext(const struct dcp_m4_frame *frame)
++{
++	u64 size = (u64)frame->stride * frame->height;
++
++	if (!frame->width || !frame->height || frame->width > 3840 || frame->height > 2160 ||
++	    frame->stride < frame->width * 4 || frame->stride % 64 ||
++	    !size || size > 0xffffffffULL || frame->backing_size < size ||
++	    !frame->dva || frame->dva % 0x4000 || frame->dva >= (1ULL << 42) ||
++	    size > (1ULL << 42) - frame->dva ||
++	    (frame->format != DCP_M4_XRGB8888 && frame->format != DCP_M4_ARGB8888))
++		return -EINVAL;
++	return 0;
++}
++
++/*
++ * One upper surface of an indexed swap (cursor/overlay contract): firmware
++ * surface-array index 1..3, a fully on-panel destination (the caller clips),
++ * no scaling. A NULL frame removes the surface.
++ */
++struct dcp_m4_upper {
++	const struct dcp_m4_frame *frame;
++	u32 index, x, y;
++	u32 id, flags;
++};
++
++static inline int dcp_m4_upper_check(const struct dcp_m4_upper *u)
++{
++	const struct dcp_m4_frame *f = u->frame;
++	u64 size;
++
++	if (u->index < 1 || u->index > 3)
++		return -EINVAL;
++	if (!f)
++		return 0;
++	size = (u64)f->stride * f->height;
++	/* Firmware rejects (or crashes on) visible surfaces below 32x32. */
++	if (f->width < 32 || f->height < 32 || f->width > 256 || f->height > 256 ||
++	    f->stride < f->width * 4 || f->stride % 64 || f->backing_size < size ||
++	    !f->dva || f->dva % 0x4000 || f->dva >= (1ULL << 42) ||
++	    f->format != DCP_M4_ARGB8888 ||
++	    u->x > DCP_M4_PANEL_WIDTH - f->width || u->y > DCP_M4_PANEL_HEIGHT - f->height)
++		return -EINVAL;
++	return 0;
++}
++
++/*
++ * Swap request. With primary, surface 0 is presented (frame) or everything is
++ * blanked (NULL frame, background colour): mask 0x80000007, less the upper
++ * indices in keep while presenting (so a primary flip never removes a live
++ * cursor), plus them when blanking. upper adds its own update bit: a swap
++ * without primary leaves surface 0 untouched (bit 0 clear, null byte 1).
++ */
++static inline int dcp_m4_swap_encode_full(void *output, size_t length, u32 swap_id,
++					  bool primary, const struct dcp_m4_frame *frame,
++					  const struct dcp_m4_upper *upper, u32 keep,
++					  bool brightness_change, u32 nits,
++					  int (*check)(const struct dcp_m4_frame *frame))
++{
++	u8 *data = output;
++	u32 mask = 0;
++
++	if (length != DCP_M4_SWAP_SIZE || !swap_id || (brightness_change && nits > 500) ||
++	    (!primary && !upper) || (keep & ~0xeU))
++		return -EINVAL;
++	if (primary && frame && check(frame))
++		return -EINVAL;
++	if (upper && dcp_m4_upper_check(upper))
++		return -EINVAL;
++	if (primary)
++		mask = frame ? 0x80000007 & ~keep : 0x80000007 | keep;
++	if (upper)
++		mask |= BIT(upper->index);
++	memset(data, 0, length);
++	put_unaligned_le32(swap_id, data + 0x98);
++	put_unaligned_le32(mask, data + 0x14c);
++	put_unaligned_le32(mask, data + 0x150);
++	put_unaligned_le32(primary && !frame ? dcp_m4_pf->disabled_color : 0xff000000,
++			   data + 0x154);
++	memset(data + dcp_m4_pf->swap_nullable, 1, 10);
++	data[dcp_m4_pf->swap_tail] = 1;
++	data[dcp_m4_pf->swap_tail + 1] = 1;
++	if (brightness_change) {
++		data[0x354] = 1;
++		put_unaligned_le64(dcp_m4_nits_binary64(nits), data + dcp_m4_pf->swap_nits);
++	}
++	if (primary && frame) {
++		put_unaligned_le32(1, data + 0x9c);
++		put_unaligned_le32(frame->width, data + 0xb4);
++		put_unaligned_le32(frame->height, data + 0xb8);
++		put_unaligned_le32(frame->width, data + 0x114);
++		put_unaligned_le32(frame->height, data + 0x118);
++		dcp_m4_surface_encode(data + dcp_m4_pf->swap_surface, frame);
++		put_unaligned_le64(frame->dva, data + dcp_m4_pf->swap_dva);
++		data[dcp_m4_pf->swap_nullable] = 0;
++	}
++	if (upper && upper->frame) {
++		const struct dcp_m4_frame *f = upper->frame;
++		u32 i = upper->index;
++
++		put_unaligned_le32(upper->id, data + 0x9c + 4 * i);
++		/* Source x,y,w,h then destination x,y,w,h. */
++		put_unaligned_le32(f->width, data + 0xac + 16 * i + 8);
++		put_unaligned_le32(f->height, data + 0xac + 16 * i + 12);
++		put_unaligned_le32(upper->flags, data + 0xec + 4 * i);
++		put_unaligned_le32(upper->x, data + 0x10c + 16 * i);
++		put_unaligned_le32(upper->y, data + 0x10c + 16 * i + 4);
++		put_unaligned_le32(f->width, data + 0x10c + 16 * i + 8);
++		put_unaligned_le32(f->height, data + 0x10c + 16 * i + 12);
++		dcp_m4_surface_encode(data + dcp_m4_pf->swap_surface + DCP_M4_SURFACE_SIZE * i, f);
++		put_unaligned_le64(f->dva, data + dcp_m4_pf->swap_dva + 8 * i);
++		data[dcp_m4_pf->swap_nullable + i] = 0;
++	}
++	return 0;
++}
++
++static inline int dcp_m4_swap_encode_checked(void *output, size_t length, u32 swap_id,
++					     const struct dcp_m4_frame *frame,
++					     bool brightness_change, u32 nits,
++					     int (*check)(const struct dcp_m4_frame *frame))
++{
++	return dcp_m4_swap_encode_full(output, length, swap_id, true, frame, NULL, 0,
++				       brightness_change, nits, check);
++}
++
++static inline int dcp_m4_swap_encode(void *output, size_t length, u32 swap_id,
++				     const struct dcp_m4_frame *frame,
++				     bool brightness_change, u32 nits)
++{
++	return dcp_m4_swap_encode_checked(output, length, swap_id, frame, brightness_change,
++					  nits, dcp_m4_frame_check);
++}
++
++static inline int dcp_m4_swap_start_reply(const void *input, size_t size, u32 *swap_id)
++{
++	const u8 *data = input;
++	u32 id;
++
++	if (size != 8)
++		return -EMSGSIZE;
++	id = get_unaligned_le32(data);
++	if (!id || get_unaligned_le32(data + 4))
++		return -EPROTO;
++	*swap_id = id;
++	return 0;
++}
++
++/* A407 reply and D590 are independent gates; callers must wait for both. */
++static inline int dcp_m4_swap_submit_reply(const void *input, size_t size)
++{
++	const u8 *data = input;
++
++	if (size != 12)
++		return -EMSGSIZE;
++	return get_unaligned_le32(data + 5) ? -EPROTO : 0;
++}
++
++static inline int dcp_m4_swap_complete(const void *input, size_t size, u32 pending_id)
++{
++	if (size != dcp_m4_pf->done_size)
++		return -EMSGSIZE;
++	return pending_id && get_unaligned_le32(input) == pending_id ? 0 : -EPROTO;
++}
++
++/* Serialized owner only. The caller retains both scanout buffers on any error. */
++struct dcp_m4_swap_state {
++	u32 id;
++	int error;
++	bool replied;
++	bool completed;
++	bool emitted;
++};
++
++static inline int dcp_m4_swap_fail(struct dcp_m4_swap_state *swap, int error)
++{
++	if (!swap->error)
++		swap->error = error < 0 ? error : -EPROTO;
++	return swap->error;
++}
++
++/* Begin after A406 supplies its validated ID, before publishing A407. */
++static inline int dcp_m4_swap_begin(struct dcp_m4_swap_state *swap, u32 id)
++{
++	if (swap->error)
++		return swap->error;
++	if (!id)
++		return dcp_m4_swap_fail(swap, -EINVAL);
++	if (swap->id && !swap->emitted)
++		return dcp_m4_swap_fail(swap, -EBUSY);
++	*swap = (struct dcp_m4_swap_state){.id = id};
++	return 0;
++}
++
++static inline int dcp_m4_swap_record_reply(struct dcp_m4_swap_state *swap,
++					 const void *reply, size_t size)
++{
++	int ret;
++
++	if (swap->error)
++		return swap->error;
++	if (!swap->id || swap->replied)
++		return dcp_m4_swap_fail(swap, -EPROTO);
++	ret = dcp_m4_swap_submit_reply(reply, size);
++	if (ret)
++		return dcp_m4_swap_fail(swap, ret);
++	swap->replied = true;
++	return 0;
++}
++
++/* Called by the exact-shape-validated D590 hook; callback alone is not a flip. */
++static inline int dcp_m4_swap_record_done(struct dcp_m4_swap_state *swap, u32 id)
++{
++	if (swap->error)
++		return swap->error;
++	if (!swap->id || id != swap->id || swap->completed)
++		return dcp_m4_swap_fail(swap, -EPROTO);
++	swap->completed = true;
++	return 0;
++}
++
++/* One completion event, only after both the A407 reply and matching D590. */
++static inline int dcp_m4_swap_take_completion(struct dcp_m4_swap_state *swap)
++{
++	if (swap->error)
++		return swap->error;
++	if (!swap->id || !swap->replied || !swap->completed || swap->emitted)
++		return 0;
++	swap->emitted = true;
++	return 1;
++}
++
++#endif
+diff --git a/drivers/gpu/drm/apple/dcp-m4-memory.h b/drivers/gpu/drm/apple/dcp-m4-memory.h
+new file mode 100644
+index 0000000000..0716c432f1
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-m4-memory.h
+@@ -0,0 +1,129 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++#ifndef APPLE_DCP_M4_MEMORY_H
++#define APPLE_DCP_M4_MEMORY_H
++
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/unaligned.h>
++#include "dcp-m4-profile.h"
++
++#define DCP_M4_MEMORY_OBJECTS 64
++#define DCP_M4_MEMORY_LIMIT (64U << 20)
++#define DCP_M4_MEMORY_MAX (16U << 20)
++#define DCP_M4_MEMORY_PAGE 0x4000U
++
++struct dcp_m4_memory_object {
++	u64 phys, dva, size;
++	bool mapped, retired;
++};
++
++/* Heap-backed, single serialized callback owner. Retired IDs are never reused. */
++struct dcp_m4_memory {
++	struct dcp_m4_memory_object object[DCP_M4_MEMORY_OBJECTS];
++	u32 count, bytes;
++	bool failed;
++};
++
++struct dcp_m4_memory_ops {
++	/* Must reserve both SID23/SID16 slots, pin backing, then publish only SID23. */
++	int (*alloc)(void *cookie, u32 size, u64 *phys, u64 *dva);
++	/* Must map the same backing at the same DVA in SID16, flush and verify. */
++	int (*map)(void *cookie, u64 phys, u64 dva, u32 size);
++};
++
++/* Called only after the dispatcher validates exact callback input/output sizes. */
++static inline int dcp_m4_memory_callback(struct dcp_m4_memory *memory,
++					 const struct dcp_m4_memory_ops *ops, void *cookie,
++					 unsigned int method, const void *input, void *output)
++{
++	struct dcp_m4_memory_object *object;
++	const u8 *in = input;
++	u8 *out = output;
++	u64 size, phys = 0, dva = 0, id;
++	u32 align;
++	int ret = -EINVAL;
++
++	if (memory->failed)
++		return -EIO;
++	if (method == 451) {
++		size = get_unaligned_le64(in + 4);
++		align = get_unaligned_le32(in + 12);
++		/* The qualified internal firmware requests alignment exponent 4. */
++		if (get_unaligned_le32(in) != 0x703 || !size || size > DCP_M4_MEMORY_MAX ||
++		    align != 4 || in[16] || in[17] || in[18])
++			goto failed;
++		/* Byte 19 is padding, observed nonzero in otherwise valid requests. */
++		size = (size + DCP_M4_MEMORY_PAGE - 1) & ~(u64)(DCP_M4_MEMORY_PAGE - 1);
++		if (memory->count >= DCP_M4_MEMORY_OBJECTS || memory->bytes > DCP_M4_MEMORY_LIMIT - size) {
++			ret = -ENOSPC;
++			goto failed;
++		}
++		if (!ops->alloc) {
++			ret = -EOPNOTSUPP;
++			goto failed;
++		}
++		ret = ops->alloc(cookie, size, &phys, &dva);
++		if (ret)
++			goto failed;
++		/* Never publish malformed allocator output to the firmware. */
++		if (!phys || ((phys | dva) & (DCP_M4_MEMORY_PAGE - 1)) ||
++		    phys >= (1ULL << 42) || size > (1ULL << 42) - phys ||
++		    dva < 0x10000000000ULL || dva >= 0x11000000000ULL ||
++		    size > 0x11000000000ULL - dva) {
++			ret = -ERANGE;
++			goto failed;
++		}
++		for (unsigned int i = 0; i < memory->count; i++) {
++			object = &memory->object[i];
++			if ((dva < object->dva + object->size && object->dva < dva + size) ||
++			    (phys < object->phys + object->size && object->phys < phys + size)) {
++				ret = -EEXIST;
++				goto failed;
++			}
++		}
++		object = &memory->object[memory->count++];
++		*object = (struct dcp_m4_memory_object){ .phys = phys, .dva = dva, .size = size };
++		memory->bytes += size;
++		put_unaligned_le64(phys, out);
++		put_unaligned_le64(dva, out + 8);
++		put_unaligned_le64(size, out + 16);
++		put_unaligned_le32(memory->count, out + 24);
++		return 0;
++	}
++	if (method != 201 && method != 454) {
++		ret = -EOPNOTSUPP;
++		goto failed;
++	}
++	id = method == 201 ? get_unaligned_le64(in) : get_unaligned_le32(in);
++	if (!id || id > memory->count || (method == 201 && get_unaligned_le32(in + 8) != 1))
++		goto failed;
++	object = &memory->object[id - 1];
++	if (object->retired)
++		goto failed;
++	if (method == 454) {
++		/* No fence exists: retain backing, both translations and the ID. */
++		object->retired = true;
++		put_unaligned_le32(1, out);
++		return 0;
++	}
++	if (object->mapped)
++		goto failed;
++	if (!ops->map) {
++		ret = -EOPNOTSUPP;
++		goto failed;
++	}
++	ret = ops->map(cookie, object->phys, object->dva, object->size);
++	if (ret)
++		goto failed;
++	object->mapped = true;
++	put_unaligned_le32(id, out);
++	put_unaligned_le64(object->dva, out + 4);
++	put_unaligned_le32(0, out + 12);
++	return 0;
++failed:
++	memory->failed = true;
++	return ret < 0 ? ret : -EPROTO;
++}
++
++#endif
+diff --git a/drivers/gpu/drm/apple/dcp-m4-profile.h b/drivers/gpu/drm/apple/dcp-m4-profile.h
+new file mode 100644
+index 0000000000..a7a91c1a4f
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-m4-profile.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++#ifndef APPLE_DCP_M4_PROFILE_H
++#define APPLE_DCP_M4_PROFILE_H
++
++#include <linux/types.h>
++
++/* Firmware 26.6.2 internal-panel ABI, qualified for the T8132/J713 handoff. */
++struct dcp_m4_profile {
++	const char *name;
++	u32 panel_width, panel_height;
++	u32 boot_stride;		/* D101: inherited framebuffer stride */
++	u32 swap_size;			/* A407 input */
++	u32 swap_surface;		/* plane-0 surface */
++	u32 swap_dva;			/* plane-0 surface DVA */
++	u32 swap_nullable;		/* ten nullable surface bytes */
++	u32 swap_tail;			/* final two bytes */
++	u32 swap_nits;			/* binary64 brightness */
++	u32 disabled_color;		/* background with no surface */
++	u16 done_method;		/* swap completion callback */
++	u32 done_size;
++	u16 open_method;		/* first client open */
++	u32 brightness_max, brightness_default;
++	u32 width_mm, height_mm;
++};
++
++static const struct dcp_m4_profile dcp_m4_profile_j713 = {
++	.name = "J713",
++	.panel_width = 2560, .panel_height = 1664, .boot_stride = 10240,
++	.swap_size = 0x1bd8, .swap_surface = 0x588, .swap_dva = 0xe38,
++	.swap_nullable = 0x1bcb, .swap_tail = 0x1bd6, .swap_nits = 0x35e,
++	.disabled_color = 0xff000000,
++	.done_method = 590, .done_size = 0x730, .open_method = 457,
++	.brightness_max = 500, .brightness_default = 120,
++	.width_mm = 0, .height_mm = 0,
++};
++
++/* This generation backend admits one qualified internal-panel ABI. */
++static const struct dcp_m4_profile *const dcp_m4_pf = &dcp_m4_profile_j713;
++
++#endif
+diff --git a/drivers/gpu/drm/apple/dcp-m4-property.h b/drivers/gpu/drm/apple/dcp-m4-property.h
+new file mode 100644
+index 0000000000..8f43ea3006
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-m4-property.h
+@@ -0,0 +1,253 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++#ifndef APPLE_DCP_M4_PROPERTY_H
++#define APPLE_DCP_M4_PROPERTY_H
++
++#include <linux/errno.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/unaligned.h>
++
++#define DCP_M4_SCALARS 256
++#define DCP_M4_RAW_PROPERTIES 32
++#define DCP_M4_RAW_LIMIT (1U << 20)
++#define DCP_M4_RAW_TOTAL (8U << 20)
++
++struct dcp_m4_scalar_property {
++	char name[64];
++	u32 service;
++	u64 value;
++	bool used;
++};
++
++struct dcp_m4_raw_property {
++	char name[64];
++	u32 service;
++	u32 size;
++	void *data;
++	bool used;
++};
++
++/* Zero-initialize in heap storage; one serialized callback owner only. */
++struct dcp_m4_properties {
++	struct dcp_m4_scalar_property scalar[DCP_M4_SCALARS];
++	struct dcp_m4_raw_property raw[DCP_M4_RAW_PROPERTIES];
++	void *chunk;
++	u32 raw_bytes;
++	u32 chunk_size;
++	u32 chunk_filled;
++	bool chunk_active;
++};
++
++static inline int dcp_m4_property_name(const void *name)
++{
++	return memchr(name, 0, 64) ? 0 : -EINVAL;
++}
++
++static inline int dcp_m4_scalar_slot(struct dcp_m4_properties *props, u32 service,
++				   const char *name, bool create)
++{
++	int free_slot = -ENOSPC;
++
++	for (unsigned int i = 0; i < DCP_M4_SCALARS; i++) {
++		if (props->scalar[i].used) {
++			if (props->scalar[i].service == service && !strcmp(props->scalar[i].name, name))
++				return i;
++		} else if (free_slot < 0) {
++			free_slot = i;
++		}
++	}
++	return create ? free_slot : -ENOENT;
++}
++
++static inline int dcp_m4_raw_slot(struct dcp_m4_properties *props, u32 service,
++				const char *name, bool create)
++{
++	int free_slot = -ENOSPC;
++
++	for (unsigned int i = 0; i < DCP_M4_RAW_PROPERTIES; i++) {
++		if (props->raw[i].used) {
++			if (props->raw[i].service == service && !strcmp(props->raw[i].name, name))
++				return i;
++		} else if (free_slot < 0) {
++			free_slot = i;
++		}
++	}
++	return create ? free_slot : -ENOENT;
++}
++
++static inline int dcp_m4_scalar_set(struct dcp_m4_properties *props, u32 service,
++				  const char *name, u64 value)
++{
++	int slot = dcp_m4_scalar_slot(props, service, name, true);
++	struct dcp_m4_scalar_property *property;
++
++	if (slot < 0)
++		return slot;
++	property = &props->scalar[slot];
++	strscpy(property->name, name, sizeof(property->name));
++	property->service = service;
++	property->value = value;
++	property->used = true;
++	return 0;
++}
++
++static inline int dcp_m4_raw_set(struct dcp_m4_properties *props, u32 service,
++			       const char *name, const void *data, u32 size, bool take_chunk)
++{
++	int slot = dcp_m4_raw_slot(props, service, name, true);
++	struct dcp_m4_raw_property *property;
++	void *copy = NULL;
++
++	if (slot < 0)
++		return slot;
++	if (size > DCP_M4_RAW_LIMIT || props->raw_bytes > DCP_M4_RAW_TOTAL - props->chunk_size)
++		return -E2BIG;
++	/* Include old values and the in-progress chunk in the allocation budget. */
++	if (!take_chunk && size > DCP_M4_RAW_TOTAL - props->raw_bytes - props->chunk_size)
++		return -ENOSPC;
++	if (take_chunk) {
++		if (!props->chunk_active || props->chunk_filled != props->chunk_size ||
++		    size != props->chunk_size || data != props->chunk)
++			return -EINVAL;
++		copy = props->chunk;
++	} else if (size) {
++		copy = kvmalloc(size, GFP_KERNEL);
++		if (!copy)
++			return -ENOMEM;
++		memcpy(copy, data, size);
++	}
++	property = &props->raw[slot];
++	if (property->used) {
++		props->raw_bytes -= property->size;
++		kvfree(property->data);
++	}
++	strscpy(property->name, name, sizeof(property->name));
++	property->service = service;
++	property->size = size;
++	property->data = copy;
++	property->used = true;
++	props->raw_bytes += size;
++	if (take_chunk) {
++		props->chunk = NULL;
++		props->chunk_active = false;
++		props->chunk_size = props->chunk_filled = 0;
++	}
++	return 0;
++}
++
++/* Only the exact-shape-validated callback dispatcher may call this hook. */
++static inline int dcp_m4_property_callback(void *cookie, unsigned int method,
++					 const void *input, void *output)
++{
++	struct dcp_m4_properties *props = cookie;
++	const u8 *in = input;
++	u8 *out = output;
++	const char *name;
++	u32 service = 0, offset = 0, size;
++	int slot, ret;
++
++	if (method == 127) {
++		size = get_unaligned_le32(in);
++		if (!size || size > DCP_M4_RAW_LIMIT + 1 || props->chunk_active)
++			return -EINVAL;
++		size--;
++		if (size > DCP_M4_RAW_TOTAL - props->raw_bytes)
++			return -ENOSPC;
++		props->chunk = size ? kvmalloc(size, GFP_KERNEL) : NULL;
++		if (size && !props->chunk)
++			return -ENOMEM;
++		props->chunk_size = size;
++		props->chunk_filled = 0;
++		props->chunk_active = true;
++		put_unaligned_le32(1, out);
++		return 0;
++	}
++	if (method == 128) {
++		offset = get_unaligned_le32(in + 4096);
++		size = get_unaligned_le32(in + 4100);
++		if (!props->chunk_active || size > 4096 || offset != props->chunk_filled ||
++		    size > props->chunk_size - props->chunk_filled)
++			return -EINVAL;
++		if (size)
++			memcpy((u8 *)props->chunk + offset, in, size);
++		props->chunk_filled += size;
++		put_unaligned_le32(1, out);
++		return 0;
++	}
++	if (method == 400 || method == 401 || method == 413 || method == 414 || method == 415) {
++		service = get_unaligned_le32(in);
++		offset = 4;
++	}
++	name = (const char *)in + offset;
++	if (dcp_m4_property_name(name))
++		return -EINVAL;
++	switch (method) {
++	case 107:
++		slot = dcp_m4_scalar_slot(props, 0, name, false);
++		if (slot >= 0)
++			props->scalar[slot].used = false;
++		return 0;
++	case 401:
++		slot = dcp_m4_scalar_slot(props, service, name, false);
++		if (slot >= 0) {
++			put_unaligned_le64(props->scalar[slot].value, out);
++			out[8] = 1;
++		}
++		return 0;
++	case 400:
++		if (in[72] & 1)
++			return -EINVAL;
++		slot = dcp_m4_raw_slot(props, service, name, false);
++		if (slot >= 0) {
++			size = props->raw[slot].size;
++			if (size > 0xc00 || size > get_unaligned_le32(in + 68))
++				return -EMSGSIZE;
++			if (size)
++				memcpy(out, props->raw[slot].data, size);
++			put_unaligned_le32(size, out + 0xc00);
++		}
++		return 0;
++	case 563: case 414:
++		ret = (in[offset + 72] & 1) ? 0 :
++			dcp_m4_scalar_set(props, service, name, get_unaligned_le64(in + offset + 64));
++		break;
++	case 565: case 415:
++		ret = (in[offset + 68] & 1) ? 0 :
++			dcp_m4_scalar_set(props, service, name, get_unaligned_le32(in + offset + 64));
++		break;
++	case 102: case 104:
++		return dcp_m4_scalar_set(props, 0, name,
++			method == 104 ? !!in[64] : get_unaligned_le32(in + 64));
++	case 413: case 552: case 561:
++		ret = (in[offset + 4160] & 1) ? 0 :
++			dcp_m4_raw_set(props, service, name, in + offset + 64, 4096, false);
++		break;
++	case 567:
++		size = strnlen((const char *)in + 64, 64);
++		if (size == 64)
++			return -EINVAL;
++		ret = dcp_m4_raw_set(props, 0, name, in + 64, size, false);
++		break;
++	case 129:
++		ret = dcp_m4_raw_set(props, 0, name, props->chunk, props->chunk_size, true);
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++	if (ret)
++		return ret;
++	put_unaligned_le32(1, out);
++	return 0;
++}
++
++/* Host-only property storage: never DMA buffers or live DCP session teardown. */
++static inline void dcp_m4_properties_destroy(struct dcp_m4_properties *props)
++{
++	for (unsigned int i = 0; i < DCP_M4_RAW_PROPERTIES; i++)
++		kvfree(props->raw[i].data);
++	kvfree(props->chunk);
++	memset(props, 0, sizeof(*props));
++}
++
++#endif
+diff --git a/drivers/gpu/drm/apple/dcp-m4-protocol.h b/drivers/gpu/drm/apple/dcp-m4-protocol.h
+new file mode 100644
+index 0000000000..6fccff5625
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-m4-protocol.h
+@@ -0,0 +1,210 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++#ifndef APPLE_DCP_M4_PROTOCOL_H
++#define APPLE_DCP_M4_PROTOCOL_H
++
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/unaligned.h>
++#include "dcp-m4-profile.h"
++
++/* J713 firmware 81BAF476-679D-3CC0-8C6A-E6B6FA659D5E only. */
++#define DCP_M4_RPC_SIZE		0xc0000U
++#define DCP_M4_STREAM_SIZE	0x8000U
++#define DCP_M4_ALIGNMENT		64U
++#define DCP_M4_READY_HASH		0x45bc9ef4U
++#define DCP_M4_PACKET_HEADER	12U
++#define DCP_M4_ENDPOINT		0x37U
++
++struct dcp_m4_packet {
++	u32 tag;
++	u32 input_size;
++	u32 output_size;
++	u16 offset;
++	u16 length;
++	u8 stream;
++	bool remote;
++	bool reply;
++	bool callback_flag;
++};
++
++static inline int dcp_m4_init_word(u64 address, u64 *word)
++{
++	if (!address || address >> 48 || address % DCP_M4_ALIGNMENT)
++		return -EINVAL;
++	*word = (address << 16) | 0x40;
++	return 0;
++}
++
++static inline bool dcp_m4_ready(u64 word)
++{
++	/* Firmware sets the remote flag; it is not part of the identity. */
++	return (word & 0xfeff) == 1 &&
++		((word >> 16) & 0xffffffffULL) == DCP_M4_READY_HASH &&
++		(word >> 48) == DCP_M4_ALIGNMENT;
++}
++
++/* Return zero for firmware-init, one for a fresh READY, or a protocol error. */
++static inline int dcp_m4_ready_notification(u64 word, bool init_sent, u64 previous)
++{
++	if (previous)
++		return -EPROTO;
++	if (!(word & 0xc3))
++		return 0;
++	return init_sent && dcp_m4_ready(word) ? 1 : -EPROTO;
++}
++
++/* This profile admits stream zero only, not the older context-ID encoding. */
++static inline int dcp_m4_decode_word_ext(u64 word, struct dcp_m4_packet *packet);
++
++static inline int dcp_m4_decode_word(u64 word, struct dcp_m4_packet *packet)
++{
++	u16 control = word;
++
++	u16 offset = word >> 16;
++	u16 length = word >> 32;
++
++	if (word >> 48 || (control & ~0x342U) || (control & 3) != 2)
++		return -EPROTO;
++	/* Qualified only on incoming remote-1 callbacks, never AP replies. */
++	if ((control & 0x200) && control != 0x302)
++		return -EPROTO;
++	/* Replies carry routing only; output remains in the outstanding AP packet. */
++	if (control & 0x40) {
++		if (offset || length)
++			return -EPROTO;
++	} else if (offset % DCP_M4_ALIGNMENT || offset >= DCP_M4_STREAM_SIZE ||
++		   length < DCP_M4_PACKET_HEADER ||
++		   length > DCP_M4_STREAM_SIZE - offset) {
++		return -EMSGSIZE;
++	}
++	*packet = (struct dcp_m4_packet) {
++		.offset = offset,
++		.length = length,
++		.remote = !!(control & 0x100),
++		.reply = !!(control & 0x40),
++		.callback_flag = !!(control & 0x200),
++	};
++	return 0;
++}
++
++/*
++ * External (DCPEXT) profile: incoming callbacks may use streams 0..3 and any
++ * remote/bit-9 route; AP replies stay on stream 0 and carry routing only.
++ */
++static inline int dcp_m4_decode_word_ext(u64 word, struct dcp_m4_packet *packet)
++{
++	u16 control = word;
++	u16 offset = word >> 16;
++	u16 length = word >> 32;
++	u8 stream = control >> 10;
++
++	if (word >> 48 || (control & 0x00bc) || (control & 3) != 2 || stream >= 4)
++		return -EPROTO;
++	if (control & 0x40) {
++		if (offset || length || stream || (control & 0x200))
++			return -EPROTO;
++	} else if (offset % DCP_M4_ALIGNMENT || offset >= DCP_M4_STREAM_SIZE ||
++		   length < DCP_M4_PACKET_HEADER ||
++		   length > DCP_M4_STREAM_SIZE - offset) {
++		return -EMSGSIZE;
++	}
++	*packet = (struct dcp_m4_packet) {
++		.offset = offset,
++		.length = length,
++		.stream = stream,
++		.remote = !!(control & 0x100),
++		.reply = !!(control & 0x40),
++		.callback_flag = !!(control & 0x200),
++	};
++	return 0;
++}
++
++/*
++ * Replies require their pending request record, not a new packet location.
++ * Only callbacks may name a nonzero stream (external profile); the internal
++ * decoder never produces one.
++ */
++static inline int dcp_m4_packet_offset(const struct dcp_m4_packet *packet, bool callback)
++{
++	unsigned int base;
++
++	if (packet->reply || (callback ? packet->stream >= 4 : packet->stream) ||
++	    (packet->callback_flag && (!callback || !packet->remote)) ||
++	    packet->offset % DCP_M4_ALIGNMENT ||
++	    packet->offset >= DCP_M4_STREAM_SIZE || packet->length < DCP_M4_PACKET_HEADER ||
++	    packet->length > DCP_M4_STREAM_SIZE - packet->offset)
++		return -EINVAL;
++	base = callback ? (packet->remote ? 0x40000 : 0x60000) :
++			  (packet->remote ? 0x20000 : 0);
++	return base + packet->stream * DCP_M4_STREAM_SIZE + packet->offset;
++}
++
++static inline int dcp_m4_callback_ack(const struct dcp_m4_packet *packet, u64 *word)
++{
++	if (dcp_m4_packet_offset(packet, true) < 0)
++		return -EINVAL;
++	/* Preserve the incoming route: stream, remote and bit 9. */
++	*word = 0x42 | (packet->remote ? 0x100 : 0) | (packet->callback_flag ? 0x200 : 0) |
++		((u64)packet->stream << 10);
++	return 0;
++}
++
++static inline int dcp_m4_nested_offset(const struct dcp_m4_packet *outer,
++				       bool remote, u16 length, u16 *offset)
++{
++	unsigned int next = 0;
++
++	if (outer) {
++		if (dcp_m4_packet_offset(outer, false) < 0)
++			return -EINVAL;
++		if (outer->remote == remote)
++			next = (outer->offset + outer->length + 63U) & ~63U;
++	}
++	if (length < DCP_M4_PACKET_HEADER || next >= DCP_M4_STREAM_SIZE ||
++	    length > DCP_M4_STREAM_SIZE - next)
++		return -EMSGSIZE;
++	*offset = next;
++	return 0;
++}
++
++/* Validate lengths before exposing either input or output to a handler. */
++static inline int dcp_m4_decode_packet(const void *data, size_t available,
++				       struct dcp_m4_packet *packet)
++{
++	const u8 *bytes = data;
++	u32 input, output, payload;
++	unsigned int i;
++
++	if (available < DCP_M4_PACKET_HEADER || available != packet->length)
++		return -EMSGSIZE;
++	input = get_unaligned_le32(bytes + 4);
++	output = get_unaligned_le32(bytes + 8);
++	payload = packet->length - DCP_M4_PACKET_HEADER;
++	if (input > payload || output != payload - input)
++		return -EMSGSIZE;
++	/* Remote selects a stream half, not the transaction's direction. */
++	/* Method FourCC is reversed on the wire: A457 is bytes "754A".
++	 * Keep logical tags with A/D in the low byte for the ownership helpers.
++	 * Input/output lengths remain little-endian; they are not FourCCs.
++	 */
++	if (bytes[3] != 'A' && bytes[3] != 'D')
++		return -EPROTO;
++	for (i = 0; i < 3; i++)
++		if (bytes[i] < '0' || bytes[i] > '9')
++			return -EPROTO;
++	packet->tag = get_unaligned_be32(bytes);
++	packet->input_size = input;
++	packet->output_size = output;
++	return 0;
++}
++
++static inline int dcp_m4_packet_size(u32 input, u32 output, u16 *size)
++{
++	if (input > DCP_M4_STREAM_SIZE - DCP_M4_PACKET_HEADER ||
++	    output > DCP_M4_STREAM_SIZE - DCP_M4_PACKET_HEADER - input)
++		return -EMSGSIZE;
++	*size = DCP_M4_PACKET_HEADER + input + output;
++	return 0;
++}
++
++#endif
+diff --git a/drivers/gpu/drm/apple/dcp-m4-timing.h b/drivers/gpu/drm/apple/dcp-m4-timing.h
+new file mode 100644
+index 0000000000..e85908b659
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-m4-timing.h
+@@ -0,0 +1,223 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++#ifndef APPLE_DCP_M4_TIMING_H
++#define APPLE_DCP_M4_TIMING_H
++
++#include <linux/errno.h>
++#include <linux/limits.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/unaligned.h>
++#include "dcp-m4-profile.h"
++
++#define DCP_M4_TIMING_TOKENS 2048
++
++/* The first qualified J713 physical mode, not a generic panel-mode fallback. */
++struct dcp_m4_timing {
++	u32 id, color_id;
++	u32 hdisplay, hsync_start, hsync_end, htotal;
++	u32 vdisplay, vsync_start, vsync_end, vtotal;
++	u32 clock_khz, refresh_16_16;
++};
++
++struct dcp_m4_timing_token {
++	u64 value;
++	u32 offset, count;
++	u16 next;
++	u8 type;
++};
++
++/* Heap storage, so a firmware dictionary cannot consume the kernel stack. */
++struct dcp_m4_timing_parser {
++	const u8 *data;
++	u32 size, pos, used;
++	struct dcp_m4_timing_token token[DCP_M4_TIMING_TOKENS];
++};
++
++static inline int dcp_m4_timing_object(struct dcp_m4_timing_parser *p, unsigned int depth)
++{
++	struct dcp_m4_timing_token *t;
++	u32 tag, bytes = 0, children = 0;
++	unsigned int index;
++
++	if (depth > 8 || p->used == DCP_M4_TIMING_TOKENS)
++		return -E2BIG;
++	p->pos = (p->pos + 3) & ~3U;
++	if (p->pos > p->size || p->size - p->pos < 4)
++		return -EINVAL;
++	tag = get_unaligned_le32(p->data + p->pos);
++	p->pos += 4;
++	if (tag & 0x60000000)
++		return -EINVAL;
++	index = p->used++;
++	t = &p->token[index];
++	t->type = (tag >> 24) & 31;
++	t->count = tag & 0xffffff;
++	t->offset = p->pos;
++	switch (t->type) {
++	case 1:
++		if (t->count > 128)
++			return -E2BIG;
++		children = t->count * 2;
++		break;
++	case 2:
++		if (t->count > 128)
++			return -E2BIG;
++		children = t->count;
++		break;
++	case 4:
++		if (t->count != 64)
++			return -EINVAL;
++		bytes = 8;
++		break;
++	case 9:
++	case 10:
++		if (t->count > (t->type == 9 ? 256 : 65536))
++			return -E2BIG;
++		bytes = t->count;
++		break;
++	case 11:
++		if (t->count > 1)
++			return -EINVAL;
++		t->value = t->count;
++		break;
++	default:
++		return -EINVAL;
++	}
++	if (bytes > p->size - p->pos)
++		return -EINVAL;
++	if (t->type == 4)
++		t->value = get_unaligned_le64(p->data + p->pos);
++	p->pos += bytes;
++	/* Counts bound containers; bit 31 is not used to extend or shorten them. */
++	for (unsigned int i = 0; i < children; i++) {
++		unsigned int key = p->used;
++		int ret = dcp_m4_timing_object(p, depth + 1);
++
++		if (ret)
++			return ret;
++		if (t->type == 1 && !(i & 1)) {
++			const struct dcp_m4_timing_token *k = &p->token[key];
++
++			if (k->type != 9 || !k->count ||
++			    memchr(p->data + k->offset, 0, k->count))
++				return -EINVAL;
++			/* Reject duplicate keys, including recognized optional fields. */
++			for (unsigned int previous = index + 1; previous < key;
++			     previous = p->token[p->token[previous].next].next) {
++				const struct dcp_m4_timing_token *old = &p->token[previous];
++
++				if (old->count == k->count &&
++				    !memcmp(p->data + old->offset, p->data + k->offset, k->count))
++					return -EINVAL;
++			}
++		}
++	}
++	t->next = p->used;
++	return 0;
++}
++
++static inline int dcp_m4_timing_field(const struct dcp_m4_timing_parser *p,
++				     unsigned int dict, const char *name, unsigned int type)
++{
++	if (dict >= p->used || p->token[dict].type != 1)
++		return -EINVAL;
++	for (unsigned int key = dict + 1; key < p->token[dict].next;
++	     key = p->token[p->token[key].next].next) {
++		const struct dcp_m4_timing_token *k = &p->token[key];
++
++		if (k->count == strlen(name) && !memcmp(p->data + k->offset, name, k->count))
++			return p->token[k->next].type == type ? k->next : -EINVAL;
++	}
++	return -ENOENT;
++}
++
++static inline bool dcp_m4_timing_equals(const struct dcp_m4_timing_parser *p,
++				       unsigned int dict, const char *name,
++				       unsigned int type, u64 value)
++{
++	int index = dcp_m4_timing_field(p, dict, name, type);
++
++	return index >= 0 && p->token[index].value == value;
++}
++
++static inline int dcp_m4_timing_axis(const struct dcp_m4_timing_parser *p,
++				    unsigned int mode, const char *name, bool vertical)
++{
++	static const char * const fields[] = {
++		"Active", "Total", "FrontPorch", "SyncWidth", "BackPorch", "PreciseSyncRate",
++		"SyncPolarity", "PixelRepetition",
++	};
++	static const u32 values[2][8] = {
++		{ 2560, 2640, 8, 32, 40, 6877358, 1, 0 },
++		{ 1664, 1749, 33, 8, 44, 3932166, 1, 0 },
++	};
++	int axis = dcp_m4_timing_field(p, mode, name, 1);
++
++	if (axis < 0)
++		return axis;
++	for (unsigned int i = 0; i < 8; i++)
++		if (!dcp_m4_timing_equals(p, axis, fields[i], 4, values[vertical][i]))
++			return -EINVAL;
++	/* Exact qualified values also establish active + porches + sync == total. */
++	return 0;
++}
++
++static inline int dcp_m4_parse_timing(const void *data, size_t size, struct dcp_m4_timing *out)
++{
++	struct dcp_m4_timing_parser *p;
++	static const char * const color_fields[] = {
++		"ID", "Depth", "PixelEncoding", "DynamicRange", "EOTF", "Colorimetry", "SupportsDSC",
++	};
++	static const u32 color_values[] = { 1, 8, 0, 0, 0, 16, 0 };
++	int ret = -EINVAL, colors, color;
++
++	if (!data || !out || size < 4 || size > (1U << 20) || get_unaligned_le32(data) != 0xd3)
++		return -EINVAL;
++	p = kzalloc(sizeof(*p), GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++	p->data = data;
++	p->size = size;
++	p->pos = 4;
++	ret = dcp_m4_timing_object(p, 0);
++	if (ret)
++		goto done;
++	ret = -EINVAL;
++	if (p->pos != size || p->token[0].type != 2 || p->token[0].count != 1 ||
++	    p->token[1].type != 1 ||
++	    !dcp_m4_timing_equals(p, 1, "ID", 4, 2) ||
++	    !dcp_m4_timing_equals(p, 1, "IsVirtual", 11, 0) ||
++	    !dcp_m4_timing_equals(p, 1, "IsPreferred", 11, 1) ||
++	    !dcp_m4_timing_equals(p, 1, "IsInterlaced", 11, 0) ||
++	    !dcp_m4_timing_equals(p, 1, "IsSplit", 11, 0) ||
++	    !dcp_m4_timing_equals(p, 1, "IsOverscanned", 11, 0) ||
++	    !dcp_m4_timing_equals(p, 1, "TimingType", 4, 3) ||
++	    !dcp_m4_timing_equals(p, 1, "MinimumVariableRefreshRate", 4, 0) ||
++	    !dcp_m4_timing_equals(p, 1, "MaximumVariableRefreshRate", 4, 0) ||
++	    dcp_m4_timing_axis(p, 1, "HorizontalAttributes", false) ||
++	    dcp_m4_timing_axis(p, 1, "VerticalAttributes", true))
++		goto done;
++	colors = dcp_m4_timing_field(p, 1, "ColorModes", 2);
++	if (colors < 0 || p->token[colors].count != 1)
++		goto done;
++	color = colors + 1;
++	if (!dcp_m4_timing_equals(p, color, "IsVirtual", 11, 0))
++		goto done;
++	for (unsigned int i = 0; i < 7; i++)
++		if (!dcp_m4_timing_equals(p, color, color_fields[i], 4, color_values[i]))
++			goto done;
++	*out = (struct dcp_m4_timing) {
++		.id = 2, .color_id = 1,
++		.hdisplay = 2560, .hsync_start = 2568, .hsync_end = 2600, .htotal = 2640,
++		.vdisplay = 1664, .vsync_start = 1697, .vsync_end = 1705, .vtotal = 1749,
++		.clock_khz = ((2640ULL * 1749 * 3932166 >> 16) + 500) / 1000,
++		.refresh_16_16 = 3932166,
++	};
++	ret = 0;
++done:
++	kfree(p);
++	return ret;
++}
++
++#endif
+diff --git a/drivers/gpu/drm/apple/dcp-m4-transaction.h b/drivers/gpu/drm/apple/dcp-m4-transaction.h
+new file mode 100644
+index 0000000000..7736a7a50d
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-m4-transaction.h
+@@ -0,0 +1,246 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++#ifndef APPLE_DCP_M4_TRANSACTION_H
++#define APPLE_DCP_M4_TRANSACTION_H
++
++#include <linux/string.h>
++#include "dcp-m4-protocol.h"
++
++/*
++ * Pure ownership core: one serialized owner, not called from the mailbox IRQ.
++ * The transport must queue notifications in order, synchronize DMA before reads
++ * and before sends, enforce deadlines, and latch queue/send/firmware failures.
++ * Buffers and state must remain pinned after failure; resetting this structure
++ * is not firmware recovery. No timeout, MMIO or mailbox operation happens here.
++ */
++#define DCP_M4_CALL_DEPTH 2
++#define DCP_M4_CALLBACK_DEPTH 8
++
++struct dcp_m4_call {
++	struct dcp_m4_packet packet;
++	unsigned int callbacks;
++};
++
++struct dcp_m4_callback {
++	struct dcp_m4_packet packet;
++	unsigned int calls;
++};
++
++struct dcp_m4_transaction {
++	struct dcp_m4_call call[DCP_M4_CALL_DEPTH];
++	struct dcp_m4_callback callback[DCP_M4_CALLBACK_DEPTH];
++	unsigned int calls;
++	unsigned int callbacks;
++	int error;
++	bool external;	/* DCPEXT profile: streams 0..3 and any flagged callback route */
++};
++
++static inline int dcp_m4_transaction_decode(const struct dcp_m4_transaction *state, u64 word,
++					    struct dcp_m4_packet *packet)
++{
++	return state->external ? dcp_m4_decode_word_ext(word, packet) :
++				 dcp_m4_decode_word(word, packet);
++}
++
++static inline int dcp_m4_transaction_fail(struct dcp_m4_transaction *state, int error)
++{
++	if (!state->error)
++		state->error = error < 0 ? error : -EPROTO;
++	return state->error;
++}
++
++static inline bool dcp_m4_tag(u32 tag, u8 direction)
++{
++	if ((tag & 0xff) != direction)
++		return false;
++	for (unsigned int shift = 8; shift < 32; shift += 8)
++		if (((tag >> shift) & 0xff) < '0' || ((tag >> shift) & 0xff) > '9')
++			return false;
++	return true;
++}
++
++/* Prepare only; the caller publishes with its DMA barrier and mailbox send. */
++static inline int dcp_m4_call_begin(struct dcp_m4_transaction *state, void *rpc,
++				  size_t rpc_size, u32 tag, bool remote,
++				  const void *input, u32 input_size, u32 output_size,
++				  u64 *word)
++{
++	struct dcp_m4_packet packet = {
++		.tag = tag, .input_size = input_size, .output_size = output_size,
++		.remote = remote,
++	};
++	const struct dcp_m4_packet *outer = NULL;
++	u8 *data;
++	int ret, offset;
++
++	if (state->error)
++		return state->error;
++	if (!rpc || rpc_size != DCP_M4_RPC_SIZE || !word || (input_size && !input) ||
++	    !dcp_m4_tag(tag, 'A') || state->calls >= DCP_M4_CALL_DEPTH)
++		return dcp_m4_transaction_fail(state, -EINVAL);
++	if (state->calls) {
++		struct dcp_m4_call *pending = &state->call[state->calls - 1];
++
++		/* Merely queuing a callback does not grant nested-call ownership. */
++		if (state->callbacks <= pending->callbacks)
++			return dcp_m4_transaction_fail(state, -EBUSY);
++		outer = &pending->packet;
++	}
++	if (state->callbacks &&
++	    remote != state->callback[state->callbacks - 1].packet.remote)
++		return dcp_m4_transaction_fail(state, -EPROTO);
++	/* AP calls use stream 0; a callback on another stream cannot recurse. */
++	if (state->callbacks && state->callback[state->callbacks - 1].packet.stream)
++		return dcp_m4_transaction_fail(state, -EOPNOTSUPP);
++	ret = dcp_m4_packet_size(input_size, output_size, &packet.length);
++	if (ret)
++		return dcp_m4_transaction_fail(state, ret);
++	ret = dcp_m4_nested_offset(outer, remote, packet.length, &packet.offset);
++	if (ret)
++		return dcp_m4_transaction_fail(state, ret);
++	offset = dcp_m4_packet_offset(&packet, false);
++	if (offset < 0)
++		return dcp_m4_transaction_fail(state, offset);
++	data = (u8 *)rpc + offset;
++	/* Check before writing the header: input must not alias this AP packet. */
++	if (input_size) {
++		unsigned long src = (unsigned long)input;
++		unsigned long dst = (unsigned long)data;
++
++		if (src > ~0UL - input_size ||
++		    (src < dst + packet.length && dst < src + input_size))
++			return dcp_m4_transaction_fail(state, -EINVAL);
++	}
++	put_unaligned_be32(tag, data);
++	put_unaligned_le32(input_size, data + 4);
++	put_unaligned_le32(output_size, data + 8);
++	if (input_size)
++		memcpy(data + DCP_M4_PACKET_HEADER, input, input_size);
++	memset(data + DCP_M4_PACKET_HEADER + input_size, 0, output_size);
++	state->call[state->calls++] = (struct dcp_m4_call) {
++		.packet = packet, .callbacks = state->callbacks,
++	};
++	*word = 2 | (remote ? 0x100 : 0) | ((u64)packet.offset << 16) |
++		((u64)packet.length << 32);
++	return 0;
++}
++
++/* Firmware may write output, but must not change the owned packet header. */
++static inline int dcp_m4_owned_packet(const void *rpc, const struct dcp_m4_packet *owned,
++				    bool callback)
++{
++	struct dcp_m4_packet actual = *owned;
++	int offset = dcp_m4_packet_offset(owned, callback);
++	int ret;
++
++	if (offset < 0)
++		return offset;
++	ret = dcp_m4_decode_packet((const u8 *)rpc + offset, owned->length, &actual);
++	if (ret)
++		return ret;
++	if (actual.tag != owned->tag || actual.input_size != owned->input_size ||
++	    actual.output_size != owned->output_size)
++		return -EPROTO;
++	return offset;
++}
++
++/* Accept only the innermost matching reply; output stays in its original AP slot. */
++static inline int dcp_m4_call_reply(struct dcp_m4_transaction *state, const void *rpc,
++				  size_t rpc_size, u64 word, void *output, u32 output_size)
++{
++	struct dcp_m4_packet reply;
++	struct dcp_m4_call *call;
++	int ret, offset;
++
++	if (state->error)
++		return state->error;
++	if (!rpc || rpc_size != DCP_M4_RPC_SIZE || !state->calls)
++		return dcp_m4_transaction_fail(state, -EPROTO);
++	ret = dcp_m4_transaction_decode(state, word, &reply);
++	if (ret)
++		return dcp_m4_transaction_fail(state, ret);
++	call = &state->call[state->calls - 1];
++	if (!reply.reply || reply.remote != call->packet.remote ||
++	    state->callbacks != call->callbacks || output_size != call->packet.output_size ||
++	    (output_size && !output))
++		return dcp_m4_transaction_fail(state, -EPROTO);
++	offset = dcp_m4_owned_packet(rpc, &call->packet, false);
++	if (offset < 0)
++		return dcp_m4_transaction_fail(state, offset);
++	if (output_size)
++		memcpy(output, (const u8 *)rpc + offset + DCP_M4_PACKET_HEADER +
++		       call->packet.input_size, output_size);
++	state->calls--;
++	return 0;
++}
++
++/* Called when the serialized owner begins handling a queued callback. */
++static inline int dcp_m4_callback_begin(struct dcp_m4_transaction *state, void *rpc,
++				      size_t rpc_size, u64 word, struct dcp_m4_packet *out)
++{
++	struct dcp_m4_packet packet;
++	u8 *data;
++	int ret, offset;
++
++	if (state->error)
++		return state->error;
++	if (!rpc || rpc_size != DCP_M4_RPC_SIZE || !out ||
++	    state->callbacks >= DCP_M4_CALLBACK_DEPTH)
++		return dcp_m4_transaction_fail(state, -EINVAL);
++	ret = dcp_m4_transaction_decode(state, word, &packet);
++	if (ret)
++		return dcp_m4_transaction_fail(state, ret);
++	offset = dcp_m4_packet_offset(&packet, true);
++	if (offset < 0)
++		return dcp_m4_transaction_fail(state, offset);
++	for (unsigned int i = 0; i < state->callbacks; i++) {
++		const struct dcp_m4_packet *active = &state->callback[i].packet;
++
++		if (active->remote == packet.remote && active->stream == packet.stream &&
++		    packet.offset < active->offset + active->length &&
++		    active->offset < packet.offset + packet.length)
++			return dcp_m4_transaction_fail(state, -EPROTO);
++	}
++	data = (u8 *)rpc + offset;
++	ret = dcp_m4_decode_packet(data, packet.length, &packet);
++	if (ret)
++		return dcp_m4_transaction_fail(state, ret);
++	if (!dcp_m4_tag(packet.tag, 'D'))
++		return dcp_m4_transaction_fail(state, -EPROTO);
++	/* Bit 9 only marks a new-stream notification route; it says nothing about
++	 * the method. Firmware sends any callback that way (e.g. the hourly D114
++	 * CoreAnalyticsSendEvent), so admission is left to the exact-shape
++	 * dispatch table, as for unflagged callbacks.
++	 */
++	memset(data + DCP_M4_PACKET_HEADER + packet.input_size, 0, packet.output_size);
++	state->callback[state->callbacks++] = (struct dcp_m4_callback) {
++		.packet = packet, .calls = state->calls,
++	};
++	*out = packet;
++	return 0;
++}
++
++/* Caller must publish handler output before sending the returned ACK word. */
++static inline int dcp_m4_callback_end(struct dcp_m4_transaction *state, const void *rpc,
++				    size_t rpc_size, u64 *word)
++{
++	struct dcp_m4_callback *callback;
++	int ret;
++
++	if (state->error)
++		return state->error;
++	if (!rpc || rpc_size != DCP_M4_RPC_SIZE || !word || !state->callbacks)
++		return dcp_m4_transaction_fail(state, -EPROTO);
++	callback = &state->callback[state->callbacks - 1];
++	if (state->calls != callback->calls)
++		return dcp_m4_transaction_fail(state, -EBUSY);
++	ret = dcp_m4_owned_packet(rpc, &callback->packet, true);
++	if (ret < 0)
++		return dcp_m4_transaction_fail(state, ret);
++	ret = dcp_m4_callback_ack(&callback->packet, word);
++	if (ret)
++		return dcp_m4_transaction_fail(state, ret);
++	state->callbacks--;
++	return 0;
++}
++
++#endif
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index a8571b5446..582df6b7e7 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -10,6 +10,7 @@
+ #include <linux/delay.h>
+ #include <linux/device/driver.h>
+ #include <linux/dma-mapping.h>
++#include <linux/dma-fence.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/iommu.h>
+ #include <linux/jiffies.h>
+@@ -36,6 +37,7 @@
+ 
+ #include <drm/drm_edid.h>
+ #include <drm/drm_fb_dma_helper.h>
++#include <drm/drm_file.h>
+ #include <drm/drm_drv.h>
+ #include <drm/drm_fourcc.h>
+ #include <drm/drm_framebuffer.h>
+@@ -54,6 +56,7 @@
+ #include "dcp-external-bw.h"
+ #include "dptx-service.h"
+ #include "iomfb.h"
++#include "iomfb_m4.h"
+ #include "ibootep.h"
+ #include "parser.h"
+ #include "trace.h"
+@@ -96,7 +99,7 @@ static int dcp_pin_live_session(struct apple_dcp *dcp)
+ 	if ((!dcp->hw.adopt_live_session &&
+ 	     dcp->hw.iomfb_method_profile !=
+ 	     DCP_IOMFB_METHODS_H17P_EXTERNAL) ||
+-	    dcp->fw_compat != DCP_FIRMWARE_H17P ||
++	    !dcp_fail_stop(dcp) ||
+ 	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G || dcp->retain_dma)
+ 		return 0;
+ 	session = kzalloc_obj(*session);
+@@ -111,7 +114,7 @@ static int dcp_pin_live_session(struct apple_dcp *dcp)
+ 	mutex_lock(&dcp_retained_sessions_lock);
+ 	list_add_tail(&session->link, &dcp_retained_sessions);
+ 	mutex_unlock(&dcp_retained_sessions_lock);
+-	dev_dbg(dcp->dev, "live H17P DMA resources retained until reboot\n");
++	dev_dbg(dcp->dev, "live DCP DMA resources retained until reboot\n");
+ 	return 0;
+ }
+ 
+@@ -305,6 +308,40 @@ void dcp_drm_crtc_vblank(struct apple_crtc *crtc)
+ 	spin_unlock_irqrestore(&crtc->base.dev->event_lock, flags);
+ }
+ 
++/* Finish an accepted atomic commit even when scanout failed. DRM has no
++ * failed-flip event encoding: report completion to unblock userspace and put
++ * the error on the out-fence. The core owns fence/completion release.
++ */
++static void dcp_failed_page_flip(struct apple_crtc *crtc,
++				struct drm_pending_vblank_event *event, int error)
++{
++	if (!event)
++		return;
++	lockdep_assert_held(&crtc->base.dev->event_lock);
++	if (event->base.fence)
++		dma_fence_set_error(event->base.fence, error);
++	drm_crtc_send_vblank_event(&crtc->base, event);
++}
++
++void dcp_drm_crtc_error(struct apple_crtc *crtc,
++			struct drm_crtc_state *state, int error)
++{
++	struct drm_device *drm = crtc->base.dev;
++	struct drm_pending_vblank_event *pending, *state_event;
++	unsigned long flags;
++
++	spin_lock_irqsave(&drm->event_lock, flags);
++	pending = crtc->event;
++	crtc->event = NULL;
++	state_event = state ? state->event : NULL;
++	if (state)
++		state->event = NULL;
++	dcp_failed_page_flip(crtc, pending, error);
++	if (state_event != pending)
++		dcp_failed_page_flip(crtc, state_event, error);
++	spin_unlock_irqrestore(&drm->event_lock, flags);
++}
++
+ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
+ {
+ 	unsigned long flags;
+@@ -599,7 +636,7 @@ void dcp_update_connector_dimensions(struct apple_dcp *dcp,
+ 
+ bool dcp_has_panel(struct apple_dcp *dcp)
+ {
+-	return dcp->panel.width_mm > 0;
++	return iomfb_is_m4(dcp) || dcp->panel.width_mm > 0;
+ }
+ 
+ int dcp_set_crc(struct drm_crtc *crtc, bool enabled)
+@@ -607,6 +644,9 @@ int dcp_set_crc(struct drm_crtc *crtc, bool enabled)
+ 	struct apple_crtc *ac = to_apple_crtc(crtc);
+ 	struct apple_dcp *dcp = platform_get_drvdata(ac->dcp);
+ 
++	if (iomfb_is_m4(dcp))
++		return enabled ? -EOPNOTSUPP : 0;
++
+ 	WRITE_ONCE(dcp->crc_enabled, enabled);
+ 
+ 	return 0;
+@@ -733,7 +773,7 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
+ 	 * remote allocator endpoint, for one).  Log their messages rather than
+ 	 * dereferencing a NULL afkep or warning about an unknown endpoint.
+ 	 */
+-	if (dcp->fw_compat == DCP_FIRMWARE_H17P && endpoint != IOMFB_ENDPOINT &&
++	if (dcp_fail_stop(dcp) && endpoint != IOMFB_ENDPOINT &&
+ 	    !dcp_afkep(dcp, endpoint)) {
+ 		dev_dbg_ratelimited(dcp->dev, "ep %#04x: %#llx\n", endpoint,
+ 				    message);
+@@ -773,7 +813,7 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
+ 	}
+ 	dcp->crashed = true;
+ 	dev_err(dcp->dev, "DCP has crashed\n");
+-	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
++	if (dcp_fail_stop(dcp) &&
+ 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+ 		/* No in-place restart exists; the last scanout stays retained. */
+ 		dev_err(dcp->dev, "a reboot is required to restore the display\n");
+@@ -917,6 +957,27 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
+ 	struct drm_crtc_state *crtc_state;
+ 	bool needs_modeset;
+ 
++	if (iomfb_is_m4(dcp)) {
++		struct drm_display_mode mode;
++		int ret = iomfb_m4_error(dcp);
++
++		if (READ_ONCE(dcp->quiescing))
++			return -ENODEV;
++		if (ret)
++			return ret;
++		crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
++		if (!crtc_state)
++			return 0;
++		if (crtc_state->vrr_enabled || crtc_state->ctm ||
++		    crtc_state->degamma_lut || crtc_state->gamma_lut)
++			return -EINVAL;
++		if (!crtc_state->enable)
++			return 0;
++		if (!(crtc_state->plane_mask & drm_plane_mask(crtc->primary)))
++			return -EINVAL;
++		ret = iomfb_m4_get_mode(dcp, &mode);
++		return ret ? ret : drm_mode_equal(&crtc_state->mode, &mode) ? 0 : -EINVAL;
++	}
+ 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
+ 		return iomfb_v26_6_atomic_check(dcp, crtc, commit);
+ 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7)
+@@ -2420,11 +2481,25 @@ unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev)
+ 	return dcp->iomfb_surfaces;
+ }
+ 
++/* KMS registration owns the aperture before the first T8132 scanout swap. */
++int dcp_activate(struct platform_device *pdev)
++{
++	struct apple_dcp *dcp = platform_get_drvdata(pdev);
++
++	return iomfb_is_m4(dcp) ? iomfb_m4_activate(dcp) : 0;
++}
++
+ int dcp_start(struct platform_device *pdev)
+ {
+ 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+ 	int ret;
+ 
++	if (iomfb_is_m4(dcp)) {
++		iomfb_m4_configure_backlight(dcp);
++		return iomfb_m4_health(dcp);
++	}
++
++
+ 	/* Even if nothing starts, dcp_wait_ready() must find it initialised. */
+ 	init_completion(&dcp->start_done);
+ 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
+@@ -2654,6 +2729,9 @@ int dcp_wait_ready(struct platform_device *pdev, u64 timeout)
+ 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+ 	int ret;
+ 
++	if (iomfb_is_m4(dcp))
++		return iomfb_m4_health(dcp);
++
+ 	if (dcp->crashed)
+ 		return -ENODEV;
+ 	if (dcp->active)
+@@ -2747,6 +2825,13 @@ void dcp_poweron(struct platform_device *pdev)
+ 	unsigned long remaining;
+ 	int ret;
+ 
++	if (iomfb_is_m4(dcp)) {
++		ret = dcp_backlight_dpms(dcp, true);
++		if (ret)
++			dev_warn(dcp->dev, "panel brightness restore failed: %d\n", ret);
++		return;
++	}
++
+ 	if (dcp_is_external_h17p(dcp)) {
+ 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+ 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+@@ -2895,6 +2980,15 @@ void dcp_poweroff(struct platform_device *pdev)
+ 	bool display_gone = false;
+ 	int ret;
+ 
++	if (iomfb_is_m4(dcp)) {
++		ret = dcp_backlight_dpms(dcp, false);
++		if (!ret)
++			ret = iomfb_m4_blank(dcp);
++		if (ret)
++			dev_warn(dcp->dev, "panel blank failed: %d\n", ret);
++		return;
++	}
++
+ 	if (dcp_is_external_h17p(dcp)) {
+ 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+ 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+@@ -3764,6 +3858,15 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
+ 		return dev_err_probe(dev, -EBUSY,
+ 				     "Live DCP session cannot be rebound; reboot required\n");
+ 
++	if (iomfb_is_m4(dcp)) {
++		ret = dcp_pin_live_session(dcp);
++		if (ret)
++			return ret;
++		ret = iomfb_m4_start(dcp, main);
++		if (!ret)
++			WRITE_ONCE(dcp->active, true);
++		return ret;
++	}
+ 	if (dcp->vblank_works_disabled) {
+ 		enable_work(&dcp->vblank_wq);
+ 		enable_delayed_work(&dcp->swap_watchdog_wq);
+@@ -4069,6 +4172,20 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
+ 	if (READ_ONCE(dcp->ext_dead))
+ 		return;
+ 
++	if (iomfb_is_m4(dcp)) {
++		WRITE_ONCE(dcp->quiescing, true);
++		dcp_backlight_stop(dcp);
++		cancel_work_sync(&dcp->bl_register_wq);
++		cancel_work_sync(&dcp->bl_update_wq);
++		iomfb_m4_quiesce(dcp);
++		if (dcp->crtc && !dcp->drm_retained) {
++			drm_dev_get(dcp->crtc->base.dev);
++			dcp->drm_retained = true;
++		}
++		dev_warn(dev, "retaining live DCP DMA resources after unbind; reboot required\n");
++		return;
++	}
++
+ 	disable_work_sync(&dcp->dimensions_wq);
+ 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6) {
+ 		iomfb_v26_6_unbind(dcp);
+@@ -4304,6 +4421,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
+ 	 */
+ 	if (fw_compat != DCP_FIRMWARE_V_14_7 &&
+ 	    fw_compat != DCP_FIRMWARE_V_26_6 &&
++	    fw_compat != DCP_FIRMWARE_M4 &&
+ 	    !of_property_present(dev->of_node, "apple,bw-scratch") &&
+ 	    !hw->firmware_clock)
+ 		return dev_err_probe(dev, -ENODEV, "Incompatible devicetree! "
+@@ -4405,6 +4523,16 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, dcp);
+ 
++	if (iomfb_is_m4(dcp)) {
++		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
++		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
++		bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
++		set_bit(0, dcp->iomfb_surfaces);
++		ret = iomfb_m4_init(dcp);
++		if (ret)
++			return ret;
++		return component_add(dev, &dcp_comp_ops);
++	}
+ 	if (fw_compat == DCP_FIRMWARE_V_26_6) {
+ 		ret = iomfb_v26_6_probe(dcp);
+ 		if (ret)
+@@ -4798,6 +4926,10 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
+ {
+ 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+ 
++	if (dcp && iomfb_is_m4(dcp)) {
++		dcp_comp_unbind(&pdev->dev, NULL, NULL);
++		return;
++	}
+ 	if (dcp && dcp->external && !dcp->external_native)
+ 		return;
+ 
+@@ -4807,8 +4939,7 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
+ 		return;
+ 	}
+ 
+-	if (dcp && dcp->hw.adopt_live_session &&
+-	    dcp->fw_compat == DCP_FIRMWARE_H17P &&
++	if (dcp && dcp->hw.adopt_live_session && dcp_fail_stop(dcp) &&
+ 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+ 		/*
+ 		 * This firmware keeps scanning across soft DPMS and has no
+@@ -4837,8 +4968,7 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
+ {
+ 	int pass;
+ 
+-	if (!dcp->hw.adopt_live_session || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+-	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
++	if (!dcp->hw.adopt_live_session || !dcp_presents_nits(dcp))
+ 		return;
+ 
+ 	/*
+@@ -4885,8 +5015,7 @@ static void dcp_hold_for_sleep(struct apple_dcp *dcp)
+ {
+ 	/* A failed component bind leaves no coprocessor session to hold. */
+ 	if (IS_ERR_OR_NULL(dcp->rtk) ||
+-	    !dcp_uses_soft_dpms(dcp) || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+-	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
++	    !dcp_uses_soft_dpms(dcp) || !dcp_presents_nits(dcp) ||
+ 	    READ_ONCE(dcp->crashed))
+ 		return;
+ 
+@@ -4986,6 +5115,9 @@ static int dcp_platform_suspend(struct device *dev)
+ {
+ 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+ 
++	/* The retained T8132 session has no qualified system-sleep handshake. */
++	if (iomfb_is_m4(dcp))
++		return -EBUSY;
+ 	if (READ_ONCE(dcp->ext_dead))
+ 		return 0;
+ 	iomfb_v14_7_backlight_suspend(dcp);
+@@ -5062,6 +5194,8 @@ static int dcp_platform_resume(struct device *dev)
+ {
+ 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+ 
++	if (iomfb_is_m4(dcp))
++		return iomfb_m4_health(dcp);
+ 	if (READ_ONCE(dcp->ext_dead))
+ 		return 0;
+ 
+@@ -5171,6 +5305,13 @@ static const struct apple_dcp_hw_data apple_dcp_hw_dcpext = {
+ 	.num_dptx_ports = 2,
+ };
+ 
++#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
++static const struct apple_dcp_hw_data apple_dcp_hw_t8132 = {
++	.adopt_live_session = true,
++	.firmware_compat = DCP_FIRMWARE_M4,
++};
++#endif
++
+ static const struct of_device_id of_match[] = {
+ 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
+ 	{ .compatible = "apple,t6020-dcpext", .data = &apple_dcp_hw_t6020_dcpext, },
+@@ -5178,6 +5319,9 @@ static const struct of_device_id of_match[] = {
+ 	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
+ 	{ .compatible = "apple,t8140-dcpext", .data = &apple_dcp_hw_t8140_external, },
+ 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
++#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
++	{ .compatible = "apple,t8132-dcp", .data = &apple_dcp_hw_t8132, },
++#endif
+ 	{ .compatible = "apple,t6030-dcp", .data = &apple_dcp_hw_t6030, },
+ 	{ .compatible = "apple,t6030-dcpext", .data = &apple_dcp_hw_t6030_dcpext, },
+ 	{ .compatible = "apple,t8122-dcp", .data = &apple_dcp_hw_t8122, },
+diff --git a/drivers/gpu/drm/apple/dcp.h b/drivers/gpu/drm/apple/dcp.h
+index baff04ee20..33f39b7645 100644
+--- a/drivers/gpu/drm/apple/dcp.h
++++ b/drivers/gpu/drm/apple/dcp.h
+@@ -66,6 +66,7 @@ bool dcp_fw_compat_is_14_7(struct platform_device *pdev);
+ bool dcp_ext_unusable(struct platform_device *pdev);
+ unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev);
+ int dcp_start(struct platform_device *pdev);
++int dcp_activate(struct platform_device *pdev);
+ int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
+ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
+ void dcp_retain_framebuffer(struct platform_device *pdev,
+@@ -77,6 +78,8 @@ void dcp_release_all_retained_framebuffers(struct apple_dcp *dcp);
+ bool dcp_is_initialized(struct platform_device *pdev);
+ void apple_crtc_vblank(struct apple_crtc *apple);
+ void dcp_drm_crtc_vblank(struct apple_crtc *crtc);
++void dcp_drm_crtc_error(struct apple_crtc *crtc,
++			struct drm_crtc_state *state, int error);
+ int dcp_get_modes(struct drm_connector *connector);
+ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
+ 				    const struct drm_display_mode *mode);
+diff --git a/drivers/gpu/drm/apple/dcp_backlight.c b/drivers/gpu/drm/apple/dcp_backlight.c
+index 5d979aa108..e90dc90757 100644
+--- a/drivers/gpu/drm/apple/dcp_backlight.c
++++ b/drivers/gpu/drm/apple/dcp_backlight.c
+@@ -103,7 +103,7 @@ static bool dcp_backlight_presents_nits(struct apple_dcp *dcp)
+ 
+ bool dcp_backlight_active(struct apple_dcp *dcp)
+ {
+-	return dcp_backlight_presents_nits(dcp) &&
++	return (dcp_backlight_presents_nits(dcp) || iomfb_is_m4(dcp)) &&
+ 		READ_ONCE(dcp->backlight.state.ready);
+ }
+ 
+@@ -177,9 +177,9 @@ int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
+ 	unsigned long flags;
+ 	int ret;
+ 
+-	if ((dcp->fw_compat != DCP_FIRMWARE_H17P && !iomfb_v14_7_panel_nits(dcp)) ||
+-	    !dcp_has_panel(dcp) ||
+-	    !dcp->crtc || !kick)
++	if ((dcp->fw_compat != DCP_FIRMWARE_H17P &&
++	     !iomfb_is_m4(dcp) && !iomfb_v14_7_panel_nits(dcp)) ||
++	    !dcp_has_panel(dcp) || !dcp->crtc || !kick)
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&dcp->bl_register_mutex);
+@@ -190,7 +190,14 @@ int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
+ 		ret = dcp_bl_init(&dcp->backlight.state, maximum,
+ 				  inherited_valid, inherited,
+ 				  default_valid, default_nits);
+-		if (!ret) {
++		if (!ret && iomfb_is_m4(dcp)) {
++			/*
++			 * The J713 panel jumps to new levels, and its first
++			 * present carries the requested level.
++			 */
++			dcp_bl_jump(&dcp->backlight.state);
++			dcp->backlight.kick = kick;
++		} else if (!ret) {
+ 			dcp->backlight.state.fade = !iomfb_v14_7_panel_nits(dcp);
+ 			dcp->backlight.kick = kick;
+ 		}
+@@ -586,7 +593,8 @@ int dcp_backlight_register(struct apple_dcp *dcp)
+ 		.scale = BACKLIGHT_SCALE_LINEAR,
+ 	};
+ 	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
+-	if (dcp_backlight_presents_nits(dcp) && !dcp_backlight_active(dcp))
++	if ((dcp_backlight_presents_nits(dcp) || iomfb_is_m4(dcp)) &&
++	    !dcp_backlight_active(dcp))
+ 		return -ENODATA;
+ 	if (dcp_backlight_active(dcp)) {
+ 		spin_lock_irqsave(&dcp->backlight.lock, flags);
+diff --git a/drivers/gpu/drm/apple/iomfb.c b/drivers/gpu/drm/apple/iomfb.c
+index 6e80eca48a..3f018a2b0b 100644
+--- a/drivers/gpu/drm/apple/iomfb.c
++++ b/drivers/gpu/drm/apple/iomfb.c
+@@ -36,6 +36,7 @@
+ #include "dcp-internal.h"
+ #include "iomfb.h"
+ #include "iomfb_internal.h"
++#include "iomfb_m4.h"
+ #include "parser.h"
+ #include "trace.h"
+ 
+@@ -642,7 +643,7 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
+ 		return;
+ 	}
+ 
+-	if (dcp->fw_compat == DCP_FIRMWARE_H17P && READ_ONCE(dcp->crashed))
++	if (dcp_fail_stop(dcp) && READ_ONCE(dcp->crashed))
+ 		return;
+ 
+ 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
+@@ -1797,6 +1798,21 @@ int dcp_get_modes(struct drm_connector *connector)
+ 		return 0;
+ 	}
+ 	dcp = platform_get_drvdata(pdev);
++	if (iomfb_is_m4(dcp)) {
++		struct drm_display_mode fixed;
++
++		if (iomfb_m4_get_mode(dcp, &fixed))
++			return 0;
++		mode = drm_mode_duplicate(dev, &fixed);
++		if (!mode)
++			return 0;
++		drm_mode_probed_add(connector, mode);
++		of_property_read_u32(dcp->dev->of_node, "apple,panel-width-mm",
++				     &connector->display_info.width_mm);
++		of_property_read_u32(dcp->dev->of_node, "apple,panel-height-mm",
++				     &connector->display_info.height_mm);
++		return 1;
++	}
+ 	modes = dcp_modes_snapshot(dcp, apple_connector, &nr_modes);
+ 
+ 	physical_edid = dcp->hw.iomfb_method_profile ==
+@@ -2046,6 +2062,12 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
+ 	if (!pdev)
+ 		return MODE_ERROR;
+ 	dcp = platform_get_drvdata(pdev);
++	if (iomfb_is_m4(dcp)) {
++		struct drm_display_mode fixed;
++
++		return !iomfb_m4_get_mode(dcp, &fixed) && drm_mode_equal(mode, &fixed) ?
++			MODE_OK : MODE_BAD;
++	}
+ 
+ 	scoped_guard(mutex, &dcp->modes_lock)
+ 		if (!dcp_modes_for_connector(dcp, apple_connector))
+@@ -2063,6 +2085,16 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
+ 	int ret = -EIO;
+ 	bool modeset;
+ 
++	if (iomfb_is_m4(dcp)) {
++		struct drm_display_mode fixed;
++
++		crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
++		if (!crtc_state || !crtc_state->active)
++			return 0;
++		ret = iomfb_m4_get_mode(dcp, &fixed);
++		return ret ? ret : drm_mode_equal(&crtc_state->mode, &fixed) ? 0 : -EINVAL;
++	}
++
+ 	/* Disconnect cannot pass the admission check before these RPCs finish. */
+ 	guard(mutex)(&dcp->external_lock);
+ 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+@@ -2211,6 +2243,12 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
+ 	struct platform_device *pdev = apple_crtc->dcp;
+ 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+ 
++	if (iomfb_is_m4(dcp)) {
++		struct drm_display_mode fixed;
++
++		return !iomfb_m4_get_mode(dcp, &fixed) && drm_mode_equal(mode, &fixed);
++	}
++
+ 	/*
+ 	 * TODO: support synthesized modes through scaling
+ 	 *
+@@ -2582,6 +2620,29 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
+ 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
+ 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+ 
++	if (iomfb_is_m4(dcp)) {
++		struct drm_plane_state *plane = drm_atomic_get_new_plane_state(commit,
++									     crtc->primary);
++		struct drm_crtc_state *new = drm_atomic_get_new_crtc_state(commit, crtc);
++		struct drm_gem_dma_object *obj;
++		int ret;
++
++		if (!new || !new->active)
++			return;
++		ret = iomfb_m4_error(dcp);
++		/* A CRTC-only commit publishes no new framebuffer. */
++		if (!ret && plane) {
++			obj = plane->fb ? drm_fb_dma_get_gem_obj(plane->fb, 0) : NULL;
++			ret = obj ? iomfb_m4_present(dcp, plane->fb, obj->dma_addr,
++						       obj->base.size) : -EINVAL;
++		}
++		if (ret)
++			dcp_drm_crtc_error(to_apple_crtc(crtc), new, -EIO);
++		else
++			dcp_drm_crtc_vblank(to_apple_crtc(crtc));
++		return;
++	}
++
+ 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6) {
+ 		iomfb_v26_6_flush(dcp, crtc, commit);
+ 		return;
+@@ -2678,7 +2739,7 @@ static void iomfb_recv_message(struct apple_dcp *dcp, u64 message)
+ {
+ 	enum dcpep_type type = FIELD_GET(IOMFB_MESSAGE_TYPE, message);
+ 
+-	if (dcp->fw_compat == DCP_FIRMWARE_H17P && READ_ONCE(dcp->crashed))
++	if (dcp_fail_stop(dcp) && READ_ONCE(dcp->crashed))
+ 		return;
+ 
+ 	if (type == IOMFB_MESSAGE_TYPE_INITIALIZED) {
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+new file mode 100644
+index 0000000000..ac68f00162
+--- /dev/null
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -0,0 +1,1422 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/*
++ * Apple DCP firmware 26.6.2 (T8132/J713).
++ *
++ * The appledrm component and KMS paths own this controller.  This backend owns
++ * only its generation-specific EP37 RPC ABI and retained firmware session.
++ * Firmware can keep every published DMA address until an exact successor
++ * completion; an uncertain transaction stays pinned until reboot.
++ */
++#include <linux/completion.h>
++#include <linux/dma-mapping.h>
++#include <linux/iommu.h>
++#include <linux/io.h>
++#include <linux/mutex.h>
++#include <linux/of_address.h>
++#include <linux/of_device.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/of_platform.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++#include <linux/crc32.h>
++#include <linux/jiffies.h>
++#include <linux/workqueue.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_fourcc.h>
++
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/soc/apple/dart.h>
++#include <linux/soc/apple/rtkit.h>
++#include <linux/soc/apple/pmp-display.h>
++
++#include "dcp.h"
++#include "iomfb_m4.h"
++
++#include "dcp-m4-profile.h"
++#include "dcp-m4-protocol.h"
++#include "dcp-m4-transaction.h"
++#include "dcp-m4-timing.h"
++#include "dcp-m4-memory.h"
++#include "dcp-m4-callback.h"
++#include "dcp-m4-property.h"
++#include "dcp-m4-frame.h"
++
++struct iomfb_m4 {
++	struct apple_dcp *owner;
++	struct device *dev;
++	struct device *scanout;
++	struct iommu_group *scanout_group;
++	resource_size_t coproc_phys;
++	size_t coproc_size;
++	struct work_struct backlight_work;
++	void __iomem *coproc;
++	struct apple_rtkit *rtkit;
++	struct mutex lock;
++	spinlock_t state_lock;
++	struct completion reply;
++	struct dcp_m4_transaction transaction;
++	struct platform_device *piodma;
++	struct dcp_m4_memory *memory;
++	struct dcp_m4_runtime *runtime;
++	void *rpc;
++	dma_addr_t rpc_dva;
++	u64 ready_word;
++	size_t allocated;
++	int error;
++	bool started, init_sent, ready, startup_started;
++	/* Exact completed successor or blank is the only framebuffer retirement. */
++	struct drm_framebuffer *active_fb;
++	struct drm_framebuffer *uncertain_fb;
++	struct dcp_m4_frame active_frame;
++	u64 flips, blanks, brightness_swaps;
++};
++
++static void dcp_m4_runtime_wake(struct iomfb_m4 *dcp);
++static void dcp_m4_runtime_receive(struct iomfb_m4 *dcp, u64 word);
++
++static int dcp_m4_dart_check(struct device *dev)
++{
++	return apple_dart_dcp_check(dev);
++}
++
++static int dcp_m4_dart_check_buffer(struct device *dev, dma_addr_t iova, size_t size)
++{
++	return apple_dart_dcp_check_buffer(dev, iova, size);
++}
++
++static void *dcp_m4_dma_alloc(struct device *dev, size_t size, dma_addr_t *dva)
++{
++	return apple_dart_dcp_alloc(dev, size, dva);
++}
++
++static int dcp_m4_pmp_get(struct device *dev)
++{
++	return apple_pmp_j713_display_get(dev);
++}
++
++static int dcp_m4_pmp_check(struct device *dev)
++{
++	return apple_pmp_j713_display_check(dev);
++}
++
++static bool dcp_m4_range(u64 base, u64 length, u64 addr, u64 size)
++{
++	return length && size && addr >= base && addr - base < length &&
++		size <= length - (addr - base);
++}
++
++/* Only the consumer's own no-map ASC reservations may back firmware buffers. */
++static bool dcp_m4_reserved(struct iomfb_m4 *dcp, u64 pa, size_t size, bool oslog)
++{
++	struct device_node *node;
++	struct resource res;
++	bool found = false;
++
++	for (int i = 0; (node = of_parse_phandle(dcp->dev->of_node, "memory-region", i)); i++) {
++		struct reserved_mem *rmem = of_reserved_mem_lookup(node);
++
++		if (of_device_is_compatible(node, "apple,asc-mem") &&
++		    of_property_read_bool(node, "no-map") &&
++		    oslog == of_property_read_bool(node, "apple,dcp-os-log") &&
++		    !of_address_to_resource(node, 0, &res) &&
++		    rmem && rmem->base == res.start && rmem->size == resource_size(&res) &&
++		    dcp_m4_range(res.start, resource_size(&res), pa, size))
++			found = true;
++		of_node_put(node);
++		if (found)
++			break;
++	}
++	return found;
++}
++
++static void dcp_m4_failed(struct iomfb_m4 *dcp, int error)
++{
++	unsigned long flags;
++	bool first;
++
++	spin_lock_irqsave(&dcp->state_lock, flags);
++	first = !dcp->error;
++	if (first)
++		dcp->error = error;
++	dcp->ready = false;
++	WRITE_ONCE(dcp->owner->crashed, true);
++	spin_unlock_irqrestore(&dcp->state_lock, flags);
++	if (first)
++		dev_err(dcp->dev, "Retained DCP session quarantined: %d\n", error);
++	complete_all(&dcp->reply);
++	dcp_m4_runtime_wake(dcp);
++}
++
++static int dcp_m4_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
++{
++	struct iomfb_m4 *dcp = cookie;
++	struct iommu_domain *domain = iommu_get_domain_for_dev(dcp->dev);
++	phys_addr_t pa;
++	int ret = -EINVAL;
++
++	if (!bfr->size || bfr->size > SZ_16M || dcp->allocated > SZ_64M - bfr->size ||
++	    dcp_m4_dart_check(dcp->dev))
++		goto fail;
++	if (!bfr->iova) {
++		bfr->buffer = dcp_m4_dma_alloc(dcp->dev, bfr->size, &bfr->iova);
++		if (IS_ERR(bfr->buffer)) {
++			ret = PTR_ERR(bfr->buffer);
++			bfr->buffer = NULL;
++			goto fail;
++		}
++		/* Allocation stays pinned even if subsequent transport validation fails. */
++		dcp->allocated += bfr->size;
++		if (!dcp_m4_range(1ULL << 40, 1ULL << 36, bfr->iova, bfr->size) ||
++		    dcp_m4_dart_check(dcp->dev))
++			goto fail;
++		bfr->is_mapped = false;
++		dev_info(dcp->dev, "RTKit allocated %zu bytes at %pad\n", bfr->size, &bfr->iova);
++		return 0;
++	}
++	/* OSLOG is explicitly marked physical; other requests are SID23 DVAs. */
++	if (dcp_m4_reserved(dcp, bfr->iova, bfr->size, true)) {
++		/* A physical address can also fall in the DVA aperture; refuse ambiguity. */
++		for (size_t off = 0; off < bfr->size;) {
++			if (iommu_iova_to_phys(domain, bfr->iova + off))
++				goto fail;
++			off += SZ_16K - ((bfr->iova + off) & (SZ_16K - 1));
++		}
++		if (dcp_m4_dart_check(dcp->dev))
++			goto fail;
++		pa = bfr->iova;
++	} else {
++		if (!dcp_m4_range(1ULL << 40, 1ULL << 36, bfr->iova, bfr->size))
++			goto fail;
++		ret = dcp_m4_dart_check_buffer(dcp->dev, bfr->iova, bfr->size);
++		if (ret)
++			goto fail;
++		ret = -EINVAL;
++		pa = iommu_iova_to_phys(domain, bfr->iova);
++		if (!pa || !dcp_m4_reserved(dcp, pa, bfr->size, false))
++			goto fail;
++		/* Include the initial unaligned span and every crossed 16-KiB page. */
++		for (size_t off = SZ_16K - (bfr->iova & (SZ_16K - 1)); off < bfr->size;
++		     off += SZ_16K)
++			if (iommu_iova_to_phys(domain, bfr->iova + off) != pa + off)
++				goto fail;
++	}
++	/* Firmware payload is Normal-NC, independent of coherent WB table walks. */
++	bfr->iomem = ioremap_wc(pa, bfr->size);
++	if (!bfr->iomem) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++	bfr->is_mapped = true;
++	dcp->allocated += bfr->size;
++	dev_info(dcp->dev, "RTKit borrowed %zu bytes at %pad -> %pa\n",
++		 bfr->size, &bfr->iova, &pa);
++	return 0;
++fail:
++	dcp_m4_failed(dcp, ret);
++	return ret;
++}
++
++static void dcp_m4_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
++{
++	/* No qualified ownership-return boundary yet. Never recycle firmware DMA. */
++}
++
++static void dcp_m4_crashed(void *cookie, const void *log, size_t size)
++{
++	struct iomfb_m4 *dcp = cookie;
++
++	dev_err(dcp->dev, "RTKit crashed; retaining session and DMA until reboot\n");
++	dcp_m4_failed(dcp, -EIO);
++}
++
++static void dcp_m4_receive(void *cookie, u8 endpoint, u64 message)
++{
++	struct iomfb_m4 *dcp = cookie;
++	unsigned long flags;
++	int ret;
++
++	dev_dbg(dcp->dev, "RTKit EP%02x word %016llx\n", endpoint, message);
++	if (endpoint != DCP_M4_ENDPOINT) {
++		dcp_m4_failed(dcp, -EPROTO);
++		return;
++	}
++	if (READ_ONCE(dcp->runtime)) {
++		dcp_m4_runtime_receive(dcp, message);
++		return;
++	}
++	spin_lock_irqsave(&dcp->state_lock, flags);
++	ret = dcp_m4_ready_notification(message, dcp->init_sent, dcp->ready_word);
++	if (ret == 1)
++		dcp->ready_word = message;
++	spin_unlock_irqrestore(&dcp->state_lock, flags);
++	if (ret < 0)
++		dcp_m4_failed(dcp, ret);
++	else if (ret == 1)
++		complete_all(&dcp->reply);
++}
++
++static const struct apple_rtkit_ops dcp_m4_rtkit_ops = {
++	.recv_message = dcp_m4_receive,
++	.crashed = dcp_m4_crashed,
++	.shmem_setup = dcp_m4_shmem_setup,
++	.shmem_destroy = dcp_m4_shmem_destroy,
++};
++
++static int dcp_m4_adopt(struct iomfb_m4 *dcp)
++{
++	struct device *dev = dcp->dev;
++	unsigned long flags;
++	u64 init_word;
++	int ret;
++
++	if (dcp->started) {
++		ret = -EBUSY;
++		goto out;
++	}
++	ret = dcp_m4_dart_check(dev);
++	if (ret)
++		goto out;
++	if (!(readl(dcp->coproc + 0x44) & BIT(4))) {
++		ret = -ENODEV;
++		goto out;
++	}
++	/* From the first message onward, neither failure nor unbind may tear down. */
++	dcp->started = true;
++	dev_info(dev, "Starting warm RTKit adoption; retaining firmware ownership\n");
++	ret = apple_rtkit_wake(dcp->rtkit);
++	if (ret)
++		goto fail;
++	if (READ_ONCE(dcp->error)) {
++		ret = READ_ONCE(dcp->error);
++		goto fail;
++	}
++	if (!apple_rtkit_has_endpoint(dcp->rtkit, DCP_M4_ENDPOINT)) {
++		ret = -ENODEV;
++		goto fail;
++	}
++	dev_info(dev, "RTKit awake; endpoint 0x37 advertised\n");
++	dcp->rpc = dcp_m4_dma_alloc(dev, DCP_M4_RPC_SIZE, &dcp->rpc_dva);
++	if (IS_ERR(dcp->rpc)) {
++		ret = PTR_ERR(dcp->rpc);
++		dcp->rpc = NULL;
++		goto fail;
++	}
++	ret = dcp_m4_dart_check(dev);
++	if (ret)
++		goto fail;
++	ret = dcp_m4_init_word(dcp->rpc_dva, &init_word);
++	if (ret)
++		goto fail;
++	if (!dcp_m4_range(1ULL << 40, 1ULL << 36, dcp->rpc_dva, DCP_M4_RPC_SIZE)) {
++		ret = -ERANGE;
++		goto fail;
++	}
++	memset(dcp->rpc, 0, DCP_M4_RPC_SIZE);
++	put_unaligned_le32(DCP_M4_ALIGNMENT, dcp->rpc + 12);
++	dma_wmb();
++	ret = apple_rtkit_start_ep(dcp->rtkit, DCP_M4_ENDPOINT);
++	if (ret)
++		goto fail;
++	dev_info(dev, "Sending INIT %016llx RPC=%pad size=%x alignment=%u\n",
++		 init_word, &dcp->rpc_dva, DCP_M4_RPC_SIZE, DCP_M4_ALIGNMENT);
++	spin_lock_irqsave(&dcp->state_lock, flags);
++	dcp->init_sent = true;
++	spin_unlock_irqrestore(&dcp->state_lock, flags);
++	ret = apple_rtkit_send_message(dcp->rtkit, DCP_M4_ENDPOINT, init_word, NULL, false);
++	if (ret)
++		goto fail;
++	if (!wait_for_completion_timeout(&dcp->reply, msecs_to_jiffies(3000))) {
++		ret = -ETIMEDOUT;
++		goto fail;
++	}
++	ret = READ_ONCE(dcp->error);
++	if (ret)
++		goto fail;
++	if (!dcp_m4_ready(dcp->ready_word) || !(readl(dcp->coproc + 0x44) & BIT(4))) {
++		ret = -EPROTO;
++		goto fail;
++	}
++	spin_lock_irqsave(&dcp->state_lock, flags);
++	ret = dcp->error;
++	if (!ret)
++		dcp->ready = true;
++	spin_unlock_irqrestore(&dcp->state_lock, flags);
++	if (ret)
++		goto fail;
++	dev_info(dev, "DCPLink READY %016llx\n",
++		 dcp->ready_word);
++	ret = 0;
++	goto out;
++fail:
++	dcp_m4_failed(dcp, ret);
++	dev_err(dev, "READY failed: %d; session pinned until guarded reboot\n", ret);
++out:
++	return ret;
++}
++static int dcp_m4_shared_alloc(void *cookie, u32 size, u64 *phys, u64 *dva)
++{
++	struct iomfb_m4 *dcp = cookie;
++
++	return apple_dart_dcp_shared_alloc(dcp->dev, &dcp->piodma->dev, size, phys, dva);
++}
++
++static int dcp_m4_shared_map(void *cookie, u64 phys, u64 dva, u32 size)
++{
++	struct iomfb_m4 *dcp = cookie;
++
++	return apple_dart_dcp_shared_map(dcp->dev, &dcp->piodma->dev, phys, dva, size);
++}
++
++static const struct dcp_m4_memory_ops dcp_m4_memory_ops = {
++	.alloc = dcp_m4_shared_alloc,
++	.map = dcp_m4_shared_map,
++};
++
++static int dcp_m4_create_piodma(struct iomfb_m4 *dcp)
++{
++	struct device_node *node, *alias;
++	struct platform_device *existing;
++	int ret = -ENODEV;
++
++	node = of_get_child_by_name(dcp->dev->of_node, "piodma");
++	alias = of_find_node_by_path("disp0_piodma");
++	if (!node || node != alias || !of_device_is_available(node) ||
++	    !of_property_read_bool(node, "apple,j713-inherited-mappings"))
++		goto out;
++	existing = of_find_device_by_node(node);
++	if (existing) {
++		put_device(&existing->dev);
++		ret = -EBUSY;
++		goto out;
++	}
++	dcp->piodma = of_platform_device_create(node, NULL, dcp->dev);
++	if (!dcp->piodma)
++		goto out;
++	/* Keep the child even on failure: retained-domain attachment can have begun. */
++	ret = dma_set_mask_and_coherent(&dcp->piodma->dev, DMA_BIT_MASK(42));
++	if (!ret)
++		ret = of_dma_configure(&dcp->piodma->dev, node, true);
++	if (!ret)
++		ret = dcp_m4_dart_check(&dcp->piodma->dev);
++out:
++	of_node_put(alias);
++	of_node_put(node);
++	return ret;
++}
++
++struct dcp_m4_runtime {
++	struct iomfb_m4 *dcp;
++	struct dcp_m4_properties *properties;
++	struct dcp_m4_timing timing;
++	struct dcp_m4_swap_state swap;
++	struct completion received;
++	struct workqueue_struct *wq;
++	struct work_struct idle;
++	u64 queue[32];
++	u32 head, count, callbacks;
++	unsigned long deadline;
++	bool done;
++	bool background_started, background_done;
++	u32 background_id;
++	bool power_started, power_done;
++	bool scanout_started, scanout_done;
++	bool qualified; /* KMS startup qualification passed; see dcp_m4_runtime_live() */
++	void *scanout_cpu;
++	struct dcp_m4_frame scanout_frame;
++};
++
++static void dcp_m4_runtime_wake(struct iomfb_m4 *dcp)
++{
++	struct dcp_m4_runtime *r = smp_load_acquire(&dcp->runtime);
++
++	if (r)
++		complete_all(&r->received);
++}
++
++static void dcp_m4_runtime_receive(struct iomfb_m4 *dcp, u64 word)
++{
++	struct dcp_m4_runtime *r = smp_load_acquire(&dcp->runtime);
++	unsigned long flags;
++	int ret = 0;
++
++	spin_lock_irqsave(&dcp->state_lock, flags);
++	if (dcp->error)
++		ret = dcp->error;
++	else if (r->count == ARRAY_SIZE(r->queue)) {
++		/* Publish failure before another owner can consume a queued reply. */
++		dcp->error = ret = -ENOSPC;
++		dcp->ready = false;
++	} else {
++		r->queue[(r->head + r->count++) % ARRAY_SIZE(r->queue)] = word;
++		complete(&r->received);
++	}
++	spin_unlock_irqrestore(&dcp->state_lock, flags);
++	if (ret)
++		dcp_m4_failed(dcp, ret);
++	else
++		queue_work(r->wq, &r->idle);
++}
++
++/* Called only while holding dcp->lock, by the synchronous RPC owner or idle worker. */
++static int dcp_m4_runtime_next(struct dcp_m4_runtime *r, u64 *word, bool wait)
++{
++	struct iomfb_m4 *dcp = r->dcp;
++	unsigned long flags, now;
++	int ret;
++
++	if (READ_ONCE(dcp->error))
++		return READ_ONCE(dcp->error);
++	if (wait) {
++		now = jiffies;
++		if (time_after_eq(now, r->deadline) ||
++		    !wait_for_completion_timeout(&r->received, r->deadline - now))
++			return -ETIMEDOUT;
++	} else if (!try_wait_for_completion(&r->received)) {
++		return -EAGAIN;
++	}
++	spin_lock_irqsave(&dcp->state_lock, flags);
++	ret = dcp->error ? dcp->error : !r->count ? -EPROTO : 0;
++	if (!ret) {
++		*word = r->queue[r->head++ % ARRAY_SIZE(r->queue)];
++		r->count--;
++	}
++	spin_unlock_irqrestore(&dcp->state_lock, flags);
++	return ret;
++}
++
++static int dcp_m4_runtime_health(struct dcp_m4_runtime *r)
++{
++	struct iomfb_m4 *dcp = r->dcp;
++	int ret = READ_ONCE(dcp->error);
++
++	if (!ret && (!(readl(dcp->coproc + 0x44) & BIT(4)) ||
++	    dcp_m4_dart_check(dcp->dev) || dcp_m4_dart_check(&dcp->piodma->dev)))
++		ret = -EIO;
++	if (!ret && r->power_done)
++		ret = dcp_m4_pmp_check(dcp->dev);
++	if (!ret && dcp->scanout)
++		ret = dcp_m4_dart_check(dcp->scanout);
++	return ret;
++}
++
++/*
++ * Full DART/PMP/CPU qualification runs through startup and KMS creation. After
++ * that, per-message, per-swap and per-frame checks are only the failure latch;
++ * RTKit crashes and protocol errors still latch it asynchronously. The full
++ * checks remain available on demand through scanout_probe/pmp_vote reads.
++ */
++static int dcp_m4_runtime_live(struct dcp_m4_runtime *r)
++{
++	if (READ_ONCE(r->qualified))
++		return READ_ONCE(r->dcp->error);
++	return dcp_m4_runtime_health(r);
++}
++
++static int dcp_m4_runtime_send(struct dcp_m4_runtime *r, u64 word)
++{
++	struct iomfb_m4 *dcp = r->dcp;
++	int ret = dcp_m4_runtime_live(r);
++
++	if (ret)
++		return ret;
++	dma_wmb();
++	return apple_rtkit_send_message(dcp->rtkit, DCP_M4_ENDPOINT, word, NULL, false);
++}
++
++static int dcp_m4_runtime_call(void *cookie, unsigned int method, bool remote,
++				const void *input, u32 input_size, void *output, u32 output_size);
++
++static int dcp_m4_runtime_property(void *cookie, unsigned int method,
++				    const void *input, void *output)
++{
++	struct dcp_m4_runtime *r = cookie;
++
++	return dcp_m4_property_callback(r->properties, method, input, output);
++}
++
++static int dcp_m4_runtime_memory(void *cookie, unsigned int method,
++				  const void *input, void *output)
++{
++	struct dcp_m4_runtime *r = cookie;
++	struct iomfb_m4 *dcp = r->dcp;
++
++	return dcp_m4_memory_callback(dcp->memory, &dcp_m4_memory_ops, dcp, method, input, output);
++}
++
++static int dcp_m4_runtime_event(void *cookie, const char *name, const void *dict, size_t size)
++{
++	struct dcp_m4_runtime *r = cookie;
++
++	dev_info(r->dcp->dev, "DCP event %.*s: %zu bytes CRC32=%08x\n", 64, name, size,
++		 dict ? crc32_le(0, dict, size) : 0);
++	return 0;
++}
++
++static int dcp_m4_runtime_swap_done(void *cookie, u32 id)
++{
++	struct dcp_m4_runtime *r = cookie;
++
++	return dcp_m4_swap_record_done(&r->swap, id);
++}
++
++static const struct dcp_m4_callback_ops dcp_m4_runtime_ops = {
++	.call = dcp_m4_runtime_call,
++	.property = dcp_m4_runtime_property,
++	.memory = dcp_m4_runtime_memory,
++	.event = dcp_m4_runtime_event,
++	.swap_done = dcp_m4_runtime_swap_done,
++};
++
++static void dcp_m4_runtime_bad_word(struct dcp_m4_runtime *r, u64 word, int error)
++{
++	u32 offset = (word >> 16) & 0xffff;
++
++	dev_err(r->dcp->dev, "Rejected RPC notification %016llx: %d\n", word, error);
++	/* Diagnostic bytes only: unknown control bits never grant packet ownership. */
++	if ((word & 3) == 2 && !(word & 0x40) && !(offset % DCP_M4_ALIGNMENT) &&
++	    offset <= DCP_M4_STREAM_SIZE - DCP_M4_PACKET_HEADER) {
++		dma_rmb();
++		dev_err(r->dcp->dev, "Candidate callback headers remote0=%12ph remote1=%12ph\n",
++			(u8 *)r->dcp->rpc + 0x60000 + offset,
++			(u8 *)r->dcp->rpc + 0x40000 + offset);
++	}
++}
++
++static int dcp_m4_runtime_callback(struct dcp_m4_runtime *r, u64 word)
++{
++	struct iomfb_m4 *dcp = r->dcp;
++	struct dcp_m4_packet packet;
++	u8 *input, *snapshot;
++	u64 ack;
++	const char *stage = "offset";
++	int ret, offset;
++
++	dma_rmb();
++	ret = dcp_m4_callback_begin(&dcp->transaction, dcp->rpc, DCP_M4_RPC_SIZE, word, &packet);
++	if (ret) {
++		dcp_m4_runtime_bad_word(r, word, ret);
++		return ret;
++	}
++	offset = dcp_m4_packet_offset(&packet, true);
++	if (offset < 0) {
++		ret = offset;
++		goto failed;
++	}
++	input = (u8 *)dcp->rpc + offset + DCP_M4_PACKET_HEADER;
++	ret = dcp_m4_callback_shape(packet.tag, packet.input_size, packet.output_size);
++	if (ret < 0)
++		goto failed;
++	/* Each nested callback owns its snapshot; validation and property/string
++	 * consumers must not fetch shared firmware bytes a second time. Exact
++	 * callback shapes bound this allocation to 4168 bytes.
++	 */
++	snapshot = kmemdup(input, packet.input_size, GFP_KERNEL);
++	if (!snapshot && packet.input_size) {
++		ret = -ENOMEM;
++		goto failed;
++	}
++	r->callbacks++;
++	dev_dbg(dcp->dev, "DCP callback D%03d %u/%u remote=%u flag9=%u\n",
++		 dcp_m4_callback_method(packet.tag), packet.input_size, packet.output_size,
++		 packet.remote, packet.callback_flag);
++	if (packet.callback_flag && packet.input_size > 80 &&
++	    packet.tag == get_unaligned_le32("D006"))
++		dev_dbg(dcp->dev, "Flagged D006 header=%12ph null-byte=%02x; ACK route=342\n",
++			 (u8 *)dcp->rpc + offset, input[80]);
++	stage = "dispatch";
++	ret = dcp_m4_callback_dispatch(&dcp_m4_runtime_ops, r, packet.tag, packet.remote,
++		snapshot, packet.input_size, input + packet.input_size, packet.output_size);
++	kfree(snapshot);
++	if (ret)
++		goto failed;
++	stage = "finish";
++	ret = dcp_m4_callback_end(&dcp->transaction, dcp->rpc, DCP_M4_RPC_SIZE, &ack);
++	if (ret)
++		goto failed;
++	stage = "ack";
++	ret = dcp_m4_runtime_send(r, ack);
++	if (!ret)
++		return 0;
++failed:
++	dev_err(dcp->dev,
++		"DCP callback D%03d tag=%08x %u/%u remote=%u flag9=%u %s failed: %d\n",
++		dcp_m4_callback_method(packet.tag), packet.tag, packet.input_size,
++		packet.output_size, packet.remote, packet.callback_flag, stage, ret);
++	return ret;
++}
++
++static int dcp_m4_runtime_call(void *cookie, unsigned int method, bool remote,
++				const void *input, u32 input_size, void *output, u32 output_size)
++{
++	struct dcp_m4_runtime *r = cookie;
++	struct iomfb_m4 *dcp = r->dcp;
++	unsigned long previous = r->deadline;
++	struct dcp_m4_packet message;
++	u64 word;
++	u32 tag;
++	int ret;
++
++	if (method > 999)
++		return -EINVAL;
++	if (!r->deadline)
++		r->deadline = jiffies + msecs_to_jiffies(5000);
++	if (time_after_eq(jiffies, r->deadline)) {
++		ret = -ETIMEDOUT;
++		goto finished;
++	}
++	tag = 'A' | (('0' + method / 100) << 8) |
++		(('0' + method / 10 % 10) << 16) | (('0' + method % 10) << 24);
++	ret = dcp_m4_call_begin(&dcp->transaction, dcp->rpc, DCP_M4_RPC_SIZE,
++			      tag, remote, input, input_size, output_size, &word);
++	if (!ret)
++		ret = dcp_m4_runtime_send(r, word);
++	while (!ret) {
++		ret = dcp_m4_runtime_next(r, &word, true);
++		if (ret)
++			break;
++		dma_rmb();
++		ret = dcp_m4_decode_word(word, &message);
++		if (ret) {
++			dcp_m4_runtime_bad_word(r, word, ret);
++			break;
++		}
++		if (message.reply) {
++			ret = dcp_m4_call_reply(&dcp->transaction, dcp->rpc, DCP_M4_RPC_SIZE,
++					word, output, output_size);
++			break;
++		}
++		ret = dcp_m4_runtime_callback(r, word);
++	}
++finished:
++	r->deadline = previous;
++	if (ret) {
++		dcp_m4_transaction_fail(&dcp->transaction, ret);
++		dcp_m4_failed(dcp, ret);
++		dev_err(dcp->dev, "DCP A%03u failed: %d; retained session\n", method, ret);
++	}
++	return ret;
++}
++
++/* One bounded drain; a positive return asks the idle worker to reschedule. */
++static int dcp_m4_runtime_drain(struct dcp_m4_runtime *r, unsigned int budget)
++{
++	u64 word;
++	int ret;
++
++	r->deadline = jiffies + msecs_to_jiffies(5000);
++	for (unsigned int handled = 0; handled < budget; handled++) {
++		ret = dcp_m4_runtime_next(r, &word, false);
++		if (ret == -EAGAIN) {
++			ret = 0;
++			goto out;
++		}
++		if (ret)
++			goto out;
++		if (time_after_eq(jiffies, r->deadline)) {
++			ret = -ETIMEDOUT;
++			goto out;
++		}
++		ret = dcp_m4_runtime_callback(r, word);
++		if (ret)
++			goto out;
++	}
++	ret = 1;
++out:
++	r->deadline = 0;
++	return ret;
++}
++
++static void dcp_m4_runtime_idle(struct work_struct *work)
++{
++	struct dcp_m4_runtime *r = container_of(work, struct dcp_m4_runtime, idle);
++	struct iomfb_m4 *dcp = r->dcp;
++	int ret;
++
++	mutex_lock(&dcp->lock);
++	ret = dcp_m4_runtime_drain(r, 32);
++	if (ret < 0) {
++		dcp_m4_transaction_fail(&dcp->transaction, ret);
++		dcp_m4_failed(dcp, ret);
++	}
++	mutex_unlock(&dcp->lock);
++	if (ret > 0)
++		queue_work(r->wq, &r->idle);
++}
++
++/*
++ * Serialized owner only; both the A407 reply and its D590 fence must complete.
++ * primary/frame/upper/keep as dcp_m4_swap_encode_full().
++ */
++static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
++		const struct dcp_m4_frame *frame, const struct dcp_m4_upper *upper, u32 keep,
++		bool brightness_change, u32 nits)
++{
++	struct iomfb_m4 *dcp = r->dcp;
++	u8 start[16] = {0}, started[8], submitted[12];
++	u8 *input;
++	u32 id;
++	u64 word;
++	int ret;
++
++	if (((primary && frame) || (upper && upper->frame)) &&
++	    (!r->power_done || !r->background_done || !dcp->scanout))
++		return -EINVAL;
++	if ((primary && frame && dcp_m4_frame_check(frame)) || (upper && dcp_m4_upper_check(upper)))
++		return -EINVAL;
++	input = kzalloc(DCP_M4_SWAP_SIZE, GFP_KERNEL);
++	if (!input) {
++		dcp_m4_swap_fail(&r->swap, -ENOMEM);
++		dcp_m4_failed(dcp, -ENOMEM);
++		return -ENOMEM;
++	}
++	r->deadline = jiffies + msecs_to_jiffies(5000);
++	ret = dcp_m4_runtime_call(r, 406, false, start, sizeof(start), started, sizeof(started));
++	if (!ret)
++		ret = dcp_m4_swap_start_reply(started, sizeof(started), &id);
++	if (!ret)
++		ret = dcp_m4_swap_begin(&r->swap, id);
++	if (!ret)
++		ret = dcp_m4_swap_encode_full(input, DCP_M4_SWAP_SIZE, id, primary, frame, upper,
++					      keep, brightness_change, nits, dcp_m4_frame_check);
++	if (!ret)
++		ret = dcp_m4_runtime_call(r, 407, false, input, DCP_M4_SWAP_SIZE,
++					 submitted, sizeof(submitted));
++	if (!ret)
++		ret = dcp_m4_swap_record_reply(&r->swap, submitted, sizeof(submitted));
++	while (!ret && !r->swap.completed) {
++		ret = dcp_m4_runtime_next(r, &word, true);
++		if (!ret)
++			ret = dcp_m4_runtime_callback(r, word);
++	}
++	if (!ret)
++		ret = dcp_m4_runtime_live(r);
++	if (!ret && dcp_m4_swap_take_completion(&r->swap) != 1)
++		ret = -EPROTO;
++	r->deadline = 0;
++	/* Only the copied host input is freed; the firmware-visible RPC stays pinned. */
++	kfree(input);
++	if (ret) {
++		dcp_m4_swap_fail(&r->swap, ret);
++		dcp_m4_transaction_fail(&dcp->transaction, ret);
++		dcp_m4_failed(dcp, ret);
++	} else {
++		dev_dbg(dcp->dev, "Display swap %u complete: A407 reply and D590\n", r->swap.id);
++	}
++	return ret;
++}
++
++static int dcp_m4_runtime_swap_brightness(struct dcp_m4_runtime *r,
++		const struct dcp_m4_frame *frame, bool brightness_change, u32 nits)
++{
++	return dcp_m4_runtime_swap_full(r, true, frame, NULL, 0, brightness_change, nits);
++}
++
++static int dcp_m4_runtime_swap(struct dcp_m4_runtime *r, const struct dcp_m4_frame *frame)
++{
++	return dcp_m4_runtime_swap_brightness(r, frame, false, 0);
++}
++
++static int dcp_m4_runtime_background(struct dcp_m4_runtime *r)
++{
++	int ret;
++
++	if (!r->done || r->background_started || READ_ONCE(r->dcp->error))
++		return -EBUSY;
++	r->background_started = true;
++	ret = dcp_m4_runtime_swap(r, NULL);
++	if (!ret) {
++		r->background_id = r->swap.id;
++		smp_store_release(&r->background_done, true);
++	}
++	return ret;
++}
++
++/* D101 must report the inherited framebuffer stride, not an invented one. */
++static int dcp_m4_boot_framebuffer_check(void)
++{
++	struct device_node *np;
++	u32 width, height, stride;
++	int ret = -ENODEV, found = 0;
++
++	for_each_compatible_node(np, NULL, "simple-framebuffer") {
++		if (!of_device_is_available(np))
++			continue;
++		found++;
++		/* The inherited console may exclude the notch (64 lines on J713). */
++		if (of_property_read_u32(np, "width", &width) ||
++		    of_property_read_u32(np, "height", &height) ||
++		    of_property_read_u32(np, "stride", &stride) ||
++		    width != dcp_m4_pf->panel_width || stride != dcp_m4_pf->boot_stride ||
++		    (height != dcp_m4_pf->panel_height &&
++		     height != dcp_m4_pf->panel_height - 64)) {
++			of_node_put(np);
++			return -EINVAL;
++		}
++		/* The inherited console can exclude the 64-line notch region. */
++		ret = 0;
++	}
++	return found > 1 ? -EINVAL : ret;
++}
++
++static int dcp_m4_startup(struct iomfb_m4 *dcp)
++{
++	struct device *dev = dcp->dev;
++	struct dcp_m4_runtime *r;
++	unsigned long flags;
++	u8 output[4];
++	int ret, slot;
++
++	ret = -EBUSY;
++	if (!READ_ONCE(dcp->ready) || READ_ONCE(dcp->error) || dcp->startup_started)
++		goto out;
++	dcp->startup_started = true;
++	ret = dcp_m4_boot_framebuffer_check();
++	if (ret)
++		goto failed;
++	ret = dcp_m4_create_piodma(dcp);
++	if (ret)
++		goto failed;
++	r = kzalloc(sizeof(*r), GFP_KERNEL);
++	dcp->memory = kzalloc(sizeof(*dcp->memory), GFP_KERNEL);
++	if (!r || !dcp->memory) {
++		ret = -ENOMEM;
++		goto failed;
++	}
++	r->properties = kzalloc(sizeof(*r->properties), GFP_KERNEL);
++	if (!r->properties) {
++		ret = -ENOMEM;
++		goto failed;
++	}
++	r->dcp = dcp;
++	init_completion(&r->received);
++	INIT_WORK(&r->idle, dcp_m4_runtime_idle);
++	r->wq = alloc_ordered_workqueue("iomfb-v26-6", WQ_MEM_RECLAIM);
++	if (!r->wq) {
++		ret = -ENOMEM;
++		goto failed;
++	}
++	spin_lock_irqsave(&dcp->state_lock, flags);
++	smp_store_release(&dcp->runtime, r);
++	spin_unlock_irqrestore(&dcp->state_lock, flags);
++	/* Fresh session only: A401, then the first client open A457. */
++	ret = dcp_m4_runtime_call(r, 401, false, NULL, 0, output, sizeof(output));
++	if (!ret && get_unaligned_le32(output) != 1)
++		ret = -EPROTO;
++	if (!ret)
++		ret = dcp_m4_runtime_call(r, dcp_m4_pf->open_method, false, NULL, 0, NULL, 0);
++	/* A reply may be followed by property callbacks queued for this owner. */
++	if (!ret)
++		ret = dcp_m4_runtime_drain(r, 256);
++	if (ret > 0)
++		ret = -E2BIG;
++	if (ret)
++		goto failed;
++	slot = dcp_m4_raw_slot(r->properties, 0, "PreferredTimingElements", false);
++	ret = slot < 0 ? slot : dcp_m4_parse_timing(r->properties->raw[slot].data,
++					       r->properties->raw[slot].size, &r->timing);
++	if (ret)
++		goto failed;
++	ret = dcp_m4_runtime_health(r);
++	if (ret)
++		goto failed;
++	smp_store_release(&r->done, true);
++	dev_info(dev, "IOMFB startup complete: %u callbacks, %ux%u at %u kHz; no modeset\n",
++		 r->callbacks, r->timing.hdisplay, r->timing.vdisplay, r->timing.clock_khz);
++	ret = 0;
++	goto out;
++failed:
++	dcp_m4_failed(dcp, ret);
++	dev_err(dev, "IOMFB startup failed: %d; retained until guarded reboot\n", ret);
++out:
++	return ret;
++}
++static int dcp_m4_prepare_scanout(struct iomfb_m4 *dcp)
++{
++	struct dcp_m4_runtime *r = dcp->runtime;
++	dma_addr_t dva;
++	int ret;
++
++	if (r->timing.hdisplay != DCP_M4_PANEL_WIDTH ||
++	    r->timing.vdisplay != DCP_M4_PANEL_HEIGHT)
++		return -EINVAL;
++	ret = dcp_m4_dart_check(dcp->scanout);
++	if (ret)
++		return ret;
++	r->scanout_started = true;
++	r->scanout_frame = (struct dcp_m4_frame) {
++		.width = DCP_M4_PANEL_WIDTH, .height = DCP_M4_PANEL_HEIGHT,
++		.stride = DCP_M4_PANEL_WIDTH * 4,
++		.backing_size = (u64)DCP_M4_PANEL_WIDTH * 4 * DCP_M4_PANEL_HEIGHT,
++		.format = DCP_M4_XRGB8888,
++	};
++	r->scanout_cpu = apple_dart_dcp_scanout_alloc(dcp->scanout,
++						   r->scanout_frame.backing_size, &dva);
++	if (IS_ERR(r->scanout_cpu))
++		return PTR_ERR(r->scanout_cpu);
++	r->scanout_frame.dva = dva;
++	ret = dcp_m4_frame_check(&r->scanout_frame);
++	if (ret)
++		return ret;
++	/* Prepare backing while simpledrm still owns the inherited surface. */
++	memset(r->scanout_cpu, 0, r->scanout_frame.backing_size);
++	dma_wmb();
++	return dcp_m4_runtime_health(r);
++}
++
++/* Called with all KMS modeset locks after the DRM device is registered. */
++static int dcp_m4_initial_scanout(struct iomfb_m4 *dcp)
++{
++	struct dcp_m4_runtime *r = dcp->runtime;
++	int ret;
++
++	if (!r || !r->scanout_cpu)
++		return -ENODEV;
++	ret = dcp_m4_runtime_health(r);
++	if (!ret)
++		ret = dcp_m4_runtime_swap(r, &r->scanout_frame);
++	if (ret)
++		return ret;
++	dcp->active_frame = r->scanout_frame;
++	smp_store_release(&r->scanout_done, true);
++	return 0;
++}
++
++/*
++ * The common DMA GEM helpers map this object into the pinned SID0 consumer and
++ * require one contiguous DMA extent.  A framebuffer reference keeps that DMA
++ * mapping stable.  Full DART/PMP validation belongs to startup and health
++ * checks, rather than an expensive page-table sweep on every display flip.
++ */
++static int iomfb_m4_check_frame(const struct dcp_m4_frame *frame)
++{
++	int ret;
++
++	ret = dcp_m4_direct_extent(frame->dva, frame->backing_size,
++				   (u64)frame->stride * frame->height);
++	return ret ?: dcp_m4_frame_check(frame);
++}
++
++static void iomfb_m4_backlight_work(struct work_struct *work);
++
++/* Once adopted, even driver unbind must preserve the callback cookie and DMA. */
++static void iomfb_m4_release(void *cookie)
++{
++	struct iomfb_m4 *dcp = cookie;
++
++	if (READ_ONCE(dcp->started) || READ_ONCE(dcp->owner->retain_dma))
++		return;
++	if (dcp->rtkit)
++		apple_rtkit_free(dcp->rtkit);
++	if (dcp->coproc)
++		iounmap(dcp->coproc);
++	if (dcp->coproc_size)
++		release_mem_region(dcp->coproc_phys, dcp->coproc_size);
++	kfree(dcp);
++}
++
++/* A UUID identifies the image; both loader version claims must agree with it. */
++static bool iomfb_m4_firmware_property(struct device_node *np, const char *name)
++{
++	u32 version[3];
++
++	return of_property_count_u32_elems(np, name) == ARRAY_SIZE(version) &&
++	       !of_property_read_u32_array(np, name, version, ARRAY_SIZE(version)) &&
++	       version[0] == 26 && version[1] == 6 && version[2] == 2;
++}
++
++int iomfb_m4_init(struct apple_dcp *owner)
++{
++	struct platform_device *pdev = to_platform_device(owner->dev);
++	struct device *dev = owner->dev;
++	struct iomfb_m4 *dcp;
++	struct resource *res;
++	const char *uuid;
++	int ret;
++
++	if (!of_machine_is_compatible("apple,j713") ||
++	    !of_device_is_compatible(dev->of_node, "apple,t8132-dcp") ||
++	    !iomfb_m4_firmware_property(dev->of_node, "apple,firmware-version") ||
++	    !iomfb_m4_firmware_property(dev->of_node, "apple,firmware-compat") ||
++	    of_property_read_string(dev->of_node, "apple,firmware-uuid", &uuid) ||
++	    strcmp(uuid, "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E"))
++		return dev_err_probe(dev, -ENODEV, "unqualified firmware 26.6.2 handoff\n");
++	ret = dcp_m4_dart_check(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "inherited SID23 domain not qualified\n");
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
++	if (ret)
++		return ret;
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "coproc");
++	if (!res || res->start != 0x30ae00000ULL || resource_size(res) != SZ_16K)
++		return -ENODEV;
++	/* Resolve the fallible supplier before creating a mailbox owner. */
++	ret = apple_pmp_j713_display_prepare(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "PMP supplier not ready\n");
++	dcp = kzalloc(sizeof(*dcp), GFP_KERNEL);
++	if (!dcp)
++		return -ENOMEM;
++	dcp->owner = owner;
++	dcp->dev = dev;
++	mutex_init(&dcp->lock);
++	spin_lock_init(&dcp->state_lock);
++	init_completion(&dcp->reply);
++	INIT_WORK(&dcp->backlight_work, iomfb_m4_backlight_work);
++	if (!request_mem_region(res->start, resource_size(res), dev_name(dev))) {
++		ret = -EBUSY;
++		goto release;
++	}
++	dcp->coproc_phys = res->start;
++	dcp->coproc_size = resource_size(res);
++	dcp->coproc = ioremap(res->start, resource_size(res));
++	if (!dcp->coproc) {
++		ret = -ENOMEM;
++		goto release;
++	}
++	if (!(readl(dcp->coproc + 0x44) & BIT(4))) {
++		ret = -ENODEV;
++		goto release;
++	}
++	dcp->rtkit = apple_rtkit_init(dev, dcp, "mbox", 0, &dcp_m4_rtkit_ops);
++	if (IS_ERR(dcp->rtkit)) {
++		ret = PTR_ERR(dcp->rtkit);
++		dcp->rtkit = NULL;
++		goto release;
++	}
++	/* No messages are sent in probe; a failed local probe has no adopted DMA. */
++	ret = devm_add_action_or_reset(dev, iomfb_m4_release, dcp);
++	if (ret)
++		return ret;
++	owner->v26_6 = dcp;
++	owner->rtk = dcp->rtkit;
++	owner->coproc_reg = dcp->coproc;
++	pm_runtime_get_noresume(dev);
++	dev_info(dev, "firmware 26.6.2 retained DCP backend prepared\n");
++	return 0;
++release:
++	iomfb_m4_release(dcp);
++	return dev_err_probe(dev, ret, "cannot prepare retained firmware 26.6.2 backend\n");
++}
++
++int iomfb_m4_start(struct apple_dcp *owner, struct device *scanout)
++{
++	struct iomfb_m4 *dcp = owner->v26_6;
++	struct dcp_m4_runtime *r;
++	struct iommu_group *group;
++	int ret;
++
++	if (!dcp || !scanout)
++		return -ENODEV;
++	mutex_lock(&dcp->lock);
++	if (READ_ONCE(dcp->error)) {
++		ret = READ_ONCE(dcp->error);
++		goto out;
++	}
++	if (dcp->started) {
++		ret = dcp->error ?: (dcp->runtime && dcp->runtime->scanout_cpu ? 0 : -EBUSY);
++		goto out;
++	}
++	ret = dcp_m4_dart_check(scanout);
++	if (ret)
++		goto out;
++	/* DMA GEM maps in this exact consumer; firmware outlives master unbind. */
++	group = iommu_group_get(scanout);
++	if (!group) {
++		ret = -ENODEV;
++		goto out;
++	}
++	ret = iommu_device_use_default_domain(scanout);
++	if (ret) {
++		iommu_group_put(group);
++		goto out;
++	}
++	get_device(scanout);
++	dcp->scanout = scanout;
++	dcp->scanout_group = group;
++	pm_runtime_get_noresume(scanout);
++	ret = dcp_m4_adopt(dcp);
++	if (ret)
++		goto fail;
++	ret = dcp_m4_startup(dcp);
++	if (ret)
++		goto fail;
++	r = dcp->runtime;
++	ret = dcp_m4_prepare_scanout(dcp);
++	if (ret)
++		goto fail;
++	dev_info(dcp->dev, "firmware 26.6.2 prepared for appledrm: %ux%u; boot scanout preserved\n",
++		 r->timing.hdisplay, r->timing.vdisplay);
++	goto out;
++fail:
++	dcp_m4_failed(dcp, ret);
++	dev_err(dcp->dev, "firmware 26.6.2 startup failed: %d; session retained until reboot\n",
++		ret);
++out:
++	mutex_unlock(&dcp->lock);
++	return ret;
++}
++
++int iomfb_m4_activate(struct apple_dcp *owner)
++{
++	struct iomfb_m4 *dcp = owner->v26_6;
++	struct dcp_m4_runtime *r;
++	int ret;
++
++	if (!dcp || !dcp->runtime)
++		return -ENODEV;
++	mutex_lock(&dcp->lock);
++	ret = READ_ONCE(dcp->error);
++	if (ret || READ_ONCE(dcp->runtime->qualified))
++		goto out;
++	r = dcp->runtime;
++	/* Preserve the firmware-qualified blank -> power vote -> surface
++	 * sequence, entirely after KMS owns the aperture and is registered.
++	 */
++	ret = dcp_m4_runtime_background(r);
++	if (ret)
++		goto failed;
++	r->power_started = true;
++	ret = dcp_m4_runtime_health(r);
++	if (!ret)
++		ret = dcp_m4_pmp_get(dcp->dev);
++	if (!ret)
++		ret = dcp_m4_pmp_check(dcp->dev);
++	if (!ret)
++		ret = dcp_m4_runtime_health(r);
++	if (ret)
++		goto failed;
++	smp_store_release(&r->power_done, true);
++	ret = dcp_m4_initial_scanout(dcp);
++	if (!ret)
++		ret = dcp_m4_runtime_health(r);
++	if (ret)
++		goto failed;
++	WRITE_ONCE(r->qualified, true);
++	dev_info(dcp->dev, "firmware 26.6.2 KMS scanout activated\n");
++	goto out;
++failed:
++	dcp_m4_failed(dcp, ret);
++out:
++	mutex_unlock(&dcp->lock);
++	return ret;
++}
++
++int iomfb_m4_get_mode(struct apple_dcp *owner, struct drm_display_mode *mode)
++{
++	struct iomfb_m4 *dcp = owner->v26_6;
++	struct dcp_m4_timing *t;
++
++	if (!dcp || !dcp->runtime || !smp_load_acquire(&dcp->runtime->done))
++		return -ENODEV;
++	if (READ_ONCE(dcp->error))
++		return READ_ONCE(dcp->error);
++	t = &dcp->runtime->timing;
++	*mode = (struct drm_display_mode) {
++		.clock = t->clock_khz,
++		.hdisplay = t->hdisplay, .hsync_start = t->hsync_start,
++		.hsync_end = t->hsync_end, .htotal = t->htotal,
++		.vdisplay = t->vdisplay, .vsync_start = t->vsync_start,
++		.vsync_end = t->vsync_end, .vtotal = t->vtotal,
++		.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
++	};
++	drm_mode_set_name(mode);
++	return 0;
++}
++
++int iomfb_m4_error(struct apple_dcp *owner)
++{
++	return owner->v26_6 ? READ_ONCE(owner->v26_6->error) : -ENODEV;
++}
++
++int iomfb_m4_health(struct apple_dcp *owner)
++{
++	struct iomfb_m4 *dcp = owner->v26_6;
++	int ret;
++
++	if (!dcp || !dcp->runtime)
++		return -ENODEV;
++	mutex_lock(&dcp->lock);
++	ret = dcp_m4_runtime_health(dcp->runtime);
++	if (ret)
++		dcp_m4_failed(dcp, ret);
++	mutex_unlock(&dcp->lock);
++	return ret;
++}
++
++/* dcp->lock is the single owner of swaps, active descriptors and brightness. */
++static int iomfb_m4_swap(struct iomfb_m4 *dcp, const struct dcp_m4_frame *frame)
++{
++	struct dcp_backlight_present present = {};
++	int prepared = -ENODATA, ret;
++
++	lockdep_assert_held(&dcp->lock);
++	if (dcp_backlight_active(dcp->owner))
++		prepared = dcp_backlight_prepare(dcp->owner, true, &present);
++	if (prepared && prepared != -EALREADY && prepared != -ENODATA)
++		return prepared;
++	ret = dcp_m4_runtime_swap_brightness(dcp->runtime, frame,
++					    !prepared, present.nits);
++	if (!prepared)
++		dcp_backlight_complete(dcp->owner, present.sequence, !ret);
++	return ret;
++}
++
++int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
++		     dma_addr_t dva, size_t mapped)
++{
++	struct iomfb_m4 *dcp = owner->v26_6;
++	struct drm_framebuffer *retire = NULL;
++	struct dcp_m4_frame frame;
++	int ret;
++
++	if (!dcp || !dcp->runtime || !fb || fb->format->num_planes != 1 ||
++	    fb->offsets[0] || fb->modifier != DRM_FORMAT_MOD_LINEAR ||
++	    (fb->format->format != DRM_FORMAT_XRGB8888 &&
++	     fb->format->format != DRM_FORMAT_ARGB8888))
++		return -EINVAL;
++	ret = dcp_m4_direct_frame(&frame, dva, mapped, fb->width, fb->height,
++				  fb->pitches[0], fb->format->format == DRM_FORMAT_ARGB8888);
++	if (ret)
++		return ret;
++	mutex_lock(&dcp->lock);
++	ret = dcp_m4_runtime_live(dcp->runtime);
++	if (!ret)
++		ret = iomfb_m4_check_frame(&frame);
++	if (ret)
++		goto out;
++	/* Keep the source before the first work descriptor can become visible. */
++	drm_framebuffer_get(fb);
++	ret = iomfb_m4_swap(dcp, &frame);
++	if (ret) {
++		/* Neither the old surface nor this successor has a release receipt. */
++		dcp->uncertain_fb = fb;
++		dcp_m4_failed(dcp, ret);
++		goto out;
++	}
++	retire = dcp->active_fb;
++	dcp->active_fb = fb;
++	dcp->active_frame = frame;
++	dcp->flips++;
++out:
++	mutex_unlock(&dcp->lock);
++	if (retire)
++		drm_framebuffer_put(retire);
++	return ret;
++}
++
++int iomfb_m4_blank(struct apple_dcp *owner)
++{
++	struct iomfb_m4 *dcp = owner->v26_6;
++	struct drm_framebuffer *retire = NULL;
++	int ret;
++
++	if (!dcp || !dcp->runtime)
++		return -ENODEV;
++	mutex_lock(&dcp->lock);
++	ret = dcp_m4_runtime_live(dcp->runtime);
++	if (!ret)
++		ret = iomfb_m4_swap(dcp, NULL);
++	if (ret) {
++		dcp_m4_failed(dcp, ret);
++	} else {
++		retire = dcp->active_fb;
++		dcp->active_fb = NULL;
++		memset(&dcp->active_frame, 0, sizeof(dcp->active_frame));
++		dcp->blanks++;
++	}
++	mutex_unlock(&dcp->lock);
++	if (retire)
++		drm_framebuffer_put(retire);
++	return ret;
++}
++
++static void iomfb_m4_backlight_work(struct work_struct *work)
++{
++	struct iomfb_m4 *dcp = container_of(work, struct iomfb_m4, backlight_work);
++	int ret;
++
++	mutex_lock(&dcp->lock);
++	if (READ_ONCE(dcp->owner->quiescing) || !dcp->runtime ||
++	    !dcp_backlight_pending(dcp->owner) || !dcp->active_frame.dva)
++		goto out;
++	ret = dcp_m4_runtime_live(dcp->runtime);
++	if (!ret)
++		ret = iomfb_m4_swap(dcp, &dcp->active_frame);
++	if (ret)
++		dcp_m4_failed(dcp, ret);
++	else
++		dcp->brightness_swaps++;
++out:
++	mutex_unlock(&dcp->lock);
++}
++
++static void iomfb_m4_backlight_kick(struct apple_dcp *owner)
++{
++	struct iomfb_m4 *dcp = owner->v26_6;
++
++	if (dcp && dcp->runtime && !READ_ONCE(owner->quiescing))
++		queue_work(dcp->runtime->wq, &dcp->backlight_work);
++}
++
++void iomfb_m4_configure_backlight(struct apple_dcp *owner)
++{
++	int ret;
++
++	if (dcp_backlight_active(owner))
++		return;
++	ret = dcp_backlight_configure(owner, 500, false, 0, true, 120,
++				      iomfb_m4_backlight_kick);
++	if (ret && ret != -EBUSY)
++		dev_err(owner->dev, "firmware 26.6.2 backlight unavailable: %d\n", ret);
++}
++
++void iomfb_m4_quiesce(struct apple_dcp *owner)
++{
++	struct iomfb_m4 *dcp = owner->v26_6;
++
++	if (!dcp)
++		return;
++	/* Wake any RPC waiter before waiting for workers; never recycle its DMA. */
++	dcp_m4_failed(dcp, -ENODEV);
++	cancel_work_sync(&dcp->backlight_work);
++	if (dcp->runtime)
++		flush_workqueue(dcp->runtime->wq);
++}
++
++static int iomfb_m4_status_show(struct seq_file *s, void *unused)
++{
++	struct apple_dcp *owner = s->private;
++	struct iomfb_m4 *dcp = owner->v26_6;
++	struct dcp_m4_runtime *r;
++	int health;
++
++	if (!dcp)
++		return -ENODEV;
++	mutex_lock(&dcp->lock);
++	r = dcp->runtime;
++	health = r ? dcp_m4_runtime_health(r) : -ENODEV;
++	if (health && r)
++		dcp_m4_failed(dcp, health);
++	seq_printf(s, "firmware=26.6.2 ready=%u qualified=%u error=%d run=%u health=%d\n",
++		   dcp->ready, r && r->qualified, dcp->error,
++		   !!(readl(dcp->coproc + 0x44) & BIT(4)), health);
++	seq_printf(s, "startup=%u background=%u power=%u scanout=%u callbacks=%u\n",
++		   r && r->done, r && r->background_done, r && r->power_done,
++		   r && r->scanout_done, r ? r->callbacks : 0);
++	seq_printf(s, "flips=%llu blanks=%llu backlight_swaps=%llu active=%u uncertain=%u\n",
++		   dcp->flips, dcp->blanks, dcp->brightness_swaps,
++		   !!dcp->active_fb, !!dcp->uncertain_fb);
++	mutex_unlock(&dcp->lock);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(iomfb_m4_status);
++
++void iomfb_m4_debugfs_init(struct apple_dcp *owner, struct dentry *root)
++{
++	debugfs_create_file("iomfb_m4", 0400, root, owner, &iomfb_m4_status_fops);
++}
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.h b/drivers/gpu/drm/apple/iomfb_m4.h
+new file mode 100644
+index 0000000000..29296e527f
+--- /dev/null
++++ b/drivers/gpu/drm/apple/iomfb_m4.h
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++#ifndef __APPLE_IOMFB_M4_H__
++#define __APPLE_IOMFB_M4_H__
++
++#include <linux/types.h>
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++
++struct apple_dcp;
++struct device;
++struct dentry;
++struct drm_display_mode;
++struct drm_framebuffer;
++struct iomfb_m4;
++
++#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
++
++/* Probe is inert; start adopts firmware after the common component is pinned. */
++int iomfb_m4_init(struct apple_dcp *dcp);
++int iomfb_m4_start(struct apple_dcp *dcp, struct device *scanout);
++int iomfb_m4_activate(struct apple_dcp *dcp);
++int iomfb_m4_get_mode(struct apple_dcp *dcp, struct drm_display_mode *mode);
++int iomfb_m4_health(struct apple_dcp *dcp);
++int iomfb_m4_error(struct apple_dcp *dcp);
++
++/* The caller has waited for the producer fence before publishing the DMA GEM. */
++int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
++		     dma_addr_t dva, size_t mapped);
++int iomfb_m4_blank(struct apple_dcp *dcp);
++void iomfb_m4_configure_backlight(struct apple_dcp *dcp);
++void iomfb_m4_quiesce(struct apple_dcp *dcp);
++void iomfb_m4_debugfs_init(struct apple_dcp *dcp, struct dentry *root);
++
++#else
++static inline int iomfb_m4_init(struct apple_dcp *dcp) { return -ENODEV; }
++static inline int iomfb_m4_start(struct apple_dcp *dcp, struct device *scanout)
++{
++	return -ENODEV;
++}
++static inline int iomfb_m4_activate(struct apple_dcp *dcp) { return -ENODEV; }
++static inline int iomfb_m4_get_mode(struct apple_dcp *dcp, struct drm_display_mode *mode)
++{
++	return -ENODEV;
++}
++static inline int iomfb_m4_health(struct apple_dcp *dcp) { return -ENODEV; }
++static inline int iomfb_m4_error(struct apple_dcp *dcp) { return -ENODEV; }
++static inline int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
++				  dma_addr_t dva, size_t mapped)
++{
++	return -ENODEV;
++}
++static inline int iomfb_m4_blank(struct apple_dcp *dcp) { return -ENODEV; }
++static inline void iomfb_m4_configure_backlight(struct apple_dcp *dcp) { }
++static inline void iomfb_m4_quiesce(struct apple_dcp *dcp) { }
++static inline void iomfb_m4_debugfs_init(struct apple_dcp *dcp, struct dentry *root) { }
++#endif
++
++#endif
+diff --git a/drivers/gpu/drm/apple/iomfb_m4_present.h b/drivers/gpu/drm/apple/iomfb_m4_present.h
+new file mode 100644
+index 0000000000..6f51b93613
+--- /dev/null
++++ b/drivers/gpu/drm/apple/iomfb_m4_present.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/* The T8132 panel's single-surface profile on common DMA GEM objects. */
++#ifndef __APPLE_IOMFB_M4_PRESENT_H__
++#define __APPLE_IOMFB_M4_PRESENT_H__
++
++#include <drm/drm_fb_dma_helper.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_plane.h>
++
++#include "dcp-m4-frame.h"
++
++static inline int iomfb_m4_plane_frame(const struct drm_plane_state *state,
++				       u32 width, u32 height,
++				       struct dcp_m4_frame *frame)
++{
++	struct drm_framebuffer *fb = state->fb;
++	struct drm_gem_dma_object *obj;
++
++	if (!fb || fb->format->num_planes != 1 || fb->offsets[0] ||
++	    fb->modifier != DRM_FORMAT_MOD_LINEAR ||
++	    (fb->format->format != DRM_FORMAT_XRGB8888 &&
++	     fb->format->format != DRM_FORMAT_ARGB8888) ||
++	    state->src_x || state->src_y || state->crtc_x || state->crtc_y ||
++	    state->src_w != (u64)width << 16 || state->src_h != (u64)height << 16 ||
++	    state->crtc_w != width || state->crtc_h != height)
++		return -EINVAL;
++	obj = drm_fb_dma_get_gem_obj(fb, 0);
++	if (!obj)
++		return -EINVAL;
++	return dcp_m4_direct_frame(frame, obj->dma_addr, obj->base.size,
++				   fb->width, fb->height, fb->pitches[0],
++				   fb->format->format == DRM_FORMAT_ARGB8888);
++}
++
++#endif
+diff --git a/drivers/gpu/drm/apple/plane.c b/drivers/gpu/drm/apple/plane.c
+index cde215f62b..a0343aa5ec 100644
+--- a/drivers/gpu/drm/apple/plane.c
++++ b/drivers/gpu/drm/apple/plane.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "plane.h"
++#include "dcp.h"
+ 
+ #include "dcp-internal.h"
+ #include "iomfb_internal.h"
+@@ -538,6 +539,10 @@ static int apple_plane_prepare_fb(struct drm_plane *plane,
+ 	if (!old || !old->crtc || !old->fb || old->fb == state->fb)
+ 		return 0;
+ 
++	/* The M4 backend retains accepted and uncertain scanout itself. */
++	if (iomfb_is_m4(platform_get_drvdata(to_apple_crtc(old->crtc)->dcp)))
++		return 0;
++
+ 	entry = kzalloc_obj(*entry);
+ 	if (!entry)
+ 		return -ENOMEM;
+@@ -825,3 +830,62 @@ struct drm_plane *apple_plane_init_v14_7(struct drm_device *dev,
+ 
+ 	return &plane->base;
+ }
++
++#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
++#include "iomfb_m4_present.h"
++
++static const u32 dcp_primary_formats_v26_6[] = {
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_ARGB8888,
++};
++
++static int apple_plane_atomic_check_v26_6(struct drm_plane *plane,
++					struct drm_atomic_commit *commit)
++{
++	struct drm_plane_state *new = drm_atomic_get_new_plane_state(commit, plane);
++	struct drm_crtc_state *crtc_state;
++	struct dcp_m4_frame frame;
++	int ret;
++
++	if (!new->crtc)
++		return 0;
++	crtc_state = drm_atomic_get_crtc_state(commit, new->crtc);
++	if (IS_ERR(crtc_state))
++		return PTR_ERR(crtc_state);
++	ret = drm_atomic_helper_check_plane_state(new, crtc_state,
++						DRM_PLANE_NO_SCALING,
++						DRM_PLANE_NO_SCALING, false, true);
++	if (ret)
++		return ret;
++	if (!new->visible)
++		return crtc_state->active ? -EINVAL : 0;
++	return iomfb_m4_plane_frame(new, crtc_state->mode.hdisplay,
++				     crtc_state->mode.vdisplay, &frame);
++}
++
++static const struct drm_plane_helper_funcs apple_primary_plane_helper_funcs_v26_6 = {
++	.prepare_fb = apple_plane_prepare_fb,
++	.cleanup_fb = apple_plane_cleanup_fb,
++	.atomic_check = apple_plane_atomic_check_v26_6,
++	.atomic_update = apple_plane_atomic_update,
++	.get_scanout_buffer = drm_fb_dma_get_scanout_buffer,
++};
++
++struct drm_plane *apple_plane_init_v26_6(struct drm_device *dev,
++				      unsigned long possible_crtcs, u32 iomfb_surf)
++{
++	struct apple_plane *plane;
++
++	plane = drmm_universal_plane_alloc(dev, struct apple_plane, base,
++					   possible_crtcs, &apple_plane_funcs,
++					   dcp_primary_formats_v26_6,
++					   ARRAY_SIZE(dcp_primary_formats_v26_6),
++					   format_modifiers_no_ix,
++					   DRM_PLANE_TYPE_PRIMARY, NULL);
++	if (IS_ERR(plane))
++		return ERR_CAST(plane);
++	drm_plane_helper_add(&plane->base, &apple_primary_plane_helper_funcs_v26_6);
++	plane->iomfb_surf = iomfb_surf;
++	return &plane->base;
++}
++#endif
+diff --git a/drivers/gpu/drm/apple/plane.h b/drivers/gpu/drm/apple/plane.h
+index d790557327..f7a819c736 100644
+--- a/drivers/gpu/drm/apple/plane.h
++++ b/drivers/gpu/drm/apple/plane.h
+@@ -44,4 +44,8 @@ struct drm_plane *apple_plane_init_v14_7(struct drm_device *dev,
+ 					 u32 iomfb_surf,
+ 					 enum drm_plane_type type);
+ 
++/* T8132 internal panel: the qualified single-surface firmware profile. */
++struct drm_plane *apple_plane_init_v26_6(struct drm_device *dev,
++				      unsigned long possible_crtcs, u32 iomfb_surf);
++
+ #endif /* __APPLE_PLANE_H__ */
+diff --git a/drivers/gpu/drm/apple/version_utils.h b/drivers/gpu/drm/apple/version_utils.h
+index 4627fd148e..053bc0a15a 100644
+--- a/drivers/gpu/drm/apple/version_utils.h
++++ b/drivers/gpu/drm/apple/version_utils.h
+@@ -38,6 +38,8 @@ enum dcp_firmware_version {
+ 	DCP_FIRMWARE_H17P,
+ 	/* J613 macOS 26.6.2 (25G83) IOMFB over DCPLink (iomfb_v26_6.c). */
+ 	DCP_FIRMWARE_V_26_6,
++	/* T8132/J713 retained EP37 session. */
++	DCP_FIRMWARE_M4,
+ };
+ 
+ #endif /*__APPLE_VERSION_UTILS_H__*/

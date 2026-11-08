@@ -1,0 +1,746 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:37:37 +1100
+Subject: [PATCH 14/16] kboot: hand the speaker amps' configuration from the
+ ADT to the kernel
+
+The kernel's SN012776 driver programs every amp's brownout prevention
+block from a copy typed into the driver, and nothing tells it how macOS
+sets the amps' DC blocker. Both come from the ADT: the node of each
+amp group's first amp ("audio-control,sn012776", with speakerN phandles
+to the others) carries the group's configuration, which macOS applies
+to every amp of the group.
+
+Copy that node's bop-config and amp-dcblocker-config, byte for byte,
+to every amp of the group in the DT, as apple,bop-config and
+apple,amp-dcblocker-config. A property the group lacks is removed from
+its amps, so the kernel never sees a value that did not come from the
+Mac. Amps are matched to the DT's ti,sn012776 nodes by I2C address,
+which must name exactly one node; a group with an amp that cannot be
+matched is left alone, so the kernel gets all of a group's
+configuration or none of it. Nothing in this pass stops the boot.
+
+Tests: tests/run-kboot-audio.sh builds kboot_audio.c with aura's own ADT
+reader and libfdt for the host and runs seven synthetic scenarios (a
+three-amp group over two buses, a group without a DC blocker setting
+and a stale DT copy, a single amp, an amp missing from the DT, an
+ambiguous address, a dangling phandle, no amps). Given a Mac's
+IODeviceTree plist and kernel DTB it prints what the kernel would get:
+on the M1 Pro (J316s), M2 (J413) and M4 Pro (J616s) ADTs every amp gets
+a brownout block identical to the one the kernel driver carries today,
+the J413 and J616s amps get their DC blocker setting and the J316s
+amps, whose ADT has none, get none.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+(cherry picked from aurora-silicon/aura commit 13c4f7a934c203f05cfd98e62b12a7ec66871159;
+ Makefile and kboot.c context adjusted to omacom m1n1)
+---
+ Makefile                       |   2 +-
+ src/kboot.c                    |   2 +
+ src/kboot_audio.c              | 194 +++++++++++++++++++++++++++++++++
+ src/kboot_audio.h              |   8 ++
+ tests/kboot_audio_adt.py       | 167 ++++++++++++++++++++++++++++
+ tests/kboot_audio_host.c       | 100 +++++++++++++++++
+ tests/kboot_audio_host/types.h |  26 +++++
+ tests/kboot_audio_host/utils.h |  14 +++
+ tests/run-kboot-audio.sh       | 105 ++++++++++++++++++
+ 9 files changed, 617 insertions(+), 1 deletion(-)
+ create mode 100644 src/kboot_audio.c
+ create mode 100644 src/kboot_audio.h
+ create mode 100644 tests/kboot_audio_adt.py
+ create mode 100644 tests/kboot_audio_host.c
+ create mode 100644 tests/kboot_audio_host/types.h
+ create mode 100644 tests/kboot_audio_host/utils.h
+ create mode 100644 tests/run-kboot-audio.sh
+
+diff --git a/Makefile b/Makefile
+index 2bc42c39..556d715e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -186,7 +186,7 @@ OBJECTS := \
+ 	iodev.o \
+ 	iova.o \
+ 	isp.o \
+-	kboot.o kboot_atc.o kboot_gpu_t8122.o kboot_gpu_t8122_power.o kboot_pmp_t8122.o \
++	kboot.o kboot_atc.o kboot_audio.o kboot_gpu_t8122.o kboot_gpu_t8122_power.o kboot_pmp_t8122.o \
+ 	kboot_t6020_compat.o \
+ 	kboot_display_handoff.o kboot_display_facts.o kboot_gpu26.o kboot_gpu_t6031.o kboot_t6031.o \
+ 	main.o boot_options.o \
+diff --git a/src/kboot.c b/src/kboot.c
+index 87324bf8..ced76b75 100644
+--- a/src/kboot.c
++++ b/src/kboot.c
+@@ -18,6 +18,7 @@
+ #include "iodev.h"
+ #include "isp.h"
+ #include "kboot_atc.h"
++#include "kboot_audio.h"
+ #include "kboot_display_facts.h"
+ #include "kboot_gpu_t8122.h"
+ #include "kboot_pmp_t8122.h"
+@@ -7163,6 +7164,7 @@ int kboot_prepare_dt(void *fdt)
+         return -1;
+     if (dt_set_speaker_safety())
+         return -1;
++    kboot_audio_amp_config(dt, adt);
+     if (dt_set_uboot_config())
+         return -1;
+     if (dt_set_serial_number())
+diff --git a/src/kboot_audio.c b/src/kboot_audio.c
+new file mode 100644
+index 00000000..4ef967d0
+--- /dev/null
++++ b/src/kboot_audio.c
+@@ -0,0 +1,194 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Speaker amp configuration from the ADT.
++ *
++ * The ADT describes a group of SN012776 speaker amps with one node: the group's first amp,
++ * compatible "audio-control,sn012776", which carries the group's configuration, and whose
++ * speakerN properties are the phandles of the group's other amps. macOS sets up every amp of
++ * the group from that configuration. The parts of it that the kernel's amp driver programs go
++ * to every amp of the group in the DT, byte for byte, so that no Linux tree has to carry a
++ * copy:
++ *
++ *   bop-config            -> apple,bop-config            (the brownout prevention block)
++ *   amp-dcblocker-config  -> apple,amp-dcblocker-config  (the DC blocker setting)
++ *
++ * A property the group does not have is removed from its amps, so the kernel never sees a
++ * value that did not come from this Mac. Amps are matched to the DT's ti,sn012776 nodes by I2C
++ * address, which must name exactly one node. A group with an amp that cannot be matched is left
++ * as it is: the kernel gets either the whole group's configuration or none of it. Nothing here
++ * stops the boot.
++ */
++
++#include "kboot_audio.h"
++#include "adt.h"
++#include "types.h"
++#include "utils.h"
++
++#include "libfdt/libfdt.h"
++
++#define AMP_ADT_COMPAT "audio-control,sn012776"
++#define AMP_DT_COMPAT  "ti,sn012776"
++#define MAX_GROUP_AMPS 16
++
++static const struct {
++    const char *adt;
++    const char *dt;
++} amp_group_props[] = {
++    {"bop-config", "apple,bop-config"},
++    {"amp-dcblocker-config", "apple,amp-dcblocker-config"},
++};
++
++/* The I2C address of an ADT amp node: the first word of its reg */
++static int adt_amp_addr(const void *adt, int node, u32 *addr)
++{
++    u32 len;
++    const u32 *reg = adt_getprop(adt, node, "reg", &len);
++
++    if (!reg || len < sizeof(*reg))
++        return -1;
++    *addr = reg[0];
++    return 0;
++}
++
++/* The ADT node under /arm-io's buses whose AAPL,phandle is @phandle */
++static int adt_amp_by_phandle(const void *adt, int arm_io, u32 phandle)
++{
++    int bus = arm_io;
++
++    ADT_FOREACH_CHILD(adt, bus)
++    {
++        int dev = bus;
++
++        ADT_FOREACH_CHILD(adt, dev)
++        {
++            u32 ph;
++
++            if (ADT_GETPROP(adt, dev, "AAPL,phandle", &ph) == sizeof(ph) && ph == phandle)
++                return dev;
++        }
++    }
++    return -1;
++}
++
++/*
++ * The DT's ti,sn012776 node at I2C address @addr. Returns its offset, -1 if there is none and
++ * -2 if more than one node has that address.
++ */
++static int dt_amp_by_addr(const void *dt, u32 addr)
++{
++    int found = -1;
++
++    for (int node = fdt_node_offset_by_compatible(dt, -1, AMP_DT_COMPAT); node >= 0;
++         node = fdt_node_offset_by_compatible(dt, node, AMP_DT_COMPAT)) {
++        int len;
++        const fdt32_t *reg = fdt_getprop(dt, node, "reg", &len);
++
++        if (!reg || len < (int)sizeof(*reg) || fdt32_to_cpu(reg[0]) != addr)
++            continue;
++        if (found >= 0)
++            return -2;
++        found = node;
++    }
++    return found;
++}
++
++static int setup_amp_group(void *dt, const void *adt, int arm_io, int group)
++{
++    const char *name = adt_get_name(adt, group);
++    u32 addrs[MAX_GROUP_AMPS];
++    int n = 0;
++
++    if (adt_amp_addr(adt, group, &addrs[n++])) {
++        printf("kboot: audio: %s has no I2C address, left alone\n", name);
++        return -1;
++    }
++
++    for (int k = 1;; k++) {
++        char prop[16];
++        u32 phandle;
++        int amp;
++
++        snprintf(prop, sizeof(prop), "speaker%d", k);
++        if (ADT_GETPROP(adt, group, prop, &phandle) != sizeof(phandle))
++            break;
++        if (n >= MAX_GROUP_AMPS) {
++            printf("kboot: audio: %s has more than %d amps, left alone\n", name, MAX_GROUP_AMPS);
++            return -1;
++        }
++        amp = adt_amp_by_phandle(adt, arm_io, phandle);
++        if (amp < 0 || adt_amp_addr(adt, amp, &addrs[n])) {
++            printf("kboot: audio: %s: %s is not an amp, group left alone\n", name, prop);
++            return -1;
++        }
++        n++;
++    }
++
++    for (int i = 0; i < n; i++) {
++        int node = dt_amp_by_addr(dt, addrs[i]);
++
++        for (int j = 0; j < i; j++) {
++            if (addrs[j] == addrs[i]) {
++                printf("kboot: audio: %s: two amps at 0x%x, group left alone\n", name, addrs[i]);
++                return -1;
++            }
++        }
++        if (node < 0) {
++            printf("kboot: audio: %s: amp at 0x%x %s in the DT, group left alone\n", name, addrs[i],
++                   node == -2 ? "is not unique" : "is missing");
++            return -1;
++        }
++    }
++
++    for (size_t p = 0; p < ARRAY_SIZE(amp_group_props); p++) {
++        u32 len = 0;
++        const void *val = adt_getprop(adt, group, amp_group_props[p].adt, &len);
++
++        for (int i = 0; i < n; i++) {
++            /* Offsets move with every change to the tree: look the amp up each time */
++            int node = dt_amp_by_addr(dt, addrs[i]);
++            int ret;
++
++            if (node < 0)
++                return -1;
++            if (val)
++                ret = fdt_setprop(dt, node, amp_group_props[p].dt, val, len);
++            else
++                ret = fdt_delprop(dt, node, amp_group_props[p].dt);
++            if (ret && !(ret == -FDT_ERR_NOTFOUND && !val)) {
++                printf("kboot: audio: %s: could not set %s on the amp at 0x%x: %d\n", name,
++                       amp_group_props[p].dt, addrs[i], ret);
++                return -1;
++            }
++        }
++    }
++
++    printf("kboot: audio: %s: amp configuration for %d amps\n", name, n);
++    return 0;
++}
++
++int kboot_audio_amp_config(void *dt, const void *adt)
++{
++    int arm_io = adt_path_offset(adt, "/arm-io");
++    int bus = arm_io;
++
++    if (arm_io < 0)
++        return 0;
++
++    ADT_FOREACH_CHILD(adt, bus)
++    {
++        int dev = bus;
++
++        ADT_FOREACH_CHILD(adt, dev)
++        {
++            if (!adt_is_compatible(adt, dev, AMP_ADT_COMPAT))
++                continue;
++            /* Only a group's first amp has speakerN or the group's configuration */
++            if (!adt_getprop(adt, dev, "speaker1", NULL) &&
++                !adt_getprop(adt, dev, "bop-config", NULL) &&
++                !adt_getprop(adt, dev, "amp-dcblocker-config", NULL))
++                continue;
++            setup_amp_group(dt, adt, arm_io, dev);
++        }
++    }
++    return 0;
++}
+diff --git a/src/kboot_audio.h b/src/kboot_audio.h
+new file mode 100644
+index 00000000..62326c8f
+--- /dev/null
++++ b/src/kboot_audio.h
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier: MIT */
++
++#ifndef __KBOOT_AUDIO_H__
++#define __KBOOT_AUDIO_H__
++
++int kboot_audio_amp_config(void *dt, const void *adt);
++
++#endif
+diff --git a/tests/kboot_audio_adt.py b/tests/kboot_audio_adt.py
+new file mode 100644
+index 00000000..6e1809e2
+--- /dev/null
++++ b/tests/kboot_audio_adt.py
+@@ -0,0 +1,167 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: MIT
++"""Fixtures for tests/kboot_audio_host.c, in the binary ADT layout aura's ADT reader
++(rust/src/adt.rs) walks.
++
++    kboot_audio_adt.py scenario <name> <out.adt> <out.dts>
++    kboot_audio_adt.py scenarios
++    kboot_audio_adt.py ioreg <IODeviceTree plist> <out.adt>
++
++"scenario" writes a synthetic ADT and device tree for one test case: every value in them is made
++up for the test. "ioreg" turns a Mac's `ioreg -a -p IODeviceTree` plist into a binary ADT, so
++that aura's code can run on that Mac's own ADT; the plist and the ADT stay outside the tree.
++"""
++import plistlib
++import struct
++import sys
++
++# Made-up configuration blobs: the code under test copies bytes and never reads them
++BOP = bytes(range(0xA0, 0xA0 + 24))
++DCB = bytes([0x5A, 0x01, 0x00, 0x00])
++
++
++def u32(v):
++    return struct.pack("<I", v)
++
++
++def cstr(s):
++    return s.encode() + b"\0"
++
++
++class Node:
++    def __init__(self, name, props=None, children=None):
++        self.name = name
++        self.props = [("name", cstr(name))] + list((props or {}).items())
++        self.children = children or []
++
++    def encode(self):
++        out = struct.pack("<II", len(self.props), len(self.children))
++        for name, data in self.props:
++            if len(name) >= 32:
++                raise SystemExit("property name %s too long" % name)
++            out += name.encode().ljust(32, b"\0") + struct.pack("<I", len(data))
++            out += data + b"\0" * (-len(data) % 4)
++        for child in self.children:
++            out += child.encode()
++        return out
++
++
++def amp(name, addr, phandle, extra=None):
++    props = {
++        "compatible": cstr("audio-control,sn012776"),
++        "reg": u32(addr) + u32(400000) + u32(0) + u32(0),
++        "AAPL,phandle": u32(phandle),
++    }
++    props.update(extra or {})
++    return Node(name, props)
++
++
++def adt(buses):
++    return Node("device-tree", {"compatible": cstr("J000AP\0Apple")},
++                [Node("arm-io", {"compatible": cstr("arm-io")}, buses)])
++
++
++def dts(amps, stale=None):
++    """A device tree with one ti,sn012776 node per (bus, addr); stale: {(bus, addr): props}"""
++    out = ["/dts-v1/;", "/ {", "\t#address-cells = <2>;", "\t#size-cells = <2>;"]
++    buses = sorted({b for b, _ in amps})
++    for b in buses:
++        out += ["\ti2c@%x {" % (0x100000 * (b + 1)), "\t\treg = <0x0 0x%x 0x0 0x4000>;" %
++                (0x100000 * (b + 1)), "\t\t#address-cells = <1>;", "\t\t#size-cells = <0>;"]
++        for bb, a in amps:
++            if bb != b:
++                continue
++            out += ["\t\tcodec@%x {" % a, '\t\t\tcompatible = "ti,sn012776", "ti,tas2764";',
++                    "\t\t\treg = <0x%x>;" % a]
++            for k, v in (stale or {}).get((b, a), {}).items():
++                out.append("\t\t\t%s = [%s];" % (k, " ".join("%02x" % x for x in v)))
++            out.append("\t\t};")
++        out.append("\t};")
++    out += ["\tother@0 { compatible = \"vendor,other\"; reg = <0x0 0x0 0x0 0x1>; };", "};", ""]
++    return "\n".join(out)
++
++
++GROUP3 = {"bop-config": BOP, "amp-dcblocker-config": DCB,
++          "speaker1": u32(0x11), "speaker2": u32(0x12)}
++STALE = {"apple,amp-dcblocker-config": b"\xee\xee", "apple,bop-config": b"\xee"}
++
++
++def scenario(name):
++    """(ADT, DTS) for one scenario"""
++    three = [(0, 0x40), (1, 0x41), (0, 0x42)]
++    group = [Node("i2c0", {}, [amp("audio-speaker", 0x40, 0x10, GROUP3),
++                                amp("audio-speaker-b", 0x42, 0x12)]),
++             Node("i2c1", {}, [amp("audio-speaker-a", 0x41, 0x11)])]
++    if name == "group":
++        return adt(group), dts(three, {(1, 0x41): STALE})
++    if name == "no-dcblocker":
++        g = dict(GROUP3)
++        del g["amp-dcblocker-config"]
++        buses = [Node("i2c0", {}, [amp("audio-speaker", 0x40, 0x10, g),
++                                    amp("audio-speaker-b", 0x42, 0x12)]),
++                 Node("i2c1", {}, [amp("audio-speaker-a", 0x41, 0x11)])]
++        return adt(buses), dts(three, {(1, 0x41): STALE})
++    if name == "single-amp":
++        one = {"bop-config": BOP}
++        return adt([Node("i2c0", {}, [amp("audio-speaker", 0x40, 0x10, one)])]), dts([(0, 0x40)])
++    if name == "amp-missing-in-dt":
++        return adt(group), dts([(0, 0x40), (0, 0x42)], {(0, 0x42): STALE})
++    if name == "amp-not-unique-in-dt":
++        return adt(group), dts(three + [(1, 0x42)])
++    if name == "dangling-phandle":
++        g = dict(GROUP3)
++        g["speaker2"] = u32(0x77)
++        buses = [Node("i2c0", {}, [amp("audio-speaker", 0x40, 0x10, g),
++                                    amp("audio-speaker-b", 0x42, 0x12)]),
++                 Node("i2c1", {}, [amp("audio-speaker-a", 0x41, 0x11)])]
++        return adt(buses), dts(three, {(1, 0x41): STALE})
++    if name == "no-amps":
++        return adt([Node("i2c0", {}, [])]), dts(three, {(1, 0x41): STALE})
++    raise SystemExit("unknown scenario %s" % name)
++
++
++SCENARIOS = ["group", "no-dcblocker", "single-amp", "amp-missing-in-dt", "amp-not-unique-in-dt",
++             "dangling-phandle", "no-amps"]
++
++
++def from_ioreg(path):
++    root = plistlib.load(open(path, "rb"))
++
++    def find(n):
++        if n.get("IORegistryEntryName") == "device-tree":
++            return n
++        for c in n.get("IORegistryEntryChildren", []):
++            r = find(c)
++            if r is not None:
++                return r
++        return None
++
++    def conv(n):
++        node = Node.__new__(Node)
++        node.props = [(k, v) for k, v in n.items() if isinstance(v, bytes) and len(k) < 32]
++        if not any(k == "name" for k, _ in node.props):
++            node.props.insert(0, ("name", cstr(n.get("IORegistryEntryName", "?"))))
++        node.children = [conv(c) for c in n.get("IORegistryEntryChildren", [])]
++        return node
++
++    dt = find(root)
++    if dt is None:
++        raise SystemExit("%s: no device-tree plane" % path)
++    return conv(dt)
++
++
++def main():
++    if len(sys.argv) == 2 and sys.argv[1] == "scenarios":
++        print(" ".join(SCENARIOS))
++    elif len(sys.argv) == 5 and sys.argv[1] == "scenario":
++        a, d = scenario(sys.argv[2])
++        open(sys.argv[3], "wb").write(a.encode())
++        open(sys.argv[4], "w").write(d)
++    elif len(sys.argv) == 4 and sys.argv[1] == "ioreg":
++        open(sys.argv[3], "wb").write(from_ioreg(sys.argv[2]).encode())
++    else:
++        raise SystemExit(__doc__)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kboot_audio_host.c b/tests/kboot_audio_host.c
+new file mode 100644
+index 00000000..9ad3b761
+--- /dev/null
++++ b/tests/kboot_audio_host.c
+@@ -0,0 +1,100 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Host test of the speaker amp configuration from the ADT (src/kboot_audio.c), with aura's own
++ * ADT reader (rust/src/adt.rs, built for the host) and libfdt.
++ *
++ *   kboot-audio-host <in.adt> <in.dtb>
++ *
++ * Runs kboot_audio_amp_config() and prints, for every ti,sn012776 node of the result in tree
++ * order, its I2C address and its apple,bop-config and apple,amp-dcblocker-config ("-" when
++ * absent), one line each ("amp ..."), after aura's own log lines.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "adt.h"
++#include "kboot_audio.h"
++#include "types.h"
++
++#include "libfdt/libfdt.h"
++
++void *adt;
++static u32 adt_size;
++
++u32 adt_get_size(void)
++{
++    return adt_size;
++}
++
++static void *slurp(const char *path, size_t extra, size_t *size)
++{
++    FILE *f = fopen(path, "rb");
++    long n;
++    void *buf;
++
++    if (!f || fseek(f, 0, SEEK_END) || (n = ftell(f)) < 0 || fseek(f, 0, SEEK_SET)) {
++        perror(path);
++        exit(2);
++    }
++    buf = calloc(1, n + extra);
++    if (!buf || fread(buf, 1, n, f) != (size_t)n) {
++        perror(path);
++        exit(2);
++    }
++    fclose(f);
++    *size = n;
++    return buf;
++}
++
++static void print_prop(const void *dt, int node, const char *name)
++{
++    int len;
++    const unsigned char *v = fdt_getprop(dt, node, name, &len);
++
++    printf(" %s=", name);
++    if (!v) {
++        printf("-");
++        return;
++    }
++    for (int i = 0; i < len; i++)
++        printf("%02x", v[i]);
++}
++
++int main(int argc, char **argv)
++{
++    size_t asz, dsz;
++    void *dt;
++
++    if (argc != 3) {
++        fprintf(stderr, "usage: %s <in.adt> <in.dtb>\n", argv[0]);
++        return 2;
++    }
++    adt = slurp(argv[1], 0, &asz);
++    adt_size = asz;
++    dt = slurp(argv[2], 64 * 1024, &dsz);
++    if (fdt_open_into(dt, dt, dsz + 64 * 1024)) {
++        fprintf(stderr, "bad dtb\n");
++        return 2;
++    }
++
++    if (kboot_audio_amp_config(dt, adt)) {
++        printf("kboot_audio_amp_config failed\n");
++        return 1;
++    }
++    if (fdt_check_full(dt, fdt_totalsize(dt))) {
++        printf("result is not a valid device tree\n");
++        return 1;
++    }
++
++    for (int node = fdt_node_offset_by_compatible(dt, -1, "ti,sn012776"); node >= 0;
++         node = fdt_node_offset_by_compatible(dt, node, "ti,sn012776")) {
++        const fdt32_t *reg = fdt_getprop(dt, node, "reg", NULL);
++
++        printf("amp 0x%x", reg ? fdt32_to_cpu(reg[0]) : 0);
++        print_prop(dt, node, "apple,bop-config");
++        print_prop(dt, node, "apple,amp-dcblocker-config");
++        printf("\n");
++    }
++    return 0;
++}
+diff --git a/tests/kboot_audio_host/types.h b/tests/kboot_audio_host/types.h
+new file mode 100644
+index 00000000..f748bf4b
+--- /dev/null
++++ b/tests/kboot_audio_host/types.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: MIT */
++/* Host stand-in for src/types.h, for tests/kboot_audio_host.c: the host libc's own types */
++#ifndef TYPES_H
++#define TYPES_H
++
++#include <limits.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <sys/types.h>
++
++typedef uint8_t u8;
++typedef uint16_t u16;
++typedef uint32_t u32;
++typedef uint64_t u64;
++
++typedef int8_t s8;
++typedef int16_t s16;
++typedef int32_t s32;
++typedef int64_t s64;
++
++#define HAVE_PTRDIFF_T 1
++#define HAVE_UINTPTR_T 1
++#define UPTRDIFF_T     uintptr_t
++
++#endif
+diff --git a/tests/kboot_audio_host/utils.h b/tests/kboot_audio_host/utils.h
+new file mode 100644
+index 00000000..6264c3cb
+--- /dev/null
++++ b/tests/kboot_audio_host/utils.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: MIT */
++/* Host stand-in for src/utils.h, for tests/kboot_audio_host.c */
++#ifndef UTILS_H
++#define UTILS_H
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "types.h"
++
++#define ARRAY_SIZE(s) (sizeof(s) / sizeof((s)[0]))
++
++#endif
+diff --git a/tests/run-kboot-audio.sh b/tests/run-kboot-audio.sh
+new file mode 100644
+index 00000000..b50d4ce7
+--- /dev/null
++++ b/tests/run-kboot-audio.sh
+@@ -0,0 +1,105 @@
++#!/bin/sh
++# Host test of the speaker amp configuration from the ADT (src/kboot_audio.c).
++#
++#   sh tests/run-kboot-audio.sh                          (the synthetic scenarios)
++#   sh tests/run-kboot-audio.sh <IODeviceTree.plist> <kernel.dtb>
++#
++# Without arguments, every scenario of tests/kboot_audio_adt.py runs against its expected result
++# below. With a Mac's `ioreg -a -p IODeviceTree` plist and a kernel DTB for that Mac, the plist
++# is turned into a binary ADT (outside the tree) and the result for that Mac is printed, so that
++# what aura hands the kernel can be compared with what the kernel used before. Neither file is
++# copied into the tree.
++set -eu
++cd "$(dirname "$0")/.."
++root=$(pwd)
++fail() {
++    echo "FAIL: $*" >&2
++    exit 1
++}
++tmp=$(mktemp -d)
++trap 'rm -rf "$tmp"' EXIT HUP INT TERM
++
++# aura's ADT reader, built for the host as tests/run-t6031-handoff.sh does
++mkdir -p "$tmp/rs" "$tmp/src"
++if grep -q 'CStr::from_bytes_until_nul(&self.name)' rust/src/adt.rs; then
++    sed 's|CStr::from_bytes_until_nul(&self.name)|CStr::from_bytes_until_nul(unsafe { \&*(\&self.name as *const [c_char; 32] as *const [u8; 32]) })|' \
++        rust/src/adt.rs > "$tmp/rs/adt.rs"
++elif grep -q 'from_raw_parts(self.name.as_ptr() as \*const u8, 32)' rust/src/adt.rs; then
++    cp rust/src/adt.rs "$tmp/rs/adt.rs"
++else
++    fail "rust/src/adt.rs changed; update the host build in $0"
++fi
++printf '#![allow(non_camel_case_types, dead_code, unused_imports)]\ntype c_size_t = usize;\nmod adt;\n' \
++    > "$tmp/rs/lib.rs"
++RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.89.0} rustc --edition 2021 --crate-type staticlib -O \
++    -o "$tmp/rs/libadt_host.a" "$tmp/rs/lib.rs" || fail "host build of the ADT reader"
++
++# The code under test and its headers next to the host stand-ins, so that their #include "types.h"
++# and "utils.h" find them
++cp src/kboot_audio.c src/kboot_audio.h src/adt.h tests/kboot_audio_host/*.h tests/kboot_audio_host.c "$tmp/src/"
++${CC:-cc} -std=gnu11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
++    -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
++    -I"$tmp/src" -I"$root/src" -I"$root" \
++    "$tmp"/src/*.c src/libfdt/fdt.c src/libfdt/fdt_ro.c src/libfdt/fdt_rw.c src/libfdt/fdt_wip.c \
++    src/libfdt/fdt_sw.c src/libfdt/fdt_empty_tree.c src/libfdt/fdt_strerror.c \
++    src/libfdt/fdt_check.c "$tmp/rs/libadt_host.a" -lm -lpthread -ldl -o "$tmp/kboot-audio-host" ||
++    fail "host build"
++export ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0}
++
++if [ "$#" = 2 ]; then
++    python3 -I tests/kboot_audio_adt.py ioreg "$1" "$tmp/mac.adt"
++    "$tmp/kboot-audio-host" "$tmp/mac.adt" "$2"
++    exit
++fi
++[ "$#" = 0 ] || fail "usage: $0 [<IODeviceTree.plist> <kernel.dtb>]"
++
++BOP=a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7
++DCB=5a010000
++STALE_DCB=eeee
++STALE_BOP=ee
++expect() { # expect <scenario>: the amp lines that scenario must give
++    case $1 in
++    group)
++        printf 'amp 0x40 apple,bop-config=%s apple,amp-dcblocker-config=%s\n' $BOP $DCB
++        printf 'amp 0x42 apple,bop-config=%s apple,amp-dcblocker-config=%s\n' $BOP $DCB
++        printf 'amp 0x41 apple,bop-config=%s apple,amp-dcblocker-config=%s\n' $BOP $DCB ;;
++    no-dcblocker)
++        printf 'amp 0x40 apple,bop-config=%s apple,amp-dcblocker-config=-\n' $BOP
++        printf 'amp 0x42 apple,bop-config=%s apple,amp-dcblocker-config=-\n' $BOP
++        printf 'amp 0x41 apple,bop-config=%s apple,amp-dcblocker-config=-\n' $BOP ;;
++    single-amp)
++        printf 'amp 0x40 apple,bop-config=%s apple,amp-dcblocker-config=-\n' $BOP ;;
++    amp-missing-in-dt)
++        printf 'amp 0x40 apple,bop-config=- apple,amp-dcblocker-config=-\n'
++        printf 'amp 0x42 apple,bop-config=%s apple,amp-dcblocker-config=%s\n' $STALE_BOP $STALE_DCB ;;
++    amp-not-unique-in-dt)
++        printf 'amp 0x40 apple,bop-config=- apple,amp-dcblocker-config=-\n'
++        printf 'amp 0x42 apple,bop-config=- apple,amp-dcblocker-config=-\n'
++        printf 'amp 0x41 apple,bop-config=- apple,amp-dcblocker-config=-\n'
++        printf 'amp 0x42 apple,bop-config=- apple,amp-dcblocker-config=-\n' ;;
++    dangling-phandle|no-amps)
++        printf 'amp 0x40 apple,bop-config=- apple,amp-dcblocker-config=-\n'
++        printf 'amp 0x42 apple,bop-config=- apple,amp-dcblocker-config=-\n'
++        printf 'amp 0x41 apple,bop-config=%s apple,amp-dcblocker-config=%s\n' $STALE_BOP $STALE_DCB ;;
++    *) fail "no expected result for $1" ;;
++    esac
++}
++
++n=0
++for s in $(python3 -I tests/kboot_audio_adt.py scenarios); do
++    python3 -I tests/kboot_audio_adt.py scenario "$s" "$tmp/$s.adt" "$tmp/$s.dts"
++    ${DTC:-dtc} -q -I dts -O dtb -o "$tmp/$s.dtb" "$tmp/$s.dts"
++    "$tmp/kboot-audio-host" "$tmp/$s.adt" "$tmp/$s.dtb" > "$tmp/$s.out" 2>&1 ||
++        { cat "$tmp/$s.out"; fail "$s: host run"; }
++    grep '^amp ' "$tmp/$s.out" > "$tmp/$s.got" || true
++    expect "$s" > "$tmp/$s.want"
++    if ! cmp -s "$tmp/$s.got" "$tmp/$s.want"; then
++        cat "$tmp/$s.out"
++        diff -u "$tmp/$s.want" "$tmp/$s.got" || true
++        fail "$s"
++    fi
++    echo "ok $s: $(grep -v '^amp ' "$tmp/$s.out" | tail -n 1)"
++    n=$((n + 1))
++done
++[ "$n" -gt 0 ] || fail "no scenarios ran"
++echo "kboot audio: $n scenarios pass"

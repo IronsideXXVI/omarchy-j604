@@ -1,0 +1,224 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Mon, 26 Oct 2026 15:03:19 +1100
+Subject: [PATCH] media: apple: isp: use the contiguous single-planar capture
+ API
+
+Remove the parameter-gated multi-planar hooks, which changed the queue type without reinitialising its cached plane semantics. Both contiguous NV12 and P010 use the existing single-planar queue. Keep format negotiation explicit through S_FMT.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+---
+ .../media/drivers/apple-isp-j616s.rst         | 13 ++-
+ .../media/platform/apple/isp/isp-v4l2-test.c  | 11 +--
+ drivers/media/platform/apple/isp/isp-v4l2.c   | 95 +------------------
+ 3 files changed, 11 insertions(+), 108 deletions(-)
+
+diff --git a/Documentation/driver-api/media/drivers/apple-isp-j616s.rst b/Documentation/driver-api/media/drivers/apple-isp-j616s.rst
+index 0b0a503eeb..ab0d7cac95 100644
+--- a/Documentation/driver-api/media/drivers/apple-isp-j616s.rst
++++ b/Documentation/driver-api/media/drivers/apple-isp-j616s.rst
+@@ -68,9 +68,9 @@ the runtime input geometry matches the source profile. An unspecified P010
+ size selects 1280x720 first. Larger P010 modes require a consistent firmware
+ output reply. P010 uses two little-endian 16-bit component planes with ten useful
+ MSB-aligned bits, and equal 64-byte-aligned Y/UV strides. UV immediately
+-follows Y, as required for contiguous P010. The standard multi-planar V4L2
+-API on T6040/IMX958 reports both NV12 and P010 as **one memory plane**
+-containing both component planes. The firmware still receives two component addresses.
++follows Y, as required for contiguous P010. Both NV12 and P010 use the
++standard single-planar V4L2 API with one memory plane containing both
++component planes. The firmware still receives two component addresses.
+ 
+ At 1920x1080, stride is 3840, Y is 4147200 bytes, UV is 2073600 bytes and
+ ``sizeimage`` is 6220800. At 1280x720, stride is 2560 and ``sizeimage`` is
+@@ -89,10 +89,9 @@ only after the firmware report ACK and doorbell have been published.
+ NV12 pool sizes and the T8140/Neo default formats, presets and command path
+ retain their existing behavior.
+ 
+-The inherited ``multiplanar`` module parameter is removed. T6040/IMX958
+-supports standard single-planar and multi-planar V4L2 negotiation for these
+-contiguous formats without a parameter; the non-contiguous NV12M alias is not
+-advertised. Other sensors retain their shipped single-planar API. No driver
++The inherited ``multiplanar`` module parameter and its inconsistent queue-type
++hooks are removed. All sensors use the shipped single-planar V4L2 API; the
++non-contiguous NV12M alias is not advertised. No driver
+ module/kernel parameter, platform flag or per-platform Kconfig option selects
+ support. NV12 stays first and is the initial format because browsers/WebRTC
+ and many applications do not support P010 or simply choose the first format.
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2-test.c b/drivers/media/platform/apple/isp/isp-v4l2-test.c
+index b3c8d26dfd..398e8e9235 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2-test.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2-test.c
+@@ -37,6 +37,8 @@ static void isp_test_queue_init(struct kunit *test)
+ 
+ 	KUNIT_ASSERT_EQ(test, isp_vb2_queue_init(isp), 0);
+ 	KUNIT_EXPECT_GE(test, isp->vbq.max_num_buffers, VB2_MAX_FRAME);
++	KUNIT_EXPECT_EQ(test, isp->vbq.type, V4L2_BUF_TYPE_VIDEO_CAPTURE);
++	KUNIT_EXPECT_FALSE(test, isp->vbq.is_multiplanar);
+ 	vb2_queue_release(&isp->vbq);
+ }
+ 
+@@ -140,10 +142,6 @@ static void isp_test_p010_format(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, fmt->plane_size[0], (size_t)4147200);
+ 	KUNIT_EXPECT_EQ(test, fmt->plane_size[1], (size_t)2073600);
+ 	KUNIT_EXPECT_EQ(test, f.fmt.pix.quantization, V4L2_QUANTIZATION_LIM_RANGE);
+-	isp_get_mp_pix_format(isp, &f, fmt);
+-	KUNIT_EXPECT_EQ(test, f.fmt.pix_mp.pixelformat, V4L2_PIX_FMT_P010);
+-	KUNIT_EXPECT_EQ(test, f.fmt.pix_mp.num_planes, 1);
+-	KUNIT_EXPECT_EQ(test, f.fmt.pix_mp.plane_fmt[0].sizeimage, 6220800);
+ 
+ 	isp->vbq.drv_priv = isp;
+ 	isp_test_set_num_buffers(test, &isp->vbq, 0);
+@@ -164,10 +162,7 @@ static void isp_test_p010_format(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, fmt->total_size, (size_t)1382400);
+ 	KUNIT_EXPECT_EQ(test, isp_num_rendered(isp), ISP_MAX_BUFFERS);
+ 	KUNIT_EXPECT_EQ(test, isp_num_meta(isp), ISP_MAX_BUFFERS);
+-	isp_get_mp_pix_format(isp, &f, fmt);
+-	KUNIT_EXPECT_EQ(test, f.fmt.pix_mp.pixelformat, V4L2_PIX_FMT_NV12);
+-	KUNIT_EXPECT_EQ(test, f.fmt.pix_mp.num_planes, 1);
+-	KUNIT_EXPECT_EQ(test, f.fmt.pix_mp.plane_fmt[0].sizeimage, 1382400);
++
+ }
+ 
+ static void isp_test_p010_admission(struct kunit *test)
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index bc270e06be..ff0133e34d 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -803,25 +803,6 @@ static inline void isp_get_sp_pix_format(struct apple_isp *isp,
+ 		f->fmt.pix.quantization = V4L2_QUANTIZATION_LIM_RANGE;
+ }
+ 
+-static inline void isp_get_mp_pix_format(struct apple_isp *isp,
+-					 struct v4l2_format *f,
+-					 struct isp_format *fmt)
+-{
+-	f->fmt.pix_mp.width = fmt->preset->output_dim.x;
+-	f->fmt.pix_mp.height = fmt->preset->output_dim.y;
+-	/* Both contiguous formats have one memory plane and two ISP components. */
+-	f->fmt.pix_mp.num_planes = 1;
+-	memset(f->fmt.pix_mp.plane_fmt, 0, sizeof(f->fmt.pix_mp.plane_fmt));
+-	f->fmt.pix_mp.plane_fmt[0].sizeimage = fmt->total_size;
+-	f->fmt.pix_mp.plane_fmt[0].bytesperline = fmt->strides[0];
+-	f->fmt.pix_mp.field = V4L2_FIELD_NONE;
+-	f->fmt.pix_mp.pixelformat = fmt->pixelformat;
+-	f->fmt.pix_mp.colorspace = V4L2_COLORSPACE_REC709;
+-	f->fmt.pix_mp.ycbcr_enc = V4L2_YCBCR_ENC_709;
+-	f->fmt.pix_mp.xfer_func = V4L2_XFER_FUNC_709;
+-	f->fmt.pix_mp.quantization = V4L2_QUANTIZATION_LIM_RANGE;
+-}
+-
+ static int isp_vidioc_get_format(struct file *file, void *fh,
+ 				 struct v4l2_format *f)
+ {
+@@ -877,69 +858,6 @@ static int isp_vidioc_try_format(struct file *file, void *fh,
+ 	return 0;
+ }
+ 
+-static int isp_vidioc_get_format_mplane(struct file *file, void *fh,
+-					struct v4l2_format *f)
+-{
+-	struct apple_isp *isp = video_drvdata(file);
+-	struct isp_format *fmt = isp_get_current_format(isp);
+-
+-	if (!isp_supports_p010(isp))
+-		return -ENOTTY;
+-
+-	isp_get_mp_pix_format(isp, f, fmt);
+-
+-	return 0;
+-}
+-
+-static int isp_vidioc_set_format_mplane(struct file *file, void *fh,
+-					struct v4l2_format *f)
+-{
+-	struct apple_isp *isp = video_drvdata(file);
+-	struct isp_format *fmt = isp_get_current_format(isp);
+-	struct isp_preset *preset;
+-	int err;
+-
+-	if (!isp_supports_p010(isp))
+-		return -ENOTTY;
+-
+-	if (vb2_is_busy(&isp->vbq))
+-		return -EBUSY;
+-
+-	preset = isp_select_preset(isp, f->fmt.pix_mp.width, f->fmt.pix_mp.height,
+-				   f->fmt.pix_mp.pixelformat);
+-	err = isp_set_preset(isp, fmt, preset, f->fmt.pix_mp.pixelformat);
+-	if (err)
+-		return err;
+-
+-	isp_get_mp_pix_format(isp, f, fmt);
+-
+-	isp->vbq.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+-
+-	return 0;
+-}
+-
+-static int isp_vidioc_try_format_mplane(struct file *file, void *fh,
+-					struct v4l2_format *f)
+-{
+-	struct apple_isp *isp = video_drvdata(file);
+-	struct isp_format fmt = *isp_get_current_format(isp);
+-	struct isp_preset *preset;
+-	int err;
+-
+-	if (!isp_supports_p010(isp))
+-		return -ENOTTY;
+-
+-	preset = isp_select_preset(isp, f->fmt.pix_mp.width, f->fmt.pix_mp.height,
+-				   f->fmt.pix_mp.pixelformat);
+-	err = isp_set_preset(isp, &fmt, preset, f->fmt.pix_mp.pixelformat);
+-	if (err)
+-		return err;
+-
+-	isp_get_mp_pix_format(isp, f, &fmt);
+-
+-	return 0;
+-}
+-
+ static int isp_vidioc_enum_input(struct file *file, void *fh,
+ 				 struct v4l2_input *inp)
+ {
+@@ -972,9 +890,7 @@ static int isp_vidioc_get_param(struct file *file, void *fh,
+ {
+ 	struct apple_isp *isp = video_drvdata(file);
+ 
+-	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
+-	    (!isp_supports_p010(isp) ||
+-	     a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE))
++	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+ 		return -EINVAL;
+ 
+ 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
+@@ -990,9 +906,7 @@ static int isp_vidioc_set_param(struct file *file, void *fh,
+ 	struct apple_isp *isp = video_drvdata(file);
+ 	struct v4l2_fract *tpf = &a->parm.capture.timeperframe;
+ 
+-	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
+-	    (!isp_supports_p010(isp) ||
+-	     a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE))
++	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+ 		return -EINVAL;
+ 
+ 	/* The rate is configured when the stream starts. */
+@@ -1041,9 +955,6 @@ static const struct v4l2_ioctl_ops isp_v4l2_ioctl_ops = {
+ 	.vidioc_g_fmt_vid_cap = isp_vidioc_get_format,
+ 	.vidioc_s_fmt_vid_cap = isp_vidioc_set_format,
+ 	.vidioc_try_fmt_vid_cap = isp_vidioc_try_format,
+-	.vidioc_g_fmt_vid_cap_mplane = isp_vidioc_get_format_mplane,
+-	.vidioc_s_fmt_vid_cap_mplane = isp_vidioc_set_format_mplane,
+-	.vidioc_try_fmt_vid_cap_mplane = isp_vidioc_try_format_mplane,
+ 
+ 	.vidioc_enum_framesizes = isp_vidioc_enum_framesizes,
+ 	.vidioc_enum_frameintervals = isp_vidioc_enum_frameintervals,
+@@ -1213,8 +1124,6 @@ int apple_isp_setup_video(struct apple_isp *isp)
+ 	vdev->fops = &isp_v4l2_fops;
+ 	vdev->ioctl_ops = &isp_v4l2_ioctl_ops;
+ 	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+-	if (isp_supports_p010(isp))
+-		vdev->device_caps |= V4L2_CAP_VIDEO_CAPTURE_MPLANE;
+ 	vdev->entity.flags = MEDIA_ENT_FL_DEFAULT;
+ 	vdev->v4l2_dev = &isp->v4l2_dev;
+ 	vdev->vfl_type = VFL_TYPE_VIDEO;

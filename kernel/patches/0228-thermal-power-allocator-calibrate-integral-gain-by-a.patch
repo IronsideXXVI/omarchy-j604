@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Tue, 20 Oct 2026 12:20:13 +1100
+Subject: [PATCH] thermal: power allocator: calibrate integral gain by an
+ optional time
+
+The default integral gain is estimated per iteration. Shortening a passive
+poll interval therefore increases the integral response per second, even
+when the numeric gain is unchanged. A faster sensor evaluation should not
+silently retune a calibrated controller.
+
+Read an optional integral-time-constant-ms zone parameter and derive k_i
+from k_pu and the effective passive interval. Retain the legacy estimate
+when the parameter is absent. Bound the derived gain to its supported
+positive range and document that sysfs k_i remains a per-iteration
+override.
+
+Add KUnit cases for unchanged legacy estimates, equal integrated correction
+at 500/250 ms with a five-second integral time, and gain saturation.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+Assisted-by: Claude:claude-opus-5.5
+---
+ .../driver-api/thermal/power_allocator.rst    | 10 ++++
+ drivers/thermal/Kconfig                       |  4 +-
+ drivers/thermal/gov_power_allocator.c         | 13 ++++-
+ drivers/thermal/gov_power_allocator_test.c    | 51 +++++++++++++++++++
+ drivers/thermal/thermal_of.c                  |  3 ++
+ include/linux/thermal.h                       |  3 ++
+ 6 files changed, 81 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/driver-api/thermal/power_allocator.rst b/Documentation/driver-api/thermal/power_allocator.rst
+index 1e05e15fd6..f95da4442e 100644
+--- a/Documentation/driver-api/thermal/power_allocator.rst
++++ b/Documentation/driver-api/thermal/power_allocator.rst
+@@ -177,6 +177,16 @@ stops at zero: the cutoff still prevents positive wind-up.  This lets the
+ power budget recover after a temperature overshoot without requiring the
+ zone to cool below its switch on temperature and reset the controller.
+ 
++The default estimate of `k_i` is `k_pu` divided by ten per iteration.  For
++polled zones, `integral-time-constant-ms` may instead specify the integral
++time relative to `k_pu`.  The estimate then scales with the passive polling
++period: `k_i = k_pu * passive_delay_ms / integral_time_constant_ms`, rounded
++down and bounded to the supported positive gain range.  For example, a
++5000 ms integral time retains the nominal gain per second when changing
++from 500 ms to 250 ms passive polling.  Zones without this property retain
++the existing estimate.  A sysfs override of `k_i` remains a per-iteration
++gain.
++
+ k_d
+ ---
+ 
+diff --git a/drivers/thermal/Kconfig b/drivers/thermal/Kconfig
+index 8aa41dd048..40c4be5354 100644
+--- a/drivers/thermal/Kconfig
++++ b/drivers/thermal/Kconfig
+@@ -180,8 +180,8 @@ config THERMAL_GOV_POWER_ALLOCATOR_KUNIT_TEST
+ 	default KUNIT_ALL_TESTS
+ 	help
+ 	  Test integral recovery after a temperature overshoot, the configured
+-	  integral cutoff and the integral power bound. The tests exercise the
+-	  PID controller with synthetic thermal zones and do not need hardware.
++	  integral cutoff, power bounds and polling-period gain calibration.
++	  The tests use synthetic thermal zones and do not need hardware.
+ 	  Only useful for kernel developers; say N unless testing the governor.
+ 
+ config CPU_THERMAL
+diff --git a/drivers/thermal/gov_power_allocator.c b/drivers/thermal/gov_power_allocator.c
+index ca3ffda42d..aaa2192dd5 100644
+--- a/drivers/thermal/gov_power_allocator.c
++++ b/drivers/thermal/gov_power_allocator.c
+@@ -8,6 +8,8 @@
+ 
+ #define pr_fmt(fmt) "Power allocator: " fmt
+ 
++#include <linux/limits.h>
++#include <linux/math64.h>
+ #include <linux/slab.h>
+ #include <linux/thermal.h>
+ 
+@@ -174,7 +176,16 @@ static void estimate_pid_constants(struct thermal_zone_device *tz,
+ 	tz->tzp->k_pu = int_to_frac(2 * sustainable_power) /
+ 		temperature_threshold;
+ 
+-	k_i = tz->tzp->k_pu / 10;
++	if (tz->tzp->integral_time_constant_ms && tz->passive_delay_jiffies) {
++		u64 gain = (u64)tz->tzp->k_pu *
++			   jiffies_to_msecs(tz->passive_delay_jiffies);
++
++		gain = div_u64(gain, tz->tzp->integral_time_constant_ms);
++		k_i = min_t(u64, gain, S32_MAX);
++	} else {
++		/* Preserve the existing estimate unless a time is supplied. */
++		k_i = tz->tzp->k_pu / 10;
++	}
+ 	tz->tzp->k_i = k_i > 0 ? k_i : 1;
+ 
+ 	/*
+diff --git a/drivers/thermal/gov_power_allocator_test.c b/drivers/thermal/gov_power_allocator_test.c
+index 2a0b6fbf87..6e48b3e00f 100644
+--- a/drivers/thermal/gov_power_allocator_test.c
++++ b/drivers/thermal/gov_power_allocator_test.c
+@@ -123,6 +123,54 @@ static void power_allocator_test_integral_bound(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, 0LL);
+ }
+ 
++static void power_allocator_test_legacy_gain(struct kunit *test)
++{
++	struct power_allocator_test_ctx *ctx = test->priv;
++	struct thermal_trip switch_on = { .temperature = 58000 };
++
++	/* Without an explicit time constant the per-poll estimate is unchanged. */
++	ctx->tz.passive_delay_jiffies = msecs_to_jiffies(500);
++	estimate_pid_constants(&ctx->tz, 1500, &switch_on, 95000);
++	KUNIT_EXPECT_EQ(test, ctx->tzp.k_i, 8);
++	ctx->tz.passive_delay_jiffies = msecs_to_jiffies(250);
++	estimate_pid_constants(&ctx->tz, 1500, &switch_on, 95000);
++	KUNIT_EXPECT_EQ(test, ctx->tzp.k_i, 8);
++}
++
++static void power_allocator_test_timed_gain(struct kunit *test)
++{
++	struct power_allocator_test_ctx *ctx = test->priv;
++	struct thermal_trip switch_on = { .temperature = 58000 };
++	u32 slow_budget;
++
++	ctx->tzp.integral_time_constant_ms = 5000;
++	ctx->tz.passive_delay_jiffies = msecs_to_jiffies(500);
++	estimate_pid_constants(&ctx->tz, 1500, &switch_on, 95000);
++	KUNIT_ASSERT_EQ(test, ctx->tzp.k_i, 8);
++	slow_budget = power_allocator_test_sample(test, 96000);
++
++	reset_pid_controller(&ctx->params);
++	ctx->tz.passive_delay_jiffies = msecs_to_jiffies(250);
++	estimate_pid_constants(&ctx->tz, 1500, &switch_on, 95000);
++	KUNIT_EXPECT_EQ(test, ctx->tzp.k_po, 41);
++	KUNIT_EXPECT_EQ(test, ctx->tzp.k_pu, 83);
++	KUNIT_ASSERT_EQ(test, ctx->tzp.k_i, 4);
++	/* Two fast samples integrate the same error as one slow sample. */
++	power_allocator_test_sample(test, 96000);
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 96000), slow_budget);
++}
++
++static void power_allocator_test_timed_gain_bound(struct kunit *test)
++{
++	struct power_allocator_test_ctx *ctx = test->priv;
++	struct thermal_trip switch_on = { .temperature = 58000 };
++
++	ctx->tzp.integral_time_constant_ms = 1;
++	ctx->tz.passive_delay_jiffies = msecs_to_jiffies(30000000);
++	estimate_pid_constants(&ctx->tz, 1500, &switch_on, 95000);
++	KUNIT_EXPECT_EQ(test, ctx->tzp.k_i, S32_MAX);
++}
++
+ static struct kunit_case power_allocator_test_cases[] = {
+ 	KUNIT_CASE(power_allocator_test_no_positive_windup),
+ 	KUNIT_CASE(power_allocator_test_hot_integrates),
+@@ -131,6 +179,9 @@ static struct kunit_case power_allocator_test_cases[] = {
+ 	KUNIT_CASE(power_allocator_test_positive_cutoff),
+ 	KUNIT_CASE(power_allocator_test_negative_cutoff),
+ 	KUNIT_CASE(power_allocator_test_integral_bound),
++	KUNIT_CASE(power_allocator_test_legacy_gain),
++	KUNIT_CASE(power_allocator_test_timed_gain),
++	KUNIT_CASE(power_allocator_test_timed_gain_bound),
+ 	{}
+ };
+ 
+diff --git a/drivers/thermal/thermal_of.c b/drivers/thermal/thermal_of.c
+index 100fd8a0c8..6e870d217d 100644
+--- a/drivers/thermal/thermal_of.c
++++ b/drivers/thermal/thermal_of.c
+@@ -207,6 +207,9 @@ static void thermal_of_parameters_init(struct device_node *np,
+ 	if (!of_property_read_u32(np, "sustainable-power", &prop))
+ 		tzp->sustainable_power = prop;
+ 
++	of_property_read_u32(np, "integral-time-constant-ms",
++			     &tzp->integral_time_constant_ms);
++
+ 	/*
+ 	 * For now, the thermal framework supports only one sensor per
+ 	 * thermal zone. Thus, we are considering only the first two
+diff --git a/include/linux/thermal.h b/include/linux/thermal.h
+index b4250b868a..ae83ddbb78 100644
+--- a/include/linux/thermal.h
++++ b/include/linux/thermal.h
+@@ -192,6 +192,9 @@ struct thermal_zone_params {
+ 	 * 		Used by thermal zone drivers (default 0).
+ 	 */
+ 	int offset;
++
++	/* Integral time relative to k_pu, in ms; 0 keeps the per-poll estimate. */
++	u32 integral_time_constant_ms;
+ };
+ 
+ /* Function declarations */

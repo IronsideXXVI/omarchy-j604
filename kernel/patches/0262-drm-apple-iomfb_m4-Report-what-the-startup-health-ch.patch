@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 6 Nov 2026 04:20:19 +0000
+Subject: [PATCH] drm/apple: iomfb_m4: Report what the startup health checks
+ cost
+
+Until the session is qualified, IOMFB startup is paced by the host's full
+health check, one per message sent to the DCP. Count those checks and keep
+their total, longest and latest duration, and print them with the startup
+time and in the iomfb_m4 debugfs status. A verify can then read the cost
+of one check and of the startup from the boot log, without a tracer.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/gpu/drm/apple/iomfb_m4.c | 28 ++++++++++++++++++++++++++--
+ 1 file changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 8fae10a894..f4bd4534e3 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -524,6 +524,9 @@ struct dcp_m4_runtime {
+ 	struct work_struct idle;
+ 	u64 queue[32];
+ 	u32 head, count, callbacks;
++	/* Cost of the full health check (startup paces on it until qualified). */
++	u32 health_checks;
++	u64 health_ns, health_max_ns, health_last_ns;
+ 	unsigned long deadline;
+ 	/* Hard cap of a progress-bounded call; 0: deadline is a fixed total. */
+ 	unsigned long limit;
+@@ -616,7 +619,7 @@ static int dcp_m4_runtime_next(struct dcp_m4_runtime *r, u64 *word, bool wait)
+ 	return ret;
+ }
+ 
+-static int dcp_m4_runtime_health(struct dcp_m4_runtime *r)
++static int __dcp_m4_runtime_health(struct dcp_m4_runtime *r)
+ {
+ 	struct iomfb_m4 *dcp = r->dcp;
+ 	int ret = READ_ONCE(dcp->error);
+@@ -631,6 +634,20 @@ static int dcp_m4_runtime_health(struct dcp_m4_runtime *r)
+ 	return ret;
+ }
+ 
++/* Callers hold dcp->lock; the counters are statistics for the log and debugfs. */
++static int dcp_m4_runtime_health(struct dcp_m4_runtime *r)
++{
++	ktime_t start = ktime_get();
++	int ret = __dcp_m4_runtime_health(r);
++	u64 ns = ktime_to_ns(ktime_sub(ktime_get(), start));
++
++	r->health_checks++;
++	r->health_ns += ns;
++	r->health_last_ns = ns;
++	r->health_max_ns = max(r->health_max_ns, ns);
++	return ret;
++}
++
+ /*
+  * Full DART/PMP/CPU qualification runs through startup and KMS creation. After
+  * that, per-message, per-swap and per-frame checks are only the failure latch;
+@@ -1123,7 +1140,9 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
+ 	smp_store_release(&r->done, true);
+ 	dev_info(dev, "IOMFB startup complete: %u callbacks, %ux%u at %u kHz; no modeset\n",
+ 		 r->callbacks, r->timing.hdisplay, r->timing.vdisplay, r->timing.clock_khz);
+-	dev_info(dev, "IOMFB startup took %lld ms\n", ktime_ms_delta(ktime_get(), start));
++	dev_info(dev, "IOMFB startup took %lld ms (%u health checks, %llu us total, max %llu us)\n",
++		 ktime_ms_delta(ktime_get(), start), r->health_checks,
++		 div_u64(r->health_ns, NSEC_PER_USEC), div_u64(r->health_max_ns, NSEC_PER_USEC));
+ 	ret = 0;
+ 	goto out;
+ failed:
+@@ -1820,6 +1839,11 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
+ 		   dcp->display_off, dcp->display_off_cycles,
+ 		   dcp->display_off_us, dcp->display_off_us_max,
+ 		   dcp->display_on_us, dcp->display_on_us_max);
++	if (r)
++		seq_printf(s, "health_checks=%u health_us=%llu max_us=%llu last_us=%llu\n",
++			   r->health_checks, div_u64(r->health_ns, NSEC_PER_USEC),
++			   div_u64(r->health_max_ns, NSEC_PER_USEC),
++			   div_u64(r->health_last_ns, NSEC_PER_USEC));
+ 	if (r)
+ 		seq_printf(s, "idle_cache=%u state=%u fences=%u registered=%u entries=%llu\n",
+ 			   !r->idle_unavailable && READ_ONCE(idle_cache_ms), r->idle_state,

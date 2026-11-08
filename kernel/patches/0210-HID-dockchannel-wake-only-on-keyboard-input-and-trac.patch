@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Goyvaerts <jonathan.goyvaerts@gmail.com>
+Date: Wed, 21 Oct 2026 14:44:34 -0300
+Subject: [PATCH] HID: dockchannel: wake only on keyboard input and trackpad
+ clicks
+
+Any frame from the MTP woke the system from suspend-to-idle, because the
+FIFO's receive interrupt was the wake interrupt. On the J616s a real
+s2idle ended 3 ms after it began ("Triggering wakeup from IRQ 74"), most
+likely on the answer to the LED report the input core sends while it
+suspends the keyboard. Resting fingers, the trackpad accelerometer and
+the other interfaces would do the same.
+
+Add system sleep PM ops that mark the sleep window. Within it, a
+received input report wakes the system with pm_wakeup_hard_event() only
+when it is a keyboard report or a multi-touch report with the firmware's
+button bit set, so a keypress or a trackpad click still wakes the
+machine. pm_wakeup_hard_event() does nothing while wakeup is disabled
+for the device in sysfs.
+
+Requests from the HID core fail with -EBUSY in that window instead of
+waiting up to a second for an answer: the LED report above timed out in
+suspend-to-idle once the link's interrupt was disabled.
+
+The coprocessor itself keeps running. No sleep command for it is known,
+and neither its RTKit session nor the trackpad AFE power sequence can be
+restarted, so the keyboard must not be put down.
+
+Signed-off-by: Jonathan Goyvaerts <jonathan.goyvaerts@gmail.com>
+Assisted-by: LLM
+
+(cherry picked from commit d5ba9ed25aa33bc3863a0493fedceacc44ae821e)
+[dylan: ported by hand onto the omacom receive path, which has no ring
+ transport and no dchid_dispatch(): the wake check sits in the
+ DCHID_CHANNEL_REPORT case of dchid_handle_packet() and reads the frame
+ from pkt_buf; it also checks that the frame holds a whole subheader
+ before reading its length. Needed with "soc: apple: dockchannel: keep
+ receiving through system sleep": without both, any MTP frame ends a
+ suspend-to-idle on the J604 (CODE: base arms the FIFO receive IRQ as
+ the wake IRQ). J604 multi-touch report 0x75 / byte 23 button bit:
+ TO-VERIFY on the J604.]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/hid/dockchannel-hid/dockchannel-hid.c | 71 +++++++++++++++++--
+ 1 file changed, 67 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/hid/dockchannel-hid/dockchannel-hid.c b/drivers/hid/dockchannel-hid/dockchannel-hid.c
+index a0af190a9b..80d96ebac9 100644
+--- a/drivers/hid/dockchannel-hid/dockchannel-hid.c
++++ b/drivers/hid/dockchannel-hid/dockchannel-hid.c
+@@ -13,6 +13,7 @@
+ #include <linux/gpio/consumer.h>
+ #include <linux/hid.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_wakeup.h>
+ #include <linux/slab.h>
+ #include <linux/soc/apple/dockchannel.h>
+ #include <linux/soc/apple/rtkit-helper.h>
+@@ -107,6 +108,10 @@ struct dchid_gpio_ack {
+ 	u8 cmd[];
+ } __packed;
+ 
++/* Multi-touch report 0x75: byte 23 bit 0 is the firmware's button state. */
++#define MT_REPORT_ID		0x75
++#define MT_REPORT_BUTTON	23
++
+ #define STM_REPORT_ID		0x10
+ #define STM_REPORT_SERIAL	0x11
+ #define STM_REPORT_KEYBTYPE	0x14
+@@ -187,6 +192,8 @@ struct dockchannel_hid {
+ 	struct device_link *helper_link;
+ 	bool stopping;
+ 	bool inherited_mtp;
++	/* Between the system sleep suspend and resume callbacks */
++	bool suspended;
+ 
+ 	/* Held from probe on when the multi-touch interface uses power method 2 */
+ 	struct gpio_desc *afe_reset;
+@@ -742,6 +749,9 @@ static int dchid_raw_request(struct hid_device *hdev,
+ 
+ 	if (READ_ONCE(iface->dchid->stopping))
+ 		return -ESHUTDOWN;
++	/* Fail fast: an answer that arrives in suspend-to-idle is not waited for. */
++	if (READ_ONCE(iface->dchid->suspended))
++		return -EBUSY;
+ 
+ 	switch (reqtype) {
+ 	case HID_REQ_GET_REPORT:
+@@ -1205,6 +1215,25 @@ static void dchid_handle_ack(struct dchid_iface *iface, struct dchid_hdr *hdr, v
+ 	complete(&iface->out_complete);
+ }
+ 
++/*
++ * Whether a report should wake the system: any keyboard report, and a
++ * multi-touch report only while the trackpad is clicked. Touches, the
++ * accelerometer and the other interfaces do not wake it.
++ */
++static bool dchid_wake_report(struct dchid_iface *iface, void *data)
++{
++	struct dchid_subhdr *shdr = data;
++	u8 *payload = data + sizeof(*shdr);
++
++	if (FIELD_GET(FLAGS_GROUP, shdr->flags) != HID_INPUT_REPORT)
++		return false;
++	if (!strcmp(iface->name, "keyboard"))
++		return shdr->length > 0;
++	return !strcmp(iface->name, "multi-touch") &&
++	       shdr->length > MT_REPORT_BUTTON && payload[0] == MT_REPORT_ID &&
++	       (payload[MT_REPORT_BUTTON] & 1);
++}
++
+ static void dchid_handle_packet(void *cookie, size_t avail)
+ {
+ 	struct dockchannel_hid *dchid = cookie;
+@@ -1255,6 +1284,13 @@ static void dchid_handle_packet(void *cookie, size_t avail)
+ 			dchid_handle_ack(iface, &hdr, dchid->pkt_buf);
+ 			goto done;
+ 		case DCHID_CHANNEL_REPORT:
++			/* pm_wakeup_hard_event() does nothing while wakeup is disabled. */
++			if (READ_ONCE(dchid->suspended) &&
++			    hdr.length >= sizeof(struct dchid_subhdr) &&
++			    hdr.length >= sizeof(struct dchid_subhdr) +
++					  ((struct dchid_subhdr *)dchid->pkt_buf)->length &&
++			    dchid_wake_report(iface, dchid->pkt_buf))
++				pm_wakeup_hard_event(dchid->dev);
+ 			break;
+ 		default:
+ 			dev_warn(dchid->dev, "Unknown channel 0x%x, treating as report...\n",
+@@ -1408,10 +1444,11 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	/*
+-	 * Keyboard and trackpad input wakes the system. The coprocessor keeps
+-	 * running across suspend-to-idle and keeps sending reports through
+-	 * the FIFO, so its receive interrupt is the wake interrupt. Without
+-	 * it the machine still works, it just cannot be woken from here.
++	 * A keypress or a trackpad click wakes the system. The coprocessor
++	 * keeps running across suspend-to-idle and keeps sending through the
++	 * FIFO, so received frames are classified (dchid_wake_report()) and
++	 * other traffic does not wake it. Without a wakeup source the machine
++	 * still works, it just cannot be woken from here.
+ 	 */
+ 	ret = dockchannel_init_wakeup(dchid->dc);
+ 	if (ret)
+@@ -1465,6 +1502,31 @@ static void dockchannel_hid_remove(struct platform_device *pdev)
+ 	}
+ }
+ 
++/*
++ * The coprocessor keeps running across suspend-to-idle: there is no known
++ * sleep command for it, and its RTKit session and the trackpad AFE power
++ * sequence are not restartable. Only mark the sleep window, in which input
++ * may wake the system and requests from the HID core fail fast.
++ */
++static int dockchannel_hid_suspend(struct device *dev)
++{
++	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
++
++	WRITE_ONCE(dchid->suspended, true);
++	return 0;
++}
++
++static int dockchannel_hid_resume(struct device *dev)
++{
++	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
++
++	WRITE_ONCE(dchid->suspended, false);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(dockchannel_hid_pm_ops, dockchannel_hid_suspend,
++				dockchannel_hid_resume);
++
+ static const struct of_device_id dockchannel_hid_of_match[] = {
+ 	{ .compatible = "apple,dockchannel-hid" },
+ 	{},
+@@ -1478,6 +1540,7 @@ static struct platform_driver dockchannel_hid_driver = {
+ 		.of_match_table = dockchannel_hid_of_match,
+ 		/* The coprocessor announces its interfaces only once per boot. */
+ 		.suppress_bind_attrs = true,
++		.pm = pm_sleep_ptr(&dockchannel_hid_pm_ops),
+ 	},
+ 	.probe = dockchannel_hid_probe,
+ 	.remove = dockchannel_hid_remove,

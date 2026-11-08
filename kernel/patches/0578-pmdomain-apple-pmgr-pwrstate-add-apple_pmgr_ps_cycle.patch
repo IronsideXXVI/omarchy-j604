@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 16:08:43 +1100
+Subject: [PATCH] pmdomain: apple: pmgr-pwrstate: add apple_pmgr_ps_cycle()
+
+A coprocessor can stop in a state that only a power-off of its domain
+clears, while other devices in that domain hold it on at runtime. The
+ANE on the J616s (T6041) is one: its firmware sometimes stops part way
+through startup, and its DARTs keep the ANE sys domain on. A runtime
+power cycle of the four ANE subdomains does not clear the stop, while
+system sleep, which also turns the sys domain off, does.
+
+Add apple_pmgr_ps_cycle(), which power gates a domain and turns it on
+again without changing genpd's view of it. The caller owns every device
+in the domain and keeps them idle, and every subdomain must already be
+off. Domains owned by firmware or inherited on are refused.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+(cherry picked from commit 06c0dfac69d2418258aa85cf08943044df1dd268)
+[j604: this base has neither the inherited-on state (3949e3640d) nor
+ apple,no-auto-enable (332eea1e90), both J713 PMGR policy; refuse only
+ firmware-owned domains and re-enable auto PM unless apple,no-auto-pm]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+
+[j604-int: 1.610 int onto the 1.609 head ad65e865a7: include/linux/soc/apple/pmgr-pwrstate.h was added on both
+ sides (1.609 9326b94e2e: the consumer-switched chain API; this commit: apple_pmgr_ps_cycle()). Kept the union: both APIs,
+ struct device + struct device_node, linux/errno.h. pmgr-pwrstate.c merged without conflict.]
+
+---
+ drivers/pmdomain/apple/pmgr-pwrstate.c  | 55 +++++++++++++++++++++++++
+ include/linux/soc/apple/pmgr-pwrstate.h |  5 +++
+ 2 files changed, 60 insertions(+)
+
+diff --git a/drivers/pmdomain/apple/pmgr-pwrstate.c b/drivers/pmdomain/apple/pmgr-pwrstate.c
+index ed8522b405..c2bbff4ec8 100644
+--- a/drivers/pmdomain/apple/pmgr-pwrstate.c
++++ b/drivers/pmdomain/apple/pmgr-pwrstate.c
+@@ -221,6 +221,61 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
+ 	return ret;
+ }
+ 
++/**
++ * apple_pmgr_ps_cycle() - power gate a domain and turn it on again
++ * @np: the power state node, as named by a consumer's power-domains
++ *
++ * For a coprocessor that can stop in a state only a power-off of this domain
++ * clears, while other devices in the domain (its DARTs) hold it on at
++ * runtime. The caller owns every device in the domain and keeps them idle;
++ * every subdomain must already be off. genpd's view does not change: the
++ * domain is on before and after, as is its automatic power management.
++ *
++ * Return: 0, -EBUSY if a subdomain is on, -EPERM for a domain Linux does not
++ * own, -EINVAL if the domain is off, or the error of a failed transition.
++ */
++int apple_pmgr_ps_cycle(struct device_node *np)
++{
++	struct platform_device *pdev = of_find_device_by_node(np);
++	struct apple_pmgr_ps *ps;
++	struct gpd_link *link;
++	unsigned long flags;
++	int ret, on;
++
++	if (!pdev)
++		return -ENODEV;
++	ps = platform_get_drvdata(pdev);
++	if (!ps) {
++		ret = -EPROBE_DEFER;
++		goto out;
++	}
++	if (ps->firmware_owned) {
++		ret = -EPERM;
++		goto out;
++	}
++
++	spin_lock_irqsave(&ps->genpd.slock, flags);
++	if (ps->genpd.status != GENPD_STATE_ON) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++	list_for_each_entry(link, &ps->genpd.parent_links, parent_node) {
++		if (link->child->status == GENPD_STATE_ON) {
++			ret = -EBUSY;
++			goto unlock;
++		}
++	}
++	ret = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_PWRGATE, false);
++	on = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_ACTIVE, !ps->no_auto_pm);
++	ret = ret ?: on;
++unlock:
++	spin_unlock_irqrestore(&ps->genpd.slock, flags);
++out:
++	put_device(&pdev->dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_pmgr_ps_cycle);
++
+ static void apple_pmgr_ps_set_system_sleep(struct device *dev, bool sleep)
+ {
+ 	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
+diff --git a/include/linux/soc/apple/pmgr-pwrstate.h b/include/linux/soc/apple/pmgr-pwrstate.h
+index b4c3b68448..18f3c4e079 100644
+--- a/include/linux/soc/apple/pmgr-pwrstate.h
++++ b/include/linux/soc/apple/pmgr-pwrstate.h
+@@ -2,7 +2,10 @@
+ #ifndef __LINUX_SOC_APPLE_PMGR_PWRSTATE_H
+ #define __LINUX_SOC_APPLE_PMGR_PWRSTATE_H
+ 
++#include <linux/errno.h>
++
+ struct device;
++struct device_node;
+ 
+ #if IS_ENABLED(CONFIG_APPLE_PMGR_PWRSTATE)
+ /*
+@@ -15,10 +18,12 @@ struct device;
+ int apple_pmgr_ps_consumer_check(struct device *consumer);
+ int apple_pmgr_ps_consumer_off(struct device *consumer);
+ int apple_pmgr_ps_consumer_on(struct device *consumer);
++int apple_pmgr_ps_cycle(struct device_node *np);
+ #else
+ static inline int apple_pmgr_ps_consumer_check(struct device *consumer) { return -EOPNOTSUPP; }
+ static inline int apple_pmgr_ps_consumer_off(struct device *consumer) { return -EOPNOTSUPP; }
+ static inline int apple_pmgr_ps_consumer_on(struct device *consumer) { return -EOPNOTSUPP; }
++static inline int apple_pmgr_ps_cycle(struct device_node *np) { return -EOPNOTSUPP; }
+ #endif
+ 
+ #endif

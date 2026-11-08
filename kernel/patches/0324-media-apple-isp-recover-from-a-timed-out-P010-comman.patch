@@ -1,0 +1,461 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Fri, 30 Oct 2026 02:38:11 +0000
+Subject: [PATCH] media: apple: isp: recover from a timed-out P010 command
+
+A P010 command or buffer batch that timed out set ipc_failed. From then
+on every command failed with -EIO, and stopping the stream halted the
+coprocessor. T6040 firmware is resident and cannot be started again, so
+one timeout left the camera unusable until the next system boot.
+
+The latch guards against a real race. A timed-out request still owns
+its ring slot, and every request on the IO and BUF_H2T rings carries the
+same arg0, the command area address. A late answer would be taken for
+the answer to the next request written to that slot, and the firmware
+would then expect that request in the following slot. The next request
+would also overwrite the command area while the firmware may still read
+the old one.
+
+Keep the timed-out channel in ipc_stale instead. Before anything else
+writes the command area or a ring, isp_ipc_resync() rings the doorbell
+once more and waits up to one second for the late answer. If it comes,
+it is consumed, the cursor moves on and the ring is in step again, so
+the next command and the next stream work. If it does not, ipc_failed
+is set as before and the stream stop halts the firmware before its
+buffer leases are released. Both outcomes are logged once.
+
+Stopping the camera resolves a pending timeout the same way before it
+frees anything the firmware may still use. A buffer batch that timed
+out in buf_queue now errors the queue and keeps its leases until the
+stream stops, instead of halting the firmware straight away. An
+answered but malformed reply leaves the ring in step, so it fails only
+its own command. A fresh firmware boot clears both flags.
+
+Add KUnit cases for a late answer, for no answer at all and for a late
+ACK that must not answer the next request.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(cherry picked from commit 504cb5d4f20cdef8e550a3c12dd12635ca248f8d)
+---
+ .../media/platform/apple/isp/isp-cam-test.c   | 25 ++++---
+ drivers/media/platform/apple/isp/isp-cam.c    | 13 ++--
+ drivers/media/platform/apple/isp/isp-cmd.c    | 12 ++--
+ drivers/media/platform/apple/isp/isp-drv.h    | 12 +++-
+ drivers/media/platform/apple/isp/isp-fw.c     |  5 ++
+ .../media/platform/apple/isp/isp-ipc-test.c   | 70 +++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-ipc.c    | 55 ++++++++++++++-
+ drivers/media/platform/apple/isp/isp-ipc.h    |  1 +
+ drivers/media/platform/apple/isp/isp-v4l2.c   | 26 +++++--
+ 9 files changed, 192 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam-test.c b/drivers/media/platform/apple/isp/isp-cam-test.c
+index 27c9e23f34..0d699add95 100644
+--- a/drivers/media/platform/apple/isp/isp-cam-test.c
++++ b/drivers/media/platform/apple/isp/isp-cam-test.c
+@@ -292,7 +292,7 @@ static int isp_test_ack_reply(struct apple_isp *isp, struct isp_channel *chan,
+ 	return 0;
+ }
+ 
+-static void isp_test_command_ack_failure_latches(struct kunit *test)
++static void isp_test_command_ack_failures(struct kunit *test)
+ {
+ 	struct apple_isp *isp = isp_test_capture_alloc(test);
+ 	struct isp_test_ack_state state = {};
+@@ -307,19 +307,28 @@ static void isp_test_command_ack_failure_latches(struct kunit *test)
+ 	kunit_activate_static_stub(test, ipc_chan_send, isp_test_ack_reply);
+ 	KUNIT_EXPECT_EQ(test, isp_cmd_ch_camera_config_select(isp, 0, 5), 0);
+ 	for (state.fault = 1; state.fault <= 4; state.fault++) {
+-		isp->ipc_failed = false;
++		unsigned int fault = state.fault;
++
+ 		state.calls = 0;
+ 		KUNIT_EXPECT_EQ(test, isp_cmd_ch_camera_config_select(isp, 0, 5),
+-				state.fault == 4 ? -ETIME : -EIO);
+-		KUNIT_EXPECT_TRUE(test, isp->ipc_failed);
+-		/* A late ACK cannot admit another command on an uncertain slot. */
+-		KUNIT_EXPECT_EQ(test, isp_cmd_ch_camera_config_select(isp, 0, 5), -EIO);
+-		KUNIT_EXPECT_EQ(test, state.calls, 1);
++				fault == 4 ? -ETIME : -EIO);
++		/* A failed command does not take the next one with it. */
++		KUNIT_EXPECT_FALSE(test, isp->ipc_failed);
++		state.fault = 0;
++		KUNIT_EXPECT_EQ(test, isp_cmd_ch_camera_config_select(isp, 0, 5), 0);
++		KUNIT_EXPECT_EQ(test, state.calls, 2);
++		state.fault = fault;
+ 	}
++
++	/* Firmware that never answered gets no further command. */
++	isp->ipc_failed = true;
++	state.calls = 0;
++	KUNIT_EXPECT_EQ(test, isp_cmd_ch_camera_config_select(isp, 0, 5), -EIO);
++	KUNIT_EXPECT_EQ(test, state.calls, 0);
+ }
+ 
+ static struct kunit_case isp_cam_test_cases[] = {
+-	KUNIT_CASE(isp_test_command_ack_failure_latches),
++	KUNIT_CASE(isp_test_command_ack_failures),
+ 	KUNIT_CASE(isp_test_sensor_geometry),
+ 	KUNIT_CASE(isp_test_sensor_config_list),
+ 	KUNIT_CASE(isp_test_sensor_config_failure),
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index a5cbb2b4d8..aa9dd05280 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -8,6 +8,7 @@
+ #include "isp-cmd.h"
+ #include "isp-fw.h"
+ #include "isp-iommu.h"
++#include "isp-ipc.h"
+ #include "isp-regs.h"
+ 
+ struct isp_setfile {
+@@ -760,10 +761,7 @@ int apple_isp_start_camera(struct apple_isp *isp)
+ 	err = isp_configure_capture(isp);
+ 	if (err) {
+ 		dev_err(isp->dev, "failed to configure capture: %d\n", err);
+-		if (isp->ipc_failed)
+-			apple_isp_firmware_halt(isp);
+-		else
+-			apple_isp_firmware_shutdown(isp);
++		apple_isp_stop_camera(isp);
+ 		return err;
+ 	}
+ 
+@@ -772,7 +770,12 @@ int apple_isp_start_camera(struct apple_isp *isp)
+ 
+ void apple_isp_stop_camera(struct apple_isp *isp)
+ {
+-	if (isp->ipc_failed)
++	/*
++	 * A timed-out request is resolved before anything the firmware may
++	 * still use for it is released. Firmware that does not answer even
++	 * late is stopped first.
++	 */
++	if (isp_ipc_resync(isp))
+ 		apple_isp_firmware_halt(isp);
+ 	else
+ 		apple_isp_firmware_shutdown(isp);
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.c b/drivers/media/platform/apple/isp/isp-cmd.c
+index a525e68c23..e1670aea79 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.c
++++ b/drivers/media/platform/apple/isp/isp-cmd.c
+@@ -31,8 +31,10 @@ int isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize, int
+ #if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
+ 	KUNIT_STATIC_STUB_REDIRECT(isp_cmd_send, isp, args, insize, outsize, timeout);
+ #endif
+-	if (isp->ipc_failed)
+-		return -EIO;
++	/* Before the command area is overwritten */
++	err = isp_ipc_resync(isp);
++	if (err)
++		return err;
+ 	chan = isp->chan_io;
+ 	req = &chan->req;
+ 
+@@ -42,6 +44,10 @@ int isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize, int
+ 
+ 	memcpy(isp->cmd_virt, args, insize);
+ 	err = ipc_chan_send(isp, chan, timeout);
++	/*
++	 * An answered request leaves the ring in step, so a malformed answer
++	 * fails only this command. A timeout is resolved before the next one.
++	 */
+ 	if (isp_is_p010(isp)) {
+ 		struct isp_message *rsp = &chan->rsp;
+ 
+@@ -50,8 +56,6 @@ int isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize, int
+ 		     rsp->arg4 || rsp->arg5 || rsp->arg6 || rsp->arg7 ||
+ 		     get_unaligned_le64(isp->cmd_virt) != get_unaligned_le64(args)))
+ 			err = -EIO;
+-		if (err)
+-			isp->ipc_failed = true;
+ 	}
+ 	if (err) {
+ 		u64 opcode;
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 34560fe986..a5173be862 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -378,7 +378,17 @@ struct apple_isp {
+ 	struct list_head bufs_returned;
+ 	u64 buffer_tag;
+ 	unsigned long meta_returned;
+-	/* A timed-out command leaves slot ownership ambiguous until reboot. */
++	/*
++	 * The channel of a timed-out request that has not been answered yet,
++	 * see isp_ipc_resync(). Sends are serialized by the callers, which
++	 * share the command area.
++	 */
++	struct isp_channel *ipc_stale;
++	/*
++	 * Not even a late answer came, so where the firmware is in the ring
++	 * is unknown. Nothing is sent until the firmware is stopped, and
++	 * resident firmware cannot be started again before the next boot.
++	 */
+ 	bool ipc_failed;
+ };
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-fw.c b/drivers/media/platform/apple/isp/isp-fw.c
+index d448225fce..22dbf99a4c 100644
+--- a/drivers/media/platform/apple/isp/isp-fw.c
++++ b/drivers/media/platform/apple/isp/isp-fw.c
+@@ -1060,6 +1060,10 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
+ 		return -EIO;
+ 	}
+ 
++	/* The firmware starts with new rings. */
++	isp->ipc_stale = NULL;
++	isp->ipc_failed = false;
++
+ 	/* Needs to be power cycled for IOMMU to behave correctly */
+ 	err = pm_runtime_resume_and_get(isp->dev);
+ 	if (err < 0) {
+@@ -1111,5 +1115,6 @@ void apple_isp_firmware_halt(struct apple_isp *isp)
+ 
+ 	isp_firmware_shutdown(isp);
+ 	pm_runtime_put_sync(isp->dev);
++	isp->ipc_stale = NULL;
+ 	isp->fw_state = isp->hw->resident_fw ? ISP_FW_DEAD : ISP_FW_OFF;
+ }
+diff --git a/drivers/media/platform/apple/isp/isp-ipc-test.c b/drivers/media/platform/apple/isp/isp-ipc-test.c
+index caa9e92f73..d7ca456055 100644
+--- a/drivers/media/platform/apple/isp/isp-ipc-test.c
++++ b/drivers/media/platform/apple/isp/isp-ipc-test.c
+@@ -188,6 +188,74 @@ static void isp_test_late_ack_keeps_cursor(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, t->chan->cursor, 1);
+ }
+ 
++/* A P010 command ring whose slots and doorbell are plain memory */
++static struct isp_message *isp_test_command_ring(struct kunit *test,
++						 struct isp_sm_test *t)
++{
++	struct isp_channel *chan = t->chan;
++	struct isp_message *slots;
++
++	t->isp->mbox2 = (__force void __iomem *)
++		kunit_kzalloc(test, ISP_MBOX2_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, (__force void *)t->isp->mbox2);
++	init_waitqueue_head(&t->isp->wait);
++	isp_get_current_format(t->isp)->pixelformat = V4L2_PIX_FMT_P010;
++
++	chan->name = "IO";
++	chan->num = 8;
++	chan->doorbell = 1;
++	chan->virt = kunit_kcalloc(test, chan->num, sizeof(*slots), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, chan->virt);
++	chan->req.arg0 = 0x5000000;
++
++	return chan->virt;
++}
++
++static void isp_test_timeout_late_answer(struct kunit *test)
++{
++	struct isp_sm_test *t = isp_sm_test_alloc(test);
++	struct isp_message *slots = isp_test_command_ring(test, t);
++	struct isp_channel *chan = t->chan;
++
++	KUNIT_EXPECT_EQ(test, ipc_chan_send(t->isp, chan, 1), -ETIME);
++	KUNIT_EXPECT_PTR_EQ(test, t->isp->ipc_stale, chan);
++	KUNIT_EXPECT_FALSE(test, t->isp->ipc_failed);
++	KUNIT_EXPECT_EQ(test, chan->cursor, 0);
++
++	/* The answer comes after the deadline and is consumed by the resync. */
++	slots[0].arg0 |= ISP_IPC_FLAG_ACK;
++	KUNIT_EXPECT_EQ(test, isp_ipc_resync(t->isp), 0);
++	KUNIT_EXPECT_NULL(test, t->isp->ipc_stale);
++	KUNIT_EXPECT_EQ(test, chan->cursor, 1);
++
++	/* The next request takes the next slot; the old ACK does not answer it. */
++	KUNIT_EXPECT_EQ(test, ipc_chan_send(t->isp, chan, 1), -ETIME);
++	KUNIT_EXPECT_EQ(test, slots[1].arg0, chan->req.arg0);
++	KUNIT_EXPECT_EQ(test, chan->cursor, 1);
++	slots[1].arg0 |= ISP_IPC_FLAG_ACK;
++	KUNIT_EXPECT_EQ(test, isp_ipc_resync(t->isp), 0);
++	KUNIT_EXPECT_EQ(test, chan->cursor, 2);
++	KUNIT_EXPECT_FALSE(test, t->isp->ipc_failed);
++}
++
++static void isp_test_timeout_no_answer(struct kunit *test)
++{
++	struct isp_sm_test *t = isp_sm_test_alloc(test);
++	struct isp_message *slots = isp_test_command_ring(test, t);
++	struct isp_channel *chan = t->chan;
++
++	KUNIT_EXPECT_EQ(test, ipc_chan_send(t->isp, chan, 1), -ETIME);
++	KUNIT_EXPECT_EQ(test, isp_ipc_resync(t->isp), -EIO);
++	KUNIT_EXPECT_TRUE(test, t->isp->ipc_failed);
++	KUNIT_EXPECT_NULL(test, t->isp->ipc_stale);
++
++	/* An answer after the resync gave up admits nothing. */
++	slots[0].arg0 |= ISP_IPC_FLAG_ACK;
++	KUNIT_EXPECT_EQ(test, ipc_chan_send(t->isp, chan, 1), -EIO);
++	KUNIT_EXPECT_EQ(test, isp_ipc_resync(t->isp), -EIO);
++	KUNIT_EXPECT_EQ(test, chan->cursor, 0);
++}
++
+ static void isp_test_message_payload_copy(struct kunit *test)
+ {
+ 	struct isp_sm_test *t = isp_sm_test_alloc(test);
+@@ -206,6 +274,8 @@ static void isp_test_message_payload_copy(struct kunit *test)
+ static struct kunit_case isp_ipc_test_cases[] = {
+ 	KUNIT_CASE(isp_test_message_payload_copy),
+ 	KUNIT_CASE(isp_test_late_ack_keeps_cursor),
++	KUNIT_CASE(isp_test_timeout_late_answer),
++	KUNIT_CASE(isp_test_timeout_no_answer),
+ 	KUNIT_CASE(isp_test_command_ring_wrap),
+ 	KUNIT_CASE(isp_test_sm_free_releases),
+ 	KUNIT_CASE(isp_test_sm_free_alias),
+diff --git a/drivers/media/platform/apple/isp/isp-ipc.c b/drivers/media/platform/apple/isp/isp-ipc.c
+index 74cc717ead..7b4dddf892 100644
+--- a/drivers/media/platform/apple/isp/isp-ipc.c
++++ b/drivers/media/platform/apple/isp/isp-ipc.c
+@@ -14,6 +14,8 @@
+ /* longer firmware log lines are cut */
+ #define ISP_IPC_TERMINAL_MAX_LEN	512
+ #define ISP_IPC_BUFEXC_STAT_META_OFFSET 0x10
++/* how much longer a timed-out request may take to be answered */
++#define ISP_IPC_RESYNC_TIMEOUT		msecs_to_jiffies(1000)
+ 
+ struct isp_sm_deferred_work {
+ 	struct work_struct work;
+@@ -192,16 +194,62 @@ static inline bool chan_tx_done(struct apple_isp *isp, struct isp_channel *chan)
+ 	return false;
+ }
+ 
++/*
++ * A request that timed out still owns its slot, and the firmware may answer
++ * it late. That answer must not be taken for the answer to the next request,
++ * which goes in the same slot with the same arg0, and the next request must
++ * not overwrite the command area while the firmware may still read the old
++ * one. So before anything else is written, wait once more for the late
++ * answer, for a bounded time, and consume it; the ring is then in step again.
++ * If it has not come yet, the doorbell is rung again in case the first one
++ * was missed. IO and DEBUG share a doorbell bit, so the firmware already
++ * copes with a doorbell that brings no new request. If the firmware still
++ * does not answer, where it is in the ring is unknown and nothing more is
++ * sent until it is stopped.
++ */
++int isp_ipc_resync(struct apple_isp *isp)
++{
++	struct isp_channel *chan = isp->ipc_stale;
++
++	if (isp->ipc_failed)
++		return -EIO;
++	if (!chan)
++		return 0;
++
++	isp->ipc_stale = NULL;
++	chan->deadline_active = false;
++	if (!chan_tx_done(isp, chan)) {
++		isp_mbox2_write32(isp, ISP_MBOX2_IRQ_DOORBELL, chan->doorbell);
++		if (!wait_event_timeout(isp->wait, chan_tx_done(isp, chan),
++					ISP_IPC_RESYNC_TIMEOUT)) {
++			isp->ipc_failed = true;
++			dev_err(isp->dev,
++				"%s: no answer to the timed-out request, sending no more commands\n",
++				chan->name);
++			return -EIO;
++		}
++	}
++
++	dev_warn(isp->dev,
++		 "%s: timed-out request answered late, channel back in step\n",
++		 chan->name);
++
++	return 0;
++}
++
+ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
+ 		  unsigned long timeout)
+ {
+ 	long t;
++	int err;
+ 
+ #if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
+ 	KUNIT_STATIC_STUB_REDIRECT(ipc_chan_send, isp, chan, timeout);
+ #endif
+-	if (isp->ipc_failed)
+-		return -EIO;
++	/* Callers that fill the command area resync before doing so. */
++	err = isp_ipc_resync(isp);
++	if (err)
++		return err;
+ 	if (isp_is_p010(isp) && timeout) {
+ 		chan->deadline = jiffies + timeout;
+ 		chan->deadline_active = true;
+@@ -216,8 +264,9 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
+ 
+ 	t = wait_event_timeout(isp->wait, chan_tx_done(isp, chan), timeout);
+ 	if (t == 0) {
++		/* Resolved before the next request, see isp_ipc_resync(). */
+ 		if (isp_is_p010(isp))
+-			isp->ipc_failed = true;
++			isp->ipc_stale = chan;
+ 		dev_err(isp->dev,
+ 			"%s: timed out on request [0x%llx, 0x%llx, 0x%llx]\n",
+ 			chan->name, chan->req.arg0, chan->req.arg1,
+diff --git a/drivers/media/platform/apple/isp/isp-ipc.h b/drivers/media/platform/apple/isp/isp-ipc.h
+index 7bc95a2005..0c93100020 100644
+--- a/drivers/media/platform/apple/isp/isp-ipc.h
++++ b/drivers/media/platform/apple/isp/isp-ipc.h
+@@ -21,6 +21,7 @@
+ int ipc_chan_handle(struct apple_isp *isp, struct isp_channel *chan);
+ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
+ 		  unsigned long timeout);
++int isp_ipc_resync(struct apple_isp *isp);
+ 
+ int ipc_tm_handle(struct apple_isp *isp, struct isp_channel *chan);
+ int ipc_sm_handle(struct apple_isp *isp, struct isp_channel *chan);
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index ff0133e34d..87f28169e0 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -196,6 +196,11 @@ static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
+ 	struct isp_buflist *bl = isp->cmd_virt;
+ 	struct isp_buflist_buffer *bufd = &bl->buffers[0];
+ 
++	/* Before the command area is overwritten */
++	err = isp_ipc_resync(isp);
++	if (err)
++		return err;
++
+ 	/* Clear what earlier commands and batches left in the reserved fields. */
+ 	memset(bl, 0, ISP_CMD_AREA_SIZE(isp_num_capmeta(isp)));
+ 	bl->type = 1;
+@@ -288,11 +293,12 @@ send:
+ 
+ 	err = ipc_chan_send(isp, chan, ISP_BUFFER_TIMEOUT);
+ 	if (err) {
+-		if (isp_is_p010(isp)) {
+-			/* Keep leases owned until stop_camera halts the coprocessor. */
+-			isp->ipc_failed = true;
++		/*
++		 * The firmware may have taken the batch. Keep its leases owned
++		 * until the timeout is resolved, see apple_isp_stop_camera().
++		 */
++		if (isp_is_p010(isp))
+ 			return err;
+-		}
+ 		/* If we fail, consider the buffer not submitted. */
+ 		dev_err(isp->dev,
+ 			"%s: failed to send bufs: [0x%llx, 0x%llx, 0x%llx]\n",
+@@ -455,8 +461,16 @@ static void isp_vb2_buf_queue(struct vb2_buffer *vb)
+ 	if (test_bit(ISP_STATE_STREAMING, &isp->state) &&
+ 	    (isp_supports_p010(isp) || !empty)) {
+ 		if (isp_submit_buffers(isp, false) && isp_is_p010(isp)) {
+-			apple_isp_firmware_halt(isp);
+-			isp_vb2_release_buffers(isp, VB2_BUF_STATE_ERROR);
++			/*
++			 * After a timeout the leases stay owned until the
++			 * stream stops. Only firmware that did not answer at
++			 * all is stopped here, before its leases are released.
++			 */
++			if (isp->ipc_failed) {
++				apple_isp_firmware_halt(isp);
++				isp_vb2_release_buffers(isp,
++							VB2_BUF_STATE_ERROR);
++			}
+ 			vb2_queue_error(&isp->vbq);
+ 		}
+ 	}

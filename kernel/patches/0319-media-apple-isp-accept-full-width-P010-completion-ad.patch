@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Mon, 26 Oct 2026 13:48:05 +1100
+Subject: [PATCH] media: apple: isp: accept full-width P010 completion address
+ pairs
+
+The buffer wire carries 64-bit addresses, while the proxy observed zero-extended low words on its firmware. Accept either complete canonical pair for a submitted lease and reject mixed or unrelated upper bits. Keep pool, plane and fresh-tag checks. Also assert that NV12 stays first in format enumeration.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+---
+ .../driver-api/media/drivers/apple-isp-j616s.rst   |  5 +++--
+ drivers/media/platform/apple/isp/isp-v4l2-test.c   | 14 ++++++++++++--
+ drivers/media/platform/apple/isp/isp-v4l2.c        | 11 +++++++----
+ 3 files changed, 22 insertions(+), 8 deletions(-)
+
+diff --git a/Documentation/driver-api/media/drivers/apple-isp-j616s.rst b/Documentation/driver-api/media/drivers/apple-isp-j616s.rst
+index 7413c0e866..d671f1981f 100644
+--- a/Documentation/driver-api/media/drivers/apple-isp-j616s.rst
++++ b/Documentation/driver-api/media/drivers/apple-isp-j616s.rst
+@@ -81,8 +81,9 @@ Linux passes its actual contiguous extents to the rendered pool instead.
+ 
+ P010 uses the proxy's eight metadata slots (0x8000 bytes each) and two
+ rendered slots. The queue limits userspace to two rendered buffers, matching
+-the pool capacity. Completion matches both zero-extended low-32-bit plane
+-addresses, plane count, pool 9 and a fresh 64-bit submission tag; an old tag
++the pool capacity. Completion matches either both full submitted addresses
++or both zero-extended low-32-bit plane addresses, plus plane count, pool 9
++and a fresh 64-bit submission tag; an old tag
+ cannot release a new lease. Buffer completion is published to videobuf2
+ only after the firmware report ACK and doorbell have been published.
+ NV12 pool sizes and the T8140/Neo formats, presets and command path retain
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2-test.c b/drivers/media/platform/apple/isp/isp-v4l2-test.c
+index 58af78581b..6af295a7da 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2-test.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2-test.c
+@@ -166,13 +166,16 @@ static void isp_test_p010_admission(struct kunit *test)
+ 	struct apple_isp *isp = isp_test_alloc(test);
+ 	struct isp_format *fmt = isp_get_current_format(isp);
+ 	struct isp_preset preset = { .output_dim = {1280, 720}, .p010 = true };
+-	struct v4l2_fmtdesc desc = { .index = 1 };
++	struct v4l2_fmtdesc desc = { .index = 0 };
+ 
+ 	isp->presets = &preset;
+ 	isp->num_presets = 1;
+ 	isp->hw = &isp_test_t6040;
+ 	fmt->version = 0x958;
+ 	KUNIT_ASSERT_EQ(test, isp_enum_pixelformat(isp, &desc), 0);
++	KUNIT_EXPECT_EQ(test, desc.pixelformat, V4L2_PIX_FMT_NV12);
++	desc.index = 1;
++	KUNIT_ASSERT_EQ(test, isp_enum_pixelformat(isp, &desc), 0);
+ 	KUNIT_EXPECT_EQ(test, desc.pixelformat, V4L2_PIX_FMT_P010);
+ 	desc.index = 2;
+ 	KUNIT_EXPECT_EQ(test, isp_enum_pixelformat(isp, &desc), -EINVAL);
+@@ -203,8 +206,15 @@ static void isp_test_p010_completion_identity(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, isp_p010_buffer_matches(&fmt, &buf, &desc));
+ 	desc.iovas[1]--;
+ 	desc.iovas[0] |= BIT_ULL(40);
++	/* Reject mixed encodings, accept both exact full submitted addresses. */
++	KUNIT_EXPECT_FALSE(test, isp_p010_buffer_matches(&fmt, &buf, &desc));
++	desc.iovas[1] |= BIT_ULL(40);
++	KUNIT_EXPECT_TRUE(test, isp_p010_buffer_matches(&fmt, &buf, &desc));
++	desc.iovas[0] |= BIT_ULL(41);
++	desc.iovas[1] |= BIT_ULL(41);
+ 	KUNIT_EXPECT_FALSE(test, isp_p010_buffer_matches(&fmt, &buf, &desc));
+-	desc.iovas[0] &= ~BIT_ULL(40);
++	desc.iovas[0] = (u32)desc.iovas[0];
++	desc.iovas[1] = (u32)desc.iovas[1];
+ 	desc.pool_type = CISP_POOL_TYPE_RENDERED;
+ 	KUNIT_EXPECT_FALSE(test, isp_p010_buffer_matches(&fmt, &buf, &desc));
+ 	desc.pool_type = CISP_POOL_TYPE_RENDERED_SCL1;
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index 4fcde29410..b5bfea73e2 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -59,11 +59,14 @@ static bool isp_p010_buffer_matches(const struct isp_format *fmt,
+ 				    const struct isp_buffer *buf,
+ 				    const struct isp_buflist_buffer *desc)
+ {
+-	/* H17 reports zero-extended low 32 bits, not the submitted high IOVA. */
++	u64 y = buf->surfs[0].iova;
++	u64 uv = y + fmt->plane_size[0];
++	bool full = desc->iovas[0] == y && desc->iovas[1] == uv;
++	bool low = desc->iovas[0] == (u32)y && desc->iovas[1] == (u32)uv;
++
++	/* Accept the submitted pair or the zero-extended pair observed on H17. */
+ 	return desc->num_planes == 2 &&
+-	       desc->pool_type == CISP_POOL_TYPE_RENDERED_SCL1 &&
+-	       desc->iovas[0] == (u32)buf->surfs[0].iova &&
+-	       desc->iovas[1] == (u32)(buf->surfs[0].iova + fmt->plane_size[0]) &&
++	       desc->pool_type == CISP_POOL_TYPE_RENDERED_SCL1 && (full || low) &&
+ 	       !desc->iovas[2] && !desc->iovas[3] && desc->tag == buf->tag;
+ }
+ 

@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 08:38:13 +0000
+Subject: [PATCH] drm/apple: read the panel colour target from raw ADT
+
+Read the boot-populated /product artwork-display-gamut only when the paired version-1 primary calibration matrix has a valid bounded shape. Retain only the standard sRGB or Display P3 target: DCP already owns the per-panel matrix at its factory location, so never submit it as a DRM CTM.
+
+Use the raw target for H17P and desktop firmware while keeping complete firmware chromaticities authoritative. Replace the short-lived board-DT gamut fallback and cover P3, sRGB, bounds, provenance, firmware precedence and both publication paths with synthetic fixtures.
+
+Assisted-by: LLM
+
+Signed-off-by: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+(backported from commit 3f0394ccfbfa8ac9fd45976c24fe7ce85027b2ed)
+[j604: only the ADT parser, drivers/gpu/drm/apple/dcp-panel-adt.c/.h as
+ they stand at 3f0394ccfb (with the /backlight EDRPotentialHeadroom read
+ of 43f112d09a), trimmed to the /product colour target and the EDR
+ headroom: the panel identity, serial number and dimension readers are
+ dropped. dcp_panel_adt_read() maps m1n1's "adt" phram region the way
+ Aurora's dcp_panel_read_adt() does, without an MTD dependency. The
+ desktop / H17P consumers (dcp.c, dcp-display-metadata.c), the removal of
+ the board-DT gamut and the parser-test.c / selftest fixtures are not
+ taken: 1.607 carries none of them (no apple,dcp gamut property, no
+ desktop panel EDID). The iomfb_m4 consumer is the next commit.
+ J604 runtime ADT (2026-11-05): artwork-display-gamut "P3", a 40-byte
+ version-1 matrix, EDRPotentialHeadroom 16.0; a host build of this parser
+ on that ADT returns DISPLAY_P3 and 16.000, and UNSPECIFIED for a
+ version-2 matrix or an unknown name.]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/gpu/drm/apple/Makefile        |   1 +
+ drivers/gpu/drm/apple/dcp-panel-adt.c | 201 ++++++++++++++++++++++++++
+ drivers/gpu/drm/apple/dcp-panel-adt.h |  30 ++++
+ 3 files changed, 232 insertions(+)
+ create mode 100644 drivers/gpu/drm/apple/dcp-panel-adt.c
+ create mode 100644 drivers/gpu/drm/apple/dcp-panel-adt.h
+
+diff --git a/drivers/gpu/drm/apple/Makefile b/drivers/gpu/drm/apple/Makefile
+index 58437ccff2..c6e806f44e 100644
+--- a/drivers/gpu/drm/apple/Makefile
++++ b/drivers/gpu/drm/apple/Makefile
+@@ -8,6 +8,7 @@ appledrm-y += dcp-hdmi.o
+ appledrm-$(CONFIG_DRM_APPLE_AUDIO) += audio.o
+ appledrm-$(CONFIG_DRM_APPLE_AUDIO) += av.o
+ appledrm-y += connector.o dcp-display-metadata.o dcp-180hz.o dcp-panel-edid.o
++appledrm-$(CONFIG_DRM_APPLE_DCP_T8132) += dcp-panel-adt.o
+ appledrm-y += ibootep.o
+ appledrm-y += dcpext_scanout.o
+ appledrm-y += dcpext_drm.o
+diff --git a/drivers/gpu/drm/apple/dcp-panel-adt.c b/drivers/gpu/drm/apple/dcp-panel-adt.c
+new file mode 100644
+index 0000000000..3d83fd5926
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-panel-adt.c
+@@ -0,0 +1,201 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/*
++ * Read-only Apple device tree decoding. The wire layout is documented by
++ * m1n1's public src/adt.h (GPL-2.0-or-later OR BSD-2-Clause). No firmware
++ * implementation or captured device identifiers are used here.
++ *
++ * Based on Aurora's dcp-panel-adt.c (3f0394ccfb "drm/apple: read the panel
++ * colour target from raw ADT"), trimmed for the J604 to the /product colour
++ * target and the /backlight EDR headroom. The panel identity, serial and
++ * dimensions are not read.
++ */
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/sizes.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++
++#include "dcp-panel-adt.h"
++
++struct dcp_adt_cursor {
++	const u8 *data;
++	size_t pos, size;
++	u32 nodes;
++};
++
++#define DCP_ADT_MATRIX_SIZE	40
++#define DCP_ADT_Q24_ONE		(1LL << 24)
++#define DCP_ADT_Q24_LIMIT	(4LL << 24)
++
++/*
++ * Validate the factory matrix only as provenance for the named target.  The
++ * DCP consumes the same raw property at matrix location 8; Linux must not
++ * retain its coefficients or submit them again through a DRM CTM.
++ */
++static bool dcp_adt_calibration_matrix(const u8 *value, u32 size)
++{
++	s64 coefficient[9], scaled[9], determinant;
++
++	if (size != DCP_ADT_MATRIX_SIZE || get_unaligned_le32(value) != 1)
++		return false;
++	for (unsigned int i = 0; i < ARRAY_SIZE(coefficient); i++) {
++		coefficient[i] = (s32)get_unaligned_le32(value + 4 + 4 * i);
++		if (coefficient[i] < -DCP_ADT_Q24_LIMIT ||
++		    coefficient[i] > DCP_ADT_Q24_LIMIT)
++			return false;
++		/* Q8.16 keeps the bounded determinant inside s64. */
++		scaled[i] = coefficient[i] >> 8;
++	}
++	for (unsigned int row = 0; row < 3; row++) {
++		s64 sum = coefficient[3 * row] + coefficient[3 * row + 1] +
++			  coefficient[3 * row + 2];
++
++		if (sum < DCP_ADT_Q24_ONE - 4 || sum > DCP_ADT_Q24_ONE + 4)
++			return false;
++	}
++	determinant = scaled[0] * (scaled[4] * scaled[8] - scaled[5] * scaled[7]) -
++		      scaled[1] * (scaled[3] * scaled[8] - scaled[5] * scaled[6]) +
++		      scaled[2] * (scaled[3] * scaled[7] - scaled[4] * scaled[6]);
++	return determinant != 0;
++}
++
++static enum dcp_panel_gamut dcp_adt_gamut(const u8 *value, u32 size)
++{
++	if (size == sizeof("P3") && !memcmp(value, "P3", sizeof("P3")))
++		return DCP_PANEL_GAMUT_DISPLAY_P3;
++	if (size == sizeof("sRGB") && !memcmp(value, "sRGB", sizeof("sRGB")))
++		return DCP_PANEL_GAMUT_SRGB;
++	return DCP_PANEL_GAMUT_UNSPECIFIED;
++}
++
++static const u8 *dcp_adt_bytes(struct dcp_adt_cursor *c, size_t size)
++{
++	const u8 *p;
++
++	if (c->pos > c->size || size > c->size - c->pos)
++		return ERR_PTR(-EINVAL);
++	p = c->data + c->pos;
++	c->pos += size;
++	return p;
++}
++
++static int dcp_adt_node(struct dcp_adt_cursor *c, struct dcp_panel_adt *panel, u32 depth)
++{
++	const u8 *header = dcp_adt_bytes(c, 8);
++	size_t props_start, props_end;
++	u32 props, children;
++	char node_name[33] = {};
++	enum dcp_panel_gamut gamut = DCP_PANEL_GAMUT_UNSPECIFIED;
++	bool gamut_seen = false, matrix_seen = false, matrix_valid = false;
++	bool product, backlight;
++
++	if (IS_ERR(header))
++		return PTR_ERR(header);
++	if (depth > 32 || ++c->nodes > 4096)
++		return -E2BIG;
++	props = get_unaligned_le32(header);
++	children = get_unaligned_le32(header + 4);
++	if (props > 4096 || children > 4096)
++		return -E2BIG;
++	props_start = c->pos;
++	/* Names need not be the first property. Validate every extent first. */
++	for (u32 i = 0; i < props; i++) {
++		const u8 *prop = dcp_adt_bytes(c, 36), *value;
++		u32 size;
++
++		if (IS_ERR(prop) || !memchr(prop, 0, 32))
++			return -EINVAL;
++		size = get_unaligned_le32(prop + 32) & 0x7fffffff;
++		value = dcp_adt_bytes(c, ALIGN((size_t)size, 4));
++		if (IS_ERR(value))
++			return PTR_ERR(value);
++		if (!strcmp((const char *)prop, "name") && size && size <= 32 &&
++		    memchr(value, 0, size))
++			memcpy(node_name, value, size);
++	}
++	props_end = c->pos;
++	product = depth == 1 && !strcmp(node_name, "product");
++	backlight = depth == 1 && !strcmp(node_name, "backlight");
++	c->pos = props_start;
++	for (u32 i = 0; i < props; i++) {
++		const u8 *prop = c->data + c->pos;
++		u32 size = get_unaligned_le32(prop + 32) & 0x7fffffff;
++		const char *name = (const char *)prop;
++
++		if (product && !strcmp(name, "artwork-display-gamut")) {
++			if (gamut_seen)
++				gamut = DCP_PANEL_GAMUT_UNSPECIFIED;
++			else
++				gamut = dcp_adt_gamut(prop + 36, size);
++			gamut_seen = true;
++		} else if (product && !strcmp(name, "primary-calibration-matrix")) {
++			matrix_valid = !matrix_seen &&
++				dcp_adt_calibration_matrix(prop + 36, size);
++			matrix_seen = true;
++		} else if (backlight && !strcmp(name, "EDRPotentialHeadroom") && size == 4) {
++			panel->edr_potential_headroom = get_unaligned_le32(prop + 36);
++		}
++		c->pos += 36 + ALIGN((size_t)size, 4);
++	}
++	if (product)
++		panel->gamut = gamut_seen && matrix_seen && matrix_valid ?
++			gamut : DCP_PANEL_GAMUT_UNSPECIFIED;
++	c->pos = props_end;
++	for (u32 i = 0; i < children; i++) {
++		int ret = dcp_adt_node(c, panel, depth + 1);
++
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++int dcp_panel_adt_parse(const void *data, size_t size, struct dcp_panel_adt *panel)
++{
++	struct dcp_adt_cursor cursor = { .data = data, .size = size };
++	struct dcp_panel_adt parsed = *panel;
++	int ret;
++
++	if (!data || size > SZ_16M)
++		return -EINVAL;
++	ret = dcp_adt_node(&cursor, &parsed, 0);
++	if (!ret)
++		*panel = parsed;
++	return ret;
++}
++
++/*
++ * m1n1 reserves the original ADT as a phram node labelled "adt" (as Aurora's
++ * dcp_panel_read_adt() reads it). Read it without an MTD dependency.
++ */
++int dcp_panel_adt_read(struct dcp_panel_adt *panel)
++{
++	struct device_node *np;
++	const char *label;
++	struct resource res;
++	void *data;
++	int ret = -ENODATA;
++
++	for_each_compatible_node(np, NULL, "phram") {
++		if (of_property_read_string(np, "label", &label) || strcmp(label, "adt"))
++			continue;
++		if (of_address_to_resource(np, 0, &res) ||
++		    !resource_size(&res) || resource_size(&res) > SZ_16M) {
++			ret = -EINVAL;
++			break;
++		}
++		data = memremap(res.start, resource_size(&res), MEMREMAP_WB);
++		if (!data) {
++			ret = -ENOMEM;
++			break;
++		}
++		ret = dcp_panel_adt_parse(data, resource_size(&res), panel);
++		memunmap(data);
++		break;
++	}
++	of_node_put(np);
++	return ret;
++}
+diff --git a/drivers/gpu/drm/apple/dcp-panel-adt.h b/drivers/gpu/drm/apple/dcp-panel-adt.h
+new file mode 100644
+index 0000000000..9dcef8bbc3
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-panel-adt.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/*
++ * The panel properties of the Apple device tree (ADT) the boot loader leaves
++ * to Linux. Based on Aurora's dcp-panel-adt.h (3f0394ccfb), trimmed to the
++ * colour target and the EDR headroom: no identity, no dimensions.
++ */
++#ifndef APPLE_DCP_PANEL_ADT_H
++#define APPLE_DCP_PANEL_ADT_H
++
++#include <linux/types.h>
++
++enum dcp_panel_gamut {
++	DCP_PANEL_GAMUT_UNSPECIFIED,
++	DCP_PANEL_GAMUT_SRGB,
++	DCP_PANEL_GAMUT_DISPLAY_P3,
++};
++
++/* Only panel properties, never the machine or account identity. */
++struct dcp_panel_adt {
++	/* /backlight EDRPotentialHeadroom, 16.16; 0 if absent */
++	u32 edr_potential_headroom;
++	/* /product target, only when its calibration matrix is also valid */
++	enum dcp_panel_gamut gamut;
++};
++
++int dcp_panel_adt_parse(const void *data, size_t size, struct dcp_panel_adt *panel);
++/* m1n1's phram copy of the ADT ("adt"); -ENODATA without one. */
++int dcp_panel_adt_read(struct dcp_panel_adt *panel);
++
++#endif

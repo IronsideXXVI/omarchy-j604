@@ -1,0 +1,319 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Sat, 31 Oct 2026 17:08:40 +1100
+Subject: [PATCH] sched/fair: Rotate misfit tasks with tasks on busy bigger
+ CPUs
+
+Load balancing moves a misfit task to a bigger CPU only when the bigger
+CPU's group has spare capacity (update_sd_pick_busiest() rejects a misfit
+source when the local group is not group_has_spare). When every bigger
+CPU already runs one task, nothing moves: the task that started on a
+small CPU keeps it for as long as the others run. Equal tasks then make
+unequal progress, and work split evenly across all CPUs ends with a tail
+in which the tasks that started on small CPUs finish alone on big ones.
+
+On the M4 Pro (T6040, 10 P cores at capacity 1024 and 4 E cores at 383)
+a 14-thread CoreMark runs for about 15 s with all CPUs busy, then the 4
+threads that ran on the E cores finish alone on P cores about 5 s later.
+It scores 425k iter/s against 546k on macOS on the same machine. Rotating
+the benchmark's threads across all CPUs every 20 ms from user space gives
+545k, so the loss is all placement.
+
+Once a task has been misfit on a CPU for four base slices, have the tick
+queue a work item that swaps it with the task on a busy bigger CPU,
+using migrate_swap(). Bigger CPUs are taken round robin, so each task on
+them takes its turn on a smaller CPU and the big CPUs are time shared
+the way one runqueue would share them. The swap only happens when every
+allowed bigger CPU runs exactly one fair task, since an idle one pulls
+the misfit task through the existing misfit balancing, and it never
+moves down a task with a higher weight or a higher uclamp_min than the
+misfit task. Kernel threads and pinned tasks are left alone.
+
+migrate_swap() was built only for NUMA balancing; build it on every SMP
+kernel, and keep the NUMA tracepoint for the NUMA caller.
+
+The MISFIT_ROTATE scheduler feature is on by default, like the other
+fair class heuristics.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(cherry picked from commit 2d24fbce39a391c5e450deda3793b71d7aa25ea2)
+---
+ kernel/sched/core.c     |  10 ++-
+ kernel/sched/fair.c     | 133 ++++++++++++++++++++++++++++++++++++++++
+ kernel/sched/features.h |   7 +++
+ kernel/sched/sched.h    |  23 ++++++-
+ 4 files changed, 169 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 0c570f46f1..a7f22fa87c 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3477,7 +3477,11 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
+ }
+ #endif /* CONFIG_SMP */
+ 
+-#ifdef CONFIG_NUMA_BALANCING
++#ifdef CONFIG_SMP
++/*
++ * Swapping two running tasks is used by NUMA balancing and by misfit
++ * rotation on asymmetric CPU capacity systems.
++ */
+ static void __migrate_swap_task(struct task_struct *p, int cpu)
+ {
+ 	if (task_on_rq_queued(p)) {
+@@ -3575,13 +3579,15 @@ int migrate_swap(struct task_struct *cur, struct task_struct *p,
+ 	if (!cpumask_test_cpu(arg.src_cpu, arg.dst_task->cpus_ptr))
+ 		goto out;
+ 
++#ifdef CONFIG_NUMA_BALANCING
+ 	trace_sched_swap_numa(cur, arg.src_cpu, p, arg.dst_cpu);
++#endif
+ 	ret = stop_two_cpus(arg.dst_cpu, arg.src_cpu, migrate_swap_stop, &arg);
+ 
+ out:
+ 	return ret;
+ }
+-#endif /* CONFIG_NUMA_BALANCING */
++#endif /* CONFIG_SMP */
+ 
+ /***
+  * kick_process - kick a running thread to enter/exit the kernel
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 41a14d7da1..270d8f3437 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -6144,6 +6144,7 @@ static inline void update_misfit_status(struct task_struct *p, struct rq *rq)
+ 	    task_fits_cpu(p, cpu)) {
+ 
+ 		rq->misfit_task_load = 0;
++		rq->misfit_task = NULL;
+ 		return;
+ 	}
+ 
+@@ -6152,6 +6153,11 @@ static inline void update_misfit_status(struct task_struct *p, struct rq *rq)
+ 	 * task_h_load() returns 0.
+ 	 */
+ 	rq->misfit_task_load = max_t(unsigned long, task_h_load(p), 1);
++
++	if (rq->misfit_task != p) {
++		rq->misfit_task = p;
++		rq->misfit_since = jiffies;
++	}
+ }
+ 
+ void __setparam_fair(struct task_struct *p, const struct sched_attr *attr)
+@@ -14829,6 +14835,130 @@ static __latent_entropy void sched_balance_softirq(void)
+ 	sched_balance_domains(this_rq, idle);
+ }
+ 
++/*
++ * Misfit rotation.
++ *
++ * Load balancing moves a misfit task to a bigger CPU only when a bigger CPU
++ * has spare capacity. When every bigger CPU runs one task of its own, the
++ * misfit task stays on its small CPU for as long as those tasks run, so
++ * equal tasks make unequal progress. Work split evenly across all CPUs then
++ * ends with a tail in which the tasks that started on small CPUs finish
++ * alone on big ones.
++ *
++ * Once a task has been misfit on a CPU for a few base slices, swap it with
++ * the task on a busy bigger CPU. Bigger CPUs are taken round robin, so each
++ * task on them takes its turn on a smaller CPU: the big CPUs are time
++ * shared, as one runqueue would share them. It only applies when every
++ * allowed bigger CPU runs exactly one fair task (an idle one pulls the
++ * misfit task through load balancing instead), and it never moves down a
++ * task with a higher weight or a higher uclamp_min than the misfit task.
++ */
++static int misfit_rotate_last_cpu;
++
++static unsigned long misfit_rotate_period(void)
++{
++	return max(1UL, nsecs_to_jiffies(4ULL * sysctl_sched_base_slice));
++}
++
++static bool misfit_rotate_candidate(struct task_struct *p)
++{
++	return p && p->sched_class == &fair_sched_class &&
++	       !(p->flags & (PF_EXITING | PF_KTHREAD)) &&
++	       p->nr_cpus_allowed > 1;
++}
++
++static void misfit_rotate_work(struct work_struct *work)
++{
++	struct rq *src_rq = container_of(work, struct rq, misfit_rotate_work);
++	int src_cpu = cpu_of(src_rq), dst_cpu = -1, cpu, start;
++	unsigned long src_cap = arch_scale_cpu_capacity(src_cpu);
++	struct task_struct *p, *t = NULL;
++	bool idle = false;
++
++	p = xchg(&src_rq->misfit_rotate_p, NULL);
++	if (!p)
++		return;
++
++	/* The task may have moved, slept or shrunk since the tick. */
++	if (task_cpu(p) != src_cpu || !task_on_rq_queued(p) ||
++	    !misfit_rotate_candidate(p) || task_fits_cpu(p, src_cpu))
++		goto out;
++
++	rcu_read_lock();
++	start = READ_ONCE(misfit_rotate_last_cpu);
++	for_each_cpu_wrap(cpu, p->cpus_ptr, start + 1) {
++		struct rq *rq = cpu_rq(cpu);
++		struct task_struct *c;
++
++		if (arch_scale_cpu_capacity(cpu) <= src_cap || !cpu_active(cpu))
++			continue;
++
++		if (!READ_ONCE(rq->nr_running)) {
++			idle = true;
++			break;
++		}
++
++		if (t || READ_ONCE(rq->nr_running) != 1)
++			continue;
++
++		c = rcu_dereference_all(rq->curr);
++		if (!misfit_rotate_candidate(c) ||
++		    !cpumask_test_cpu(src_cpu, c->cpus_ptr))
++			continue;
++
++		if (c->se.load.weight > p->se.load.weight ||
++		    uclamp_eff_value(c, UCLAMP_MIN) > uclamp_eff_value(p, UCLAMP_MIN))
++			continue;
++
++		t = c;
++		dst_cpu = cpu;
++	}
++
++	if (idle)
++		t = NULL;
++	if (t) {
++		get_task_struct(t);
++		WRITE_ONCE(misfit_rotate_last_cpu, dst_cpu);
++	}
++	rcu_read_unlock();
++
++	if (t) {
++		migrate_swap(p, t, dst_cpu, src_cpu);
++		put_task_struct(t);
++	}
++out:
++	put_task_struct(p);
++}
++
++/* Called from the tick on this CPU, so current is rq->curr. */
++static void misfit_rotate_trigger(struct rq *rq)
++{
++	struct task_struct *p = current;
++
++	if (!sched_feat(MISFIT_ROTATE) || !sched_asym_cpucap_active())
++		return;
++
++	if (READ_ONCE(rq->misfit_task) != p || !READ_ONCE(rq->misfit_task_load) ||
++	    READ_ONCE(rq->nr_running) != 1 || !misfit_rotate_candidate(p))
++		return;
++
++	if (time_before(jiffies, READ_ONCE(rq->misfit_since) + misfit_rotate_period()))
++		return;
++
++	/* Whatever the outcome, try again no sooner than one period from now. */
++	WRITE_ONCE(rq->misfit_since, jiffies);
++
++	if (READ_ONCE(rq->misfit_rotate_p))
++		return;
++
++	get_task_struct(p);
++	if (cmpxchg(&rq->misfit_rotate_p, NULL, p)) {
++		put_task_struct(p);
++		return;
++	}
++	queue_work_on(cpu_of(rq), system_highpri_wq, &rq->misfit_rotate_work);
++}
++
+ /*
+  * Trigger the SCHED_SOFTIRQ if it is time to do periodic load balancing.
+  */
+@@ -14841,6 +14971,8 @@ void sched_balance_trigger(struct rq *rq)
+ 	if (unlikely(on_null_domain(rq) || !cpu_active(cpu_of(rq))))
+ 		return;
+ 
++	misfit_rotate_trigger(rq);
++
+ 	if (time_after_eq(jiffies, rq->next_balance))
+ 		raise_softirq(SCHED_SOFTIRQ);
+ 
+@@ -15757,6 +15889,7 @@ __init void init_sched_fair_class(void)
+ 		zalloc_cpumask_var_node(&per_cpu(select_rq_mask,    i), GFP_KERNEL, cpu_to_node(i));
+ 		zalloc_cpumask_var_node(&per_cpu(should_we_balance_tmpmask, i),
+ 					GFP_KERNEL, cpu_to_node(i));
++		INIT_WORK(&cpu_rq(i)->misfit_rotate_work, misfit_rotate_work);
+ 
+ #ifdef CONFIG_CFS_BANDWIDTH
+ 		INIT_CSD(&cpu_rq(i)->cfsb_csd, __cfsb_csd_unthrottle, cpu_rq(i));
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index 8f0dee8fc4..07132f33d1 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -135,6 +135,13 @@ SCHED_FEAT(WA_BIAS, true)
+  */
+ SCHED_FEAT(UTIL_EST, true)
+ 
++/*
++ * On asymmetric CPU capacity systems, swap a task that has been stuck as a
++ * misfit on a smaller CPU with a task on a busy bigger CPU, so equal tasks
++ * get an equal share of the big CPUs.
++ */
++SCHED_FEAT(MISFIT_ROTATE, true)
++
+ SCHED_FEAT(LATENCY_WARN, false)
+ 
+ /*
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index a6c6f8165e..e8826e0277 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1263,6 +1263,16 @@ struct rq {
+ 	unsigned char		idle_balance;
+ 
+ 	unsigned long		misfit_task_load;
++	/*
++	 * Misfit rotation: the misfit task (compared, never dereferenced),
++	 * the jiffies when it became misfit here, and the task handed (with
++	 * a reference) to the work that swaps it with the task on a busy
++	 * higher-capacity CPU.
++	 */
++	struct task_struct	*misfit_task;
++	unsigned long		misfit_since;
++	struct task_struct	*misfit_rotate_p;
++	struct work_struct	misfit_rotate_work;
+ 
+ 	/* For active balancing */
+ 	int			active_balance;
+@@ -2082,6 +2092,17 @@ static inline int sched_numa_find_closest(const struct cpumask *cpus, int cpu)
+ 
+ #endif /* !CONFIG_NUMA */
+ 
++#ifdef CONFIG_SMP
++extern int migrate_swap(struct task_struct *p, struct task_struct *t,
++			int cpu, int scpu);
++#else
++static inline int migrate_swap(struct task_struct *p, struct task_struct *t,
++			       int cpu, int scpu)
++{
++	return -EINVAL;
++}
++#endif
++
+ #ifdef CONFIG_NUMA_BALANCING
+ 
+ /* The regions in numa_faults array from task_struct */
+@@ -2094,8 +2115,6 @@ enum numa_faults_stats {
+ 
+ extern void sched_setnuma(struct task_struct *p, int node);
+ extern int migrate_task_to(struct task_struct *p, int cpu);
+-extern int migrate_swap(struct task_struct *p, struct task_struct *t,
+-			int cpu, int scpu);
+ extern void init_numa_balancing(u64 clone_flags, struct task_struct *p);
+ 
+ #else /* !CONFIG_NUMA_BALANCING: */

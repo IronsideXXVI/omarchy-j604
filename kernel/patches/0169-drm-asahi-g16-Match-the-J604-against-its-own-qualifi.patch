@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 4 Nov 2026 07:32:55 -0600
+Subject: [PATCH] drm/asahi: g16: Match the J604 against its own qualified
+ firmware builds
+
+Admitting the J604 needs J604 data at every step the J713 is qualified
+on: the loaded TEXT identity, the PMP AGX vote, the original ADT
+performance selection, the SGX identification words and the boot-loader
+handoff layout. None of it may be borrowed from the J713. The loaded
+TEXT already differs between J713 boards once iBoot has filled it in
+(the 8-core J713 has its own entry), so a J713 digest says nothing about
+the J604.
+
+Key the J604 on its compatible and give it its own, still empty, table
+of qualified loaded builds. Its identity report is matched against that
+table only, by the same rule firmware() applies (sizes, GKTS offset,
+normalized digest), and the result is logged. The J604 is refused with
+-ENODEV in either case, before the PMP lease, the PMP supplier or the
+driver's own power-domain hold: a matching build alone does not qualify
+the other steps. Enabling it later is then one measured table entry per
+item instead of a change to the J713 gates.
+
+The J713 path is unchanged. Other T8132 boards keep the plain report.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/boot.rs     | 29 +++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/glue.c      |  8 ++++++++
+ drivers/gpu/drm/asahi/g16/hw.rs       |  5 +++++
+ drivers/gpu/drm/asahi/g16/identity.rs | 14 +++++++++++++
+ 4 files changed, 56 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index f8b84a52d6..12ec3103a5 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -44,6 +44,7 @@ pub(crate) mod glue {
+         fn asahi_g16_sha256(data: *const u8, len: usize, out: *mut u8);
+         fn asahi_g16_board() -> bool;
+         fn asahi_g16_identify_board() -> bool;
++        fn asahi_g16_j604_board() -> bool;
+         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+         fn asahi_g16_module_get();
+         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
+@@ -82,6 +83,12 @@ pub(crate) mod glue {
+         unsafe { asahi_g16_identify_board() }
+     }
+ 
++    /// The J604/T8132.
++    pub(crate) fn j604_board() -> bool {
++        // SAFETY: Reads the machine compatible strings only.
++        unsafe { asahi_g16_j604_board() }
++    }
++
+     /// Holds the GFX power domain for the retained session.
+     pub(crate) fn hold_power(dev: &device::Device) -> Result {
+         // SAFETY: `dev` is a valid device; runtime-PM accounting on it has no other requirement.
+@@ -433,10 +440,32 @@ impl Orphan {
+ ///
+ /// An unqualified T8132 board first reports the firmware its boot loader left in place, which
+ /// is what qualifying it needs, and is then refused the same way.
++///
++/// The J604 is matched against its own qualified builds, never the J713's. It stays refused
++/// even on a match until its PMP AGX vote, performance selection, hardware identity and
++/// boot-loader handoff layout are qualified on J604 data as well.
+ pub(crate) fn qualified_board(dev: &device::Device) -> Result {
+     if glue::board() {
+         return Ok(());
+     }
++    if glue::j604_board() {
++        let loaded = identity::report_unqualified(dev);
++        match loaded
++            .as_ref()
++            .and_then(|loaded| identity::qualified(loaded, hw::t8132::J604_FIRMWARE))
++        {
++            Some(build) => dev_info!(
++                dev,
++                "G16: J604 firmware build: {}; PMP AGX vote, performance selection, hardware identity and handoff layout not qualified, not probing\n",
++                build.name
++            ),
++            None => dev_info!(
++                dev,
++                "G16: J604 firmware build not qualified, not probing\n"
++            ),
++        }
++        return Err(ENODEV);
++    }
+     if glue::identify_board() {
+         identity::report_unqualified(dev);
+         dev_info!(dev, "G16: board not qualified, not probing\n");
+diff --git a/drivers/gpu/drm/asahi/g16/glue.c b/drivers/gpu/drm/asahi/g16/glue.c
+index 3afa528af9..403bca0f10 100644
+--- a/drivers/gpu/drm/asahi/g16/glue.c
++++ b/drivers/gpu/drm/asahi/g16/glue.c
+@@ -26,6 +26,7 @@
+ void asahi_g16_sha256(const u8 *data, size_t len, u8 *out);
+ bool asahi_g16_board(void);
+ bool asahi_g16_identify_board(void);
++bool asahi_g16_j604_board(void);
+ int asahi_g16_hold_power(struct device *dev);
+ void asahi_g16_module_get(void);
+ bool asahi_g16_ram_disjoint(u64 start, u64 size);
+@@ -167,6 +168,13 @@ bool asahi_g16_identify_board(void)
+ 	return of_machine_is_compatible("apple,t8132");
+ }
+ 
++/* The J604 (MacBook Pro 14-inch, M4), measured against its own firmware table. */
++bool asahi_g16_j604_board(void)
++{
++	return of_machine_is_compatible("apple,j604") &&
++	       of_machine_is_compatible("apple,t8132");
++}
++
+ /*
+  * Keep the GFX domain powered for the whole (retained) session. Never released,
+  * like the firmware session itself.
+diff --git a/drivers/gpu/drm/asahi/g16/hw.rs b/drivers/gpu/drm/asahi/g16/hw.rs
+index c68617064a..dc54f98569 100644
+--- a/drivers/gpu/drm/asahi/g16/hw.rs
++++ b/drivers/gpu/drm/asahi/g16/hw.rs
+@@ -72,6 +72,11 @@ pub(crate) mod t8132 {
+             },
+         ],
+     };
++
++    /// Loaded builds qualified on the J604 (MacBook Pro 14-inch, M4), matched on the J604's
++    /// own measured identity ([`crate::g16::identity::report_unqualified`]). None is qualified
++    /// yet, and no J713 entry stands in for one: TEXT differs per board after iBoot fills it.
++    pub(crate) const J604_FIRMWARE: &[FirmwareBuild] = &[];
+ }
+ 
+ /// User VA range reported as `vm_start..vm_end`: 42 bits with the final two pages excluded.
+diff --git a/drivers/gpu/drm/asahi/g16/identity.rs b/drivers/gpu/drm/asahi/g16/identity.rs
+index cbd430862c..bb66c11e1c 100644
+--- a/drivers/gpu/drm/asahi/g16/identity.rs
++++ b/drivers/gpu/drm/asahi/g16/identity.rs
+@@ -297,3 +297,17 @@ pub(crate) fn report_unqualified(dev: &device::Device) -> Option<Loaded> {
+     );
+     Some(loaded)
+ }
++
++/// The build in `builds` that a measured identity is, by the rule [`firmware`] applies: sizes,
++/// GKTS offset and normalized digest. The ECAP offset is covered by the digest.
++pub(crate) fn qualified<'a>(
++    loaded: &Loaded,
++    builds: &'a [FirmwareBuild],
++) -> Option<&'a FirmwareBuild> {
++    builds.iter().find(|build| {
++        build.text_size == loaded.text_size
++            && build.data_size == loaded.data_size
++            && build.marker as usize == loaded.gkts
++            && build.text_sha256 == loaded.sha256
++    })
++}

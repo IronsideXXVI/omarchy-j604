@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 5 Nov 2026 21:18:40 +0000
+Subject: [PATCH] drm/asahi: g16: start T8132 after its native display, then
+ autoload it
+
+The G16 platform driver exports no module metadata, so with
+DRM_ASAHI=m udev has no device alias with which to load asahi.ko on
+T8132 Macs: the module had to be loaded by hand after the native
+display was up. T6030 and T6031 had the same arrangement and replaced
+it with a display-order admission gate plus a module alias, in
+commit b9d3cf70f1e8 ("drm/asahi: export a T6030 module alias for the native G15 driver")
+and commit 6ec4d35fc5c4 ("drm/asahi: g15: start T6031 after its native display, then autoload it").
+
+Do the same for T8132. Give drm/apple a publication slot for the T8132
+display subsystem, published after DRM registration and client setup
+and withdrawn before unbind like the G15 slots, and export
+apple_drm_t8132_link_device() beside the T6030/T6031 ones. G16
+admission calls it after the board check and before the PMP supplier:
+it defers until the native display is published, so a boot that leaves
+the display disabled keeps the GPU waiting (logged once) rather than
+starting its firmware, and the GPU becomes a device-link consumer of
+the display. Then export apple,agx-t8132 through a module alias table,
+so the module is loaded when the GPU node is created. The J713 and the
+J604 both drive their panel through apple,t8132-display-subsystem, so
+no board check is added here; admission keeps its existing one.
+
+DRM_ASAHI_G16 now needs drm/apple reachable from asahi, as G15 does.
+A distribution that needs explicit ordering can still blacklist the
+module; a blacklist stops alias loading, not explicit modprobe.
+
+Build-tested only (Image + modules, the -11.3 package config). The
+probe itself was exercised on J604 by an explicit modprobe on the
+parent commit (READY, render node, no Oops); the autoload path is not
+yet tested on hardware.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/gpu/drm/apple/apple_drv.c | 14 ++++++++++++--
+ drivers/gpu/drm/asahi/Kconfig     |  9 ++++++---
+ drivers/gpu/drm/asahi/g16/boot.rs | 15 +++++++++++++++
+ drivers/gpu/drm/asahi/g16/glue.c  | 22 ++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/mod.rs  | 19 ++++++++++++-------
+ include/linux/soc/apple/display.h |  3 ++-
+ 6 files changed, 69 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/apple_drv.c b/drivers/gpu/drm/apple/apple_drv.c
+index fdbe0de078..20f000c20f 100644
+--- a/drivers/gpu/drm/apple/apple_drv.c
++++ b/drivers/gpu/drm/apple/apple_drv.c
+@@ -61,14 +61,17 @@ struct apple_drm_private {
+ static DEFINE_MUTEX(apple_g15_display_lock);
+ static struct device *apple_t6030_display;
+ static struct device *apple_t6031_display;
++static struct device *apple_t8132_display;
+ 
+-/* The publication slot of a G15 SoC's internal display subsystem, or NULL. */
++/* The publication slot of a G15 or G16 SoC's internal display subsystem, or NULL. */
+ static struct device **apple_g15_display_slot(struct device *dev)
+ {
+ 	if (of_device_is_compatible(dev->of_node, "apple,t6030-display-subsystem"))
+ 		return &apple_t6030_display;
+ 	if (of_device_is_compatible(dev->of_node, "apple,t6031-display-subsystem"))
+ 		return &apple_t6031_display;
++	if (of_device_is_compatible(dev->of_node, "apple,t8132-display-subsystem"))
++		return &apple_t8132_display;
+ 	return NULL;
+ }
+ 
+@@ -101,7 +104,7 @@ static void apple_g15_display_withdraw(struct device *dev)
+ 	put_device(old);
+ }
+ 
+-/* Initial G15 firmware startup must follow successful native display setup.
++/* Initial G15/G16 firmware startup must follow successful native display setup.
+  * The component's device lock does not serialize component bind/unbind, so
+  * publish separately. This lock protects only publication and a device link;
+  * no display calls or firmware RPC run while it is held.
+@@ -135,6 +138,13 @@ int apple_drm_t6031_link_device(struct device *consumer)
+ }
+ EXPORT_SYMBOL_GPL(apple_drm_t6031_link_device);
+ 
++int apple_drm_t8132_link_device(struct device *consumer)
++{
++	return apple_g15_link_device(consumer, "apple,t8132", "apple,agx-t8132",
++				     &apple_t8132_display);
++}
++EXPORT_SYMBOL_GPL(apple_drm_t8132_link_device);
++
+ DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
+ 
+ #define DART_PAGE_SIZE 16384
+diff --git a/drivers/gpu/drm/asahi/Kconfig b/drivers/gpu/drm/asahi/Kconfig
+index 9141644b79..b988ea406a 100644
+--- a/drivers/gpu/drm/asahi/Kconfig
++++ b/drivers/gpu/drm/asahi/Kconfig
+@@ -28,14 +28,17 @@ config DRM_ASAHI_G16
+ 	bool "Apple M4 (G16G) support (experimental)"
+ 	depends on DRM_ASAHI && ARM64
+ 	depends on APPLE_PMP=y || APPLE_PMP=DRM_ASAHI
++	depends on DRM_APPLE=y || (DRM_APPLE=m && DRM_ASAHI=m)
+ 	depends on THERMAL_OF
+ 	select CRYPTO_LIB_SHA256
+ 	select DRM_ASAHI_UAT_ADOPTION
+ 	help
+ 	  Rust Asahi backend for the qualified J713/T8132 GPU firmware.
+-	  Load asahi explicitly after the native display and GFX TVM supplier
+-	  are ready. Firmware-visible storage remains retained until a verified
+-	  retirement or reboot. Keep the working kernel available during bring-up.
++	  The module alias loads asahi when the GPU node is created; probe
++	  admission waits for the native display and the PMP supplier before
++	  the firmware starts. Firmware-visible storage remains retained
++	  until a verified retirement or reboot. Keep the working kernel
++	  available during bring-up.
+ 	  A rendering VM pins about 0.7 GiB; memory-cgroup limits are advisable.
+ 	  An aborted receipt disables that command class until reboot.
+ 	  Suspend, hibernation and kexec are blocked while native graphics owns DMA.
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 82f32da212..994f60a84e 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -45,6 +45,7 @@ pub(crate) mod glue {
+         fn asahi_g16_board() -> bool;
+         fn asahi_g16_identify_board() -> bool;
+         fn asahi_g16_j604_board() -> bool;
++        fn asahi_g16_display_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+         fn asahi_g16_module_get();
+         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
+@@ -89,6 +90,13 @@ pub(crate) mod glue {
+         unsafe { asahi_g16_j604_board() }
+     }
+ 
++    /// Defers (`EPROBE_DEFER`) until the native T8132 display is published, then links the GPU
++    /// to it.
++    pub(crate) fn display_prepare(dev: &device::Device) -> Result {
++        // SAFETY: `dev` is a valid device; the helper only adds a device link to it.
++        kernel::error::to_result(unsafe { asahi_g16_display_prepare(dev.as_raw().cast()) })
++    }
++
+     /// Holds the GFX power domain for the retained session.
+     pub(crate) fn hold_power(dev: &device::Device) -> Result {
+         // SAFETY: `dev` is a valid device; runtime-PM accounting on it has no other requirement.
+@@ -491,6 +499,13 @@ pub(crate) fn admit(
+     } else {
+         return Err(ENODEV);
+     };
++    // The first firmware start follows the native display (as on G15): defer until it is up.
++    if let Err(err) = glue::display_prepare(dev) {
++        if err != EPROBE_DEFER {
++            dev_err!(dev, "native display not admitted: {:?}\n", err);
++        }
++        return Err(err);
++    }
+     // Retain the PMP supplier (and its AGX bridge) before any vote.
+     // SAFETY: `dev` is the bound GPU device.
+     let ret = unsafe { bindings::apple_pmp_j713_gpu_prepare(dev.as_raw()) };
+diff --git a/drivers/gpu/drm/asahi/g16/glue.c b/drivers/gpu/drm/asahi/g16/glue.c
+index 403bca0f10..5d87dfb4d2 100644
+--- a/drivers/gpu/drm/asahi/g16/glue.c
++++ b/drivers/gpu/drm/asahi/g16/glue.c
+@@ -18,6 +18,7 @@
+ #include <linux/of_reserved_mem.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/slab.h>
++#include <linux/soc/apple/display.h>
+ #include <linux/soc/apple/pmp-display.h>
+ #include <linux/soc/apple/pmp-cooling.h>
+ #include <linux/soc/apple/pmp-telemetry.h>
+@@ -27,6 +28,7 @@ void asahi_g16_sha256(const u8 *data, size_t len, u8 *out);
+ bool asahi_g16_board(void);
+ bool asahi_g16_identify_board(void);
+ bool asahi_g16_j604_board(void);
++int asahi_g16_display_prepare(struct device *dev);
+ int asahi_g16_hold_power(struct device *dev);
+ void asahi_g16_module_get(void);
+ bool asahi_g16_ram_disjoint(u64 start, u64 size);
+@@ -175,6 +177,26 @@ bool asahi_g16_j604_board(void)
+ 	       of_machine_is_compatible("apple,t8132");
+ }
+ 
++/*
++ * The first firmware start follows the native display, as on G15: defer until
++ * the T8132 display subsystem is published (after its DRM registration and
++ * client setup) and link the GPU to it. Say once why the GPU waits.
++ */
++int asahi_g16_display_prepare(struct device *dev)
++{
++	struct device_node *np;
++	int ret;
++
++	ret = apple_drm_t8132_link_device(dev);
++	if (ret != -EPROBE_DEFER)
++		return ret;
++	np = of_find_compatible_node(NULL, NULL, "apple,t8132-display-subsystem");
++	if (!np || !of_device_is_available(np))
++		dev_info_once(dev, "G16: waiting for the T8132 native display, which this boot did not enable\n");
++	of_node_put(np);
++	return ret;
++}
++
+ /*
+  * Keep the GFX domain powered for the whole (retained) session. Never released,
+  * like the firmware session itself.
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 8e312a5992..c5f6362b5d 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -14,9 +14,9 @@
+ //!
+ //! # Plugging into the shared driver
+ //!
+-//! - [`Driver`] is a separate platform driver for `apple,agx-t8132` without a module alias, so
+-//!   probing (which boots the firmware) happens when userspace loads the module after the native
+-//!   display is up. It calls [`crate::driver::AsahiPlatformDriver::probe_g16`].
++//! - [`Driver`] is a separate platform driver for `apple,agx-t8132` with a module alias. Its
++//!   probe (which boots the firmware) waits for the native display and the PMP supplier first.
++//!   It calls [`crate::driver::AsahiPlatformDriver::probe_g16`].
+ //! - [`Gpu`] implements [`crate::gpu::Gpu`]: GET_PARAMS identity, VM creation (`new_vm`),
+ //!   queues (`new_queue`, see [`queue`]) and timestamp buffers.
+ //! - User VMs are shared-layer [`mmu::Vm`]s on a [`mmu::Uat::new_adopted`] UAT with tracked
+@@ -119,16 +119,21 @@ pub(crate) struct Config {
+ }
+ 
+ /// OF match table of the G16 platform driver.
+-///
+-/// Deliberately not exported with `module_device_table!`: without a module alias, the asahi
+-/// module is not loaded at boot for this GPU, and the firmware only starts when userspace loads
+-/// the module after the native display is up (the J713 bring-up order).
+ const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 1> =
+     kernel::device_id::IdArray::new([(
+         of::DeviceId::new(c_str!("apple,agx-t8132")),
+         &hw::t8132::CONFIG,
+     )]);
+ 
++// Probe admission requires the native display and the PMP supplier before the firmware starts,
++// so the module may be loaded at device creation.
++kernel::of_device_table!(
++    AUTOLOAD_OF_TABLE,
++    MODULE_OF_TABLE_G16,
++    (),
++    [(of::DeviceId::new(c_str!("apple,agx-t8132")), ())]
++);
++
+ /// The G16 platform driver: the shared [`AsahiPlatformDriver`] probed through
+ /// [`AsahiPlatformDriver::probe_g16`].
+ ///
+diff --git a/include/linux/soc/apple/display.h b/include/linux/soc/apple/display.h
+index eb71ce91e0..16bc1634d7 100644
+--- a/include/linux/soc/apple/display.h
++++ b/include/linux/soc/apple/display.h
+@@ -4,8 +4,9 @@
+ 
+ struct device;
+ 
+-/* Initial native display admission, before starting retained G15 firmware. */
++/* Initial native display admission, before starting retained G15/G16 firmware. */
+ int apple_drm_t6030_link_device(struct device *consumer);
+ int apple_drm_t6031_link_device(struct device *consumer);
++int apple_drm_t8132_link_device(struct device *consumer);
+ 
+ #endif

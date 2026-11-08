@@ -1,0 +1,275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Tue, 20 Oct 2026 11:49:33 +1100
+Subject: [PATCH] thermal: power allocator: unwind negative integral above the
+ cutoff
+
+With the default zero integral cutoff, an over-temperature sample reduces
+the integral power budget, but subsequent below-target samples cannot
+restore it. The restriction lasts until the zone cools below its switch-on
+trip and resets the controller. This makes the budget depend on whether a
+load starts after a cold rest or while the zone is still warm, and faster
+passive polling can accumulate the retained reduction more quickly.
+
+Allow positive error to unwind a negative integral even when the cutoff
+blocks normal integration. Limit that recovery to zero unless the error
+also passes the configured cutoff, preserving protection against positive
+wind-up and the existing integral power bound.
+
+Exercise the actual PID controller with KUnit: cold samples, continued hot
+integration, partial recovery, recovery stopping at zero, positive and
+negative cutoffs, and saturation. Document the recovery behavior.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+Assisted-by: Claude:claude-opus-5.5
+---
+ .../driver-api/thermal/power_allocator.rst    |   6 +
+ drivers/thermal/.kunitconfig.power_allocator  |   6 +
+ drivers/thermal/Kconfig                       |  10 ++
+ drivers/thermal/gov_power_allocator.c         |  23 ++-
+ drivers/thermal/gov_power_allocator_test.c    | 143 ++++++++++++++++++
+ 5 files changed, 185 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/thermal/.kunitconfig.power_allocator
+ create mode 100644 drivers/thermal/gov_power_allocator_test.c
+
+diff --git a/Documentation/driver-api/thermal/power_allocator.rst b/Documentation/driver-api/thermal/power_allocator.rst
+index aa5f66552d..1e05e15fd6 100644
+--- a/Documentation/driver-api/thermal/power_allocator.rst
++++ b/Documentation/driver-api/thermal/power_allocator.rst
+@@ -171,6 +171,12 @@ integral term.  This term is then multiplied by `k_i` and the result
+ added to the output of the controller.  Typically `k_i` is set low (1
+ or 2) and `integral_cutoff` is 0.
+ 
++A positive temperature error also unwinds a negative integral term, even
++when the error is at or above `integral_cutoff`.  In that case recovery
++stops at zero: the cutoff still prevents positive wind-up.  This lets the
++power budget recover after a temperature overshoot without requiring the
++zone to cool below its switch on temperature and reset the controller.
++
+ k_d
+ ---
+ 
+diff --git a/drivers/thermal/.kunitconfig.power_allocator b/drivers/thermal/.kunitconfig.power_allocator
+new file mode 100644
+index 0000000000..556dbd0d57
+--- /dev/null
++++ b/drivers/thermal/.kunitconfig.power_allocator
+@@ -0,0 +1,6 @@
++CONFIG_KUNIT=y
++CONFIG_THERMAL=y
++CONFIG_CPU_FREQ=y
++CONFIG_ENERGY_MODEL=y
++CONFIG_THERMAL_GOV_POWER_ALLOCATOR=y
++CONFIG_THERMAL_GOV_POWER_ALLOCATOR_KUNIT_TEST=y
+diff --git a/drivers/thermal/Kconfig b/drivers/thermal/Kconfig
+index ca7818863a..8aa41dd048 100644
+--- a/drivers/thermal/Kconfig
++++ b/drivers/thermal/Kconfig
+@@ -174,6 +174,16 @@ config THERMAL_GOV_POWER_ALLOCATOR
+ 	  Enable this to manage platform thermals by dynamically
+ 	  allocating and limiting power to devices.
+ 
++config THERMAL_GOV_POWER_ALLOCATOR_KUNIT_TEST
++	bool "KUnit tests for the power allocator governor" if !KUNIT_ALL_TESTS
++	depends on THERMAL_GOV_POWER_ALLOCATOR && KUNIT=y
++	default KUNIT_ALL_TESTS
++	help
++	  Test integral recovery after a temperature overshoot, the configured
++	  integral cutoff and the integral power bound. The tests exercise the
++	  PID controller with synthetic thermal zones and do not need hardware.
++	  Only useful for kernel developers; say N unless testing the governor.
++
+ config CPU_THERMAL
+ 	bool "Generic cpu cooling support"
+ 	depends on THERMAL_OF
+diff --git a/drivers/thermal/gov_power_allocator.c b/drivers/thermal/gov_power_allocator.c
+index 31f778dd49..ca3ffda42d 100644
+--- a/drivers/thermal/gov_power_allocator.c
++++ b/drivers/thermal/gov_power_allocator.c
+@@ -263,12 +263,25 @@ static u32 pid_controller(struct thermal_zone_device *tz,
+ 	 */
+ 	i = mul_frac(tz->tzp->k_i, params->err_integral);
+ 
+-	if (err < int_to_frac(tz->tzp->integral_cutoff)) {
+-		s64 i_next = i + mul_frac(tz->tzp->k_i, err);
++	if (err < int_to_frac(tz->tzp->integral_cutoff) ||
++	    (err > 0 && params->err_integral < 0)) {
++		s64 integral_err = err;
++		s64 i_next;
++
++		/*
++		 * The cutoff prevents positive wind-up while below the target,
++		 * but must not retain a power reduction after an overshoot.
++		 * Allow that reduction to unwind, without crossing zero unless
++		 * the error also satisfies the configured cutoff.
++		 */
++		if (err >= int_to_frac(tz->tzp->integral_cutoff))
++			integral_err = min_t(s64, integral_err,
++					     -params->err_integral);
++		i_next = i + mul_frac(tz->tzp->k_i, integral_err);
+ 
+ 		if (abs(i_next) < max_power_frac) {
+ 			i = i_next;
+-			params->err_integral += err;
++			params->err_integral += integral_err;
+ 		}
+ 	}
+ 
+@@ -798,3 +811,7 @@ static struct thermal_governor thermal_gov_power_allocator = {
+ 	.update_tz	= power_allocator_update_tz,
+ };
+ THERMAL_GOVERNOR_DECLARE(thermal_gov_power_allocator);
++
++#if IS_ENABLED(CONFIG_THERMAL_GOV_POWER_ALLOCATOR_KUNIT_TEST)
++#include "gov_power_allocator_test.c"
++#endif
+diff --git a/drivers/thermal/gov_power_allocator_test.c b/drivers/thermal/gov_power_allocator_test.c
+new file mode 100644
+index 0000000000..2a0b6fbf87
+--- /dev/null
++++ b/drivers/thermal/gov_power_allocator_test.c
+@@ -0,0 +1,143 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Included by gov_power_allocator.c to exercise the actual PID controller. */
++
++#include <kunit/test.h>
++
++struct power_allocator_test_ctx {
++	struct thermal_zone_device tz;
++	struct thermal_zone_params tzp;
++	struct power_allocator_params params;
++};
++
++static int power_allocator_test_init(struct kunit *test)
++{
++	struct power_allocator_test_ctx *ctx;
++
++	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++
++	ctx->tz.tzp = &ctx->tzp;
++	ctx->tz.governor_data = &ctx->params;
++	ctx->tz.passive_delay_jiffies = msecs_to_jiffies(500);
++	ctx->tzp.sustainable_power = 1500;
++	ctx->params.sustainable_power = 1500;
++	/* Isolate the integral term: one mW per millidegree of error. */
++	ctx->tzp.k_i = int_to_frac(1);
++	test->priv = ctx;
++	return 0;
++}
++
++static u32 power_allocator_test_sample(struct kunit *test, int temperature)
++{
++	struct power_allocator_test_ctx *ctx = test->priv;
++
++	ctx->tz.temperature = temperature;
++	return pid_controller(&ctx->tz, 95000, 10000);
++}
++
++static void power_allocator_test_no_positive_windup(struct kunit *test)
++{
++	struct power_allocator_test_ctx *ctx = test->priv;
++	int n;
++
++	for (n = 0; n < 10; n++)
++		KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 94000), 1500U);
++	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, 0LL);
++}
++
++static void power_allocator_test_hot_integrates(struct kunit *test)
++{
++	struct power_allocator_test_ctx *ctx = test->priv;
++
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 95100), 1400U);
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 95100), 1300U);
++	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, -(s64)int_to_frac(200));
++}
++
++static void power_allocator_test_partial_recovery(struct kunit *test)
++{
++	struct power_allocator_test_ctx *ctx = test->priv;
++
++	KUNIT_ASSERT_EQ(test, power_allocator_test_sample(test, 95100), 1400U);
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 94950), 1450U);
++	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, -(s64)int_to_frac(50));
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 94950), 1500U);
++	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, 0LL);
++}
++
++static void power_allocator_test_recovery_stops_at_zero(struct kunit *test)
++{
++	struct power_allocator_test_ctx *ctx = test->priv;
++
++	KUNIT_ASSERT_EQ(test, power_allocator_test_sample(test, 95100), 1400U);
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 94000), 1500U);
++	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, 0LL);
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 94000), 1500U);
++	/* Recovery does not require crossing the switch-on trip or resetting. */
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 95100), 1400U);
++}
++
++static void power_allocator_test_positive_cutoff(struct kunit *test)
++{
++	struct power_allocator_test_ctx *ctx = test->priv;
++
++	ctx->tzp.integral_cutoff = 1000;
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 94500), 2000U);
++	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, (s64)int_to_frac(500));
++	/* Error at the cutoff still cannot grow a positive integral. */
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 94000), 2000U);
++	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, (s64)int_to_frac(500));
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 96000), 1000U);
++	/* Above the cutoff, recovery is permitted only as far as zero. */
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 93000), 1500U);
++	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, 0LL);
++}
++
++static void power_allocator_test_negative_cutoff(struct kunit *test)
++{
++	struct power_allocator_test_ctx *ctx = test->priv;
++
++	ctx->tzp.integral_cutoff = -100;
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 95050), 1500U);
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 95100), 1500U);
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 95200), 1300U);
++	/* A negative error outside the cutoff must not unwind anything. */
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 95050), 1300U);
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 94800), 1500U);
++	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, 0LL);
++}
++
++static void power_allocator_test_integral_bound(struct kunit *test)
++{
++	struct power_allocator_test_ctx *ctx = test->priv;
++
++	/* The existing strict power bound still rejects saturated updates. */
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 105000), 1500U);
++	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, 0LL);
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 104000), 0U);
++	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, -(s64)int_to_frac(9000));
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 96000), 0U);
++	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, -(s64)int_to_frac(9000));
++	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 85000), 1500U);
++	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, 0LL);
++}
++
++static struct kunit_case power_allocator_test_cases[] = {
++	KUNIT_CASE(power_allocator_test_no_positive_windup),
++	KUNIT_CASE(power_allocator_test_hot_integrates),
++	KUNIT_CASE(power_allocator_test_partial_recovery),
++	KUNIT_CASE(power_allocator_test_recovery_stops_at_zero),
++	KUNIT_CASE(power_allocator_test_positive_cutoff),
++	KUNIT_CASE(power_allocator_test_negative_cutoff),
++	KUNIT_CASE(power_allocator_test_integral_bound),
++	{}
++};
++
++static struct kunit_suite power_allocator_test_suite = {
++	.name = "thermal-power-allocator",
++	.init = power_allocator_test_init,
++	.test_cases = power_allocator_test_cases,
++};
++
++kunit_test_suite(power_allocator_test_suite);

@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erik Bourget <erik@ebourget.net>
+Date: Sun, 25 Oct 2026 01:14:51 -0400
+Subject: [PATCH] Port aurora-silicon/m1n1's merged change #48 (6918c029)
+
+pcie: bypass the static SID16 for a J713 radio with managed streams
+
+aurora-silicon/m1n1 #48 (erikwb/j713/radio-managed-sids), merged as
+6918c029, ported as its merge diff against the first parent. It carries
+two commits by Erik Bourget:
+
+  2699ae65 pcie: bypass the static SID16 for a J713 radio with managed streams
+  7b6feb7e pcie: admit the whole J713 managed-sids list before using it
+
+Upstream's summary: when the kernel tree lists the radio's ordinary DART
+streams in apple,managed-sids on the PCIe host, m1n1 bypasses the
+static SID16 instead of the iommu-map stream. It refuses a mapped stream
+outside the list, a list naming SID16, or a malformed list, before the
+rail is powered. Trees without the property are unchanged. Upstream
+reports it tested on a J713 (MacBook Air 13" M4) with a 7.3
+integration/aurora kernel tree (SOURCE: PR #48 description). Nothing in
+this port has been booted.
+
+Applied cleanly on top of the #35 port (2 files, +79/-2); no conflicts.
+
+The behaviour depends on the kernel tree (apple,managed-sids). Whether
+the omacom linux-aurora J604 tree uses managed streams for its radio
+is up to the kernel device tree. The J604 radio sits on apcie
+pci-bridge0/wlan + bluetooth-pcie, as on the J713, but the J604 also
+has pci-bridge2/pcie-sdreader and dart-apcie2, which the J713 lacks
+(from the 25G83 J604 and J713 device tree templates).
+That port is not handled here.
+
+Build (RELEASE=1 CHAINLOADING=1, clang/lld 23.1.4): no new warnings.
+
+Hardware tested on: NOT YET
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ src/pcie_fdt.c                         | 45 ++++++++++++++++++++++++--
+ tests/python/test_m4_pcie_power_fdt.py | 36 +++++++++++++++++++++
+ 2 files changed, 79 insertions(+), 2 deletions(-)
+
+diff --git a/src/pcie_fdt.c b/src/pcie_fdt.c
+index 8ddc147d..4f83f244 100644
+--- a/src/pcie_fdt.c
++++ b/src/pcie_fdt.c
+@@ -101,9 +101,50 @@ static int pcie_fdt_resolve_iommu(void *dt, int host, int port, u32 *phandle, u8
+     return -1;
+ }
+ 
+-static bool pcie_fdt_t8132_port(void *dt, int host, int port, u32 *phandle, u8 *sid)
++/*
++ * Trees that list the radio's ordinary streams in apple,managed-sids leave them
++ * to the OS, which adopts them only while they are inactive; the radio's
++ * boot-time DMA goes through the DART's static SID16 bypass role instead
++ * (bindings: apple,pcie.yaml and apple,dart.yaml). Older trees map the endpoint
++ * to SID16 directly. Either way SID16 is the stream to bypass, and a mapped
++ * stream outside the managed list is refused.
++ */
++#define PCIE_STATIC_BYPASS_SID 16
++
++static int pcie_fdt_bypass_sid(void *dt, int host, u8 sid, u8 *bypass)
++{
++    int len;
++    const fdt32_t *managed = fdt_getprop(dt, host, "apple,managed-sids", &len);
++
++    if (!managed) {
++        *bypass = sid;
++        return len == -FDT_ERR_NOTFOUND ? 0 : -1;
++    }
++    if (len <= 0 || len % (int)sizeof(*managed))
++        return -1;
++
++    /* Admit the whole list before using it: a bad cell anywhere refuses it. */
++    bool member = false;
++    for (int i = 0; i < len / (int)sizeof(*managed); i++) {
++        u32 managed_sid = fdt32_ld(&managed[i]);
++
++        if (managed_sid == PCIE_STATIC_BYPASS_SID || managed_sid > 0xff)
++            return -1;
++        if (managed_sid == sid)
++            member = true;
++    }
++    if (!member)
++        return -1;
++    *bypass = PCIE_STATIC_BYPASS_SID;
++    return 0;
++}
++
++static bool pcie_fdt_t8132_port(void *dt, int host, int port, u32 *phandle, u8 *bypass)
+ {
+-    if (pcie_fdt_resolve_iommu(dt, host, port, phandle, sid))
++    u8 sid;
++
++    if (pcie_fdt_resolve_iommu(dt, host, port, phandle, &sid) ||
++        pcie_fdt_bypass_sid(dt, host, sid, bypass))
+         return false;
+ 
+     int dart = fdt_node_offset_by_phandle(dt, *phandle);
+diff --git a/tests/python/test_m4_pcie_power_fdt.py b/tests/python/test_m4_pcie_power_fdt.py
+index 2bef961a..6122c893 100644
+--- a/tests/python/test_m4_pcie_power_fdt.py
++++ b/tests/python/test_m4_pcie_power_fdt.py
+@@ -149,6 +149,41 @@ static void test_iommu_admission(void *dt)
+  assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/dart"), "compatible", "apple,t8103-dart"));
+  check_admission(dt, false);
+ }
++/* 7.3 trees map the radio to managed ordinary streams; SID16 is still bypassed. */
++static void test_managed_streams(void *dt)
++{
++ const struct { u32 base; fdt32_t managed[3]; int count; bool valid; } cases[] = {
++  {1, {cpu_to_fdt32(1), cpu_to_fdt32(2)}, 2, true},
++  {2, {cpu_to_fdt32(1), cpu_to_fdt32(2)}, 2, true},
++  {3, {cpu_to_fdt32(1), cpu_to_fdt32(2)}, 2, false}, /* Mapped outside the list. */
++  {1, {cpu_to_fdt32(16), cpu_to_fdt32(1)}, 2, false}, /* SID16 is never managed, */
++  {1, {cpu_to_fdt32(1), cpu_to_fdt32(16)}, 2, false}, /* in either order, */
++  {1, {cpu_to_fdt32(1), cpu_to_fdt32(2), cpu_to_fdt32(16)}, 3, false}, /* nor last. */
++  {1, {cpu_to_fdt32(1), cpu_to_fdt32(0x100)}, 2, false}, /* A trailing cell that is no SID. */
++  {1, {cpu_to_fdt32(1)}, 1, true},
++  {1, {0}, 0, false}, /* An empty list is malformed, not absent. */
++ };
++ for (unsigned i = 0; i < sizeof(cases) / sizeof(*cases); i++) {
++  setup(dt, true, 0);
++  int host = fdt_path_offset(dt, "/pcie");
++  fdt32_t map[] = {cpu_to_fdt32(0x100), cpu_to_fdt32(2), cpu_to_fdt32(cases[i].base),
++                   cpu_to_fdt32(1)};
++  assert(!fdt_setprop(dt, host, "iommu-map", map, sizeof(map)));
++  assert(!fdt_setprop_u32(dt, host, "iommu-map-mask", 0xffff));
++  assert(!fdt_setprop(dt, fdt_path_offset(dt, "/pcie"), "apple,managed-sids", cases[i].managed,
++                      cases[i].count * sizeof(fdt32_t)));
++  expected_sid = 16;
++  check_admission(dt, cases[i].valid);
++ }
++ /* A list that is not whole cells is refused, even when its first cell matches. */
++ setup(dt, true, 0);
++ fdt32_t map[] = {cpu_to_fdt32(0x100), cpu_to_fdt32(2), cpu_to_fdt32(1), cpu_to_fdt32(1)};
++ assert(!fdt_setprop(dt, fdt_path_offset(dt, "/pcie"), "iommu-map", map, sizeof(map)));
++ assert(!fdt_setprop_u32(dt, fdt_path_offset(dt, "/pcie"), "iommu-map-mask", 0xffff));
++ assert(!fdt_setprop(dt, fdt_path_offset(dt, "/pcie"), "apple,managed-sids", "\0\0\0\1\0", 5));
++ expected_sid = 16;
++ check_admission(dt, false);
++}
+ static void test_smc_failure_admission(void *dt)
+ {
+  /* smc_cmd returns a positive firmware status, not a negative errno. */
+@@ -185,6 +220,7 @@ int main(void)
+   assert(!pcie_prepare_fdt(blob) && !pcie_handoff_fdt(blob));
+  }
+  test_iommu_admission(blob);
++ test_managed_streams(blob);
+  test_smc_failure_admission(blob);
+  return 0;
+ }

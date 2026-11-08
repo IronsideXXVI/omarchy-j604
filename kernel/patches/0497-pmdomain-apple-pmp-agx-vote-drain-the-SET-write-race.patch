@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 09:06:09 -0600
+Subject: [PATCH] pmdomain: apple: pmp-agx-vote: drain the SET-write race,
+ bound the retry deadline and quiet the backoff kicks
+
+Three findings from chriskearney's review of #334; the suite cases landed
+first (825e9aca, red) and this is the smallest change that turns them green.
+
+- end() during the SET write (between decide and applied) sees voted false
+  and arms nothing; applied then leaves the vote set with no user and an
+  already-reached idle deadline, and next() answered 0, which the caller
+  reads as nothing pending. An already-reached deadline now returns 1, so
+  the caller runs the reconcile that clears the vote. It settles one step
+  later: decide CLEAR, applied, next 0.
+- A retry deadline more than one backoff window in the future cannot be
+  real (an idle gap beyond half the 32-bit millisecond range reads an
+  expired deadline as future through the wrapped compare), so the new
+  agx_vote_retry_reached() treats it as expired instead of keeping the vote
+  off for days.
+- begin() no longer asks for a reconciliation while a failed set is in
+  backoff: decide would return NONE, and the retry timer already drives the
+  set. One kick per operation during the window was pure waste.
+
+The mutants in tools/asahi/pmp-agx-vote-tests.py pin each: set-write-ends
+dies at the race assert, retry-revival at the bound assert,
+begin-backoff-kick at the kick-count assert, and the five earlier mutants
+still die. Plain suite: 22 cases, selfcheck ok.
+
+Signed-off-by: Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
+(cherry picked from commit a7330a53e0e37feb8c4103d16cf94c9606f7d697)
+---
+ drivers/pmdomain/apple/pmp-agx-vote.h | 26 ++++++++++++++++++++------
+ 1 file changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/pmdomain/apple/pmp-agx-vote.h b/drivers/pmdomain/apple/pmp-agx-vote.h
+index 64d8f3f199..ef0845b897 100644
+--- a/drivers/pmdomain/apple/pmp-agx-vote.h
++++ b/drivers/pmdomain/apple/pmp-agx-vote.h
+@@ -51,11 +51,21 @@ static inline bool agx_vote_reached(agx_ms_t now, agx_ms_t t)
+ 	return (agx_sms_t)(now - t) >= 0;
+ }
+ 
++/* A retry deadline more than one backoff window in the future cannot be real: an idle gap beyond half the
++ * 32-bit millisecond range makes the wrapped arithmetic read an expired deadline as future. Treat it as expired. */
++static inline bool agx_vote_retry_reached(const struct agx_vote *v, agx_ms_t now)
++{
++	return agx_vote_reached(now, v->retry_at)
++	       || (agx_sms_t)(v->retry_at - now) > (agx_sms_t)AGX_VOTE_RETRY_MS;
++}
++
+ /* An operation starts. True: run the reconcile step now. */
+ static inline bool agx_vote_begin(struct agx_vote *v)
+ {
+ 	v->users++;
+-	return v->enabled && !v->voted && !v->stopped;
++	/* While a failed set is in backoff the retry timer drives the set: decide would return NONE here, so
++	 * asking for a reconciliation only burns a kick per operation until the deadline. */
++	return v->enabled && !v->voted && !v->stopped && !v->failures;
+ }
+ 
+ /* An operation ends. Returns the delay in ms after which the reconcile step must run, 0 when none is needed. */
+@@ -77,15 +87,17 @@ static inline enum agx_vote_action agx_vote_decide(const struct agx_vote *v, agx
+ 	if (!v->enabled || v->stopped)
+ 		return v->voted ? AGX_VOTE_CLEAR : AGX_VOTE_NONE;
+ 	if (v->users)
+-		return !v->voted && (!v->failures || agx_vote_reached(now, v->retry_at)) ? AGX_VOTE_SET : AGX_VOTE_NONE;
++		return !v->voted && (!v->failures || agx_vote_retry_reached(v, now)) ? AGX_VOTE_SET : AGX_VOTE_NONE;
+ 	if (v->voted && agx_vote_reached(now, v->idle_at + v->idle_ms))
+ 		return AGX_VOTE_CLEAR;
+ 	return AGX_VOTE_NONE;
+ }
+ 
+ /*
+- * Delay in ms until the reconcile step must run again, 0 when no timer is needed. 1 when a set is owed right now: an operation began while a
+- * clear was being written (begin saw voted still true and did not kick), so after the clear nothing would schedule the set.
++ * Delay in ms until the reconcile step must run again, 0 when no timer is needed. 1 when work is due now: an
++ * operation began while a clear was being written (begin saw voted still true and did not kick), or an end
++ * landed inside the SET write so the vote is set with an already-reached idle deadline. The caller must run the
++ * reconcile those cases would otherwise skip; it cannot read 1 as "nothing pending".
+  */
+ static inline agx_ms_t agx_vote_next(const struct agx_vote *v, agx_ms_t now)
+ {
+@@ -96,12 +108,14 @@ static inline agx_ms_t agx_vote_next(const struct agx_vote *v, agx_ms_t now)
+ 	if (v->users && !v->voted && !v->failures)
+ 		return 1;
+ 	if (v->users && !v->voted && v->failures)
+-		at = v->retry_at;
++		at = agx_vote_retry_reached(v, now) ? now : v->retry_at;
+ 	else if (!v->users && v->voted)
+ 		at = v->idle_at + v->idle_ms;
+ 	else
+ 		return 0;
+-	return agx_vote_reached(now, at) ? 0 : at - now;
++	/* An already-reached deadline returns 1: there is work, due now. The SET-write race leaves exactly
++	 * this state (voted, no user, deadline passed), and 0 here would strand the vote set forever. */
++	return agx_vote_reached(now, at) ? 1 : at - now;
+ }
+ 
+ /* Record the outcome of the register write for `action` (ret 0: acknowledged). */

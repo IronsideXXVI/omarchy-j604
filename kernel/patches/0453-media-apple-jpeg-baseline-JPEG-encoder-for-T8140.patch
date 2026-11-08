@@ -1,0 +1,2070 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Mon, 2 Nov 2026 15:27:41 +1100
+Subject: [PATCH] media: apple: jpeg: baseline JPEG encoder for T8140
+
+Turn the JPEG scaffold into a V4L2 memory-to-memory encoder for the A18
+Pro (T8140) engines. It takes full-range NV12M (4:2:0) or NV16M (4:2:2)
+frames and produces baseline JPEG with the standard Huffman tables, at a
+quality set by V4L2_CID_JPEG_COMPRESSION_QUALITY (Annex K tables with the
+libjpeg scaling) and an optional restart interval.
+
+T8140 widens every DMA address to a 64-bit low/high pair, which moves the
+colour, input-format, timeout and revision registers up from the m1n1
+map. The engine is identified by its revision with the stepping ignored,
+reset with the documented handshake before every job, and programmed
+with one ordered register list that KUnit checks write by write. The
+interrupt is acknowledged in the engine's order: completion status, run
+bit, prefetch and mask. Registers past the control block are only touched
+once MODE has opened them, which is what made early writes fault.
+
+T6041 is still refused: its layout is not supported yet.
+
+Originally-by: Acelogic <miguelc4600@gmail.com>
+Link: https://github.com/aurora-silicon/linux-aurora/commit/3e77f272d9bb8940de8e744ead8d638e65f7500f
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(cherry picked from commit 6f1281f793d44f44e84b01e6529598fe8e11f91f)
+---
+ .../media/platform/apple/jpeg/.kunitconfig    |  15 +
+ drivers/media/platform/apple/jpeg/Kconfig     |  25 +-
+ drivers/media/platform/apple/jpeg/Makefile    |   1 +
+ .../platform/apple/jpeg/apple-jpeg-drv.c      | 802 ++++++++++++++++++
+ .../media/platform/apple/jpeg/apple-jpeg-hw.c | 222 +++++
+ .../media/platform/apple/jpeg/apple-jpeg-hw.h | 139 ++-
+ .../platform/apple/jpeg/apple-jpeg-test.c     | 176 +++-
+ .../media/platform/apple/jpeg/apple-jpeg.c    | 543 ------------
+ 8 files changed, 1315 insertions(+), 608 deletions(-)
+ create mode 100644 drivers/media/platform/apple/jpeg/.kunitconfig
+ create mode 100644 drivers/media/platform/apple/jpeg/apple-jpeg-drv.c
+ create mode 100644 drivers/media/platform/apple/jpeg/apple-jpeg-hw.c
+ delete mode 100644 drivers/media/platform/apple/jpeg/apple-jpeg.c
+
+diff --git a/drivers/media/platform/apple/jpeg/.kunitconfig b/drivers/media/platform/apple/jpeg/.kunitconfig
+new file mode 100644
+index 0000000000..b07fcec866
+--- /dev/null
++++ b/drivers/media/platform/apple/jpeg/.kunitconfig
+@@ -0,0 +1,15 @@
++CONFIG_KUNIT=y
++CONFIG_ARCH_APPLE=y
++CONFIG_PM=y
++CONFIG_PM_GENERIC_DOMAINS=y
++CONFIG_OF=y
++CONFIG_IOMMU_SUPPORT=y
++CONFIG_APPLE_DART=y
++CONFIG_IOMMU_DMA=y
++CONFIG_MEDIA_SUPPORT=y
++CONFIG_MEDIA_SUPPORT_FILTER=n
++CONFIG_VIDEO_DEV=y
++CONFIG_V4L_PLATFORM_DRIVERS=y
++CONFIG_V4L_MEM2MEM_DRIVERS=y
++CONFIG_VIDEO_APPLE_JPEG=y
++CONFIG_VIDEO_APPLE_JPEG_KUNIT_TEST=y
+diff --git a/drivers/media/platform/apple/jpeg/Kconfig b/drivers/media/platform/apple/jpeg/Kconfig
+index f429b8970d..3aa4249758 100644
+--- a/drivers/media/platform/apple/jpeg/Kconfig
++++ b/drivers/media/platform/apple/jpeg/Kconfig
+@@ -1,25 +1,26 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ 
+ config VIDEO_APPLE_JPEG
+-	tristate "Apple Silicon JPEG codec skeleton"
++	tristate "Apple Silicon JPEG encoder"
+ 	depends on VIDEO_DEV
+ 	depends on ARCH_APPLE || (COMPILE_TEST && 64BIT)
+ 	depends on OF_ADDRESS && IOMMU_API && PM
+ 	select V4L2_MEM2MEM_DEV
+ 	select VIDEOBUF2_DMA_CONTIG
+ 	help
+-	  Build the common Apple JPEG memory-to-memory driver scaffold.
+-	  Hardware revisions are not qualified yet: probe reads HWREV and
+-	  refuses all currently described hardware. No reset, interrupt
+-	  acknowledgment or DMA job is implemented, and streaming is refused.
+-	  Device tree nodes must remain disabled pending hardware qualification.
++	  V4L2 memory-to-memory baseline JPEG encoder for the JPEG engine
++	  in Apple A18 Pro (T8140) SoCs. It takes full-range NV12M (4:2:0)
++	  or NV16M (4:2:2) frames. Other SoCs' engines are identified and
++	  refused until their register layout is supported.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called apple-jpeg.
+ 
+ config VIDEO_APPLE_JPEG_KUNIT_TEST
+-	tristate "KUnit tests for Apple JPEG admission" if !KUNIT_ALL_TESTS
+-	depends on KUNIT
++	tristate "KUnit tests for the Apple JPEG encoder" if !KUNIT_ALL_TESTS
++	depends on KUNIT && VIDEO_APPLE_JPEG
+ 	default KUNIT_ALL_TESTS
+ 	help
+-	  Test exact per-compatible HWREV matching and the empty target
+-	  allow-lists, including invalid readbacks and revisions observed
+-	  on other SoCs. Synthetic match data exercises the admission helper.
+-	  These tests do not access hardware or qualify any target revision.
++	  Check engine identification, the quantisation tables and every
++	  register write of 4:2:0 and 4:2:2 encode jobs. No hardware is
++	  needed.
+diff --git a/drivers/media/platform/apple/jpeg/Makefile b/drivers/media/platform/apple/jpeg/Makefile
+index eee453f627..1cff391a65 100644
+--- a/drivers/media/platform/apple/jpeg/Makefile
++++ b/drivers/media/platform/apple/jpeg/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ 
+ obj-$(CONFIG_VIDEO_APPLE_JPEG) += apple-jpeg.o
++apple-jpeg-y := apple-jpeg-drv.o apple-jpeg-hw.o
+ obj-$(CONFIG_VIDEO_APPLE_JPEG_KUNIT_TEST) += apple-jpeg-test.o
+diff --git a/drivers/media/platform/apple/jpeg/apple-jpeg-drv.c b/drivers/media/platform/apple/jpeg/apple-jpeg-drv.c
+new file mode 100644
+index 0000000000..d8b2b2141b
+--- /dev/null
++++ b/drivers/media/platform/apple/jpeg/apple-jpeg-drv.c
+@@ -0,0 +1,802 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple Silicon JPEG encoder, V4L2 memory-to-memory.
++ *
++ * Takes full-range two-plane YUV (NV12M for 4:2:0, NV16M for 4:2:2) and
++ * produces baseline JPEG with the standard Huffman tables. One job runs at
++ * a time; the engine is reset before each job and the completion interrupt
++ * ends it. Register layout: see apple-jpeg-hw.h.
++ */
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iommu.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
++
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-fh.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-mem2mem.h>
++#include <media/videobuf2-dma-contig.h>
++
++#include "apple-jpeg-hw.h"
++
++#define AJ_NAME			"apple-jpeg"
++#define AJ_MIN_SIZE		16
++#define AJ_MAX_SIZE		16384
++#define AJ_JOB_TIMEOUT_MS	2000
++
++struct apple_jpeg {
++	struct device *dev;
++	void __iomem *regs;
++	const struct apple_jpeg_variant *variant;
++	struct mutex lock;	/* serialises ioctls and queue state */
++	struct v4l2_device v4l2_dev;
++	struct video_device vdev;
++	struct v4l2_m2m_dev *m2m_dev;
++	int irq;
++
++	spinlock_t hw_lock;	/* protects the fields below */
++	struct apple_jpeg_ctx *active;
++	bool broken;
++	u32 status, int_status, bytes;
++	struct delayed_work watchdog;
++	struct apple_jpeg_write writes[APPLE_JPEG_MAX_WRITES];
++};
++
++struct apple_jpeg_ctx {
++	struct v4l2_fh fh;
++	struct apple_jpeg *jpeg;
++	struct v4l2_ctrl_handler hdl;
++	struct v4l2_ctrl *quality;
++	struct v4l2_ctrl *restart;
++	struct v4l2_pix_format_mplane src;	/* raw, OUTPUT queue */
++	struct v4l2_pix_format_mplane dst;	/* JPEG, CAPTURE queue */
++	u32 sequence;
++};
++
++static struct apple_jpeg_ctx *aj_file_to_ctx(struct file *file)
++{
++	return container_of(file_to_v4l2_fh(file), struct apple_jpeg_ctx, fh);
++}
++
++static void aj_write(struct apple_jpeg *jpeg, u32 reg, u32 val)
++{
++	writel_relaxed(val, jpeg->regs + reg);
++}
++
++static u32 aj_read(struct apple_jpeg *jpeg, u32 reg)
++{
++	return readl_relaxed(jpeg->regs + reg);
++}
++
++/* ---- hardware --------------------------------------------------------- */
++
++/*
++ * Reset handshake. Registers outside the control block (the IRQ mask and
++ * the 0x1000 block) may only be touched once MODE has opened them.
++ */
++static int aj_reset(struct apple_jpeg *jpeg)
++{
++	int n, ret;
++	u32 v;
++
++	aj_write(jpeg, AJ_MODE, AJ_MODE_RESET);
++	aj_write(jpeg, AJ_MODE, AJ_MODE_SETUP);
++	aj_write(jpeg, AJ_MAIN_RUN, 0);
++	n = apple_jpeg_defaults(false, jpeg->writes, ARRAY_SIZE(jpeg->writes));
++	if (n < 0)
++		return n;
++	for (int i = 0; i < n; i++)
++		aj_write(jpeg, jpeg->writes[i].offset, jpeg->writes[i].value);
++	aj_write(jpeg, AJ_MODE, AJ_MODE_OPEN);
++	ret = readl_relaxed_poll_timeout_atomic(jpeg->regs + AJ_COMMAND, v, !v, 1, 10000);
++	if (ret)
++		return ret;
++	aj_write(jpeg, AJ_RST_INTERVAL, 1);
++	ret = readl_relaxed_poll_timeout_atomic(jpeg->regs + AJ_RST_INTERVAL, v, v == 1, 1,
++						10000);
++	if (ret)
++		return ret;
++	aj_write(jpeg, AJ_RST_INTERVAL, 0);
++	aj_write(jpeg, AJ_MODE, AJ_MODE_IDLE);
++	return 0;
++}
++
++static void aj_finish(struct apple_jpeg *jpeg, struct apple_jpeg_ctx *ctx, int err)
++{
++	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
++	struct vb2_v4l2_buffer *src, *dst;
++
++	src = v4l2_m2m_src_buf_remove(m2m);
++	dst = v4l2_m2m_dst_buf_remove(m2m);
++	if (src && dst) {
++		if (!err && (jpeg->bytes < 4 || jpeg->bytes > vb2_plane_size(&dst->vb2_buf, 0)))
++			err = -EIO;
++		vb2_set_plane_payload(&dst->vb2_buf, 0, err ? 0 : jpeg->bytes);
++		v4l2_m2m_buf_copy_metadata(src, dst);
++		dst->sequence = ctx->sequence++;
++		dst->flags |= V4L2_BUF_FLAG_KEYFRAME;
++		if (v4l2_m2m_is_last_draining_src_buf(m2m, src)) {
++			static const struct v4l2_event eos = { .type = V4L2_EVENT_EOS };
++
++			dst->flags |= V4L2_BUF_FLAG_LAST;
++			v4l2_event_queue_fh(&ctx->fh, &eos);
++			v4l2_m2m_mark_stopped(m2m);
++		}
++		v4l2_m2m_buf_done(src, err ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
++		v4l2_m2m_buf_done(dst, err ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
++	}
++	pm_runtime_mark_last_busy(jpeg->dev);
++	pm_runtime_put_autosuspend(jpeg->dev);
++	v4l2_m2m_job_finish(jpeg->m2m_dev, m2m);
++}
++
++/* Completion: snapshot, acknowledge and quiesce, in the engine's order. */
++static irqreturn_t aj_irq(int irq, void *data)
++{
++	struct apple_jpeg *jpeg = data;
++	struct apple_jpeg_ctx *ctx;
++	int err = 0;
++
++	spin_lock(&jpeg->hw_lock);
++	ctx = jpeg->active;
++	if (!ctx) {
++		spin_unlock(&jpeg->hw_lock);
++		return IRQ_NONE;
++	}
++	aj_read(jpeg, AJ_CODEC_MODE);
++	jpeg->status = aj_read(jpeg, AJ_STATUS);
++	jpeg->int_status = aj_read(jpeg, AJ_INT_STATUS);
++	aj_read(jpeg, AJ_DEBUG_STATUS);
++	if (!(jpeg->int_status & AJ_INT_STATUS_DONE) && !(jpeg->status & AJ_STATUS_ERRORS)) {
++		spin_unlock(&jpeg->hw_lock);
++		return IRQ_NONE;
++	}
++	aj_write(jpeg, AJ_INT_STATUS, 0);
++	aj_write(jpeg, AJ_MAIN_RUN, 0);
++	aj_write(jpeg, AJ_AXI_READ_PREFETCH, 0);
++	aj_write(jpeg, AJ_AXI_WRITE_PREFETCH, 0);
++	aj_write(jpeg, AJ_IRQ_MASK, 0);
++	aj_read(jpeg, AJ_BITSTREAM_CORRUPTION);
++	jpeg->bytes = aj_read(jpeg, AJ_COMPRESSED_BYTES);
++	jpeg->active = NULL;
++	spin_unlock(&jpeg->hw_lock);
++
++	if (!(jpeg->status & AJ_STATUS_DONE) || (jpeg->status & AJ_STATUS_ERRORS) ||
++	    !(jpeg->int_status & AJ_INT_STATUS_DONE)) {
++		dev_err_ratelimited(jpeg->dev, "job failed: status %#x int %#x\n",
++				    jpeg->status, jpeg->int_status);
++		err = -EIO;
++	}
++	cancel_delayed_work(&jpeg->watchdog);
++	aj_finish(jpeg, ctx, err);
++	return IRQ_HANDLED;
++}
++
++static void aj_watchdog(struct work_struct *work)
++{
++	struct apple_jpeg *jpeg = container_of(work, struct apple_jpeg, watchdog.work);
++	struct apple_jpeg_ctx *ctx;
++	unsigned long flags;
++
++	spin_lock_irqsave(&jpeg->hw_lock, flags);
++	ctx = jpeg->active;
++	jpeg->active = NULL;
++	if (ctx) {
++		aj_write(jpeg, AJ_MAIN_RUN, 0);
++		aj_write(jpeg, AJ_IRQ_MASK, 0);
++		/* The reset before the next job decides whether the engine recovered. */
++	}
++	spin_unlock_irqrestore(&jpeg->hw_lock, flags);
++	if (ctx) {
++		dev_err(jpeg->dev, "job timed out\n");
++		aj_finish(jpeg, ctx, -ETIMEDOUT);
++	}
++}
++
++static void aj_device_run(void *priv)
++{
++	struct apple_jpeg_ctx *ctx = priv;
++	struct apple_jpeg *jpeg = ctx->jpeg;
++	struct vb2_v4l2_buffer *src, *dst;
++	struct apple_jpeg_job job;
++	unsigned long flags;
++	dma_addr_t y, c;
++	int n, ret;
++
++	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
++	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
++	ret = pm_runtime_resume_and_get(jpeg->dev);
++	if (ret < 0) {
++		pm_runtime_get_noresume(jpeg->dev);
++		aj_finish(jpeg, ctx, ret);
++		return;
++	}
++
++	y = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
++	c = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 1);
++	job = (struct apple_jpeg_job){
++		.width = ctx->src.width,
++		.height = ctx->src.height,
++		.is422 = ctx->src.pixelformat == V4L2_PIX_FMT_NV16M,
++		.luma_stride = ctx->src.plane_fmt[0].bytesperline,
++		.chroma_stride = ctx->src.plane_fmt[1].bytesperline,
++		.luma = y,
++		.chroma = c,
++		.input_end = max(y + vb2_plane_size(&src->vb2_buf, 0),
++				 c + vb2_plane_size(&src->vb2_buf, 1)) - 1,
++		.output = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0),
++		.output_size = vb2_plane_size(&dst->vb2_buf, 0),
++		.quality = v4l2_ctrl_g_ctrl(ctx->quality),
++		.restart_interval = v4l2_ctrl_g_ctrl(ctx->restart),
++	};
++
++	spin_lock_irqsave(&jpeg->hw_lock, flags);
++	ret = jpeg->broken ? -EIO : aj_reset(jpeg);
++	if (ret) {
++		jpeg->broken = true;
++		spin_unlock_irqrestore(&jpeg->hw_lock, flags);
++		dev_err_ratelimited(jpeg->dev, "engine reset failed: %d\n", ret);
++		aj_finish(jpeg, ctx, -EIO);
++		return;
++	}
++	n = apple_jpeg_build_job(&job, jpeg->writes, ARRAY_SIZE(jpeg->writes));
++	if (n < 0) {
++		spin_unlock_irqrestore(&jpeg->hw_lock, flags);
++		aj_finish(jpeg, ctx, n);
++		return;
++	}
++	jpeg->active = ctx;
++	/* Buffers must be visible before the start command, the last write. */
++	dma_wmb();
++	for (int i = 0; i < n; i++)
++		writel(jpeg->writes[i].value, jpeg->regs + jpeg->writes[i].offset);
++	spin_unlock_irqrestore(&jpeg->hw_lock, flags);
++	schedule_delayed_work(&jpeg->watchdog, msecs_to_jiffies(AJ_JOB_TIMEOUT_MS));
++}
++
++static const struct v4l2_m2m_ops aj_m2m_ops = {
++	.device_run = aj_device_run,
++};
++
++/* ---- formats ---------------------------------------------------------- */
++
++/* Raw input: Y plane and interleaved CbCr plane, separate buffers, full range. */
++static void aj_fill_raw(struct v4l2_pix_format_mplane *pix)
++{
++	bool is422 = pix->pixelformat == V4L2_PIX_FMT_NV16M;
++	u32 w = clamp_t(u32, ALIGN(pix->width, 2), AJ_MIN_SIZE, AJ_MAX_SIZE);
++	u32 h = clamp_t(u32, pix->height, AJ_MIN_SIZE, AJ_MAX_SIZE);
++	u32 stride = ALIGN(w, 16), rows = ALIGN(h, 16);
++
++	pix->pixelformat = is422 ? V4L2_PIX_FMT_NV16M : V4L2_PIX_FMT_NV12M;
++	pix->width = w;
++	pix->height = h;
++	pix->field = V4L2_FIELD_NONE;
++	pix->num_planes = 2;
++	pix->flags = 0;
++	memset(pix->plane_fmt, 0, sizeof(pix->plane_fmt));
++	memset(pix->reserved, 0, sizeof(pix->reserved));
++	/* The engine reads whole macroblock rows, so the planes cover them. */
++	pix->plane_fmt[0].bytesperline = stride;
++	pix->plane_fmt[0].sizeimage = stride * rows;
++	pix->plane_fmt[1].bytesperline = stride;
++	pix->plane_fmt[1].sizeimage = stride * (is422 ? rows : rows / 2);
++	/* JPEG carries full-range BT.601; the engine does no range conversion. */
++	pix->colorspace = V4L2_COLORSPACE_SRGB;
++	pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
++	pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	pix->xfer_func = V4L2_XFER_FUNC_SRGB;
++}
++
++static void aj_fill_coded(struct v4l2_pix_format_mplane *dst,
++			  const struct v4l2_pix_format_mplane *src)
++{
++	*dst = *src;
++	dst->pixelformat = V4L2_PIX_FMT_JPEG;
++	dst->num_planes = 1;
++	memset(dst->plane_fmt, 0, sizeof(dst->plane_fmt));
++	/* Worst case at quality 100 plus headers. */
++	dst->plane_fmt[0].sizeimage = PAGE_ALIGN(src->width * src->height * 3 + SZ_16K);
++}
++
++static int aj_querycap(struct file *file, void *priv, struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, AJ_NAME, sizeof(cap->driver));
++	strscpy(cap->card, "Apple JPEG encoder", sizeof(cap->card));
++	return 0;
++}
++
++static int aj_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *f)
++{
++	static const u32 fmts[] = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV16M };
++
++	if (f->index >= ARRAY_SIZE(fmts))
++		return -EINVAL;
++	f->pixelformat = fmts[f->index];
++	return 0;
++}
++
++static int aj_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f)
++{
++	if (f->index)
++		return -EINVAL;
++	f->pixelformat = V4L2_PIX_FMT_JPEG;
++	f->flags = V4L2_FMT_FLAG_COMPRESSED;
++	return 0;
++}
++
++static int aj_enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *fs)
++{
++	if (fs->index || (fs->pixel_format != V4L2_PIX_FMT_JPEG &&
++			  fs->pixel_format != V4L2_PIX_FMT_NV12M &&
++			  fs->pixel_format != V4L2_PIX_FMT_NV16M))
++		return -EINVAL;
++	fs->type = V4L2_FRMSIZE_TYPE_STEPWISE;
++	fs->stepwise = (struct v4l2_frmsize_stepwise){
++		AJ_MIN_SIZE, AJ_MAX_SIZE, 2, AJ_MIN_SIZE, AJ_MAX_SIZE, 1,
++	};
++	return 0;
++}
++
++static int aj_g_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
++{
++	f->fmt.pix_mp = aj_file_to_ctx(file)->src;
++	return 0;
++}
++
++static int aj_g_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
++{
++	f->fmt.pix_mp = aj_file_to_ctx(file)->dst;
++	return 0;
++}
++
++static int aj_try_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
++{
++	aj_fill_raw(&f->fmt.pix_mp);
++	return 0;
++}
++
++static int aj_try_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
++{
++	aj_fill_coded(&f->fmt.pix_mp, &aj_file_to_ctx(file)->src);
++	return 0;
++}
++
++static int aj_s_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct apple_jpeg_ctx *ctx = aj_file_to_ctx(file);
++
++	if (vb2_is_busy(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)) ||
++	    vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
++		return -EBUSY;
++	aj_fill_raw(&f->fmt.pix_mp);
++	ctx->src = f->fmt.pix_mp;
++	aj_fill_coded(&ctx->dst, &ctx->src);
++	return 0;
++}
++
++static int aj_s_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct apple_jpeg_ctx *ctx = aj_file_to_ctx(file);
++
++	if (vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
++		return -EBUSY;
++	aj_fill_coded(&f->fmt.pix_mp, &ctx->src);
++	ctx->dst = f->fmt.pix_mp;
++	return 0;
++}
++
++static int aj_subscribe_event(struct v4l2_fh *fh, const struct v4l2_event_subscription *sub)
++{
++	if (sub->type == V4L2_EVENT_EOS)
++		return v4l2_event_subscribe(fh, sub, 0, NULL);
++	return v4l2_ctrl_subscribe_event(fh, sub);
++}
++
++static const struct v4l2_ioctl_ops aj_ioctl_ops = {
++	.vidioc_querycap = aj_querycap,
++	.vidioc_enum_fmt_vid_out = aj_enum_fmt_out,
++	.vidioc_enum_fmt_vid_cap = aj_enum_fmt_cap,
++	.vidioc_enum_framesizes = aj_enum_framesizes,
++	.vidioc_g_fmt_vid_out_mplane = aj_g_fmt_out,
++	.vidioc_g_fmt_vid_cap_mplane = aj_g_fmt_cap,
++	.vidioc_try_fmt_vid_out_mplane = aj_try_fmt_out,
++	.vidioc_try_fmt_vid_cap_mplane = aj_try_fmt_cap,
++	.vidioc_s_fmt_vid_out_mplane = aj_s_fmt_out,
++	.vidioc_s_fmt_vid_cap_mplane = aj_s_fmt_cap,
++
++	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
++	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
++	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
++	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
++	.vidioc_prepare_buf = v4l2_m2m_ioctl_prepare_buf,
++	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
++	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
++	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
++	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
++
++	.vidioc_try_encoder_cmd = v4l2_m2m_ioctl_try_encoder_cmd,
++	.vidioc_encoder_cmd = v4l2_m2m_ioctl_encoder_cmd,
++
++	.vidioc_subscribe_event = aj_subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++};
++
++/* ---- queues ----------------------------------------------------------- */
++
++static struct v4l2_pix_format_mplane *aj_q_fmt(struct apple_jpeg_ctx *ctx, u32 type)
++{
++	return V4L2_TYPE_IS_OUTPUT(type) ? &ctx->src : &ctx->dst;
++}
++
++static int aj_queue_setup(struct vb2_queue *q, unsigned int *nbufs, unsigned int *nplanes,
++			  unsigned int sizes[], struct device *alloc_devs[])
++{
++	struct v4l2_pix_format_mplane *pix = aj_q_fmt(vb2_get_drv_priv(q), q->type);
++
++	if (*nplanes) {
++		if (*nplanes != pix->num_planes)
++			return -EINVAL;
++		for (unsigned int i = 0; i < *nplanes; i++)
++			if (sizes[i] < pix->plane_fmt[i].sizeimage)
++				return -EINVAL;
++		return 0;
++	}
++	*nplanes = pix->num_planes;
++	for (unsigned int i = 0; i < *nplanes; i++)
++		sizes[i] = pix->plane_fmt[i].sizeimage;
++	return 0;
++}
++
++static int aj_buf_prepare(struct vb2_buffer *vb)
++{
++	struct v4l2_pix_format_mplane *pix = aj_q_fmt(vb2_get_drv_priv(vb->vb2_queue), vb->type);
++
++	for (unsigned int i = 0; i < pix->num_planes; i++) {
++		if (vb2_plane_size(vb, i) < pix->plane_fmt[i].sizeimage)
++			return -EINVAL;
++		/* Luma and chroma need 4-byte aligned starts, output 32-byte. */
++		if (vb2_dma_contig_plane_dma_addr(vb, i) & 31)
++			return -EINVAL;
++		if (V4L2_TYPE_IS_OUTPUT(vb->type))
++			vb2_set_plane_payload(vb, i, pix->plane_fmt[i].sizeimage);
++		else
++			vb2_set_plane_payload(vb, i, 0);
++	}
++	return 0;
++}
++
++static void aj_buf_queue(struct vb2_buffer *vb)
++{
++	struct apple_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++
++	if (!V4L2_TYPE_IS_OUTPUT(vb->type) && vb2_is_streaming(vb->vb2_queue) &&
++	    v4l2_m2m_dst_buf_is_last(ctx->fh.m2m_ctx)) {
++		vb2_set_plane_payload(vb, 0, 0);
++		vbuf->field = V4L2_FIELD_NONE;
++		v4l2_m2m_last_buffer_done(ctx->fh.m2m_ctx, vbuf);
++		return;
++	}
++	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vbuf);
++}
++
++static int aj_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct apple_jpeg_ctx *ctx = vb2_get_drv_priv(q);
++
++	if (V4L2_TYPE_IS_OUTPUT(q->type))
++		ctx->sequence = 0;
++	v4l2_m2m_update_start_streaming_state(ctx->fh.m2m_ctx, q);
++	return 0;
++}
++
++static void aj_stop_streaming(struct vb2_queue *q)
++{
++	struct apple_jpeg_ctx *ctx = vb2_get_drv_priv(q);
++	struct vb2_v4l2_buffer *vbuf;
++
++	for (;;) {
++		vbuf = V4L2_TYPE_IS_OUTPUT(q->type) ? v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx) :
++						      v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++		if (!vbuf)
++			break;
++		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
++	}
++	v4l2_m2m_update_stop_streaming_state(ctx->fh.m2m_ctx, q);
++	if (V4L2_TYPE_IS_OUTPUT(q->type) && v4l2_m2m_has_stopped(ctx->fh.m2m_ctx)) {
++		static const struct v4l2_event eos = { .type = V4L2_EVENT_EOS };
++
++		v4l2_event_queue_fh(&ctx->fh, &eos);
++	}
++}
++
++static const struct vb2_ops aj_qops = {
++	.queue_setup = aj_queue_setup,
++	.buf_prepare = aj_buf_prepare,
++	.buf_queue = aj_buf_queue,
++	.start_streaming = aj_start_streaming,
++	.stop_streaming = aj_stop_streaming,
++};
++
++static int aj_init_queue(struct apple_jpeg_ctx *ctx, struct vb2_queue *q, u32 type)
++{
++	q->type = type;
++	q->io_modes = VB2_MMAP | VB2_DMABUF;
++	q->drv_priv = ctx;
++	q->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
++	q->ops = &aj_qops;
++	q->mem_ops = &vb2_dma_contig_memops;
++	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
++	q->lock = &ctx->jpeg->lock;
++	q->dev = ctx->jpeg->dev;
++	return vb2_queue_init(q);
++}
++
++static int aj_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *dst)
++{
++	int ret = aj_init_queue(priv, src, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
++
++	return ret ?: aj_init_queue(priv, dst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++}
++
++/* ---- file operations -------------------------------------------------- */
++
++static int aj_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	return 0;	/* read when each job is built */
++}
++
++static const struct v4l2_ctrl_ops aj_ctrl_ops = {
++	.s_ctrl = aj_s_ctrl,
++};
++
++static int aj_open(struct file *file)
++{
++	struct apple_jpeg *jpeg = video_drvdata(file);
++	struct apple_jpeg_ctx *ctx;
++	int ret;
++
++	ctx = kzalloc_obj(*ctx);
++	if (!ctx)
++		return -ENOMEM;
++	ctx->jpeg = jpeg;
++	ctx->src.width = 1920;
++	ctx->src.height = 1080;
++	ctx->src.pixelformat = V4L2_PIX_FMT_NV12M;
++	aj_fill_raw(&ctx->src);
++	aj_fill_coded(&ctx->dst, &ctx->src);
++	v4l2_fh_init(&ctx->fh, video_devdata(file));
++
++	v4l2_ctrl_handler_init(&ctx->hdl, 2);
++	ctx->quality = v4l2_ctrl_new_std(&ctx->hdl, &aj_ctrl_ops,
++					 V4L2_CID_JPEG_COMPRESSION_QUALITY, 1, 100, 1, 75);
++	ctx->restart = v4l2_ctrl_new_std(&ctx->hdl, &aj_ctrl_ops,
++					 V4L2_CID_JPEG_RESTART_INTERVAL, 0, U16_MAX, 1, 0);
++	if (ctx->hdl.error) {
++		ret = ctx->hdl.error;
++		goto err_ctrls;
++	}
++	ctx->fh.ctrl_handler = &ctx->hdl;
++	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(jpeg->m2m_dev, ctx, aj_queue_init);
++	if (IS_ERR(ctx->fh.m2m_ctx)) {
++		ret = PTR_ERR(ctx->fh.m2m_ctx);
++		goto err_ctrls;
++	}
++	v4l2_fh_add(&ctx->fh, file);
++	return 0;
++
++err_ctrls:
++	v4l2_ctrl_handler_free(&ctx->hdl);
++	v4l2_fh_exit(&ctx->fh);
++	kfree(ctx);
++	return ret;
++}
++
++static int aj_release(struct file *file)
++{
++	struct apple_jpeg_ctx *ctx = aj_file_to_ctx(file);
++	struct apple_jpeg *jpeg = ctx->jpeg;
++
++	mutex_lock(&jpeg->lock);
++	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
++	mutex_unlock(&jpeg->lock);
++	v4l2_ctrl_handler_free(&ctx->hdl);
++	v4l2_fh_del(&ctx->fh, file);
++	v4l2_fh_exit(&ctx->fh);
++	kfree(ctx);
++	return 0;
++}
++
++static const struct v4l2_file_operations aj_fops = {
++	.owner = THIS_MODULE,
++	.open = aj_open,
++	.release = aj_release,
++	.poll = v4l2_m2m_fop_poll,
++	.unlocked_ioctl = video_ioctl2,
++	.mmap = v4l2_m2m_fop_mmap,
++};
++
++/* ---- power management and probe --------------------------------------- */
++
++static int aj_runtime_suspend(struct device *dev)
++{
++	return 0;
++}
++
++static int aj_runtime_resume(struct device *dev)
++{
++	struct apple_jpeg *jpeg = dev_get_drvdata(dev);
++
++	/* The power-up state needs the reset before each job, done there. */
++	jpeg->broken = false;
++	return 0;
++}
++
++static int aj_suspend(struct device *dev)
++{
++	struct apple_jpeg *jpeg = dev_get_drvdata(dev);
++
++	v4l2_m2m_suspend(jpeg->m2m_dev);
++	return pm_runtime_force_suspend(dev);
++}
++
++static int aj_resume(struct device *dev)
++{
++	struct apple_jpeg *jpeg = dev_get_drvdata(dev);
++	int ret = pm_runtime_force_resume(dev);
++
++	if (ret)
++		return ret;
++	v4l2_m2m_resume(jpeg->m2m_dev);
++	return 0;
++}
++
++static const struct dev_pm_ops aj_pm_ops = {
++	RUNTIME_PM_OPS(aj_runtime_suspend, aj_runtime_resume, NULL)
++	SYSTEM_SLEEP_PM_OPS(aj_suspend, aj_resume)
++};
++
++static void aj_cleanup(void *data)
++{
++	struct apple_jpeg *jpeg = data;
++
++	cancel_delayed_work_sync(&jpeg->watchdog);
++	if (jpeg->m2m_dev)
++		v4l2_m2m_release(jpeg->m2m_dev);
++	v4l2_device_unregister(&jpeg->v4l2_dev);
++}
++
++/* Identify the engine: MODE must open the identity register first. */
++static int aj_identify(struct apple_jpeg *jpeg)
++{
++	u32 hwrev;
++	int ret = pm_runtime_resume_and_get(jpeg->dev);
++
++	if (ret < 0)
++		return ret;
++	aj_write(jpeg, AJ_MODE, AJ_MODE_IDENTIFY);
++	hwrev = aj_read(jpeg, AJ_HWREV);
++	pm_runtime_put_sync_suspend(jpeg->dev);
++	if (!apple_jpeg_hwrev_supported(jpeg->variant, hwrev))
++		return dev_err_probe(jpeg->dev, -ENODEV, "unsupported HWREV %#x\n", hwrev);
++	dev_info(jpeg->dev, "JPEG encoder, HWREV %#x\n", hwrev);
++	return 0;
++}
++
++static int aj_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct apple_jpeg *jpeg;
++	struct video_device *vdev;
++	struct resource *res;
++	int ret;
++
++	jpeg = devm_kzalloc(dev, sizeof(*jpeg), GFP_KERNEL);
++	if (!jpeg)
++		return -ENOMEM;
++	jpeg->dev = dev;
++	jpeg->variant = of_device_get_match_data(dev);
++	if (!jpeg->variant || !jpeg->variant->hwrev)
++		return dev_err_probe(dev, -ENODEV, "engine layout not supported\n");
++	mutex_init(&jpeg->lock);
++	spin_lock_init(&jpeg->hw_lock);
++	INIT_DELAYED_WORK(&jpeg->watchdog, aj_watchdog);
++	platform_set_drvdata(pdev, jpeg);
++
++	if (!device_iommu_mapped(dev))
++		return dev_err_probe(dev, -ENODEV, "no IOMMU\n");
++	if (!dev->pm_domain)
++		return dev_err_probe(dev, -ENODEV, "requires a power domain\n");
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res || resource_size(res) != APPLE_JPEG_REG_SIZE)
++		return -EINVAL;
++	jpeg->regs = devm_ioremap_resource(dev, res);
++	if (IS_ERR(jpeg->regs))
++		return PTR_ERR(jpeg->regs);
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
++	if (ret)
++		return ret;
++
++	pm_runtime_set_autosuspend_delay(dev, 100);
++	pm_runtime_use_autosuspend(dev);
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++	ret = aj_identify(jpeg);
++	if (ret)
++		return ret;
++
++	/* The interrupt is only taken once identification passed. */
++	jpeg->irq = platform_get_irq(pdev, 0);
++	if (jpeg->irq < 0)
++		return jpeg->irq;
++	ret = devm_request_irq(dev, jpeg->irq, aj_irq, 0, dev_name(dev), jpeg);
++	if (ret)
++		return ret;
++
++	ret = v4l2_device_register(dev, &jpeg->v4l2_dev);
++	if (ret)
++		return ret;
++	ret = devm_add_action_or_reset(dev, aj_cleanup, jpeg);
++	if (ret)
++		return ret;
++	jpeg->m2m_dev = v4l2_m2m_init(&aj_m2m_ops);
++	if (IS_ERR(jpeg->m2m_dev)) {
++		ret = PTR_ERR(jpeg->m2m_dev);
++		jpeg->m2m_dev = NULL;
++		return ret;
++	}
++
++	vdev = &jpeg->vdev;
++	strscpy(vdev->name, AJ_NAME, sizeof(vdev->name));
++	vdev->fops = &aj_fops;
++	vdev->ioctl_ops = &aj_ioctl_ops;
++	vdev->release = video_device_release_empty;
++	vdev->lock = &jpeg->lock;
++	vdev->v4l2_dev = &jpeg->v4l2_dev;
++	vdev->vfl_dir = VFL_DIR_M2M;
++	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
++	video_set_drvdata(vdev, jpeg);
++	return video_register_device(vdev, VFL_TYPE_VIDEO, -1);
++}
++
++static void aj_remove(struct platform_device *pdev)
++{
++	struct apple_jpeg *jpeg = platform_get_drvdata(pdev);
++
++	video_unregister_device(&jpeg->vdev);
++}
++
++static const struct of_device_id aj_of_match[] = {
++	{ .compatible = "apple,t6041-jpeg", .data = &apple_jpeg_t6041 },
++	{ .compatible = "apple,t8140-jpeg", .data = &apple_jpeg_t8140 },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, aj_of_match);
++
++static struct platform_driver aj_driver = {
++	.probe = aj_probe,
++	.remove = aj_remove,
++	.driver = {
++		.name = AJ_NAME,
++		.of_match_table = aj_of_match,
++		.pm = pm_ptr(&aj_pm_ops),
++	},
++};
++module_platform_driver(aj_driver);
++
++MODULE_DESCRIPTION("Apple Silicon JPEG encoder");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/apple/jpeg/apple-jpeg-hw.c b/drivers/media/platform/apple/jpeg/apple-jpeg-hw.c
+new file mode 100644
+index 0000000000..4922f6a35e
+--- /dev/null
++++ b/drivers/media/platform/apple/jpeg/apple-jpeg-hw.c
+@@ -0,0 +1,222 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple Silicon JPEG engine: encode job programming, without hardware access
++ * so that KUnit covers all of it.
++ *
++ * Quantisation tables are the ITU-T T.81 Annex K tables scaled with the
++ * libjpeg quality formula.
++ */
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/kernel.h>
++#include <linux/minmax.h>
++#include <linux/module.h>
++
++#include <kunit/visibility.h>
++
++#include "apple-jpeg-hw.h"
++
++/* T.81 Annex K, tables K.1 and K.2, in natural (row-major) order. */
++static const u8 apple_jpeg_annex_k_luma[64] = {
++	16, 11, 10, 16, 24, 40, 51, 61,
++	12, 12, 14, 19, 26, 58, 60, 55,
++	14, 13, 16, 24, 40, 57, 69, 56,
++	14, 17, 22, 29, 51, 87, 80, 62,
++	18, 22, 37, 56, 68, 109, 103, 77,
++	24, 35, 55, 64, 81, 104, 113, 92,
++	49, 64, 78, 87, 103, 121, 120, 101,
++	72, 92, 95, 98, 112, 100, 103, 99,
++};
++
++static const u8 apple_jpeg_annex_k_chroma[64] = {
++	17, 18, 24, 47, 99, 99, 99, 99,
++	18, 21, 26, 66, 99, 99, 99, 99,
++	24, 26, 56, 99, 99, 99, 99, 99,
++	47, 66, 99, 99, 99, 99, 99, 99,
++	99, 99, 99, 99, 99, 99, 99, 99,
++	99, 99, 99, 99, 99, 99, 99, 99,
++	99, 99, 99, 99, 99, 99, 99, 99,
++	99, 99, 99, 99, 99, 99, 99, 99,
++};
++
++void apple_jpeg_quant_tables(u32 quality, u8 luma[64], u8 chroma[64])
++{
++	u32 q = clamp_t(u32, quality, 1, 100);
++	u32 scale = q < 50 ? 5000 / q : 200 - 2 * q;
++
++	for (unsigned int i = 0; i < 64; i++) {
++		luma[i] = clamp_t(u32, (apple_jpeg_annex_k_luma[i] * scale + 50) / 100, 1, 255);
++		chroma[i] = clamp_t(u32, (apple_jpeg_annex_k_chroma[i] * scale + 50) / 100, 1, 255);
++	}
++}
++EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_quant_tables);
++
++/* Engine cycles allowed per job: three per input byte, within fixed bounds. */
++u32 apple_jpeg_timeout(u32 width, u32 height)
++{
++	u64 t = 3ULL * width * height;
++
++	return clamp_t(u64, t, 0x03000000, 0x7ed6b400);
++}
++EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_timeout);
++
++struct aj_list {
++	struct apple_jpeg_write *w;
++	unsigned int n, max;
++};
++
++static void aj_put(struct aj_list *l, u32 offset, u32 value)
++{
++	if (l->n < l->max)
++		l->w[l->n] = (struct apple_jpeg_write){ offset, value };
++	l->n++;
++}
++
++static void aj_put64(struct aj_list *l, u32 offset, u64 value)
++{
++	aj_put(l, offset, lower_32_bits(value));
++	aj_put(l, offset + 4, upper_32_bits(value));
++}
++
++static void aj_put_range(struct aj_list *l, u32 from, u32 to, u32 value)
++{
++	for (u32 off = from; off <= to; off += 4)
++		aj_put(l, off, value);
++}
++
++static void aj_defaults(struct aj_list *l, bool encode)
++{
++	static const u32 zero[] = {
++		0x000, 0x004, 0x028, 0x02c, 0x030, 0x090, 0x094, 0x0a0, 0x0a4,
++		0x0c0, 0x0c4, 0x0d0, 0x0d4, 0x1c0, 0x1dc, 0x288, 0x28c, 0x290,
++		0x2a4, 0x2a8, 0x2ac,
++	};
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(zero); i++)
++		aj_put(l, zero[i], 0);
++	aj_put_range(l, 0x03c, 0x058, 0);
++	aj_put_range(l, 0x0e8, 0x110, 0);
++	aj_put_range(l, 0x13c, 0x158, 0);
++	aj_put_range(l, 0x16c, 0x198, 0);
++	aj_put_range(l, 0x1e4, 0x1f0, 0);
++	aj_put_range(l, 0x1f8, 0x210, 0);
++	aj_put_range(l, 0x218, 0x254, 0);
++	aj_put_range(l, 0x260, 0x27c, 0);
++	aj_put(l, AJ_DECODE_ENABLE, 1);
++	aj_put(l, AJ_ENCODE_ENABLE, 1);
++	aj_put_range(l, 0x05c, 0x088, 1);
++	aj_put64(l, AJ_INPUT_END, 0xfffffffffULL);
++	aj_put64(l, AJ_OUTPUT_END, 0xfffffffffULL);
++	aj_put(l, AJ_ENCODE_PIPE_LIMIT0, 1);
++	aj_put(l, AJ_ENCODE_PIPE_LIMIT1, 1);
++	aj_put(l, 0x280, 0x1f40);
++	aj_put(l, 0x294, 7);
++	aj_put(l, 0x2b0, 7);
++	aj_put(l, AJ_IRQ_MASK, 0xff);
++	aj_put(l, AJ_TILING_ENABLE, encode);
++}
++
++/* The reset image, as written between the mode changes of a reset. */
++int apple_jpeg_defaults(bool encode, struct apple_jpeg_write *w, unsigned int max)
++{
++	struct aj_list l = { w, 0, max };
++
++	aj_defaults(&l, encode);
++	return l.n <= max ? l.n : -ENOSPC;
++}
++EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_defaults);
++
++/*
++ * Every register write of one baseline encode of two-plane (NV12 or NV16)
++ * full-range input, in order, ending with the start command.
++ */
++int apple_jpeg_build_job(const struct apple_jpeg_job *job, struct apple_jpeg_write *w,
++			 unsigned int max)
++{
++	u32 width = job->width, height = job->height;
++	u32 mcu_h = job->is422 ? 8 : 16;
++	u32 crows = job->is422 ? height : DIV_ROUND_UP(height, 2);
++	struct aj_list l = { w, 0, max };
++	u8 luma[64], chroma[64];
++
++	if (!width || !height || width > U16_MAX || height > U16_MAX)
++		return -EINVAL;
++	if (job->luma_stride < width || job->chroma_stride < ALIGN(width, 2))
++		return -EINVAL;
++	if ((job->luma | job->chroma) & 3 || job->output & 31 || !job->output_size)
++		return -EINVAL;
++	if (job->input_end < job->luma || job->input_end < job->chroma ||
++	    job->restart_interval > U16_MAX)
++		return -EINVAL;
++
++	aj_put(&l, AJ_MODE, AJ_MODE_SETUP);
++	aj_put(&l, AJ_MAIN_RUN, 0);
++	aj_defaults(&l, true);
++	aj_put(&l, AJ_MODE, AJ_MODE_OPEN);
++
++	aj_put(&l, AJ_ENCODE_ENABLE, 1);
++	aj_put(&l, AJ_CODEC_MODE, 1);
++	aj_put(&l, AJ_DECODE_ENABLE, 0);
++	aj_put(&l, AJ_CODEC, job->is422 ? AJ_CODEC_422 : AJ_CODEC_420);
++
++	aj_put(&l, AJ_PX_USE_PLANE1, 1);
++	aj_put(&l, AJ_PX_MCUS_W, DIV_ROUND_UP(width, 16));
++	aj_put(&l, AJ_PX_MCUS_H, DIV_ROUND_UP(height, mcu_h));
++	aj_put(&l, AJ_PX_PLANE0_WIDTH_M1, width - 1);
++	aj_put(&l, AJ_PX_PLANE0_HEIGHT_M1, height - 1);
++	aj_put(&l, AJ_PX_PLANE0_TILE_H, 2);
++	aj_put(&l, AJ_PX_PLANE0_TILE_V, mcu_h);
++	aj_put(&l, AJ_PX_PLANE0_STRIDE, job->luma_stride);
++	aj_put(&l, AJ_PX_PLANE1_WIDTH_M1, ALIGN(width, 2) - 1);
++	aj_put(&l, AJ_PX_PLANE1_HEIGHT_M1, crows - 1);
++	aj_put(&l, AJ_PX_PLANE1_TILE_H, 2);
++	aj_put(&l, AJ_PX_PLANE1_TILE_V, 8);
++	aj_put(&l, AJ_PX_PLANE1_STRIDE, job->chroma_stride);
++	aj_put(&l, AJ_DMA_IMAGE_WIDTH, width);
++	aj_put(&l, AJ_DMA_IMAGE_HEIGHT, height);
++
++	aj_put64(&l, AJ_INPUT_PLANE0, job->luma);
++	aj_put64(&l, AJ_INPUT_PLANE1, job->chroma);
++	/* The engine treats the end as inclusive of a whole 8-byte word. */
++	aj_put64(&l, AJ_INPUT_END, job->input_end | 7);
++	aj_put64(&l, AJ_OUTPUT_START0, job->output);
++	aj_put64(&l, AJ_OUTPUT_START1, job->output);
++	aj_put64(&l, AJ_OUTPUT_END, job->output + job->output_size - 1);
++	aj_put(&l, AJ_ENCODE_PIPE_LIMIT0, job->is422 ? 8 : 3);
++	aj_put(&l, AJ_ENCODE_PIPE_LIMIT1, job->is422 ? 2 : 1);
++
++	/* Two planes, Y then interleaved Cb, Cr; no colour conversion. */
++	aj_put(&l, AJ_ENCODE_PIXEL_FORMAT, AJ_PIXEL_FORMAT_YUV_PLANES);
++	aj_put(&l, AJ_ENCODE_COMPONENT_POS(0), 0);
++	aj_put(&l, AJ_ENCODE_COMPONENT_POS(1), 0);
++	aj_put(&l, AJ_ENCODE_COMPONENT_POS(2), 1);
++	aj_put(&l, AJ_ENCODE_COMPONENT_POS(3), 0);
++	aj_put(&l, AJ_CONVERT_COLOR_SPACE, 0);
++
++	aj_put(&l, AJ_TIMEOUT, apple_jpeg_timeout(width, height));
++	aj_put(&l, AJ_AXI_READ_PREFETCH, 1);
++	aj_put(&l, AJ_AXI_WRITE_PREFETCH, 0);
++
++	aj_put(&l, AJ_MODE, AJ_MODE_ENCODE);
++	aj_put(&l, AJ_JPEG_IO_FLAGS, AJ_IO_FLAGS_ORDER |
++	       (job->is422 ? AJ_IO_FLAGS_422 : AJ_IO_FLAGS_420));
++	aj_put(&l, AJ_JPEG_WIDTH, width);
++	aj_put(&l, AJ_JPEG_HEIGHT, height);
++	aj_put(&l, AJ_RST_INTERVAL, job->restart_interval);
++	aj_put(&l, AJ_OUTPUT_FLAGS, 0);
++
++	apple_jpeg_quant_tables(job->quality, luma, chroma);
++	for (unsigned int i = 0; i < 16; i++) {
++		aj_put(&l, AJ_QTBL(0) + 4 * i, luma[4 * i] << 24 | luma[4 * i + 1] << 16 |
++		       luma[4 * i + 2] << 8 | luma[4 * i + 3]);
++		aj_put(&l, AJ_QTBL(1) + 4 * i, chroma[4 * i] << 24 | chroma[4 * i + 1] << 16 |
++		       chroma[4 * i + 2] << 8 | chroma[4 * i + 3]);
++	}
++	aj_put(&l, AJ_QTBL_SEL, AJ_QTBL_SEL_LUMA_CHROMA);
++	aj_put(&l, AJ_HUFFMAN_TABLE, AJ_HUFFMAN_BASELINE);
++
++	aj_put(&l, AJ_MAIN_RUN, 1);
++	aj_put(&l, AJ_COMMAND, 1);
++	return l.n <= max ? l.n : -ENOSPC;
++}
++EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_build_job);
+diff --git a/drivers/media/platform/apple/jpeg/apple-jpeg-hw.h b/drivers/media/platform/apple/jpeg/apple-jpeg-hw.h
+index 332f4313e7..35b4e9ab49 100644
+--- a/drivers/media/platform/apple/jpeg/apple-jpeg-hw.h
++++ b/drivers/media/platform/apple/jpeg/apple-jpeg-hw.h
+@@ -1,41 +1,140 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Apple Silicon JPEG engine: register map and encode job programming.
++ *
++ * Offsets follow the public m1n1 map (proxyclient/m1n1/hw/jpeg.py, MIT) for
++ * the control and 0x1000 blocks. T8140 widens every DMA address to a 64-bit
++ * low/high pair, which moves the colour, format and identity registers up.
++ */
+ #ifndef APPLE_JPEG_HW_H
+ #define APPLE_JPEG_HW_H
+ 
+ #include <linux/limits.h>
+ #include <linux/types.h>
+ 
+-/* Public MIT-licensed m1n1 register map: proxyclient/m1n1/hw/jpeg.py. */
+-#define APPLE_JPEG_HWREV		0x188
+-#define APPLE_JPEG_REG_SIZE	0x4000
+-#define APPLE_JPEG_DMA_BASE	0x10000000000ULL
+-#define APPLE_JPEG_DMA_SIZE	0x100000000ULL
++#define APPLE_JPEG_REG_SIZE		0x4000
++
++#define AJ_MAIN_RUN			0x000
++#define AJ_MODE				0x008
++#define  AJ_MODE_RESET			0x100
++#define  AJ_MODE_SETUP			0x13e
++#define  AJ_MODE_IDENTIFY		0x147
++#define  AJ_MODE_OPEN			0x17f
++#define  AJ_MODE_IDLE			0x743
++#define  AJ_MODE_ENCODE			0x74f
++#define AJ_DEBUG_STATUS			0x00c
++#define AJ_IRQ_MASK			0x020
++#define AJ_STATUS			0x024
++#define  AJ_STATUS_DONE			BIT(0)
++#define  AJ_STATUS_ERRORS		GENMASK(7, 1)
++#define AJ_CODEC			0x028
++#define  AJ_CODEC_422			1
++#define  AJ_CODEC_420			3
++#define AJ_CODEC_MODE			0x02c	/* 1 encode */
++#define AJ_DECODE_ENABLE		0x034
++#define AJ_ENCODE_ENABLE		0x038
++#define AJ_PX_USE_PLANE1		0x058
++#define AJ_PX_MCUS_W			0x05c
++#define AJ_PX_MCUS_H			0x060
++#define AJ_PX_PLANE0_WIDTH_M1		0x064
++#define AJ_PX_PLANE0_HEIGHT_M1		0x068
++#define AJ_PX_PLANE0_TILE_H		0x06c
++#define AJ_PX_PLANE0_TILE_V		0x070
++#define AJ_PX_PLANE0_STRIDE		0x074
++#define AJ_PX_PLANE1_WIDTH_M1		0x078
++#define AJ_PX_PLANE1_HEIGHT_M1		0x07c
++#define AJ_PX_PLANE1_TILE_H		0x080
++#define AJ_PX_PLANE1_TILE_V		0x084
++#define AJ_PX_PLANE1_STRIDE		0x088
++#define AJ_INPUT_PLANE0			0x090	/* low, high */
++#define AJ_INPUT_PLANE1			0x0a0
++#define AJ_INPUT_END			0x0b0
++#define AJ_ENCODE_PIPE_LIMIT0		0x0b8
++#define AJ_ENCODE_PIPE_LIMIT1		0x0bc
++#define AJ_OUTPUT_START0		0x0c0
++#define AJ_OUTPUT_START1		0x0d0
++#define AJ_OUTPUT_END			0x0e0
++#define AJ_ENCODE_PIXEL_FORMAT		0x13c
++#define  AJ_PIXEL_FORMAT_YUV_PLANES	4
++#define AJ_ENCODE_COMPONENT_POS(i)	(0x140 + 4 * (i))
++#define AJ_CONVERT_COLOR_SPACE		0x150
++#define AJ_AXI_READ_PREFETCH		0x154
++#define AJ_AXI_WRITE_PREFETCH		0x158
++#define AJ_TILING_ENABLE		0x19c
++#define AJ_TIMEOUT			0x1c0
++#define AJ_HWREV			0x1c4
++#define AJ_DMA_IMAGE_WIDTH		0x258
++#define AJ_DMA_IMAGE_HEIGHT		0x25c
++#define AJ_JPEG_IO_FLAGS		0x1000
++#define  AJ_IO_FLAGS_ORDER		(BIT(4) | BIT(5))
++#define  AJ_IO_FLAGS_422		1
++#define  AJ_IO_FLAGS_420		2
++#define AJ_COMMAND			0x1004
++#define AJ_QTBL_SEL			0x100c
++#define  AJ_QTBL_SEL_LUMA_CHROMA	0x14	/* Y: table 0, Cb and Cr: table 1 */
++#define AJ_HUFFMAN_TABLE		0x1010
++#define  AJ_HUFFMAN_BASELINE		0x3c
++#define AJ_RST_INTERVAL			0x1014
++#define AJ_JPEG_HEIGHT			0x1018
++#define AJ_JPEG_WIDTH			0x101c
++#define AJ_COMPRESSED_BYTES		0x1020
++#define AJ_OUTPUT_FLAGS			0x1024
++#define AJ_INT_STATUS			0x102c
++#define  AJ_INT_STATUS_DONE		BIT(31)
++#define AJ_BITSTREAM_CORRUPTION		0x1030
++#define AJ_QTBL(t)			(0x1100 + 0x40 * (t))
++
++#define AJ_HWREV_MASK			0xffff0fff
++#define AJ_HWREV_T8140			0x110000
+ 
+ struct apple_jpeg_variant {
+-	const u32 *hwrevs;
+-	size_t num_hwrevs;
++	u32 hwrev_mask;
++	u32 hwrev;
+ };
+ 
+-/*
+- * Empty until each SoC's revision and reset/IRQ behaviour are qualified.
+- * Neither an ADT hw-type nor m1n1's M1 Max revision qualifies another SoC.
+- */
++/* T6041 has the engine too, but its register layout is not qualified. */
+ static const struct apple_jpeg_variant apple_jpeg_t6041 = { };
+-static const struct apple_jpeg_variant apple_jpeg_t8140 = { };
++
++static const struct apple_jpeg_variant apple_jpeg_t8140 = {
++	.hwrev_mask = AJ_HWREV_MASK,
++	.hwrev = AJ_HWREV_T8140,
++};
+ 
+ static inline bool
+ apple_jpeg_hwrev_supported(const struct apple_jpeg_variant *variant, u32 hwrev)
+ {
+-	size_t i;
+-
+-	if (!variant || !variant->hwrevs || !hwrev || hwrev == U32_MAX)
++	if (!variant || !variant->hwrev || !hwrev || hwrev == U32_MAX)
+ 		return false;
++	return (hwrev & variant->hwrev_mask) == variant->hwrev;
++}
+ 
+-	for (i = 0; i < variant->num_hwrevs; i++)
+-		if (variant->hwrevs[i] == hwrev)
+-			return true;
++struct apple_jpeg_write {
++	u32 offset;
++	u32 value;
++};
+ 
+-	return false;
+-}
++struct apple_jpeg_job {
++	u32 width;
++	u32 height;
++	bool is422;		/* NV16: 4:2:2; NV12: 4:2:0 */
++	u32 luma_stride;
++	u32 chroma_stride;
++	u64 luma;
++	u64 chroma;
++	u64 input_end;		/* inclusive */
++	u64 output;
++	u32 output_size;
++	u32 quality;		/* 1 to 100 */
++	u32 restart_interval;
++};
++
++/* Enough for the default image, the job and both quantisation tables. */
++#define APPLE_JPEG_MAX_WRITES		256
++
++void apple_jpeg_quant_tables(u32 quality, u8 luma[64], u8 chroma[64]);
++u32 apple_jpeg_timeout(u32 width, u32 height);
++int apple_jpeg_defaults(bool encode, struct apple_jpeg_write *w, unsigned int max);
++int apple_jpeg_build_job(const struct apple_jpeg_job *job, struct apple_jpeg_write *w,
++			 unsigned int max);
+ 
+ #endif /* APPLE_JPEG_HW_H */
+diff --git a/drivers/media/platform/apple/jpeg/apple-jpeg-test.c b/drivers/media/platform/apple/jpeg/apple-jpeg-test.c
+index 651a2b1822..3676647b7d 100644
+--- a/drivers/media/platform/apple/jpeg/apple-jpeg-test.c
++++ b/drivers/media/platform/apple/jpeg/apple-jpeg-test.c
+@@ -1,56 +1,166 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++/* KUnit tests for Apple JPEG identity matching and encode job programming. */
+ #include <kunit/test.h>
+ #include <linux/module.h>
+ 
+ #include "apple-jpeg-hw.h"
+ 
+-static void apple_jpeg_unqualified_test(struct kunit *test)
++static void apple_jpeg_hwrev_test(struct kunit *test)
+ {
+-	const struct apple_jpeg_variant *variants[] = {
+-		&apple_jpeg_t6041, &apple_jpeg_t8140,
+-	};
+-	/* Public M1 Max revision, arbitrary revisions and invalid readbacks. */
+-	const u32 revisions[] = { 0xd1013, 1, 0x12345678, 0, U32_MAX };
+-	size_t i, j;
+-
+-	for (i = 0; i < ARRAY_SIZE(variants); i++) {
+-		KUNIT_EXPECT_EQ(test, variants[i]->num_hwrevs, (size_t)0);
+-		for (j = 0; j < ARRAY_SIZE(revisions); j++)
+-			KUNIT_EXPECT_FALSE(test,
+-					   apple_jpeg_hwrev_supported(variants[i], revisions[j]));
+-	}
++	/* The stepping nibble (bits 15:12) is ignored. */
++	KUNIT_EXPECT_TRUE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t8140, 0x110000));
++	KUNIT_EXPECT_TRUE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t8140, 0x11f000));
++	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t8140, 0x110001));
++	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t8140, 0xd1013));
++	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t8140, 0));
++	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t8140, U32_MAX));
++	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&apple_jpeg_t6041, 0x110000));
++	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(NULL, 0x110000));
++}
++
++static void apple_jpeg_quant_test(struct kunit *test)
++{
++	u8 luma[64], chroma[64];
++
++	/* Quality 50 is the Annex K table itself. */
++	apple_jpeg_quant_tables(50, luma, chroma);
++	KUNIT_EXPECT_EQ(test, luma[0], 16);
++	KUNIT_EXPECT_EQ(test, luma[63], 99);
++	KUNIT_EXPECT_EQ(test, chroma[0], 17);
++	/* Quality 75 halves it, rounding to nearest. */
++	apple_jpeg_quant_tables(75, luma, chroma);
++	KUNIT_EXPECT_EQ(test, luma[0], 8);
++	KUNIT_EXPECT_EQ(test, luma[1], 6);	/* 11 * 50 / 100 = 5.5 */
++	KUNIT_EXPECT_EQ(test, chroma[63], 50);
++	/* The extremes clamp to 1..255. */
++	apple_jpeg_quant_tables(100, luma, chroma);
++	KUNIT_EXPECT_EQ(test, luma[0], 1);
++	apple_jpeg_quant_tables(1, luma, chroma);
++	KUNIT_EXPECT_EQ(test, luma[0], 255);
++	KUNIT_EXPECT_EQ(test, chroma[63], 255);
+ }
+ 
+-static void apple_jpeg_exact_match_test(struct kunit *test)
++static struct apple_jpeg_job apple_jpeg_test_job(void)
+ {
+-	/* Synthetic revisions exercise the matcher without qualifying hardware. */
+-	const u32 revisions[] = { 0x12345678, 0x1234567a };
+-	const struct apple_jpeg_variant variant = {
+-		.hwrevs = revisions,
+-		.num_hwrevs = ARRAY_SIZE(revisions),
++	return (struct apple_jpeg_job){
++		.width = 1920, .height = 1080,
++		.luma_stride = 1920, .chroma_stride = 1920,
++		.luma = 0x10000100000ULL, .chroma = 0x10000400000ULL,
++		.input_end = 0x100004fffffULL,
++		.output = 0x10001000000ULL, .output_size = 0x800000,
++		.quality = 75,
+ 	};
+-	const struct apple_jpeg_variant empty = { .hwrevs = revisions };
+-
+-	KUNIT_EXPECT_TRUE(test, apple_jpeg_hwrev_supported(&variant, revisions[0]));
+-	KUNIT_EXPECT_TRUE(test, apple_jpeg_hwrev_supported(&variant, revisions[1]));
+-	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&variant, 0x12345679));
+-	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&variant, 0));
+-	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&variant, U32_MAX));
+-	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(&empty, revisions[0]));
+-	KUNIT_EXPECT_FALSE(test, apple_jpeg_hwrev_supported(NULL, revisions[0]));
++}
++
++static u32 apple_jpeg_last(const struct apple_jpeg_write *w, int n, u32 offset)
++{
++	u32 value = 0xdeadbeef;
++
++	for (int i = 0; i < n; i++)
++		if (w[i].offset == offset)
++			value = w[i].value;
++	return value;
++}
++
++static void apple_jpeg_job_420_test(struct kunit *test)
++{
++	struct apple_jpeg_write *w = kunit_kcalloc(test, APPLE_JPEG_MAX_WRITES, sizeof(*w),
++						   GFP_KERNEL);
++	struct apple_jpeg_job job = apple_jpeg_test_job();
++	int n;
++
++	KUNIT_ASSERT_NOT_NULL(test, w);
++	n = apple_jpeg_build_job(&job, w, APPLE_JPEG_MAX_WRITES);
++	KUNIT_ASSERT_GT(test, n, 0);
++	/* Mode opens first; the start command is the very last write. */
++	KUNIT_EXPECT_EQ(test, w[0].offset, AJ_MODE);
++	KUNIT_EXPECT_EQ(test, w[0].value, AJ_MODE_SETUP);
++	KUNIT_EXPECT_EQ(test, w[n - 2].offset, AJ_MAIN_RUN);
++	KUNIT_EXPECT_EQ(test, w[n - 2].value, 1);
++	KUNIT_EXPECT_EQ(test, w[n - 1].offset, AJ_COMMAND);
++	KUNIT_EXPECT_EQ(test, w[n - 1].value, 1);
++
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_CODEC), AJ_CODEC_420);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_MCUS_W), 120);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_MCUS_H), 68);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_PLANE0_TILE_V), 16);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_PLANE1_HEIGHT_M1), 539);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_INPUT_PLANE0), 0x00100000);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_INPUT_PLANE0 + 4), 0x100);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_INPUT_END), 0x004fffff);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_OUTPUT_START1), 0x01000000);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_OUTPUT_END), 0x017fffff);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_ENCODE_PIPE_LIMIT0), 3);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_JPEG_IO_FLAGS), 0x32);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_TIMEOUT), 0x03000000);	/* floor */
++	/* Table slot 0 holds luma 8, 6, 5, 8 at quality 75, MSB first. */
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_QTBL(0)), 0x08060508);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_QTBL_SEL), 0x14);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_IRQ_MASK), 0xff);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_TILING_ENABLE), 1);
++}
++
++static void apple_jpeg_job_422_test(struct kunit *test)
++{
++	struct apple_jpeg_write *w = kunit_kcalloc(test, APPLE_JPEG_MAX_WRITES, sizeof(*w),
++						   GFP_KERNEL);
++	struct apple_jpeg_job job = apple_jpeg_test_job();
++	int n;
++
++	KUNIT_ASSERT_NOT_NULL(test, w);
++	job.is422 = true;
++	job.width = 641;	/* odd width: chroma rounds up */
++	job.luma_stride = 656;
++	job.chroma_stride = 656;
++	n = apple_jpeg_build_job(&job, w, APPLE_JPEG_MAX_WRITES);
++	KUNIT_ASSERT_GT(test, n, 0);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_CODEC), AJ_CODEC_422);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_MCUS_W), 41);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_MCUS_H), 135);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_PLANE1_WIDTH_M1), 641);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_PX_PLANE1_HEIGHT_M1), 1079);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_ENCODE_PIPE_LIMIT0), 8);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_ENCODE_PIPE_LIMIT1), 2);
++	KUNIT_EXPECT_EQ(test, apple_jpeg_last(w, n, AJ_JPEG_IO_FLAGS), 0x31);
++	/* Large pictures get three cycles per input byte. */
++	KUNIT_EXPECT_EQ(test, apple_jpeg_timeout(8192, 8192), 3 * 8192 * 8192);
++}
++
++static void apple_jpeg_job_reject_test(struct kunit *test)
++{
++	struct apple_jpeg_write *w = kunit_kcalloc(test, APPLE_JPEG_MAX_WRITES, sizeof(*w),
++						   GFP_KERNEL);
++	struct apple_jpeg_job job;
++
++	KUNIT_ASSERT_NOT_NULL(test, w);
++	job = apple_jpeg_test_job();
++	job.luma_stride = 1000;
++	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(&job, w, APPLE_JPEG_MAX_WRITES), -EINVAL);
++	job = apple_jpeg_test_job();
++	job.output += 16;
++	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(&job, w, APPLE_JPEG_MAX_WRITES), -EINVAL);
++	job = apple_jpeg_test_job();
++	job.input_end = job.chroma - 1;
++	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(&job, w, APPLE_JPEG_MAX_WRITES), -EINVAL);
++	job = apple_jpeg_test_job();
++	KUNIT_EXPECT_EQ(test, apple_jpeg_build_job(&job, w, 10), -ENOSPC);
+ }
+ 
+ static struct kunit_case apple_jpeg_cases[] = {
+-	KUNIT_CASE(apple_jpeg_unqualified_test),
+-	KUNIT_CASE(apple_jpeg_exact_match_test),
++	KUNIT_CASE(apple_jpeg_hwrev_test),
++	KUNIT_CASE(apple_jpeg_quant_test),
++	KUNIT_CASE(apple_jpeg_job_420_test),
++	KUNIT_CASE(apple_jpeg_job_422_test),
++	KUNIT_CASE(apple_jpeg_job_reject_test),
+ 	{ }
+ };
+ 
+ static struct kunit_suite apple_jpeg_suite = {
+-	.name = "apple-jpeg-admission",
++	.name = "apple-jpeg",
+ 	.test_cases = apple_jpeg_cases,
+ };
+-
+ kunit_test_suite(apple_jpeg_suite);
+ 
++MODULE_DESCRIPTION("KUnit tests for the Apple JPEG encoder");
+ MODULE_LICENSE("GPL");
++MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");
+diff --git a/drivers/media/platform/apple/jpeg/apple-jpeg.c b/drivers/media/platform/apple/jpeg/apple-jpeg.c
+deleted file mode 100644
+index 0d8b637fd5..0000000000
+--- a/drivers/media/platform/apple/jpeg/apple-jpeg.c
++++ /dev/null
+@@ -1,543 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-only
+-/*
+- * Apple Silicon JPEG mem2mem scaffold. No hardware jobs are implemented.
+- * Register offset provenance: Asahi Linux m1n1 (MIT), commit
+- * f3ac615eb1376d3bbba24cd84c414b9e41892adb, proxyclient/m1n1/hw/jpeg.py.
+- */
+-#include <linux/dma-mapping.h>
+-#include <linux/io.h>
+-#include <linux/iommu.h>
+-#include <linux/module.h>
+-#include <linux/mutex.h>
+-#include <linux/of.h>
+-#include <linux/of_device.h>
+-#include <linux/platform_device.h>
+-#include <linux/pm_runtime.h>
+-#include <linux/slab.h>
+-
+-#include <media/v4l2-device.h>
+-#include <media/v4l2-fh.h>
+-#include <media/v4l2-ioctl.h>
+-#include <media/v4l2-mem2mem.h>
+-#include <media/videobuf2-dma-contig.h>
+-
+-#include "apple-jpeg-hw.h"
+-
+-struct apple_jpeg {
+-	struct device *dev;
+-	void __iomem *regs;
+-	const struct apple_jpeg_variant *variant;
+-	struct mutex lock; /* Serializes video operations and queue/context state. */
+-	struct v4l2_device v4l2_dev;
+-	struct video_device vdev;
+-	struct v4l2_m2m_dev *m2m_dev;
+-};
+-
+-struct apple_jpeg_ctx {
+-	struct v4l2_fh fh;
+-	struct apple_jpeg *jpeg;
+-	struct v4l2_pix_format_mplane output;
+-	struct v4l2_pix_format_mplane capture;
+-};
+-
+-static struct apple_jpeg_ctx *fh_to_ctx(void *priv)
+-{
+-	return container_of(priv, struct apple_jpeg_ctx, fh);
+-}
+-
+-static struct v4l2_pix_format_mplane *
+-apple_jpeg_format(struct apple_jpeg_ctx *ctx, enum v4l2_buf_type type)
+-{
+-	if (type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+-		return &ctx->output;
+-	if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+-		return &ctx->capture;
+-	return NULL;
+-}
+-
+-/* Allocation policy for the scaffold, not a qualified hardware size limit. */
+-static void apple_jpeg_normalize_format(struct v4l2_pix_format_mplane *pix)
+-{
+-	u32 width = clamp_t(u32, pix->width, 16, 8192);
+-	u32 height = clamp_t(u32, pix->height, 16, 8192);
+-	u32 fourcc = pix->pixelformat;
+-
+-	memset(pix, 0, sizeof(*pix));
+-	pix->width = ALIGN(width, 16);
+-	pix->height = ALIGN(height, 16);
+-	pix->field = V4L2_FIELD_NONE;
+-	pix->colorspace = V4L2_COLORSPACE_JPEG;
+-	pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
+-	pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+-	pix->xfer_func = V4L2_XFER_FUNC_SRGB;
+-
+-	if (fourcc == V4L2_PIX_FMT_NV12M) {
+-		pix->pixelformat = fourcc;
+-		pix->num_planes = 2;
+-		pix->plane_fmt[0].bytesperline = pix->width;
+-		pix->plane_fmt[0].sizeimage = pix->width * pix->height;
+-		pix->plane_fmt[1].bytesperline = pix->width;
+-		pix->plane_fmt[1].sizeimage = pix->width * pix->height / 2;
+-	} else {
+-		pix->pixelformat = V4L2_PIX_FMT_JPEG;
+-		pix->num_planes = 1;
+-		pix->plane_fmt[0].sizeimage = pix->width * pix->height * 3 + 4096;
+-	}
+-}
+-
+-static int apple_jpeg_querycap(struct file *file, void *priv,
+-			       struct v4l2_capability *cap)
+-{
+-	struct apple_jpeg_ctx *ctx = fh_to_ctx(priv);
+-
+-	strscpy(cap->driver, "apple-jpeg", sizeof(cap->driver));
+-	strscpy(cap->card, "Apple JPEG scaffold", sizeof(cap->card));
+-	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
+-		 dev_name(ctx->jpeg->dev));
+-	return 0;
+-}
+-
+-static int apple_jpeg_enum_fmt(struct file *file, void *priv,
+-			       struct v4l2_fmtdesc *f)
+-{
+-	if (f->index > 1)
+-		return -EINVAL;
+-	f->pixelformat = f->index ? V4L2_PIX_FMT_NV12M : V4L2_PIX_FMT_JPEG;
+-	return 0;
+-}
+-
+-static int apple_jpeg_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
+-{
+-	struct v4l2_pix_format_mplane *pix = apple_jpeg_format(fh_to_ctx(priv), f->type);
+-
+-	if (!pix)
+-		return -EINVAL;
+-	f->fmt.pix_mp = *pix;
+-	return 0;
+-}
+-
+-static int apple_jpeg_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
+-{
+-	if (!apple_jpeg_format(fh_to_ctx(priv), f->type))
+-		return -EINVAL;
+-	apple_jpeg_normalize_format(&f->fmt.pix_mp);
+-	return 0;
+-}
+-
+-static int apple_jpeg_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
+-{
+-	struct apple_jpeg_ctx *ctx = fh_to_ctx(priv);
+-	struct v4l2_pix_format_mplane *pix, *other;
+-	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
+-	int ret;
+-
+-	ret = apple_jpeg_try_fmt(file, priv, f);
+-	if (ret)
+-		return ret;
+-	if (vb2_is_busy(v4l2_m2m_get_src_vq(m2m)) ||
+-	    vb2_is_busy(v4l2_m2m_get_dst_vq(m2m)))
+-		return -EBUSY;
+-
+-	pix = apple_jpeg_format(ctx, f->type);
+-	other = pix == &ctx->output ? &ctx->capture : &ctx->output;
+-	*pix = f->fmt.pix_mp;
+-	*other = *pix;
+-	other->pixelformat = pix->pixelformat == V4L2_PIX_FMT_JPEG ?
+-		V4L2_PIX_FMT_NV12M : V4L2_PIX_FMT_JPEG;
+-	apple_jpeg_normalize_format(other);
+-	return 0;
+-}
+-
+-static int apple_jpeg_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
+-				  unsigned int *num_planes, unsigned int sizes[],
+-				  struct device *alloc_devs[])
+-{
+-	struct apple_jpeg_ctx *ctx = vb2_get_drv_priv(q);
+-	struct v4l2_pix_format_mplane *pix = apple_jpeg_format(ctx, q->type);
+-	unsigned int i;
+-
+-	if (*num_planes) {
+-		if (*num_planes != pix->num_planes)
+-			return -EINVAL;
+-		for (i = 0; i < *num_planes; i++)
+-			if (sizes[i] < pix->plane_fmt[i].sizeimage)
+-				return -EINVAL;
+-		return 0;
+-	}
+-	*num_planes = pix->num_planes;
+-	for (i = 0; i < *num_planes; i++)
+-		sizes[i] = pix->plane_fmt[i].sizeimage;
+-	return 0;
+-}
+-
+-static int apple_jpeg_buf_prepare(struct vb2_buffer *vb)
+-{
+-	struct apple_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+-	struct v4l2_pix_format_mplane *pix = apple_jpeg_format(ctx, vb->type);
+-	unsigned int i;
+-
+-	for (i = 0; i < pix->num_planes; i++) {
+-		if (vb2_plane_size(vb, i) < pix->plane_fmt[i].sizeimage)
+-			return -EINVAL;
+-		if (!V4L2_TYPE_IS_OUTPUT(vb->type))
+-			vb2_set_plane_payload(vb, i, 0);
+-	}
+-	return 0;
+-}
+-
+-static void apple_jpeg_buf_queue(struct vb2_buffer *vb)
+-{
+-	struct apple_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+-
+-	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
+-}
+-
+-static void apple_jpeg_return_buffers(struct apple_jpeg_ctx *ctx,
+-				      enum v4l2_buf_type type,
+-				      enum vb2_buffer_state state)
+-{
+-	struct vb2_v4l2_buffer *buf;
+-
+-	for (;;) {
+-		buf = V4L2_TYPE_IS_OUTPUT(type) ?
+-			v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx) :
+-			v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+-		if (!buf)
+-			break;
+-		v4l2_m2m_buf_done(buf, state);
+-	}
+-}
+-
+-static int apple_jpeg_start_streaming(struct vb2_queue *q, unsigned int count)
+-{
+-	/* VB2 requires queued buffers back on a failed STREAMON. No MMIO here. */
+-	apple_jpeg_return_buffers(vb2_get_drv_priv(q), q->type, VB2_BUF_STATE_QUEUED);
+-	return -EOPNOTSUPP;
+-}
+-
+-static void apple_jpeg_stop_streaming(struct vb2_queue *q)
+-{
+-	apple_jpeg_return_buffers(vb2_get_drv_priv(q), q->type, VB2_BUF_STATE_ERROR);
+-}
+-
+-static const struct vb2_ops apple_jpeg_queue_ops = {
+-	.queue_setup = apple_jpeg_queue_setup,
+-	.buf_prepare = apple_jpeg_buf_prepare,
+-	.buf_queue = apple_jpeg_buf_queue,
+-	.start_streaming = apple_jpeg_start_streaming,
+-	.stop_streaming = apple_jpeg_stop_streaming,
+-};
+-
+-static int apple_jpeg_init_queue(struct apple_jpeg_ctx *ctx, struct vb2_queue *q,
+-				 enum v4l2_buf_type type)
+-{
+-	q->type = type;
+-	q->io_modes = VB2_MMAP | VB2_DMABUF;
+-	q->drv_priv = ctx;
+-	q->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
+-	q->ops = &apple_jpeg_queue_ops;
+-	q->mem_ops = &vb2_dma_contig_memops;
+-	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+-	q->lock = &ctx->jpeg->lock;
+-	q->dev = ctx->jpeg->dev;
+-	return vb2_queue_init(q);
+-}
+-
+-static int apple_jpeg_queue_init(void *priv, struct vb2_queue *src,
+-				 struct vb2_queue *dst)
+-{
+-	struct apple_jpeg_ctx *ctx = priv;
+-	int ret;
+-
+-	ret = apple_jpeg_init_queue(ctx, src, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
+-	if (ret)
+-		return ret;
+-	return apple_jpeg_init_queue(ctx, dst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+-}
+-
+-static int apple_jpeg_job_ready(void *priv)
+-{
+-	return 0;
+-}
+-
+-static void apple_jpeg_device_run(void *priv)
+-{
+-	struct apple_jpeg_ctx *ctx = priv;
+-
+-	/* Defensive fallback; STREAMON and job_ready prevent scheduling. */
+-	apple_jpeg_return_buffers(ctx, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+-				  VB2_BUF_STATE_ERROR);
+-	apple_jpeg_return_buffers(ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+-				  VB2_BUF_STATE_ERROR);
+-	v4l2_m2m_job_finish(ctx->jpeg->m2m_dev, ctx->fh.m2m_ctx);
+-}
+-
+-static const struct v4l2_m2m_ops apple_jpeg_m2m_ops = {
+-	.device_run = apple_jpeg_device_run,
+-	.job_ready = apple_jpeg_job_ready,
+-};
+-
+-static int apple_jpeg_open(struct file *file)
+-{
+-	struct apple_jpeg *jpeg = video_drvdata(file);
+-	struct apple_jpeg_ctx *ctx;
+-	int ret = 0;
+-
+-	if (mutex_lock_interruptible(&jpeg->lock))
+-		return -ERESTARTSYS;
+-	if (!video_is_registered(&jpeg->vdev)) {
+-		ret = -ENODEV;
+-		goto unlock;
+-	}
+-	ctx = kzalloc_obj(*ctx);
+-	if (!ctx) {
+-		ret = -ENOMEM;
+-		goto unlock;
+-	}
+-	ctx->jpeg = jpeg;
+-	ctx->output.width = 640;
+-	ctx->output.height = 480;
+-	ctx->output.pixelformat = V4L2_PIX_FMT_JPEG;
+-	apple_jpeg_normalize_format(&ctx->output);
+-	ctx->capture = ctx->output;
+-	ctx->capture.pixelformat = V4L2_PIX_FMT_NV12M;
+-	apple_jpeg_normalize_format(&ctx->capture);
+-	v4l2_fh_init(&ctx->fh, &jpeg->vdev);
+-	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(jpeg->m2m_dev, ctx, apple_jpeg_queue_init);
+-	if (IS_ERR(ctx->fh.m2m_ctx)) {
+-		ret = PTR_ERR(ctx->fh.m2m_ctx);
+-		v4l2_fh_exit(&ctx->fh);
+-		kfree(ctx);
+-		goto unlock;
+-	}
+-	v4l2_fh_add(&ctx->fh, file);
+-unlock:
+-	mutex_unlock(&jpeg->lock);
+-	return ret;
+-}
+-
+-static int apple_jpeg_release(struct file *file)
+-{
+-	struct apple_jpeg_ctx *ctx = fh_to_ctx(file->private_data);
+-	struct apple_jpeg *jpeg = ctx->jpeg;
+-
+-	mutex_lock(&jpeg->lock);
+-	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
+-	v4l2_fh_del(&ctx->fh, file);
+-	v4l2_fh_exit(&ctx->fh);
+-	kfree(ctx);
+-	mutex_unlock(&jpeg->lock);
+-	return 0;
+-}
+-
+-static const struct v4l2_file_operations apple_jpeg_fops = {
+-	.owner = THIS_MODULE,
+-	.open = apple_jpeg_open,
+-	.release = apple_jpeg_release,
+-	.poll = v4l2_m2m_fop_poll,
+-	.unlocked_ioctl = video_ioctl2,
+-	.mmap = v4l2_m2m_fop_mmap,
+-};
+-
+-static const struct v4l2_ioctl_ops apple_jpeg_ioctl_ops = {
+-	.vidioc_querycap = apple_jpeg_querycap,
+-	.vidioc_enum_fmt_vid_cap = apple_jpeg_enum_fmt,
+-	.vidioc_enum_fmt_vid_out = apple_jpeg_enum_fmt,
+-	.vidioc_g_fmt_vid_cap_mplane = apple_jpeg_g_fmt,
+-	.vidioc_g_fmt_vid_out_mplane = apple_jpeg_g_fmt,
+-	.vidioc_try_fmt_vid_cap_mplane = apple_jpeg_try_fmt,
+-	.vidioc_try_fmt_vid_out_mplane = apple_jpeg_try_fmt,
+-	.vidioc_s_fmt_vid_cap_mplane = apple_jpeg_s_fmt,
+-	.vidioc_s_fmt_vid_out_mplane = apple_jpeg_s_fmt,
+-	.vidioc_reqbufs = v4l2_m2m_ioctl_reqbufs,
+-	.vidioc_create_bufs = v4l2_m2m_ioctl_create_bufs,
+-	.vidioc_querybuf = v4l2_m2m_ioctl_querybuf,
+-	.vidioc_qbuf = v4l2_m2m_ioctl_qbuf,
+-	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf,
+-	.vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
+-	.vidioc_streamon = v4l2_m2m_ioctl_streamon,
+-	.vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
+-};
+-
+-static int apple_jpeg_runtime_resume(struct device *dev)
+-{
+-	struct apple_jpeg *jpeg = dev_get_drvdata(dev);
+-	u32 hwrev = readl(jpeg->regs + APPLE_JPEG_HWREV);
+-
+-	/* Identify before any reset writes; no target reset profile is known. */
+-	if (!apple_jpeg_hwrev_supported(jpeg->variant, hwrev))
+-		return dev_err_probe(dev, -ENODEV, "unqualified HWREV %#x\n", hwrev);
+-	return 0;
+-}
+-
+-static int apple_jpeg_runtime_suspend(struct device *dev)
+-{
+-	/* This scaffold never starts DMA or changes the engine's register state. */
+-	return 0;
+-}
+-
+-static const struct dev_pm_ops apple_jpeg_pm_ops = {
+-	RUNTIME_PM_OPS(apple_jpeg_runtime_suspend, apple_jpeg_runtime_resume, NULL)
+-	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+-};
+-
+-static int apple_jpeg_check_dma(struct device *dev)
+-{
+-	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+-	struct of_phandle_args args;
+-	u64 range[2];
+-	int ret;
+-
+-	if (of_count_phandle_with_args(dev->of_node, "iommus", "#iommu-cells") != 1)
+-		return -EINVAL;
+-	ret = of_parse_phandle_with_args(dev->of_node, "iommus", "#iommu-cells", 0, &args);
+-	if (ret)
+-		return ret;
+-	of_node_put(args.np);
+-	if (args.args_count != 1 || args.args[0] != 0)
+-		return -EINVAL;
+-	if (!domain || (domain->type != IOMMU_DOMAIN_DMA &&
+-			domain->type != IOMMU_DOMAIN_DMA_FQ))
+-		return -ENODEV;
+-	if (of_property_count_u64_elems(dev->of_node, "apple,dma-range") != 2)
+-		return -EINVAL;
+-	ret = of_property_read_u64_array(dev->of_node, "apple,dma-range", range, 2);
+-	if (ret)
+-		return ret;
+-	if (range[0] != APPLE_JPEG_DMA_BASE || range[1] != APPLE_JPEG_DMA_SIZE)
+-		return -EINVAL;
+-	/* BIT(40) is part of the DART alias, not a 32-bit physical DMA mask. */
+-	return dma_set_mask_and_coherent(dev, DMA_BIT_MASK(41));
+-}
+-
+-static void apple_jpeg_v4l2_release(struct v4l2_device *v4l2_dev)
+-{
+-	struct apple_jpeg *jpeg = container_of(v4l2_dev, struct apple_jpeg, v4l2_dev);
+-
+-	if (jpeg->m2m_dev)
+-		v4l2_m2m_release(jpeg->m2m_dev);
+-	put_device(jpeg->dev);
+-	mutex_destroy(&jpeg->lock);
+-	kfree(jpeg);
+-}
+-
+-static int apple_jpeg_probe(struct platform_device *pdev)
+-{
+-	struct device *dev = &pdev->dev;
+-	struct apple_jpeg *jpeg;
+-	struct resource *res;
+-	int ret;
+-
+-	ret = apple_jpeg_check_dma(dev);
+-	if (ret)
+-		return dev_err_probe(dev, ret, "requires a dedicated SID-0 DART window\n");
+-	if (!dev->pm_domain)
+-		return dev_err_probe(dev, -ENODEV, "requires a power domain\n");
+-	ret = platform_get_irq(pdev, 0);
+-	if (ret < 0)
+-		return ret;
+-	/* Do not request an IRQ before acknowledgment semantics are qualified. */
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	if (!res || resource_size(res) != APPLE_JPEG_REG_SIZE)
+-		return -EINVAL;
+-
+-	jpeg = kzalloc_obj(*jpeg);
+-	if (!jpeg)
+-		return -ENOMEM;
+-	jpeg->dev = get_device(dev);
+-	jpeg->variant = of_device_get_match_data(dev);
+-	mutex_init(&jpeg->lock);
+-	jpeg->regs = devm_ioremap_resource(dev, res);
+-	if (IS_ERR(jpeg->regs)) {
+-		ret = PTR_ERR(jpeg->regs);
+-		goto free_jpeg;
+-	}
+-	platform_set_drvdata(pdev, jpeg);
+-	pm_runtime_set_autosuspend_delay(dev, 100);
+-	pm_runtime_use_autosuspend(dev);
+-	pm_runtime_enable(dev);
+-	ret = pm_runtime_resume_and_get(dev);
+-	if (ret < 0)
+-		goto disable_pm;
+-	ret = pm_runtime_put_sync_suspend(dev);
+-	if (ret < 0)
+-		goto disable_pm;
+-
+-	ret = v4l2_device_register(dev, &jpeg->v4l2_dev);
+-	if (ret)
+-		goto disable_pm;
+-	jpeg->v4l2_dev.release = apple_jpeg_v4l2_release;
+-	jpeg->m2m_dev = v4l2_m2m_init(&apple_jpeg_m2m_ops);
+-	if (IS_ERR(jpeg->m2m_dev)) {
+-		ret = PTR_ERR(jpeg->m2m_dev);
+-		jpeg->m2m_dev = NULL;
+-		goto unregister_v4l2;
+-	}
+-	strscpy(jpeg->vdev.name, "apple-jpeg", sizeof(jpeg->vdev.name));
+-	jpeg->vdev.v4l2_dev = &jpeg->v4l2_dev;
+-	jpeg->vdev.fops = &apple_jpeg_fops;
+-	jpeg->vdev.ioctl_ops = &apple_jpeg_ioctl_ops;
+-	jpeg->vdev.release = video_device_release_empty;
+-	jpeg->vdev.lock = &jpeg->lock;
+-	jpeg->vdev.vfl_dir = VFL_DIR_M2M;
+-	jpeg->vdev.device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
+-	video_set_drvdata(&jpeg->vdev, jpeg);
+-	ret = video_register_device(&jpeg->vdev, VFL_TYPE_VIDEO, -1);
+-	if (ret)
+-		goto unregister_v4l2;
+-	return 0;
+-
+-unregister_v4l2:
+-	v4l2_device_unregister(&jpeg->v4l2_dev);
+-	pm_runtime_disable(dev);
+-	pm_runtime_dont_use_autosuspend(dev);
+-	platform_set_drvdata(pdev, NULL);
+-	v4l2_device_put(&jpeg->v4l2_dev);
+-	return ret;
+-disable_pm:
+-	pm_runtime_disable(dev);
+-	pm_runtime_dont_use_autosuspend(dev);
+-	platform_set_drvdata(pdev, NULL);
+-free_jpeg:
+-	put_device(jpeg->dev);
+-	mutex_destroy(&jpeg->lock);
+-	kfree(jpeg);
+-	return ret;
+-}
+-
+-static void apple_jpeg_remove(struct platform_device *pdev)
+-{
+-	struct apple_jpeg *jpeg = platform_get_drvdata(pdev);
+-
+-	mutex_lock(&jpeg->lock);
+-	v4l2_device_disconnect(&jpeg->v4l2_dev);
+-	video_unregister_device(&jpeg->vdev);
+-	mutex_unlock(&jpeg->lock);
+-	v4l2_device_unregister(&jpeg->v4l2_dev);
+-	pm_runtime_disable(&pdev->dev);
+-	pm_runtime_dont_use_autosuspend(&pdev->dev);
+-	platform_set_drvdata(pdev, NULL);
+-	/* Open files retain the video_device's V4L2 reference until last close. */
+-	v4l2_device_put(&jpeg->v4l2_dev);
+-}
+-
+-static const struct of_device_id apple_jpeg_of_match[] = {
+-	{ .compatible = "apple,t6041-jpeg", .data = &apple_jpeg_t6041 },
+-	{ .compatible = "apple,t8140-jpeg", .data = &apple_jpeg_t8140 },
+-	{ }
+-};
+-MODULE_DEVICE_TABLE(of, apple_jpeg_of_match);
+-
+-static struct platform_driver apple_jpeg_driver = {
+-	.probe = apple_jpeg_probe,
+-	.remove = apple_jpeg_remove,
+-	.driver = {
+-		.name = "apple-jpeg",
+-		.of_match_table = apple_jpeg_of_match,
+-		.pm = pm_ptr(&apple_jpeg_pm_ops),
+-	},
+-};
+-module_platform_driver(apple_jpeg_driver);
+-
+-MODULE_DESCRIPTION("Apple Silicon JPEG mem2mem scaffold");
+-MODULE_LICENSE("GPL");

@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erik Bourget <erik@ebourget.net>
+Date: Thu, 29 Oct 2026 15:48:59 -0400
+Subject: [PATCH] drm/asahi: g16: Report work in flight to the CLPC
+
+The G16 firmware keeps GFX powered while the GPU idles, so a host
+performance controller cannot tell GPU work from its power state. Take the
+DT-selected CLPC's input (apple,clpc) at probe, as G17 does, and report
+whether work is in flight. Polling retires finished work before it
+publishes, so reporting after each publication pass sees work start and
+drain; a fail-stop, which empties the flights without another pass,
+reports from fail_flights(). Only changes are reported.
+
+The handle is taken before the PMP vote, so a CLPC that has not probed yet
+defers the GPU before anything is set up, with the reason recorded; any
+other error is reported.
+
+The floor is a performance aid: without apple,clpc, or in a kernel built
+without the CLPC, the GPU runs without one, with a warning in the latter
+case. Kconfig keeps a CLPC that is built reachable from the GPU driver.
+
+Signed-off-by: Erik Bourget <erik@ebourget.net>
+(cherry picked from commit 33156bde82c167bb8bff1cb28758749756291b72)
+[j604: context conflicts only: Kconfig keeps 1.604's DRM_APPLE dependency beside the new APPLE_CLPC one, and
+ glue.c keeps 1.604's <linux/soc/apple/display.h> include beside <linux/soc/apple/clpc.h>]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/Kconfig         |  1 +
+ drivers/gpu/drm/asahi/g16/engine.rs   |  3 ++
+ drivers/gpu/drm/asahi/g16/glue.c      | 33 +++++++++++++++
+ drivers/gpu/drm/asahi/g16/power.rs    | 59 +++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/recovery.rs |  2 +
+ 5 files changed, 98 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/Kconfig b/drivers/gpu/drm/asahi/Kconfig
+index b988ea406a..d40caf2ea8 100644
+--- a/drivers/gpu/drm/asahi/Kconfig
++++ b/drivers/gpu/drm/asahi/Kconfig
+@@ -29,6 +29,7 @@ config DRM_ASAHI_G16
+ 	depends on DRM_ASAHI && ARM64
+ 	depends on APPLE_PMP=y || APPLE_PMP=DRM_ASAHI
+ 	depends on DRM_APPLE=y || (DRM_APPLE=m && DRM_ASAHI=m)
++	depends on APPLE_CLPC=y || APPLE_CLPC=DRM_ASAHI || APPLE_CLPC=n
+ 	depends on THERMAL_OF
+ 	select CRYPTO_LIB_SHA256
+ 	select DRM_ASAHI_UAT_ADOPTION
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index e2397fd056..3905c1ab16 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -855,6 +855,9 @@ impl Firmware {
+         if !self.engine.chan_wait {
+             self.recovery.publication_wait_deadline = None;
+         }
++        // Polling retires before it publishes, so this sees work start and
++        // drain; a fail-stop reports from fail_flights().
++        self.power.report_work(!self.engine.flights.is_empty());
+         result
+     }
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/glue.c b/drivers/gpu/drm/asahi/g16/glue.c
+index 5d87dfb4d2..993097d50e 100644
+--- a/drivers/gpu/drm/asahi/g16/glue.c
++++ b/drivers/gpu/drm/asahi/g16/glue.c
+@@ -19,6 +19,7 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/slab.h>
+ #include <linux/soc/apple/display.h>
++#include <linux/soc/apple/clpc.h>
+ #include <linux/soc/apple/pmp-display.h>
+ #include <linux/soc/apple/pmp-cooling.h>
+ #include <linux/soc/apple/pmp-telemetry.h>
+@@ -52,6 +53,9 @@ void asahi_g16_cooling_unregister(struct asahi_g16_cooling *cooling);
+ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
+ 			    long *temperature, u32 *governor, u32 *power,
+ 			    u32 *backstop);
++int asahi_g16_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out);
++void asahi_g16_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active);
++void asahi_g16_clpc_gpu_put(struct apple_clpc_gpu *gpu);
+ 
+ static int asahi_g16_cooling_max(struct thermal_cooling_device *cdev,
+ 				unsigned long *state)
+@@ -309,3 +313,32 @@ int asahi_g16_power_domain_state(struct device *dev, u32 *offset, u32 *state)
+ 		return PTR_ERR(pmgr);
+ 	return regmap_read(pmgr, *offset, state);
+ }
++
++/*
++ * The CLPC holding the memory floor for GPU work is a performance aid: the GPU
++ * works without one, only slower. A kernel without the CLPC runs without it;
++ * one that has not probed yet defers the GPU, with the reason recorded.
++ */
++int asahi_g16_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
++{
++	int ret = apple_clpc_gpu_get(dev, out);
++
++	if (ret == -ENODEV) {
++		dev_warn(dev, "no CLPC: GPU work gets no memory floor\n");
++		*out = NULL;
++		return 0;
++	}
++	if (ret)
++		return dev_err_probe(dev, ret, "no CLPC for GPU work\n");
++	return 0;
++}
++
++void asahi_g16_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active)
++{
++	apple_clpc_gpu_set_active(gpu, active);
++}
++
++void asahi_g16_clpc_gpu_put(struct apple_clpc_gpu *gpu)
++{
++	apple_clpc_gpu_put(gpu);
++}
+diff --git a/drivers/gpu/drm/asahi/g16/power.rs b/drivers/gpu/drm/asahi/g16/power.rs
+index 3b16fa04f7..9c23f8688e 100644
+--- a/drivers/gpu/drm/asahi/g16/power.rs
++++ b/drivers/gpu/drm/asahi/g16/power.rs
+@@ -10,6 +10,10 @@
+ //!
+ //! The firmware runs at the published state, busy or not, so the host requests
+ //! one from the GPU's busy share of each window, bounded by the ceiling.
++//!
++//! The firmware keeps GFX powered while the GPU idles, so the host reports
++//! when it has work in flight to the DT-selected CLPC, which holds the memory
++//! and fabric floor for that work.
+ 
+ pub(crate) mod policy;
+ 
+@@ -27,6 +31,9 @@ static_assert!(globals::PSTATE_SELECTORS[1] == 0x8c);
+ static_assert!(globals::PSTATE_SELECTORS[2] == 0x98);
+ 
+ extern "C" {
++    fn asahi_g16_clpc_gpu_get(dev: *mut c_void, out: *mut *mut c_void) -> core::ffi::c_int;
++    fn asahi_g16_clpc_gpu_set_active(gpu: *mut c_void, active: bool);
++    fn asahi_g16_clpc_gpu_put(gpu: *mut c_void);
+     fn asahi_g16_cooling_register(dev: *mut c_void) -> *mut c_void;
+     fn asahi_g16_cooling_unregister(cooling: *mut c_void);
+     fn asahi_g16_cooling_sample(
+@@ -100,9 +107,49 @@ struct Sample {
+     backstop: u32,
+ }
+ 
++/// DT-selected memory-demand provider (`apple,clpc`), or none. Its
++/// independent allocation outlives a detached provider; a device link orders
++/// supplier removal and suspend.
++struct Demand(*mut c_void);
++
++// SAFETY: the provider's leaf spinlock serializes all access; no GPU callback.
++unsafe impl Send for Demand {}
++// SAFETY: shared access only changes that locked request, never its lifetime.
++unsafe impl Sync for Demand {}
++
++impl Demand {
++    fn new(dev: &device::Device) -> Result<Self> {
++        let mut out = core::ptr::null_mut();
++        // SAFETY: live platform device and writable result; C returns an owned
++        // reference, or NULL without an `apple,clpc` provider.
++        let ret = unsafe { asahi_g16_clpc_gpu_get(dev.as_raw().cast(), &mut out) };
++        if ret < 0 {
++            Err(Error::from_errno(ret))
++        } else {
++            Ok(Self(out))
++        }
++    }
++
++    fn set_active(&self, active: bool) {
++        // SAFETY: the retained reference is live; NULL denotes no provider.
++        unsafe { asahi_g16_clpc_gpu_set_active(self.0, active) };
++    }
++}
++
++impl Drop for Demand {
++    fn drop(&mut self) {
++        // SAFETY: releases exactly the reference returned by get, clearing
++        // the demand first.
++        unsafe { asahi_g16_clpc_gpu_put(self.0) };
++    }
++}
++
+ /// All fields are protected by the device mutex. Before the first valid
+ /// provider sample the shared cooling policy keeps the ceiling at S1.
+ pub(crate) struct Power {
++    clpc: Demand,
++    /// The work-in-flight state last reported to `clpc`.
++    reported: Option<bool>,
+     cooling: Cooling,
+     sample: Sample,
+     last_sample_ns: Option<u64>,
+@@ -125,6 +172,9 @@ impl Power {
+     /// startup S1 before INIT; this object starts with that same effective state.
+     pub(crate) fn new(dev: &device::Device) -> Result<Self> {
+         Ok(Self {
++            // First: a CLPC that has not probed yet defers before the PMP vote.
++            clpc: Demand::new(dev)?,
++            reported: None,
+             cooling: Cooling::new(dev)?,
+             sample: Sample {
+                 temperature_mc: 0,
+@@ -148,6 +198,15 @@ impl Power {
+         })
+     }
+ 
++    /// Reports a change of work in flight to the CLPC: the memory and fabric
++    /// floor follows it, not the GFX power state.
++    pub(crate) fn report_work(&mut self, in_flight: bool) {
++        if self.reported != Some(in_flight) {
++            self.clpc.set_active(in_flight);
++            self.reported = Some(in_flight);
++        }
++    }
++
+     fn ceiling(&mut self, now: u64) -> (u32, bool) {
+         if policy::read_due(self.last_sample_ns, now) {
+             self.last_sample_ns = Some(now);
+diff --git a/drivers/gpu/drm/asahi/g16/recovery.rs b/drivers/gpu/drm/asahi/g16/recovery.rs
+index cc3f3525c1..eccf70cf82 100644
+--- a/drivers/gpu/drm/asahi/g16/recovery.rs
++++ b/drivers/gpu/drm/asahi/g16/recovery.rs
+@@ -254,6 +254,8 @@ impl Firmware {
+     /// flights are retained whole, never released to the free slot lists.
+     pub(crate) fn fail_flights(&mut self, error: Error, done: &mut Completions) {
+         let flights = core::mem::take(&mut self.engine.flights);
++        // A failed device never publishes again: release the memory floor now.
++        self.power.report_work(false);
+         for flight in flights.iter() {
+             for job in Iterator::chain(core::iter::once(&flight.job), flight.group.iter()) {
+                 push_completion(done, job, Err(error));

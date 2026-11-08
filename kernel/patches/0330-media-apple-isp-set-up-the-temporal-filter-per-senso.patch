@@ -1,0 +1,412 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Sun, 1 Nov 2026 15:49:16 +1100
+Subject: [PATCH] media: apple: isp: set up the temporal filter per sensor as
+ macOS does
+
+On the H17 interface macOS does not start the ISP's temporal noise filter
+the same way for every sensor. For the IMX958 (J616s) it sends a longer
+start record, (1, 0, 0), then turns high-strength filtering and band 0
+modulation off and sets the band 0 strength thresholds to 120 and 100 in
+1/256 steps, before the motion history and the enable. For the IMX558
+(J700) it starts nothing: it disables the filter and stops the motion
+history and the filter, since the firmware keeps that state between
+streams. These values come from Daybreak's reading of the macOS 27.0
+camera stack.
+
+Linux sent the short start with the apple,temporal-filter value on every
+sensor, 1 on the J700. On the Neo, starting the filter with 0 instead of
+1 already leaves about 13% less luma noise and 18% less chroma noise on a
+still scene.
+
+Keep the per-sensor choice next to the setfile of each sensor and leave
+every other sensor on the original sequence.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(cherry picked from commit 7f9611314715fbebe4dfed79e2b60225273a30e8)
+---
+ .../media/platform/apple/isp/isp-cam-test.c   | 117 ++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-cam.c    |  82 ++++++++++--
+ drivers/media/platform/apple/isp/isp-cmd.c    |  43 +++++++
+ drivers/media/platform/apple/isp/isp-cmd.h    |  36 ++++++
+ 4 files changed, 267 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam-test.c b/drivers/media/platform/apple/isp/isp-cam-test.c
+index b97fa7b06c..765deb0ff0 100644
+--- a/drivers/media/platform/apple/isp/isp-cam-test.c
++++ b/drivers/media/platform/apple/isp/isp-cam-test.c
+@@ -210,6 +210,121 @@ static void isp_test_optional_setfile_continues_setup(struct kunit *test)
+ 	}
+ }
+ 
++struct isp_test_nv12_trace {
++	unsigned int count;
++	u32 opcode[64];
++	u32 size[64];
++	u32 word[64][3];
++};
++
++/* Accept every NV12 setup command and record its opcode and first fields. */
++static int isp_test_record(struct apple_isp *isp, void *args, u32 insize,
++			   u32 outsize, int timeout)
++{
++	struct kunit *test = kunit_get_current_test();
++	struct isp_test_nv12_trace *trace = test->priv;
++	const u32 *words = args;
++	unsigned int i = trace->count;
++
++	if (i >= ARRAY_SIZE(trace->opcode)) {
++		KUNIT_FAIL(test, "unexpected extra command");
++		return -EIO;
++	}
++	trace->opcode[i] = words[1];
++	trace->size[i] = insize;
++	for (unsigned int j = 0; j < 3 && 12 + 4 * j < insize; j++)
++		trace->word[i][j] = words[3 + j];
++	trace->count++;
++	return 0;
++}
++
++static int isp_test_find(const struct isp_test_nv12_trace *trace, u32 opcode)
++{
++	for (unsigned int i = 0; i < trace->count; i++)
++		if (trace->opcode[i] == opcode)
++			return i;
++	return -1;
++}
++
++static int isp_test_no_setfile(struct apple_isp *isp, u32 ch)
++{
++	return 0;
++}
++
++static struct apple_isp *isp_test_nv12_alloc(struct kunit *test,
++					     enum isp_sensor_id id)
++{
++	struct apple_isp *isp = isp_test_capture_alloc(test);
++	struct isp_format *fmt = isp_get_current_format(isp);
++
++	fmt->pixelformat = V4L2_PIX_FMT_NV12;
++	fmt->id = id;
++	fmt->version = isp_setfiles[id].version;
++	isp->temporal_filter = 1;
++	kunit_activate_static_stub(test, isp_ch_load_setfile, isp_test_no_setfile);
++	kunit_activate_static_stub(test, isp_cmd_send, isp_test_record);
++	return isp;
++}
++
++/* Expect exactly @n commands, in this order, from the first of them on. */
++static void isp_test_expect_run(struct kunit *test,
++				const struct isp_test_nv12_trace *trace,
++				const u32 (*run)[2], unsigned int n)
++{
++	int first = isp_test_find(trace, run[0][0]);
++
++	KUNIT_ASSERT_GE(test, first, 0);
++	KUNIT_ASSERT_LE(test, first + n, trace->count);
++	for (unsigned int i = 0; i < n; i++) {
++		KUNIT_EXPECT_EQ(test, trace->opcode[first + i], run[i][0]);
++		KUNIT_EXPECT_EQ(test, trace->size[first + i], run[i][1]);
++	}
++}
++
++static void isp_test_temporal_filter_band0(struct kunit *test)
++{
++	static const u32 run[][2] = {
++		{ 0xc100, 0x18 }, { 0xc120, 0x10 }, { 0xc11c, 0x10 },
++		{ 0xc11d, 0x14 }, { 0xc102, 0x0c }, { 0xc113, 0x0c },
++	};
++	struct apple_isp *isp = isp_test_nv12_alloc(test, ISP_IMX958_2224_01);
++	struct isp_test_nv12_trace *trace;
++	int i;
++
++	trace = kunit_kzalloc(test, sizeof(*trace), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, trace);
++	test->priv = trace;
++	KUNIT_EXPECT_EQ(test, isp_ch_configure_capture(isp, 0), 0);
++	isp_test_expect_run(test, trace, run, ARRAY_SIZE(run));
++	/* The start record is (1, 0, 0) whatever the DT property says. */
++	i = isp_test_find(trace, 0xc100);
++	KUNIT_EXPECT_EQ(test, trace->word[i][0], 1);
++	KUNIT_EXPECT_EQ(test, trace->word[i][1], 0);
++	KUNIT_EXPECT_EQ(test, trace->word[i][2], 0);
++	i = isp_test_find(trace, 0xc11d);
++	KUNIT_EXPECT_EQ(test, trace->word[i][0], 0x7800);
++	KUNIT_EXPECT_EQ(test, trace->word[i][1], 0x6400);
++	KUNIT_EXPECT_LT(test, isp_test_find(trace, 0xc114), 0);
++}
++
++static void isp_test_temporal_filter_off(struct kunit *test)
++{
++	static const u32 run[][2] = {
++		{ 0xc114, 0x0c }, { 0xc103, 0x0c }, { 0xc101, 0x0c },
++	};
++	struct apple_isp *isp = isp_test_nv12_alloc(test, ISP_IMX558_1925_03);
++	struct isp_test_nv12_trace *trace;
++
++	trace = kunit_kzalloc(test, sizeof(*trace), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, trace);
++	test->priv = trace;
++	KUNIT_EXPECT_EQ(test, isp_ch_configure_capture(isp, 0), 0);
++	isp_test_expect_run(test, trace, run, ARRAY_SIZE(run));
++	KUNIT_EXPECT_LT(test, isp_test_find(trace, 0xc100), 0);
++	KUNIT_EXPECT_LT(test, isp_test_find(trace, 0xc102), 0);
++	KUNIT_EXPECT_LT(test, isp_test_find(trace, 0xc113), 0);
++}
++
+ static int isp_test_config_reply(struct apple_isp *isp, void *args, u32 insize,
+ 				 u32 outsize, int timeout)
+ {
+@@ -500,6 +615,8 @@ static struct kunit_case isp_cam_test_cases[] = {
+ 	KUNIT_CASE(isp_test_sensor_config_failure),
+ 	KUNIT_CASE(isp_test_preview_stream),
+ 	KUNIT_CASE(isp_test_preview_command_failures),
++	KUNIT_CASE(isp_test_temporal_filter_band0),
++	KUNIT_CASE(isp_test_temporal_filter_off),
+ 	{}
+ };
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 67691cc884..e021d4ea30 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -13,6 +13,18 @@
+ #include "isp-ipc.h"
+ #include "isp-regs.h"
+ 
++/*
++ * How the ISP's own temporal noise filter is set up for a sensor. macOS
++ * picks this per sensor on the H17 interface: the IMX558 (J700) runs
++ * without it and the IMX958 (J616s) runs it with explicit strength
++ * controls. Everything else keeps the original start sequence.
++ */
++enum isp_temporal_filter {
++	ISP_TEMPORAL_FILTER_START,
++	ISP_TEMPORAL_FILTER_OFF,
++	ISP_TEMPORAL_FILTER_BAND0,
++};
++
+ struct isp_setfile {
+ 	u32 version;
+ 	u32 magic;
+@@ -20,6 +32,7 @@ struct isp_setfile {
+ 	size_t size;
+ 	/* bytes present in the file if fewer than size; the rest is zero */
+ 	size_t file_size;
++	enum isp_temporal_filter temporal_filter;
+ };
+ 
+ // clang-format off
+@@ -49,7 +62,8 @@ static const struct isp_setfile isp_setfiles[] = {
+ 	[ISP_IMX514_2820_04] = {0x514, 0x28200405, "apple/isp_2820_04XX.dat", 0xa198},
+ 	[ISP_IMX558_1921_01] = {0x558, 0x19210106, "apple/isp_1921_01XX.dat", 0xad40},
+ 	[ISP_IMX558_1922_02] = {0x558, 0x19220201, "apple/isp_1922_02XX.dat", 0xad40},
+-	[ISP_IMX558_1925_03] = {0x558, 0x19250306, "apple/isp_1925_03XX.dat", 0xcbc0, 0xcba6},
++	[ISP_IMX558_1925_03] = {0x558, 0x19250306, "apple/isp_1925_03XX.dat", 0xcbc0, 0xcba6,
++				ISP_TEMPORAL_FILTER_OFF},
+ 	[ISP_IMX603_7920_01] = {0x603, 0x79200109, "apple/isp_7920_01XX.dat", 0xad2c},
+ 	[ISP_IMX603_7920_02] = {0x603, 0x79200205, "apple/isp_7920_02XX.dat", 0xad2c},
+ 	[ISP_IMX603_7921_01] = {0x603, 0x79210104, "apple/isp_7921_01XX.dat", 0xad90},
+@@ -71,7 +85,8 @@ static const struct isp_setfile isp_setfiles[] = {
+ 	[ISP_IMX814_2123_01] = {0x814, 0x21230101, "apple/isp_2123_01XX.dat", 0xed54},
+ 	[ISP_IMX853_7622_01] = {0x853, 0x76220112, "apple/isp_7622_01XX.dat", 0x247f8},
+ 	[ISP_IMX913_7523_01] = {0x913, 0x75230107, "apple/isp_7523_01XX.dat", 0x247f8},
+-	[ISP_IMX958_2224_01] = {0x958, 0x22240106, "apple/isp_2224_01XX.dat", 0x6ff4},
++	[ISP_IMX958_2224_01] = {0x958, 0x22240106, "apple/isp_2224_01XX.dat", 0x6ff4, 0,
++				ISP_TEMPORAL_FILTER_BAND0},
+ 	[ISP_VD56G0_6221_01] = {0xd56, 0x62210102, "apple/isp_6221_01XX.dat", 0x1b80},
+ 	[ISP_VD56G0_6222_01] = {0xd56, 0x62220102, "apple/isp_6222_01XX.dat", 0x1b80},
+ };
+@@ -689,6 +704,59 @@ static int isp_ch_configure_frame_rate(struct apple_isp *isp, u32 ch)
+ 	return isp_cmd_ch_ae_frame_rate_min_set(isp, ch, min_rate);
+ }
+ 
++static int isp_ch_configure_temporal_filter(struct apple_isp *isp, u32 ch)
++{
++	struct isp_format *fmt = isp_get_format(isp, ch);
++	int err;
++
++	switch (isp_setfiles[fmt->id].temporal_filter) {
++	case ISP_TEMPORAL_FILTER_OFF:
++		/* The firmware keeps its state between streams; stop it. */
++		err = isp_cmd_apple_ch_temporal_filter_disable(isp, ch);
++		if (err)
++			return err;
++
++		err = isp_cmd_apple_ch_motion_history_stop(isp, ch);
++		if (err)
++			return err;
++
++		return isp_cmd_apple_ch_temporal_filter_stop(isp, ch);
++
++	case ISP_TEMPORAL_FILTER_BAND0:
++		err = isp_cmd_apple_ch_tnr_start_h17(isp, ch);
++		if (err)
++			return err;
++
++		err = isp_cmd_apple_ch_tnr_high_strength_set(isp, ch, 0);
++		if (err)
++			return err;
++
++		err = isp_cmd_apple_ch_tnr_band0_mod_set(isp, ch, 0);
++		if (err)
++			return err;
++
++		/* 120 and 100, in 1/256 steps */
++		err = isp_cmd_apple_ch_tnr_band0_threshold_set(isp, ch, 120 << 8,
++							       100 << 8);
++		if (err)
++			return err;
++		break;
++
++	default:
++		err = isp_cmd_apple_ch_temporal_filter_start(isp, ch,
++							     isp->temporal_filter);
++		if (err)
++			return err;
++		break;
++	}
++
++	err = isp_cmd_apple_ch_motion_history_start(isp, ch);
++	if (err)
++		return err;
++
++	return isp_cmd_apple_ch_temporal_filter_enable(isp, ch);
++}
++
+ static int isp_ch_configure_pools(struct apple_isp *isp, u32 ch)
+ {
+ 	struct isp_format *fmt = isp_get_format(isp, ch);
+@@ -845,15 +913,7 @@ select_config:
+ 			return err;
+ 	}
+ 
+-	err = isp_cmd_apple_ch_temporal_filter_start(isp, ch, isp->temporal_filter);
+-	if (err)
+-		return err;
+-
+-	err = isp_cmd_apple_ch_motion_history_start(isp, ch);
+-	if (err)
+-		return err;
+-
+-	err = isp_cmd_apple_ch_temporal_filter_enable(isp, ch);
++	err = isp_ch_configure_temporal_filter(isp, ch);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.c b/drivers/media/platform/apple/isp/isp-cmd.c
+index e1670aea79..75b8704cce 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.c
++++ b/drivers/media/platform/apple/isp/isp-cmd.c
+@@ -607,6 +607,49 @@ int isp_cmd_apple_ch_temporal_filter_disable(struct apple_isp *isp, u32 chan)
+ 	return CISP_SEND_IN(isp, args);
+ }
+ 
++int isp_cmd_apple_ch_tnr_start_h17(struct apple_isp *isp, u32 chan)
++{
++	struct cmd_apple_ch_temporal_filter_start_h17 args = {
++		.opcode = CISP_OPCODE(CISP_CMD_APPLE_CH_TEMPORAL_FILTER_START),
++		.chan = chan,
++		.unk_c = 1,
++	};
++	return CISP_SEND_IN(isp, args);
++}
++
++int isp_cmd_apple_ch_tnr_high_strength_set(struct apple_isp *isp, u32 chan,
++					   u32 enable)
++{
++	struct cmd_apple_ch_temporal_filter_enable_set args = {
++		.opcode = CISP_OPCODE(CISP_CMD_APPLE_CH_TEMPORAL_FILTER_HIGH_STRENGTH),
++		.chan = chan,
++		.enable = enable,
++	};
++	return CISP_SEND_IN(isp, args);
++}
++
++int isp_cmd_apple_ch_tnr_band0_mod_set(struct apple_isp *isp, u32 chan,
++				       u32 enable)
++{
++	struct cmd_apple_ch_temporal_filter_enable_set args = {
++		.opcode = CISP_OPCODE(CISP_CMD_APPLE_CH_TEMPORAL_FILTER_BAND0_MODULATION),
++		.chan = chan,
++		.enable = enable,
++	};
++	return CISP_SEND_IN(isp, args);
++}
++
++int isp_cmd_apple_ch_tnr_band0_threshold_set(struct apple_isp *isp, u32 chan,
++					     u32 first, u32 second)
++{
++	struct cmd_apple_ch_temporal_filter_band0_threshold args = {
++		.opcode = CISP_OPCODE(CISP_CMD_APPLE_CH_TEMPORAL_FILTER_BAND0_THRESHOLD),
++		.chan = chan,
++		.threshold = { first, second },
++	};
++	return CISP_SEND_IN(isp, args);
++}
++
+ int isp_cmd_ch_ae_stability_set(struct apple_isp *isp, u32 chan, u32 stability)
+ {
+ 	struct cmd_ch_ae_stability_set args = {
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.h b/drivers/media/platform/apple/isp/isp-cmd.h
+index a3167108b1..9e2678bd16 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.h
++++ b/drivers/media/platform/apple/isp/isp-cmd.h
+@@ -97,6 +97,9 @@
+ #define CISP_CMD_APPLE_CH_MOTION_HISTORY_STOP		     0xc103
+ #define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_ENABLE	     0xc113
+ #define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_DISABLE	     0xc114
++#define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_BAND0_MODULATION   0xc11c
++#define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_BAND0_THRESHOLD    0xc11d
++#define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_HIGH_STRENGTH	     0xc120
+ 
+ #define CISP_POOL_TYPE_META				     0x0
+ #define CISP_POOL_TYPE_RENDERED				     0x1
+@@ -643,6 +646,32 @@ struct cmd_apple_ch_temporal_filter_start {
+ } __packed;
+ static_assert(sizeof(struct cmd_apple_ch_temporal_filter_start) == 0x14);
+ 
++/* The H17 firmware's start record carries one more word, sent as zero. */
++struct cmd_apple_ch_temporal_filter_start_h17 {
++	u64 opcode;
++	u32 chan;
++	u32 unk_c;
++	u32 unk_10;
++	u32 unk_14;
++} __packed;
++static_assert(sizeof(struct cmd_apple_ch_temporal_filter_start_h17) == 0x18);
++
++/* High-strength filtering (0xc120) and band 0 modulation (0xc11c) */
++struct cmd_apple_ch_temporal_filter_enable_set {
++	u64 opcode;
++	u32 chan;
++	u32 enable;
++} __packed;
++static_assert(sizeof(struct cmd_apple_ch_temporal_filter_enable_set) == 0x10);
++
++/* Band 0 strength modulation thresholds, in 1/256 steps */
++struct cmd_apple_ch_temporal_filter_band0_threshold {
++	u64 opcode;
++	u32 chan;
++	u32 threshold[2];
++} __packed;
++static_assert(sizeof(struct cmd_apple_ch_temporal_filter_band0_threshold) == 0x14);
++
+ struct cmd_apple_ch_temporal_filter_stop {
+ 	u64 opcode;
+ 	u32 chan;
+@@ -679,6 +708,13 @@ int isp_cmd_apple_ch_motion_history_start(struct apple_isp *isp, u32 chan);
+ int isp_cmd_apple_ch_motion_history_stop(struct apple_isp *isp, u32 chan);
+ int isp_cmd_apple_ch_temporal_filter_enable(struct apple_isp *isp, u32 chan);
+ int isp_cmd_apple_ch_temporal_filter_disable(struct apple_isp *isp, u32 chan);
++int isp_cmd_apple_ch_tnr_start_h17(struct apple_isp *isp, u32 chan);
++int isp_cmd_apple_ch_tnr_high_strength_set(struct apple_isp *isp, u32 chan,
++					   u32 enable);
++int isp_cmd_apple_ch_tnr_band0_mod_set(struct apple_isp *isp, u32 chan,
++				       u32 enable);
++int isp_cmd_apple_ch_tnr_band0_threshold_set(struct apple_isp *isp, u32 chan,
++					     u32 first, u32 second);
+ 
+ struct cmd_ch_ae_stability_set {
+ 	u64 opcode;

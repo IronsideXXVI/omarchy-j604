@@ -1,0 +1,313 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 06:57:35 -0600
+Subject: [PATCH] pmdomain: apple: pmp-report: close the races in the AGX vote
+ and stop it across unbind and sleep
+
+Review of the AGX vote found four problems.
+
+1. agx_vote=1 on the kernel command line runs the parameter setter from
+   parse_args(), before workqueue_init_early() has created the workqueues,
+   and the setter queued work on a NULL workqueue. kick() now returns while
+   system_dfl_wq does not exist; begin() and the work function read the
+   parameter themselves, so the first GPU operation votes. It also uses
+   system_dfl_wq instead of the deprecated system_wq.
+
+2. An operation that began while the clear was being written saw voted
+   still true and did not kick; after the clear nothing scheduled a set, so
+   the GPU ran at the idle floor until the next begin. agx_vote_next()
+   now reports a set that is owed (1 ms) when users > 0, the request is not
+   voted and no set has failed.
+
+3. release() did not stop a later begin() from setting the bit again, and
+   the report's removal had the same shape. A stopped flag, set under the
+   vote lock at release and at report removal, is checked by begin(),
+   decide() and next(); it is cleared by a new
+   apple_pmp_agx_activity_resume() called at GPU probe and at report probe.
+
+4. The request is withdrawn on PM_SUSPEND_PREPARE and PM_HIBERNATION_PREPARE
+   and decided again on PM_POST_SUSPEND and PM_POST_HIBERNATION: holding the
+   bit through s2idle may cost power (a held display request cost about
+   0.25 W on J514S), and the PMP may drop the word across sleep, which would
+   leave voted true with nothing on the wire.
+
+Each case has a test in tools/ptd-vote of the research repository that
+carries the policy header (cases 14 to 17 of the vote simulator, and a source
+check for the boot-time kick); they were written to fail first.
+
+Signed-off-by: Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
+(cherry picked from commit 6ece0825c8ebd47ac8762c02039e83e05d97d11b)
+---
+ drivers/gpu/drm/asahi/driver.rs       |  3 ++
+ drivers/pmdomain/apple/pmp-agx-vote.h | 33 ++++++++++--
+ drivers/pmdomain/apple/pmp-report.c   | 72 ++++++++++++++++++++++++++-
+ include/linux/soc/apple/pmp-report.h  |  5 ++
+ 4 files changed, 107 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/driver.rs b/drivers/gpu/drm/asahi/driver.rs
+index 7d6d5e2a6c..f22e1eff9c 100644
+--- a/drivers/gpu/drm/asahi/driver.rs
++++ b/drivers/gpu/drm/asahi/driver.rs
+@@ -254,6 +254,9 @@ impl platform::Driver for AsahiPlatformDriver {
+     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
+         debug::update_debug_flags();
+ 
++        // SAFETY: Takes no arguments, process context. Lets the T6001 AGX vote run again after an earlier unbind released it; a no-op everywhere else.
++        unsafe { bindings::apple_pmp_agx_activity_resume() };
++
+         dev_info!(pdev.as_ref(), "Probing...\n");
+ 
+         let cfg = match info.ok_or(ENODEV)? {
+diff --git a/drivers/pmdomain/apple/pmp-agx-vote.h b/drivers/pmdomain/apple/pmp-agx-vote.h
+index 715ab63e42..64d8f3f199 100644
+--- a/drivers/pmdomain/apple/pmp-agx-vote.h
++++ b/drivers/pmdomain/apple/pmp-agx-vote.h
+@@ -32,6 +32,7 @@ typedef int32_t agx_sms_t;
+ struct agx_vote {
+ 	bool enabled;		/* the module parameter */
+ 	bool voted;		/* bit 9 is set and was acknowledged */
++	bool stopped;		/* released (GPU unbind, report removal, sleep): no new vote until agx_vote_resume() */
+ 	unsigned int users;	/* GPU operations in flight */
+ 	agx_ms_t idle_ms;	/* keep the vote this long after the last operation ends */
+ 	agx_ms_t idle_at;	/* when users last fell to 0 */
+@@ -54,7 +55,7 @@ static inline bool agx_vote_reached(agx_ms_t now, agx_ms_t t)
+ static inline bool agx_vote_begin(struct agx_vote *v)
+ {
+ 	v->users++;
+-	return v->enabled && !v->voted;
++	return v->enabled && !v->voted && !v->stopped;
+ }
+ 
+ /* An operation ends. Returns the delay in ms after which the reconcile step must run, 0 when none is needed. */
+@@ -73,7 +74,7 @@ static inline agx_ms_t agx_vote_end(struct agx_vote *v, agx_ms_t now)
+ /* What the reconcile step must do now. */
+ static inline enum agx_vote_action agx_vote_decide(const struct agx_vote *v, agx_ms_t now)
+ {
+-	if (!v->enabled)
++	if (!v->enabled || v->stopped)
+ 		return v->voted ? AGX_VOTE_CLEAR : AGX_VOTE_NONE;
+ 	if (v->users)
+ 		return !v->voted && (!v->failures || agx_vote_reached(now, v->retry_at)) ? AGX_VOTE_SET : AGX_VOTE_NONE;
+@@ -82,13 +83,18 @@ static inline enum agx_vote_action agx_vote_decide(const struct agx_vote *v, agx
+ 	return AGX_VOTE_NONE;
+ }
+ 
+-/* Delay in ms until the reconcile step must run again, 0 when no timer is needed. */
++/*
++ * Delay in ms until the reconcile step must run again, 0 when no timer is needed. 1 when a set is owed right now: an operation began while a
++ * clear was being written (begin saw voted still true and did not kick), so after the clear nothing would schedule the set.
++ */
+ static inline agx_ms_t agx_vote_next(const struct agx_vote *v, agx_ms_t now)
+ {
+ 	agx_ms_t at;
+ 
+-	if (!v->enabled)
++	if (!v->enabled || v->stopped)
+ 		return 0;
++	if (v->users && !v->voted && !v->failures)
++		return 1;
+ 	if (v->users && !v->voted && v->failures)
+ 		at = v->retry_at;
+ 	else if (!v->users && v->voted)
+@@ -114,13 +120,30 @@ static inline void agx_vote_applied(struct agx_vote *v, enum agx_vote_action act
+ 	}
+ }
+ 
+-/* The GPU driver unbinds: drop the vote now. True when bit 9 is set and the caller must write the clear. */
++/*
++ * The GPU driver unbinds, the report goes away, or the system sleeps: drop the vote now and refuse new ones. True when bit 9 is set and the caller must
++ * write the clear. An operation that begins afterwards (an ioctl already past the unplug check) counts as a user but does not vote.
++ */
+ static inline bool agx_vote_release(struct agx_vote *v)
+ {
+ 	bool was_voted = v->voted;
+ 
+ 	v->voted = false;
++	v->stopped = true;
+ 	return was_voted;
+ }
+ 
++/* Refuse new votes without touching the one that is set (the first step of a release, before the work item is waited out). */
++static inline void agx_vote_refuse(struct agx_vote *v)
++{
++	v->stopped = true;
++}
++
++/* The GPU probes (or the report comes back, or the system resumes): votes are allowed again. True when work is already in flight and the caller must run the reconcile step. */
++static inline bool agx_vote_resume(struct agx_vote *v)
++{
++	v->stopped = false;
++	return v->enabled && v->users && !v->voted;
++}
++
+ #endif /* PMP_AGX_VOTE_H */
+diff --git a/drivers/pmdomain/apple/pmp-report.c b/drivers/pmdomain/apple/pmp-report.c
+index ef01d9a21a..8d9b825316 100644
+--- a/drivers/pmdomain/apple/pmp-report.c
++++ b/drivers/pmdomain/apple/pmp-report.c
+@@ -27,6 +27,7 @@
+ #include <linux/slab.h>
+ #include <linux/soc/apple/pmp-report.h>
+ #include <linux/string.h>
++#include <linux/suspend.h>
+ #include <linux/unaligned.h>
+ #include <linux/uuid.h>
+ #include <linux/workqueue.h>
+@@ -93,6 +94,7 @@ static DEFINE_MUTEX(apple_pmp_agx_vote_mutex);
+ static void apple_pmp_agx_vote_fn(struct work_struct *work);
+ static DECLARE_DELAYED_WORK(apple_pmp_agx_vote_work, apple_pmp_agx_vote_fn);
+ static void apple_pmp_agx_vote_stop(void);
++static void apple_pmp_agx_vote_stop_new(void);
+ 
+ /* Bound report regions, protected by RCU until managed teardown drains readers. */
+ static LIST_HEAD(apple_pmp_reports);
+@@ -182,6 +184,7 @@ static void apple_pmp_report_release(void *data)
+ 	/* Withdraw child providers while their power callbacks can still use MMIO. */
+ 	of_platform_depopulate(rep->dev);
+ 	if (rep->offsets == &apple_pmp_offsets_t600x) {
++		apple_pmp_agx_vote_stop_new();
+ 		cancel_delayed_work_sync(&apple_pmp_agx_vote_work);
+ 		guard(mutex)(&apple_pmp_agx_vote_mutex);
+ 		apple_pmp_agx_vote_stop();
+@@ -1156,6 +1159,10 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
+ 	list_add_tail_rcu(&rep->list, &apple_pmp_reports);
+ 	mutex_unlock(&apple_pmp_reports_lock);
+ 
++	/* A report that comes back (rebind) takes votes again; its removal refused them. */
++	if (rep->offsets == &apple_pmp_offsets_t600x)
++		apple_pmp_agx_activity_resume();
++
+ 	if (rep->offsets->fast_die || rep->start)
+ 		rep->debugfs = debugfs_create_file(dev_name(dev), 0400,
+ 						   apple_pmp_report_debugfs, rep,
+@@ -1346,9 +1353,18 @@ static agx_ms_t apple_pmp_agx_now_ms(void)
+ 	return jiffies_to_msecs(jiffies);
+ }
+ 
++/*
++ * Queue the reconcile step. agx_vote=1 on the kernel command line runs the parameter setter from parse_args(), before workqueue_init_early() has
++ * created system_dfl_wq; queueing on the NULL workqueue would oops in start_kernel(). Nothing is owed then: begin() and the work function read the
++ * parameter themselves, so the first GPU operation kicks.
++ */
+ static void apple_pmp_agx_vote_kick(unsigned long delay_ms)
+ {
+-	mod_delayed_work(system_wq, &apple_pmp_agx_vote_work, msecs_to_jiffies(delay_ms));
++	struct workqueue_struct *wq = READ_ONCE(system_dfl_wq);
++
++	if (!wq)
++		return;
++	mod_delayed_work(wq, &apple_pmp_agx_vote_work, msecs_to_jiffies(delay_ms));
+ }
+ 
+ static int apple_pmp_agx_vote_param_set(const char *val, const struct kernel_param *kp)
+@@ -1391,6 +1407,16 @@ static int apple_pmp_agx_write(bool enable, bool no_ack)
+ 	return ret;
+ }
+ 
++/* Refuse new votes (the stopped flag), without writing anything. */
++static void apple_pmp_agx_vote_stop_new(void)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&apple_pmp_agx_vote_lock, flags);
++	agx_vote_refuse(&apple_pmp_agx_vote_state);
++	spin_unlock_irqrestore(&apple_pmp_agx_vote_lock, flags);
++}
++
+ /* Clear a request that is still set. Caller holds apple_pmp_agx_vote_mutex. */
+ static void apple_pmp_agx_vote_stop(void)
+ {
+@@ -1480,12 +1506,54 @@ EXPORT_SYMBOL_GPL(apple_pmp_agx_activity_end);
+  */
+ void apple_pmp_agx_activity_release(void)
+ {
++	/* Stop first so that a begin() from now on cannot queue a set, then wait out a work item that already decided, then clear what it set. */
++	apple_pmp_agx_vote_stop_new();
+ 	cancel_delayed_work_sync(&apple_pmp_agx_vote_work);
+ 	guard(mutex)(&apple_pmp_agx_vote_mutex);
+ 	apple_pmp_agx_vote_stop();
+ }
+ EXPORT_SYMBOL_GPL(apple_pmp_agx_activity_release);
+ 
++/* The GPU probes again, the report comes back or the system resumes: allow votes, and vote now if operations are already in flight. Process context. */
++void apple_pmp_agx_activity_resume(void)
++{
++	struct agx_vote *v = &apple_pmp_agx_vote_state;
++	unsigned long flags;
++	bool kick;
++
++	spin_lock_irqsave(&apple_pmp_agx_vote_lock, flags);
++	v->enabled = READ_ONCE(agx_vote);
++	kick = agx_vote_resume(v);
++	spin_unlock_irqrestore(&apple_pmp_agx_vote_lock, flags);
++	if (kick)
++		apple_pmp_agx_vote_kick(0);
++}
++EXPORT_SYMBOL_GPL(apple_pmp_agx_activity_resume);
++
++/*
++ * System sleep: withdraw the request before the devices suspend and decide again after resume. Whether bit 9 held through s2idle costs power is not
++ * measured (a held display request cost about 0.25 W on J514S), and the PMP may drop the word across sleep, which would leave voted true with nothing
++ * on the wire. Clearing and re-voting covers both.
++ */
++static int apple_pmp_agx_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
++{
++	switch (action) {
++	case PM_SUSPEND_PREPARE:
++	case PM_HIBERNATION_PREPARE:
++		apple_pmp_agx_activity_release();
++		break;
++	case PM_POST_SUSPEND:
++	case PM_POST_HIBERNATION:
++		apple_pmp_agx_activity_resume();
++		break;
++	}
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block apple_pmp_agx_pm_nb = {
++	.notifier_call = apple_pmp_agx_pm_notify,
++};
++
+ /* Find and check the report before taking the GPU vote; optionally update it. */
+ static int apple_pmp_report_t6030_gfx(struct device *supplier, const bool *enable)
+ {
+@@ -1855,6 +1923,7 @@ MODULE_DEVICE_TABLE(of, apple_pmp_report_entry_of_match);
+ 
+ static int __init apple_pmp_report_init(void)
+ {
++	register_pm_notifier(&apple_pmp_agx_pm_nb);
+ 	apple_pmp_report_debugfs = debugfs_create_dir("apple-pmp-report", NULL);
+ 	platform_driver_register(&apple_pmp_report_entry_driver);
+ 	platform_driver_register(&apple_pmp_report_driver);
+@@ -1863,6 +1932,7 @@ static int __init apple_pmp_report_init(void)
+ 
+ static void __exit apple_pmp_report_exit(void)
+ {
++	unregister_pm_notifier(&apple_pmp_agx_pm_nb);
+ 	debugfs_remove_recursive(apple_pmp_report_debugfs);
+ 	platform_driver_unregister(&apple_pmp_report_entry_driver);
+ 	platform_driver_unregister(&apple_pmp_report_driver);
+diff --git a/include/linux/soc/apple/pmp-report.h b/include/linux/soc/apple/pmp-report.h
+index 345848c91d..25049fcd73 100644
+--- a/include/linux/soc/apple/pmp-report.h
++++ b/include/linux/soc/apple/pmp-report.h
+@@ -35,6 +35,7 @@ int apple_pmp_report_set_request(const struct device_node *report_np, unsigned i
+ void apple_pmp_agx_activity_begin(void);
+ void apple_pmp_agx_activity_end(void);
+ void apple_pmp_agx_activity_release(void);
++void apple_pmp_agx_activity_resume(void);
+ #else
+ static inline void apple_pmp_agx_activity_begin(void)
+ {
+@@ -44,6 +45,10 @@ static inline void apple_pmp_agx_activity_end(void)
+ {
+ }
+ 
++static inline void apple_pmp_agx_activity_resume(void)
++{
++}
++
+ static inline void apple_pmp_agx_activity_release(void)
+ {
+ }

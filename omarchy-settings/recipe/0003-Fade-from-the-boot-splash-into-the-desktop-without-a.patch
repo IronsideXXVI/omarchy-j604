@@ -1,0 +1,332 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emir Beganovic <beganovic.emir@gmail.com>
+Date: Thu, 29 Oct 2026 06:20:02 +0100
+Subject: [PATCH 1/2] Fade from the boot splash into the desktop without a
+ black screen
+
+After the disk is unlocked, Plymouth quits before sddm starts and the
+screen stays pure black until the shell reveals the desktop: 4.50, 4.25
+and 4.25 s on three reboots of quattro in QEMU, sampled every 250 ms.
+Three things paint it black: plymouth-quit.service tears the splash
+down first, Hyprland's background_color is black, and the shell's login
+cover is a black rectangle.
+
+sddm has no Plymouth handover of its own, so a drop-in gives it gdm's:
+plymouth-quit.service is conflicted out and Plymouth is deactivated
+instead, keeping its last frame on screen until Hyprland has committed
+a buffer of its own to every output it enables at startup. Hyprland
+then emits hyprland.start as it begins rendering (src/render/Renderer.cpp),
+and the handler, the session's in autostart.lua or the greeter's in
+default/sddm/hyprland.lua, starts omarchy-plymouth-quit.service, which
+quits Plymouth with --retain-splash, through a sudoers grant for that
+one command. sudo -n never prompts, so a machine without the grant
+falls back to the timer, which quits Plymouth 60 s after sddm starts if
+neither Hyprland does. A failed sddm still runs the plain quit through
+OnFailure.
+
+Plymouth has to go as soon as Hyprland has the display, not after the
+shell: multi-user.target waits for plymouth-quit-wait.service and
+power-profiles-daemon is ordered after multi-user.target, so a shell
+that asked for power profiles before Plymouth quit sat out the 25 s
+D-Bus timeout. Released from hyprland.start, Plymouth is gone 0.4 s
+after Hyprland starts and before the shell launches.
+
+The colours come from the splash itself. Hyprland, the greeter and the
+login cover read the background Plymouth paints from the installed
+omarchy.script and truncate it to 8 bits as Plymouth does: Plymouth
+paints the stock 0.101, 0.105, 0.149 as #191a25, not #1a1b26. The
+splash's logo stays with Plymouth; Hyprland draws frames of its own
+before the cover maps, and a logo on the cover blinked out and back.
+
+On the same three reboots with this change, the screen goes from the
+splash to its own colour to the desktop, with one 250 ms sample of
+black where Hyprland commits its first, still unrendered buffer
+(src/output/Monitor.cpp, ensureBufferPresent). Unlock to wallpaper is
+unchanged: 8.41, 8.44 and 8.38 s against 9.12, 8.37 and 8.39 s. A boot
+with autologin off reaches the greeter the same way, its Hyprland
+quitting Plymouth 0.6 s after it starts.
+
+[J604: onto the 4.5.0 stable source ac2690cd. Conflict in
+ shell/services/BackgroundIntro.qml resolved by keeping the stable side and
+ adding only this commit's splashDir/splashBackground block; the other lines
+ in that hunk (themeFinishing .. coverPresented) come from later quattro work
+ that 4.5 does not carry. All other hunks applied as they are.]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ default/hypr/autostart.lua                    |  6 ++++
+ default/hypr/looknfeel.lua                    | 26 ++++++++++++++-
+ default/sddm/hyprland.lua                     | 33 ++++++++++++++++++-
+ etc/sudoers.d/omarchy-plymouth-quit           |  2 ++
+ .../system/omarchy-plymouth-quit.service      |  9 +++++
+ .../system/omarchy-plymouth-quit.timer        |  7 ++++
+ .../10-omarchy-plymouth-handoff.conf          | 16 +++++++++
+ shell/services/BackgroundIntro.qml            | 24 +++++++++++++-
+ test/shell.d/background-startup-test.sh       |  6 +++-
+ .../fixtures/background-startup/shell.qml     |  3 +-
+ 10 files changed, 127 insertions(+), 5 deletions(-)
+ create mode 100644 etc/sudoers.d/omarchy-plymouth-quit
+ create mode 100644 etc/systemd/system/omarchy-plymouth-quit.service
+ create mode 100644 etc/systemd/system/omarchy-plymouth-quit.timer
+ create mode 100644 etc/systemd/system/sddm.service.d/10-omarchy-plymouth-handoff.conf
+
+diff --git a/default/hypr/autostart.lua b/default/hypr/autostart.lua
+index d1529d712..f575a6674 100644
+--- a/default/hypr/autostart.lua
++++ b/default/hypr/autostart.lua
+@@ -1,6 +1,12 @@
+ require("default.hypr.startup-cursor")
+ 
+ hl.on("hyprland.start", function()
++  -- sddm only deactivated Plymouth, which kept its frame on screen until
++  -- Hyprland committed a buffer of its own to every output it enabled at
++  -- startup. This event comes as Hyprland starts rendering, after those
++  -- commits, so Plymouth can quit. See etc/systemd/system/sddm.service.d/.
++  hl.exec_cmd("sudo -n /usr/bin/systemctl start --no-block omarchy-plymouth-quit.service")
++
+   -- Applications inherit the user's cursor; only the compositor starts blank.
+   if omarchy_startup_cursor_pending then
+     hl.env("XCURSOR_PATH", omarchy_startup_cursor.path)
+diff --git a/default/hypr/looknfeel.lua b/default/hypr/looknfeel.lua
+index a562c6be4..9fcdfedb1 100644
+--- a/default/hypr/looknfeel.lua
++++ b/default/hypr/looknfeel.lua
+@@ -1,5 +1,29 @@
+ -- Refer to https://wiki.hypr.land/Configuring/Basics/Variables/
+ 
++-- The boot splash's background, so the desktop starts on the colour the splash
++-- leaves on screen instead of cutting to black. omarchy-plymouth-set writes it
++-- into the installed Plymouth script; keep in sync with default/sddm/hyprland.lua.
++local function splash_background()
++  local file = io.open("/usr/share/plymouth/themes/omarchy/omarchy.script", "r")
++  if not file then
++    return "rgb(000000)"
++  end
++
++  local script = file:read("a")
++  file:close()
++  local r, g, b = script:match("Window%.SetBackgroundTopColor%(%s*([%d.]+)%s*,%s*([%d.]+)%s*,%s*([%d.]+)%s*%)")
++  r, g, b = tonumber(r), tonumber(g), tonumber(b)
++  if not (r and g and b) then
++    return "rgb(000000)"
++  end
++
++  -- Truncated as Plymouth converts it, so the two match to the last bit.
++  local function byte(value)
++    return math.floor(math.min(math.max(value, 0), 1) * 255)
++  end
++  return string.format("rgb(%02x%02x%02x)", byte(r), byte(g), byte(b))
++end
++
+ local active_border_color = { colors = { "rgba(33ccffee)", "rgba(00ff99ee)" }, angle = 45 }
+ local inactive_border_color = "rgba(595959aa)"
+ 
+@@ -106,7 +130,7 @@ hl.config({
+   misc = {
+     disable_hyprland_logo = true,
+     disable_splash_rendering = true,
+-    background_color = "rgb(000000)",
++    background_color = splash_background(),
+     disable_scale_notification = true,
+     focus_on_activate = true,
+     anr_missed_pings = 3,
+diff --git a/default/sddm/hyprland.lua b/default/sddm/hyprland.lua
+index 5f31ecbd1..2c76e0ed5 100644
+--- a/default/sddm/hyprland.lua
++++ b/default/sddm/hyprland.lua
+@@ -67,6 +67,37 @@ if non_latin_layouts:find(" " .. kb_layout:match("^[^,]*") .. " ", 1, true) then
+   kb_options = "grp:alts_toggle"
+ end
+ 
++-- The boot splash's background, so the greeter starts on the colour the splash
++-- leaves on screen instead of cutting to black. Duplicated from
++-- default/hypr/looknfeel.lua for the same reason as read_vconsole(); keep the
++-- two in sync.
++local function splash_background()
++  local file = io.open("/usr/share/plymouth/themes/omarchy/omarchy.script", "r")
++  if not file then
++    return "rgb(000000)"
++  end
++
++  local script = file:read("a")
++  file:close()
++  local r, g, b = script:match("Window%.SetBackgroundTopColor%(%s*([%d.]+)%s*,%s*([%d.]+)%s*,%s*([%d.]+)%s*%)")
++  r, g, b = tonumber(r), tonumber(g), tonumber(b)
++  if not (r and g and b) then
++    return "rgb(000000)"
++  end
++
++  -- Truncated as Plymouth converts it, so the two match to the last bit.
++  local function byte(value)
++    return math.floor(math.min(math.max(value, 0), 1) * 255)
++  end
++  return string.format("rgb(%02x%02x%02x)", byte(r), byte(g), byte(b))
++end
++
++-- sddm only deactivated Plymouth; see default/hypr/autostart.lua. A boot that
++-- shows this greeter quits it here, as a session's Hyprland does.
++hl.on("hyprland.start", function()
++  hl.exec_cmd("sudo -n /usr/bin/systemctl start --no-block omarchy-plymouth-quit.service")
++end)
++
+ hl.config({
+   input = {
+     kb_layout = kb_layout,
+@@ -77,7 +108,7 @@ hl.config({
+   misc = {
+     disable_hyprland_logo = true,
+     disable_splash_rendering = true,
+-    background_color = "rgb(000000)",
++    background_color = splash_background(),
+     force_default_wallpaper = 0,
+   },
+ 
+diff --git a/etc/sudoers.d/omarchy-plymouth-quit b/etc/sudoers.d/omarchy-plymouth-quit
+new file mode 100644
+index 000000000..a45721663
+--- /dev/null
++++ b/etc/sudoers.d/omarchy-plymouth-quit
+@@ -0,0 +1,2 @@
++%wheel ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block omarchy-plymouth-quit.service
++sddm ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block omarchy-plymouth-quit.service
+diff --git a/etc/systemd/system/omarchy-plymouth-quit.service b/etc/systemd/system/omarchy-plymouth-quit.service
+new file mode 100644
+index 000000000..ecb9b7556
+--- /dev/null
++++ b/etc/systemd/system/omarchy-plymouth-quit.service
+@@ -0,0 +1,9 @@
++[Unit]
++Description=Hand the screen from the boot splash to the desktop
++ConditionPathExists=/run/plymouth/pid
++
++[Service]
++Type=oneshot
++# The desktop is on screen by now, so keep the splash's frame rather than
++# repaint the console under it.
++ExecStart=/usr/bin/plymouth quit --retain-splash
+diff --git a/etc/systemd/system/omarchy-plymouth-quit.timer b/etc/systemd/system/omarchy-plymouth-quit.timer
+new file mode 100644
+index 000000000..96aeb6e31
+--- /dev/null
++++ b/etc/systemd/system/omarchy-plymouth-quit.timer
+@@ -0,0 +1,7 @@
++[Unit]
++Description=Quit the boot splash if the desktop never takes it over
++
++[Timer]
++OnActiveSec=60s
++AccuracySec=1s
++Unit=omarchy-plymouth-quit.service
+diff --git a/etc/systemd/system/sddm.service.d/10-omarchy-plymouth-handoff.conf b/etc/systemd/system/sddm.service.d/10-omarchy-plymouth-handoff.conf
+new file mode 100644
+index 000000000..0037de1bb
+--- /dev/null
++++ b/etc/systemd/system/sddm.service.d/10-omarchy-plymouth-handoff.conf
+@@ -0,0 +1,16 @@
++# sddm has no Plymouth handover of its own: plymouth-quit.service runs first
++# and the screen goes black until the desktop draws, for seconds. Take that job
++# over as gdm.service does. Plymouth is deactivated instead: it keeps its last
++# frame on screen and gives up the display, so the compositor's first frame
++# replaces the splash directly. Hyprland, the session's or the greeter's,
++# quits Plymouth as it starts rendering (omarchy-plymouth-quit.service); the
++# timer quits it if neither ever does, and a failed sddm still runs the plain
++# quit.
++[Unit]
++After=plymouth-start.service
++Conflicts=plymouth-quit.service
++OnFailure=plymouth-quit.service
++Wants=omarchy-plymouth-quit.timer
++
++[Service]
++ExecStartPre=-/usr/bin/plymouth deactivate
+diff --git a/shell/services/BackgroundIntro.qml b/shell/services/BackgroundIntro.qml
+index 673aefad2..38b517488 100644
+--- a/shell/services/BackgroundIntro.qml
++++ b/shell/services/BackgroundIntro.qml
+@@ -26,6 +26,20 @@ Item {
+   property string themeColors: ""
+   property string themeShell: ""
+   property real themeOpacity: 1
++  // The boot splash's background, as omarchy-plymouth-set installed it. The
++  // login cover is that colour, as Hyprland's own background is, so the screen
++  // holds the splash's colour from Plymouth until the desktop fades in. The
++  // splash's logo stays with Plymouth: Hyprland draws frames of its own before
++  // this cover maps, and a logo here would blink out and back.
++  property string splashDir: "/usr/share/plymouth/themes/omarchy"
++  readonly property color splashBackground: {
++    var match = String(splashScript.text() || "").match(/Window\.SetBackgroundTopColor\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*\)/)
++    var channels = match ? match.slice(1).map(Number) : []
++    if (channels.length !== 3 || !channels.every(isFinite)) return "black"
++    // Truncated to 8 bits as Plymouth converts it, so the two match exactly.
++    var byte = function(value) { return Math.floor(Math.min(Math.max(value, 0), 1) * 255) / 255 }
++    return Qt.rgba(byte(channels[0]), byte(channels[1]), byte(channels[2]), 1)
++  }
+   readonly property var backgroundService: host && host.services ? host.firstPartyServiceFor("omarchy.background") : null
+   readonly property bool backgroundActive: !!backgroundService && !backgroundService.suspended
+   readonly property bool backgroundReady: backgroundActive && backgroundService.ready !== false
+@@ -196,6 +210,14 @@ Item {
+     }
+   }
+ 
++  FileView {
++    id: splashScript
++    path: root.startupPending ? root.splashDir + "/omarchy.script" : ""
++    blockLoading: true
++    watchChanges: false
++    printErrors: false
++  }
++
+   // A shell restart shares this compositor session; a new login does not.
+   FileView {
+     id: sessionMarker
+@@ -255,7 +277,7 @@ Item {
+ 
+       Rectangle {
+         anchors.fill: parent
+-        color: "black"
++        color: root.splashBackground
+         opacity: root.startupOpacity
+       }
+ 
+diff --git a/test/shell.d/background-startup-test.sh b/test/shell.d/background-startup-test.sh
+index 624e80a64..6f6fb6cfb 100644
+--- a/test/shell.d/background-startup-test.sh
++++ b/test/shell.d/background-startup-test.sh
+@@ -28,11 +28,15 @@ else
+ fi
+ SH
+ chmod +x "$stage/bin/hyprctl"
++# The boot splash as omarchy-plymouth-set installs it.
++mkdir -p "$stage/splash"
++printf 'Window.SetBackgroundTopColor(0.101, 0.105, 0.149);\n' >"$stage/splash/omarchy.script"
+ : >"$stage/cursor.log"
+-output=$(HOME="$stage/home" PATH="$stage/bin:$PATH" STARTUP_CURSOR_LOG="$stage/cursor.log" timeout 6 quickshell -p "$stage" --no-color 2>&1) || fail "background startup fixture exits cleanly" "$output"
++output=$(HOME="$stage/home" PATH="$stage/bin:$PATH" STARTUP_CURSOR_LOG="$stage/cursor.log" SPLASH_DIR="$stage/splash" timeout 6 quickshell -p "$stage" --no-color 2>&1) || fail "background startup fixture exits cleanly" "$output"
+ [[ $output == *"RESULT pass"* ]] || fail "the wallpaper restores before background plugin loading" "$output"
+ if rg -q 'RESULT fail|ReferenceError|TypeError|Error:|Unable to assign|Binding loop' <<<"$output"; then
+   fail "background startup fixture has no QML errors" "$output"
+ fi
+ pass "fresh startup hides the desktop until both the background and bar are ready"
+ pass "the startup cursor stays hidden until the desktop begins fading in"
++pass "a new login starts on the boot splash's background"
+diff --git a/test/shell.d/fixtures/background-startup/shell.qml b/test/shell.d/fixtures/background-startup/shell.qml
+index c53545846..4b84b3e87 100644
+--- a/test/shell.d/fixtures/background-startup/shell.qml
++++ b/test/shell.d/fixtures/background-startup/shell.qml
+@@ -29,7 +29,7 @@ ShellRoot {
+     property bool suspended: false
+     property bool ready: false
+   }
+-  BackgroundIntro { id: intro; host: test }
++  BackgroundIntro { id: intro; host: test; splashDir: Quickshell.env("SPLASH_DIR") }
+   FileView { id: cursorLog; path: Quickshell.env("STARTUP_CURSOR_LOG"); printErrors: false }
+ 
+   Timer {
+@@ -40,6 +40,7 @@ ShellRoot {
+       test.check(intro.cover && !intro.themeBackground, "fresh startup does not prepare an outgoing still image")
+       test.check(intro.startupSettled, "the launcher has finished without an intro")
+       test.check(intro.startupPending && intro.startupOpacity === 1, "a fresh login hides the desktop until its media and bar are ready")
++      test.check(Qt.colorEqual(intro.splashBackground, "#191a25"), "the login cover takes the boot splash's background, truncated as Plymouth paints it")
+       cursorLog.reload()
+       cursorLog.waitForJob()
+       test.check(!cursorLog.text().trim(), "startup does not restore the cursor while media is loading")

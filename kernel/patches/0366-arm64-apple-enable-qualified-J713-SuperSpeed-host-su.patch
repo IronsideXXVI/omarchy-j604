@@ -1,0 +1,1647 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eryk Wieliczko <eryk@wieliczko.ninja>
+Date: Wed, 21 Oct 2026 14:19:15 +0200
+Subject: [PATCH] arm64: apple: enable qualified J713 SuperSpeed host support
+
+Add banked T8132 ATC calibration and the shared USB host startup needed
+for the admitted J713 ATC1 port. Check inherited common-domain state
+before taking ownership and preserve unsupported port profiles as USB2.
+Keep display crossbar registers outside the mapped resources and support
+the USB side of multifunction adapters without enabling DP output.
+
+Publish the initial DWC3 host role before core initialization, propagate
+PHY admission failures, and validate the Type-C SPMI response bounds.
+Refuse suspend while a T8132 common epoch remains owned or incomplete.
+Cover calibration bounds/order, failure unwind, inherited PMGR policy,
+initial host-role ordering and transport lengths with host selftests.
+
+The integrated driver has repeatedly enumerated a 5 Gbit/s SanDisk drive
+through a multifunction adapter and completed matching read-only direct
+512 MiB reads. Qualification is limited to ATC1; ATC0 stays USB2. Suspend,
+10 Gbit/s operation and external display output remain unqualified.
+
+Signed-off-by: Eryk Wieliczko <eryk@wieliczko.ninja>
+Assisted-by: Codex:GPT-6
+(backported from commit 3949e3640d94d2b5434c84e9e1f6d7b81f650b70)
+[j604: on j604/usb-idle-pm (omacom linux-aurora 1.607 + the T8132 idle
+ runtime PM picks). Dropped: the PMGR apple,inherited-on contract
+ (pmgr-pwrstate.c, its binding text and pmgr-inherited.py; the J604 keeps
+ the ATCn_USB_AON parents on with apple,always-on, and ATCn_COMMON is
+ managed, so nothing here needs it), the J713 board and policy hunks
+ (t8132-j713*.dts*: this tree carries no J713 PMGR policy), and the
+ original-loader adapter and m4-pmgr-policy harness hunks (files not in
+ this tree). atc.c resolved to the Aurora integration form: the T8103
+ dummy-pending check stays ahead of the T8132 dispatch, the legacy live
+ PIPE lock retry stays next to the T8132 lock timeout, the USB3 phy ops
+ get .exit next to the runtime PM wrappers, and atcphy_rpm_busy() gets
+ back the common-power epoch term (and its KUnit case) that the
+ 1c79b03209 backport had to leave out. Host selftests:
+ sn201202x-transport.py is taken in its Aurora integration form
+ (f738b993b7, 8e656b0b69), which matches this tree's SN201202x driver;
+ atc-t8132-usb3.py and dwc3-initial-role.py are not taken, as their
+ source models no longer build against the later ATC and DWC3 code,
+ in the Aurora integration tree as well (the KUnit suites cover
+ these paths).]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ .../devicetree/bindings/phy/apple,atcphy.yaml | 118 +++-
+ MAINTAINERS                                   |   1 +
+ drivers/phy/apple/atc-test.c                  |   4 +
+ drivers/phy/apple/atc.c                       | 558 ++++++++++++++++--
+ drivers/usb/dwc3/core.c                       |  38 ++
+ drivers/usb/dwc3/dwc3-apple.c                 |  82 ++-
+ drivers/usb/dwc3/glue.h                       |   3 +
+ drivers/usb/typec/tipd/spmi.c                 |  18 +-
+ .../testing/selftests/drivers/apple/Makefile  |   5 +-
+ .../drivers/apple/sn201202x-transport.py      | 184 ++++++
+ 10 files changed, 941 insertions(+), 70 deletions(-)
+ create mode 100755 tools/testing/selftests/drivers/apple/sn201202x-transport.py
+
+diff --git a/Documentation/devicetree/bindings/phy/apple,atcphy.yaml b/Documentation/devicetree/bindings/phy/apple,atcphy.yaml
+index dba9944f34..f9b8f79820 100644
+--- a/Documentation/devicetree/bindings/phy/apple,atcphy.yaml
++++ b/Documentation/devicetree/bindings/phy/apple,atcphy.yaml
+@@ -30,8 +30,11 @@ description: >
+   second eUSB2 PHY register bank whose per-device defaults are also provided by
+   the bootloader.
+ 
+-  The T8132 variant provides only USB2 and its pipehandler, without the
+-  SuperSpeed core or its associated register banks and tunables.
++  The T8132 variant supports an initial USB2-only description containing the
++  USB2 PHY and pipehandler banks. Its SuperSpeed host profile adds separately
++  owned core, AXI, LIOA, fabric and common-configuration banks. The intervening
++  display crossbar is not part of the PHY resource. SuperSpeed calibration is
++  supplied in banked lists so that no list spans that crossbar.
+ 
+ allOf:
+   - $ref: /schemas/usb/usb-switch.yaml#
+@@ -41,15 +44,36 @@ allOf:
+           contains:
+             const: apple,t8132-atcphy
+     then:
+-      properties:
+-        reg:
+-          items:
+-            - description: USB2 PHY specific controls
+-            - description: USB3 PIPE interface controls
+-        reg-names:
+-          items:
+-            - const: usb2phy
+-            - const: pipehandler
++      oneOf:
++        - properties:
++            reg:
++              minItems: 2
++              maxItems: 2
++            reg-names:
++              items:
++                - const: usb2phy
++                - const: pipehandler
++        - properties:
++            reg:
++              items:
++                - description: USB2 PHY specific controls
++                - description: USB3 PIPE interface controls
++                - description: SuperSpeed PHY core, excluding the display crossbar
++                - description: AXI to Apple Fabric interface controls
++                - description: Local IO address translation controls
++                - description: ATC fabric controls
++                - description: ATC common configuration controls
++            reg-names:
++              items:
++                - const: usb2phy
++                - const: pipehandler
++                - const: core
++                - const: axi2af
++                - const: lioa
++                - const: fabric
++                - const: common-config
++          required:
++            - power-domains
+     else:
+       properties:
+         reg:
+@@ -85,16 +109,41 @@ allOf:
+           minItems: 6
+     else:
+       properties:
+-        reg:
+-          maxItems: 5
+-        reg-names:
+-          maxItems: 5
+         apple,tunable-usb2phy-reg-dflt: false
+         apple,tunable-dp-common-pre: false
+         apple,tunable-dp-lpdptx: false
+         apple,tunable-dp-common-post: false
+       patternProperties:
+         "^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$": false
++  - if:
++      properties:
++        compatible:
++          not:
++            contains:
++              enum:
++                - apple,t8132-atcphy
++                - apple,t8140-atcphy
++    then:
++      properties:
++        reg:
++          maxItems: 5
++        reg-names:
++          maxItems: 5
++  - if:
++      properties:
++        compatible:
++          not:
++            contains:
++              const: apple,t8132-atcphy
++    then:
++      properties:
++        apple,tunable-usb3-axi2af: false
++        apple,tunable-usb3-lioa: false
++        apple,tunable-usb3-fabric: false
++        apple,tunable-usb3-config: false
++        apple,tunable-usb3-common: false
++        apple,tunable-usb3-efuse: false
++        apple,tunable-usb3-dp: false
+ 
+ $defs:
+   apple,tunable:
+@@ -128,11 +177,11 @@ properties:
+ 
+   reg:
+     minItems: 2
+-    maxItems: 6
++    maxItems: 7
+ 
+   reg-names:
+     minItems: 2
+-    maxItems: 6
++    maxItems: 7
+ 
+   "#phy-cells":
+     const: 1
+@@ -165,6 +214,41 @@ properties:
+         $ref: /schemas/graph.yaml#/properties/port
+         description: Incoming endpoint from the USB4/Thunderbolt controller.
+ 
++  apple,tunable-usb3-axi2af:
++    $ref: "#/$defs/apple,tunable"
++    description: T8132 AXI setup followed by write-disable and lock operations.
++
++  apple,tunable-usb3-lioa:
++    $ref: "#/$defs/apple,tunable"
++    description: T8132 LIOA setup, applied after the AXI list.
++
++  apple,tunable-usb3-fabric:
++    $ref: "#/$defs/apple,tunable"
++    description: T8132 fabric setup, applied after the LIOA list.
++
++  apple,tunable-usb3-config:
++    $ref: "#/$defs/apple,tunable"
++    description: T8132 common-configuration setup, applied after fabric setup.
++
++  apple,tunable-usb3-common:
++    $ref: "#/$defs/apple,tunable"
++    description: T8132 core PLL and common setup, before the selected USB lane.
++
++  apple,tunable-usb3-dp:
++    $ref: "#/$defs/apple,tunable"
++    description: >
++      T8132 AUX_TOP calibration within the core bank, applied after the
++      common list has supplied AUSCMN_DIG and AUSPLL_CORE. This handoff
++      applies to ADTs without AUX_SHM and is optional for USB3-only mode.
++      This list does not initialize the display crossbar or DisplayPort
++      transmitter and does not authorize taking over an active PHY epoch.
++
++  apple,tunable-usb3-efuse:
++    $ref: "#/$defs/apple,tunable"
++    description: >
++      T8132 ADT-provided efuse-derived core values, applied after lane routing
++      and before the PHY reset is released. No raw fuse register is read.
++
+   apple,tunable-common-a:
+     $ref: "#/$defs/apple,tunable"
+     description: >
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 9c405ae09b..bc714112eb 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2749,6 +2749,7 @@ F:	include/uapi/drm/asahi_drm.h
+ F:	include/uapi/linux/apple-sep.h
+ F:	net/bluetooth/brcm.c
+ F:	net/bluetooth/brcm.h
++F:	tools/testing/selftests/drivers/apple/
+ 
+ ARM/APPLE QSPIMC DRIVER
+ M:	Ryan Murray <ryan@aurorasilicon.org>
+diff --git a/drivers/phy/apple/atc-test.c b/drivers/phy/apple/atc-test.c
+index f9265c0f9a..e569cb4af4 100644
+--- a/drivers/phy/apple/atc-test.c
++++ b/drivers/phy/apple/atc-test.c
+@@ -1060,6 +1060,10 @@ static void atcphy_test_t8132_rpm_busy(struct kunit *test)
+ 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_USB3;
+ 	KUNIT_EXPECT_TRUE(test, atcphy_rpm_busy(atcphy));
+ 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
++
++	/* A failed USB3 admission keeps its common-power epoch */
++	atcphy->t8132_common_owned = true;
++	KUNIT_EXPECT_TRUE(test, atcphy_rpm_busy(atcphy));
+ }
+ 
+ /* The hold follows the busy state, with one reference at most. */
+diff --git a/drivers/phy/apple/atc.c b/drivers/phy/apple/atc.c
+index ce5b613d20..47e749ce29 100644
+--- a/drivers/phy/apple/atc.c
++++ b/drivers/phy/apple/atc.c
+@@ -28,6 +28,7 @@
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/of_device.h>
+ #include <linux/of_graph.h>
+ #include <linux/of_platform.h>
+@@ -158,6 +159,8 @@
+ #define ATCPHY_EVT_USB2_CTL_EVT_EN 0x1
+ #define ATCPHY_EVT_USB2_CTL_LOAD_CNT 0x8
+ 
++#define ACIOPHY_T8132_COMMON_CTRL 0x10c
++
+ #define ACIOPHY_CFG0 0x08
+ #define ACIOPHY_CFG0_COMMON_BIG BIT(0)
+ #define ACIOPHY_CFG0_COMMON_BIG_OV BIT(1)
+@@ -642,7 +645,7 @@ struct apple_atcphy;
+  * @aciophy_lane_mode: Lane mode register offset
+  * @aciophy_crossbar: Crossbar register offset
+  * @has_usb4: A USB4/Thunderbolt controller sits behind the PHY
+- * @usb2_only: Only the USB2 PHY and pipehandler register banks exist
++ * @usb2_only: Uses the USB2 subset unless its banked SuperSpeed resources exist
+  * @usb2phy_sig_host: Host role field mask, or zero for the original layout
+  * @pipe_mux_clk: PIPE clock selection field mask
+  * @pipe_mux_data: PIPE data selection field mask
+@@ -685,6 +688,17 @@ struct atcphy_hw {
+ 	bool idle_power_off;
+ };
+ 
++enum atcphy_t8132_bank {
++	T8132_AXI2AF,
++	T8132_LIOA,
++	T8132_FABRIC,
++	T8132_CONFIG,
++	T8132_COMMON,
++	T8132_EFUSE,
++	T8132_NR_BANKS,
++};
++
++
+ /**
+  * struct apple_atcphy - Apple Type-C PHY device struct
+  * @np: Device node pointer
+@@ -790,12 +804,25 @@ struct apple_atcphy {
+ 		struct apple_tunable *lane_dp[2];
+ 		struct apple_tunable *lane_usb4[2];
+ 		struct apple_tunable *usb2phy_reg_dflt;
++		struct apple_tunable *usb3_dp;
+ 		struct apple_tunable *dp_common_pre;
+ 		struct apple_tunable *dp_lpdptx;
+ 		struct apple_tunable *dp_common_post;
+ 	} tunables;
+ 
+ 	const struct atcphy_hw *hw;
++	/* T8132 keeps USB2 support when its optional SuperSpeed banks are absent. */
++	bool t8132_ss;
++	/* Only this driver's admitted common-power epoch may be stopped. */
++	bool t8132_common_owned;
++	/* A touched failure has no qualified partial rollback or retry. */
++	bool t8132_failed;
++	bool t8132_suspended;
++	struct {
++		void __iomem *regs;
++		struct resource *resource;
++		struct apple_tunable *tunable;
++	} t8132_banks[T8132_NR_BANKS];
+ 	bool ss_tunables;
+ 	bool dp_tunables;
+ 	bool aux_power_requested;
+@@ -873,6 +900,11 @@ struct apple_atcphy {
+ 	struct mutex lock;
+ };
+ 
++static bool atcphy_usb2_only(const struct apple_atcphy *atcphy)
++{
++	return atcphy->hw->usb2_only && !atcphy->t8132_ss;
++}
++
+ static const struct {
+ 	const struct atcphy_mode_configuration normal;
+ 	const struct atcphy_mode_configuration swapped;
+@@ -1191,16 +1223,12 @@ static void atcphy_apply_tunables(struct apple_atcphy *atcphy, enum atcphy_mode
+ 
+ }
+ 
+-static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
++static int atcphy_pipehandler_lock_timeout(struct apple_atcphy *atcphy, u32 timeout)
+ {
+ 	int ret;
+ 	u32 reg;
+ 	u32 requested;
+ 
+-	/* The tests stand in for the controller that acknowledges the lock */
+-	if (IS_ENABLED(CONFIG_PHY_APPLE_ATC_KUNIT_TEST))
+-		KUNIT_STATIC_STUB_REDIRECT(atcphy_pipehandler_lock, atcphy);
+-
+ 	requested = readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ);
+ 	dev_dbg(atcphy->dev, "PIPE request: req=%#x mode=%u pipe=%u host=%u dirty=%u\n",
+ 		requested, atcphy->mode, atcphy->pipe_state,
+@@ -1217,7 +1245,7 @@ static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
+ 	}
+ 
+ 	ret = readl_poll_timeout(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK, reg,
+-				 reg & PIPEHANDLER_LOCK_EN, 10, PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
++				 reg & PIPEHANDLER_LOCK_EN, 10, timeout);
+ 	if (ret) {
+ 		dev_dbg(atcphy->dev, "PIPE lock timeout: ack=%#x mode=%u pipe=%u dirty=%u\n",
+ 			reg, atcphy->mode, atcphy->pipe_state, atcphy->mode_dirty);
+@@ -1228,6 +1256,17 @@ static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
+ 	return ret;
+ }
+ 
++static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
++{
++	/* The tests stand in for the controller that acknowledges the lock. */
++	if (IS_ENABLED(CONFIG_PHY_APPLE_ATC_KUNIT_TEST))
++		KUNIT_STATIC_STUB_REDIRECT(atcphy_pipehandler_lock, atcphy);
++
++	return atcphy_pipehandler_lock_timeout(atcphy,
++		atcphy->hw->gen == ATCPHY_GENERATION_T8132 ?
++		6000 : PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
++}
++
+ /* Retry only a live legacy PIPE: USB4 and stopped parking cannot clock the ACK. */
+ static int atcphy_pipehandler_lock_live(struct apple_atcphy *atcphy)
+ {
+@@ -1381,6 +1420,71 @@ static int atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *atc
+ 	return error;
+ }
+ 
++/* T8132's second host BIST transition completes on STATUS2 bit 6 set. */
++static int atcphy_t8132_bist_pulse(struct apple_atcphy *atcphy)
++{
++	u32 reg;
++	int ret;
++
++	core_set32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
++	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_BIST_CFG1, reg,
++				 reg & ACIOPHY_BIST_CFG1_USB_EN, 10, 10000);
++	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
++	if (ret)
++		dev_err(atcphy->dev, "T8132 USB3 BIST request timed out (%#x)\n", reg);
++	return ret;
++}
++
++static void atcphy_t8132_bist_ack(struct apple_atcphy *atcphy)
++{
++	core_set32(atcphy, ACIOPHY_BIST_CFG2, ACIOPHY_BIST_CFG2_LN0_PHY_STATUS_RE);
++	udelay(10);
++	core_clear32(atcphy, ACIOPHY_BIST_CFG2, ACIOPHY_BIST_CFG2_LN0_PHY_STATUS_RE);
++}
++
++static int atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *atcphy)
++{
++	u32 reg;
++	int ret;
++
++	core_set32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_CLOCK_EN);
++	writel(0x04100000, atcphy->regs.core + ACIOPHY_BIST_MAC_USBPHY_CFG_OV1);
++	writel(0x220, atcphy->regs.core + ACIOPHY_BIST_MAC_USBPHY_CFG_OV2);
++	ret = atcphy_t8132_bist_pulse(atcphy);
++	if (ret)
++		return ret;
++	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_BIST_MAC_USBPHY_STATUS2,
++				 reg, !(reg & BIT(7)), 10, 130000);
++	if (ret) {
++		dev_err(atcphy->dev, "T8132 USB3 BIST phase 1 timed out (%#x)\n", reg);
++		return ret;
++	}
++	atcphy_t8132_bist_ack(atcphy);
++	core_mask32(atcphy, ACIOPHY_BIST_MAC_USBPHY_CFG_OV1,
++		    ACIOPHY_BIST_MAC_USBPHY_CFG_OV1_LN0_PWR_DOWN_OV,
++		    FIELD_PREP(ACIOPHY_BIST_MAC_USBPHY_CFG_OV1_LN0_PWR_DOWN_OV, 3));
++	writel(0x220, atcphy->regs.core + ACIOPHY_BIST_MAC_USBPHY_CFG_OV2);
++	udelay(10);
++	ret = atcphy_t8132_bist_pulse(atcphy);
++	if (ret)
++		return ret;
++	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_BIST_MAC_USBPHY_STATUS2,
++				 reg, reg & BIT(6), 10, 130000);
++	if (ret) {
++		dev_err(atcphy->dev, "T8132 USB3 BIST phase 2 timed out (%#x)\n", reg);
++		return ret;
++	}
++	atcphy_t8132_bist_ack(atcphy);
++	mask32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
++	       PIPEHANDLER_NATIVE_POWER_DOWN, FIELD_PREP(PIPEHANDLER_NATIVE_POWER_DOWN, 3));
++	clear32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
++		PIPEHANDLER_NATIVE_RESET);
++	core_clear32(atcphy, ACIOPHY_BIST_MAC_USBPHY_CFG_OV2, 0x220);
++	ret = atcphy_t8132_bist_pulse(atcphy);
++	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_CLOCK_EN);
++	return ret;
++}
++
+ static int atcphy_configure_pipehandler_usb3_host_t8103(struct apple_atcphy *atcphy)
+ {
+ 	int ret, error = 0;
+@@ -1487,6 +1591,8 @@ static int atcphy_configure_pipehandler_usb3(struct apple_atcphy *atcphy, bool h
+ 		/* BIST dance */
+ 		if (atcphy->hw->gen == ATCPHY_GENERATION_T8103)
+ 			ret = atcphy_configure_pipehandler_usb3_host_t8103(atcphy);
++		else if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
++			ret = atcphy_configure_pipehandler_usb3_host_t8132(atcphy);
+ 		else
+ 			ret = atcphy_configure_pipehandler_usb3_host_t8122(atcphy);
+ 		if (ret) {
+@@ -1604,7 +1710,8 @@ static bool atcphy_pipe_live(const struct apple_atcphy *atcphy)
+ 
+ static bool atcphy_needs_dummy_phy(struct apple_atcphy *atcphy)
+ {
+-	return !atcphy->hw->has_usb4 || atcphy->hw->park_dummy_phy;
++	return atcphy->hw->gen != ATCPHY_GENERATION_T8132 &&
++	       (!atcphy->hw->has_usb4 || atcphy->hw->park_dummy_phy);
+ }
+ 
+ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy, bool lock)
+@@ -1627,7 +1734,9 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy, bool
+ 	set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
+ 
+ 	if (lock) {
+-		ret = atcphy_pipehandler_lock(atcphy);
++		ret = atcphy->hw->gen == ATCPHY_GENERATION_T8132 ?
++			atcphy_pipehandler_lock_timeout(atcphy, 150000) :
++			atcphy_pipehandler_lock(atcphy);
+ 		if (ret) {
+ 			/* A live controller must acknowledge before its backend changes. */
+ 			if (live_usb3) {
+@@ -1693,6 +1802,10 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
+ 		ret = atcphy_configure_pipehandler_dummy(atcphy, true);
+ 		break;
+ 	}
++	if (ret && atcphy->t8132_common_owned) {
++		atcphy->t8132_failed = true;
++		atcphy->mode_dirty = true;
++	}
+ 	if (!ret) {
+ 		atcphy->pipe_state = state;
+ 		atcphy->pipe_pending = false;
+@@ -1771,6 +1884,9 @@ static int atcphy_park_pipehandler(struct apple_atcphy *atcphy, bool stopped)
+ 
+ 	lockdep_assert_held(&atcphy->lock);
+ 
++	if (atcphy->t8132_failed)
++		return -EIO;
++
+ 	dev_dbg(atcphy->dev, "PIPE park: mode=%u pipe=%u host=%u dirty=%u owned=%u idle=%u\n",
+ 		atcphy->mode, atcphy->pipe_state, atcphy->host_active, atcphy->mode_dirty,
+ 		atcphy->dp_owned_pmas, atcphy->dp_idle_pmas);
+@@ -1783,6 +1899,10 @@ static int atcphy_park_pipehandler(struct apple_atcphy *atcphy, bool stopped)
+ 
+ 	ret = atcphy_configure_pipehandler_dummy(atcphy, lock);
+ 	if (ret) {
++		if (atcphy->t8132_common_owned) {
++			atcphy->t8132_failed = true;
++			atcphy->mode_dirty = true;
++		}
+ 		dev_warn(atcphy->dev, "Failed to switch PIPE to dummy: %d\n", ret);
+ 		return ret;
+ 	}
+@@ -2430,9 +2550,11 @@ static int atcphy_power_off(struct apple_atcphy *atcphy)
+ 	u32 reg;
+ 	int ret;
+ 
+-	ret = atcphy_disable_dp_aux(atcphy);
+-	if (ret)
+-		return ret;
++	if (atcphy->hw->gen != ATCPHY_GENERATION_T8132) {
++		ret = atcphy_disable_dp_aux(atcphy);
++		if (ret)
++			return ret;
++	}
+ 
+ 	/* Enable all reset lines */
+ 	core_clear32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
+@@ -3482,6 +3604,209 @@ static void atcphy_dp_stop_t8122(struct apple_atcphy *atcphy)
+ 	}
+ }
+ 
++/* Orientation is retained by native full-off; it does not denote a live epoch. */
++static bool atcphy_t8132_cold(struct apple_atcphy *atcphy)
++{
++	return core_read32(atcphy, ATCPHY_POWER_CTRL) == ATCPHY_POWER_CLAMP_EN &&
++	       !core_read32(atcphy, ATCPHY_POWER_STAT) &&
++	       !(core_read32(atcphy, ATCPHY_MISC) & ~ATCPHY_MISC_LANE_SWAP);
++}
++
++static int atcphy_t8132_common_start(struct apple_atcphy *atcphy)
++{
++	u32 reg;
++
++	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_SMALL);
++	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_SMALL_OV);
++	udelay(1);
++	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_BIG);
++	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_BIG_OV);
++	udelay(1);
++	core_clear32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_CLAMP);
++	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_CLAMP_OV);
++	udelay(1);
++	core_set32(atcphy, AUS_COMMON_SHIM_BLK_BIAS_REG,
++		   AUS_COMMON_SHIM_BLK_BIAS_REG_BGBIAS_OV);
++	/* Native settling time before the bounded 100 us calibration poll. */
++	udelay(15);
++	return readl_poll_timeout(atcphy->regs.core + AUS_COMMON_DIG_RCAL1, reg,
++				 reg & AUS_COMMON_DIG_RCAL1_ALL_CODES_DONE, 1, 100);
++}
++
++/* Native full-off, only after a successful mode4 epoch and the last USB release. */
++static int atcphy_t8132_full_stop(struct apple_atcphy *atcphy)
++{
++	u32 reg;
++	int ret;
++
++	core_set32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_CLOCK_EN);
++	core_mask32(atcphy, ACIOPHY_BIST_MAC_USBPHY_CFG_OV1, 0x1e100000, 0x04000000);
++	core_mask32(atcphy, ACIOPHY_BIST_MAC_USBPHY_CFG_OV2, 0x660, 0x220);
++	core_set32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
++	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
++	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_BIST_MAC_USBPHY_STATUS2,
++				 reg, reg & BIT(7), 1, 200);
++	if (ret)
++		return ret;
++	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_CLOCK_EN);
++
++	core_clear32(atcphy, AUS_COMMON_SHIM_BLK_BIAS_REG,
++		     AUS_COMMON_SHIM_BLK_BIAS_REG_BGBIAS_OV);
++	udelay(1);
++	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_CLAMP);
++	udelay(1);
++	core_clear32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_BIG);
++	udelay(1);
++	core_clear32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_SMALL);
++	udelay(1);
++
++	core_mask32(atcphy, ACIOPHY_T8132_COMMON_CTRL, 0x333, 0x300);
++	udelay(1);
++	core_mask32(atcphy, ACIOPHY_T8132_COMMON_CTRL, 0xc00, 0x400);
++	udelay(1);
++	core_mask32(atcphy, ACIOPHY_T8132_COMMON_CTRL, 0xc, 0x4);
++	udelay(1);
++	core_mask32(atcphy, ACIOPHY_T8132_COMMON_CTRL, 0xc0, 0x40);
++	udelay(1);
++	core_set32(atcphy, ACIOPHY_T8132_COMMON_CTRL, 0xc00);
++	udelay(1);
++	core_set32(atcphy, ACIOPHY_T8132_COMMON_CTRL, 0xc);
++	udelay(1);
++	core_set32(atcphy, ACIOPHY_T8132_COMMON_CTRL, 0xc0);
++	udelay(1);
++
++	core_clear32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
++	udelay(1);
++	core_clear32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_APB_RESET_N);
++	ndelay(1);
++	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_CLAMP_EN);
++	ndelay(1);
++	core_clear32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_SLEEP_BIG);
++	ret = readl_poll_timeout(atcphy->regs.core + ATCPHY_POWER_STAT, reg,
++				 !(reg & ATCPHY_POWER_SLEEP_BIG), 1, 1000);
++	if (ret)
++		return ret;
++	core_clear32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_SLEEP_SMALL);
++	ret = readl_poll_timeout(atcphy->regs.core + ATCPHY_POWER_STAT, reg,
++				 !(reg & ATCPHY_POWER_SLEEP_SMALL), 1, 1000);
++	if (ret)
++		return ret;
++	ndelay(1);
++	core_clear32(atcphy, ATCPHY_MISC, ATCPHY_MISC_RESET_N);
++	ndelay(1);
++	return 0;
++}
++
++/* USB-only mode1 does not need mode4's analog common wake and calibration. */
++static int atcphy_configure_t8132(struct apple_atcphy *atcphy, enum atcphy_mode mode)
++{
++	u32 reg;
++	int ret;
++
++	if (mode != APPLE_ATCPHY_MODE_OFF && mode != APPLE_ATCPHY_MODE_USB2 &&
++	    mode != APPLE_ATCPHY_MODE_USB3 && mode != APPLE_ATCPHY_MODE_USB3_DP)
++		return -EOPNOTSUPP;
++	if ((mode == APPLE_ATCPHY_MODE_USB3 || mode == APPLE_ATCPHY_MODE_USB3_DP) &&
++	    !atcphy->ss_tunables)
++		return -EOPNOTSUPP;
++	if (mode == APPLE_ATCPHY_MODE_USB3_DP && !atcphy->tunables.usb3_dp)
++		return -ENODEV;
++	if (atcphy->t8132_failed)
++		return -EIO;
++	if ((mode == APPLE_ATCPHY_MODE_USB3 || mode == APPLE_ATCPHY_MODE_USB3_DP) &&
++	    atcphy->t8132_suspended)
++		return -EBUSY;
++	if (atcphy->pipe_pending || atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
++		return -EBUSY;
++
++	if (atcphy->t8132_common_owned && atcphy->host_active)
++		return -EBUSY;
++	atcphy->mode_dirty = true;
++	if (atcphy->t8132_common_owned) {
++		ret = atcphy->mode == APPLE_ATCPHY_MODE_USB3_DP ?
++			atcphy_t8132_full_stop(atcphy) : atcphy_power_off(atcphy);
++		if (ret)
++			goto failed;
++		if (!atcphy_t8132_cold(atcphy)) {
++			ret = -EIO;
++			goto failed;
++		}
++		atcphy->t8132_common_owned = false;
++	}
++	if (mode == APPLE_ATCPHY_MODE_OFF) {
++		atcphy_usb2_power_off(atcphy);
++		goto done;
++	}
++	if (mode == APPLE_ATCPHY_MODE_USB2) {
++		atcphy_usb2_power_on(atcphy);
++		goto done;
++	}
++
++	/* Never reset an inherited common-power epoch to manufacture a cold state. */
++	if (!atcphy_t8132_cold(atcphy))
++		return -EBUSY;
++	atcphy_usb2_power_on(atcphy);
++	ndelay(500);
++	/* A touched failure retains this epoch without guessing a rollback. */
++	atcphy->t8132_common_owned = true;
++	core_set32(atcphy, ATCPHY_MISC, ATCPHY_MISC_RESET_N);
++	udelay(1);
++	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_SLEEP_SMALL);
++	udelay(1);
++	ret = readl_poll_timeout(atcphy->regs.core + ATCPHY_POWER_STAT, reg,
++				 reg & ATCPHY_POWER_SLEEP_SMALL, 1, 1000);
++	if (ret)
++		goto failed;
++	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_SLEEP_BIG);
++	udelay(1);
++	ret = readl_poll_timeout(atcphy->regs.core + ATCPHY_POWER_STAT, reg,
++				 reg & ATCPHY_POWER_SLEEP_BIG, 1, 1000);
++	if (ret)
++		goto failed;
++	core_clear32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_CLAMP_EN);
++	udelay(1);
++	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_APB_RESET_N);
++	udelay(1);
++	if (core_read32(atcphy, ATCPHY_POWER_CTRL) != 0xb ||
++	    (core_read32(atcphy, ATCPHY_MISC) & ~ATCPHY_MISC_LANE_SWAP) != ATCPHY_MISC_RESET_N) {
++		ret = -EIO;
++		goto failed;
++	}
++
++	for (unsigned int i = T8132_AXI2AF; i <= T8132_COMMON; i++)
++		apple_tunable_apply(atcphy->t8132_banks[i].regs,
++				    atcphy->t8132_banks[i].tunable);
++	apple_tunable_apply(atcphy->regs.core,
++			    atcphy->tunables.lane_usb3[atcphy->swap_lanes ? 1 : 0]);
++	if (mode == APPLE_ATCPHY_MODE_USB3_DP)
++		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.usb3_dp);
++	core_mask32(atcphy, ACIOPHY_LANE_MODE_T8122, GENMASK(11, 0),
++		    atcphy->swap_lanes ? 0x252 : 0x489);
++	core_mask32(atcphy, ACIOPHY_CROSSBAR_T8122, GENMASK(16, 0),
++		    atcphy->swap_lanes ? 0x111 : 0x110);
++	core_mask32(atcphy, ATCPHY_MISC, ATCPHY_MISC_LANE_SWAP,
++		    atcphy->swap_lanes ? ATCPHY_MISC_LANE_SWAP : 0);
++	udelay(1);
++	apple_tunable_apply(atcphy->regs.core, atcphy->t8132_banks[T8132_EFUSE].tunable);
++	udelay(10);
++	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
++	udelay(100);
++	if (mode == APPLE_ATCPHY_MODE_USB3_DP) {
++		ret = atcphy_t8132_common_start(atcphy);
++		if (ret)
++			goto failed;
++	}
++
++done:
++	atcphy->mode = mode;
++	atcphy->mode_dirty = false;
++	return 0;
++
++failed:
++	atcphy->t8132_failed = true;
++	return ret;
++}
++
+ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
+ {
+ 	int ret = 0;
+@@ -3493,20 +3818,8 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
+ 	lockdep_assert_held(&atcphy->lock);
+ 	if (atcphy->t8103_dummy_pending)
+ 		return -EBUSY;
+-	if (atcphy->hw->usb2_only) {
+-		/* A SuperSpeed cable still carries USB2 on the dedicated pair. */
+-		if (mode == APPLE_ATCPHY_MODE_USB3 || mode == APPLE_ATCPHY_MODE_USB3_DP)
+-			mode = APPLE_ATCPHY_MODE_USB2;
+-		if (mode == APPLE_ATCPHY_MODE_OFF)
+-			atcphy_usb2_power_off(atcphy);
+-		else if (mode == APPLE_ATCPHY_MODE_USB2)
+-			atcphy_usb2_power_on(atcphy);
+-		else
+-			return -EOPNOTSUPP;
+-		atcphy->mode = mode;
+-		atcphy->mode_dirty = false;
+-		return 0;
+-	}
++	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
++		return atcphy_configure_t8132(atcphy, mode);
+ 	if (atcphy->pipe_pending)
+ 		return -EBUSY;
+ 	if (atcphy->usb_off_pending && mode != APPLE_ATCPHY_MODE_OFF)
+@@ -3668,14 +3981,16 @@ static int atcphy_rpm_get(struct apple_atcphy *atcphy)
+ }
+ 
+ /*
+- * What a power-down would lose: a mode or a host, or a PIPE away from its
+- * parked dummy backend or between backends. Without these the PHY is in the
+- * baseline that atcphy_restore_after_pd_off() sets up again.
++ * What a power-down would lose: a mode or a host, a PIPE away from its parked
++ * dummy backend or between backends, or on T8132 a common-power epoch, which
++ * only its own stop may end. Without these the PHY is in the baseline that
++ * atcphy_restore_after_pd_off() sets up again.
+  */
+ static bool atcphy_rpm_busy(const struct apple_atcphy *atcphy)
+ {
+ 	return atcphy->mode != APPLE_ATCPHY_MODE_OFF || atcphy->host_active ||
+-	       atcphy->pipe_pending || atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY;
++	       atcphy->pipe_pending || atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY ||
++	       atcphy->t8132_common_owned;
+ }
+ 
+ /* Take or drop the reference held while busy; the device must be on. */
+@@ -3830,7 +4145,8 @@ static int atcphy_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode
+ 		return -EINVAL;
+ 	}
+ 
+-	if (atcphy->hw->usb2_only && atcphy->mode == APPLE_ATCPHY_MODE_USB2)
++	if (atcphy->hw->usb2_only && atcphy->mode != APPLE_ATCPHY_MODE_OFF &&
++	    !atcphy->mode_dirty)
+ 		atcphy_usb2_power_on(atcphy);
+ 
+ 	return 0;
+@@ -3939,7 +4255,8 @@ static int atcphy_usb3_power_off(struct phy *phy)
+ 	 * DPTX FIFO error and drops the display. The Type-C mux turns the PHY off
+ 	 * when the alt mode actually ends, so leave a DP mode alone here.
+ 	 */
+-	if (atcphy_modes[atcphy->mode].enable_dp_aux)
++	if (atcphy_modes[atcphy->mode].enable_dp_aux &&
++	    atcphy->hw->gen != ATCPHY_GENERATION_T8132)
+ 		return 0;
+ 
+ 	if (atcphy->mode != APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty) {
+@@ -4009,6 +4326,11 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
+ 	if (atcphy->usb_off_pending)
+ 		return -EBUSY;
+ 
++	if (atcphy->t8132_ss &&
++	    (atcphy->mode == APPLE_ATCPHY_MODE_USB3 || atcphy->mode == APPLE_ATCPHY_MODE_USB3_DP) &&
++	    mode == PHY_MODE_USB_DEVICE)
++		return -EOPNOTSUPP;
++
+ 	switch (mode) {
+ 	case PHY_MODE_USB_HOST:
+ 		atcphy->host_active = true;
+@@ -4023,6 +4345,15 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
+ 	}
+ 
+ 	ret = atcphy_usb3_route(atcphy, mode == PHY_MODE_USB_HOST);
++	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
++		dev_dbg(atcphy->dev,
++			 "USB %s route: mode=%u ss=%u calibration=%u common=%u dirty=%u pipe=%u pending=%u ret=%d mux=%#x override=%#x config=%#x\n",
++			 mode == PHY_MODE_USB_HOST ? "host" : "device", atcphy->mode,
++			 atcphy->t8132_ss, atcphy->ss_tunables, atcphy->t8132_common_owned,
++			 atcphy->mode_dirty, atcphy->pipe_state, atcphy->pipe_pending, ret,
++			 readl(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL),
++			 readl(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE),
++			 readl(atcphy->regs.pipehandler + PIPEHANDLER_T8132_USB2_CONFIG));
+ 	if (!ret || !atcphy->fixed_usb2 || mode != PHY_MODE_USB_HOST)
+ 		return ret;
+ 
+@@ -4040,6 +4371,20 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
+ 	return 0;
+ }
+ 
++static int atcphy_usb3_exit(struct phy *phy)
++{
++	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
++
++	/* An unpowered init lease does not own the Type-C mux's common epoch. */
++	if (!atcphy->t8132_ss || !phy->power_count)
++		return 0;
++	guard(mutex)(&atcphy->lock);
++	if (atcphy->t8132_common_owned || atcphy->t8132_failed || atcphy->pipe_pending ||
++	    atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
++		return -EBUSY;
++	return 0;
++}
++
+ static int atcphy_rpm_usb3_power_off(struct phy *phy)
+ {
+ 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+@@ -4068,6 +4413,7 @@ static int atcphy_rpm_usb3_set_mode(struct phy *phy, enum phy_mode mode, int sub
+ 
+ static const struct phy_ops apple_atc_usb3_phy_ops = {
+ 	.owner = THIS_MODULE,
++	.exit = atcphy_usb3_exit,
+ 	.power_off = atcphy_rpm_usb3_power_off,
+ 	.set_mode = atcphy_rpm_usb3_set_mode,
+ };
+@@ -4358,7 +4704,8 @@ static int atcphy_probe_phy(struct apple_atcphy *atcphy)
+ 
+ 	for (int i = 0; i < ARRAY_SIZE(phys); i++) {
+ 		if ((atcphy->dp_only && phys[i].phy != &atcphy->phys.dp) ||
+-		    (atcphy->hw->usb2_only && i != 0))
++		    (atcphy_usb2_only(atcphy) && i != 0) ||
++		    (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && i == 2))
+ 			continue;
+ 		*phys[i].phy = devm_phy_create(atcphy->dev, NULL, phys[i].ops);
+ 		if (IS_ERR(*phys[i].phy))
+@@ -4419,7 +4766,8 @@ static int atcphy_dwc3_reset_deassert(struct reset_controller_dev *rcdev, unsign
+ 	}
+ 
+ 	/* Reset assertion powers USB2 off without changing the mux mode. */
+-	if (atcphy->hw->usb2_only && atcphy->mode == APPLE_ATCPHY_MODE_USB2)
++	if (atcphy->hw->usb2_only && atcphy->mode != APPLE_ATCPHY_MODE_OFF &&
++	    !atcphy->mode_dirty)
+ 		atcphy_usb2_power_on(atcphy);
+ 
+ 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN,
+@@ -4894,6 +5242,7 @@ static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
+ 		target_mode = APPLE_ATCPHY_MODE_USB2;
+ 
+ 	if (atcphy->hw->usb2_only &&
++	    (!atcphy->t8132_ss || !atcphy->ss_tunables) &&
+ 	    (target_mode == APPLE_ATCPHY_MODE_USB3 || target_mode == APPLE_ATCPHY_MODE_USB3_DP))
+ 		target_mode = APPLE_ATCPHY_MODE_USB2;
+ 
+@@ -4930,6 +5279,21 @@ static bool atcphy_mux_is_noop(const struct apple_atcphy *atcphy, enum atcphy_mo
+ /* Whether the PHY can run @mode at all, which needs no lane or PIPE work to tell */
+ static int atcphy_mux_check(const struct apple_atcphy *atcphy, enum atcphy_mode mode)
+ {
++	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 &&
++	    mode != APPLE_ATCPHY_MODE_OFF && mode != APPLE_ATCPHY_MODE_USB2 &&
++	    mode != APPLE_ATCPHY_MODE_USB3 && mode != APPLE_ATCPHY_MODE_USB3_DP) {
++		/*
++		 * This is the port's lane provider, not an unrelated mux which can
++		 * ignore the request. typec_mux_apply() skips EOPNOTSUPP, which
++		 * would otherwise start the controller while these lanes stay off.
++		 */
++		return -ENODEV;
++	}
++
++	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 &&
++	    mode == APPLE_ATCPHY_MODE_USB3_DP && !atcphy->tunables.usb3_dp)
++		return -ENODEV;
++
+ 	if (atcphy->dp_only && mode != APPLE_ATCPHY_MODE_OFF &&
+ 	    mode != APPLE_ATCPHY_MODE_DP)
+ 		return -EOPNOTSUPP;
+@@ -5289,6 +5653,53 @@ static int atcphy_load_t8140_dp(struct apple_atcphy *atcphy)
+ 	return 0;
+ }
+ 
++static int atcphy_load_t8132_tunables(struct apple_atcphy *atcphy)
++{
++	static const char * const names[] = {
++		"usb3-axi2af", "usb3-lioa", "usb3-fabric", "usb3-config",
++		"usb3-common", "usb3-efuse", "lane0-usb", "lane1-usb",
++	};
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(names); i++) {
++		struct resource *res = i < T8132_EFUSE ?
++			atcphy->t8132_banks[i].resource : atcphy->res.core;
++		struct apple_tunable *tunable;
++		char name[40];
++
++		snprintf(name, sizeof(name), "apple,tunable-%s", names[i]);
++		tunable = devm_apple_tunable_parse(atcphy->dev, atcphy->np, name, res);
++		if (IS_ERR(tunable)) {
++			if (PTR_ERR(tunable) != -ENOENT)
++				return dev_err_probe(atcphy->dev, PTR_ERR(tunable),
++						     "Invalid T8132 calibration %s\n", name);
++			dev_warn(atcphy->dev, "T8132 calibration incomplete, USB2 only\n");
++			return 0;
++		}
++		if (!tunable->sz)
++			return dev_err_probe(atcphy->dev, -EINVAL, "Empty T8132 calibration %s\n",
++					     name);
++		if (i <= T8132_EFUSE)
++			atcphy->t8132_banks[i].tunable = tunable;
++		else
++			atcphy->tunables.lane_usb3[i - T8132_EFUSE - 1] = tunable;
++	}
++	atcphy->ss_tunables = true;
++	/* J713 has no AUX_SHM; AUX_TOP follows the shared common calibration. */
++	atcphy->tunables.usb3_dp =
++		devm_apple_tunable_parse(atcphy->dev, atcphy->np,
++					 "apple,tunable-usb3-dp", atcphy->res.core);
++	if (IS_ERR(atcphy->tunables.usb3_dp)) {
++		int ret = PTR_ERR(atcphy->tunables.usb3_dp);
++
++		atcphy->tunables.usb3_dp = NULL;
++		if (ret != -ENOENT)
++			return dev_err_probe(atcphy->dev, ret, "Invalid T8132 AUX calibration\n");
++	} else if (!atcphy->tunables.usb3_dp->sz) {
++		return dev_err_probe(atcphy->dev, -EINVAL, "Empty T8132 AUX calibration\n");
++	}
++	return 0;
++}
++
+ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
+ {
+ 	size_t tunable_count;
+@@ -5309,7 +5720,7 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
+ 		{ "apple,tunable-lane1-dp", &atcphy->tunables.lane_dp[1], atcphy->res.core },
+ 	};
+ 	if (atcphy->hw->usb2_only)
+-		return 0;
++		return atcphy->t8132_ss ? atcphy_load_t8132_tunables(atcphy) : 0;
+ 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8122 && !atcphy->hw->dp_t8122) {
+ 		tunable_count = ARRAY_SIZE(tunables) - 2;
+ 		atcphy->tunables.lane_dp[0] = NULL;
+@@ -5420,6 +5831,37 @@ static int atcphy_map_resources(struct platform_device *pdev, struct apple_atcph
+ 	struct resource *res;
+ 	void __iomem *addr;
+ 
++	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 &&
++	    platform_get_resource_byname(pdev, IORESOURCE_MEM, "common-config")) {
++		static const char * const names[] = {
++			"axi2af", "lioa", "fabric", "common-config", "core", "core",
++		};
++
++		for (unsigned int i = 0; i < ARRAY_SIZE(names); i++) {
++			res = platform_get_resource_byname(pdev, IORESOURCE_MEM, names[i]);
++			if (!res)
++				return dev_err_probe(atcphy->dev, -EINVAL,
++						     "Missing %s bank\n", names[i]);
++			if (i == T8132_COMMON && resource_size(res) < ATCPHY_MISC + sizeof(u32))
++				return dev_err_probe(atcphy->dev, -EINVAL,
++						     "Short T8132 core bank\n");
++			if (i == T8132_EFUSE)
++				addr = atcphy->regs.core;
++			else
++				addr = devm_ioremap_resource(&pdev->dev, res);
++			if (IS_ERR(addr))
++				return dev_err_probe(atcphy->dev, PTR_ERR(addr),
++						     "Unable to map %s bank\n", names[i]);
++			atcphy->t8132_banks[i].regs = addr;
++			atcphy->t8132_banks[i].resource = res;
++			if (i == T8132_COMMON) {
++				atcphy->regs.core = addr;
++				atcphy->res.core = res;
++			}
++		}
++		atcphy->t8132_ss = true;
++	}
++
+ 	/*
+ 	 * A T8122 generation PHY described without the USB2 PHY and PIPE
+ 	 * windows is DisplayPort-only, like the one behind the T6030 HDMI port.
+@@ -5431,7 +5873,7 @@ static int atcphy_map_resources(struct platform_device *pdev, struct apple_atcph
+ 		atcphy->dp_only = true;
+ 
+ 	for (int i = 0; i < ARRAY_SIZE(resources); i++) {
+-		/* T8132 has neither the SuperSpeed core nor its auxiliary banks. */
++		/* T8132 uses the independently mapped banks above, or USB2 only. */
+ 		if (atcphy->hw->usb2_only && i < 3)
+ 			continue;
+ 		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, resources[i].name);
+@@ -5520,6 +5962,7 @@ static int atcphy_probe_finalize(struct apple_atcphy *atcphy)
+ 
+ 	/* Reset atcphy to clear any state potentially left by the bootloader */
+ 	atcphy_usb2_power_off(atcphy);
++	/* M4 validates and acquires its common bank only on USB3 admission. */
+ 	if (!atcphy->hw->usb2_only)
+ 		atcphy_power_off(atcphy);
+ 	atcphy_setup_pipehandler(atcphy);
+@@ -5701,6 +6144,23 @@ static int atcphy_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++static int atcphy_suspend(struct device *dev)
++{
++	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
++
++	if (atcphy->hw->gen != ATCPHY_GENERATION_T8132 || !atcphy->t8132_ss)
++		return 0;
++
++	guard(mutex)(&atcphy->lock);
++	/* Active and incomplete common epochs have no qualified sleep handoff. */
++	if (atcphy->t8132_common_owned || atcphy->mode_dirty)
++		return -EBUSY;
++	/* Do not admit a new epoch after this check and before resume. */
++	atcphy->t8132_suspended = true;
++
++	return 0;
++}
++
+ /*
+  * Nothing to save on the way down: whatever the PHY runs stays up when its
+  * domain stays on. If the domain was switched off, restore the state here
+@@ -5711,6 +6171,7 @@ static int atcphy_resume(struct device *dev)
+ 	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
+ 
+ 	guard(mutex)(&atcphy->lock);
++	atcphy->t8132_suspended = false;
+ 	/*
+ 	 * A suspended PHY holds nothing, and its domain may drop again once system
+ 	 * resume completes: leave the restore to its next operation.
+@@ -5722,7 +6183,29 @@ static int atcphy_resume(struct device *dev)
+ 	return 0;
+ }
+ 
+-static DEFINE_SIMPLE_DEV_PM_OPS(atcphy_pm_ops, NULL, atcphy_resume);
++/* Consumer device links shut DWC3 down before this supplier is visited. */
++static void atcphy_shutdown(struct platform_device *pdev)
++{
++	struct apple_atcphy *atcphy = platform_get_drvdata(pdev);
++	int ret;
++
++	if (atcphy->hw->gen != ATCPHY_GENERATION_T8132 || !atcphy->t8132_ss)
++		return;
++	guard(mutex)(&atcphy->lock);
++	atcphy->t8132_suspended = true;
++	if (!atcphy->t8132_common_owned)
++		return;
++	if (atcphy->t8132_failed || atcphy->host_active || atcphy->pipe_pending ||
++	    atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY) {
++		dev_err(atcphy->dev, "Shutdown retains incomplete USB3 common ownership\n");
++		return;
++	}
++	ret = atcphy_configure_t8132(atcphy, APPLE_ATCPHY_MODE_OFF);
++	if (ret)
++		dev_err(atcphy->dev, "USB3 common shutdown failed: %d\n", ret);
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(atcphy_pm_ops, atcphy_suspend, atcphy_resume);
+ 
+ static const struct atcphy_hw atcphy_hw_t8103 = {
+ 	.gen = ATCPHY_GENERATION_T8103,
+@@ -5797,6 +6280,7 @@ static struct platform_driver atcphy_driver = {
+ 		.pm = pm_sleep_ptr(&atcphy_pm_ops),
+ 	},
+ 	.probe = atcphy_probe,
++	.shutdown = atcphy_shutdown,
+ };
+ module_platform_driver(atcphy_driver);
+ 
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index 2380cdfc9a..147c687a03 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -2216,6 +2216,40 @@ static struct power_supply *dwc3_get_usb_power_supply(struct dwc3 *dwc)
+ 	return usb_psy;
+ }
+ 
++/* A glue-owned role must reach hardware before role-dependent core reset. */
++static int dwc3_core_set_initial_role(const struct dwc3_probe_data *data)
++{
++	struct dwc3 *dwc = data->dwc;
++	unsigned long flags;
++	u32 mode;
++
++	if (data->initial_role == USB_ROLE_NONE)
++		return 0;
++	if (!data->skip_core_init_mode)
++		return -EINVAL;
++
++	switch (data->initial_role) {
++	case USB_ROLE_HOST:
++		if (dwc->dr_mode == USB_DR_MODE_PERIPHERAL)
++			return -EINVAL;
++		mode = DWC3_GCTL_PRTCAP_HOST;
++		break;
++	case USB_ROLE_DEVICE:
++		if (dwc->dr_mode == USB_DR_MODE_HOST)
++			return -EINVAL;
++		mode = DWC3_GCTL_PRTCAP_DEVICE;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	spin_lock_irqsave(&dwc->lock, flags);
++	dwc3_set_prtcap(dwc, mode, false);
++	spin_unlock_irqrestore(&dwc->lock, flags);
++
++	return 0;
++}
++
+ int dwc3_core_probe(const struct dwc3_probe_data *data)
+ {
+ 	struct dwc3		*dwc = data->dwc;
+@@ -2343,6 +2377,10 @@ int dwc3_core_probe(const struct dwc3_probe_data *data)
+ 	if (ret)
+ 		goto err_free_event_buffers;
+ 
++	ret = dwc3_core_set_initial_role(data);
++	if (ret)
++		goto err_free_event_buffers;
++
+ 	ret = dwc3_core_init(dwc);
+ 	if (ret) {
+ 		dev_err_probe(dev, ret, "failed to initialize core\n");
+diff --git a/drivers/usb/dwc3/dwc3-apple.c b/drivers/usb/dwc3/dwc3-apple.c
+index 29b73a1bca..150d3d01e3 100644
+--- a/drivers/usb/dwc3/dwc3-apple.c
++++ b/drivers/usb/dwc3/dwc3-apple.c
+@@ -112,6 +112,7 @@
+  * @state: Current state of the controller, see enum dwc3_apple_state and the comment above
+  * @core_active: Core still owns initialized PHYs
+  * @core_exit_pending: Event buffers have been cleaned for this shutdown
++ * @shutting_down: Reject new roles after the shutdown consumer has stopped
+  * @reset_pending: Controller reset must complete before another start
+  * @usb2_power_off_pending: Core-owned USB2 references still to release
+  * @usb3_power_off_pending: Core-owned USB3 references still to release
+@@ -137,6 +138,7 @@ struct dwc3_apple {
+ 	enum dwc3_apple_state state;
+ 	bool core_active;
+ 	bool core_exit_pending;
++	bool shutting_down;
+ 	bool reset_pending;
+ 	unsigned long usb2_power_off_pending;
+ 	unsigned long usb3_power_off_pending;
+@@ -212,7 +214,14 @@ static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
+ 	dwc3_set_prtcap(&appledwc->dwc, mode, false);
+ }
+ 
+-static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
++static bool dwc3_apple_host_before_core_init(struct dwc3_apple *appledwc,
++					     enum dwc3_apple_state state)
++{
++	return state == DWC3_APPLE_HOST && of_machine_is_compatible("apple,j713") &&
++		of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3");
++}
++
++static int dwc3_apple_core_probe(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
+ {
+ 	struct dwc3_probe_data probe_data = {};
+ 	void *group;
+@@ -226,6 +235,8 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
+ 	probe_data.res = appledwc->mmio_resource;
+ 	probe_data.ignore_clocks_and_resets = true;
+ 	probe_data.skip_core_init_mode = true;
++	if (dwc3_apple_host_before_core_init(appledwc, state))
++		probe_data.initial_role = USB_ROLE_HOST;
+ 	probe_data.properties = DWC3_DEFAULT_PROPERTIES;
+ 	/*
+ 	 * The controller has no wake signal of its own, and a halted xHC writes no events, so its
+@@ -247,6 +258,8 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
+ 		return -ENOMEM;
+ 
+ 	ret = dwc3_core_probe(&probe_data);
++	/* The glue remains bound even when a first core attempt unwinds. */
++	dev_set_drvdata(appledwc->dev, &appledwc->dwc);
+ 	if (ret) {
+ 		devres_release_group(appledwc->dev, group);
+ 		/*
+@@ -274,7 +287,7 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
+ 	return 0;
+ }
+ 
+-static int dwc3_apple_core_init(struct dwc3_apple *appledwc)
++static int dwc3_apple_core_init(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
+ {
+ 	int ret;
+ 
+@@ -282,11 +295,16 @@ static int dwc3_apple_core_init(struct dwc3_apple *appledwc)
+ 
+ 	switch (appledwc->state) {
+ 	case DWC3_APPLE_PROBE_PENDING:
+-		ret = dwc3_apple_core_probe(appledwc);
++		ret = dwc3_apple_core_probe(appledwc, state);
+ 		if (ret)
+ 			dev_err(appledwc->dev, "Failed to probe DWC3 Core, err=%d\n", ret);
+ 		break;
+ 	case DWC3_APPLE_NO_CABLE:
++		/* Physical reset also loses the role on a later cable session. */
++		if (dwc3_apple_host_before_core_init(appledwc, state)) {
++			appledwc->dwc.dr_mode = USB_DR_MODE_HOST;
++			dwc3_apple_set_ptrcap(appledwc, DWC3_GCTL_PRTCAP_HOST);
++		}
+ 		ret = dwc3_core_init(&appledwc->dwc);
+ 		if (ret)
+ 			dev_err(appledwc->dev, "Failed to initialize DWC3 Core, err=%d\n", ret);
+@@ -388,10 +406,17 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
+ 		/* Unreachable unless there's a bug in this driver */
+ 		return ret;
+ 	}
++	/* T8132 latches the host role while its USB2 PHY is stopped. */
++	if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") &&
++	    state == DWC3_APPLE_HOST)
++		mode = PHY_MODE_USB_HOST;
+ 	if (mode != PHY_MODE_INVALID) {
+ 		ret = phy_set_mode(appledwc->usb2_phy, mode);
+-		if (ret)
++		if (ret) {
++			if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3"))
++				return ret;
+ 			dev_warn(appledwc->dev, "Failed to set the USB2 PHY mode, err=%d\n", ret);
++		}
+ 	}
+ 
+ 	/*
+@@ -431,7 +456,7 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
+ 	appledwc->reset_pending = true;
+ 	/* Keep register access powered until both PHY shutdown and reset finish. */
+ 	dev_pm_syscore_device(appledwc->dev, true);
+-	ret = dwc3_apple_core_init(appledwc);
++	ret = dwc3_apple_core_init(appledwc, state);
+ 	if (ret) {
+ 		ret_reset = dwc3_apple_core_stop(appledwc);
+ 		if (ret_reset)
+@@ -443,8 +468,9 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
+ 	 * Now that the core is initialized and already went through dwc3_core_soft_reset we can
+ 	 * configure some unknown Apple-specific settings and then bring up xhci or gadget mode.
+ 	 */
+-	/* T8132 has no CIO block behind its USB2-only controller. */
+-	if (!of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3"))
++	/* Native J713 host reset uses the same CIO setup before xHCI starts. */
++	if (!of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") ||
++	    dwc3_apple_host_before_core_init(appledwc, state))
+ 		dwc3_apple_setup_cio(appledwc);
+ 	appledwc->core_active = true;
+ 	appledwc->usb2_power_off_pending = BIT(appledwc->dwc.num_usb2_ports) - 1;
+@@ -454,7 +480,7 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
+ }
+ 
+ /* Select the role in the core and route the USB3 PHY, before xhci or the gadget is started */
+-static void dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
++static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
+ {
+ 	bool host = state == DWC3_APPLE_HOST;
+ 	int ret;
+@@ -466,13 +492,18 @@ static void dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_sta
+ 	/*
+ 	 * This platform requires SUSPHY to be enabled here already in order to properly
+ 	 * configure the PHY and switch dwc3's PIPE interface to USB3 PHY. The USB2 PHY's
+-	 * device mode has already been selected in dwc3_apple_core_start(); its host mode
+-	 * is selected by the xHCI root hub as it starts.
++	 * device mode and the T8132 host role were selected in dwc3_apple_core_start();
++	 * other host roles are selected by the xHCI root hub as it starts.
+ 	 */
+ 	dwc3_enable_susphy(&appledwc->dwc, true);
+ 	ret = phy_set_mode(appledwc->usb3_phy, host ? PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE);
+-	if (ret)
++	if (ret) {
++		/* A failed T8132 BIST or PIPE handoff must not start xHCI. */
++		if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3"))
++			return ret;
+ 		dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
++	}
++	return 0;
+ }
+ 
+ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
+@@ -485,7 +516,9 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
+ 	if (ret)
+ 		return ret;
+ 
+-	dwc3_apple_set_role(appledwc, state);
++	ret = dwc3_apple_set_role(appledwc, state);
++	if (ret)
++		goto core_exit;
+ 
+ 	switch (state) {
+ 	case DWC3_APPLE_HOST:
+@@ -560,6 +593,9 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role ro
+ 
+ 	guard(mutex)(&appledwc->lock);
+ 
++	if (appledwc->shutting_down)
++		return -ESHUTDOWN;
++
+ 	/* A controller behind a fixed hub is a host regardless of the connectors */
+ 	if (appledwc->fixed_hub)
+ 		return 0;
+@@ -663,6 +699,9 @@ static int dwc3_apple_probe(struct platform_device *pdev)
+ 	appledwc->idle_rpm = of_device_is_compatible(dev->of_node, "apple,t6040-dwc3") ||
+ 			     of_device_is_compatible(dev->of_node, "apple,t8132-dwc3");
+ 	mutex_init(&appledwc->lock);
++	/* A never-connected port has no generic core probe to publish this. */
++	appledwc->dwc.dev = dev;
++	platform_set_drvdata(pdev, &appledwc->dwc);
+ 
+ 	appledwc->reset = devm_reset_control_get_exclusive(dev, NULL);
+ 	if (IS_ERR(appledwc->reset))
+@@ -674,7 +713,7 @@ static int dwc3_apple_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, PTR_ERR(appledwc->usb2_phy),
+ 				     "Failed to get the USB2 PHY\n");
+ 
+-	/* T8132 exposes only a USB2 PHY; a NULL PHY is a no-op. */
++	/* Older T8132 device trees expose only USB2; a NULL PHY is a no-op. */
+ 	if (of_device_is_compatible(dev->of_node, "apple,t8132-dwc3"))
+ 		appledwc->usb3_phy = devm_phy_optional_get(dev, "usb3-phy");
+ 	else
+@@ -779,6 +818,22 @@ static void dwc3_apple_remove(struct platform_device *pdev)
+ 		pm_runtime_disable(appledwc->dev);
+ }
+ 
++/* Stop the consumer and release its PHY epoch before the supplier shutdown. */
++static void dwc3_apple_shutdown(struct platform_device *pdev)
++{
++	struct dwc3_apple *appledwc = to_dwc3_apple(platform_get_drvdata(pdev));
++	int ret;
++
++	if (!of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3"))
++		return;
++	guard(mutex)(&appledwc->lock);
++	appledwc->shutting_down = true;
++	ret = dwc3_apple_exit(appledwc);
++	if (ret)
++		dev_err(appledwc->dev,
++			"Shutdown retains incomplete PHY/reset ownership: %d\n", ret);
++}
++
+ static const struct of_device_id dwc3_apple_of_match[] = {
+ 	{ .compatible = "apple,t8132-dwc3" },
+ 	{ .compatible = "apple,t8103-dwc3" },
+@@ -789,6 +844,7 @@ MODULE_DEVICE_TABLE(of, dwc3_apple_of_match);
+ static struct platform_driver dwc3_apple_driver = {
+ 	.probe		= dwc3_apple_probe,
+ 	.remove		= dwc3_apple_remove,
++	.shutdown	= dwc3_apple_shutdown,
+ 	.driver		= {
+ 		.name	= "dwc3-apple",
+ 		.of_match_table	= dwc3_apple_of_match,
+diff --git a/drivers/usb/dwc3/glue.h b/drivers/usb/dwc3/glue.h
+index 0737f533a8..a3fa7591b7 100644
+--- a/drivers/usb/dwc3/glue.h
++++ b/drivers/usb/dwc3/glue.h
+@@ -36,6 +36,8 @@ struct dwc3_properties {
+  *		be ignored by the DWC3 core, as they are managed by the glue
+  * @skip_core_init_mode: Skip the finial initialization of the target mode, as
+  *		it must be managed by the glue
++ * @initial_role: Optional known role to program before low-level core init.
++ *		Requires skip_core_init_mode. USB_ROLE_NONE preserves the default.
+  * @properties: dwc3 software manage properties
+  */
+ struct dwc3_probe_data {
+@@ -43,6 +45,7 @@ struct dwc3_probe_data {
+ 	struct resource *res;
+ 	bool ignore_clocks_and_resets;
+ 	bool skip_core_init_mode;
++	enum usb_role initial_role;
+ 	struct dwc3_properties properties;
+ };
+ 
+diff --git a/drivers/usb/typec/tipd/spmi.c b/drivers/usb/typec/tipd/spmi.c
+index 0b8b7fac76..11c1174c19 100644
+--- a/drivers/usb/typec/tipd/spmi.c
++++ b/drivers/usb/typec/tipd/spmi.c
+@@ -86,6 +86,7 @@ static int __regmap_sn201202x_read(void *context,
+ 				   const void *reg, size_t reg_size,
+ 				   void *val, size_t val_size)
+ {
++	struct spmi_device *sdev = context;
+ 	int err;
+ 	unsigned int offset = 0x20;
+ 	size_t len;
+@@ -102,10 +103,25 @@ static int __regmap_sn201202x_read(void *context,
+ 
+ 	addr = *(u8 *)reg;
+ 
+-	err = regmap_sn201202x_select_reg(context, addr);
++	err = regmap_sn201202x_select_reg(sdev, addr);
+ 	if (err)
+ 		return err;
+ 
++	if (of_device_is_compatible(sdev->dev.of_node, "apple,t8132-sn201202x")) {
++		u8 size;
++
++		/* Selection completion does not establish the payload's length. */
++		err = spmi_register_read(sdev, 0x1f, &size);
++		if (err)
++			return err;
++		if (size < val_size || size > TPS_MAX_LEN) {
++			dev_err_ratelimited(&sdev->dev,
++					    "Register %#x reports %u bytes for a %zu-byte read\n",
++					    addr, size, val_size);
++			return -EIO;
++		}
++	}
++
+ 	while (val_size) {
+ 		len = min_t(size_t, val_size, 16);
+ 		err = spmi_ext_register_read(context, offset, val, len);
+diff --git a/tools/testing/selftests/drivers/apple/Makefile b/tools/testing/selftests/drivers/apple/Makefile
+index f9ebee07e7..9605bdd5ef 100644
+--- a/tools/testing/selftests/drivers/apple/Makefile
++++ b/tools/testing/selftests/drivers/apple/Makefile
+@@ -1,7 +1,8 @@
+ # SPDX-License-Identifier: GPL-2.0
+-# Manual physical test: requires user interaction and changes LED brightness.
++# macsmc-j713.py requires physical interaction and changes LED brightness.
++# sn201202x-transport.py checks the production SPMI selection and payload path.
+ # aop-motion.py checks the motion report decoder and calibration selector.
+-TEST_PROGS := macsmc-j713.py aop-motion.py
++TEST_PROGS := macsmc-j713.py sn201202x-transport.py aop-motion.py
+ TEST_FILES := j813-peripherals.sh
+ 
+ include ../../lib.mk
+diff --git a/tools/testing/selftests/drivers/apple/sn201202x-transport.py b/tools/testing/selftests/drivers/apple/sn201202x-transport.py
+new file mode 100755
+index 0000000000..1c37169ba4
+--- /dev/null
++++ b/tools/testing/selftests/drivers/apple/sn201202x-transport.py
+@@ -0,0 +1,184 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only OR MIT
++"""Exercise production SN201202x selection/reads with a bounded SPMI model."""
++from pathlib import Path
++import re
++import resource
++import subprocess
++import tempfile
++
++
++def function(source, name):
++    match = re.search(r"^static int " + name + r"\(", source, re.M)
++    assert match, name
++    start = source.index("{", match.start())
++    depth, end = 1, start + 1
++    while depth:
++        depth += (source[end] == "{") - (source[end] == "}")
++        end += 1
++    return source[match.start():end] + "\n"
++
++
++def main():
++    root = Path(__file__).resolve().parents[5]
++    path = root / "drivers/usb/typec/tipd/spmi.c"
++    if not path.exists():
++        print("# SKIP: requires the matching kernel source tree")
++        return 4
++    source = path.read_text()
++    program = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <errno.h>
++typedef uint8_t u8;
++#define TPS_MAX_LEN 64
++#define WARN_ON(x) ((void)(x))
++#define dev_warn(...) ((void)0)
++#define dev_err_ratelimited(...) ((void)0)
++#define min_t(type,a,b) ((type)(a)<(type)(b) ? (type)(a) : (type)(b))
++#define msecs_to_jiffies(x) (x)
++struct completion { int unused; };
++struct device { void *of_node; };
++struct tps6598x { struct device *dev; };
++struct sn201202x { bool polled, select_polled, atomic; struct completion select_completion; };
++struct spmi_device { struct device dev; struct tps6598x tps; };
++static struct sn201202x sn;
++static u8 selected, advertised;
++static unsigned polls, busy_cycles, writes, length_reads, payload_reads, bytes;
++static int select_error, status_error, length_error, payload_error;
++static bool wrong, forever, completed, length_checked;
++static struct tps6598x *spmi_device_get_drvdata(struct spmi_device *s) { return &s->tps; }
++static struct sn201202x *tps_to_sn(struct tps6598x *t) { (void)t; return &sn; }
++static void reinit_completion(struct completion *c) { (void)c; }
++static bool wait_for_completion_timeout(struct completion *c,unsigned n)
++{ (void)c; (void)n; return false; }
++static void msleep(unsigned n) { (void)n; }
++static bool of_device_is_compatible(void *node,const char *name)
++{ assert(!strcmp(name,"apple,t8132-sn201202x")); return node != NULL; }
++static int spmi_register_zero_write(struct spmi_device *s,u8 reg)
++{ (void)s; selected=reg; writes++; return select_error; }
++static int spmi_register_read(struct spmi_device *s,u8 reg,u8 *value)
++{
++    (void)s;
++    if(reg==0) {
++        if(status_error) return status_error;
++        if(wrong) { *value=(selected+1)&0x7f; return 0; }
++        if(forever || polls++<busy_cycles) { *value=selected|0x80; return 0; }
++        completed=true; *value=selected; return 0;
++    }
++    assert(reg==0x1f && completed);
++    length_reads++;
++    if(length_error) return length_error;
++    length_checked=true; *value=advertised; return 0;
++}
++static int spmi_ext_register_read(struct spmi_device *s,unsigned off,void *val,size_t len)
++{
++    assert(completed);
++    if(s->dev.of_node) assert(length_checked);
++    assert(len>0 && len<=16 && off==0x20+bytes && off+len<=0x60);
++    payload_reads++;
++    if(payload_error) return payload_error;
++    for(size_t i=0;i<len;i++) ((u8 *)val)[i]=(u8)(off-0x20+i);
++    bytes+=len;
++    return 0;
++}
++#define read_poll_timeout(op,ret,condition,delay,bound,sleep_before,...) ({ \
++    int poll_ret=-ETIMEDOUT; \
++    for(unsigned attempt=0;attempt<8;attempt++) { \
++        (ret)=op(__VA_ARGS__); if(condition) { poll_ret=0; break; } \
++    } poll_ret; })
++#define SN201202X_ATOMIC_SELECT_MS 10
++#define read_poll_timeout_atomic read_poll_timeout
++''' + function(source, "regmap_sn201202x_select_reg") + function(source, "__regmap_sn201202x_read") + r'''
++#define regmap_sn201202x_read __regmap_sn201202x_read
++static void clean(struct spmi_device *s)
++{
++    memset(s,0,sizeof(*s)); s->dev.of_node=s; s->tps.dev=&s->dev;
++    sn=(struct sn201202x){ .select_polled=true };
++    selected=0; advertised=4; busy_cycles=2;
++    polls=writes=length_reads=payload_reads=bytes=0;
++    select_error=status_error=length_error=payload_error=0;
++    wrong=forever=completed=length_checked=false;
++}
++int main(void)
++{
++    struct spmi_device s;
++    u8 reg=0x5f, out[64];
++    clean(&s); memset(out,0xa5,sizeof(out));
++    assert(!regmap_sn201202x_read(&s,&reg,1,out,4));
++    assert(writes==1 && polls==3 && completed && length_reads==1 && payload_reads==1);
++    assert(bytes==4 && out[0]==0 && out[3]==3 && out[4]==0xa5);
++    clean(&s); sn.atomic=true; memset(out,0xa5,sizeof(out));
++    assert(!regmap_sn201202x_read(&s,&reg,1,out,4));
++    assert(writes==1 && polls==3 && completed && length_reads==1 && payload_reads==1);
++    assert(bytes==4 && out[0]==0 && out[3]==3 && out[4]==0xa5);
++    puts("ok 1 - exact selector completion precedes length and payload");
++    for(unsigned length=0;length<=255;length++) for(unsigned request=0;request<=64;request++) {
++        clean(&s); advertised=length; memset(out,0xa5,sizeof(out));
++        int ret=regmap_sn201202x_read(&s,&reg,1,out,request);
++        bool valid=length>=request && length<=64;
++        if(valid) {
++            assert(!ret && bytes==request && payload_reads==(request+15)/16);
++            for(unsigned i=0;i<request;i++) assert(out[i]==i);
++        } else {
++            assert(ret==-EIO && !payload_reads && !bytes);
++            for(unsigned i=0;i<64;i++) assert(out[i]==0xa5);
++        }
++    }
++    puts("ok 2 - all bounded lengths, short responses and oversized payloads");
++    clean(&s); select_error=-EREMOTEIO;
++    assert(regmap_sn201202x_read(&s,&reg,1,out,4)==-EREMOTEIO && !length_reads && !payload_reads);
++    clean(&s); status_error=-EIO;
++    assert(regmap_sn201202x_read(&s,&reg,1,out,4)==-EIO && !length_reads && !payload_reads);
++    clean(&s); wrong=true;
++    assert(regmap_sn201202x_read(&s,&reg,1,out,4)==-ETIMEDOUT && !length_reads && !payload_reads);
++    clean(&s); forever=true;
++    assert(regmap_sn201202x_read(&s,&reg,1,out,4)==-ETIMEDOUT && !length_reads && !payload_reads);
++    puts("ok 3 - failed, wrong or busy selection never reaches payload");
++    clean(&s); length_error=-EREMOTEIO;
++    assert(regmap_sn201202x_read(&s,&reg,1,out,4)==-EREMOTEIO && !payload_reads);
++    clean(&s); payload_error=-EREMOTEIO;
++    assert(regmap_sn201202x_read(&s,&reg,1,out,4)==-EREMOTEIO && payload_reads==1 && !bytes);
++    clean(&s);
++    assert(regmap_sn201202x_read(&s,&reg,2,out,4)==-EINVAL && !writes);
++    assert(regmap_sn201202x_read(&s,&reg,1,out,65)==-EINVAL && !writes);
++    reg=0x80;
++    assert(regmap_sn201202x_read(&s,&reg,1,out,4)==-EINVAL && !writes);
++    puts("ok 4 - transport errors and invalid transfer bounds propagate");
++    clean(&s); s.dev.of_node=NULL; reg=0x5f; advertised=0;
++    assert(!regmap_sn201202x_read(&s,&reg,1,out,4) && !length_reads && bytes==4);
++    puts("ok 5 - older SN201202x transport behavior preserved");
++    return 0;
++}
++'''
++    busy = program.replace("err || val == reg", "err || (val & 0x7f) == reg")
++    unchecked = program.replace(
++        'if (of_device_is_compatible(sdev->dev.of_node, "apple,t8132-sn201202x"))',
++        'if (false)', 1)
++    oversized = program.replace("size > TPS_MAX_LEN", "false", 1)
++    assert all(text != program for text in [busy, unchecked, oversized])
++    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
++    print("TAP version 13\n1..6", flush=True)
++    with tempfile.TemporaryDirectory(prefix="sn201202x-transport-") as directory:
++        tmp = Path(directory)
++        for name, text in [("production", program), ("busy", busy),
++                           ("unchecked", unchecked), ("oversized", oversized)]:
++            c, binary = tmp / (name + ".c"), tmp / name
++            c.write_text(text)
++            options = [] if name == "production" else ["-Wno-unused-function"]
++            subprocess.run(["cc", "-std=gnu11", "-Wall", "-Werror"] + options +
++                           [str(c), "-o", str(binary)], check=True)
++            result = subprocess.run([str(binary)], capture_output=name != "production")
++            if name == "production":
++                result.check_returncode()
++            elif result.returncode == 0:
++                raise RuntimeError(f"negative control passed: {name}")
++    print("ok 6 - busy, missing-length and oversize negative controls rejected")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

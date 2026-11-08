@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Tue, 27 Oct 2026 17:48:38 +1100
+Subject: [PATCH] ASoC: apple: refuse speaker backends without enforced
+ protection
+
+Do not let the legacy unsafe parameter admit an unsupported backend, skip
+safe-volume setup failures or expose fixed protection controls. Generic
+apple,macaudio and SSM3515 backends remain disabled. Require a supported
+amplifier, speaker layout and negative safe volume before adding a Speaker
+link. Keep the parameter accepted for compatibility, without unsafe overrides.
+
+Add a hardware-free KUnit regression covering generic fallback, unsupported
+and missing-protection configurations with parameter 2 and other values,
+plus the supported TAS and software-gain paths.
+
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(cherry picked from commit ac3d6315e3e5dd338109d55de1d572875d594b54)
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ sound/soc/apple/macaudio-admission-test.h | 41 +++++++++++++++++++++++
+ sound/soc/apple/macaudio.c                | 30 +++++++++++------
+ 2 files changed, 61 insertions(+), 10 deletions(-)
+ create mode 100644 sound/soc/apple/macaudio-admission-test.h
+
+diff --git a/sound/soc/apple/macaudio-admission-test.h b/sound/soc/apple/macaudio-admission-test.h
+new file mode 100644
+index 0000000000..d0465e887d
+--- /dev/null
++++ b/sound/soc/apple/macaudio-admission-test.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Exercise the same admission predicate used for Speaker/Speakers DT links. */
++#include <kunit/test.h>
++
++static void macaudio_admission_unsafe_parameter_cannot_admit_speakers(struct kunit *test)
++{
++	struct macaudio_platform_cfg cfg = macaudio_j413_cfg;
++	int saved = please_blow_up_my_speakers;
++	int values[] = { 0, 1, 2, 3, -1 };
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(values); i++) {
++		please_blow_up_my_speakers = values[i];
++		/* Generic apple,macaudio plus a DT Speaker backend. */
++		KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_fallback_cfg));
++		KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j45x_cfg));
++		KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j413_cfg));
++		KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j700_cfg));
++		cfg = macaudio_j413_cfg;
++		cfg.safe_vol = 0;
++		KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&cfg));
++		cfg = macaudio_j413_cfg;
++		cfg.speakers = SPKR_NONE;
++		KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&cfg));
++		cfg = macaudio_j413_cfg;
++		cfg.amp = AMP_NONE;
++		KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&cfg));
++	}
++	please_blow_up_my_speakers = saved;
++}
++
++static struct kunit_case macaudio_admission_cases[] = {
++	KUNIT_CASE(macaudio_admission_unsafe_parameter_cannot_admit_speakers),
++	{}
++};
++
++static struct kunit_suite macaudio_admission_suite = {
++	.name = "apple-speaker-admission",
++	.test_cases = macaudio_admission_cases,
++};
++kunit_test_suite(macaudio_admission_suite);
+diff --git a/sound/soc/apple/macaudio.c b/sound/soc/apple/macaudio.c
+index 96cd57aae2..28473445e0 100644
+--- a/sound/soc/apple/macaudio.c
++++ b/sound/soc/apple/macaudio.c
+@@ -225,7 +225,7 @@ struct macaudio_snd_data {
+ 
+ static int please_blow_up_my_speakers;
+ module_param(please_blow_up_my_speakers, int, 0644);
+-MODULE_PARM_DESC(please_blow_up_my_speakers, "Allow unsafe or untested operating configurations");
++MODULE_PARM_DESC(please_blow_up_my_speakers, "Deprecated: cannot bypass speaker admission or protection");
+ 
+ SND_SOC_DAILINK_DEFS(primary,
+ 	DAILINK_COMP_ARRAY(COMP_CPU("mca-pcm-0")), // CPU
+@@ -689,6 +689,16 @@ static int macaudio_copy_link(struct device *dev, struct snd_soc_dai_link *targe
+ 	return 0;
+ }
+ 
++/* A Speaker DT link alone does not establish a protected backend. */
++static bool macaudio_speakers_allowed(const struct macaudio_platform_cfg *cfg)
++{
++	/* Every admitted backend must have a configured, enforced safe level. */
++	return cfg->enable_speakers && cfg->safe_vol < 0 &&
++		cfg->speakers != SPKR_NONE &&
++		(cfg->amp == AMP_TAS5770 || cfg->amp == AMP_SN012776 ||
++		 cfg->amp == AMP_MAX98360A);
++}
++
+ static int macaudio_parse_of_component(struct device_node *node, int index,
+ 				struct snd_soc_dai_link_component *comp)
+ {
+@@ -885,7 +895,7 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
+ 		speakers = !strcmp(link_name, "Speaker")
+ 			   || !strcmp(link_name, "Speakers");
+ 		if (speakers) {
+-			if (!ma->cfg->enable_speakers  && !please_blow_up_my_speakers) {
++			if (!macaudio_speakers_allowed(ma->cfg)) {
+ 				dev_err(card->dev, "driver can't assure safety on this model, disabling speakers\n");
+ 				continue;
+ 			}
+@@ -1657,8 +1667,7 @@ static int macaudio_card_remove(struct snd_soc_card *card)
+ 		if (err < 0) {                                                 \
+ 			dev_err(card->dev, "%s on '%s': %d\n", #call, pattern, \
+ 				ret);                                          \
+-			if (please_blow_up_my_speakers < 2)                    \
+-				return err;                                    \
++			return err;                                    \
+ 		} else {                                                       \
+ 			dev_dbg(card->dev, "%s on '%s': %d hits\n", #call,     \
+ 				pattern, ret);                                 \
+@@ -1698,8 +1707,7 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
+ 		CHECK_CONCAT(snd_soc_set_enum_kctl, "HPF Corner Frequency",
+ 			     tweeter ? "800 Hz" : "2 Hz");
+ 
+-		if (please_blow_up_my_speakers < 2)
+-			CHECK_CONCAT(snd_soc_deactivate_kctl, "HPF Corner Frequency", 0);
++		CHECK_CONCAT(snd_soc_deactivate_kctl, "HPF Corner Frequency", 0);
+ 
+ 		CHECK_CONCAT(snd_soc_set_enum_kctl, "OCE Handling", "Retry");
+ 		CHECK_CONCAT(snd_soc_deactivate_kctl, "OCE Handling", 0);
+@@ -1708,8 +1716,7 @@ static int macaudio_set_speaker(struct snd_soc_card *card, const char *prefix, b
+ 		/* TODO: check */
+ 		CHECK_CONCAT(snd_soc_set_enum_kctl, "DAC Analog Gain Select", "8.4 V Span");
+ 
+-		if (please_blow_up_my_speakers < 2)
+-			CHECK_CONCAT(snd_soc_deactivate_kctl, "DAC Analog Gain Select", 0);
++		CHECK_CONCAT(snd_soc_deactivate_kctl, "DAC Analog Gain Select", 0);
+ 
+ 		/* TODO: HPF, needs new call to set */
+ 		break;
+@@ -1749,8 +1756,7 @@ static int macaudio_fixup_controls(struct snd_soc_card *card)
+ 	 */
+ 	switch(ma->cfg->speakers) {
+ 	case SPKR_NONE:
+-		WARN_ON(please_blow_up_my_speakers < 2);
+-		return please_blow_up_my_speakers >= 2 ? 0 : -EINVAL;
++		return -EINVAL;
+ 	case SPKR_1W:
+ 		/* only 1W stereo system (J313) is uses cs42l83 */
+ 		if (ma->cfg->stereo) {
+@@ -2315,3 +2321,7 @@ module_platform_driver(macaudio_snd_driver);
+ MODULE_AUTHOR("Martin Povišer <povik+lin@cutebit.org>");
+ MODULE_DESCRIPTION("Apple Silicon Macs machine-level sound driver");
+ MODULE_LICENSE("GPL");
++
++#if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
++#include "macaudio-admission-test.h"
++#endif

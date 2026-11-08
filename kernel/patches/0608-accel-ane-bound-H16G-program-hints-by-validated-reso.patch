@@ -1,0 +1,271 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 17:37:04 +1100
+Subject: [PATCH] accel/ane: bound H16G program hints by validated resources
+
+The staged compiler increases the program record and work hints with task
+and tensor size. Treating these hints as enums rejects softmax, tiled
+matmul and larger elementwise programs before firmware sees them.
+
+Bound the nonzero record hint by the validated task payload's capacity
+for minimum-sized records, excluding task headers and padding. It is not
+an exact encoded record count: the staged softmax declares 88 with 51
+encoded records, while the 3072 matmul declares 340 with 757 records.
+Bound the work hint by the sum of validated surface allocation bytes.
+Neither hint grants an allocation, mapping or stream extent.
+
+Keep all structural, register, relocation and reserved-byte checks.
+Exercise staged task/hint combinations in both program forms, coalesced
+records, count and work boundaries, and malformed payloads in KUnit.
+
+Signed-off-by: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Assisted-by: LLM
+(cherry picked from commit 303fb19521ac0b6fdf19084794b5f5197e180dab)
+---
+ drivers/accel/ane/ane_h16_hwx.c              | 41 +++++-----
+ drivers/accel/ane/ane_h16_hwx_test.c         | 86 ++++++++++++++++++++
+ drivers/accel/ane/ane_h16_hwx_test_fixture.h |  2 +-
+ drivers/accel/ane/ane_h16_tasks.h            | 19 ++++-
+ 4 files changed, 122 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/accel/ane/ane_h16_hwx.c b/drivers/accel/ane/ane_h16_hwx.c
+index e970df7d11..aaa38d29e6 100644
+--- a/drivers/accel/ane/ane_h16_hwx.c
++++ b/drivers/accel/ane/ane_h16_hwx.c
+@@ -206,25 +206,13 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
+ 	return 0;
+ }
+ 
+-static bool hwx_format(u32 code)
+-{
+-	static const u8 known[] = {
+-		0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 15, 16, 17,
+-		18, 20, 21, 23, 27, 30, 31, 36, 41, 43, 72, 145,
+-	};
+-	unsigned int i;
+-
+-	for (i = 0; i < ARRAY_SIZE(known); i++)
+-		if (known[i] == code)
+-			return true;
+-	return false;
+-}
+-
+ static int hwx_program(struct hwx_parser *p)
+ {
+ 	const u8 *c = p->bytes + p->info.program_offset;
+ 	struct ane_h16_hwx *info = &p->info;
+-	u32 length = get_unaligned_le32(c + 4), records, i;
++	u32 length = get_unaligned_le32(c + 4), records, record_limit, i;
++	u32 prologue = info->subtype == ANE_HWX_SUBTYPE_H17 ? 0 : 1;
++	u64 work_limit = 0;
+ 	bool mixed = length == 0x8c0;
+ 	/* Nonzero cells only; every other byte is checked below. */
+ 	static const u16 common[] = {
+@@ -249,8 +237,6 @@ static int hwx_program(struct hwx_parser *p)
+ 	    get_unaligned_le32(c + 0x848) != (mixed ? 0x8b8 : 0x898))
+ 		return -ENOEXEC;
+ 	records = get_unaligned_le32(c + 0x860);
+-	if (records != 0x10 && records != 0x12 && records != 0x1f && records != 0x20)
+-		return -ENOEXEC;
+ 	info->tasks = get_unaligned_le32(c + 0x830);
+ 	if (mixed) {
+ 		u32 usable = get_unaligned_le32(c + 0x858);
+@@ -271,7 +257,14 @@ static int hwx_program(struct hwx_parser *p)
+ 		    get_unaligned_le64(c + 0x78 + i * 16))
+ 			return -ENOEXEC;
+ 	}
+-	if (!hwx_format(get_unaligned_le32(c + (mixed ? 0x8b0 : 0x890))))
++	/*
++	 * Work hints scale with tensor size, rather than selecting a format.
++	 * Bound them by the total validated surface allocation in bytes; they
++	 * never authorize an allocation, mapping or task-stream extent.
++	 */
++	for (i = 0; i < info->surface_count; i++)
++		work_limit += info->surfaces[i].allocation;
++	if (get_unaligned_le32(c + (mixed ? 0x8b0 : 0x890)) > work_limit)
+ 		return -ENOEXEC;
+ 
+ 	/* Construct the exact fixed trailer and reserved-space expectation. */
+@@ -301,10 +294,14 @@ static int hwx_program(struct hwx_parser *p)
+ 	}
+ 	memcpy(expected + (mixed ? 0x8b0 : 0x890), c + (mixed ? 0x8b0 : 0x890), 4);
+ 	memcpy(expected + (mixed ? 0x8b8 : 0x898), "main", 5);
+-	if (!memcmp(c, expected, length))
+-		ret = ane_hx_task_stream_validate(p->bytes + info->text.offset,
+-						  info->text.size, info->tasks,
+-						  info->subtype == ANE_HWX_SUBTYPE_H17 ? 0 : 1);
++	if (!memcmp(c, expected, length)) {
++		ret = ane_hx_task_stream_validate_limit(p->bytes + info->text.offset,
++							info->text.size, info->tasks, prologue,
++							&record_limit);
++		/* This compiler hint need not equal the encoded record count. */
++		if (!ret && (!records || records > record_limit))
++			ret = -ENOEXEC;
++	}
+ 	kfree(expected);
+ 	return ret;
+ }
+diff --git a/drivers/accel/ane/ane_h16_hwx_test.c b/drivers/accel/ane/ane_h16_hwx_test.c
+index 86af1c4779..1b852982f3 100644
+--- a/drivers/accel/ane/ane_h16_hwx_test.c
++++ b/drivers/accel/ane/ane_h16_hwx_test.c
+@@ -216,6 +216,91 @@ static void hwx_program_test(struct kunit *test)
+ 	}
+ }
+ 
++/* Build only structural tasks: no model bytes or hardware fixtures needed. */
++static void fixture_tasks(struct hwx_fixture *f, u32 tasks, u32 records)
++{
++	u8 *text = f->bytes + SZ_16K, *program = f->bytes + f->program;
++	u8 *section = f->bytes + f->text_command + 72;
++	u64 vm = get_unaligned_le64(section + 32);
++	u32 pos = 16, task, constants;
++
++	memset(text, 0, SZ_16K);
++	put_unaligned_le32(1, text);
++	for (task = 0; task < tasks; task++) {
++		u32 count = records / tasks + (task < records % tasks);
++
++		put_unaligned_le32((9 + 2 * count) << 16, text + pos);
++		/* Coalesce writes: the hint exceeds the encoded record count. */
++		put_unaligned_le32(((2 * count - 2) << 15) | (0x4100 / 4),
++				   text + pos + 36);
++		pos += (9 + 2 * count) * 4;
++		if (task + 1 < tasks)
++			pos = ALIGN(pos, 16);
++	}
++	constants = ALIGN(pos, 64);
++	put_unaligned_le64(pos, section + 40);
++	put_unaligned_le64(vm + constants, section + 80 + 32);
++	put_unaligned_le32(SZ_16K + constants, section + 80 + 48);
++	put_unaligned_le64(vm + constants, program + 0x20);
++	put_unaligned_le32(pos / 4, program + 0x824);
++	put_unaligned_le32(tasks, program + 0x830);
++	put_unaligned_le32(records, program + 0x860);
++}
++
++static void hwx_staged_counts_test(struct kunit *test)
++{
++	static const struct {
++		u32 tasks, records, work;
++	} shapes[] = {
++		{ 7, 0x58, 1 }, /* Row softmax. */
++		{ 4, 0x2e, 0 }, /* Tiled matmul 768. */
++		{ 5, 0x3c, 0 }, /* Tiled matmul 896. */
++		{ 7, 0x58, 0 }, /* Tiled matmul 1536. */
++		{ 25, 0x154, 0 }, /* Tiled matmul 3072. */
++		{ 10, 0x75, 1 }, /* Decoded attention. */
++		{ 1, 0x10, 61 }, { 1, 0x10, 92 }, /* LUT/ALU 1024. */
++		{ 1, 0x10, 245 }, { 1, 0x10, 368 }, /* LUT/ALU 2048. */
++	};
++	struct ane_h16_hwx info;
++	unsigned int form, i;
++
++	for (form = 0; form < 2; form++) {
++		for (i = 0; i < ARRAY_SIZE(shapes); i++) {
++			struct hwx_fixture *f = fixture_create(test, form, false);
++			u32 work_offset = form ? 0x8b0 : 0x890;
++			u8 *program;
++
++			KUNIT_ASSERT_NOT_NULL(test, f);
++			fixture_tasks(f, shapes[i].tasks, shapes[i].records);
++			program = f->bytes + f->program;
++			put_unaligned_le32(shapes[i].work, program + work_offset);
++			KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
++			KUNIT_EXPECT_EQ(test, info.tasks, shapes[i].tasks);
++			/* Neither count nor work may exceed its program-derived bound. */
++			put_unaligned_le32(shapes[i].records + 1, program + 0x860);
++			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
++					-ENOEXEC);
++			put_unaligned_le32(0, program + 0x860);
++			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
++					-ENOEXEC);
++			put_unaligned_le32(shapes[i].records, program + 0x860);
++			put_unaligned_le32(SZ_32K, program + work_offset);
++			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
++			put_unaligned_le32(SZ_32K + 1, program + work_offset);
++			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
++					-ENOEXEC);
++			put_unaligned_le32(U32_MAX, program + work_offset);
++			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
++					-ENOEXEC);
++			put_unaligned_le32(shapes[i].work, program + work_offset);
++			/* A plausible hint never overrides a corrupt task stream. */
++			put_unaligned_le32(0x6000 / 4, f->bytes + SZ_16K + 52);
++			KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info),
++					-ENOEXEC);
++		}
++	}
++}
++
+ static void hwx_geometry_test(struct kunit *test)
+ {
+ 	struct hwx_fixture *f = fixture_create(test, false, false);
+@@ -483,6 +568,7 @@ static struct kunit_case hwx_cases[] = {
+ 	KUNIT_CASE(hwx_tensor_test),
+ 	KUNIT_CASE(hwx_surface_order_test),
+ 	KUNIT_CASE(hwx_program_test),
++	KUNIT_CASE(hwx_staged_counts_test),
+ 	KUNIT_CASE(hwx_geometry_test),
+ 	KUNIT_CASE(hwx_symbols_test),
+ 	KUNIT_CASE(hwx_relocations_test),
+diff --git a/drivers/accel/ane/ane_h16_hwx_test_fixture.h b/drivers/accel/ane/ane_h16_hwx_test_fixture.h
+index fd839d68af..e129550d84 100644
+--- a/drivers/accel/ane/ane_h16_hwx_test_fixture.h
++++ b/drivers/accel/ane/ane_h16_hwx_test_fixture.h
+@@ -122,7 +122,7 @@ static struct hwx_fixture *fixture_create(struct kunit *test, bool mixed, bool k
+ 	put_unaligned_le32(U32_MAX, c + 0x83c);
+ 	put_unaligned_le32(0xffff, c + 0x844);
+ 	put_unaligned_le32(mixed ? 0x8b8 : 0x898, c + 0x848);
+-	put_unaligned_le32(0x10, c + 0x860);
++	put_unaligned_le32(1, c + 0x860);
+ 	put_unaligned_le32(4, c + 0x868);
+ 	put_unaligned_le32(mixed ? 4 : 2, c + 0x870);
+ 	put_unaligned_le32(mixed ? 2 : 7, c + 0x878);
+diff --git a/drivers/accel/ane/ane_h16_tasks.h b/drivers/accel/ane/ane_h16_tasks.h
+index e6e4ebc706..413be2af81 100644
+--- a/drivers/accel/ane/ane_h16_tasks.h
++++ b/drivers/accel/ane/ane_h16_tasks.h
+@@ -41,11 +41,12 @@ static inline bool ane_h16_register_valid(u32 word)
+  * does not replace container/tensor/aperture validation.
+  */
+ static inline int
+-ane_hx_task_stream_validate(const void *text, size_t size, u32 expected_tasks, u32 prologue)
++ane_hx_task_stream_validate_limit(const void *text, size_t size, u32 expected_tasks,
++				  u32 prologue, u32 *record_limit)
+ {
+ 	const u8 *p = text;
+ 	size_t pos = 16;
+-	u32 tasks = 0;
++	u32 tasks = 0, limit = 0;
+ 
+ 	if (!p || !expected_tasks || size < 16 || size > ANE_H16_TASK_MAX ||
+ 	    (size & 3) || get_unaligned_le32(p) != prologue ||
+@@ -72,6 +73,8 @@ ane_hx_task_stream_validate(const void *text, size_t size, u32 expected_tasks, u
+ 		if (words < header_words)
+ 			return -ENOEXEC;
+ 		rec = pos + header_words * 4;
++		/* A record needs at least one header and one register value. */
++		limit += (end - rec) / 8;
+ 		while (rec < end) {
+ 			u32 h = get_unaligned_le32(p + rec);
+ 			u32 base = h & 0x7fff;
+@@ -104,7 +107,17 @@ ane_hx_task_stream_validate(const void *text, size_t size, u32 expected_tasks, u
+ 		if (++tasks > expected_tasks)
+ 			return -ENOEXEC;
+ 	}
+-	return tasks == expected_tasks ? 0 : -ENOEXEC;
++	if (tasks != expected_tasks)
++		return -ENOEXEC;
++	if (record_limit)
++		*record_limit = limit;
++	return 0;
++}
++
++static inline int
++ane_hx_task_stream_validate(const void *text, size_t size, u32 expected_tasks, u32 prologue)
++{
++	return ane_hx_task_stream_validate_limit(text, size, expected_tasks, prologue, NULL);
+ }
+ 
+ static inline int

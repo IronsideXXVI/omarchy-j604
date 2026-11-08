@@ -1,0 +1,473 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Sun, 1 Nov 2026 11:28:17 +1100
+Subject: [PATCH] pmdomain: apple: pmc: provide rail floors as power domains
+
+Some devices only run at full speed while a shared rail is above its
+lowest state. The M4 Pro video encoder runs on the SoC fabric clock: with
+the SoC rail at its idle state it encodes 1080p H.264 at 100 fps, with the
+rail at its highest state at 219 fps, close to what macOS gets (it raises
+the same rail for every encode session).
+
+Let the DT describe such a floor as a child of the PMC with a rail and a
+performance state, and provide it as a power domain. While the domain is
+powered, the AP's own voter agent holds the rail at least at that state.
+Floors on one rail combine to the highest one held, so several devices
+can share a rail. The DCS rail is left to the DCS limit, which votes
+through the same agent. Floors are dropped when the PMC goes away.
+
+Add KUnit cases for combining floors next to the AP's DCS vote and for a
+PMC that does not take the new floor.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(cherry picked from commit 6da646dd86cdb4cb2a00858ce546da02a9657c0a)
+[j604: conflict resolved on a15y by strict diff3 rules (ours==base ws-only -> theirs; empty base -> union): drivers/pmdomain/apple/pmc-test.c; hunk 1 line 271: ours 3 base 0 theirs 2 -> union (empty base);drivers/pmdomain/apple/pmc.c; hunk 1 line 346: ours 17 base 15 theirs 1 -> theirs (ours==base modulo ws)]
+[j604: a15y apple_pmc_hw has no agent_rails (Aurora T6040 5ae9585175 not carried; it is 0, every rail, for T8132/T8140): that term dropped from the rail check]
+[j604: floor_aggregate KUnit case uses a test-local four-rail fixture (Aurora T6040 layout, 5ae9585175 not carried, without agent_rails)]
+---
+ .../devicetree/bindings/power/apple,pmc.yaml  |  38 ++++
+ drivers/pmdomain/apple/pmc-test.c             |  82 ++++++++
+ drivers/pmdomain/apple/pmc.c                  | 184 +++++++++++++++---
+ 3 files changed, 282 insertions(+), 22 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/power/apple,pmc.yaml b/Documentation/devicetree/bindings/power/apple,pmc.yaml
+index 036902f365..1a92ae2ade 100644
+--- a/Documentation/devicetree/bindings/power/apple,pmc.yaml
++++ b/Documentation/devicetree/bindings/power/apple,pmc.yaml
+@@ -100,6 +100,37 @@ patternProperties:
+       - reg
+       - '#power-domain-cells'
+ 
++  '^floor-[a-z0-9-]+$':
++    type: object
++    description: |
++      A rail floor, provided as a power domain. While the domain is powered,
++      the AP's voter agent holds the rail at least at the given performance
++      state. Floors on the same rail combine to the highest powered one. The
++      AP agent must be a static voter, and the DCS rail cannot have a floor.
++    additionalProperties: false
++
++    properties:
++      label:
++        description: Name of the power domain.
++
++      '#power-domain-cells':
++        const: 0
++
++      apple,rail:
++        $ref: /schemas/types.yaml#/definitions/uint32
++        description: Rail index.
++
++      apple,level:
++        $ref: /schemas/types.yaml#/definitions/uint32
++        minimum: 1
++        maximum: 15
++        description: Performance state held while the domain is powered.
++
++    required:
++      - '#power-domain-cells'
++      - apple,rail
++      - apple,level
++
+   '^performance-controller@[0-9a-f]+$':
+     type: object
+     description: The host performance controller's voter agent.
+@@ -157,5 +188,12 @@ examples:
+                 label = "gfx";
+                 #power-domain-cells = <0>;
+             };
++
++            floor-soc-max {
++                label = "soc-max";
++                #power-domain-cells = <0>;
++                apple,rail = <1>;
++                apple,level = <2>;
++            };
+         };
+     };
+diff --git a/drivers/pmdomain/apple/pmc-test.c b/drivers/pmdomain/apple/pmc-test.c
+index 89a9b8f069..ec09fbf018 100644
+--- a/drivers/pmdomain/apple/pmc-test.c
++++ b/drivers/pmdomain/apple/pmc-test.c
+@@ -198,6 +198,86 @@ static void apple_pmc_test_t8140_ignores_pending_word(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, readl(reg) & 0xff, 0x35);
+ }
+ 
++static struct apple_pmc_domain *apple_pmc_test_floor(struct kunit *test,
++						     struct apple_pmc *pmc,
++						     unsigned int rail,
++						     unsigned int level)
++{
++	struct apple_pmc_domain *dom = kunit_kzalloc(test, sizeof(*dom), GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, dom);
++	dom->pmc = pmc;
++	dom->floor = true;
++	dom->rail = rail;
++	dom->level = level;
++	list_add_tail(&dom->list, &pmc->domains);
++	return dom;
++}
++
++/*
++ * Four rails and no pending word: Aurora's T6040 layout, which this tree does not
++ * carry (the floors are tested on a rail other than the DCS rail and a third one).
++ */
++static const struct apple_pmc_hw apple_pmc_test_hw_four_rails = {
++	.agent_stride = 0x4000,
++	.agents = 4,
++	.rails = 4,
++	.agent_state = 0x0,
++	.rail_enable = 0x2000,
++	.dcs_rail = 0,
++	.dcs_max = 5,
++	.ap_agent = 3,
++};
++
++static u32 apple_pmc_test_ap_floor(struct apple_pmc *pmc)
++{
++	return readl(pmc->voters + pmc->hw->ap_agent * pmc->hw->agent_stride);
++}
++
++/*
++ * Floors on one rail combine to the highest one held, leave other rails and
++ * the AP's DCS vote alone, and are gone once the last one is released.
++ */
++static void apple_pmc_test_floor_aggregate(struct kunit *test)
++{
++	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
++	struct apple_pmc_domain *mid, *max, *other;
++	u32 soc = APPLE_PMC_RAIL_MASK(1);
++
++	INIT_LIST_HEAD(&pmc->domains);
++	pmc->hw = &apple_pmc_test_hw_four_rails;
++	apple_pmc_test_set_dcs_vote(pmc, pmc->hw->ap_agent, 3);
++	mid = apple_pmc_test_floor(test, pmc, 1, 1);
++	max = apple_pmc_test_floor(test, pmc, 1, 2);
++	other = apple_pmc_test_floor(test, pmc, 3, 1);
++
++	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(mid, true), 0);
++	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & soc, 1U << 4);
++	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(max, true), 0);
++	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & soc, 2U << 4);
++	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(max, false), 0);
++	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc) & soc, 1U << 4);
++	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(mid, false), 0);
++	KUNIT_EXPECT_EQ(test, apple_pmc_test_ap_floor(pmc), 3U);
++	KUNIT_EXPECT_FALSE(test, other->on);
++}
++
++/* A floor that the PMC does not take back is not left marked as held. */
++static void apple_pmc_test_floor_pending_timeout(struct kunit *test)
++{
++	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
++	struct apple_pmc_domain *dom;
++	void __iomem *reg;
++
++	INIT_LIST_HEAD(&pmc->domains);
++	pmc->hw = &apple_pmc_hw_t8132;
++	reg = pmc->voters + pmc->hw->ap_agent * pmc->hw->agent_stride;
++	writel(BIT(pmc->hw->ap_agent), reg + 4);
++	dom = apple_pmc_test_floor(test, pmc, 1, 2);
++	KUNIT_EXPECT_EQ(test, apple_pmc_floor_set(dom, true), -ETIMEDOUT);
++	KUNIT_EXPECT_FALSE(test, dom->on);
++}
++
+ static struct kunit_case apple_pmc_test_cases[] = {
+ 	KUNIT_CASE(apple_pmc_test_partial_enable),
+ 	KUNIT_CASE(apple_pmc_test_release_restores_ap_vote),
+@@ -206,6 +286,8 @@ static struct kunit_case apple_pmc_test_cases[] = {
+ 	KUNIT_CASE(apple_pmc_test_t8132_floor_update),
+ 	KUNIT_CASE(apple_pmc_test_t8132_pending_stuck),
+ 	KUNIT_CASE(apple_pmc_test_t8140_ignores_pending_word),
++	KUNIT_CASE(apple_pmc_test_floor_aggregate),
++	KUNIT_CASE(apple_pmc_test_floor_pending_timeout),
+ 	{}
+ };
+ 
+diff --git a/drivers/pmdomain/apple/pmc.c b/drivers/pmdomain/apple/pmc.c
+index 7d60ecf721..212a570685 100644
+--- a/drivers/pmdomain/apple/pmc.c
++++ b/drivers/pmdomain/apple/pmc.c
+@@ -17,6 +17,12 @@
+  * and models each dynamic agent as a power domain that sits between the
+  * device and its PMGR power state, which gives the same ordering.
+  *
++ * A rail floor is a power domain too: while any device in it is powered,
++ * the AP's own agent holds that rail at a given performance state. The AVE
++ * encoder on the M4 Pro runs on the SoC fabric clock and needs the SoC rail
++ * at its highest state to encode at full speed; macOS raises the same rail
++ * for every encode session. Floors on one rail combine to the highest.
++ *
+  * Under thermal pressure the driver can also limit the DRAM controller
+  * (DCS) rail: it stops honouring the other agents on that rail and votes
+  * on their behalf through the AP's own agent, capped. This bounds the heat
+@@ -97,6 +103,8 @@ struct apple_pmc {
+ 	/* Agents enabled on each rail, before any DCS limit is applied. */
+ 	u32 enable[APPLE_PMC_MAX_RAILS];
+ 	u32 static_agents;
++	/* Rails with a floor domain. */
++	u32 floor_rails;
+ 	struct list_head domains;
+ 	struct dentry *debugfs;
+ 	/* Cooling state of the DCS limit: 0 is none, dcs_max holds DCS at 0. */
+@@ -108,12 +116,24 @@ struct apple_pmc {
+ 	struct delayed_work dcs_work;
+ };
+ 
++/**
++ * struct apple_pmc_domain - a power domain provided by the PMC
++ * @agent: dynamic voter agent the domain enables (not for a floor)
++ * @floor: the domain is a rail floor held through the AP's agent
++ * @rail: with @floor, the rail
++ * @level: with @floor, the performance state held while powered
++ * @on: with @floor, whether the floor is held; protected by pmc->lock
++ */
+ struct apple_pmc_domain {
+ 	struct generic_pm_domain genpd;
+ 	struct apple_pmc *pmc;
+ 	struct device_node *np;
+ 	struct list_head list;
+ 	unsigned int agent;
++	bool floor;
++	unsigned int rail;
++	unsigned int level;
++	bool on;
+ 	bool provider;
+ };
+ 
+@@ -268,6 +288,32 @@ u32 apple_pmc_floor_read(struct device *dev, unsigned int agent)
+ }
+ EXPORT_SYMBOL_GPL(apple_pmc_floor_read);
+ 
++/* Caller holds pmc->lock. */
++static int __apple_pmc_floor_update(struct apple_pmc *pmc, unsigned int agent,
++				    u32 mask, u32 value)
++{
++	void __iomem *reg = pmc->voters + agent * pmc->hw->agent_stride;
++	u32 old, val;
++	int ret = 0;
++
++	if (pmc->hw->has_pending) {
++		ret = readl_poll_timeout_atomic(reg + 4, old, !(old & BIT(agent)), 1, 1000);
++		if (ret)
++			return ret;
++	}
++	old = readl(reg);
++	val = (old & ~mask) | (value & mask);
++	if (val != old) {
++		writel(val, reg);
++		if ((readl(reg) & mask) != (value & mask))
++			ret = -EIO;
++	}
++	if (!ret && pmc->hw->has_pending)
++		ret = readl_poll_timeout_atomic(reg + 4, old, !(old & BIT(agent)), 1, 1000);
++
++	return ret;
++}
++
+ /**
+  * apple_pmc_floor_update() - update the perf-state floor of an agent
+  * @dev: the PMC device
+@@ -290,33 +336,14 @@ int apple_pmc_floor_update(struct device *dev, unsigned int agent, u32 mask,
+ 			   u32 value)
+ {
+ 	struct apple_pmc *pmc = apple_pmc_from_dev(dev);
+-	void __iomem *reg;
+ 	unsigned long flags;
+-	u32 old, val;
+-	int ret = 0;
++	int ret;
+ 
+ 	if (!pmc || agent >= pmc->hw->agents)
+ 		return -EINVAL;
+ 
+-	reg = pmc->voters + agent * pmc->hw->agent_stride;
+ 	raw_spin_lock_irqsave(&pmc->lock, flags);
+-	if (pmc->hw->has_pending) {
+-		ret = readl_poll_timeout_atomic(reg + 4, old, !(old & BIT(agent)),
+-						1, 1000);
+-		if (ret)
+-			goto unlock;
+-	}
+-	old = readl(reg);
+-	val = (old & ~mask) | (value & mask);
+-	if (val != old) {
+-		writel(val, reg);
+-		if ((readl(reg) & mask) != (value & mask))
+-			ret = -EIO;
+-	}
+-	if (!ret && pmc->hw->has_pending)
+-		ret = readl_poll_timeout_atomic(reg + 4, old, !(old & BIT(agent)),
+-						1, 1000);
+-unlock:
++	ret = __apple_pmc_floor_update(pmc, agent, mask, value);
+ 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
+ 
+ 	return ret;
+@@ -574,10 +601,48 @@ static int apple_pmc_dcs_init(struct apple_pmc *pmc)
+ 	return 0;
+ }
+ 
++/*
++ * Caller holds pmc->lock. The AP agent's floor on @rail becomes the highest
++ * level of the floors held there.
++ */
++static int apple_pmc_floor_apply(struct apple_pmc *pmc, unsigned int rail)
++{
++	struct apple_pmc_domain *dom;
++	unsigned int level = 0;
++
++	list_for_each_entry(dom, &pmc->domains, list)
++		if (dom->floor && dom->rail == rail && dom->on)
++			level = max(level, dom->level);
++
++	return __apple_pmc_floor_update(pmc, pmc->hw->ap_agent,
++					APPLE_PMC_RAIL_MASK(rail),
++					level << APPLE_PMC_RAIL_SHIFT(rail));
++}
++
++static int apple_pmc_floor_set(struct apple_pmc_domain *dom, bool on)
++{
++	struct apple_pmc *pmc = dom->pmc;
++	unsigned long flags;
++	int ret;
++
++	raw_spin_lock_irqsave(&pmc->lock, flags);
++	dom->on = on;
++	ret = apple_pmc_floor_apply(pmc, dom->rail);
++	if (ret) {
++		dom->on = !on;
++		apple_pmc_floor_apply(pmc, dom->rail);
++	}
++	raw_spin_unlock_irqrestore(&pmc->lock, flags);
++
++	return ret;
++}
++
+ static int apple_pmc_domain_power_on(struct generic_pm_domain *genpd)
+ {
+ 	struct apple_pmc_domain *dom = genpd_to_apple_pmc_domain(genpd);
+ 
++	if (dom->floor)
++		return apple_pmc_floor_set(dom, true);
+ 	return apple_pmc_agent_enable(dom->pmc, dom->agent, true);
+ }
+ 
+@@ -585,6 +650,8 @@ static int apple_pmc_domain_power_off(struct generic_pm_domain *genpd)
+ {
+ 	struct apple_pmc_domain *dom = genpd_to_apple_pmc_domain(genpd);
+ 
++	if (dom->floor)
++		return apple_pmc_floor_set(dom, false);
+ 	return apple_pmc_agent_enable(dom->pmc, dom->agent, false);
+ }
+ 
+@@ -676,10 +743,71 @@ static int apple_pmc_domain_add(struct apple_pmc *pmc, struct device_node *np)
+ 	return 0;
+ }
+ 
++/* A rail floor held through the AP's agent while the domain is powered. */
++static int apple_pmc_floor_add(struct apple_pmc *pmc, struct device_node *np)
++{
++	const struct apple_pmc_hw *hw = pmc->hw;
++	struct device *dev = pmc->dev;
++	struct apple_pmc_domain *dom;
++	const char *label;
++	u32 rail, level;
++	int ret;
++
++	if (of_property_read_u32(np, "apple,rail", &rail) ||
++	    of_property_read_u32(np, "apple,level", &level))
++		return dev_err_probe(dev, -EINVAL, "%pOF: missing rail or level\n", np);
++	/* The DCS rail's AP vote belongs to the DCS limit. */
++	if (rail >= hw->rails || rail == hw->dcs_rail)
++		return dev_err_probe(dev, -EINVAL, "%pOF: invalid rail %u\n", np, rail);
++	if (!level || level >= APPLE_PMC_MAX_STATES)
++		return dev_err_probe(dev, -EINVAL, "%pOF: invalid level %u\n", np, level);
++	if (!(pmc->static_agents & BIT(hw->ap_agent)))
++		return dev_err_probe(dev, -EINVAL,
++				     "%pOF: the AP agent is not a static voter\n", np);
++
++	dom = kzalloc_obj(*dom);
++	if (!dom)
++		return -ENOMEM;
++
++	dom->pmc = pmc;
++	dom->np = of_node_get(np);
++	dom->floor = true;
++	dom->rail = rail;
++	dom->level = level;
++	if (of_property_read_string(np, "label", &label))
++		label = np->name;
++	dom->genpd.name = kasprintf(GFP_KERNEL, "pmc-%s", label);
++	if (!dom->genpd.name) {
++		of_node_put(dom->np);
++		kfree(dom);
++		return -ENOMEM;
++	}
++	dom->genpd.power_on = apple_pmc_domain_power_on;
++	dom->genpd.power_off = apple_pmc_domain_power_off;
++
++	ret = pm_genpd_init(&dom->genpd, NULL, true);
++	if (ret) {
++		of_node_put(dom->np);
++		kfree(dom->genpd.name);
++		kfree(dom);
++		return dev_err_probe(dev, ret, "%pOF: genpd init failed\n", np);
++	}
++	list_add_tail(&dom->list, &pmc->domains);
++
++	ret = of_genpd_add_provider_simple(np, &dom->genpd);
++	if (ret)
++		return dev_err_probe(dev, ret, "%pOF: provider failed\n", np);
++	dom->provider = true;
++	pmc->floor_rails |= BIT(rail);
++
++	return 0;
++}
++
+ static int apple_pmc_status_show(struct seq_file *s, void *unused)
+ {
+ 	struct apple_pmc *pmc = s->private;
+ 	const struct apple_pmc_hw *hw = pmc->hw;
++	struct apple_pmc_domain *dom;
+ 	unsigned int i;
+ 
+ 	seq_printf(s, "static agents: %#x\n", pmc->static_agents);
+@@ -692,6 +820,10 @@ static int apple_pmc_status_show(struct seq_file *s, void *unused)
+ 			   i, apple_pmc_enable_read(pmc, i), pmc->saved_enable[i]);
+ 	seq_printf(s, "dcs limit: state %lu of %u\n", READ_ONCE(pmc->dcs_state),
+ 		   hw->dcs_max);
++	list_for_each_entry(dom, &pmc->domains, list)
++		if (dom->floor)
++			seq_printf(s, "%s: rail%u level %u %s\n", dom->genpd.name,
++				   dom->rail, dom->level, READ_ONCE(dom->on) ? "held" : "released");
+ 
+ 	return 0;
+ }
+@@ -714,6 +846,11 @@ static void apple_pmc_release(void *data)
+ 	/* The cooling device is gone by now; drop any limit it left. */
+ 	cancel_delayed_work_sync(&pmc->dcs_work);
+ 	raw_spin_lock_irqsave(&pmc->lock, flags);
++	/* No floor outlives its domains. */
++	for (rail = 0; rail < pmc->hw->rails; rail++)
++		if (pmc->floor_rails & BIT(rail))
++			__apple_pmc_floor_update(pmc, pmc->hw->ap_agent,
++						 APPLE_PMC_RAIL_MASK(rail), 0);
+ 	for (rail = 0; rail < pmc->hw->rails; rail++)
+ 		writel(pmc->saved_enable[rail],
+ 		       pmc->rails + pmc->hw->rail_enable + 4 * rail);
+@@ -799,7 +936,10 @@ static int apple_pmc_probe(struct platform_device *pdev)
+ 	for_each_available_child_of_node(np, child) {
+ 		if (!of_property_present(child, "#power-domain-cells"))
+ 			continue;
+-		ret = apple_pmc_domain_add(pmc, child);
++		if (of_property_present(child, "apple,rail"))
++			ret = apple_pmc_floor_add(pmc, child);
++		else
++			ret = apple_pmc_domain_add(pmc, child);
+ 		if (ret) {
+ 			of_node_put(child);
+ 			return ret;

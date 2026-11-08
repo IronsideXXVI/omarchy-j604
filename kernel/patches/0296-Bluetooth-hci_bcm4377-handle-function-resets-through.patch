@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Fri, 30 Oct 2026 10:46:10 +1100
+Subject: [PATCH] Bluetooth: hci_bcm4377: handle function resets through the
+ PCI core
+
+Probe resets the function with pci_reset_function_locked() while the
+driver is bound. The driver has no reset_prepare or reset_done handler,
+so since commit a3151e6daaec ("PCI: Warn if a running device is unaware
+of reset") every boot logs
+
+  hci_bcm4377 0000:01:00.1: resetting
+  hci_bcm4377 0000:01:00.1: reset done
+
+on the M1 Pro, the M2 and the M4 Pro. The warning has a point: a reset
+from the PCI core or from sysfs while the controller runs loses its
+firmware and rings, and nothing in the driver notices until commands
+time out.
+
+Add the handlers. Probe resets before it sets the driver data, and
+bcm4377_pci_reset() already quiesces and restarts the controller around
+its own reset, so both are left alone. Any other reset keeps the
+interrupt off while it runs and then rebinds the driver, the recovery
+the driver already uses after a command timeout; that path moves into
+bcm4377_queue_rebind() so both callers share it.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit ec5c702bb54d3332295e7d03344b9005f5e203a8)
+(cherry picked from commit 5bc9ff640132538e6c211c0d152bd3df40230335)
+---
+ drivers/bluetooth/hci_bcm4377.c | 62 +++++++++++++++++++++++++++++----
+ 1 file changed, 56 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/bluetooth/hci_bcm4377.c b/drivers/bluetooth/hci_bcm4377.c
+index c8b6dbd689..3f5c143053 100644
+--- a/drivers/bluetooth/hci_bcm4377.c
++++ b/drivers/bluetooth/hci_bcm4377.c
+@@ -587,6 +587,8 @@ struct bcm4377_data {
+ 	const char *board_type;
+ 
+ 	bool needs_reset;
++	/* Set while bcm4377_pci_reset() resets the function itself. */
++	bool own_reset;
+ 	bool cal_needed;
+ 	bool cal_loaded;
+ 	bool setup_retry_used;
+@@ -1353,7 +1355,9 @@ static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
+ 	if (bcm4377->hw->disable_aspm)
+ 		bcm4377_disable_aspm(bcm4377);
+ 
++	WRITE_ONCE(bcm4377->own_reset, true);
+ 	ret = pci_reset_function(bcm4377->pdev);
++	WRITE_ONCE(bcm4377->own_reset, false);
+ 	if (ret) {
+ 		dev_err(&bcm4377->pdev->dev,
+ 			"function level reset failed: %d\n", ret);
+@@ -2734,14 +2738,12 @@ static void bcm4377_reset_work(struct work_struct *work)
+  * every later command times out until the module is reloaded. Recover the
+  * same way, by rebinding the driver.
+  */
+-static void bcm4377_hci_reset(struct hci_dev *hdev)
++static void bcm4377_queue_rebind(struct bcm4377_data *bcm4377,
++				 const char *why)
+ {
+-	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
++	struct hci_dev *hdev = bcm4377->hdev;
+ 	struct bcm4377_reset_work *rw;
+ 
+-	/* A timeout while still setting up would only loop probe failures. */
+-	if (hci_dev_test_flag(hdev, HCI_SETUP))
+-		return;
+ 	if (test_and_set_bit(0, &bcm4377->reset_pending))
+ 		return;
+ 
+@@ -2751,12 +2753,59 @@ static void bcm4377_hci_reset(struct hci_dev *hdev)
+ 		return;
+ 	}
+ 
+-	bt_dev_err(hdev, "controller not responding, rebinding the driver");
++	bt_dev_err(hdev, "%s, rebinding the driver", why);
+ 	rw->pdev = pci_dev_get(bcm4377->pdev);
+ 	INIT_WORK(&rw->work, bcm4377_reset_work);
+ 	queue_work(bcm4377_reset_wq, &rw->work);
+ }
+ 
++static void bcm4377_hci_reset(struct hci_dev *hdev)
++{
++	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
++
++	/* A timeout while still setting up would only loop probe failures. */
++	if (hci_dev_test_flag(hdev, HCI_SETUP))
++		return;
++	bcm4377_queue_rebind(bcm4377, "controller not responding");
++}
++
++/*
++ * A function reset requested by the PCI core or by userspace. Probe resets the
++ * function before it sets the driver data, and bcm4377_pci_reset() quiesces
++ * and restarts the controller around its own reset, so neither needs more.
++ * Any other reset loses the firmware and the rings under a running driver:
++ * keep the interrupt off across it, then rebind, as for a command timeout.
++ */
++static void bcm4377_reset_prepare(struct pci_dev *pdev)
++{
++	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
++	int irq;
++
++	if (!bcm4377 || READ_ONCE(bcm4377->own_reset))
++		return;
++	irq = pci_irq_vector(pdev, 0);
++	if (irq > 0)
++		disable_irq(irq);
++}
++
++static void bcm4377_reset_done(struct pci_dev *pdev)
++{
++	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
++	int irq;
++
++	if (!bcm4377 || READ_ONCE(bcm4377->own_reset))
++		return;
++	irq = pci_irq_vector(pdev, 0);
++	if (irq > 0)
++		enable_irq(irq);
++	bcm4377_queue_rebind(bcm4377, "function reset");
++}
++
++static const struct pci_error_handlers bcm4377_err_handler = {
++	.reset_prepare = bcm4377_reset_prepare,
++	.reset_done = bcm4377_reset_done,
++};
++
+ static void bcm4377_hci_unregister_dev(void *data)
+ {
+ 	struct hci_dev *hdev = data;
+@@ -3120,6 +3169,7 @@ static struct pci_driver bcm4377_pci_driver = {
+ 	.name = "hci_bcm4377",
+ 	.id_table = bcm4377_devid_table,
+ 	.probe = bcm4377_probe,
++	.err_handler = &bcm4377_err_handler,
+ 	.driver.pm = &bcm4377_ops,
+ };
+ 

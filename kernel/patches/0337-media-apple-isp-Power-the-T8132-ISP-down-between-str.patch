@@ -1,0 +1,242 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erik Bourget <erik@ebourget.net>
+Date: Fri, 30 Oct 2026 15:00:03 -0400
+Subject: [PATCH] media: apple: isp: Power the T8132 ISP down between streams
+
+T8132 firmware starts again after it stopped, from its data segment as
+loaded, once the coprocessor was quiesced before the power-down. Stop
+keeping it resident: restore its data before each start, quiesce it
+before each power-down, and power the ISP down after every stream, as
+the older SoCs do. The camera then costs nothing when it is not in use,
+not only until its first use, and can be used again after the firmware
+stopped (for example across hibernation).
+
+The deferred start no longer needs resident firmware, so it becomes
+deferred_start: the camera is detected at the first stream, which with
+firmware that starts again boots it a second time to stream. A deferred
+detection that fails is reported to the stream instead of deferring a
+probe. Metadata buffers are reset for each stream of firmware that
+starts again, as for resident firmware: none survives the restart.
+
+Signed-off-by: Erik Bourget <erik@ebourget.net>
+(cherry picked from commit 140a8213fdb77a6a0440cb607c28e450baa6dc7b)
+---
+ drivers/media/platform/apple/isp/isp-cam.c    | 28 ++++++++++++++-----
+ .../media/platform/apple/isp/isp-drv-test.c   | 19 +++++++++----
+ drivers/media/platform/apple/isp/isp-drv.c    | 13 ++++++---
+ drivers/media/platform/apple/isp/isp-drv.h    | 12 ++++----
+ drivers/media/platform/apple/isp/isp-fw.c     |  2 +-
+ drivers/media/platform/apple/isp/isp-v4l2.c   |  9 +++---
+ 6 files changed, 57 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 9b6d7a0f06..1881d22482 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -214,7 +214,7 @@ static int isp_check_presets(struct apple_isp *isp, u32 num_fw_presets)
+ 	 * advertised: keep them, and refuse a stream on one the firmware
+ 	 * lacks instead.
+ 	 */
+-	if (isp->hw->resident_fw_deferred) {
++	if (isp->hw->deferred_start) {
+ 		isp->num_fw_presets = num_fw_presets;
+ 		for (int i = 0; i < isp->num_presets; i++)
+ 			if (isp->presets[i].index >= num_fw_presets)
+@@ -575,8 +575,12 @@ int apple_isp_detect_camera(struct apple_isp *isp)
+ 		dev_err(isp->dev,
+ 			"failed to boot firmware for initial sensor detection: %d\n",
+ 			err);
+-		/* Resident firmware would fail a deferred retry the same way. */
+-		return isp->hw->resident_fw ? err : -EPROBE_DEFER;
++		/*
++		 * Resident firmware would fail a deferred retry the same way,
++		 * and a deferred start is not a probe to defer.
++		 */
++		return isp->hw->resident_fw || isp->hw->deferred_start ?
++		       err : -EPROBE_DEFER;
+ 	}
+ 
+ 	err = isp_detect_camera(isp);
+@@ -597,6 +601,8 @@ int apple_isp_detect_camera(struct apple_isp *isp)
+ 
+ 	apple_isp_firmware_shutdown(isp);
+ 
++	if (!err)
++		isp->camera_detected = true;
+ 	return err;
+ }
+ 
+@@ -977,11 +983,19 @@ int apple_isp_start_camera(struct apple_isp *isp)
+ 	struct isp_format *fmt = isp_get_current_format(isp);
+ 	int err;
+ 
+-	/* A deferred start boots the firmware and detects the camera now. */
+-	if (isp->hw->resident_fw_deferred && !isp->camera_detected)
++	/*
++	 * A deferred start detects the camera now. Resident firmware is then
++	 * left running; firmware that starts again is stopped after the
++	 * detection like at probe, and booted again here.
++	 */
++	if (isp->hw->deferred_start && !isp->camera_detected) {
+ 		err = apple_isp_detect_camera(isp);
+-	else
+-		err = apple_isp_firmware_boot(isp);
++		if (err < 0) {
++			dev_err(isp->dev, "failed to detect the camera: %d\n", err);
++			return err;
++		}
++	}
++	err = apple_isp_firmware_boot(isp);
+ 	if (err < 0) {
+ 		dev_err(isp->dev, "failed to boot firmware: %d\n", err);
+ 		return err;
+diff --git a/drivers/media/platform/apple/isp/isp-drv-test.c b/drivers/media/platform/apple/isp/isp-drv-test.c
+index ca86f58968..dbddb079a0 100644
+--- a/drivers/media/platform/apple/isp/isp-drv-test.c
++++ b/drivers/media/platform/apple/isp/isp-drv-test.c
+@@ -99,22 +99,31 @@ static struct kunit_suite isp_dapf_test_suite = {
+ 
+ kunit_test_suite(isp_dapf_test_suite);
+ 
+-/* Only resident firmware may defer its start: it is detected once. */
+-static void isp_test_deferred_is_resident(struct kunit *test)
++/*
++ * A deferred start detects the camera once: its firmware must keep running
++ * or start again. Firmware that starts again is not resident, and only it
++ * is quiesced before the power-down.
++ */
++static void isp_test_firmware_lifetime(struct kunit *test)
+ {
+ 	const struct of_device_id *match;
+ 
+ 	for (match = apple_isp_of_match; match->compatible[0]; match++) {
+ 		const struct apple_isp_hw *hw = match->data;
+ 
+-		if (hw->resident_fw_deferred)
+-			KUNIT_EXPECT_TRUE_MSG(test, hw->resident_fw, "%s",
++		if (hw->deferred_start)
++			KUNIT_EXPECT_TRUE_MSG(test, hw->resident_fw || hw->fw_restore,
++					      "%s", match->compatible);
++		KUNIT_EXPECT_FALSE_MSG(test, hw->resident_fw && hw->fw_restore, "%s",
++				       match->compatible);
++		if (hw->coproc_quiesce)
++			KUNIT_EXPECT_TRUE_MSG(test, hw->fw_restore, "%s",
+ 					      match->compatible);
+ 	}
+ }
+ 
+ static struct kunit_case isp_hw_test_cases[] = {
+-	KUNIT_CASE(isp_test_deferred_is_resident),
++	KUNIT_CASE(isp_test_firmware_lifetime),
+ 	{}
+ };
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index 3baa86dfa9..70d350ca5f 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -696,7 +696,7 @@ static int apple_isp_probe(struct platform_device *pdev)
+ 
+ 	pm_runtime_enable(dev);
+ 
+-	if (!isp->hw->resident_fw_deferred) {
++	if (!isp->hw->deferred_start) {
+ 		err = apple_isp_detect_camera(isp);
+ 		if (err) {
+ 			dev_err(dev, "failed to detect camera: %d\n", err);
+@@ -1061,7 +1061,10 @@ static const struct isp_dapf_window apple_isp_dapf_t8132[] = {
+  * T8132 runs T6040's coprocessor and firmware interface, booted the same
+  * way. Its two AMCCs (ADT mcc amcc_aperture_count) give two broadcast-clear
+  * windows, passed one per AMCC without padding slots. No PMP_CTRL_SET is
+- * sent: T8132's PMP scratch offsets are not established.
++ * sent: T8132's PMP scratch offsets are not established. Its firmware
++ * starts again from its data segment as loaded once the coprocessor was
++ * quiesced before the power-down, so the ISP is powered only while the
++ * camera is in use.
+  */
+ static const struct apple_isp_hw apple_isp_hw_t8132 = {
+ 	.gen = ISP_GEN_T6040,
+@@ -1084,10 +1087,12 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
+ 	.num_dapf = ARRAY_SIZE(apple_isp_dapf_t8132),
+ 
+ 	.coproc_control = ISP_COPROC_CONTROL_T8140,
++	.coproc_status = ISP_COPROC_STATUS_T8140,
++	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
+ 	.boot_mode = 1,
+ 	.shared_size = 0xdec00000,
+-	.resident_fw = true,
+-	.resident_fw_deferred = true,
++	.fw_restore = true,
++	.deferred_start = true,
+ };
+ 
+ static const struct of_device_id apple_isp_of_match[] = {
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 039f51de6a..738590fec3 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -240,15 +240,17 @@ struct apple_isp_hw {
+ 	/*
+ 	 * The firmware can be started only once per system boot, so once
+ 	 * started it is kept running while the driver is bound. It starts at
+-	 * probe, or at the first stream with resident_fw_deferred.
++	 * probe, or at the first stream with deferred_start.
+ 	 */
+ 	bool resident_fw;
+ 
+ 	/*
+-	 * With resident_fw: start the firmware, and detect the camera, at the
+-	 * first stream instead of at probe, so the ISP stays off until then.
++	 * Start the firmware, and detect the camera, at the first stream
++	 * instead of at probe, so the ISP stays off until then. The firmware
++	 * must be resident or start again (fw_restore): the camera is
++	 * detected only once.
+ 	 */
+-	bool resident_fw_deferred;
++	bool deferred_start;
+ };
+ 
+ enum isp_sensor_id {
+@@ -495,7 +497,7 @@ int apple_isp_program_dapf(struct apple_isp *isp);
+ static inline bool isp_supports_p010(struct apple_isp *isp)
+ {
+ 	/* Its config discovery would change formats already advertised. */
+-	return isp->hw->gen == ISP_GEN_T6040 && !isp->hw->resident_fw_deferred &&
++	return isp->hw->gen == ISP_GEN_T6040 && !isp->hw->deferred_start &&
+ 	       isp_get_current_format(isp)->version == 0x958;
+ }
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-fw.c b/drivers/media/platform/apple/isp/isp-fw.c
+index 130b0d9b85..28727ef24f 100644
+--- a/drivers/media/platform/apple/isp/isp-fw.c
++++ b/drivers/media/platform/apple/isp/isp-fw.c
+@@ -1096,7 +1096,7 @@ static void isp_firmware_shutdown(struct apple_isp *isp)
+  * does not start again once it has been stopped: after CISP_CMD_SUSPEND,
+  * a coprocessor reset and a power cycle of its domains it never completes
+  * the first handshake. It is booted once, at probe or with
+- * resident_fw_deferred at the first stream, and runs until the
++ * deferred_start at the first stream, and runs until the
+  * driver is unbound, probe fails or the system hibernates, also across
+  * suspend; after it has stopped the device stays unusable until the next
+  * system boot.
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index 24506ed526..81964ab191 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -531,11 +531,12 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
+ 	}
+ 
+ 	/*
+-	 * Resident firmware was not restarted, but the channel's pools are
+-	 * configured again for every stream. Metadata buffers still marked
+-	 * as submitted to the previous pools would never reach the new ones.
++	 * The channel's pools are configured again for every stream, by
++	 * resident firmware that kept running or by firmware that started
++	 * afresh. Metadata buffers still marked as submitted to the previous
++	 * pools, or to firmware that stopped, would never reach the new ones.
+ 	 */
+-	if (isp->hw->resident_fw) {
++	if (isp->hw->resident_fw || isp->hw->fw_restore) {
+ 		spin_lock_irqsave(&isp->buf_lock, flags);
+ 		for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++)
+ 			isp->meta_surfs[i]->submitted = false;

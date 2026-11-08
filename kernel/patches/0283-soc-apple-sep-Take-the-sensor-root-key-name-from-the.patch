@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Mon, 26 Oct 2026 23:30:10 +1100
+Subject: [PATCH] soc: apple: sep: Take the sensor root key name from the
+ device tree
+
+The signed root-key container is per-device data, but its name was
+fixed to J700's. Read it from the sensor node's second firmware-name
+entry and keep J700's name when the board gives only the calibration,
+so the J700 device tree and its installed file keep working unchanged.
+Name the file in the error when it cannot be loaded.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+
+(cherry picked from commit 1bcccae53e5bfa901859a4e29f85cdbd9278a47c)
+---
+ drivers/soc/apple/sbio.rs       |  9 +++++----
+ drivers/soc/apple/sensor.rs     | 15 +++++++++++++--
+ drivers/soc/apple/sensor_shim.c | 24 ++++++++++++++----------
+ drivers/soc/apple/sep.rs        |  3 +++
+ drivers/soc/apple/shim.h        |  2 +-
+ 5 files changed, 36 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/soc/apple/sbio.rs b/drivers/soc/apple/sbio.rs
+index 9c69ca184c..fbdc9da24f 100644
+--- a/drivers/soc/apple/sbio.rs
++++ b/drivers/soc/apple/sbio.rs
+@@ -2183,14 +2183,15 @@ impl SepData {
+         self.sensor_trace(c"SENSOR_NONCE");
+ 
+         if !self.sensor_key_loaded.load(Relaxed) {
+-            let firmware = match kernel::firmware::Firmware::request(
+-                c"apple/msrk-j700.bin", &self.dev,
+-            ) {
++            // Per-device data, so the board names it; J700 predates that.
++            let name = sensor::root_key_firmware_name().unwrap_or(ROOT_KEY_FIRMWARE);
++            let firmware = match kernel::firmware::Firmware::request(name, &self.dev) {
+                 Ok(firmware) => firmware,
+                 Err(error) => {
+                     dev_err!(
+                         self.dev,
+-                        "sensor: signed root-key container unavailable: {:?}\n",
++                        "sensor: signed root-key container {} unavailable: {:?}\n",
++                        name,
+                         error
+                     );
+                     return false;
+diff --git a/drivers/soc/apple/sensor.rs b/drivers/soc/apple/sensor.rs
+index c0f3a6159f..46af2b3fdf 100644
+--- a/drivers/soc/apple/sensor.rs
++++ b/drivers/soc/apple/sensor.rs
+@@ -25,15 +25,26 @@ extern "C" {
+     fn sep_sensor_irq_available() -> c_int;
+     fn sep_sensor_irq_arm();
+     fn sep_sensor_irq_wait(timeout_ms: c_uint) -> c_int;
+-    fn sep_sensor_firmware_name() -> *const c_char;
++    fn sep_sensor_firmware_name(index: c_uint) -> *const c_char;
+ }
+ 
+ /// The calibration blob's name from the board description, or `None` when the
+ /// sensor node has no `firmware-name` property (the caller then uses a default).
+ pub(crate) fn firmware_name() -> Option<&'static CStr> {
++    firmware_name_at(0)
++}
++
++/// The signed root-key container's name from the board description: the
++/// second `firmware-name` entry, or `None` when the board gives only the
++/// calibration (the caller then uses a default).
++pub(crate) fn root_key_firmware_name() -> Option<&'static CStr> {
++    firmware_name_at(1)
++}
++
++fn firmware_name_at(index: c_uint) -> Option<&'static CStr> {
+     // SAFETY: the shim returns NULL or a pointer to a NUL-terminated string
+     // owned by the device property and valid for the device's lifetime.
+-    let ptr = unsafe { sep_sensor_firmware_name() };
++    let ptr = unsafe { sep_sensor_firmware_name(index) };
+     if ptr.is_null() {
+         return None;
+     }
+diff --git a/drivers/soc/apple/sensor_shim.c b/drivers/soc/apple/sensor_shim.c
+index 68405e0a74..bed228b4d1 100644
+--- a/drivers/soc/apple/sensor_shim.c
++++ b/drivers/soc/apple/sensor_shim.c
+@@ -568,19 +568,23 @@ static int sep_sensor_power_line_locked(void)
+ }
+ 
+ /*
+- * The per-device calibration blob name, as the board description gives it in
+- * the sensor node's "firmware-name" property. NULL when absent, so the caller
+- * can fall back to a default.
++ * A per-device blob name, as the board description gives it in the sensor
++ * node's "firmware-name" list: index 0 is the calibration, index 1 the signed
++ * root key. NULL when that entry is absent, so the caller can fall back to a
++ * default.
+  */
+-static const char *sep_sensor_firmware_name_locked(void)
++static const char *sep_sensor_firmware_name_locked(unsigned int index)
+ {
+-	const char *name = NULL;
++	const char *names[2] = { NULL, NULL };
++	int count;
+ 
+-	if (!sep_spi)
++	if (!sep_spi || index >= ARRAY_SIZE(names))
+ 		return NULL;
+-	if (device_property_read_string(&sep_spi->dev, "firmware-name", &name))
++	count = device_property_read_string_array(&sep_spi->dev, "firmware-name",
++						  names, ARRAY_SIZE(names));
++	if (count <= (int)index)
+ 		return NULL;
+-	return name;
++	return names[index];
+ }
+ 
+ /* Powers the sensor on/off, holding the hardware settling delay. */
+@@ -871,14 +875,14 @@ int sep_sensor_power_line(void)
+ 	return result;
+ }
+ 
+-const char *sep_sensor_firmware_name(void)
++const char *sep_sensor_firmware_name(unsigned int index)
+ {
+ 	struct sep_sensor_lifetime *sensor = sep_lock_sensor();
+ 	const char *result;
+ 
+ 	if (!sensor)
+ 		return NULL;
+-	result = sep_sensor_firmware_name_locked();
++	result = sep_sensor_firmware_name_locked(index);
+ 	mutex_unlock(&sensor->lock);
+ 	return result;
+ }
+diff --git a/drivers/soc/apple/sep.rs b/drivers/soc/apple/sep.rs
+index 87b90a7d98..25d6e18525 100644
+--- a/drivers/soc/apple/sep.rs
++++ b/drivers/soc/apple/sep.rs
+@@ -447,6 +447,9 @@ const PATCH_POLL_MS: u32 = 20;
+ const PATCH_POLL_ATTEMPTS: u32 = 250;
+ 
+ const CALIBRATION_FIRMWARE: &CStr = c"apple/mesa_calibration.bin";
++/// The signed root-key container on boards whose sensor node names only the
++/// calibration (J700).
++const ROOT_KEY_FIRMWARE: &CStr = c"apple/msrk-j700.bin";
+ 
+ const SBIO_PROBE_USER_ID: i32 = 1000;
+ static_assert!(SBIO_PROBE_USER_ID >= crate::sks::SKS_DESIGNATE_USER_MIN);
+diff --git a/drivers/soc/apple/shim.h b/drivers/soc/apple/shim.h
+index 0425bf2cda..99d2661e2c 100644
+--- a/drivers/soc/apple/shim.h
++++ b/drivers/soc/apple/shim.h
+@@ -132,7 +132,7 @@ int sep_sensor_cs_timing_mode(void);
+ int sep_sensor_power_cycle(void);
+ int sep_sensor_power_source(void);
+ int sep_sensor_power(int on);
+-const char *sep_sensor_firmware_name(void);
++const char *sep_sensor_firmware_name(unsigned int index);
+ int sep_sensor_xfer(const void *tx, void *rx, size_t len);
+ int sep_sensor_xfer_tx(const void *tx, size_t len);
+ int sep_sensor_xfer2(const void *tx, size_t tx_len, void *rx, size_t rx_len);

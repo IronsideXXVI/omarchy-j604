@@ -1,0 +1,354 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erik Bourget <erik@ebourget.net>
+Date: Wed, 28 Oct 2026 09:44:07 -0400
+Subject: [PATCH] media: apple: isp: Program the DART address filter
+
+On T8132 the ADT gives the first ISP DART address filter windows for the
+fixed MMIO windows the ISP's coprocessor reaches, among them the ISP
+power states and the DSID broadcast-clear windows. The filter loses its
+windows whenever ISP_SYS is off and powers up with arbitrary contents.
+The camera streams with the filter cleared and with it left as it powers
+up, but program it as the ADT describes rather than leave it undefined.
+
+Take an optional per-SoC window list, find the filter registers on the
+first iommus DART, and program and verify the windows after every
+power-up, before the coprocessor starts. The windows lie inside the
+fw_mmio windows that the driver already maps into that DART for the
+firmware, so the list belongs next to fw_mmio; the DART driver itself
+has no use for them.
+
+Two KUnit cases check that every SoC's windows lie inside its fw_mmio
+windows, and the register image the writer produces.
+
+Signed-off-by: Erik Bourget <erik@ebourget.net>
+(cherry picked from commit 7e4f610ba21b0055e9c28db7cac7f63349d881b2)
+---
+ drivers/media/platform/apple/isp/Kconfig      |  6 +-
+ .../media/platform/apple/isp/isp-drv-test.c   | 99 +++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-drv.c    | 82 +++++++++++++++
+ drivers/media/platform/apple/isp/isp-drv.h    | 20 ++++
+ drivers/media/platform/apple/isp/isp-fw.c     |  6 ++
+ drivers/media/platform/apple/isp/isp-regs.h   | 14 +++
+ 6 files changed, 224 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/media/platform/apple/isp/isp-drv-test.c
+
+diff --git a/drivers/media/platform/apple/isp/Kconfig b/drivers/media/platform/apple/isp/Kconfig
+index d5c6ca6904..3967e51d47 100644
+--- a/drivers/media/platform/apple/isp/Kconfig
++++ b/drivers/media/platform/apple/isp/Kconfig
+@@ -28,9 +28,9 @@ config VIDEO_APPLE_ISP_KUNIT_TEST
+ 	default KUNIT_ALL_TESTS
+ 	help
+ 	  Builds unit tests for queue setup, P010 layouts and buffer identity,
+-	  firmware sensor geometry, the capture command stream and shared
+-	  memory retirement. The command tests stub the IPC transport and
+-	  need no hardware. Only useful for kernel developers running KUnit.
++	  firmware sensor geometry, the capture command stream, shared memory
++	  retirement and the per-SoC DART address filter windows. The command
++	  tests stub the IPC transport and need no hardware. Only useful for kernel developers running KUnit.
+ 
+ 	  If unsure, say N.
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-drv-test.c b/drivers/media/platform/apple/isp/isp-drv-test.c
+new file mode 100644
+index 0000000000..a31cf2bfa8
+--- /dev/null
++++ b/drivers/media/platform/apple/isp/isp-drv-test.c
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * KUnit tests for the DART address filter windows of the Apple ISP driver,
++ * built into isp-drv.c. They need no hardware.
++ */
++
++#include <kunit/device.h>
++#include <kunit/test.h>
++#include <linux/unaligned.h>
++
++/* Every address filter window must lie inside a window the firmware is mapped. */
++static void isp_test_dapf_in_fw_mmio(struct kunit *test)
++{
++	const struct of_device_id *match;
++
++	for (match = apple_isp_of_match; match->compatible[0]; match++) {
++		const struct apple_isp_hw *hw = match->data;
++
++		for (unsigned int i = 0; i < hw->num_dapf; i++) {
++			const struct isp_dapf_window *w = &hw->dapf[i];
++			bool inside = false;
++
++			KUNIT_EXPECT_LE_MSG(test, w->start, w->end, "%s window %u",
++					    match->compatible, i);
++			for (unsigned int j = 0; j < hw->num_fw_mmio; j++) {
++				const struct isp_mmio_window *m = &hw->fw_mmio[j];
++
++				if (w->start >= m->base && w->end < m->base + m->size)
++					inside = true;
++			}
++			KUNIT_EXPECT_TRUE_MSG(test, inside,
++					      "%s window %u 0x%llx-0x%llx is not in fw_mmio",
++					      match->compatible, i, w->start, w->end);
++		}
++	}
++}
++
++#define ISP_TEST_DAPF_FILL	0xa5
++
++/*
++ * Each window fills its own 0x40-byte slot with exactly these words, and
++ * leaves every other byte alone. The bank is plain memory here: the driver
++ * is arm64 only, where the MMIO accessors work on it unchanged.
++ */
++static void isp_test_dapf_program(struct kunit *test)
++{
++	static const struct isp_dapf_window windows[] = {
++		{ 0x380704000, 0x380704063 },
++		{ 0x382824000, 0x382824004 },
++	};
++	static const struct apple_isp_hw hw = {
++		.dapf = windows,
++		.num_dapf = ARRAY_SIZE(windows),
++	};
++	size_t size = (ARRAY_SIZE(windows) + 1) * DAPF_WINDOW_STRIDE;
++	u8 expect[DAPF_WINDOW_STRIDE];
++	struct apple_isp *isp;
++	u8 *bank;
++
++	isp = kunit_kzalloc(test, sizeof(*isp), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, isp);
++	isp->dev = kunit_device_register(test, "apple-isp-dapf-test");
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, isp->dev);
++	bank = kunit_kmalloc(test, size, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, bank);
++	memset(bank, ISP_TEST_DAPF_FILL, size);
++	isp->hw = &hw;
++	isp->dapf = (__force void __iomem *)bank;
++
++	KUNIT_ASSERT_EQ(test, apple_isp_program_dapf(isp), 0);
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(windows); i++) {
++		memset(expect, ISP_TEST_DAPF_FILL, sizeof(expect));
++		put_unaligned_le32(0x31, &expect[0x00]);
++		put_unaligned_le32(0, &expect[0x04]);
++		put_unaligned_le64(windows[i].start, &expect[0x08]);
++		put_unaligned_le64(windows[i].end, &expect[0x10]);
++		put_unaligned_le32(1, &expect[0x20]);
++		KUNIT_EXPECT_MEMEQ_MSG(test, bank + i * DAPF_WINDOW_STRIDE, expect,
++				       sizeof(expect), "window %u", i);
++	}
++
++	/* The slot after the last window is untouched. */
++	KUNIT_EXPECT_NULL(test, memchr_inv(bank + ARRAY_SIZE(windows) * DAPF_WINDOW_STRIDE,
++					   ISP_TEST_DAPF_FILL, DAPF_WINDOW_STRIDE));
++}
++
++static struct kunit_case isp_dapf_test_cases[] = {
++	KUNIT_CASE(isp_test_dapf_in_fw_mmio),
++	KUNIT_CASE(isp_test_dapf_program),
++	{}
++};
++
++static struct kunit_suite isp_dapf_test_suite = {
++	.name = "apple-isp-dapf",
++	.test_cases = isp_dapf_test_cases,
++};
++
++kunit_test_suite(isp_dapf_test_suite);
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index d5f7c39539..5e816ed8d5 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -175,6 +175,78 @@ static int isp_of_region_iova(struct device *dev, const char *name,
+ 	return 0;
+ }
+ 
++/*
++ * The firmware reaches its fixed MMIO windows through the first DART, whose
++ * address filter the ADT describes for them. Its registers are on that DART.
++ */
++static int apple_isp_map_dapf(struct apple_isp *isp)
++{
++	struct device *dev = isp->dev;
++	/* The first iommus entry, whatever its #iommu-cells */
++	struct device_node *dart __free(device_node) =
++		of_parse_phandle(dev->of_node, "iommus", 0);
++	struct resource res;
++	int idx, err;
++
++	if (!dart)
++		return dev_err_probe(dev, -ENODEV, "no ISP DART\n");
++
++	/* DAPF_* describe the T8110 DART's address filter */
++	if (!of_device_is_compatible(dart, "apple,t8110-dart"))
++		return dev_err_probe(dev, -ENODEV,
++				     "%pOF has no known address filter\n", dart);
++
++	idx = of_property_match_string(dart, "reg-names", "dapf");
++	if (idx < 0)
++		return dev_err_probe(dev, idx,
++				     "%pOF has no address filter registers\n", dart);
++
++	err = of_address_to_resource(dart, idx, &res);
++	if (err)
++		return dev_err_probe(dev, err, "%pOF: bad address filter registers\n",
++				     dart);
++
++	if (resource_size(&res) < isp->hw->num_dapf * DAPF_WINDOW_STRIDE)
++		return dev_err_probe(dev, -EINVAL, "%pOF: address filter too small\n",
++				     dart);
++
++	isp->dapf = devm_ioremap_resource(dev, &res);
++	return PTR_ERR_OR_ZERO(isp->dapf);
++}
++
++/* Program the address filter windows, then check that they took. */
++int apple_isp_program_dapf(struct apple_isp *isp)
++{
++	const struct apple_isp_hw *hw = isp->hw;
++	void __iomem *w;
++	unsigned int i;
++
++	for (i = 0; i < hw->num_dapf; i++) {
++		w = isp->dapf + i * DAPF_WINDOW_STRIDE;
++		writel(0, w + DAPF_CTRL1);
++		writeq(hw->dapf[i].start, w + DAPF_START);
++		writeq(hw->dapf[i].end, w + DAPF_END);
++		writel(DAPF_CTRL0_ISP, w + DAPF_CTRL0);
++		writel(DAPF_CTRL2_ISP, w + DAPF_CTRL2);
++	}
++
++	/* Only bits 7:0 of CTRL0 and bits 63:2 of END read back. */
++	for (i = 0; i < hw->num_dapf; i++) {
++		w = isp->dapf + i * DAPF_WINDOW_STRIDE;
++		if (readl(w + DAPF_CTRL1) ||
++		    readq(w + DAPF_START) != hw->dapf[i].start ||
++		    (readq(w + DAPF_END) | 3) != (hw->dapf[i].end | 3) ||
++		    (readl(w + DAPF_CTRL0) & 0xff) != DAPF_CTRL0_ISP ||
++		    readl(w + DAPF_CTRL2) != DAPF_CTRL2_ISP) {
++			dev_err(isp->dev, "DAPF window %u (0x%llx-0x%llx) failed readback\n",
++				i, hw->dapf[i].start, hw->dapf[i].end);
++			return -EIO;
++		}
++	}
++
++	return 0;
++}
++
+ static int apple_isp_init_iommu(struct apple_isp *isp)
+ {
+ 	struct device *dev = isp->dev;
+@@ -521,6 +593,12 @@ static int apple_isp_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	if (isp->hw->num_dapf) {
++		err = apple_isp_map_dapf(isp);
++		if (err)
++			goto detach_genpd;
++	}
++
+ 	/* Capture watchdog, where the ISP gates its frames on one */
+ 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wdt");
+ 	if (res) {
+@@ -998,3 +1076,7 @@ module_platform_driver(apple_isp_driver);
+ MODULE_AUTHOR("Eileen Yoon <eyn@gmx.com>");
+ MODULE_DESCRIPTION("Apple ISP driver");
+ MODULE_LICENSE("GPL v2");
++
++#if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
++#include "isp-drv-test.c"
++#endif
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 30425f6cf4..70c647fcea 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -137,6 +137,15 @@ struct isp_mmio_window {
+ 	u64 size;
+ };
+ 
++/*
++ * A DART address filter window. Both bounds are inclusive and word
++ * granular, as the hardware takes them.
++ */
++struct isp_dapf_window {
++	u64 start;
++	u64 end;
++};
++
+ struct isp_preset {
+ 	u32 index;
+ 	struct coord input_dim;
+@@ -192,6 +201,14 @@ struct apple_isp_hw {
+ 	const struct isp_mmio_window *fw_mmio;
+ 	unsigned int num_fw_mmio;
+ 
++	/*
++	 * The windows the ADT gives the first DART's address filter, inside
++	 * the fw_mmio windows. The filter loses them with ISP_SYS, so they
++	 * are programmed after every power-up.
++	 */
++	const struct isp_dapf_window *dapf;
++	unsigned int num_dapf;
++
+ 	/* ISP_GPIO_6 boot mode */
+ 	u32 boot_mode;
+ 
+@@ -330,6 +347,7 @@ struct apple_isp {
+ 	void __iomem *gpio;
+ 	void __iomem *mbox2;
+ 	void __iomem *wdt;
++	void __iomem *dapf;
+ 	struct hrtimer wdt_timer;
+ 	bool wdt_running;
+ 
+@@ -424,6 +442,8 @@ enum {
+ 	ISP_STATE_SLEEPING,
+ };
+ 
++int apple_isp_program_dapf(struct apple_isp *isp);
++
+ #define isp_dbg(isp, fmt, ...) \
+ 	dev_dbg((isp)->dev, "[%s] " fmt, __func__, ##__VA_ARGS__)
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-fw.c b/drivers/media/platform/apple/isp/isp-fw.c
+index 22dbf99a4c..d892841470 100644
+--- a/drivers/media/platform/apple/isp/isp-fw.c
++++ b/drivers/media/platform/apple/isp/isp-fw.c
+@@ -407,6 +407,12 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
+ 	if (err < 0)
+ 		return err;
+ 
++	if (isp->dapf) {
++		err = apple_isp_program_dapf(isp);
++		if (err)
++			goto shutdown;
++	}
++
+ 	/* ISP17a and T6040 have no clock enable word */
+ 	if (isp->hw->gen != ISP_GEN_T8140 && isp->hw->gen != ISP_GEN_T6040)
+ 		isp_gpio_write32(isp, ISP_GPIO_CLOCK_EN, 0x1);
+diff --git a/drivers/media/platform/apple/isp/isp-regs.h b/drivers/media/platform/apple/isp/isp-regs.h
+index f2f6f1c948..f300440568 100644
+--- a/drivers/media/platform/apple/isp/isp-regs.h
++++ b/drivers/media/platform/apple/isp/isp-regs.h
+@@ -40,6 +40,20 @@
+ #define ISP_COPROC_RESET_ACK_0_T8140 0x1600818
+ #define ISP_COPROC_RESET_ACK_1_T8140 0x160081c
+ 
++/*
++ * Address filter (DAPF) registers of a T8110-type DART: an array of windows,
++ * each with its inclusive start and end and three control words. Every ISP
++ * window takes the control values its ADT dapf-instance entry gives.
++ */
++#define DAPF_WINDOW_STRIDE        0x40
++#define DAPF_CTRL0                0x00
++#define DAPF_CTRL0_ISP            0x31
++#define DAPF_CTRL1                0x04
++#define DAPF_START                0x08
++#define DAPF_END                  0x10
++#define DAPF_CTRL2                0x20
++#define DAPF_CTRL2_ISP            0x1
++
+ #define ISP_MBOX_IRQ_INTERRUPT    0x00
+ #define ISP_MBOX_IRQ_ENABLE       0x04
+ #define ISP_MBOX_IRQ_ENABLE_T6031 0x08

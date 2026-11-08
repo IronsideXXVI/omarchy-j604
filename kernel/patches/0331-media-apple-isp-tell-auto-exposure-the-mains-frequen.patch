@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Sun, 1 Nov 2026 15:49:16 +1100
+Subject: [PATCH] media: apple: isp: tell auto exposure the mains frequency
+
+The H17 firmware's auto exposure keeps exposure times in step with the
+mains frequency so that lights do not flicker or band in the picture.
+macOS tells it the frequency for every camera, 50 Hz unless the country
+uses 60 Hz, as Hz in 16.16 fixed point. Linux never sent it.
+
+Add the standard V4L2 power line frequency control on H17 hardware, 50 Hz
+by default as on macOS, and send it with the stream setup. It is applied
+when the stream starts, like the exposure priority.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(cherry picked from commit e16d7ec93895b5b0abb7e3b53df045abe6e48f8f)
+---
+ .../media/platform/apple/isp/isp-cam-test.c   | 54 ++++++++++++++++++-
+ drivers/media/platform/apple/isp/isp-cam.c    | 25 +++++++++
+ drivers/media/platform/apple/isp/isp-drv.h    |  1 +
+ drivers/media/platform/apple/isp/isp-v4l2.c   | 19 ++++++-
+ 4 files changed, 96 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam-test.c b/drivers/media/platform/apple/isp/isp-cam-test.c
+index 765deb0ff0..191d8ada0d 100644
+--- a/drivers/media/platform/apple/isp/isp-cam-test.c
++++ b/drivers/media/platform/apple/isp/isp-cam-test.c
+@@ -71,6 +71,7 @@ struct isp_test_command_trace {
+ 	unsigned int fail_at;
+ 	int setfile_error;
+ 	unsigned int setfile_calls;
++	u32 last_opcode;
+ };
+ 
+ static int isp_test_send(struct apple_isp *isp, void *args, u32 insize,
+@@ -190,6 +191,19 @@ static void isp_test_setfile_failure_stops_setup(struct kunit *test)
+ 	}
+ }
+ 
++/* Count NV12 setup commands and fail the chosen one, without a fixture. */
++static int isp_test_count_send(struct apple_isp *isp, void *args, u32 insize,
++			       u32 outsize, int timeout)
++{
++	struct kunit *test = kunit_get_current_test();
++	struct isp_test_command_trace *trace = test->priv;
++
++	trace->last_opcode = ((const u32 *)args)[1];
++	if (++trace->count == trace->fail_at)
++		return -ETIME;
++	return 0;
++}
++
+ static void isp_test_optional_setfile_continues_setup(struct kunit *test)
+ {
+ 	static const int results[] = { 0, -ENOENT };
+@@ -198,14 +212,16 @@ static void isp_test_optional_setfile_continues_setup(struct kunit *test)
+ 
+ 	isp_get_current_format(isp)->pixelformat = V4L2_PIX_FMT_NV12;
+ 	kunit_activate_static_stub(test, isp_ch_load_setfile, isp_test_load_setfile);
++	kunit_activate_static_stub(test, isp_cmd_send, isp_test_count_send);
+ 	test->priv = &trace;
+ 	for (unsigned int i = 0; i < ARRAY_SIZE(results); i++) {
+ 		trace = (struct isp_test_command_trace){
+ 			.setfile_error = results[i], .fail_at = 2,
+ 		};
+-		/* The SBS command after tuning, rather than tuning, fails. */
++		/* The mains frequency after tuning, rather than tuning, fails. */
+ 		KUNIT_EXPECT_EQ(test, isp_ch_configure_capture(isp, 0), -ETIME);
+ 		KUNIT_EXPECT_EQ(test, trace.count, 2);
++		KUNIT_EXPECT_EQ(test, trace.last_opcode, 0x8212);
+ 		KUNIT_EXPECT_EQ(test, trace.setfile_calls, 1);
+ 	}
+ }
+@@ -325,6 +341,41 @@ static void isp_test_temporal_filter_off(struct kunit *test)
+ 	KUNIT_EXPECT_LT(test, isp_test_find(trace, 0xc113), 0);
+ }
+ 
++static void isp_test_power_line_frequency(struct kunit *test)
++{
++	struct apple_isp *isp = isp_test_nv12_alloc(test, ISP_IMX958_2224_01);
++	struct isp_test_nv12_trace *trace;
++	int i;
++
++	trace = kunit_kzalloc(test, sizeof(*trace), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, trace);
++	test->priv = trace;
++
++	/* No control: 50 Hz, in Hz 16.16 */
++	KUNIT_EXPECT_EQ(test, isp_ch_configure_capture(isp, 0), 0);
++	i = isp_test_find(trace, 0x8212);
++	KUNIT_ASSERT_GE(test, i, 0);
++	KUNIT_EXPECT_EQ(test, trace->size[i], 0x10);
++	KUNIT_EXPECT_EQ(test, trace->word[i][0], 0x00320000);
++	/* After the tuning, before the sensor configuration is selected */
++	KUNIT_EXPECT_LT(test, i, isp_test_find(trace, 0x107));
++
++	isp->power_line_frequency =
++		v4l2_ctrl_new_std_menu(&isp->ctrl_handler, NULL,
++				       V4L2_CID_POWER_LINE_FREQUENCY,
++				       V4L2_CID_POWER_LINE_FREQUENCY_60HZ,
++				       BIT(V4L2_CID_POWER_LINE_FREQUENCY_DISABLED),
++				       V4L2_CID_POWER_LINE_FREQUENCY_50HZ);
++	KUNIT_ASSERT_NOT_NULL(test, isp->power_line_frequency);
++	KUNIT_ASSERT_EQ(test, v4l2_ctrl_s_ctrl(isp->power_line_frequency,
++					       V4L2_CID_POWER_LINE_FREQUENCY_60HZ), 0);
++	memset(trace, 0, sizeof(*trace));
++	KUNIT_EXPECT_EQ(test, isp_ch_configure_capture(isp, 0), 0);
++	i = isp_test_find(trace, 0x8212);
++	KUNIT_ASSERT_GE(test, i, 0);
++	KUNIT_EXPECT_EQ(test, trace->word[i][0], 0x003c0000);
++}
++
+ static int isp_test_config_reply(struct apple_isp *isp, void *args, u32 insize,
+ 				 u32 outsize, int timeout)
+ {
+@@ -617,6 +668,7 @@ static struct kunit_case isp_cam_test_cases[] = {
+ 	KUNIT_CASE(isp_test_preview_command_failures),
+ 	KUNIT_CASE(isp_test_temporal_filter_band0),
+ 	KUNIT_CASE(isp_test_temporal_filter_off),
++	KUNIT_CASE(isp_test_power_line_frequency),
+ 	{}
+ };
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index e021d4ea30..004a7fa13d 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -704,6 +704,27 @@ static int isp_ch_configure_frame_rate(struct apple_isp *isp, u32 ch)
+ 	return isp_cmd_ch_ae_frame_rate_min_set(isp, ch, min_rate);
+ }
+ 
++/*
++ * Tell auto exposure the mains frequency, so that it picks exposure times
++ * that do not beat with lights on that supply. The firmware takes it in Hz,
++ * 16.16 fixed point. macOS sends it on the H17 interface for every camera.
++ */
++static int isp_ch_configure_power_line(struct apple_isp *isp, u32 ch)
++{
++	u32 hz = 50;
++
++	if (isp->hw->fw_abi != ISP_FW_ABI_H17)
++		return 0;
++
++	if (isp->power_line_frequency &&
++	    v4l2_ctrl_g_ctrl(isp->power_line_frequency) ==
++		    V4L2_CID_POWER_LINE_FREQUENCY_60HZ)
++		hz = 60;
++
++	return isp_cmd_apple_ch_ae_flicker_freq_update_current_set(isp, ch,
++								    hz << 16);
++}
++
+ static int isp_ch_configure_temporal_filter(struct apple_isp *isp, u32 ch)
+ {
+ 	struct isp_format *fmt = isp_get_format(isp, ch);
+@@ -815,6 +836,10 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
+ 			return err;
+ 	}
+ 
++	err = isp_ch_configure_power_line(isp, ch);
++	if (err)
++		return err;
++
+ select_config:
+ 	err = isp_cmd_ch_sbs_enable(isp, ch, 1);
+ 	if (err)
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 956754f5ef..30425f6cf4 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -305,6 +305,7 @@ struct apple_isp {
+ 	struct v4l2_device v4l2_dev;
+ 	struct v4l2_ctrl_handler ctrl_handler;
+ 	struct v4l2_ctrl *exposure_priority;
++	struct v4l2_ctrl *power_line_frequency;
+ 	/* read-only exposure report of the last frame, NULL without one */
+ 	struct v4l2_ctrl *gain;
+ 	struct v4l2_ctrl *exposure;
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index 3c58b56b42..24506ed526 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -592,12 +592,14 @@ static int isp_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
+ 
+ 	isp->sequence = 0;
+ 
+-	/* The exposure priority is applied when the stream starts. */
++	/* The exposure controls are applied when the stream starts. */
+ 	v4l2_ctrl_grab(isp->exposure_priority, true);
++	v4l2_ctrl_grab(isp->power_line_frequency, true);
+ 
+ 	err = apple_isp_start_streaming(isp);
+ 	if (err) {
+ 		v4l2_ctrl_grab(isp->exposure_priority, false);
++		v4l2_ctrl_grab(isp->power_line_frequency, false);
+ 		isp_vb2_release_buffers(isp, VB2_BUF_STATE_QUEUED);
+ 	}
+ 
+@@ -611,6 +613,7 @@ static void isp_vb2_stop_streaming(struct vb2_queue *q)
+ 	apple_isp_stop_streaming(isp);
+ 	isp_vb2_release_buffers(isp, VB2_BUF_STATE_ERROR);
+ 	v4l2_ctrl_grab(isp->exposure_priority, false);
++	v4l2_ctrl_grab(isp->power_line_frequency, false);
+ }
+ 
+ int apple_isp_video_suspend(struct apple_isp *isp)
+@@ -1218,10 +1221,22 @@ int apple_isp_setup_video(struct apple_isp *isp)
+ 	 * Auto exposure is always on. By default it holds the frame rate, as
+ 	 * V4L2 specifies; with exposure priority it may slow down in low light.
+ 	 */
+-	v4l2_ctrl_handler_init(&isp->ctrl_handler, 3);
++	v4l2_ctrl_handler_init(&isp->ctrl_handler, 4);
+ 	isp->exposure_priority =
+ 		v4l2_ctrl_new_std(&isp->ctrl_handler, NULL,
+ 				  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1, 0);
++	/*
++	 * The H17 firmware's auto exposure avoids mains flicker at the given
++	 * frequency. 50 Hz is the default, as on macOS when it does not know
++	 * the country; userspace sets 60 Hz where the mains runs at 60 Hz.
++	 */
++	if (isp->hw->fw_abi == ISP_FW_ABI_H17)
++		isp->power_line_frequency =
++			v4l2_ctrl_new_std_menu(&isp->ctrl_handler, NULL,
++					       V4L2_CID_POWER_LINE_FREQUENCY,
++					       V4L2_CID_POWER_LINE_FREQUENCY_60HZ,
++					       BIT(V4L2_CID_POWER_LINE_FREQUENCY_DISABLED),
++					       V4L2_CID_POWER_LINE_FREQUENCY_50HZ);
+ 	if (isp->hw->meta_exposure)
+ 		isp_init_exposure_ctrls(isp);
+ 	if (isp->ctrl_handler.error) {

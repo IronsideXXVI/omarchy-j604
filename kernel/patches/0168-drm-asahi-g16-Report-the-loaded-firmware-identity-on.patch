@@ -1,0 +1,466 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 4 Nov 2026 07:32:16 -0600
+Subject: [PATCH] drm/asahi: g16: Report the loaded firmware identity on
+ unqualified T8132 boards
+
+The G16 backend admits the J713 only. On another T8132 board whose GPU
+node is enabled, the probe fails at the board check before anything says
+which firmware the boot loader left in place, yet qualifying such a board
+needs exactly that: the normalized SHA-256 of the loaded TEXT that
+FirmwareBuild matches on, and the original ADT performance states that a
+board selection is built from.
+
+On an unqualified T8132 board, measure both read-only before refusing:
+
+- take the TEXT range from the boot loader's fw-text no-map reservation,
+  which must lie outside System RAM and must equal the first gfx-asc
+  segment of the original ADT (the phram "adt" export), named __TEXT;
+- copy TEXT twice and require both copies to match, as firmware() does;
+- locate the one GKTS and the one ECAP record with an 8-byte payload
+  instead of assuming the J713 offsets, zero both payloads and hash;
+- log the ADT export hash, its performance states, the gfx-asc segments,
+  the TEXT and DATA sizes, the record offsets and the digest, or why the
+  ADT export or the TEXT range could not be used.
+
+If the records are missing or not unique, no digest is printed: the raw
+TEXT carries per-boot entropy, so its hash would identify nothing. The
+probe then fails with -ENODEV as before. The path takes no PMP lease or
+supplier, takes no power-domain hold of its own (the driver core's
+attach around the probe is unchanged), maps nothing but the reserved
+TEXT and the ADT export, and writes nothing the firmware can see. The
+qualified path, including its fixed-offset admission rule, is unchanged.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/adt.rs      |   4 +-
+ drivers/gpu/drm/asahi/g16/adt/perf.rs |  75 ++++++++++
+ drivers/gpu/drm/asahi/g16/boot.rs     |  21 ++-
+ drivers/gpu/drm/asahi/g16/glue.c      |  10 ++
+ drivers/gpu/drm/asahi/g16/identity.rs | 203 +++++++++++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/mod.rs      |   2 +-
+ 6 files changed, 306 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/adt.rs b/drivers/gpu/drm/asahi/g16/adt.rs
+index e78c12fd57..e239fb5107 100644
+--- a/drivers/gpu/drm/asahi/g16/adt.rs
++++ b/drivers/gpu/drm/asahi/g16/adt.rs
+@@ -29,7 +29,7 @@ pub(crate) struct GpuAdt {
+ /// Find the one original-ADT phram export, with explicit 64-bit reservation cells.
+ /// Unlike the GPU's no-map ranges, this reserved boot-loader copy is System RAM and must be
+ /// mapped WB. Never accept a userspace supplied address or a generic physical-memory fallback.
+-fn performance_source(regions: &[Range<u64>]) -> Result<(KVVec<u8>, u64)> {
++pub(crate) fn original_adt(regions: &[Range<u64>]) -> Result<(KVVec<u8>, u64)> {
+     let root = of::root().ok_or(ENODEV)?;
+     let mut source = None;
+     for reserved in root.children() {
+@@ -177,7 +177,7 @@ pub(crate) fn read(dev: &device::Device) -> Result<GpuAdt> {
+         }
+         regions[index] = start..end;
+     }
+-    let (copy, source_pa) = performance_source(&regions)?;
++    let (copy, source_pa) = original_adt(&regions)?;
+     let performance = perf::parse(&copy).map_err(|error| {
+         dev_err!(
+             dev,
+diff --git a/drivers/gpu/drm/asahi/g16/adt/perf.rs b/drivers/gpu/drm/asahi/g16/adt/perf.rs
+index 1824cd2553..8c22f5ed78 100644
+--- a/drivers/gpu/drm/asahi/g16/adt/perf.rs
++++ b/drivers/gpu/drm/asahi/g16/adt/perf.rs
+@@ -36,6 +36,16 @@ fn u32_at(data: &[u8], at: usize) -> Result<u32, Error> {
+     ))
+ }
+ 
++fn u64_at(data: &[u8], at: usize) -> Result<u64, Error> {
++    let end = at.checked_add(8).ok_or(Error::Malformed)?;
++    Ok(u64::from_le_bytes(
++        data.get(at..end)
++            .ok_or(Error::Malformed)?
++            .try_into()
++            .map_err(|_| Error::Malformed)?,
++    ))
++}
++
+ fn string_is(data: &[u8], expected: &[u8]) -> bool {
+     data.strip_suffix(&[0]) == Some(expected)
+ }
+@@ -187,3 +197,68 @@ pub(crate) fn parse(data: &[u8]) -> Result<Source, Error> {
+     }
+     Ok(source)
+ }
++
++/// Most `/arm-io/gfx-asc` firmware segments accepted from the original ADT.
++pub(crate) const MAX_SEGMENTS: usize = 4;
++
++/// One `/arm-io/gfx-asc` firmware segment, as the boot loader filled `segment-ranges`.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(crate) struct Segment {
++    pub(crate) pa: u64,
++    pub(crate) iova: u64,
++    pub(crate) size: u64,
++    pub(crate) flags: u32,
++    /// Named `__TEXT` in `segment-names`.
++    pub(crate) text: bool,
++    /// Named `__DATA` in `segment-names`.
++    pub(crate) data: bool,
++}
++
++/// The gfx-asc firmware segments, in `segment-names` order.
++pub(crate) struct Segments<'a> {
++    /// The raw `segment-names` value.
++    pub(crate) names: &'a [u8],
++    pub(crate) count: usize,
++    pub(crate) list: [Segment; MAX_SEGMENTS],
++}
++
++/// Decodes `/arm-io/gfx-asc` `segment-names` and `segment-ranges`. Each 32-byte range record is
++/// `{u64 pa; u64 iova; u64 remap; u32 size; u32 flags}`; every record needs one name. Nothing
++/// here qualifies a layout: that is the board owner's decision.
++pub(crate) fn segments(data: &[u8]) -> Result<Segments<'_>, Error> {
++    if data.is_empty() || data.len() > 0x20_0000 {
++        return Err(Error::Malformed);
++    }
++    let tree = Tree { data };
++    tree.node_end(0, 0, &mut 0)?;
++    let asc = tree.child(tree.child(0, b"arm-io")?, b"gfx-asc")?;
++    let names = tree.property(asc, b"segment-names")?;
++    let ranges = tree.property(asc, b"segment-ranges")?;
++    if ranges.is_empty() || ranges.len() % 32 != 0 || ranges.len() / 32 > MAX_SEGMENTS {
++        return Err(Error::Shape);
++    }
++    let mut segments = Segments {
++        names,
++        count: 0,
++        list: [Segment::default(); MAX_SEGMENTS],
++    };
++    let mut named = names
++        .split(|&c| c == b';' || c == 0)
++        .filter(|name| !name.is_empty());
++    for (index, record) in ranges.chunks_exact(32).enumerate() {
++        let name = named.next().ok_or(Error::Shape)?;
++        segments.list[index] = Segment {
++            pa: u64_at(record, 0)?,
++            iova: u64_at(record, 8)?,
++            size: u32_at(record, 24)?.into(),
++            flags: u32_at(record, 28)?,
++            text: name == b"__TEXT",
++            data: name == b"__DATA",
++        };
++        segments.count = index + 1;
++    }
++    if named.next().is_some() {
++        return Err(Error::Shape);
++    }
++    Ok(segments)
++}
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index cd946620da..f8b84a52d6 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -43,6 +43,7 @@ pub(crate) mod glue {
+     extern "C" {
+         fn asahi_g16_sha256(data: *const u8, len: usize, out: *mut u8);
+         fn asahi_g16_board() -> bool;
++        fn asahi_g16_identify_board() -> bool;
+         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+         fn asahi_g16_module_get();
+         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
+@@ -75,6 +76,12 @@ pub(crate) mod glue {
+         unsafe { asahi_g16_board() }
+     }
+ 
++    /// A T8132 machine, qualified or not: selects the identity report, never admission.
++    pub(crate) fn identify_board() -> bool {
++        // SAFETY: Reads the machine compatible strings only.
++        unsafe { asahi_g16_identify_board() }
++    }
++
+     /// Holds the GFX power domain for the retained session.
+     pub(crate) fn hold_power(dev: &device::Device) -> Result {
+         // SAFETY: `dev` is a valid device; runtime-PM accounting on it has no other requirement.
+@@ -423,12 +430,18 @@ impl Orphan {
+ 
+ /// The board gate, before the PMP telemetry lease, the PMP supplier, any power-domain hold or
+ /// any firmware-visible access.
+-pub(crate) fn qualified_board() -> Result {
++///
++/// An unqualified T8132 board first reports the firmware its boot loader left in place, which
++/// is what qualifying it needs, and is then refused the same way.
++pub(crate) fn qualified_board(dev: &device::Device) -> Result {
+     if glue::board() {
+-        Ok(())
+-    } else {
+-        Err(ENODEV)
++        return Ok(());
++    }
++    if glue::identify_board() {
++        identity::report_unqualified(dev);
++        dev_info!(dev, "G16: board not qualified, not probing\n");
+     }
++    Err(ENODEV)
+ }
+ 
+ /// Probe-time admission.
+diff --git a/drivers/gpu/drm/asahi/g16/glue.c b/drivers/gpu/drm/asahi/g16/glue.c
+index 3031f92f54..3afa528af9 100644
+--- a/drivers/gpu/drm/asahi/g16/glue.c
++++ b/drivers/gpu/drm/asahi/g16/glue.c
+@@ -25,6 +25,7 @@
+ 
+ void asahi_g16_sha256(const u8 *data, size_t len, u8 *out);
+ bool asahi_g16_board(void);
++bool asahi_g16_identify_board(void);
+ int asahi_g16_hold_power(struct device *dev);
+ void asahi_g16_module_get(void);
+ bool asahi_g16_ram_disjoint(u64 start, u64 size);
+@@ -157,6 +158,15 @@ bool asahi_g16_board(void)
+ 	return apple_pmp_j713_board();
+ }
+ 
++/*
++ * Any T8132 machine. On one that asahi_g16_board() does not qualify, this
++ * selects the read-only firmware identity report; it never admits a board.
++ */
++bool asahi_g16_identify_board(void)
++{
++	return of_machine_is_compatible("apple,t8132");
++}
++
+ /*
+  * Keep the GFX domain powered for the whole (retained) session. Never released,
+  * like the firmware session itself.
+diff --git a/drivers/gpu/drm/asahi/g16/identity.rs b/drivers/gpu/drm/asahi/g16/identity.rs
+index 466a97867a..cbd430862c 100644
+--- a/drivers/gpu/drm/asahi/g16/identity.rs
++++ b/drivers/gpu/drm/asahi/g16/identity.rs
+@@ -8,11 +8,17 @@
+ //! `hw_ids` at start ([`super::boot`]). An unknown build or revision is refused with its measured
+ //! identity. The canonical object VAs, the initdata graph, the board templates and the work
+ //! layouts all belong to one build, so nothing is written before the build is identified.
++//!
++//! A T8132 board the backend does not qualify gets [`report_unqualified`] instead: the same
++//! measurement, read-only, with the entropy records located rather than assumed, so that the
++//! board can be qualified from its own loaded image.
+ 
+-use kernel::{bindings, device, fmt, prelude::*};
++use core::ops::Range;
++use kernel::{bindings, c_str, device, fmt, prelude::*, str::BStr};
+ 
++use super::adt::{self, perf};
+ use super::boot::glue;
+-use super::hw::FirmwareBuild;
++use super::hw::{self, FirmwareBuild};
+ 
+ /// Lowercase hex of a byte string, as `%*phN` prints it.
+ pub(crate) struct Hex<'a>(pub(crate) &'a [u8]);
+@@ -98,3 +104,196 @@ pub(crate) fn firmware(
+     }
+     Err(EINVAL)
+ }
++
++/// Upper bound for the TEXT of an unqualified board (the qualified TEXT is 0x60000 bytes).
++const REPORT_TEXT_MAX: u64 = 0x10_0000;
++
++/// The loaded firmware identity of a board the backend does not qualify.
++pub(crate) struct Loaded {
++    pub(crate) text_size: u64,
++    pub(crate) data_size: u64,
++    /// Located `GKTS` and `ECAP` record offsets in TEXT.
++    pub(crate) gkts: usize,
++    pub(crate) ecap: usize,
++    /// SHA-256 of TEXT with both 8-byte entropy payloads zeroed, as [`firmware`] hashes it.
++    pub(crate) sha256: [u8; 32],
++}
++
++/// The offset of the only `tag` record with an 8-byte payload in `text`; `None` when there is
++/// none or more than one.
++fn find_record(text: &[u8], tag: &[u8; 4]) -> Option<usize> {
++    let length = 8u32.to_le_bytes();
++    let mut found = None;
++    for at in 0..text.len().saturating_sub(15) {
++        if text[at..at + 4] != tag[..] || text[at + 4..at + 8] != length {
++            continue;
++        }
++        if found.replace(at).is_some() {
++            return None;
++        }
++    }
++    found
++}
++
++/// Logs the original ADT performance states, the input a board performance selection needs.
++fn report_performance(dev: &device::Device, source: &[u8]) {
++    match perf::parse(source) {
++        Ok(table) => {
++            dev_info!(
++                dev,
++                "G16: unqualified board: {} performance states\n",
++                table.count
++            );
++            for state in 0..table.count {
++                dev_info!(
++                    dev,
++                    "G16: unqualified board: state {}: {} MHz {} mV, SRAM {} MHz {} mV\n",
++                    state,
++                    table.frequency_mhz[state],
++                    table.core_mv[state],
++                    table.sram_frequency_mhz[state],
++                    table.sram_mv[state]
++                );
++            }
++        }
++        Err(error) => dev_info!(
++            dev,
++            "G16: unqualified board: performance states rejected: {:?}\n",
++            error
++        ),
++    }
++}
++
++/// Measures the loaded TEXT. Its range must be the boot loader's published `fw-text` no-map
++/// reservation, outside System RAM, and the original ADT's first gfx-asc segment, `__TEXT`, at
++/// the same address and size. Nothing else is mapped and nothing is written.
++fn loaded(dev: &device::Device) -> Result<Loaded> {
++    let (start, size) = glue::reserved_region(dev, c_str!("fw-text")).inspect_err(|_| {
++        dev_info!(
++            dev,
++            "G16: unqualified board: no fw-text reservation published\n"
++        )
++    })?;
++    let end = start.checked_add(size).ok_or(EINVAL)?;
++    if start == 0
++        || size == 0
++        || size > REPORT_TEXT_MAX
++        || (start | size) & (hw::PAGE - 1) != 0
++        || end - 1 > (hw::PA_MASK | (hw::PAGE - 1))
++        || !glue::ram_disjoint(start, size)
++    {
++        dev_info!(
++            dev,
++            "G16: unqualified board: fw-text {:#x}+{:#x} not readable\n",
++            start,
++            size
++        );
++        return Err(EINVAL);
++    }
++    let text: Range<u64> = start..end;
++    let (source, source_pa) =
++        adt::original_adt(core::slice::from_ref(&text)).inspect_err(|error| {
++            dev_info!(
++                dev,
++                "G16: unqualified board: original ADT export not usable: {:?}\n",
++                error
++            )
++        })?;
++    dev_info!(
++        dev,
++        "G16: unqualified board: original ADT PA={:#x} bytes={:#x} sha256={}\n",
++        source_pa,
++        source.len(),
++        Hex(&glue::sha256(&source))
++    );
++    report_performance(dev, &source);
++    let segments = perf::segments(&source).map_err(|error| {
++        dev_info!(
++            dev,
++            "G16: unqualified board: gfx-asc segments rejected: {:?}\n",
++            error
++        );
++        EINVAL
++    })?;
++    dev_info!(
++        dev,
++        "G16: unqualified board: gfx-asc segments \"{}\"\n",
++        BStr::from_bytes(segments.names.strip_suffix(&[0]).unwrap_or(segments.names))
++    );
++    let list = &segments.list[..segments.count];
++    for (index, segment) in list.iter().enumerate() {
++        dev_info!(
++            dev,
++            "G16: unqualified board: segment {}: PA={:#x} IOVA={:#x} size={:#x} flags={:#x}\n",
++            index,
++            segment.pa,
++            segment.iova,
++            segment.size,
++            segment.flags
++        );
++    }
++    if !list[0].text || list[0].pa != start || list[0].size != size {
++        dev_info!(
++            dev,
++            "G16: unqualified board: fw-text is not the ADT __TEXT segment\n"
++        );
++        return Err(EINVAL);
++    }
++    let data_size = list
++        .iter()
++        .find(|segment| segment.data)
++        .map_or(0, |s| s.size);
++    let size = usize::try_from(size)?;
++    let mut copy = copy_physical(start, size)?;
++    if copy.as_slice() != copy_physical(start, size)?.as_slice() {
++        dev_info!(
++            dev,
++            "G16: unqualified board: TEXT changed while it was read\n"
++        );
++        return Err(EAGAIN);
++    }
++    let (Some(gkts), Some(ecap)) = (find_record(&copy, b"GKTS"), find_record(&copy, b"ECAP"))
++    else {
++        // TEXT carries per-boot entropy, so a digest of the raw image identifies nothing.
++        dev_info!(
++            dev,
++            "G16: unqualified board: TEXT {:#x} DATA {:#x}: no unique GKTS and ECAP records\n",
++            size,
++            data_size
++        );
++        return Err(ENOENT);
++    };
++    copy[gkts + 8..gkts + 16].fill(0);
++    copy[ecap + 8..ecap + 16].fill(0);
++    Ok(Loaded {
++        text_size: size as u64,
++        data_size,
++        gkts,
++        ecap,
++        sha256: glue::sha256(&copy),
++    })
++}
++
++/// Logs the identity of the firmware the boot loader of an unqualified T8132 board left in
++/// place. Read-only: no PMP, no power domain, no firmware-visible write.
++pub(crate) fn report_unqualified(dev: &device::Device) -> Option<Loaded> {
++    let loaded = loaded(dev)
++        .inspect_err(|error| {
++            dev_info!(
++                dev,
++                "G16: unqualified board: firmware identity not reported: {:?}\n",
++                error
++            )
++        })
++        .ok()?;
++    dev_info!(
++        dev,
++        "G16: unqualified board: TEXT {:#x} DATA {:#x} GKTS {:#x} ECAP {:#x} sha256 {}\n",
++        loaded.text_size,
++        loaded.data_size,
++        loaded.gkts,
++        loaded.ecap,
++        Hex(&loaded.sha256)
++    );
++    Some(loaded)
++}
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 032f636f49..9e6d9d2efc 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -365,7 +365,7 @@ impl Gpu {
+         // Admission (probe-time checks), then the firmware start to READY. The board gate
+         // comes first: the cooling device takes a PMP telemetry lease, which an unqualified
+         // board's PMP may never provide.
+-        boot::qualified_board()?;
++        boot::qualified_board(pdev.as_ref())?;
+         let power = power::Power::new(dev.as_ref().as_ref())?;
+         let admitted = boot::admit(pdev, dev, cfg, res)?;
+         let data = admitted.adt.data.clone();

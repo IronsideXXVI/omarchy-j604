@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 7 Nov 2026 09:08:20 +0000
+Subject: [PATCH] drm/apple: read the panel's bright-surroundings SDR maximum
+ from raw ADT
+
+The /backlight node of the Apple device tree carries supports-aurora and
+aurora-maximum-nits, a binary32 number of nits. On the J604 they are 1
+and 0x447a7c7c, 1001.94 nits (runtime ADT, 2026-11-05), above the user-
+accessible maximum of 600 nits. Apple's technical specifications for the
+MacBook Pro (14-inch, M4, 2024) give "SDR brightness: up to 1000 nits
+(outdoor)" next to the 1600 nit HDR peak. Read it as whole nits, only
+with supports-aurora set, for the T8132 backend's bright-surroundings
+ceiling. A KUnit case covers the J604 value, the property without
+supports-aurora, and a negative one.
+
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp-panel-adt-test.c | 28 +++++++++++++++++++++-
+ drivers/gpu/drm/apple/dcp-panel-adt.c      | 19 +++++++++++++++
+ drivers/gpu/drm/apple/dcp-panel-adt.h      |  6 +++++
+ 3 files changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-panel-adt-test.c b/drivers/gpu/drm/apple/dcp-panel-adt-test.c
+index 076e310a5c..facf4954bf 100644
+--- a/drivers/gpu/drm/apple/dcp-panel-adt-test.c
++++ b/drivers/gpu/drm/apple/dcp-panel-adt-test.c
+@@ -67,6 +67,8 @@ struct adt_spec {
+ 	bool singular;
+ 	u32 headroom;		/* 0: no EDRPotentialHeadroom */
+ 	u32 lmax;		/* 0: no LmaxProduct */
++	u32 aurora;		/* 0: no supports-aurora, else its value */
++	u32 aurora_nits;	/* 0: no aurora-maximum-nits, else binary32 bits */
+ 	bool gamut_in_child;	/* the target one level too deep */
+ };
+ 
+@@ -93,12 +95,16 @@ static size_t adt_build(struct adt_buf *b, const struct adt_spec *s)
+ 	if (s->matrix)
+ 		adt_matrix(b, s->matrix, s->singular);
+ 
+-	adt_node(b, 1 + !!s->headroom + !!s->lmax, 0);
++	adt_node(b, 1 + !!s->headroom + !!s->lmax + !!s->aurora + !!s->aurora_nits, 0);
+ 	adt_name(b, "backlight");
+ 	if (s->headroom)
+ 		adt_u32(b, "EDRPotentialHeadroom", s->headroom);
+ 	if (s->lmax)
+ 		adt_u32(b, "LmaxProduct", s->lmax);
++	if (s->aurora)
++		adt_u32(b, "supports-aurora", s->aurora);
++	if (s->aurora_nits)
++		adt_u32(b, "aurora-maximum-nits", s->aurora_nits);
+ 	return b->len;
+ }
+ 
+@@ -137,6 +143,25 @@ static void panel_adt_peak(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, panel.lmax_product, 0U);
+ }
+ 
++/* The J604 value 0x447a7c7c is 1001.94 nits; without supports-aurora none. */
++static void panel_adt_aurora_maximum(struct kunit *test)
++{
++	const struct adt_spec s = { .gamut = "P3", .matrix = 1, .aurora = 1,
++				    .aurora_nits = 0x447a7c7c };
++	const struct adt_spec off = { .gamut = "P3", .matrix = 1, .aurora_nits = 0x447a7c7c };
++	const struct adt_spec bad = { .gamut = "P3", .matrix = 1, .aurora = 1,
++				      .aurora_nits = 0xc47a0000 };
++	struct dcp_panel_adt panel;
++
++	adt_parse(test, &s, &panel);
++	KUNIT_EXPECT_EQ(test, panel.aurora_max_nits, 1001U);
++	adt_parse(test, &off, &panel);
++	KUNIT_EXPECT_EQ(test, panel.aurora_max_nits, 0U);
++	/* A negative value is not a ceiling. */
++	adt_parse(test, &bad, &panel);
++	KUNIT_EXPECT_EQ(test, panel.aurora_max_nits, 0U);
++}
++
+ static void panel_adt_srgb(struct kunit *test)
+ {
+ 	const struct adt_spec s = { .gamut = "sRGB", .matrix = 1 };
+@@ -200,6 +225,7 @@ static void panel_adt_malformed_tree(struct kunit *test)
+ static struct kunit_case panel_adt_cases[] = {
+ 	KUNIT_CASE(panel_adt_p3_and_headroom),
+ 	KUNIT_CASE(panel_adt_peak),
++	KUNIT_CASE(panel_adt_aurora_maximum),
+ 	KUNIT_CASE(panel_adt_srgb),
+ 	KUNIT_CASE(panel_adt_target_needs_a_valid_v1_matrix),
+ 	KUNIT_CASE(panel_adt_unknown_or_misplaced_target),
+diff --git a/drivers/gpu/drm/apple/dcp-panel-adt.c b/drivers/gpu/drm/apple/dcp-panel-adt.c
+index ed56003e60..d1800dbabf 100644
+--- a/drivers/gpu/drm/apple/dcp-panel-adt.c
++++ b/drivers/gpu/drm/apple/dcp-panel-adt.c
+@@ -9,6 +9,7 @@
+  * target and the /backlight EDR headroom. The panel identity, serial and
+  * dimensions are not read.
+  */
++#include <linux/bits.h>
+ #include <linux/err.h>
+ #include <linux/io.h>
+ #include <linux/kernel.h>
+@@ -71,6 +72,16 @@ static enum dcp_panel_gamut dcp_adt_gamut(const u8 *value, u32 size)
+ 	return DCP_PANEL_GAMUT_UNSPECIFIED;
+ }
+ 
++/* Whole units of a positive binary32 below 2^24; 0 for anything else. */
++static u32 dcp_adt_binary32_int(u32 bits)
++{
++	int exponent = (int)((bits >> 23) & 0xff) - 127;
++
++	if (bits >> 31 || exponent < 0 || exponent > 23)
++		return 0;
++	return ((bits & GENMASK(22, 0)) | BIT(23)) >> (23 - exponent);
++}
++
+ static const u8 *dcp_adt_bytes(struct dcp_adt_cursor *c, size_t size)
+ {
+ 	const u8 *p;
+@@ -90,6 +101,8 @@ static int dcp_adt_node(struct dcp_adt_cursor *c, struct dcp_panel_adt *panel, u
+ 	char node_name[33] = {};
+ 	enum dcp_panel_gamut gamut = DCP_PANEL_GAMUT_UNSPECIFIED;
+ 	bool gamut_seen = false, matrix_seen = false, matrix_valid = false;
++	bool aurora = false;
++	u32 aurora_nits = 0;
+ 	bool product, backlight;
+ 
+ 	if (IS_ERR(header))
+@@ -139,9 +152,15 @@ static int dcp_adt_node(struct dcp_adt_cursor *c, struct dcp_panel_adt *panel, u
+ 			panel->edr_potential_headroom = get_unaligned_le32(prop + 36);
+ 		} else if (backlight && !strcmp(name, "LmaxProduct") && size == 4) {
+ 			panel->lmax_product = get_unaligned_le32(prop + 36);
++		} else if (backlight && !strcmp(name, "supports-aurora") && size == 4) {
++			aurora = get_unaligned_le32(prop + 36) == 1;
++		} else if (backlight && !strcmp(name, "aurora-maximum-nits") && size == 4) {
++			aurora_nits = dcp_adt_binary32_int(get_unaligned_le32(prop + 36));
+ 		}
+ 		c->pos += 36 + ALIGN((size_t)size, 4);
+ 	}
++	if (backlight)
++		panel->aurora_max_nits = aurora ? aurora_nits : 0;
+ 	if (product)
+ 		panel->gamut = gamut_seen && matrix_seen && matrix_valid ?
+ 			gamut : DCP_PANEL_GAMUT_UNSPECIFIED;
+diff --git a/drivers/gpu/drm/apple/dcp-panel-adt.h b/drivers/gpu/drm/apple/dcp-panel-adt.h
+index edaf613fcf..434d3553d8 100644
+--- a/drivers/gpu/drm/apple/dcp-panel-adt.h
++++ b/drivers/gpu/drm/apple/dcp-panel-adt.h
+@@ -22,6 +22,12 @@ struct dcp_panel_adt {
+ 	u32 edr_potential_headroom;
+ 	/* /backlight LmaxProduct, the panel peak in 16.16 nits; 0 if absent */
+ 	u32 lmax_product;
++	/*
++	 * /backlight supports-aurora and aurora-maximum-nits (binary32 nits,
++	 * here whole nits): the SDR ceiling for bright surroundings; 0 if either
++	 * is absent or off.
++	 */
++	u32 aurora_max_nits;
+ 	/* /product target, only when its calibration matrix is also valid */
+ 	enum dcp_panel_gamut gamut;
+ };

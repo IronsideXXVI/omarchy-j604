@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Mon, 26 Oct 2026 13:09:55 +1100
+Subject: [PATCH] media: apple: isp: reject P010 command ACKs after the
+ deadline
+
+Check the command deadline before advancing the ring cursor, including when an ACK arrives at the wait timeout boundary. Keep the failed channel latched until coprocessor stop. Cover the boundary in KUnit. Emit the capture stress result after cleanup so a failed STREAMOFF cannot leave a passing result.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(backported from commit 3bd32e8909402c48eea988b72df229093f2a5cf6)
+[j604: the hunk for tools/testing/selftests/media/apple-isp-stress.c is dropped: that host stress test is not in this tree (added by an Aurora commit outside the ISP driver series).]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/isp/isp-drv.h    |  2 ++
+ .../media/platform/apple/isp/isp-ipc-test.c   | 19 +++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-ipc.c    |  8 ++++++++
+ 3 files changed, 29 insertions(+)
+
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index e02d675f0e..db042f94ae 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -117,6 +117,8 @@ struct isp_channel {
+ 	void *virt;
+ 	u32 doorbell;
+ 	u32 cursor;
++	unsigned long deadline;
++	bool deadline_active;
+ 	struct mutex lock;
+ 	struct isp_message req;
+ 	struct isp_message rsp;
+diff --git a/drivers/media/platform/apple/isp/isp-ipc-test.c b/drivers/media/platform/apple/isp/isp-ipc-test.c
+index efd24f6794..8b6decd63f 100644
+--- a/drivers/media/platform/apple/isp/isp-ipc-test.c
++++ b/drivers/media/platform/apple/isp/isp-ipc-test.c
+@@ -170,7 +170,26 @@ static void isp_test_command_ring_wrap(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, chan->cursor, 0);
+ }
+ 
++static void isp_test_late_ack_keeps_cursor(struct kunit *test)
++{
++	struct isp_sm_test *t = isp_sm_test_alloc(test);
++	struct isp_message response = { .arg0 = 0x5000001 };
++
++	isp_get_current_format(t->isp)->pixelformat = V4L2_PIX_FMT_P010;
++	t->chan->virt = &response;
++	t->chan->num = 8;
++	t->chan->req.arg0 = 0x5000000;
++	t->chan->deadline_active = true;
++	t->chan->deadline = jiffies;
++	KUNIT_EXPECT_FALSE(test, chan_tx_done(t->isp, t->chan));
++	KUNIT_EXPECT_EQ(test, t->chan->cursor, 0);
++	t->chan->deadline = jiffies + HZ;
++	KUNIT_EXPECT_TRUE(test, chan_tx_done(t->isp, t->chan));
++	KUNIT_EXPECT_EQ(test, t->chan->cursor, 1);
++}
++
+ static struct kunit_case isp_ipc_test_cases[] = {
++	KUNIT_CASE(isp_test_late_ack_keeps_cursor),
+ 	KUNIT_CASE(isp_test_command_ring_wrap),
+ 	KUNIT_CASE(isp_test_sm_free_releases),
+ 	KUNIT_CASE(isp_test_sm_free_alias),
+diff --git a/drivers/media/platform/apple/isp/isp-ipc.c b/drivers/media/platform/apple/isp/isp-ipc.c
+index da946f360f..92cfc6ab35 100644
+--- a/drivers/media/platform/apple/isp/isp-ipc.c
++++ b/drivers/media/platform/apple/isp/isp-ipc.c
+@@ -177,6 +177,9 @@ int ipc_chan_handle(struct apple_isp *isp, struct isp_channel *chan)
+ 
+ static inline bool chan_tx_done(struct apple_isp *isp, struct isp_channel *chan)
+ {
++	if (isp_is_p010(isp) && chan->deadline_active &&
++	    time_after_eq(jiffies, chan->deadline))
++		return false;
+ 	dma_rmb();
+ 
+ 	chan_read_msg(isp, chan, &chan->rsp);
+@@ -198,6 +201,10 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
+ #endif
+ 	if (isp->ipc_failed)
+ 		return -EIO;
++	if (isp_is_p010(isp) && timeout) {
++		chan->deadline = jiffies + timeout;
++		chan->deadline_active = true;
++	}
+ 	chan_write_msg(isp, chan, &chan->req);
+ 	dma_wmb();
+ 
+@@ -217,6 +224,7 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
+ 		return -ETIME;
+ 	}
+ 
++	chan->deadline_active = false;
+ 	isp_dbg(isp, "%s: request success (%ld)\n", chan->name, t);
+ 
+ 	return 0;

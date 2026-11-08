@@ -1,0 +1,702 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 02:54:46 +1100
+Subject: [PATCH] media: apple: scaler: build the register list for same-size
+ jobs
+
+Add the job builder the submission path will use: it turns a source
+image, a destination image and an optional colour matrix into the
+ordered register writes for one job, ending with the pre-start tag and
+START. It covers conversions without scaling, which are the common case
+(decoder output to RGB, RGB to encoder input):
+
+- read and write DMA: layout, format code, subsampling, plane addresses,
+  strides, component order, picture and per-plane sizes;
+- alpha fill when the source has no alpha and the destination does;
+- chroma upsampling for 4:2:x sources and downsampling for 4:2:x
+  destinations, ordered dither when going from 10 to 8 bits;
+- the scaler at 1:1 (filters off, unit Q22 ratios);
+- the CSC matrix, offsets and clamps;
+- the per-plane memory request words and control words the engine is
+  driven with on every job.
+
+KUnit builds three 1080p jobs (NV12 BT.709 to ARGB32, ARGB32 to NV12,
+P010 BT.2020 to ARGB32) and checks that every register ends with the
+value the engine was given for the same job on macOS, and that nothing
+else is written.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+(cherry picked from commit 2fb8a25a57e40f3b7dc49c7d6e875f677b424552)
+---
+ .../platform/apple/scaler/apple-scaler-hw.c   | 233 ++++++++++++-
+ .../platform/apple/scaler/apple-scaler-hw.h   |  43 +++
+ .../platform/apple/scaler/apple-scaler-test.c | 324 ++++++++++++++++++
+ 3 files changed, 599 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/apple/scaler/apple-scaler-hw.c b/drivers/media/platform/apple/scaler/apple-scaler-hw.c
+index 2cbff1aee9..5eb645a776 100644
+--- a/drivers/media/platform/apple/scaler/apple-scaler-hw.c
++++ b/drivers/media/platform/apple/scaler/apple-scaler-hw.c
+@@ -15,6 +15,7 @@
+ #include <linux/math64.h>
+ #include <linux/module.h>
+ #include <linux/string.h>
++#include <linux/wordpart.h>
+ 
+ #include <kunit/visibility.h>
+ 
+@@ -45,7 +46,7 @@ static const struct asc_format asc_formats[] = {
+ 		/* 10 bits in the top of each 16-bit sample. */
+ 		.fourcc = V4L2_PIX_FMT_P010, .layout = 0xc, .code = 0x2,
+ 		.sampling = 0x12, .swizzle = ASC_SWIZZLE_CBCR, .planes = 2,
+-		.bpp = { 2, 4 }, .hsub = 2, .vsub = 2, .yuv = true,
++		.bpp = { 2, 4 }, .hsub = 2, .vsub = 2, .yuv = true, .wide = true,
+ 	},
+ };
+ 
+@@ -190,3 +191,233 @@ u32 asc_scale_ratio(u32 in, u32 out)
+ 	return (u32)div_u64((u64)in << ASC_RATIO_SHIFT, out) & ~3u;
+ }
+ EXPORT_SYMBOL_IF_KUNIT(asc_scale_ratio);
++
++/*
++ * Job programming. The engine takes the whole pipeline state for every
++ * job; nothing carries over from the previous one. The order below follows
++ * the pipeline (source, destination, chroma, scaler, CSC, memory system)
++ * and ends with the pre-start tag and START.
++ */
++struct asc_emit {
++	struct asc_reg *w;
++	unsigned int n, max;
++};
++
++static void asc_emit(struct asc_emit *e, u32 off, u32 val)
++{
++	if (e->n < e->max)
++		e->w[e->n] = (struct asc_reg){ off, val };
++	e->n++;
++}
++
++/* Source (read DMA) and destination (write DMA) register banks. */
++struct asc_dma_regs {
++	u32 layout, code, sampling, plane, stride, offset, swizzle, size;
++	u32 plane_width, plane_height;
++	u32 flag;	/* or-ed into layout-adjacent words on the write side */
++};
++
++static const struct asc_dma_regs asc_rdma = {
++	.layout = 0x180, .code = 0x184, .sampling = 0x188, .plane = 0x198,
++	.stride = 0x1d8, .offset = 0x1e8, .swizzle = 0x1f8, .size = 0x1fc,
++	.plane_width = 0x234, .plane_height = 0x244, .flag = 0,
++};
++
++static const struct asc_dma_regs asc_wdma = {
++	.layout = 0x280, .code = 0x284, .sampling = 0x288, .plane = 0x290,
++	.stride = 0x2c0, .offset = 0x2cc, .swizzle = 0x2d8, .size = 0x2dc,
++	.plane_width = 0x308, .plane_height = 0x314, .flag = BIT(15),
++};
++
++static void asc_emit_image(struct asc_emit *e, const struct asc_dma_regs *r,
++			   const struct asc_image *img)
++{
++	const struct asc_format *f = img->fmt;
++	/* Plane 2 is never used; the engine still takes it at luma size. */
++	u32 pw[3] = { img->width, img->width / f->hsub, img->width };
++	u32 ph[3] = { img->height, img->height / f->vsub, img->height };
++	unsigned int i, nplanes = f->planes == 1 ? 3 : f->planes;
++
++	asc_emit(e, r->layout, f->layout);
++	asc_emit(e, r->code, r->flag | f->code);
++	asc_emit(e, r->sampling, r->flag | f->sampling);
++	if (r->flag)
++		asc_emit(e, r->sampling + 4, r->flag);
++	else {
++		asc_emit(e, r->sampling + 4, 0);
++		asc_emit(e, r->sampling + 8, 0);
++	}
++	for (i = 0; i < nplanes; i++) {
++		u64 dva = i < f->planes ? img->dva[i] : 0;
++
++		asc_emit(e, r->plane + 8 * i, lower_32_bits(dva));
++		asc_emit(e, r->plane + 8 * i + 4, upper_32_bits(dva));
++		asc_emit(e, r->stride + 4 * i, i < f->planes ? img->stride[i] : 0);
++	}
++	for (i = 0; i < 3; i++)
++		asc_emit(e, r->offset + 4 * i, 0);
++	asc_emit(e, r->swizzle, f->swizzle);
++	asc_emit(e, r->size, img->width);
++	asc_emit(e, r->size + 4, img->height);
++	for (i = 0; i < 3; i++) {
++		asc_emit(e, r->plane_width + 4 * i, f->planes == 1 ? img->width : pw[i]);
++		asc_emit(e, r->plane_height + 4 * i, f->planes == 1 ? img->height : ph[i]);
++	}
++}
++
++/* Per-plane memory request words, as the engine is driven on macOS. */
++static void asc_emit_memory(struct asc_emit *e, const struct asc_job *job)
++{
++	const struct asc_format *s = job->src.fmt, *d = job->dst.fmt;
++	u32 wide = s->wide ? BIT(1) : 0;
++	unsigned int i;
++
++	for (i = 0; i < 4; i++) {
++		asc_emit(e, 0x204 + 4 * i, 0x0007d311);
++		asc_emit(e, 0x214 + 4 * i, 0x00000707);
++		asc_emit(e, 0x224 + 4 * i, 0x00000020);
++	}
++	for (i = 0; i < 3; i++) {
++		asc_emit(e, 0x2e4 + 4 * i, 0x000ac211);
++		asc_emit(e, 0x2f0 + 4 * i, 0x0c0ac207);
++		asc_emit(e, 0x2fc + 4 * i, 0x04000620);
++	}
++	asc_emit(e, 0x254, 1);
++
++	for (i = 0; i < 4; i++)
++		asc_emit(e, 0x13800 + 4 * i, 0);
++	asc_emit(e, 0x13810, 0x8 | wide);
++	asc_emit(e, 0x13814, (s->yuv ? 0x28 : 0x8) | wide);
++	asc_emit(e, 0x13818, (s->yuv ? 0x28 : 0x8) | wide);
++	asc_emit(e, 0x1381c, s->yuv ? 0x20 : 0x8);
++	asc_emit(e, 0x13c04, 0);
++	asc_emit(e, 0x13c10, 0x8);
++	asc_emit(e, 0x13c14, d->yuv ? 0x28 : 0x8);
++	asc_emit(e, 0x13c18, d->yuv ? 0x28 : 0x8);
++	asc_emit(e, 0x13c1c, d->yuv ? 0x20 : 0x8);
++	asc_emit(e, 0x13c00, 1);
++}
++
++static void asc_emit_chroma(struct asc_emit *e, const struct asc_job *job)
++{
++	/* Upsampler interpolation weights, 0x800 = one half. */
++	static const u32 up[8] = { 0, 0x800, 0x800, 0, 0, 0x800, 0x800, 0 };
++	/* 2x2 ordered-dither index pattern, repeated over 4x4. */
++	static const u32 dither[16] = { 0, 2, 0, 2, 3, 1, 3, 1, 0, 2, 0, 2, 3, 1, 3, 1 };
++	const struct asc_format *s = job->src.fmt, *d = job->dst.fmt;
++	unsigned int i;
++
++	asc_emit(e, 0x800, s->yuv && s->hsub > 1 ? 0xd : 0xc);
++	if (s->yuv && s->hsub > 1)
++		for (i = 0; i < ARRAY_SIZE(up); i++)
++			asc_emit(e, 0x804 + 4 * i, up[i]);
++	asc_emit(e, 0x824, 0xc);
++	asc_emit(e, 0x900, d->yuv && d->hsub > 1 ? 0x00010103 : 0);
++	if (s->wide && !d->wide) {
++		asc_emit(e, 0xa00, 0x02020200);
++		for (i = 0; i < ARRAY_SIZE(dither); i++)
++			asc_emit(e, 0xa80 + 4 * i, dither[i]);
++	} else {
++		asc_emit(e, 0xa00, 0);
++	}
++}
++
++/* Scaler at 1:1: polyphase filters off, unit ratios, zero initial phase. */
++static void asc_emit_unscaled(struct asc_emit *e, const struct asc_job *job)
++{
++	static const u32 base[2] = { 0x1000, 0x2000 };
++	u32 flags = job->src.fmt->yuv && job->src.fmt->hsub > 1 ? BIT(1) : 0;
++	u32 one = 1u << ASC_RATIO_SHIFT;
++	unsigned int i;
++
++	for (i = 0; i < 2; i++) {
++		asc_emit(e, base[i], flags);
++		asc_emit(e, base[i] + 0x04, 0);
++		asc_emit(e, base[i] + 0x08, 0);
++		asc_emit(e, base[i] + 0x0c, one);
++		asc_emit(e, base[i] + 0x10, one);
++		asc_emit(e, base[i] + 0x14, one);
++		asc_emit(e, base[i] + 0x18, one);
++		asc_emit(e, base[i] + 0x1c, 0);
++		asc_emit(e, base[i] + 0x20, one);
++		asc_emit(e, base[i] + 0x24, one);
++	}
++	asc_emit(e, 0x480, 0);
++}
++
++static void asc_emit_csc(struct asc_emit *e, const struct asc_csc *csc)
++{
++	unsigned int r, c;
++
++	asc_emit(e, ASC_CSC_MODE, ASC_CSC_MODE_DEFAULT);
++	for (c = 0; c < 3; c++)
++		asc_emit(e, ASC_CSC_PRE_OFFSET(c), asc_csc_offset_reg(csc->pre[c]));
++	for (r = 0; r < 3; r++)
++		for (c = 0; c < 3; c++)
++			asc_emit(e, ASC_CSC_COEF(r, c), (u16)csc->coef[r][c]);
++	for (c = 0; c < 3; c++)
++		asc_emit(e, ASC_CSC_POST_OFFSET(c), asc_csc_offset_reg(csc->post[c]));
++	/* Output clamps: full signed range on every channel. */
++	for (c = 0; c < 3; c++) {
++		asc_emit(e, 0xa98c + 4 * c, 0x80000001);
++		asc_emit(e, 0xa998 + 4 * c, 0x7fffffff);
++		asc_emit(e, 0xa9a4 + 4 * c, 0x80000001);
++		asc_emit(e, 0xa9b0 + 4 * c, 0x7fffffff);
++	}
++	asc_emit(e, ASC_CSC_CTRL, ASC_CSC_CTRL_ENABLE);
++}
++
++/* Control words the engine is driven with for every job on macOS. */
++static const struct asc_reg asc_job_fixed[] = {
++	{ 0x000e4, 0x00000000 }, { 0x000e8, 0x00000038 }, { 0x00124, 0x00000000 },
++	{ 0x00380, 0x00000000 }, { 0x03000, 0x00000000 }, { 0x07418, 0xffffffff },
++	{ 0x16000, 0x00000000 }, { 0x16004, 0x244024c0 }, { 0x16080, 0x00000000 },
++	{ 0x16084, 0x0b710367 }, { 0x16088, 0x00000128 }, { 0x16504, 0x02000500 },
++	{ 0x16508, 0x00003200 }, { 0x1651c, 0x00851400 }, { 0x16534, 0x00000008 },
++	{ 0x16568, 0x00250500 }, { 0x16588, 0x00496513 }, { 0x16600, 0x00000015 },
++	{ 0x16800, 0x00000000 }, { 0x25080, 0x00000000 }, { 0x2e300, 0x03804038 },
++	{ 0x2e304, 0xa0a0a0a0 }, { 0x2e308, 0x02550000 }, { 0x2e30c, 0x02550255 },
++	{ 0x2e310, 0x00000000 }, { 0x2e314, 0x00100008 }, { 0x2e318, 0x02550000 },
++};
++
++/**
++ * asc_job_build - register writes for one job, in order
++ * @job: the conversion; source and destination must be the same size
++ * @w: output array
++ * @max: capacity of @w
++ *
++ * Return: number of writes, -EINVAL for a job this path cannot run, or
++ * -ENOSPC if @w is too small.
++ */
++int asc_job_build(const struct asc_job *job, struct asc_reg *w, unsigned int max)
++{
++	const struct asc_format *s = job->src.fmt, *d = job->dst.fmt;
++	struct asc_emit e = { .w = w, .max = max };
++	unsigned int i;
++
++	if (!s || !d || job->src.width != job->dst.width ||
++	    job->src.height != job->dst.height)
++		return -EINVAL;
++	/* Y'CbCr <-> R'G'B' needs a matrix; same-family jobs must not have one. */
++	if ((s->yuv != d->yuv) != !!job->csc)
++		return -EINVAL;
++
++	asc_emit(&e, ASC_CSC_CTRL, ASC_CSC_CTRL_BYPASS);
++	asc_emit_image(&e, &asc_rdma, &job->src);
++	asc_emit_image(&e, &asc_wdma, &job->dst);
++	asc_emit_memory(&e, job);
++	/* Alpha fill: constant opaque alpha when the source has none. */
++	asc_emit(&e, 0x8c, (d->alpha && !s->alpha ? BIT(31) : 0) | 0xffff);
++	asc_emit_chroma(&e, job);
++	asc_emit_unscaled(&e, job);
++	if (job->csc)
++		asc_emit_csc(&e, job->csc);
++	for (i = 0; i < ARRAY_SIZE(asc_job_fixed); i++)
++		asc_emit(&e, asc_job_fixed[i].off, asc_job_fixed[i].val);
++	asc_emit(&e, 0x110, job->transform_id);
++	asc_emit(&e, 0x098, 0xfffffffe);
++	asc_emit(&e, 0x080, 1);
++
++	return e.n <= max ? e.n : -ENOSPC;
++}
++EXPORT_SYMBOL_IF_KUNIT(asc_job_build);
+diff --git a/drivers/media/platform/apple/scaler/apple-scaler-hw.h b/drivers/media/platform/apple/scaler/apple-scaler-hw.h
+index 3093aebc3d..cf371272dc 100644
+--- a/drivers/media/platform/apple/scaler/apple-scaler-hw.h
++++ b/drivers/media/platform/apple/scaler/apple-scaler-hw.h
+@@ -56,6 +56,7 @@ struct asc_csc {
+  * @vsub: vertical chroma subsampling of plane 1
+  * @yuv: Y'CbCr format (needs the CSC to pair with RGB)
+  * @alpha: carries an alpha channel
++ * @wide: samples are 16 bits in memory (more than 8 significant bits)
+  */
+ struct asc_format {
+ 	u32 fourcc;
+@@ -69,8 +70,50 @@ struct asc_format {
+ 	u8 vsub;
+ 	bool yuv;
+ 	bool alpha;
++	bool wide;
+ };
+ 
++/* One register write: byte offset in the MSR aperture and value. */
++struct asc_reg {
++	u32 off;
++	u32 val;
++};
++
++#define ASC_MAX_PLANES		2
++#define ASC_JOB_MAX_WRITES	224
++
++/**
++ * struct asc_image - one side of a job
++ * @fmt: pixel format
++ * @width: width in pixels
++ * @height: height in pixels
++ * @dva: DMA address of each colour plane
++ * @stride: bytes per line of each colour plane
++ */
++struct asc_image {
++	const struct asc_format *fmt;
++	u32 width;
++	u32 height;
++	u64 dva[ASC_MAX_PLANES];
++	u32 stride[ASC_MAX_PLANES];
++};
++
++/**
++ * struct asc_job - a complete conversion
++ * @src: image read
++ * @dst: image written
++ * @csc: colour conversion, or NULL to pass components through
++ * @transform_id: tag the engine carries for this job
++ */
++struct asc_job {
++	struct asc_image src;
++	struct asc_image dst;
++	const struct asc_csc *csc;
++	u32 transform_id;
++};
++
++int asc_job_build(const struct asc_job *job, struct asc_reg *w, unsigned int max);
++
+ const struct asc_format *asc_find_format(u32 fourcc);
+ const struct asc_format *asc_format_by_index(unsigned int index);
+ 
+diff --git a/drivers/media/platform/apple/scaler/apple-scaler-test.c b/drivers/media/platform/apple/scaler/apple-scaler-test.c
+index 58f3b2f6f3..4e61ad54e5 100644
+--- a/drivers/media/platform/apple/scaler/apple-scaler-test.c
++++ b/drivers/media/platform/apple/scaler/apple-scaler-test.c
+@@ -12,6 +12,7 @@
+ #include <linux/string.h>
+ 
+ #include "apple-scaler-hw.h"
++#include "apple-scaler-regs.h"
+ 
+ struct asc_csc_case {
+ 	const char *name;
+@@ -138,12 +139,335 @@ static void asc_test_formats(struct kunit *test)
+ 	}
+ }
+ 
++
++/*
++ * Final register state of three jobs as the engine was driven on macOS
++ * (1920x1080, same size): NV12 BT.709 limited -> ARGB32, ARGB32 -> NV12
++ * BT.709 limited, P010 BT.2020 limited -> ARGB32. The CSC matrix words
++ * (0x3814..0x3834) are covered by asc_test_csc.
++ */
++static const struct asc_reg asc_expect_nv12_709_argb[] = {
++	{ 0x00080, 0x00000001 }, { 0x0008c, 0x8000ffff }, { 0x00098, 0xfffffffe },
++	{ 0x000e4, 0x00000000 }, { 0x000e8, 0x00000038 }, { 0x00110, 0x00000094 },
++	{ 0x00124, 0x00000000 }, { 0x00180, 0x0000000c }, { 0x00184, 0x00000001 },
++	{ 0x00188, 0x00000006 }, { 0x0018c, 0x00000000 }, { 0x00190, 0x00000000 },
++	{ 0x00198, 0x007f0200 }, { 0x0019c, 0x00000100 }, { 0x001a0, 0x009ea600 },
++	{ 0x001a4, 0x00000100 }, { 0x001d8, 0x00000780 }, { 0x001dc, 0x00000780 },
++	{ 0x001e8, 0x00000000 }, { 0x001ec, 0x00000000 }, { 0x001f0, 0x00000000 },
++	{ 0x001f8, 0x03000102 }, { 0x001fc, 0x00000780 }, { 0x00200, 0x00000438 },
++	{ 0x00204, 0x0007d311 }, { 0x00208, 0x0007d311 }, { 0x0020c, 0x0007d311 },
++	{ 0x00210, 0x0007d311 }, { 0x00214, 0x00000707 }, { 0x00218, 0x00000707 },
++	{ 0x0021c, 0x00000707 }, { 0x00220, 0x00000707 }, { 0x00224, 0x00000020 },
++	{ 0x00228, 0x00000020 }, { 0x0022c, 0x00000020 }, { 0x00230, 0x00000020 },
++	{ 0x00234, 0x00000780 }, { 0x00238, 0x000003c0 }, { 0x0023c, 0x00000780 },
++	{ 0x00244, 0x00000438 }, { 0x00248, 0x0000021c }, { 0x0024c, 0x00000438 },
++	{ 0x00254, 0x00000001 }, { 0x00280, 0x00000001 }, { 0x00284, 0x0000801e },
++	{ 0x00288, 0x00008000 }, { 0x0028c, 0x00008000 }, { 0x00290, 0x00000000 },
++	{ 0x00294, 0x00000100 }, { 0x00298, 0x00000000 }, { 0x0029c, 0x00000000 },
++	{ 0x002a0, 0x00000000 }, { 0x002a4, 0x00000000 }, { 0x002c0, 0x00001e00 },
++	{ 0x002c4, 0x00000000 }, { 0x002c8, 0x00000000 }, { 0x002cc, 0x00000000 },
++	{ 0x002d0, 0x00000000 }, { 0x002d4, 0x00000000 }, { 0x002d8, 0x03020100 },
++	{ 0x002dc, 0x00000780 }, { 0x002e0, 0x00000438 }, { 0x002e4, 0x000ac211 },
++	{ 0x002e8, 0x000ac211 }, { 0x002ec, 0x000ac211 }, { 0x002f0, 0x0c0ac207 },
++	{ 0x002f4, 0x0c0ac207 }, { 0x002f8, 0x0c0ac207 }, { 0x002fc, 0x04000620 },
++	{ 0x00300, 0x04000620 }, { 0x00304, 0x04000620 }, { 0x00308, 0x00000780 },
++	{ 0x0030c, 0x00000780 }, { 0x00310, 0x00000780 }, { 0x00314, 0x00000438 },
++	{ 0x00318, 0x00000438 }, { 0x0031c, 0x00000438 }, { 0x00380, 0x00000000 },
++	{ 0x00480, 0x00000000 }, { 0x00800, 0x0000000d }, { 0x00804, 0x00000000 },
++	{ 0x00808, 0x00000800 }, { 0x0080c, 0x00000800 }, { 0x00810, 0x00000000 },
++	{ 0x00814, 0x00000000 }, { 0x00818, 0x00000800 }, { 0x0081c, 0x00000800 },
++	{ 0x00820, 0x00000000 }, { 0x00824, 0x0000000c }, { 0x00900, 0x00000000 },
++	{ 0x00a00, 0x00000000 }, { 0x01000, 0x00000002 }, { 0x01004, 0x00000000 },
++	{ 0x01008, 0x00000000 }, { 0x0100c, 0x00400000 }, { 0x01010, 0x00400000 },
++	{ 0x01014, 0x00400000 }, { 0x01018, 0x00400000 }, { 0x0101c, 0x00000000 },
++	{ 0x01020, 0x00400000 }, { 0x01024, 0x00400000 }, { 0x02000, 0x00000002 },
++	{ 0x02004, 0x00000000 }, { 0x02008, 0x00000000 }, { 0x0200c, 0x00400000 },
++	{ 0x02010, 0x00400000 }, { 0x02014, 0x00400000 }, { 0x02018, 0x00400000 },
++	{ 0x0201c, 0x00000000 }, { 0x02020, 0x00400000 }, { 0x02024, 0x00400000 },
++	{ 0x03000, 0x00000000 }, { 0x03800, 0x000e0003 }, { 0x03804, 0x0000000c },
++	{ 0x03808, 0x03eff000 }, { 0x0380c, 0x037fe000 }, { 0x03810, 0x037fe000 },
++	{ 0x03838, 0x00000000 }, { 0x0383c, 0x00000000 }, { 0x03840, 0x00000000 },
++	{ 0x07418, 0xffffffff }, { 0x0a98c, 0x80000001 }, { 0x0a990, 0x80000001 },
++	{ 0x0a994, 0x80000001 }, { 0x0a998, 0x7fffffff }, { 0x0a99c, 0x7fffffff },
++	{ 0x0a9a0, 0x7fffffff }, { 0x0a9a4, 0x80000001 }, { 0x0a9a8, 0x80000001 },
++	{ 0x0a9ac, 0x80000001 }, { 0x0a9b0, 0x7fffffff }, { 0x0a9b4, 0x7fffffff },
++	{ 0x0a9b8, 0x7fffffff }, { 0x13800, 0x00000000 }, { 0x13804, 0x00000000 },
++	{ 0x13808, 0x00000000 }, { 0x1380c, 0x00000000 }, { 0x13810, 0x00000008 },
++	{ 0x13814, 0x00000028 }, { 0x13818, 0x00000028 }, { 0x1381c, 0x00000020 },
++	{ 0x13c00, 0x00000001 }, { 0x13c04, 0x00000000 }, { 0x13c10, 0x00000008 },
++	{ 0x13c14, 0x00000008 }, { 0x13c18, 0x00000008 }, { 0x13c1c, 0x00000008 },
++	{ 0x16000, 0x00000000 }, { 0x16004, 0x244024c0 }, { 0x16080, 0x00000000 },
++	{ 0x16084, 0x0b710367 }, { 0x16088, 0x00000128 }, { 0x16504, 0x02000500 },
++	{ 0x16508, 0x00003200 }, { 0x1651c, 0x00851400 }, { 0x16534, 0x00000008 },
++	{ 0x16568, 0x00250500 }, { 0x16588, 0x00496513 }, { 0x16600, 0x00000015 },
++	{ 0x16800, 0x00000000 }, { 0x25080, 0x00000000 }, { 0x2e300, 0x03804038 },
++	{ 0x2e304, 0xa0a0a0a0 }, { 0x2e308, 0x02550000 }, { 0x2e30c, 0x02550255 },
++	{ 0x2e310, 0x00000000 }, { 0x2e314, 0x00100008 }, { 0x2e318, 0x02550000 },
++};
++
++static const struct asc_reg asc_expect_argb_nv12_709[] = {
++	{ 0x00080, 0x00000001 }, { 0x0008c, 0x0000ffff }, { 0x00098, 0xfffffffe },
++	{ 0x000e4, 0x00000000 }, { 0x000e8, 0x00000038 }, { 0x00110, 0x000000b4 },
++	{ 0x00124, 0x00000000 }, { 0x00180, 0x00000001 }, { 0x00184, 0x0000001e },
++	{ 0x00188, 0x00000000 }, { 0x0018c, 0x00000000 }, { 0x00190, 0x00000000 },
++	{ 0x00198, 0x00300000 }, { 0x0019c, 0x00000100 }, { 0x001a0, 0x00000000 },
++	{ 0x001a4, 0x00000000 }, { 0x001a8, 0x00000000 }, { 0x001ac, 0x00000000 },
++	{ 0x001d8, 0x00001e00 }, { 0x001dc, 0x00000000 }, { 0x001e0, 0x00000000 },
++	{ 0x001e8, 0x00000000 }, { 0x001ec, 0x00000000 }, { 0x001f0, 0x00000000 },
++	{ 0x001f8, 0x03020100 }, { 0x001fc, 0x00000780 }, { 0x00200, 0x00000438 },
++	{ 0x00204, 0x0007d311 }, { 0x00208, 0x0007d311 }, { 0x0020c, 0x0007d311 },
++	{ 0x00210, 0x0007d311 }, { 0x00214, 0x00000707 }, { 0x00218, 0x00000707 },
++	{ 0x0021c, 0x00000707 }, { 0x00220, 0x00000707 }, { 0x00224, 0x00000020 },
++	{ 0x00228, 0x00000020 }, { 0x0022c, 0x00000020 }, { 0x00230, 0x00000020 },
++	{ 0x00234, 0x00000780 }, { 0x00238, 0x00000780 }, { 0x0023c, 0x00000780 },
++	{ 0x00244, 0x00000438 }, { 0x00248, 0x00000438 }, { 0x0024c, 0x00000438 },
++	{ 0x00254, 0x00000001 }, { 0x00280, 0x0000000c }, { 0x00284, 0x00008001 },
++	{ 0x00288, 0x00008006 }, { 0x0028c, 0x00008000 }, { 0x00290, 0x00000200 },
++	{ 0x00294, 0x00000100 }, { 0x00298, 0x001fa600 }, { 0x0029c, 0x00000100 },
++	{ 0x002c0, 0x00000780 }, { 0x002c4, 0x00000780 }, { 0x002cc, 0x00000000 },
++	{ 0x002d0, 0x00000000 }, { 0x002d4, 0x00000000 }, { 0x002d8, 0x03000102 },
++	{ 0x002dc, 0x00000780 }, { 0x002e0, 0x00000438 }, { 0x002e4, 0x000ac211 },
++	{ 0x002e8, 0x000ac211 }, { 0x002ec, 0x000ac211 }, { 0x002f0, 0x0c0ac207 },
++	{ 0x002f4, 0x0c0ac207 }, { 0x002f8, 0x0c0ac207 }, { 0x002fc, 0x04000620 },
++	{ 0x00300, 0x04000620 }, { 0x00304, 0x04000620 }, { 0x00308, 0x00000780 },
++	{ 0x0030c, 0x000003c0 }, { 0x00310, 0x00000780 }, { 0x00314, 0x00000438 },
++	{ 0x00318, 0x0000021c }, { 0x0031c, 0x00000438 }, { 0x00380, 0x00000000 },
++	{ 0x00480, 0x00000000 }, { 0x00800, 0x0000000c }, { 0x00824, 0x0000000c },
++	{ 0x00900, 0x00010103 }, { 0x00a00, 0x00000000 }, { 0x01000, 0x00000000 },
++	{ 0x01004, 0x00000000 }, { 0x01008, 0x00000000 }, { 0x0100c, 0x00400000 },
++	{ 0x01010, 0x00400000 }, { 0x01014, 0x00400000 }, { 0x01018, 0x00400000 },
++	{ 0x0101c, 0x00000000 }, { 0x01020, 0x00400000 }, { 0x01024, 0x00400000 },
++	{ 0x02000, 0x00000000 }, { 0x02004, 0x00000000 }, { 0x02008, 0x00000000 },
++	{ 0x0200c, 0x00400000 }, { 0x02010, 0x00400000 }, { 0x02014, 0x00400000 },
++	{ 0x02018, 0x00400000 }, { 0x0201c, 0x00000000 }, { 0x02020, 0x00400000 },
++	{ 0x02024, 0x00400000 }, { 0x03000, 0x00000000 }, { 0x03800, 0x000e0003 },
++	{ 0x03804, 0x0000000c }, { 0x03808, 0x00000000 }, { 0x0380c, 0x00000000 },
++	{ 0x03810, 0x00000000 }, { 0x03838, 0x00101000 }, { 0x0383c, 0x00802000 },
++	{ 0x03840, 0x00802000 }, { 0x07418, 0xffffffff }, { 0x0a98c, 0x80000001 },
++	{ 0x0a990, 0x80000001 }, { 0x0a994, 0x80000001 }, { 0x0a998, 0x7fffffff },
++	{ 0x0a99c, 0x7fffffff }, { 0x0a9a0, 0x7fffffff }, { 0x0a9a4, 0x80000001 },
++	{ 0x0a9a8, 0x80000001 }, { 0x0a9ac, 0x80000001 }, { 0x0a9b0, 0x7fffffff },
++	{ 0x0a9b4, 0x7fffffff }, { 0x0a9b8, 0x7fffffff }, { 0x13800, 0x00000000 },
++	{ 0x13804, 0x00000000 }, { 0x13808, 0x00000000 }, { 0x1380c, 0x00000000 },
++	{ 0x13810, 0x00000008 }, { 0x13814, 0x00000008 }, { 0x13818, 0x00000008 },
++	{ 0x1381c, 0x00000008 }, { 0x13c00, 0x00000001 }, { 0x13c04, 0x00000000 },
++	{ 0x13c10, 0x00000008 }, { 0x13c14, 0x00000028 }, { 0x13c18, 0x00000028 },
++	{ 0x13c1c, 0x00000020 }, { 0x16000, 0x00000000 }, { 0x16004, 0x244024c0 },
++	{ 0x16080, 0x00000000 }, { 0x16084, 0x0b710367 }, { 0x16088, 0x00000128 },
++	{ 0x16504, 0x02000500 }, { 0x16508, 0x00003200 }, { 0x1651c, 0x00851400 },
++	{ 0x16534, 0x00000008 }, { 0x16568, 0x00250500 }, { 0x16588, 0x00496513 },
++	{ 0x16600, 0x00000015 }, { 0x16800, 0x00000000 }, { 0x25080, 0x00000000 },
++	{ 0x2e300, 0x03804038 }, { 0x2e304, 0xa0a0a0a0 }, { 0x2e308, 0x02550000 },
++	{ 0x2e30c, 0x02550255 }, { 0x2e310, 0x00000000 }, { 0x2e314, 0x00100008 },
++	{ 0x2e318, 0x02550000 },
++};
++
++static const struct asc_reg asc_expect_p010_2020_argb[] = {
++	{ 0x00080, 0x00000001 }, { 0x0008c, 0x8000ffff }, { 0x00098, 0xfffffffe },
++	{ 0x000e4, 0x00000000 }, { 0x000e8, 0x00000038 }, { 0x00110, 0x000000bc },
++	{ 0x00124, 0x00000000 }, { 0x00180, 0x0000000c }, { 0x00184, 0x00000002 },
++	{ 0x00188, 0x00000012 }, { 0x0018c, 0x00000000 }, { 0x00190, 0x00000000 },
++	{ 0x00198, 0x007f0200 }, { 0x0019c, 0x00000100 }, { 0x001a0, 0x00be4a00 },
++	{ 0x001a4, 0x00000100 }, { 0x001d8, 0x00000f00 }, { 0x001dc, 0x00000f00 },
++	{ 0x001e8, 0x00000000 }, { 0x001ec, 0x00000000 }, { 0x001f0, 0x00000000 },
++	{ 0x001f8, 0x03000102 }, { 0x001fc, 0x00000780 }, { 0x00200, 0x00000438 },
++	{ 0x00204, 0x0007d311 }, { 0x00208, 0x0007d311 }, { 0x0020c, 0x0007d311 },
++	{ 0x00210, 0x0007d311 }, { 0x00214, 0x00000707 }, { 0x00218, 0x00000707 },
++	{ 0x0021c, 0x00000707 }, { 0x00220, 0x00000707 }, { 0x00224, 0x00000020 },
++	{ 0x00228, 0x00000020 }, { 0x0022c, 0x00000020 }, { 0x00230, 0x00000020 },
++	{ 0x00234, 0x00000780 }, { 0x00238, 0x000003c0 }, { 0x0023c, 0x00000780 },
++	{ 0x00244, 0x00000438 }, { 0x00248, 0x0000021c }, { 0x0024c, 0x00000438 },
++	{ 0x00254, 0x00000001 }, { 0x00280, 0x00000001 }, { 0x00284, 0x0000801e },
++	{ 0x00288, 0x00008000 }, { 0x0028c, 0x00008000 }, { 0x00290, 0x00000000 },
++	{ 0x00294, 0x00000100 }, { 0x00298, 0x00000000 }, { 0x0029c, 0x00000000 },
++	{ 0x002a0, 0x00000000 }, { 0x002a4, 0x00000000 }, { 0x002c0, 0x00001e00 },
++	{ 0x002c4, 0x00000000 }, { 0x002c8, 0x00000000 }, { 0x002cc, 0x00000000 },
++	{ 0x002d0, 0x00000000 }, { 0x002d4, 0x00000000 }, { 0x002d8, 0x03020100 },
++	{ 0x002dc, 0x00000780 }, { 0x002e0, 0x00000438 }, { 0x002e4, 0x000ac211 },
++	{ 0x002e8, 0x000ac211 }, { 0x002ec, 0x000ac211 }, { 0x002f0, 0x0c0ac207 },
++	{ 0x002f4, 0x0c0ac207 }, { 0x002f8, 0x0c0ac207 }, { 0x002fc, 0x04000620 },
++	{ 0x00300, 0x04000620 }, { 0x00304, 0x04000620 }, { 0x00308, 0x00000780 },
++	{ 0x0030c, 0x00000780 }, { 0x00310, 0x00000780 }, { 0x00314, 0x00000438 },
++	{ 0x00318, 0x00000438 }, { 0x0031c, 0x00000438 }, { 0x00380, 0x00000000 },
++	{ 0x00480, 0x00000000 }, { 0x00800, 0x0000000d }, { 0x00804, 0x00000000 },
++	{ 0x00808, 0x00000800 }, { 0x0080c, 0x00000800 }, { 0x00810, 0x00000000 },
++	{ 0x00814, 0x00000000 }, { 0x00818, 0x00000800 }, { 0x0081c, 0x00000800 },
++	{ 0x00820, 0x00000000 }, { 0x00824, 0x0000000c }, { 0x00900, 0x00000000 },
++	{ 0x00a00, 0x02020200 }, { 0x00a80, 0x00000000 }, { 0x00a84, 0x00000002 },
++	{ 0x00a88, 0x00000000 }, { 0x00a8c, 0x00000002 }, { 0x00a90, 0x00000003 },
++	{ 0x00a94, 0x00000001 }, { 0x00a98, 0x00000003 }, { 0x00a9c, 0x00000001 },
++	{ 0x00aa0, 0x00000000 }, { 0x00aa4, 0x00000002 }, { 0x00aa8, 0x00000000 },
++	{ 0x00aac, 0x00000002 }, { 0x00ab0, 0x00000003 }, { 0x00ab4, 0x00000001 },
++	{ 0x00ab8, 0x00000003 }, { 0x00abc, 0x00000001 }, { 0x01000, 0x00000002 },
++	{ 0x01004, 0x00000000 }, { 0x01008, 0x00000000 }, { 0x0100c, 0x00400000 },
++	{ 0x01010, 0x00400000 }, { 0x01014, 0x00400000 }, { 0x01018, 0x00400000 },
++	{ 0x0101c, 0x00000000 }, { 0x01020, 0x00400000 }, { 0x01024, 0x00400000 },
++	{ 0x02000, 0x00000002 }, { 0x02004, 0x00000000 }, { 0x02008, 0x00000000 },
++	{ 0x0200c, 0x00400000 }, { 0x02010, 0x00400000 }, { 0x02014, 0x00400000 },
++	{ 0x02018, 0x00400000 }, { 0x0201c, 0x00000000 }, { 0x02020, 0x00400000 },
++	{ 0x02024, 0x00400000 }, { 0x03000, 0x00000000 }, { 0x03800, 0x000e0003 },
++	{ 0x03804, 0x0000000c }, { 0x03808, 0x03eff000 }, { 0x0380c, 0x037fe000 },
++	{ 0x03810, 0x037fe000 }, { 0x03838, 0x00000000 }, { 0x0383c, 0x00000000 },
++	{ 0x03840, 0x00000000 }, { 0x07418, 0xffffffff }, { 0x0a98c, 0x80000001 },
++	{ 0x0a990, 0x80000001 }, { 0x0a994, 0x80000001 }, { 0x0a998, 0x7fffffff },
++	{ 0x0a99c, 0x7fffffff }, { 0x0a9a0, 0x7fffffff }, { 0x0a9a4, 0x80000001 },
++	{ 0x0a9a8, 0x80000001 }, { 0x0a9ac, 0x80000001 }, { 0x0a9b0, 0x7fffffff },
++	{ 0x0a9b4, 0x7fffffff }, { 0x0a9b8, 0x7fffffff }, { 0x13800, 0x00000000 },
++	{ 0x13804, 0x00000000 }, { 0x13808, 0x00000000 }, { 0x1380c, 0x00000000 },
++	{ 0x13810, 0x0000000a }, { 0x13814, 0x0000002a }, { 0x13818, 0x0000002a },
++	{ 0x1381c, 0x00000020 }, { 0x13c00, 0x00000001 }, { 0x13c04, 0x00000000 },
++	{ 0x13c10, 0x00000008 }, { 0x13c14, 0x00000008 }, { 0x13c18, 0x00000008 },
++	{ 0x13c1c, 0x00000008 }, { 0x16000, 0x00000000 }, { 0x16004, 0x244024c0 },
++	{ 0x16080, 0x00000000 }, { 0x16084, 0x0b710367 }, { 0x16088, 0x00000128 },
++	{ 0x16504, 0x02000500 }, { 0x16508, 0x00003200 }, { 0x1651c, 0x00851400 },
++	{ 0x16534, 0x00000008 }, { 0x16568, 0x00250500 }, { 0x16588, 0x00496513 },
++	{ 0x16600, 0x00000015 }, { 0x16800, 0x00000000 }, { 0x25080, 0x00000000 },
++	{ 0x2e300, 0x03804038 }, { 0x2e304, 0xa0a0a0a0 }, { 0x2e308, 0x02550000 },
++	{ 0x2e30c, 0x02550255 }, { 0x2e310, 0x00000000 }, { 0x2e314, 0x00100008 },
++	{ 0x2e318, 0x02550000 },
++};
++
++
++struct asc_job_case {
++	const char *name;
++	u32 src, dst;
++	enum v4l2_ycbcr_encoding enc;
++	const struct asc_reg *expect;
++	unsigned int n;
++};
++
++#define ASC_JOB_CASE(_n, _s, _d, _e, _x) \
++	{ _n, _s, _d, _e, _x, ARRAY_SIZE(_x) }
++
++static const struct asc_job_case asc_job_cases[] = {
++	ASC_JOB_CASE("NV12 BT.709 to ARGB32", V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_ARGB32,
++		     V4L2_YCBCR_ENC_709, asc_expect_nv12_709_argb),
++	ASC_JOB_CASE("ARGB32 to NV12 BT.709", V4L2_PIX_FMT_ARGB32, V4L2_PIX_FMT_NV12M,
++		     V4L2_YCBCR_ENC_709, asc_expect_argb_nv12_709),
++	ASC_JOB_CASE("P010 BT.2020 to ARGB32", V4L2_PIX_FMT_P010, V4L2_PIX_FMT_ARGB32,
++		     V4L2_YCBCR_ENC_BT2020, asc_expect_p010_2020_argb),
++};
++
++static void asc_job_case_desc(const struct asc_job_case *c, char *desc)
++{
++	strscpy(desc, c->name, KUNIT_PARAM_DESC_SIZE);
++}
++
++KUNIT_ARRAY_PARAM(asc_job, asc_job_cases, asc_job_case_desc);
++
++static u32 asc_expect_get(const struct asc_job_case *c, u32 off)
++{
++	unsigned int i;
++
++	for (i = 0; i < c->n; i++)
++		if (c->expect[i].off == off)
++			return c->expect[i].val;
++	return 0;
++}
++
++static void asc_image_from_expect(const struct asc_job_case *c, struct asc_image *img,
++				  u32 fourcc, u32 plane, u32 stride)
++{
++	unsigned int i;
++
++	img->fmt = asc_find_format(fourcc);
++	img->width = 1920;
++	img->height = 1080;
++	for (i = 0; i < ASC_MAX_PLANES; i++) {
++		img->dva[i] = asc_expect_get(c, plane + 8 * i) |
++			      (u64)asc_expect_get(c, plane + 8 * i + 4) << 32;
++		img->stride[i] = asc_expect_get(c, stride + 4 * i);
++	}
++}
++
++static bool asc_is_matrix(u32 off)
++{
++	return off >= ASC_CSC_COEF(0, 0) && off <= ASC_CSC_COEF(2, 2);
++}
++
++static void asc_test_job(struct kunit *test)
++{
++	const struct asc_job_case *c = test->param_value;
++	struct asc_reg *w;
++	struct asc_csc csc;
++	struct asc_job job = {};
++	unsigned int i, j;
++	int n;
++
++	w = kunit_kcalloc(test, ASC_JOB_MAX_WRITES, sizeof(*w), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, w);
++
++	asc_image_from_expect(c, &job.src, c->src, 0x198, 0x1d8);
++	asc_image_from_expect(c, &job.dst, c->dst, 0x290, 0x2c0);
++	KUNIT_ASSERT_NOT_NULL(test, job.src.fmt);
++	KUNIT_ASSERT_NOT_NULL(test, job.dst.fmt);
++	KUNIT_ASSERT_EQ(test, asc_csc_compute(c->enc, V4L2_QUANTIZATION_LIM_RANGE,
++					      job.src.fmt->yuv, &csc), 0);
++	job.csc = &csc;
++	job.transform_id = asc_expect_get(c, ASC_TRANSFORM_ID);
++
++	n = asc_job_build(&job, w, ASC_JOB_MAX_WRITES);
++	KUNIT_ASSERT_GT(test, n, 0);
++
++	/* START last, the pre-start tag right before it. */
++	KUNIT_EXPECT_EQ(test, w[n - 1].off, ASC_START);
++	KUNIT_EXPECT_EQ(test, w[n - 1].val, 1);
++	KUNIT_EXPECT_EQ(test, w[n - 2].off, ASC_PRE_START);
++
++	/* Every register macOS set ends with the same value... */
++	for (i = 0; i < c->n; i++) {
++		u32 val = 0;
++		bool found = false;
++
++		for (j = 0; j < n; j++)
++			if (w[j].off == c->expect[i].off) {
++				val = w[j].val;
++				found = true;
++			}
++		KUNIT_EXPECT_TRUE_MSG(test, found, "%#x not written", c->expect[i].off);
++		KUNIT_EXPECT_EQ_MSG(test, val, c->expect[i].val, "register %#x",
++				    c->expect[i].off);
++	}
++	/* ...and nothing else is written. */
++	for (j = 0; j < n; j++) {
++		bool known = asc_is_matrix(w[j].off);
++
++		for (i = 0; i < c->n && !known; i++)
++			known = c->expect[i].off == w[j].off;
++		KUNIT_EXPECT_TRUE_MSG(test, known, "unexpected write %#x", w[j].off);
++	}
++}
++
++static void asc_test_job_rejects(struct kunit *test)
++{
++	struct asc_reg *w = kunit_kcalloc(test, ASC_JOB_MAX_WRITES, sizeof(*w), GFP_KERNEL);
++	struct asc_csc csc;
++	struct asc_job job = {
++		.src = { .fmt = asc_find_format(V4L2_PIX_FMT_NV12M), .width = 64, .height = 64 },
++		.dst = { .fmt = asc_find_format(V4L2_PIX_FMT_ARGB32), .width = 64, .height = 64 },
++	};
++
++	KUNIT_ASSERT_NOT_NULL(test, w);
++	/* Y'CbCr to RGB without a matrix */
++	KUNIT_EXPECT_EQ(test, asc_job_build(&job, w, ASC_JOB_MAX_WRITES), -EINVAL);
++	KUNIT_ASSERT_EQ(test, asc_csc_compute(V4L2_YCBCR_ENC_709,
++					      V4L2_QUANTIZATION_LIM_RANGE, true, &csc), 0);
++	job.csc = &csc;
++	KUNIT_EXPECT_GT(test, asc_job_build(&job, w, ASC_JOB_MAX_WRITES), 0);
++	KUNIT_EXPECT_EQ(test, asc_job_build(&job, w, 8), -ENOSPC);
++	/* scaling is not handled by this path yet */
++	job.dst.width = 32;
++	KUNIT_EXPECT_EQ(test, asc_job_build(&job, w, ASC_JOB_MAX_WRITES), -EINVAL);
++}
++
+ static struct kunit_case asc_test_cases[] = {
+ 	KUNIT_CASE_PARAM(asc_test_csc, asc_csc_gen_params),
+ 	KUNIT_CASE(asc_test_csc_rejects),
+ 	KUNIT_CASE(asc_test_csc_white),
+ 	KUNIT_CASE(asc_test_ratio),
+ 	KUNIT_CASE(asc_test_formats),
++	KUNIT_CASE_PARAM(asc_test_job, asc_job_gen_params),
++	KUNIT_CASE(asc_test_job_rejects),
+ 	{}
+ };
+ 

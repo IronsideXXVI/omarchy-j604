@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erik Bourget <erik@ebourget.net>
+Date: Sat, 7 Nov 2026 07:15:29 +0000
+Subject: [PATCH] i2c: pasemi: Reset a controller that stays stuck in a
+ transaction
+
+A transfer that a device doesn't complete can leave the controller in
+its transaction, with XIP set in SMSTA. The CTL reset that follows the
+failed transfer doesn't end it, and neither does rebinding the driver,
+so every later transfer on the bus fails with "Bus is still stuck"
+until the next boot.
+
+This was seen on the M4 MacBook Air (J713) after a debugfs read of a
+TAS2764's regmap had cached the amp's whole register space: the cache
+sync at the next resume wrote back registers the amp didn't complete,
+and the stuck controller (SMSTA 0x10850140) took down the bus of all
+four speaker amps. A transaction left open on purpose gives the same
+state.
+
+Only resetting the controller ends that transaction. When it has a
+reset:
+
+- a bus still busy after the wait at the start of a transfer is reset,
+  and IMASK and CTL are written again as at probe (the reset returns CTL
+  to its reset value) before waiting once more;
+- an I2C transfer that times out and leaves XIP set gets the same reset
+  and returns -EAGAIN, and the adapter retries it once. The retry sends
+  the whole transfer again, including what may already have reached the
+  device. SMBus transfers have no retry; they recover at the start of
+  the next transfer.
+
+Controllers without a reset, such as the PA Semi one, behave as before.
+
+Signed-off-by: Erik Bourget <erik@ebourget.net>
+[eryk: rebased onto integration/aurora 21f7ffcf, where 8d54cd288f05 holds
+ a runtime PM reference around each transfer: reset the controller of a
+ timed-out transfer before that reference is dropped, and leave with -EAGAIN
+ through the put; get the reset before the clock is enabled]
+Signed-off-by: Eryk Wieliczko <eryk@wieliczko.ninja>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(backported from commit 1dcabeda5f434e40421eccc663407a01f624428c)
+[j604: the 1.607 i2c-pasemi has no runtime PM reference around a
+ transfer (8d54cd288f05 is not in this base), so the -ETIME reset sits
+ at the end of pasemi_i2c_xfer() without the out:/put path; the reset
+ is taken after the clock (devm_clk_get_enabled in this base) and
+ before pasemi_i2c_common_probe() adds the adapter. The T8132 i2c nodes
+ carry resets = <&ps_i2cN>, so this is active on the J604.]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/i2c/busses/i2c-pasemi-core.c     | 50 ++++++++++++++++++++++--
+ drivers/i2c/busses/i2c-pasemi-core.h     |  4 ++
+ drivers/i2c/busses/i2c-pasemi-platform.c |  9 +++++
+ 3 files changed, 59 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-pasemi-core.c b/drivers/i2c/busses/i2c-pasemi-core.c
+index f4eca44ed1..231a8ca59b 100644
+--- a/drivers/i2c/busses/i2c-pasemi-core.c
++++ b/drivers/i2c/busses/i2c-pasemi-core.c
+@@ -13,6 +13,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/pci.h>
++#include <linux/reset.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/stddef.h>
+@@ -88,16 +89,44 @@ static void pasemi_reset(struct pasemi_smbus *smbus)
+ 	reinit_completion(&smbus->irq_completion);
+ }
+ 
++static int pasemi_smb_wait_idle(struct pasemi_smbus *smbus, unsigned int *status)
++{
++	return readx_poll_timeout(ioread32, smbus->ioaddr + REG_SMSTA,
++				  *status, !(*status & (SMSTA_XIP | SMSTA_JAM)),
++				  USEC_PER_MSEC,
++				  USEC_PER_MSEC * PASEMI_TRANSFER_TIMEOUT_MS);
++}
++
++/*
++ * A controller can stay in a transaction that no CTL reset ends, for example
++ * after a system sleep. Only resetting the controller gets it out of there;
++ * its CTL is then back at the reset value and is written again.
++ */
++static bool pasemi_smb_recover(struct pasemi_smbus *smbus, unsigned int status)
++{
++	if (!smbus->reset)
++		return false;
++
++	dev_warn(smbus->dev, "Bus is stuck (status 0x%08x xfstatus 0x%08x), resetting the controller\n",
++		 status, reg_read(smbus, REG_XFSTA));
++	if (reset_control_reset(smbus->reset))
++		return false;
++
++	reg_write(smbus, REG_IMASK, 0);
++	pasemi_reset(smbus);
++	return true;
++}
++
+ static int pasemi_smb_clear(struct pasemi_smbus *smbus)
+ {
+ 	unsigned int status;
+ 	int ret;
+ 
+ 	/* First wait for the bus to go idle */
+-	ret = readx_poll_timeout(ioread32, smbus->ioaddr + REG_SMSTA,
+-				 status, !(status & (SMSTA_XIP | SMSTA_JAM)),
+-				 USEC_PER_MSEC,
+-				 USEC_PER_MSEC * PASEMI_TRANSFER_TIMEOUT_MS);
++	ret = pasemi_smb_wait_idle(smbus, &status);
++
++	if (ret < 0 && pasemi_smb_recover(smbus, status))
++		ret = pasemi_smb_wait_idle(smbus, &status);
+ 
+ 	if (ret < 0) {
+ 		dev_err(smbus->dev, "Bus is still stuck (status 0x%08x xfstatus 0x%08x)\n",
+@@ -251,6 +280,19 @@ static int pasemi_i2c_xfer(struct i2c_adapter *adapter,
+ 	for (i = 0; i < num && !ret; i++)
+ 		ret = pasemi_i2c_xfer_msg(adapter, &msgs[i], (i == (num - 1)));
+ 
++	/*
++	 * A timed-out transfer can leave the controller in it. Reset it and let
++	 * the core retry; the retry sends the whole transfer again, including
++	 * what may already have reached the device. SMBus transfers have no
++	 * retry and recover at the start of their next transfer.
++	 */
++	if (ret == -ETIME) {
++		unsigned int status = reg_read(smbus, REG_SMSTA);
++
++		if (status & SMSTA_XIP && pasemi_smb_recover(smbus, status))
++			ret = -EAGAIN;
++	}
++
+ 	return ret ? ret : num;
+ }
+ 
+diff --git a/drivers/i2c/busses/i2c-pasemi-core.h b/drivers/i2c/busses/i2c-pasemi-core.h
+index 88821f4e8a..495519af60 100644
+--- a/drivers/i2c/busses/i2c-pasemi-core.h
++++ b/drivers/i2c/busses/i2c-pasemi-core.h
+@@ -11,6 +11,8 @@
+ 
+ #define PASEMI_HW_REV_PCI -1
+ 
++struct reset_control;
++
+ struct pasemi_smbus {
+ 	struct device		*dev;
+ 	struct i2c_adapter	 adapter;
+@@ -19,6 +21,8 @@ struct pasemi_smbus {
+ 	int			 hw_rev;
+ 	int			 use_irq;
+ 	struct completion	 irq_completion;
++	/* Resets a controller stuck in a transaction (optional) */
++	struct reset_control	*reset;
+ };
+ 
+ int pasemi_i2c_common_probe(struct pasemi_smbus *smbus);
+diff --git a/drivers/i2c/busses/i2c-pasemi-platform.c b/drivers/i2c/busses/i2c-pasemi-platform.c
+index a486a37d38..436b0eb726 100644
+--- a/drivers/i2c/busses/i2c-pasemi-platform.c
++++ b/drivers/i2c/busses/i2c-pasemi-platform.c
+@@ -11,6 +11,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
++#include <linux/reset.h>
+ #include <linux/types.h>
+ 
+ #include "i2c-pasemi-core.h"
+@@ -74,6 +75,14 @@ static int pasemi_platform_i2c_probe(struct platform_device *pdev)
+ 	if (error)
+ 		return error;
+ 
++	smbus->reset = devm_reset_control_get_optional_exclusive(dev, NULL);
++	if (IS_ERR(smbus->reset))
++		return dev_err_probe(dev, PTR_ERR(smbus->reset),
++				     "failed to get the reset\n");
++	/* A transfer stuck in the controller is retried once after a reset */
++	if (smbus->reset)
++		smbus->adapter.retries = 1;
++
+ 	smbus->adapter.dev.of_node = pdev->dev.of_node;
+ 	error = pasemi_i2c_common_probe(smbus);
+ 	if (error)

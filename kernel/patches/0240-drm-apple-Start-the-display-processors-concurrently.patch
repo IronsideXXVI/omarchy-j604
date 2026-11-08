@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Tue, 3 Nov 2026 17:52:10 +1100
+Subject: [PATCH] drm/apple: Start the display processors concurrently
+
+apple_drm_init_dcp() started each display processor in turn and only then
+waited for them. Starting a processor waits for its firmware's endpoints:
+on a T6041 (J616s) the panel's processor is up in about 50 ms, but the two
+external processors take 1.6 s and 0.6 s, so the DRM device registered at
+4.57 s and the boot splash had nothing to draw on until then, after the
+initramfs had already handed over to the root filesystem.
+
+Each processor has its own RTKit and mailbox. Start them all on the
+unbound workqueue and wait for each before the existing readiness wait.
+The display fabric claims shared Type-C routes and crossbars through the
+mux core's locking, as it does when processors hotplug, so starting
+external processors together does not need further serialization.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(cherry picked from commit fdfb8410d0438026b8911a4012a2de40fe6574fb)
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/gpu/drm/apple/apple_drv.c | 33 ++++++++++++++++++++++++++++++-
+ 1 file changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/apple/apple_drv.c b/drivers/gpu/drm/apple/apple_drv.c
+index 20f000c20f..710fd49000 100644
+--- a/drivers/gpu/drm/apple/apple_drv.c
++++ b/drivers/gpu/drm/apple/apple_drv.c
+@@ -18,6 +18,7 @@
+ #include <linux/of_device.h>
+ #include <linux/of_graph.h>
+ #include <linux/of_platform.h>
++#include <linux/workqueue.h>
+ #include <linux/soc/apple/dp-tunnel.h>
+ #include <linux/soc/apple/display.h>
+ 
+@@ -1003,6 +1004,28 @@ static void apple_drm_quiesce_connectors(struct drm_device *drm)
+ 	drm_connector_list_iter_end(&iter);
+ }
+ 
++/*
++ * Each display processor runs its own RTKit firmware, and starting one waits
++ * for its firmware: a T6041 external processor takes 0.6 to 1.6 s to bring up
++ * its endpoints. Started one after another, the internal panel waited for
++ * every external processor before the DRM device registered. Start them all
++ * at once and wait for each; shared routes and crossbars are claimed through
++ * the display fabric's locking, as they are when processors hotplug.
++ */
++struct apple_dcp_start_work {
++	struct work_struct work;
++	struct platform_device *dcp;
++	int ret;
++};
++
++static void apple_dcp_start_fn(struct work_struct *work)
++{
++	struct apple_dcp_start_work *w =
++		container_of(work, struct apple_dcp_start_work, work);
++
++	w->ret = dcp_start(w->dcp);
++}
++
+ static int apple_drm_init_dcp(struct device *dev)
+ {
+ 	struct apple_drm_private *apple = dev_get_drvdata(dev);
+@@ -1011,6 +1034,7 @@ static int apple_drm_init_dcp(struct device *dev)
+ 	u32 crtc_mask[MAX_COPROCESSORS] = {};
+ 	int connector_type[MAX_COPROCESSORS];
+ 	bool started[MAX_COPROCESSORS] = {};
++	struct apple_dcp_start_work start[MAX_COPROCESSORS];
+ 	bool ready[MAX_COPROCESSORS] = {};
+ 	struct device_node *np;
+ 	u64 timeout;
+@@ -1073,7 +1097,14 @@ static int apple_drm_init_dcp(struct device *dev)
+ 
+ 	for (i = 0; i < num_dcp; i++) {
+ 		connector_type[i] = dcp_get_connector_type(dcp[i]);
+-		ret = dcp_start(dcp[i]);
++		start[i].dcp = dcp[i];
++		INIT_WORK_ONSTACK(&start[i].work, apple_dcp_start_fn);
++		queue_work(system_unbound_wq, &start[i].work);
++	}
++	for (i = 0; i < num_dcp; i++) {
++		flush_work(&start[i].work);
++		destroy_work_on_stack(&start[i].work);
++		ret = start[i].ret;
+ 		started[i] = !ret;
+ 		if (ret)
+ 			dev_warn(dev, "DCP[%d] failed to start: %d\n", i, ret);

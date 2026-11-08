@@ -1,0 +1,362 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 02:16:08 +0000
+Subject: [PATCH] pmdomain: apple: pmp-report: Vote the J604 GPU's AGX request
+
+The AGX vote (pmp_report.agx_vote) sets the GPU's power request in the
+PMP report while GPU work is in flight; it only knew the T6001. On the
+J604 (T8132) the GPU's PMP vote today is the RTKit AGX command, which,
+as the T6030 report path notes, does not set the report's request.
+
+The J604 ADT (macOS 27.2 26B123 and the 25G83 Linux stub) gives the
+layout. Its ptd-range puts SOC-DEV-PS-REQ at PTD index 0x188 (read
+0x1880, update 0x10000 + 0xc40) and SOC-DEV-PS-ACK at 0x190 (0x1900),
+the offsets this driver already uses for T8132. Its soc-device table has
+34 records; AGX (device ID 5) is record 12, inside soc-device-ps-group,
+so the request is bit 12.
+
+Give each report the bit it votes: 9 on a T6001, as before, and on the
+J604 the record of device ID 5 named AGX in the soc-device table the
+loader copies onto the PMP that names this report, which must be record
+12 of 34. Any other table leaves the vote without effect. The write, the
+removal and rebind paths and the export's refusal use that bit. The
+check is a pure helper with a KUnit case.
+
+The G16 driver reports work in flight to the CLPC on each start and
+drain; begin and end the vote on the same edges, and end it if the GPU
+goes away with work in flight.
+
+Three read-only counters (agx_vote_sets, agx_vote_clears,
+agx_vote_failed) let a run on the device show that the vote happened.
+The vote stays off by default and can be switched at run time, so one
+boot can run an A/B.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/gpu/drm/asahi/g16/power.rs            | 23 +++++-
+ drivers/pmdomain/apple/pmp-report-test.c      | 37 +++++++++
+ .../pmdomain/apple/pmp-report-validation.h    | 24 ++++++
+ drivers/pmdomain/apple/pmp-report.c           | 79 ++++++++++++++++---
+ 4 files changed, 151 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/power.rs b/drivers/gpu/drm/asahi/g16/power.rs
+index 87dcf2ab8a..bd8ec48310 100644
+--- a/drivers/gpu/drm/asahi/g16/power.rs
++++ b/drivers/gpu/drm/asahi/g16/power.rs
+@@ -19,7 +19,7 @@
+ pub(crate) mod policy;
+ 
+ use core::{ffi::c_void, ptr::NonNull};
+-use kernel::{device, prelude::*, sync::aref::ARef};
++use kernel::{bindings, device, prelude::*, sync::aref::ARef};
+ 
+ use super::fw::initdata::globals;
+ use super::recovery::now_ns;
+@@ -168,6 +168,16 @@ pub(crate) struct Power {
+     pub(crate) utilization: policy::Governor,
+ }
+ 
++impl Drop for Power {
++    fn drop(&mut self) {
++        if self.reported == Some(true) {
++            // SAFETY: Ends the operation begun in `report_work`, so a GPU torn down
++            // with work in flight leaves no user behind in the AGX vote; any context.
++            unsafe { bindings::apple_pmp_agx_activity_end() };
++        }
++    }
++}
++
+ impl Power {
+     /// The Main image initializes all nine active states. Initdata publishes
+     /// startup S1 before INIT; this object starts with that same effective state.
+@@ -201,9 +211,20 @@ impl Power {
+ 
+     /// Reports a change of work in flight to the CLPC: the memory and fabric
+     /// floor follows it, not the GFX power state.
++    /// The PMP AGX request (`pmp_report.agx_vote`, off by default) follows the
++    /// same edges: one begin when work starts, one end when it drains.
+     pub(crate) fn report_work(&mut self, in_flight: bool) {
+         if self.reported != Some(in_flight) {
+             self.clpc.set_active(in_flight);
++            if in_flight {
++                // SAFETY: Takes no arguments and may be called from any context. Does
++                // nothing unless pmp_report.agx_vote is set and the report has a
++                // qualified AGX record; ended below or in `drop`.
++                unsafe { bindings::apple_pmp_agx_activity_begin() };
++            } else if self.reported == Some(true) {
++                // SAFETY: Pairs with the begin above; any context.
++                unsafe { bindings::apple_pmp_agx_activity_end() };
++            }
+             self.reported = Some(in_flight);
+         }
+     }
+diff --git a/drivers/pmdomain/apple/pmp-report-test.c b/drivers/pmdomain/apple/pmp-report-test.c
+index e04a91d339..5cc443f2b1 100644
+--- a/drivers/pmdomain/apple/pmp-report-test.c
++++ b/drivers/pmdomain/apple/pmp-report-test.c
+@@ -214,6 +214,42 @@ static void pmp_records_t8122(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, apple_pmp_record_of_id(table, len, 8), -ENOENT);
+ }
+ 
++/* T8132 (J604 ADT): AGX is device ID 5 at record 12 of 34, so PS-REQ bit 12. */
++static void pmp_t8132_agx_bit(struct kunit *test)
++{
++	static const u32 ids[PMP_T8132_SOC_DEVICES] = {
++		1, 2, 23, 24, 25, 26, 27, 28, 16, 17, 3, 4, 5, 6, 7, 8, 9,
++		18, 14, 10, 11, 12, 13, 15, 19, 20, 21, 22, 30, 31, 32, 33, 34, 35,
++	};
++	const size_t len = ARRAY_SIZE(ids) * PMP_SOC_DEVICE_SIZE;
++	u8 *agx, *table = kunit_kzalloc(test, len, GFP_KERNEL);
++	unsigned int i;
++
++	KUNIT_ASSERT_NOT_NULL(test, table);
++	for (i = 0; i < ARRAY_SIZE(ids); i++)
++		put_unaligned_le32(ids[i], table + i * PMP_SOC_DEVICE_SIZE);
++	agx = table + PMP_T8132_AGX_RECORD * PMP_SOC_DEVICE_SIZE;
++	memcpy(agx + PMP_SOC_DEVICE_NAME, "AGX", 3);
++	KUNIT_EXPECT_EQ(test, apple_pmp_t8132_agx_bit(table, len), 12);
++	/* A shorter or partial table, or one that is not whole records */
++	KUNIT_EXPECT_EQ(test, apple_pmp_t8132_agx_bit(table, len - PMP_SOC_DEVICE_SIZE), -ENOENT);
++	KUNIT_EXPECT_EQ(test, apple_pmp_t8132_agx_bit(table, len - 1), -ENOENT);
++	KUNIT_EXPECT_EQ(test, apple_pmp_t8132_agx_bit(NULL, 0), -ENOENT);
++	/* Another name at record 12 */
++	agx[PMP_SOC_DEVICE_NAME + 2] = 'Y';
++	KUNIT_EXPECT_EQ(test, apple_pmp_t8132_agx_bit(table, len), -ENOENT);
++	agx[PMP_SOC_DEVICE_NAME + 2] = 'X';
++	/* ID 5 on another record as well: not unique */
++	put_unaligned_le32(5, table + 11 * PMP_SOC_DEVICE_SIZE);
++	KUNIT_EXPECT_EQ(test, apple_pmp_t8132_agx_bit(table, len), -ENOENT);
++	/* ID 5 moved to record 11: the request bit would be 11, not qualified */
++	put_unaligned_le32(4, agx);
++	KUNIT_EXPECT_EQ(test, apple_pmp_t8132_agx_bit(table, len), -ENOENT);
++	put_unaligned_le32(4, table + 11 * PMP_SOC_DEVICE_SIZE);
++	put_unaligned_le32(5, agx);
++	KUNIT_EXPECT_EQ(test, apple_pmp_t8132_agx_bit(table, len), 12);
++}
++
+ static void pmp_bootargs_valid_ids(struct kunit *test)
+ {
+ 	u8 args[32];
+@@ -264,6 +300,7 @@ static struct kunit_case apple_pmp_report_cases[] = {
+ 	KUNIT_CASE(pmp_devices_reordered),
+ 	KUNIT_CASE(pmp_devices_t6031),
+ 	KUNIT_CASE(pmp_records_t8122),
++	KUNIT_CASE(pmp_t8132_agx_bit),
+ 	KUNIT_CASE(pmp_bootargs_valid_ids),
+ 	KUNIT_CASE(pmp_bootargs_reject_truncation),
+ 	KUNIT_CASE(pmp_bootargs_reject_integer_width),
+diff --git a/drivers/pmdomain/apple/pmp-report-validation.h b/drivers/pmdomain/apple/pmp-report-validation.h
+index 94a682a9f1..3d864ff128 100644
+--- a/drivers/pmdomain/apple/pmp-report-validation.h
++++ b/drivers/pmdomain/apple/pmp-report-validation.h
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/bitops.h>
+ #include <linux/errno.h>
++#include <linux/string.h>
+ #include <linux/types.h>
+ #include <linux/unaligned.h>
+ 
+@@ -92,6 +93,29 @@ static inline int apple_pmp_record_of_id(const u8 *table, size_t len, u32 id)
+ 	return found;
+ }
+ 
++/*
++ * T8132: the PS-REQ bit of the AGX request is the index of the soc-device
++ * record that holds device ID 5 and is named "AGX". The J604 ADT (macOS 27.2
++ * 26B123 and the 25G83 Linux stub) has 34 records with AGX at record 12; any
++ * other table is not qualified and gets -ENOENT.
++ */
++#define PMP_T8132_SOC_DEVICES	34
++#define PMP_T8132_AGX_ID	5
++#define PMP_T8132_AGX_RECORD	12
++#define PMP_SOC_DEVICE_NAME	0x74
++
++static inline int apple_pmp_t8132_agx_bit(const u8 *table, size_t len)
++{
++	int rec = apple_pmp_record_of_id(table, len, PMP_T8132_AGX_ID);
++
++	if (len != PMP_T8132_SOC_DEVICES * PMP_SOC_DEVICE_SIZE ||
++	    rec != PMP_T8132_AGX_RECORD ||
++	    memcmp(table + rec * PMP_SOC_DEVICE_SIZE + PMP_SOC_DEVICE_NAME,
++		   "AGX\0\0\0\0\0", 8))
++		return -ENOENT;
++	return rec;
++}
++
+ /*
+  * Request bit N names soc-device record N. Each seeded record must exist and
+  * be acknowledged exactly when its flags say so.
+diff --git a/drivers/pmdomain/apple/pmp-report.c b/drivers/pmdomain/apple/pmp-report.c
+index cf0322bd0a..24aee54dd1 100644
+--- a/drivers/pmdomain/apple/pmp-report.c
++++ b/drivers/pmdomain/apple/pmp-report.c
+@@ -79,10 +79,13 @@ struct apple_pmp_report {
+ 	struct dentry *debugfs;
+ 	/* Set only for a report whose halted PMP this driver starts. */
+ 	struct apple_pmp_start *start;
++	/* PS-REQ bit of the AGX request this report votes, or -1 (see apple_pmp_report_agx_id()) */
++	int agx_id;
+ };
+ 
+ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030;
+ static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x;
++static const struct apple_pmp_report_offsets apple_pmp_offsets_t8132;
+ 
+ /* T6001 AGX request (see the engine below set_state): AGX is soc-device record 9 on the T6001. */
+ #define APPLE_PMP_T6001_AGX_ID 9
+@@ -183,7 +186,7 @@ static void apple_pmp_report_release(void *data)
+ 
+ 	/* Withdraw child providers while their power callbacks can still use MMIO. */
+ 	of_platform_depopulate(rep->dev);
+-	if (rep->offsets == &apple_pmp_offsets_t600x) {
++	if (rep->agx_id >= 0) {
+ 		apple_pmp_agx_vote_stop_new();
+ 		cancel_delayed_work_sync(&apple_pmp_agx_vote_work);
+ 		guard(mutex)(&apple_pmp_agx_vote_mutex);
+@@ -1124,6 +1127,37 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(apple_pmp_report_wait_ready);
+ 
++/*
++ * The PS-REQ bit of the AGX request this report votes for pmp_report.agx_vote, or -1.
++ * T6001: soc-device record 9. J604 (T8132): the record of device ID 5 named AGX in the
++ * soc-device table the loader copies onto the PMP that names this report, which the J604
++ * ADT has at record 12 (apple_pmp_t8132_agx_bit()); the table is read, not assumed.
++ */
++static int apple_pmp_report_agx_id(struct apple_pmp_report *rep)
++{
++	struct device_node *pmp, *report;
++	const u8 *table;
++	int len = 0, id = -1;
++
++	if (rep->offsets == &apple_pmp_offsets_t600x)
++		return of_machine_is_compatible("apple,t6001") ? APPLE_PMP_T6001_AGX_ID : -1;
++	if (rep->offsets != &apple_pmp_offsets_t8132 || !of_machine_is_compatible("apple,j604"))
++		return -1;
++	for_each_compatible_node(pmp, NULL, "apple,t8132-pmp-v2") {
++		report = of_parse_phandle(pmp, "apple,pmp-report", 0);
++		of_node_put(report);
++		if (report != rep->dev->of_node)
++			continue;
++		table = of_get_property(pmp, "apple,tunable-soc-device", &len);
++		id = apple_pmp_t8132_agx_bit(table, len > 0 ? len : 0);
++		of_node_put(pmp);
++		break;
++	}
++	if (id < 0)
++		dev_info(rep->dev, "no qualified AGX record: pmp_report.agx_vote has no effect\n");
++	return id < 0 ? -1 : id;
++}
++
+ static int apple_pmp_report_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -1141,6 +1175,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
+ 	if (IS_ERR(rep->base))
+ 		return PTR_ERR(rep->base);
+ 	rep->offsets = of_device_get_match_data(dev);
++	rep->agx_id = apple_pmp_report_agx_id(rep);
+ 	platform_set_drvdata(pdev, rep);
+ 
+ 	INIT_LIST_HEAD(&rep->list);
+@@ -1160,7 +1195,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
+ 	mutex_unlock(&apple_pmp_reports_lock);
+ 
+ 	/* A report that comes back (rebind) takes votes again; its removal refused them. */
+-	if (rep->offsets == &apple_pmp_offsets_t600x)
++	if (rep->agx_id >= 0)
+ 		apple_pmp_agx_activity_resume();
+ 
+ 	if (rep->offsets->fast_die || rep->start)
+@@ -1381,26 +1416,39 @@ static const struct kernel_param_ops apple_pmp_agx_vote_ops = {
+ 	.get = param_get_bool,
+ };
+ module_param_cb(agx_vote, &apple_pmp_agx_vote_ops, &agx_vote, 0644);
+-MODULE_PARM_DESC(agx_vote, "T6001: set the AGX power request in the PMP report while the GPU has work in flight (default: off)");
++MODULE_PARM_DESC(agx_vote,
++	"Set the AGX power request while GPU work is in flight (T6001, J604; default: off)");
+ module_param(agx_vote_idle_ms, uint, 0644);
+ MODULE_PARM_DESC(agx_vote_idle_ms, "Keep the AGX request this many ms after the last GPU operation ends (default: 250)");
+ 
+-/* Write the AGX request of the bound T6001 report: -ENODEV without one, -EAGAIN (nothing written) when the PMP does not run. */
++/* Acknowledged sets, clears written and failed sets of the AGX request, for A/B runs. */
++static unsigned long agx_vote_sets, agx_vote_clears, agx_vote_failed;
++module_param(agx_vote_sets, ulong, 0444);
++MODULE_PARM_DESC(agx_vote_sets, "AGX requests set and acknowledged since boot (read-only)");
++module_param(agx_vote_clears, ulong, 0444);
++MODULE_PARM_DESC(agx_vote_clears, "AGX request clears written since boot (read-only)");
++module_param(agx_vote_failed, ulong, 0444);
++MODULE_PARM_DESC(agx_vote_failed, "AGX request sets that failed since boot (read-only)");
++
++/*
++ * Write the AGX request of the bound T6001 or J604 report: -ENODEV without one,
++ * -EAGAIN (nothing written) when the PMP does not run.
++ */
+ static int apple_pmp_agx_write(bool enable, bool no_ack)
+ {
+ 	struct apple_pmp_report *rep;
+ 	int ret = -ENODEV;
+ 
+-	if (!of_machine_is_compatible("apple,t6001"))
+-		return ret;
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+-		if (rep->offsets != &apple_pmp_offsets_t600x)
++		if (rep->agx_id < 0)
+ 			continue;
+ 		if (enable && !(readq(rep->base + rep->offsets->status) & PMP_REPORT_READY))
+ 			ret = -EAGAIN;
+ 		else
+-			ret = apple_pmp_report_set_state(rep, APPLE_PMP_T6001_AGX_ID, enable, no_ack);
++			ret = apple_pmp_report_set_state(rep, rep->agx_id, enable, no_ack);
++		if (!ret && enable)
++			pr_info_once("pmp_report: AGX request (PS-REQ bit %d) set\n", rep->agx_id);
+ 		break;
+ 	}
+ 	rcu_read_unlock();
+@@ -1426,8 +1474,10 @@ static void apple_pmp_agx_vote_stop(void)
+ 	spin_lock_irqsave(&apple_pmp_agx_vote_lock, flags);
+ 	voted = agx_vote_release(&apple_pmp_agx_vote_state);
+ 	spin_unlock_irqrestore(&apple_pmp_agx_vote_lock, flags);
+-	if (voted)
++	if (voted) {
+ 		apple_pmp_agx_write(false, true);
++		agx_vote_clears++;
++	}
+ }
+ 
+ static void apple_pmp_agx_vote_fn(struct work_struct *work)
+@@ -1457,6 +1507,12 @@ static void apple_pmp_agx_vote_fn(struct work_struct *work)
+ 			pr_err("pmp_report: AGX request %s not acknowledged, clearing\n", set ? "set" : "clear");
+ 			apple_pmp_agx_write(false, true);
+ 		}
++		if (set && ret)
++			agx_vote_failed++;
++		else if (set)
++			agx_vote_sets++;
++		else
++			agx_vote_clears++;
+ 		if (!set)
+ 			ret = 0;	/* a clear is final: the state is "not voted" whatever happened */
+ 		spin_lock_irqsave(&apple_pmp_agx_vote_lock, flags);
+@@ -1629,7 +1685,8 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_set_t6030_gfx);
+  * returned, as for a report entry.
+  *
+  * The caller owns the bit it requests; this function does not arbitrate between callers of the
+- * same bit. On the T6001 bit 9 belongs to the AGX vote (pmp_report.agx_vote) and is refused here
++ * same bit. The AGX vote (pmp_report.agx_vote) owns bit 9 on the T6001 and bit 12 on the J604;
++ * the bit is refused here
+  * with -EBUSY. After -ETIMEDOUT the request was written but not acknowledged and stays in the
+  * word: the caller must clear it (@enable false, @no_ack true) before giving up.
+  *
+@@ -1648,7 +1705,7 @@ int apple_pmp_report_set_request(const struct device_node *report_np, unsigned i
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+ 		if (rep->dev->of_node == report_np) {
+-			if (id == APPLE_PMP_T6001_AGX_ID && rep->offsets == &apple_pmp_offsets_t600x)
++			if (rep->agx_id >= 0 && id == rep->agx_id)
+ 				ret = -EBUSY;	/* the AGX vote owns this bit */
+ 			else
+ 				ret = apple_pmp_report_set_state(rep, id, enable, no_ack);

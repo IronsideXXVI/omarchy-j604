@@ -1,0 +1,416 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 7 Nov 2026 08:47:15 +0000
+Subject: [PATCH] selftests: apple-dcp: follow the T8132 SuperSpeed host and P3
+ paths
+
+The SuperSpeed host start takes the PIPE handler lock with
+atcphy_pipehandler_lock_timeout(), adds the t8132_ss, t8132_common_owned
+and t8132_failed PHY fields and a T8132 USB3 host configure, and the P3
+change lets dwc3_host_exit() see dis_u3_susphy_quirk from the glue's
+dt_dis_u3_susphy. The apple-dcp host units extract these functions and
+no longer built (19 of 57 units, MEASURED).
+
+Take the harness side of both from the Aurora integration tree: extract
+atcphy_pipehandler_lock_timeout() in front of the lock helpers and name it
+as the polling caller, give the fixture PHYs the T8132 fields (always
+false: the fixtures are older generations, and a T8132 dispatch asserts),
+and give the dwc3 fixtures the two SUSPHY fields. No assertion is relaxed.
+
+With it the suite reads 31 ok / 27 not ok on this branch against 27 / 30
+on the base: no unit that passes on the base fails here. The 27 that fail
+on the base fail for harness drift that predates this series.
+
+[j604: hunks from 4c254113bf (phy.py, lifecycle.py, pm.py, quiesce.py,
+ dwc3/mocks.c; its M4 graphics tests and run.py changes not taken) and
+ the tools hunks of 9ec757d1fb (dwc3/mocks.c, teardown_pm.py), resolved
+ onto the 1.607 harness: this tree's lock list keeps
+ atcphy_pipehandler_lock_live, and its fixtures keep their own fields.]
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ .../drivers/gpu/apple-dcp/dwc3/mocks.c        | 24 ++++++++-
+ .../drivers/gpu/apple-dcp/lifecycle.py        | 17 ++++--
+ .../selftests/drivers/gpu/apple-dcp/phy.py    | 53 ++++++++++++++++---
+ .../selftests/drivers/gpu/apple-dcp/pm.py     |  6 +--
+ .../drivers/gpu/apple-dcp/quiesce.py          |  3 +-
+ .../drivers/gpu/apple-dcp/teardown_pm.py      |  8 +--
+ 6 files changed, 88 insertions(+), 23 deletions(-)
+
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c b/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c
+index 29006a4c34..7ef6b3954d 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c
+@@ -1,5 +1,11 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
++/* This fixture selects the original controller layout, not T8132. */
++#define of_device_is_compatible(...) false
+ struct apple_atcphy {
++    /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
++    bool t8132_ss, t8132_common_owned, t8132_failed;
++    struct { void *usb3_dp; } tunables;
++
+ 	const struct atcphy_hw *hw;
+ 	struct {
+ 		unsigned char *core, *lpdptx, *pipehandler, *usb2phy;
+@@ -68,6 +74,7 @@ struct dwc3 {
+ 	int num_usb2_ports, num_usb3_ports, usb2_phy, usb3_phy;
+ 	struct reset_controller_dev *reset;
+ 	int dev, usb_psy, vbus_draw_work;
++	bool dis_u3_susphy_quirk;
+ };
+ struct dwc3_apple {
+ 	struct dwc3 dwc;
+@@ -79,6 +86,7 @@ struct dwc3_apple {
+ 	bool fixed_hub, core_active, core_exit_pending, reset_pending;
+ 	/* T8132 only: runtime PM of an idle controller; never set here. */
+ 	bool idle_rpm, rpm_held, pre_core_rpm;
++	bool dt_dis_u3_susphy;
+ 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
+ };
+ static unsigned int polls, fail_poll, reset_calls, reset_writes, core_writes;
+@@ -191,6 +199,13 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *p);
+ static int atcphy_power_off(struct apple_atcphy *p);
+ static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode);
+ 
++/* These units exercise older PHY generations. Never accept a T8132 dispatch. */
++static int __attribute__((unused)) atcphy_configure_t8132(struct apple_atcphy *p, enum atcphy_mode mode)
++{ (void)p; (void)mode; assert(false); return -EOPNOTSUPP; }
++static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *p)
++{ (void)p; assert(false); return -EOPNOTSUPP; }
++
++
+ /* USB2 power-on is outside this teardown/recovery control. */
+ static void atcphy_usb2_power_on(struct apple_atcphy *p)
+ {
+@@ -287,7 +302,7 @@ static int phy_set_mode(struct phy *p, int m)
+ 	(void)m;
+ 	return 0;
+ }
+-static int dwc3_apple_core_probe(struct dwc3_apple *a);
++static int dwc3_apple_core_probe(struct dwc3_apple *a, enum dwc3_apple_state s);
+ static int dwc3_core_init(struct dwc3 *d);
+ static void dwc3_apple_setup_cio(struct dwc3_apple *a)
+ {
+@@ -302,7 +317,7 @@ static int dwc3_apple_usb2_mode_before_reset(enum dwc3_apple_state s,
+ 	*m = s == DWC3_APPLE_HOST ? PHY_MODE_INVALID : PHY_MODE_USB_DEVICE;
+ 	return 0;
+ }
+-static void dwc3_apple_set_role(struct dwc3_apple *a, enum dwc3_apple_state s);
++static int dwc3_apple_set_role(struct dwc3_apple *a, enum dwc3_apple_state s);
+ static int dwc3_host_init(struct dwc3 *d)
+ {
+ 	(void)d;
+@@ -344,3 +359,8 @@ static void dwc3_free_event_buffers(struct dwc3 *d)
+ 	(void)d;
+ 	free_buffers++;
+ }
++
++/* J713 host-before-init is exercised by the dedicated initial-role test. */
++enum { USB_DR_MODE_HOST = 1, DWC3_GCTL_PRTCAP_HOST = 1 };
++static void dwc3_apple_set_ptrcap(struct dwc3_apple *a, u32 mode)
++{ (void)a; (void)mode; assert(!"J713 pre-init path entered a legacy fixture"); }
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/lifecycle.py b/tools/testing/selftests/drivers/gpu/apple-dcp/lifecycle.py
+index ca30ad95a7..bc77fb51ba 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/lifecycle.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/lifecycle.py
+@@ -1020,7 +1020,7 @@ def teardown(root):
+     decls.append(files['atc'][start:end])
+ 
+     names = {
+-        'atc': ('atcphy_pipehandler_lock', 'atcphy_pipehandler_lock_live',
++        'atc': ('atcphy_pipehandler_lock_timeout', 'atcphy_pipehandler_lock', 'atcphy_pipehandler_lock_live',
+                 'atcphy_pipehandler_unlock',
+                 'atcphy_pipehandler_check', 'atcphy_pipehandler_set_mux',
+                 'atcphy_clear_nonselected_phy_reset',
+@@ -1038,7 +1038,7 @@ def teardown(root):
+                 '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert', 'atcphy_mux_set'),
+         'phy': ('phy_init', 'phy_exit', 'phy_power_on', 'phy_power_off'),
+         'core': ('dwc3_phy_power_on', 'dwc3_phy_power_off', 'dwc3_phy_exit', 'dwc3_core_exit'),
+-        'apple': ('dwc3_apple_core_stop', 'dwc3_apple_core_init', 'dwc3_apple_core_start',
++        'apple': ('dwc3_apple_host_before_core_init', 'dwc3_apple_core_stop', 'dwc3_apple_core_init', 'dwc3_apple_core_start',
+                   'dwc3_apple_init', 'dwc3_apple_exit', 'dwc3_usb_role_switch_set'),
+     }
+     names['core'] = ('dwc3_phy_power_on', 'dwc3_phy_power_off', 'dwc3_phy_exit',
+@@ -1681,7 +1681,7 @@ struct apple_connector { bool connected; };
+ enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_12_3, DCP_FIRMWARE_V_13_5,
+     DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6 };
+ struct apple_dcp {
+-    bool crashed, external, external_native;
++    bool crashed, external, external_native, quiescing;
+     unsigned int nr_typec_routes;
+     enum dcp_firmware_version fw_compat;
+     struct { int iomfb_method_profile; } hw;
+@@ -1690,9 +1690,9 @@ struct apple_dcp {
+     void *dev;
+ };
+ struct platform_device { struct apple_dcp *data; };
+-struct drm_crtc { struct platform_device *dcp; };
++struct drm_crtc { struct platform_device *dcp; void *primary; };
+ struct drm_display_mode { int unused; };
+-struct drm_crtc_state { bool enable, vrr_enabled, modeset; struct drm_display_mode mode; };
++struct drm_crtc_state { bool enable, vrr_enabled, modeset; struct drm_display_mode mode; void *ctm, *degamma_lut, *gamma_lut; unsigned plane_mask; };
+ /* mainline 7.2 renamed struct drm_atomic_state to struct drm_atomic_commit */
+ struct drm_atomic_commit { struct drm_crtc_state crtc; };
+ #define to_apple_crtc(x) (x)
+@@ -1708,6 +1708,13 @@ static int __attribute__((unused)) iomfb_v14_7_atomic_check(struct apple_dcp *d,
+ static int __attribute__((unused)) iomfb_v26_6_atomic_check(struct apple_dcp *d,
+     struct drm_crtc *c, struct drm_atomic_commit *s)
+ { (void)d; (void)c; (void)s; assert(!"26.6 backend on a non-26.6 DCP"); return -EINVAL; }
++static bool iomfb_is_m4(struct apple_dcp *d) { (void)d; return false; }
++static int iomfb_m4_error(struct apple_dcp *d) { (void)d; assert(false); return -ENODEV; }
++static int iomfb_m4_get_mode(struct apple_dcp *d,struct drm_display_mode *m)
++{ (void)d; (void)m; assert(false); return -ENODEV; }
++static unsigned drm_plane_mask(void *p) { (void)p; assert(false); return 0; }
++static bool drm_mode_equal(const struct drm_display_mode *a,const struct drm_display_mode *b)
++{ (void)a; (void)b; assert(false); return false; }
+ /* Route-follow is for Type-C displays; this DCP has no Type-C routes. */
+ static bool __attribute__((unused)) typec_follow_crtc = true;
+ static int __attribute__((unused)) dcp_typec_follow_check(struct apple_dcp *d, struct drm_crtc *c,
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/phy.py b/tools/testing/selftests/drivers/gpu/apple-dcp/phy.py
+index 9235010f2b..614eee0ae4 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/phy.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/phy.py
+@@ -32,6 +32,10 @@ def parking(root):
+         parts.append(block(atc, 'struct ' + name + ' {') + ';')
+     parts.append(r'''
+ struct apple_atcphy {
++    /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
++    bool t8132_ss, t8132_common_owned, t8132_failed;
++    struct { void *usb3_dp; } tunables;
++
+     const struct atcphy_hw *hw;
+     struct { unsigned char *core, *lpdptx, *pipehandler, *usb2phy; } regs;
+     struct reset_controller_dev rcdev;
+@@ -146,6 +150,13 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *);
+ static int atcphy_power_off(struct apple_atcphy *);
+ static int atcphy_configure(struct apple_atcphy *, enum atcphy_mode);
+ 
++/* These units exercise older PHY generations. Never accept a T8132 dispatch. */
++static int __attribute__((unused)) atcphy_configure_t8132(struct apple_atcphy *p, enum atcphy_mode mode)
++{ (void)p; (void)mode; assert(false); return -EOPNOTSUPP; }
++static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *p)
++{ (void)p; assert(false); return -EOPNOTSUPP; }
++
++
+ ''')
+     for name in ('atc_t8122_dp_mask', 'atc_t8122_dp_aux_on', 'atc_t8122_dp_aux_off', 'atc_t8122_dp_aux_is_on'):
+         match = re.search(r'^static inline [^\n]*\b' + name + r'\([^;{}]*\)\s*\{', t8122, re.M)
+@@ -153,7 +164,7 @@ static int atcphy_configure(struct apple_atcphy *, enum atcphy_mode);
+         parts.append(block(t8122, match.start()).replace('static inline ', 'static inline __attribute__((unused)) ', 1))
+     for name in ('atcphy_dp_aux_on_t8122', 'atcphy_dp_stop_t8122'):
+         parts.append(function(atc, name))
+-    for name in ('atcphy_pipehandler_lock', 'atcphy_pipehandler_lock_live',
++    for name in ('atcphy_pipehandler_lock_timeout', 'atcphy_pipehandler_lock', 'atcphy_pipehandler_lock_live',
+                  'atcphy_pipehandler_unlock', 'atcphy_pipehandler_check',
+                  'atcphy_pipehandler_set_mux', 'atcphy_clear_nonselected_phy_reset',
+                  'atcphy_configure_pipehandler_usb3_host_t8122',
+@@ -697,7 +708,7 @@ static void orientation_faults(void)
+                            !strcmp(caller, "j700_usb_field_update") ||
+                            !strcmp(caller, "atcphy_power_on") ||
+                            !strcmp(caller, "atcphy_configure") ||
+-                           (fixed && (!strcmp(caller, "atcphy_pipehandler_lock") ||
++                           (fixed && (!strcmp(caller, "atcphy_pipehandler_lock_timeout") ||
+                                       !strcmp(caller, "atcphy_pipehandler_unlock"))));
+                 }
+             }
+@@ -854,7 +865,7 @@ static void safe_first_recovery(void)
+         assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
+         unsigned int host_lock_poll = 0;
+         for (unsigned int i = 0; i < polls; i++)
+-            if (!strcmp(poll_caller[i], "atcphy_pipehandler_lock")) host_lock_poll = i + 1;
++            if (!strcmp(poll_caller[i], "atcphy_pipehandler_lock_timeout")) host_lock_poll = i + 1;
+         assert(host_lock_poll > 1); /* Inject the host lock, after acknowledged parking. */
+         orientation_initial(&p, true);
+         orient(&p, first);
+@@ -1104,7 +1115,7 @@ static void t8103_release_fault(struct apple_atcphy *p, struct phy *phy, bool fi
+         if (unlock) {
+             assert(polls==2 && only_released(0) && p->pipe_pending && mux_writes==0);
+         } else {
+-            assert(polls==3 && !strcmp(poll_caller[1],"atcphy_pipehandler_lock") &&
++            assert(polls==3 && !strcmp(poll_caller[1],"atcphy_pipehandler_lock_timeout") &&
+                    !strcmp(poll_caller[2],"atcphy_pipehandler_unlock"));
+             assert(!p->pipe_pending && mux_writes==3);
+         }
+@@ -1240,7 +1251,7 @@ static void pending_gate(void)
+         struct apple_atcphy p;
+         legacy_setup(&p,gen,false);
+         struct phy phy={&p};
+-        const char *fault="atcphy_pipehandler_lock";
++        const char *fault="atcphy_pipehandler_lock_timeout";
+ #if !T8103_HOST_BIST
+         /* T8103 host start takes no lock: fail the release of a stale one instead. */
+         if (gen==0) {
+@@ -1314,7 +1325,7 @@ static void dp_cache_gate(void)
+         struct apple_atcphy p;
+         legacy_setup(&p,gen,false);
+         struct phy phy={&p};
+-        const char *fault="atcphy_pipehandler_lock";
++        const char *fault="atcphy_pipehandler_lock_timeout";
+ #if !T8103_HOST_BIST
+         /* T8103 host start takes no lock: fail the release of a stale one instead. */
+         if (gen==0) {
+@@ -1912,6 +1923,10 @@ def pipe(root):
+         parts.append(block('struct ' + name + ' {') + ';')
+     parts.append(r'''
+ struct apple_atcphy {
++    /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
++    bool t8132_ss, t8132_common_owned, t8132_failed;
++    struct { void *usb3_dp; } tunables;
++
+     bool dp_only, pd_was_off, tunnel_clock_on;
+     unsigned int tunnel_rate, tunnel_users;
+     struct { bool aux, pll; unsigned int pairs, rate; } dp_t8122;
+@@ -1962,6 +1977,13 @@ static void core_clear32(struct apple_atcphy *p, u32 o, u32 v) { core_mask32(p,
+ /* Observation is read-only and separately tested; retain production caller control flow. */
+ static void __attribute__((unused)) atcphy_restore_after_pd_off(struct apple_atcphy *p) { assert(!p->pd_was_off); }
+ static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode);
++
++/* These units exercise older PHY generations. Never accept a T8132 dispatch. */
++static int __attribute__((unused)) atcphy_configure_t8132(struct apple_atcphy *p, enum atcphy_mode mode)
++{ (void)p; (void)mode; assert(false); return -EOPNOTSUPP; }
++static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *p)
++{ (void)p; assert(false); return -EOPNOTSUPP; }
++
+ ''')
+     for name in ('core_read32', 'atcphy_get_mode_config'):
+         parts.append(function(name))
+@@ -1978,7 +2000,7 @@ static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode)
+     p->mode = mode; p->mode_dirty = false; return 0;
+ }
+ ''')
+-    for name in ('atcphy_pipehandler_lock', 'atcphy_pipehandler_lock_live',
++    for name in ('atcphy_pipehandler_lock_timeout', 'atcphy_pipehandler_lock', 'atcphy_pipehandler_lock_live',
+                  'atcphy_pipehandler_unlock', 'atcphy_pipehandler_check',
+                  'atcphy_pipehandler_set_mux', 'atcphy_clear_nonselected_phy_reset',
+                  'atcphy_configure_pipehandler_usb3_host_t8122',
+@@ -2113,7 +2135,7 @@ static void host_lock_failure(void)
+         hw.gen = gen ? ATCPHY_GENERATION_T8122 : ATCPHY_GENERATION_T8103;
+         initial(&p, APPLE_ATCPHY_MODE_USB3, ATCPHY_PIPEHANDLER_STATE_DUMMY);
+         struct phy phy = { &p };
+-        const char *fault = "atcphy_pipehandler_lock";
++        const char *fault = "atcphy_pipehandler_lock_timeout";
+ #if !T8103_HOST_BIST
+         /* T8103 host start takes no lock: fail the release of a stale one instead. */
+         if (!gen) {
+@@ -2299,6 +2321,10 @@ def unwind(root):
+         parts.append(block(atc, 'struct ' + name + ' {') + ';')
+     parts.append(r'''
+ struct apple_atcphy {
++    /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
++    bool t8132_ss, t8132_common_owned, t8132_failed;
++    struct { void *usb3_dp; } tunables;
++
+     bool dp_only, pd_was_off, tunnel_clock_on;
+     unsigned int tunnel_rate, tunnel_users;
+     struct { bool aux, pll; unsigned int pairs, rate; } dp_t8122;
+@@ -2378,6 +2404,13 @@ static bool of_machine_is_compatible(const char *name) { (void)name; return fals
+ static int atcphy_power_off(struct apple_atcphy *);
+ static int atcphy_configure(struct apple_atcphy *, enum atcphy_mode);
+ 
++/* These units exercise older PHY generations. Never accept a T8132 dispatch. */
++static int __attribute__((unused)) atcphy_configure_t8132(struct apple_atcphy *p, enum atcphy_mode mode)
++{ (void)p; (void)mode; assert(false); return -EOPNOTSUPP; }
++static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *p)
++{ (void)p; assert(false); return -EOPNOTSUPP; }
++
++
+ static int atcphy_park_pipehandler(struct apple_atcphy *p, bool keep_dp)
+ { (void)keep_dp; p->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY; return 0; }
+ /* The T8140 profile never owes a T8103-generation live PIPE park. */
+@@ -2607,6 +2640,10 @@ def aux(root):
+ typedef uint32_t u32;
+ #define BIT(n) (1U << (n))
+ struct apple_atcphy {
++    /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
++    bool t8132_ss, t8132_common_owned, t8132_failed;
++    struct { void *usb3_dp; } tunables;
++
+     bool dp_only, pd_was_off, tunnel_clock_on;
+     unsigned int tunnel_rate, tunnel_users;
+     struct { bool aux, pll; unsigned int pairs, rate; } dp_t8122; struct { unsigned char *core; } regs; bool aux_power_requested; };
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/pm.py b/tools/testing/selftests/drivers/gpu/apple-dcp/pm.py
+index 3872506124..eec3ea85f6 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/pm.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/pm.py
+@@ -293,7 +293,7 @@ int main(void)
+  assert(safe(&p)==-EIO&&writes==before&&p.dp_usb_context_valid==valid&&p.dp_usb_context_dirty==dirty&&p.dp_owned_pmas==owned);balanced(&p);
+  resume_error=0;assert(safe(&p)==0);balanced(&p);
+  /* PM resume is NOT proof of ACK. Real parking timeout stays fatal. */
+- prepare(&p,true,true,false);fail_caller="atcphy_pipehandler_lock";before=writes;
++ prepare(&p,true,true,false);fail_caller="atcphy_pipehandler_lock_timeout";before=writes;
+  assert(safe(&p)==-ETIMEDOUT&&writes==before&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3&&p.mode_dirty);balanced(&p);
+  fail_caller=NULL;assert(safe(&p)==0);balanced(&p);
+  for(unsigned int missing=0;missing<5;missing++){
+@@ -363,7 +363,7 @@ int main(void)
+  }
+  prepare(&p,true,true,false);link_present=link_suspended=true;link_error=-EIO;
+  assert(safe(&p)==-EIO);balanced(&p);link_error=0;assert(safe(&p)==0);balanced(&p);
+- prepare(&p,true,true,false);link_present=link_suspended=true;fail_caller="atcphy_pipehandler_lock";before=writes;
++ prepare(&p,true,true,false);link_present=link_suspended=true;fail_caller="atcphy_pipehandler_lock_timeout";before=writes;
+  assert(safe(&p)==-ETIMEDOUT&&writes==before&&p.mode_dirty&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);balanced(&p);
+  fail_caller=NULL;assert(safe(&p)==0);balanced(&p);
+ #else
+@@ -393,7 +393,7 @@ int main(void)
+  balanced(&p);port_on_error=0;before=writes;
+  assert(select_mode(&p,APPLE_ATCPHY_MODE_USB3_DP)==0&&port_ons==2&&!p.usb3_port_off&&writes==before);balanced(&p);
+  /* PM resume is NOT proof of ACK; the port is down and stays down. */
+- prepare(&p,true,true,false);link_present=link_suspended=true;fail_caller="atcphy_pipehandler_lock";before=writes;
++ prepare(&p,true,true,false);link_present=link_suspended=true;fail_caller="atcphy_pipehandler_lock_timeout";before=writes;
+  assert(safe(&p)==-ETIMEDOUT&&writes==before&&p.mode_dirty&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);
+  assert(usb3_port_down&&p.usb3_port_off&&!port_ons);balanced(&p);
+  fail_caller=NULL;assert(safe(&p)==0);balanced(&p);
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/quiesce.py b/tools/testing/selftests/drivers/gpu/apple-dcp/quiesce.py
+index 1b88670daf..b8c25bd0a8 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/quiesce.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/quiesce.py
+@@ -123,7 +123,7 @@ static void gpiod_set_value_cansleep(void *p,int v) { (void)p;assert(v==1);gpio_
+  # atcphy_mux_set_locked() also reports whether a SuperSpeed port may come back up.
+  split=[atc_function(atc,name) for name in ('atcphy_usb3_port_ready','atcphy_mux_check','atcphy_mux_park','atcphy_mux_switch')]
+  functions+=block(core,'static '+('void' if parent else 'int')+' tps6598x_disconnect(')+'\n'+block(core,'static '+('void' if parent else 'int')+' cd321x_remove(')+'\n'+block(core,'void tipd_remove(')+'\n'
+- ordinary_phy=r'''
++ ordinary_phy=block(atc, 'enum atcphy_generation {') + ';\n' + r'''
+ /* Actual ordinary-port ATC power-off, mux recheck and USB2 init; MMIO leaves. */
+ #undef WARN_ON_ONCE
+ #define WARN_ON_ONCE(x) ({ bool hit=(x);phy_warns+=hit;hit; })
+@@ -136,6 +136,7 @@ enum atcphy_pipehandler_state { ATCPHY_PIPEHANDLER_STATE_DUMMY, ATCPHY_PIPEHANDL
+ GENERATION_ENUM
+ struct atcphy_hw { GENERATION_FIELD bool has_usb4,has_t8140_dp,dp_t8122; };
+ struct apple_atcphy {
++ struct { void *usb3_dp; } tunables;
+  void *dev; int lock;
+  const struct atcphy_hw *hw;
+  struct { void *usb2phy; } regs;
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/teardown_pm.py b/tools/testing/selftests/drivers/gpu/apple-dcp/teardown_pm.py
+index 7381092399..b293087d49 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/teardown_pm.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/teardown_pm.py
+@@ -92,15 +92,15 @@ struct xhci_hcd { atomic_int xhc_state; struct clk *clk,*reg_clk; struct reset_c
+ static struct xhci_hcd xhci_context;
+ #define XHCI_STATE_REMOVING 1
+ #define hcd_to_xhci(h) (&xhci_context)
+-struct dwc3 { bool sys_wakeup; struct platform_device *xhci; };
++struct dwc3 { bool sys_wakeup, dis_u3_susphy_quirk; struct platform_device *xhci; };
+ enum { DWC3_APPLE_PROBE_PENDING, DWC3_APPLE_NO_CABLE, DWC3_APPLE_HOST, DWC3_APPLE_DEVICE };
+ /* pre_core_rpm is T8132 only: runtime PM before the first core probe; never set here. */
+-struct dwc3_apple { struct dwc3 dwc; struct device *dev; int lock,state; void *role_sw; bool pre_core_rpm; };
++struct dwc3_apple { struct dwc3 dwc; struct device *dev; int lock,state; void *role_sw; bool pre_core_rpm, dt_dis_u3_susphy; };
+ static struct dwc3_apple apple_context;
+ #define to_dwc3_apple(d) container_of(d,struct dwc3_apple,dwc)
+ static bool inside_host_remove;
+ static void *platform_get_drvdata(struct platform_device *d) { return d==&controller?(void *)&apple_context.dwc:(void *)&hcd; }
+-static void dwc3_enable_susphy(struct dwc3 *d,bool v) { (void)d;assert(v);susphy_calls++;observed_controller_write(); }
++static void dwc3_enable_susphy(struct dwc3 *d,bool v) { assert(v&&d->dis_u3_susphy_quirk==apple_context.dt_dis_u3_susphy);susphy_calls++;observed_controller_write(); }
+ static void device_init_wakeup(struct device *d,bool b) { (void)d;(void)b; }
+ static void platform_device_unregister(struct platform_device *d);
+ static void dwc3_gadget_exit(struct dwc3 *d) { (void)d;assert(0); }
+@@ -158,7 +158,7 @@ int main(void) {
+   struct apple_atcphy p;prepare(&p,true,true,false);
+   struct device_private private={0};controller.dev.p=&private;host_device.p=&private;
+   controller_driver.remove=controller_remove;host_driver.remove=host_remove;
+-  apple_context=(struct dwc3_apple){.dwc={.xhci=&host_platform_device},.dev=&controller.dev,.state=DWC3_APPLE_HOST};
++  apple_context=(struct dwc3_apple){.dwc={.xhci=&host_platform_device,.dis_u3_susphy_quirk=true},.dev=&controller.dev,.state=DWC3_APPLE_HOST};
+   xhci_context=(struct xhci_hcd){0};
+   inject_remove=true;removal_started=blocked_attempt=release_remove=false;
+   atomic_store(&early_write,false);atomic_store(&handoff_active,true);

@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Sat, 24 Oct 2026 13:59:28 +1100
+Subject: [PATCH] Port the segment-reservation helper of aurora-silicon/m1n1
+ aaf9fe96 (prerequisite of #47)
+
+kboot: let the ASC firmware reservation skip segments outside DRAM
+
+aurora-silicon/m1n1 #47 (J713 AOP handoff, ported in the next commit)
+reserves the J713 AOP's DRAM firmware segments through
+dt_reserve_asc_segments(..., dram_only = true), and extends
+dt_set_aop_firmware(). aaf9fe96 ("kboot: Reserve the T6040 AOP's DRAM
+firmware segments", Ryan Murray, on aurora-wip before #47) introduced
+both. This tree has neither, so #47 does not build on it alone.
+
+This commit ports only the helper half of aaf9fe96, unchanged:
+
+  - dt_reserve_asc_firmware() becomes dt_reserve_asc_segments() with a
+    dram_only argument. With dram_only it reads /chosen dram-base and
+    dram-size from the ADT, and skips (with a log line) any segment
+    whose 16 KiB-aligned span is not inside DRAM.
+  - dt_reserve_asc_firmware() remains as a wrapper that passes
+    dram_only = false. All existing callers are unchanged and keep
+    their exact behaviour. The function body otherwise matches this
+    tree's copy, including omacom's segment-list validation and the
+    T6030/T8132 DCP os-log case (CODE: the region is byte-identical to
+    a07d8c86^1 and a07d8c86, and differs from this tree's copy only by
+    aaf9fe96's hunks).
+
+Deliberately not ported: aaf9fe96's T6040/T6041 dt_set_aop_firmware()
+and its call in kboot_prepare_dt(). They change T6040/T6041 behaviour,
+which is outside the J604 work and untested on this tree. The #47 port
+adds dt_set_aop_firmware() gated to T8132 only (see its message).
+
+Fixtures: test_isp_optional.py, test_isp_reservation_full.py and
+test_t8122_dcpext_ready.py compile dt_reserve_asc_firmware() out of
+kboot.c, and now also need dt_reserve_asc_segments() plus a stub
+ADT_GETPROP (only the dram_only path reads it). Their hunks are taken
+unchanged from aurora-silicon 6b00c5f4 ("tests: follow the merged
+kboot and NVMe code in the host fixtures", #44). After this change the
+three files are byte-identical to aurora-wip's.
+
+(cherry picked from commit aaf9fe9697c384cd0bc82458b9b97f817bcb88bd, partial: helper refactor only)
+
+Hardware tested on: NOT YET
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ src/kboot.c                               | 42 ++++++++++++++++++++---
+ tests/python/test_isp_optional.py         |  7 ++--
+ tests/python/test_isp_reservation_full.py |  5 ++-
+ tests/python/test_t8122_dcpext_ready.py   |  2 +-
+ 4 files changed, 47 insertions(+), 9 deletions(-)
+
+diff --git a/src/kboot.c b/src/kboot.c
+index b7719933..91346707 100644
+--- a/src/kboot.c
++++ b/src/kboot.c
+@@ -2587,8 +2587,14 @@ static int dt_vram_reserved_region(const char *dcp_alias, const char *disp_alias
+                                    disp_reserved_regions_vram, &region, 1);
+ }
+ 
+-static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_alt,
+-                                   const char *fdt_path, bool remap, u64 base)
++/*
++ * Reserve the firmware segments of an ASC coprocessor from its ADT
++ * segment-ranges and attach them to its FDT node. With dram_only, segments
++ * outside DRAM (such as the coprocessor's own SRAM, which the OS maps as MMIO)
++ * are left out.
++ */
++static int dt_reserve_asc_segments(const char *adt_path, const char *adt_path_alt,
++                                   const char *fdt_path, bool remap, u64 base, bool dram_only)
+ {
+     int ret = 0;
+ 
+@@ -2610,6 +2616,18 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
+         bail("ADT: invalid ASC firmware segment list for %s\n", fdt_path);
+     unsigned int num_maps = segments_len / sizeof(*seg);
+ 
++    u64 dram_base = 0, dram_end = 0;
++    if (dram_only) {
++        int chosen = adt_path_offset(adt, "/chosen");
++        u64 dram_size;
++
++        if (chosen < 0 || ADT_GETPROP(adt, chosen, "dram-base", &dram_base) != sizeof(dram_base) ||
++            ADT_GETPROP(adt, chosen, "dram-size", &dram_size) != sizeof(dram_size) || !dram_size ||
++            dram_base > UINT64_MAX - dram_size)
++            bail("ADT: no DRAM range for '%s'\n", adt_path);
++        dram_end = dram_base + dram_size;
++    }
++
+     uint32_t dev_phandle = fdt_get_phandle(dt, fdt_node);
+     if (!dev_phandle) {
+         ret = fdt_generate_phandle(dt, &dev_phandle);
+@@ -2619,7 +2637,17 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
+             bail("FDT: couldn't set '%s.phandle' property: %d\n", fdt_path, ret);
+     }
+ 
+-    for (unsigned i = 0; i < num_maps; i++) {
++    for (unsigned i = 0; i < num_maps; i++, seg++) {
++        if (dram_only) {
++            u64 span = ALIGN_UP((u64)seg->size, SZ_16K);
++
++            if (seg->phys < dram_base || seg->phys >= dram_end || span > dram_end - seg->phys) {
++                printf("FDT: %s: segment at 0x%lx is outside DRAM, not reserved\n", fdt_path,
++                       seg->phys);
++                continue;
++            }
++        }
++
+         u64 iova = (remap ? seg->remap : seg->iova) | base;
+ 
+         char node_name[64];
+@@ -2653,13 +2681,17 @@ static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_al
+         ret = dt_device_add_mem_region(fdt_path, mem_phandle, NULL);
+         if (ret < 0)
+             return ret;
+-
+-        seg++;
+     }
+ 
+     return 0;
+ }
+ 
++static int dt_reserve_asc_firmware(const char *adt_path, const char *adt_path_alt,
++                                   const char *fdt_path, bool remap, u64 base)
++{
++    return dt_reserve_asc_segments(adt_path, adt_path_alt, fdt_path, remap, base, false);
++}
++
+ static int dt_set_ave(void)
+ {
+     if (chip_id != T8140)
+diff --git a/tests/python/test_isp_optional.py b/tests/python/test_isp_optional.py
+index eb0bfaaa..2f1f73a0 100644
+--- a/tests/python/test_isp_optional.py
++++ b/tests/python/test_isp_optional.py
+@@ -1,7 +1,8 @@
+ # SPDX-License-Identifier: MIT
+ """The ISP is optional: an unusable firmware description disables it, not the boot.
+ 
+-Runs kboot.c's dt_set_isp() and dt_reserve_asc_firmware() as they are, on real FDTs.
++Runs kboot.c's dt_set_isp(), dt_reserve_asc_firmware() and dt_reserve_asc_segments() as they
++are, on real FDTs.
+ """
+ 
+ from pathlib import Path
+@@ -39,6 +40,8 @@ typedef uint32_t u32;
+ #define SZ_16K 16384
+ #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
+ #define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
++/* Only the dram_only segment filter reads properties this way; ISP reservations do not. */
++#define ADT_GETPROP(a, n, k, v) ((size_t)0)
+ static void *dt, *adt;
+ static u32 chip_id = 0x8122;
+ static unsigned char blob[32768];
+@@ -86,7 +89,7 @@ static int dt_set_isp_fwdata(void)
+     return fwdata_fault ? -1 : 0;
+ }
+ ''' + function("dt_device_set_reserved_mem") + function("dt_device_add_mem_region") +
+-        function("dt_reserve_asc_firmware") + set_isp + r'''
++        function("dt_reserve_asc_segments") + function("dt_reserve_asc_firmware") + set_isp + r'''
+ static void world(int which)
+ {
+     fault = which;
+diff --git a/tests/python/test_isp_reservation_full.py b/tests/python/test_isp_reservation_full.py
+index 9b4596c2..c2c562c8 100644
+--- a/tests/python/test_isp_reservation_full.py
++++ b/tests/python/test_isp_reservation_full.py
+@@ -14,7 +14,8 @@ def test_isp_reservation_no_space(tmp_path):
+         start = source.index(signature)
+         return source[start:source.index("\n}", start) + 2]
+ 
+-    firmware = definition("static int dt_reserve_asc_firmware(")
++    firmware = definition("static int dt_reserve_asc_segments(") + "\n" + \
++        definition("static int dt_reserve_asc_firmware(")
+     heap = definition("static int dt_set_isp_fwdata(void)")
+     harness = r'''
+ #include <assert.h>
+@@ -27,6 +28,8 @@ typedef uint32_t u32;
+ #define SZ_16K 0x4000
+ #define T6030 0x6030
+ #define T8132 0x8132
++/* Only the dram_only segment filter reads properties this way. */
++#define ADT_GETPROP(a, n, k, v) ((size_t)0)
+ static u32 chip_id;
+ static unsigned int mappings, links;
+ #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
+diff --git a/tests/python/test_t8122_dcpext_ready.py b/tests/python/test_t8122_dcpext_ready.py
+index 182eb75b..acb7356d 100644
+--- a/tests/python/test_t8122_dcpext_ready.py
++++ b/tests/python/test_t8122_dcpext_ready.py
+@@ -105,7 +105,7 @@ static int set_u32(void *tree, int node, const char *name, uint32_t value)
+ #define fdt_setprop_u32 set_u32
+ ''' + function("dt_enable_dcp_with_typec_routes") +
+         function("dt_device_set_reserved_mem") + function("dt_device_add_mem_region") +
+-        function("dt_reserve_asc_firmware") + aliases + "\n" +
++        function("dt_reserve_asc_segments") + function("dt_reserve_asc_firmware") + aliases + "\n" +
+         function("dt_display_transaction") + function("dt_reserve_t8122_dcpext_one") +
+         function("dt_t8122_dcpext_armed", "static bool ") +
+         function("dt_reserve_dcpext_firmware") + r'''

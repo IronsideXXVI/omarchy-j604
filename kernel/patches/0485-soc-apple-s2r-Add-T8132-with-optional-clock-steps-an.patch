@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 02:21:43 +0000
+Subject: [PATCH] soc: apple: s2r: Add T8132, with optional clock steps and a
+ firmware-less bring-up mode
+
+Prepare the suspend-to-RAM driver for T8132 (M4, J604):
+
+ - Add the apple,t8132-pmgr-s2r compatible.
+
+ - Make the clkgen, pll and s2r-timer registers optional. On T8132 their
+   addresses are not known: the T6021 offsets from PMGR/PMGR_AON (clkgen
+   PMGR - 0x48000, PLL PMGR + 0x1a4000, timer PMGR_AON + 0x344000) fall
+   outside every register range the J604 ADT gives the PMGR, unlike the
+   wake, counter and wake-time blocks, which are where T6021 has them.
+   Without them the clock generator, PLL off-mode and timer steps are
+   left out; the PMGR sleep-state counters (apple-sleep) then show which
+   state (DEEP_WAIT, SLP_DDR, SLP_S2R) the SoC actually reached.
+
+ - Add apple_s2r.bringup_no_fw. With it the driver also registers when
+   the boot firmware has no warm boot mailbox, but ->enter() refuses
+   (-EOPNOTSUPP) unless apple_s2r.abort_before stops the sequence before
+   the clock generators (steps 1-8). That runs the whole kernel side of
+   suspend-to-RAM - secondary CPUs offlined and powered down through the
+   PMGR, AIC state saved, CPM/SIO/wake masks applied and undone, the SMC
+   AP-sleep handshake - and resumes without the SoC ever going to sleep,
+   so it can be qualified on a J604 before the boot loader side exists.
+
+Default behaviour is unchanged: nothing registers without
+apple_s2r.enable=1, and without bringup_no_fw the mailbox stays required.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ .../bindings/power/apple,pmgr-s2r.yaml        | 14 ++-
+ drivers/soc/apple/apple-s2r.c                 | 86 ++++++++++++++-----
+ 2 files changed, 75 insertions(+), 25 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/power/apple,pmgr-s2r.yaml b/Documentation/devicetree/bindings/power/apple,pmgr-s2r.yaml
+index cd4cfc3249..0959d3c7b7 100644
+--- a/Documentation/devicetree/bindings/power/apple,pmgr-s2r.yaml
++++ b/Documentation/devicetree/bindings/power/apple,pmgr-s2r.yaml
+@@ -37,15 +37,22 @@ properties:
+     pattern: "^power-management@[0-9a-f]+$"
+ 
+   compatible:
+-    const: apple,t6021-pmgr-s2r
++    enum:
++      - apple,t6021-pmgr-s2r
++      - apple,t8132-pmgr-s2r
+ 
+   reg:
++    description:
++      Optional where the registers are not known (T8132); the clock
++      generator, PLL and timer steps are then left out.
++    minItems: 1
+     items:
+       - description: SoC clock generator
+       - description: SoC PLL off-mode control
+       - description: PMGR suspend-to-RAM timer
+ 
+   reg-names:
++    minItems: 1
+     items:
+       - const: clkgen
+       - const: pll
+@@ -75,12 +82,13 @@ properties:
+ 
+ required:
+   - compatible
+-  - reg
+-  - reg-names
+   - apple,pmgr
+   - apple,cpu-clusters
+   - apple,sep-domain
+ 
++dependentRequired:
++  reg: [ reg-names ]
++
+ additionalProperties: false
+ 
+ examples:
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index b8771ebd40..a7d4290497 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -223,6 +223,10 @@ static uint wdt_timeout;
+ module_param(wdt_timeout, uint, 0644);
+ MODULE_PARM_DESC(wdt_timeout, "For bring-up: right before the SoC goes to sleep, arm the watchdog to reset the system after this many seconds (at most 178) unless the resume path disarms it first; needs apple,watchdog (default: 0, off)");
+ 
++static bool bringup_no_fw;
++module_param(bringup_no_fw, bool, 0444);
++MODULE_PARM_DESC(bringup_no_fw, "For bring-up without firmware warm boot support: register anyway, but only run suspend-to-RAM with abort_before set to a step before the clock generators (1-8), so the SoC never goes to sleep (default: off)");
++
+ static bool spin_instead_of_sleep;
+ module_param(spin_instead_of_sleep, bool, 0644);
+ MODULE_PARM_DESC(spin_instead_of_sleep, "For bring-up: run every step, arm the watchdog, then spin with interrupts off instead of the final power-down, so only the watchdog can end it; needs wdt_timeout (default: off)");
+@@ -358,7 +362,7 @@ static int apple_s2r_finish(unsigned long arg)
+ 		apple_s2r_wdt_arm(s2r);
+ 
+ 	/* The timer start is written a second time, as the very last step */
+-	if (!(skip & S2R_SKIP_TIMER))
++	if (s2r->timer && !(skip & S2R_SKIP_TIMER))
+ 		writel(S2R_TIMER_START, s2r->timer);
+ 
+ 	if (READ_ONCE(spin_instead_of_sleep) && s2r->wdt_armed)
+@@ -406,6 +410,17 @@ static int apple_s2r_enter(suspend_state_t state)
+ 	s2r->restore_ret = 0;
+ 	s2r->wdt_armed = false;
+ 
++	/*
++	 * Without a warm boot mailbox nothing can resume the SoC: only the
++	 * bring-up runs that stop before the clock generators are allowed.
++	 */
++	if (!s2r->mailbox) {
++		unsigned int ab = READ_ONCE(abort_before);
++
++		if (!ab || ab > S2R_STEP_CLKGEN)
++			return -EOPNOTSUPP;
++	}
++
+ 	/* No printk from here on: the console may lose its clock */
+ 	ret = apple_s2r_step(s2r, S2R_STEP_PARKED, 0,
+ 			     apple_cpu_park_power_down_all);
+@@ -438,7 +453,7 @@ static int apple_s2r_enter(suspend_state_t state)
+ 	if (ret)
+ 		goto fail;
+ 
+-	if (!(skip & S2R_DONE_CLOCKS)) {
++	if (s2r->clkgen && s2r->pll && !(skip & S2R_DONE_CLOCKS)) {
+ 		ret = apple_s2r_check(s2r, S2R_STEP_CLKGEN);
+ 		if (ret)
+ 			goto fail;
+@@ -451,7 +466,7 @@ static int apple_s2r_enter(suspend_state_t state)
+ 	ret = apple_s2r_check(s2r, S2R_STEP_SUSPEND);
+ 	if (ret)
+ 		goto fail;
+-	if (!(skip & S2R_SKIP_TIMER))
++	if (s2r->timer && !(skip & S2R_SKIP_TIMER))
+ 		writel(S2R_TIMER_START, s2r->timer);
+ 
+ 	/* Armed by the finisher, once nothing is left that could abort */
+@@ -520,14 +535,17 @@ static void apple_s2r_wake(void)
+ 	struct apple_s2r_mailbox *mb = s2r->mailbox;
+ 	u64 flags;
+ 
+-	/* The firmware updated the mailbox with the caches off */
+-	dcache_clean_inval_poc((unsigned long)mb, (unsigned long)(mb + 1));
+-	flags = le64_to_cpu(READ_ONCE(mb->flags));
++	flags = 0;
++	if (mb) {
++		/* The firmware updated the mailbox with the caches off */
++		dcache_clean_inval_poc((unsigned long)mb, (unsigned long)(mb + 1));
++		flags = le64_to_cpu(READ_ONCE(mb->flags));
+ 
+-	/* Disarm, and stop muting the firmware console on CPU restarts */
+-	WRITE_ONCE(mb->magic, 0);
+-	WRITE_ONCE(mb->flags, 0);
+-	dcache_clean_poc((unsigned long)mb, (unsigned long)(mb + 1));
++		/* Disarm, and stop muting the firmware console on CPU restarts */
++		WRITE_ONCE(mb->magic, 0);
++		WRITE_ONCE(mb->flags, 0);
++		dcache_clean_poc((unsigned long)mb, (unsigned long)(mb + 1));
++	}
+ 
+ 	if (s2r->resumed)
+ 		dev_info(s2r->dev, "resumed from suspend-to-RAM%s\n",
+@@ -552,6 +570,15 @@ static const struct platform_suspend_ops apple_s2r_ops = {
+ 	.wake = apple_s2r_wake,
+ };
+ 
++static void __iomem *apple_s2r_optional_reg(struct platform_device *pdev,
++					    const char *name)
++{
++	if (!platform_get_resource_byname(pdev, IORESOURCE_MEM, name))
++		return NULL;
++
++	return devm_platform_ioremap_resource_byname(pdev, name);
++}
++
+ /* The watchdog driver owns the registers: map them without claiming them */
+ static int apple_s2r_map_wdt(struct apple_s2r *s2r)
+ {
+@@ -589,28 +616,37 @@ static int apple_s2r_probe(struct platform_device *pdev)
+ 	if (!is_kernel_in_hyp_mode())
+ 		return dev_err_probe(dev, -ENODEV, "warm boot resumes at EL2\n");
+ 
+-	if (of_property_read_u64(of_chosen, "asahi,s2r-mailbox", &mailbox))
+-		return dev_err_probe(dev, -ENODEV,
+-				     "boot firmware has no warm boot mailbox\n");
++	if (of_property_read_u64(of_chosen, "asahi,s2r-mailbox", &mailbox)) {
++		if (!bringup_no_fw)
++			return dev_err_probe(dev, -ENODEV,
++					     "boot firmware has no warm boot mailbox\n");
++		mailbox = 0;
++	}
+ 
+ 	s2r = devm_kzalloc(dev, sizeof(*s2r), GFP_KERNEL);
+ 	if (!s2r)
+ 		return -ENOMEM;
+ 	s2r->dev = dev;
+ 
+-	s2r->mailbox = devm_memremap(dev, mailbox, sizeof(*s2r->mailbox),
+-				     MEMREMAP_WB);
+-	if (IS_ERR(s2r->mailbox))
+-		return dev_err_probe(dev, PTR_ERR(s2r->mailbox),
+-				     "failed to map the warm boot mailbox\n");
++	if (mailbox) {
++		s2r->mailbox = devm_memremap(dev, mailbox,
++					     sizeof(*s2r->mailbox), MEMREMAP_WB);
++		if (IS_ERR(s2r->mailbox))
++			return dev_err_probe(dev, PTR_ERR(s2r->mailbox),
++					     "failed to map the warm boot mailbox\n");
++	}
+ 
+-	s2r->clkgen = devm_platform_ioremap_resource_byname(pdev, "clkgen");
++	/*
++	 * The clock generator, PLL off-mode and timer registers are not known
++	 * on every SoC (T8132): without them those steps are left out.
++	 */
++	s2r->clkgen = apple_s2r_optional_reg(pdev, "clkgen");
+ 	if (IS_ERR(s2r->clkgen))
+ 		return PTR_ERR(s2r->clkgen);
+-	s2r->pll = devm_platform_ioremap_resource_byname(pdev, "pll");
++	s2r->pll = apple_s2r_optional_reg(pdev, "pll");
+ 	if (IS_ERR(s2r->pll))
+ 		return PTR_ERR(s2r->pll);
+-	s2r->timer = devm_platform_ioremap_resource_byname(pdev, "s2r-timer");
++	s2r->timer = apple_s2r_optional_reg(pdev, "s2r-timer");
+ 	if (IS_ERR(s2r->timer))
+ 		return PTR_ERR(s2r->timer);
+ 
+@@ -649,13 +685,19 @@ static int apple_s2r_probe(struct platform_device *pdev)
+ 
+ 	suspend_set_ops(&apple_s2r_ops);
+ 
+-	dev_info(dev, "suspend-to-RAM available (mailbox at %#llx)\n", mailbox);
++	if (s2r->mailbox)
++		dev_info(dev, "suspend-to-RAM available (mailbox at %#llx)%s\n",
++			 mailbox, s2r->timer ? "" : ", without clock/PLL/timer steps");
++	else
++		dev_warn(dev, "bring-up only: no warm boot mailbox, suspend-to-RAM runs only with abort_before 1-%d\n",
++			 S2R_STEP_CLKGEN);
+ 
+ 	return 0;
+ }
+ 
+ static const struct of_device_id apple_s2r_of_match[] = {
+ 	{ .compatible = "apple,t6021-pmgr-s2r" },
++	{ .compatible = "apple,t8132-pmgr-s2r" },
+ 	{}
+ };
+ 

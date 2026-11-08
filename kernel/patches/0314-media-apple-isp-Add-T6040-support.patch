@@ -1,0 +1,682 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Goyvaerts <jonathan.goyvaerts@gmail.com>
+Date: Tue, 20 Oct 2026 17:28:21 -0300
+Subject: [PATCH] media: apple: isp: Add T6040 support
+
+The T6040 (M4 Pro/Max) ISP is the T8140 coprocessor with the same H17
+firmware interface: its register map in the macOS kext has the T8140
+reset, control, fabric and interrupt words, and its firmware asks for
+the 0x290-byte H16 boot descriptor. What differs is taken from how
+macOS 26.6.2 boots it on the J616s (the firmware's own log of the boot
+and of every command it receives) and from aurora's m1n1 proxy captures
+on that machine:
+
+ - The firmware is started as iBoot left it, with no reset sequence.
+   The coprocessor must not have run yet and its reset vector must be
+   the firmware text at the base of the heap region; the driver checks
+   both instead of starting something else.
+ - No clock enable word, legacy boot mode 1 in GPIO 6.
+ - The boot descriptor carries the board's camera connection layout and
+   a 0xde600000-byte shared window, as macOS passes it.
+ - The broadcast-clear command takes four windows in eight slots, the
+   unused ones all ones. Generalise the H17 command to several windows;
+   T8140 still sends its single one.
+ - Like T8140, the firmware reaches PMGR, PMP and DSID registers through
+   its DART at their physical addresses, among them the clock and
+   bandwidth scratch words named in PMP_CTRL_SET and the broadcast-clear
+   bases. Map the J616s ADT's DART address filter ranges for the ISP
+   1:1, rounded out to 16 KiB pages.
+ - The firmware's main memory is 32 MiB at IOVA 0. iBoot loads __TEXT
+   and __DATA into it, and they end 80 KiB short of the top (0x1fec000
+   of 0x2000000). The rest is the host's to back, as macOS does; left
+   unbacked, the firmware's first writes there take DART translation
+   faults and it never answers its first command. Read the end of the
+   "data" memory-region and map zeroed pages from there to the heap top
+   for as long as the firmware surfaces live.
+ - Output goes through scaler 1, so the rendered pool is the scaler 1
+   pool, as the buffers submitted to it already were.
+ - There is no capture metadata pool or capture watchdog. Skip that
+   pool and its size check on H17 firmware that has none.
+
+The front camera is an IMX958 (sensor 0x958, lens 0x29). Of the 32
+setfiles in macOS's appleh16camerad, only module 2224 revision 01 names
+it in section 0x50f, where each setfile names the sensor it tunes; 2924
+and 2921 name the IMX614. With 2924 the firmware streams, but reports
+a lens shading calibration for a 3744-pixel-wide sensor on every frame
+("fullRes (3072 x 3024) lsCalibRes (3744 x 3024) not match!") and never
+logs the module match macOS logs once the setfile has loaded. 2224
+carries a 3072 x 3024 calibration. The file is 0x6ff4 bytes up to the
+end of its section chain.
+
+T6040 sets none of T8140's fw_iova_mask, mbox2_offset and
+mbox_irq_route. The firmware's own addresses are at 0x100_0000_0000,
+above the 36 bits T8140 keeps, so no mask is applied. Its doorbells have
+a register window of their own in Apple's device tree, described as
+"mbox2", instead of sitting inside the mailbox window. Only the base
+interrupt enable is written; T8140's extra enable and routing words are
+not needed on T6040.
+
+Signed-off-by: Jonathan Goyvaerts <jonathan.goyvaerts@gmail.com>
+Assisted-by: LLM
+(backported from commit 316136216030f8c857875f3e5751c7f4585f9468)
+[j604: context conflict in apple_isp_probe() with official linux-aurora's J613/J615 temporal-filter quirk (4433ef5a0d, 7bdc7439d9, not in Aurora): kept both, quirk first.]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/isp/isp-cam.c   |  27 +++-
+ drivers/media/platform/apple/isp/isp-cmd.c   |  21 ++-
+ drivers/media/platform/apple/isp/isp-cmd.h   |  15 +-
+ drivers/media/platform/apple/isp/isp-drv.c   | 141 ++++++++++++++++---
+ drivers/media/platform/apple/isp/isp-drv.h   |  11 ++
+ drivers/media/platform/apple/isp/isp-fw.c    |  75 +++++++++-
+ drivers/media/platform/apple/isp/isp-iommu.c |  29 ++++
+ drivers/media/platform/apple/isp/isp-iommu.h |   2 +
+ 8 files changed, 273 insertions(+), 48 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 24d8a10f4b..a5881c35ff 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -70,6 +70,7 @@ static const struct isp_setfile isp_setfiles[] = {
+ 	[ISP_IMX814_2123_01] = {0x814, 0x21230101, "apple/isp_2123_01XX.dat", 0xed54},
+ 	[ISP_IMX853_7622_01] = {0x853, 0x76220112, "apple/isp_7622_01XX.dat", 0x247f8},
+ 	[ISP_IMX913_7523_01] = {0x913, 0x75230107, "apple/isp_7523_01XX.dat", 0x247f8},
++	[ISP_IMX958_2224_01] = {0x958, 0x22240106, "apple/isp_2224_01XX.dat", 0x6ff4},
+ 	[ISP_VD56G0_6221_01] = {0xd56, 0x62210102, "apple/isp_6221_01XX.dat", 0x1b80},
+ 	[ISP_VD56G0_6222_01] = {0xd56, 0x62220102, "apple/isp_6222_01XX.dat", 0x1b80},
+ };
+@@ -158,6 +159,10 @@ static int isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
+ 	case 0x913:
+ 		id = ISP_IMX913_7523_01;
+ 		break;
++	case 0x958:
++		/* Section 0x50f of 2224 names sensor 0x958; 2924's names 0x614. */
++		id = ISP_IMX958_2224_01;
++		break;
+ 	case 0xd56:
+ 		id = ISP_VD56G0_6221_01;
+ 		break;
+@@ -228,10 +233,14 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
+ 
+ 	dev_dbg(isp->dev, "found sensor %x on ch %d\n", args->version, ch);
+ 
+-	/* The metadata buffers are allocated for the sizes the driver knows. */
++	/*
++	 * The metadata buffers are allocated for the sizes the driver knows;
++	 * without a capture metadata pool its size is not used.
++	 */
+ 	if (isp->hw->fw_abi == ISP_FW_ABI_H17 &&
+ 	    (args->unk_68 != isp->hw->meta_size ||
+-	     args->unk_78 != isp->hw->capture_meta_size)) {
++	     (isp->hw->capture_meta_size &&
++	      args->unk_78 != isp->hw->capture_meta_size))) {
+ 		dev_err(isp->dev,
+ 			"metadata sizes 0x%x/0x%x, expected 0x%x/0x%x\n",
+ 			args->unk_68, args->unk_78, isp->hw->meta_size,
+@@ -245,7 +254,8 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
+ 	err = isp_ch_get_sensor_id(isp, ch);
+ 	if (err ||
+ 	    (fmt->id != ISP_IMX248_1820_01 && fmt->id != ISP_IMX558_1921_01 &&
+-	     fmt->id != ISP_IMX558_1925_03 && fmt->id != ISP_IMX364_8720_01)) {
++	     fmt->id != ISP_IMX558_1925_03 && fmt->id != ISP_IMX364_8720_01 &&
++	     fmt->id != ISP_IMX958_2224_01)) {
+ 		dev_err(isp->dev,
+ 			"ch %d: unsupported sensor. Please file a bug report with hardware info & dmesg trace.\n",
+ 			ch);
+@@ -451,10 +461,13 @@ static int isp_ch_configure_pools(struct apple_isp *isp, u32 ch)
+ 	if (err)
+ 		return err;
+ 
+-	err = isp_cmd_ch_buffer_pool_config_set(isp, ch,
+-						CISP_POOL_TYPE_META_CAPTURE);
+-	if (err)
+-		return err;
++	/* H17 firmware without capture metadata has no such pool. */
++	if (isp->hw->fw_abi != ISP_FW_ABI_H17 || isp->hw->capture_meta_size) {
++		err = isp_cmd_ch_buffer_pool_config_set(isp, ch,
++							CISP_POOL_TYPE_META_CAPTURE);
++		if (err)
++			return err;
++	}
+ 
+ 	/* The H17 firmware also takes the geometry of the output buffers. */
+ 	if (isp->hw->fw_abi != ISP_FW_ABI_H17)
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.c b/drivers/media/platform/apple/isp/isp-cmd.c
+index 42c448fd0f..fd7dcfd528 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.c
++++ b/drivers/media/platform/apple/isp/isp-cmd.c
+@@ -151,16 +151,24 @@ int isp_cmd_set_dsid_clr_req_base(struct apple_isp *isp, u64 dsid_clr_base,
+ 	return CISP_SEND_IN(isp, args);
+ }
+ 
+-int isp_cmd_set_dsid_clr_multi_bc(struct apple_isp *isp, u64 dsid_clr_base,
+-				  u32 dsid_clr_range)
++int isp_cmd_set_dsid_clr_multi_bc(struct apple_isp *isp, const u64 *bases,
++				  unsigned int count, u32 dsid_clr_range)
+ {
+ 	struct cmd_set_dsid_clr_multi_bc_reg_base args = {
+ 		.opcode = CISP_OPCODE(CISP_CMD_SET_DSID_CLR_MULTI_BC_REG_BASE),
+-		.count = 1,
++		.count = count,
+ 		.dsid_clr_range = dsid_clr_range,
+-		.dsid_clr_base = dsid_clr_base,
+ 	};
+-	return CISP_SEND_IN(isp, args);
++
++	/* The caller, isp_set_dsid_clr(), bounds count by the array. */
++	if (!count)
++		return -EINVAL;
++	memcpy(args.dsid_clr_base, bases, count * sizeof(*bases));
++
++	return cisp_send(isp, &args,
++			 offsetof(typeof(args), dsid_clr_base) +
++				 count * sizeof(*bases), 0,
++			 CISP_TIMEOUT);
+ }
+ 
+ int isp_cmd_pmp_ctrl_set(struct apple_isp *isp, u64 clock_scratch,
+@@ -481,7 +489,8 @@ int isp_cmd_ch_buffer_pool_config_set_rendered(struct apple_isp *isp, u32 chan,
+ 	struct cmd_ch_buffer_pool_config_set_rendered args = {
+ 		.opcode = CISP_OPCODE(CISP_CMD_CH_BUFFER_POOL_CONFIG_SET),
+ 		.chan = chan,
+-		.type = CISP_POOL_TYPE_RENDERED,
++		.type = isp->hw->scl1 ? CISP_POOL_TYPE_RENDERED_SCL1 :
++					CISP_POOL_TYPE_RENDERED,
+ 		.count = count,
+ 		.plane0_size = plane0_size,
+ 		.plane0_stride = plane0_stride,
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.h b/drivers/media/platform/apple/isp/isp-cmd.h
+index ab0c85023b..695c0a9f7a 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.h
++++ b/drivers/media/platform/apple/isp/isp-cmd.h
+@@ -197,15 +197,20 @@ struct cmd_set_dsid_clr_req_base {
+ } __packed;
+ static_assert(sizeof(struct cmd_set_dsid_clr_req_base) == 0x14);
+ 
+-/* H17: a count of broadcast-clear windows and the first window */
++/*
++ * H17: a count of broadcast-clear windows, their common range and the
++ * windows; the command carries only the @count windows.
++ */
++#define ISP_DSID_MULTI_BC_MAX 8
++
+ struct cmd_set_dsid_clr_multi_bc_reg_base {
+ 	u64 opcode;
+ 	u8 count;
+ 	u8 pad_9[3];
+ 	u32 dsid_clr_range;
+-	u64 dsid_clr_base;
++	u64 dsid_clr_base[ISP_DSID_MULTI_BC_MAX];
+ } __packed;
+-static_assert(sizeof(struct cmd_set_dsid_clr_multi_bc_reg_base) == 0x18);
++static_assert(sizeof(struct cmd_set_dsid_clr_multi_bc_reg_base) == 0x50);
+ 
+ struct cmd_pmp_ctrl_set {
+ 	u64 opcode;
+@@ -260,8 +265,8 @@ int isp_cmd_config_get(struct apple_isp *isp, struct cmd_config_get *args);
+ int isp_cmd_set_isp_pmu_base(struct apple_isp *isp, u64 pmu_base);
+ int isp_cmd_set_dsid_clr_req_base(struct apple_isp *isp, u64 dsid_clr_base,
+ 				  u32 dsid_clr_range);
+-int isp_cmd_set_dsid_clr_multi_bc(struct apple_isp *isp, u64 dsid_clr_base,
+-				  u32 dsid_clr_range);
++int isp_cmd_set_dsid_clr_multi_bc(struct apple_isp *isp, const u64 *bases,
++				  unsigned int count, u32 dsid_clr_range);
+ int isp_cmd_set_dsid_clr_req_base2(struct apple_isp *isp, u64 dsid_clr_base0,
+ 				   u64 dsid_clr_base1, u64 dsid_clr_base2,
+ 				   u64 dsid_clr_base3, u32 dsid_clr_range0,
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index 2cbdcd2fb0..2d954e864b 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -144,17 +144,44 @@ static int apple_isp_map_fw_mmio(struct apple_isp *isp)
+ 	return 0;
+ }
+ 
++/* The IOVA range of a memory-region, from its last iommu-addresses entry. */
++static int isp_of_region_iova(struct device *dev, const char *name,
++			      phys_addr_t *base, size_t *size)
++{
++	const __be32 *maps, *end;
++	int idx, len;
++
++	idx = of_property_match_string(dev->of_node, "memory-region-names",
++				       name);
++	if (idx < 0)
++		return -ENOENT;
++
++	struct device_node *np __free(device_node) =
++		of_parse_phandle(dev->of_node, "memory-region", idx);
++	if (!np)
++		return -ENODEV;
++
++	maps = of_get_property(np, "iommu-addresses", &len);
++	if (!maps || !len)
++		return -ENODEV;
++
++	end = maps + len / sizeof(__be32);
++
++	while (maps < end) {
++		maps++;
++		maps = of_translate_dma_region(dev->of_node, maps, base, size);
++	}
++
++	return 0;
++}
++
+ static int apple_isp_init_iommu(struct apple_isp *isp)
+ {
+ 	struct device *dev = isp->dev;
+-	phys_addr_t heap_base;
+-	size_t heap_size;
++	phys_addr_t heap_base, data_base;
++	size_t heap_size, data_size;
+ 	u64 vm_size;
+ 	int err;
+-	int idx;
+-	int size;
+-	struct device_node *mem_node;
+-	const __be32 *maps, *end;
+ 
+ 	isp->domain = iommu_get_domain_for_dev(isp->dev);
+ 	if (!isp->domain)
+@@ -162,30 +189,36 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
+ 	isp->shift = __ffs(isp->domain->pgsize_bitmap);
+ 	isp->fw_iova_mask = isp->hw->fw_iova_mask ?: U64_MAX;
+ 
+-	idx = of_property_match_string(dev->of_node, "memory-region-names",
+-				       "heap");
+-	mem_node = of_parse_phandle(dev->of_node, "memory-region", idx);
+-	if (!mem_node) {
+-		dev_err(dev, "No memory-region found for heap\n");
+-		return -ENODEV;
+-	}
+-
+-	maps = of_get_property(mem_node, "iommu-addresses", &size);
+-	if (!maps || !size) {
++	err = isp_of_region_iova(dev, "heap", &heap_base, &heap_size);
++	if (err) {
+ 		dev_err(dev, "No valid iommu-addresses found for heap\n");
+ 		return -ENODEV;
+ 	}
+ 
+-	end = maps + size / sizeof(__be32);
++	isp->fw.heap_base = heap_base;
++	isp->fw.heap_top = heap_base + heap_size;
+ 
+-	while (maps < end) {
+-		maps++;
+-		maps = of_translate_dma_region(dev->of_node, maps, &heap_base,
+-					       &heap_size);
++	/*
++	 * Where the bootloader loads the firmware's data, it backs the
++	 * firmware's main memory only up to the end of it. The rest, up to
++	 * the heap top, is the host's to back.
++	 */
++	err = isp_of_region_iova(dev, "data", &data_base, &data_size);
++	if (!err) {
++		isp->fw.data_top = data_base + data_size;
++		if (isp->fw.data_top <= isp->fw.heap_base ||
++		    isp->fw.data_top > isp->fw.heap_top ||
++		    !IS_ALIGNED(isp->fw.data_top, 1UL << isp->shift)) {
++			dev_err(dev, "data 0x%llx outside the heap 0x%llx-0x%llx\n",
++				isp->fw.data_top, isp->fw.heap_base,
++				isp->fw.heap_top);
++			return -EINVAL;
++		}
++	} else if (err != -ENOENT) {
++		dev_err(dev, "No valid iommu-addresses found for data\n");
++		return -ENODEV;
+ 	}
+ 
+-	isp->fw.heap_top = heap_base + heap_size;
+-
+ 	err = of_property_read_u64(dev->of_node, "apple,dart-vm-size",
+ 				   &vm_size);
+ 	if (err) {
+@@ -433,6 +466,9 @@ static int apple_isp_probe(struct platform_device *pdev)
+ 		dev_info(dev, "using temporal filter 0 on M3 Air firmware 14.7\n");
+ 		isp->temporal_filter = 0;
+ 	}
++	/* the sensor connection layout, for firmware that takes it at boot */
++	of_property_read_u32(dev->of_node, "apple,cam-connections-scheme",
++			     &isp->cam_connections_scheme);
+ 
+ 	err = apple_isp_init_presets(isp);
+ 	if (err) {
+@@ -801,6 +837,64 @@ static const struct apple_isp_hw apple_isp_hw_t8140 = {
+ 	.resident_fw = true,
+ };
+ 
++/* The same for T6040, from the J616s ADT's DART address filter. */
++static const struct isp_mmio_window apple_isp_fw_mmio_t6040[] = {
++	{ 0x220004000, 0x1d4000 },	/* DSID broadcast-clear windows */
++	{ 0x222004000, 0x1d4000 },
++	{ 0x224004000, 0x1d4000 },
++	{ 0x226004000, 0x1d4000 },
++	{ 0x485660000, 0x4000 },
++	{ 0x5003c0000, 0x28000 },	/* PMGR, with the PMP clock scratch */
++	{ 0x500e3c000, 0x4000 },
++	{ 0x502284000, 0x4000 },	/* PMGR, ISP power states */
++	{ 0x502880000, 0x8000 },
++	{ 0x504824000, 0x4000 },	/* PMP bandwidth scratch */
++	{ 0x51062c000, 0x20000 },
++};
++
++/*
++ * T6040 runs the same coprocessor and firmware interface as T8140, booted
++ * as macOS boots it on the J616s (macOS 26.6.2 camera log, kext register
++ * map) and as aurora's m1n1 proxy captures with it: no coprocessor reset,
++ * four broadcast-clear windows in eight slots, the scaler 1 output path and
++ * no capture metadata pool or watchdog.
++ */
++static const struct apple_isp_hw apple_isp_hw_t6040 = {
++	.gen = ISP_GEN_T6040,
++	.fw_abi = ISP_FW_ABI_H17,
++	.pmu_base = 0x0,
++
++	.dsid_count = 4,
++	.dsid_slots = 8,
++	.dsid_clr_base0 = 0x2201d4000,
++	.dsid_clr_base1 = 0x2221d4000,
++	.dsid_clr_base2 = 0x2241d4000,
++	.dsid_clr_base3 = 0x2261d4000,
++	.dsid_clr_range0 = 0x2fc,
++
++	/* the PMGR and PMP scratch words of the ISP's DAPF windows */
++	.clock_scratch = 0x5003d0fa8,
++	.clock_base = 0x0,
++	.clock_bit = 0x0,
++	.clock_size = 0x8,
++	.bandwidth_scratch = 0x504824000,
++	.bandwidth_base = 0x0,
++	.bandwidth_bit = 0x0,
++	.bandwidth_size = 0x8,
++	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
++
++	.scl1 = true,
++	.lpdp = false,
++	.meta_size = ISP_META_SIZE_T8140,
++	.fw_mmio = apple_isp_fw_mmio_t6040,
++	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t6040),
++
++	.coproc_control = ISP_COPROC_CONTROL_T8140,
++	.boot_mode = 1,
++	.shared_size = 0xde600000,
++	.resident_fw = true,
++};
++
+ static const struct of_device_id apple_isp_of_match[] = {
+ 	{ .compatible = "apple,t8103-isp", .data = &apple_isp_hw_t8103 },
+ 	{ .compatible = "apple,t8112-isp", .data = &apple_isp_hw_t8112 },
+@@ -810,6 +904,7 @@ static const struct of_device_id apple_isp_of_match[] = {
+ 	{ .compatible = "apple,t6030-isp", .data = &apple_isp_hw_t6030 },
+ 	{ .compatible = "apple,t6031-isp", .data = &apple_isp_hw_t6031 },
+ 	{ .compatible = "apple,t8140-isp", .data = &apple_isp_hw_t8140 },
++	{ .compatible = "apple,t6041-isp", .data = &apple_isp_hw_t6040 },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, apple_isp_of_match);
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 8f945c26f0..ed3e48eef5 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -51,6 +51,7 @@ enum isp_generation {
+ 	ISP_GEN_T8112,
+ 	ISP_GEN_T6031,
+ 	ISP_GEN_T8140,
++	ISP_GEN_T6040,
+ };
+ 
+ /*
+@@ -146,6 +147,8 @@ struct apple_isp_hw {
+ 	u64 pmu_base;
+ 
+ 	int dsid_count;
++	/* windows of the H17 multi broadcast-clear command, the unused all ones */
++	u8 dsid_slots;
+ 	u64 dsid_clr_base0;
+ 	u64 dsid_clr_base1;
+ 	u64 dsid_clr_base2;
+@@ -186,6 +189,9 @@ struct apple_isp_hw {
+ 	/* ISP_GPIO_6 boot mode */
+ 	u32 boot_mode;
+ 
++	/* shared memory size in the H16 boot descriptor, 0 for the T8140 one */
++	u64 shared_size;
++
+ 	/* size of a capture metadata buffer, 0 for no such pool */
+ 	u32 capture_meta_size;
+ 
+@@ -244,6 +250,7 @@ enum isp_sensor_id {
+ 	ISP_IMX814_2123_01,
+ 	ISP_IMX853_7622_01,
+ 	ISP_IMX913_7523_01,
++	ISP_IMX958_2224_01,
+ 	ISP_VD56G0_6221_01,
+ 	ISP_VD56G0_6222_01,
+ };
+@@ -264,6 +271,7 @@ struct apple_isp {
+ 	enum isp_firmware_version fw_compat;
+ 	u32 platform_id;
+ 	u32 temporal_filter;
++	u32 cam_connections_scheme;
+ 	struct isp_preset *presets;
+ 	int num_presets;
+ 
+@@ -306,7 +314,9 @@ struct apple_isp {
+ 	struct mutex iovad_lock;
+ 
+ 	struct isp_firmware {
++		u64 heap_base;
+ 		u64 heap_top;
++		u64 data_top; /* 0 unless the bootloader loads the data */
+ 	} fw;
+ 	/* changes under video_lock once the video device is registered */
+ 	enum isp_fw_state fw_state;
+@@ -314,6 +324,7 @@ struct apple_isp {
+ 	struct isp_surf *ipc_surf;
+ 	struct isp_surf *extra_surf;
+ 	struct isp_surf *data_surf;
++	struct isp_surf *main_tail_surf;
+ 	struct isp_surf *log_surf;
+ 	struct isp_surf *bt_surf;
+ 	struct isp_surf *meta_surfs[ISP_MAX_BUFFERS];
+diff --git a/drivers/media/platform/apple/isp/isp-fw.c b/drivers/media/platform/apple/isp/isp-fw.c
+index c96681173f..30ff704ef1 100644
+--- a/drivers/media/platform/apple/isp/isp-fw.c
++++ b/drivers/media/platform/apple/isp/isp-fw.c
+@@ -10,6 +10,7 @@
+ #include <linux/overflow.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/types.h>
++#include <linux/unaligned.h>
+ 
+ #include "isp-cam.h"
+ #include "isp-cmd.h"
+@@ -163,6 +164,7 @@ static_assert(sizeof(struct isp_firmware_bootargs) == 0x180);
+  */
+ #define ISP_H16_DESCRIPTOR_SIZE		0x200
+ #define ISP_H16_SHARED_SIZE		0xee000000ULL
++#define ISP_H16_DESC_CAM_SCHEME		0x60
+ #define ISP_H16_DESC_NO_OPTICAL_CARD_ID 0xb0
+ 
+ struct isp_firmware_bootargs_h16 {
+@@ -315,6 +317,31 @@ static int isp_reset_coproc_t8140(struct apple_isp *isp)
+ 	return 0;
+ }
+ 
++/*
++ * The T6040 firmware is started as the bootloader left it, without a reset:
++ * the coprocessor must never have run, and its reset vector must be the
++ * entry of the firmware text at the base of the heap region.
++ */
++static int isp_check_coproc_t6040(struct apple_isp *isp)
++{
++	u32 control = isp_coproc_read32(isp, isp_coproc_control(isp));
++	u64 rvbar = readq(isp->coproc + ISP_COPROC_RVBAR);
++
++	if (control) {
++		isp_err(isp, "coprocessor already started (control 0x%x)\n",
++			control);
++		return -EBUSY;
++	}
++
++	if (rvbar != (isp->fw.heap_base | 1)) {
++		isp_err(isp, "reset vector 0x%llx is not the firmware at 0x%llx\n",
++			rvbar, isp->fw.heap_base);
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
+ static int isp_reset_coproc(struct apple_isp *isp)
+ {
+ 	int retries;
+@@ -323,6 +350,8 @@ static int isp_reset_coproc(struct apple_isp *isp)
+ 
+ 	if (isp->hw->gen == ISP_GEN_T8140)
+ 		return isp_reset_coproc_t8140(isp);
++	if (isp->hw->gen == ISP_GEN_T6040)
++		return isp_check_coproc_t6040(isp);
+ 
+ 	isp_coproc_write32(isp, ISP_COPROC_EDPRCR, 0x2);
+ 
+@@ -377,8 +406,8 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
+ 	if (err < 0)
+ 		return err;
+ 
+-	/* ISP17a has no clock enable word */
+-	if (isp->hw->gen != ISP_GEN_T8140)
++	/* ISP17a and T6040 have no clock enable word */
++	if (isp->hw->gen != ISP_GEN_T8140 && isp->hw->gen != ISP_GEN_T6040)
+ 		isp_gpio_write32(isp, ISP_GPIO_CLOCK_EN, 0x1);
+ 
+ #if 0
+@@ -445,11 +474,27 @@ int apple_isp_alloc_firmware_surface(struct apple_isp *isp)
+ 	dev_dbg(isp->dev, "Data surface iova: 0x%llx\n",
+ 		(long long)isp->data_surf->iova);
+ 
++	/* Without it, the firmware faults on its first writes there. */
++	if (isp->fw.data_top && isp->fw.data_top < isp->fw.heap_top) {
++		isp->main_tail_surf =
++			isp_alloc_surface_at(isp, isp->fw.data_top,
++					     isp->fw.heap_top - isp->fw.data_top);
++		if (!isp->main_tail_surf) {
++			isp_err(isp, "failed to back main memory 0x%llx-0x%llx\n",
++				isp->fw.data_top, isp->fw.heap_top);
++			isp_free_surface(isp, isp->data_surf);
++			isp_free_surface(isp, isp->ipc_surf);
++			return -ENOMEM;
++		}
++	}
++
+ 	return 0;
+ }
+ 
+ void apple_isp_free_firmware_surface(struct apple_isp *isp)
+ {
++	if (isp->main_tail_surf)
++		isp_free_surface(isp, isp->main_tail_surf);
+ 	isp_free_surface(isp, isp->data_surf);
+ 	isp_free_surface(isp, isp->ipc_surf);
+ }
+@@ -491,12 +536,14 @@ static void isp_write_bootargs_h16(struct apple_isp *isp, void *virt,
+ 	memset(&args, 0, sizeof(args));
+ 	args.ipc_iova = isp->ipc_surf->iova;
+ 	args.shared_base = isp->fw.heap_top & 0xffffffff;
+-	args.shared_size = ISP_H16_SHARED_SIZE;
++	args.shared_size = isp->hw->shared_size ?: ISP_H16_SHARED_SIZE;
+ 	args.extra_iova = isp->extra_surf->iova;
+ 	args.extra_size = isp->extra_surf->size;
+ 	args.platform_id = isp->platform_id;
+ 	args.ipc_queue_size = (u64)args_offset + 1;
+ 	args.unk_68 = 0x40;
++	put_unaligned_le64(isp->cam_connections_scheme,
++			   &args.descriptor[ISP_H16_DESC_CAM_SCHEME]);
+ 	args.descriptor[ISP_H16_DESC_NO_OPTICAL_CARD_ID] = 1;
+ 	memcpy(virt, &args, sizeof(args));
+ }
+@@ -825,12 +872,26 @@ static int isp_set_dsid_clr(struct apple_isp *isp)
+ 	int err;
+ 
+ 	/*
+-	 * The H17 firmware takes no PMU base, and its single broadcast-clear
+-	 * window in the multi-window form.
++	 * The H17 firmware takes no PMU base, and its broadcast-clear windows
++	 * in the multi-window form.
+ 	 */
+-	if (hw->fw_abi == ISP_FW_ABI_H17)
+-		return isp_cmd_set_dsid_clr_multi_bc(isp, hw->dsid_clr_base0,
++	if (hw->fw_abi == ISP_FW_ABI_H17) {
++		const u64 used[] = { hw->dsid_clr_base0, hw->dsid_clr_base1,
++				     hw->dsid_clr_base2, hw->dsid_clr_base3 };
++		u64 bases[ISP_DSID_MULTI_BC_MAX];
++		unsigned int slots = max_t(unsigned int, hw->dsid_count,
++					   hw->dsid_slots);
++
++		if (WARN_ON(hw->dsid_count > ARRAY_SIZE(used) ||
++			    slots > ARRAY_SIZE(bases)))
++			return -EINVAL;
++
++		for (unsigned int i = 0; i < slots; i++)
++			bases[i] = i < hw->dsid_count ? used[i] : U64_MAX;
++
++		return isp_cmd_set_dsid_clr_multi_bc(isp, bases, slots,
+ 						     hw->dsid_clr_range0);
++	}
+ 
+ 	err = isp_cmd_set_isp_pmu_base(isp, hw->pmu_base);
+ 	if (err)
+diff --git a/drivers/media/platform/apple/isp/isp-iommu.c b/drivers/media/platform/apple/isp/isp-iommu.c
+index ade5a4a31f..8e77a71f93 100644
+--- a/drivers/media/platform/apple/isp/isp-iommu.c
++++ b/drivers/media/platform/apple/isp/isp-iommu.c
+@@ -218,6 +218,35 @@ struct isp_surf *isp_alloc_surface_vmap(struct apple_isp *isp, u64 size)
+ 	return surf;
+ }
+ 
++/* A surface at a fixed IOVA, outside the range the others come from. */
++struct isp_surf *isp_alloc_surface_at(struct apple_isp *isp, dma_addr_t iova,
++				      u64 size)
++{
++	struct isp_surf *surf;
++
++	surf = kzalloc_obj(*surf);
++	if (!surf)
++		return NULL;
++
++	__isp_surf_init(isp, surf, size, false);
++	surf->iova = iova;
++
++	if (isp_surf_alloc_pages(surf) < 0)
++		goto free_surf;
++
++	if (isp_surf_iommu_map(isp, surf) < 0)
++		goto free_pages;
++
++	refcount_set(&surf->refcount, 1);
++	return surf;
++
++free_pages:
++	isp_surf_free_pages(surf);
++free_surf:
++	kfree(surf);
++	return NULL;
++}
++
+ void isp_free_surface(struct apple_isp *isp, struct isp_surf *surf)
+ {
+ 	if (refcount_dec_and_test(&surf->refcount)) {
+diff --git a/drivers/media/platform/apple/isp/isp-iommu.h b/drivers/media/platform/apple/isp/isp-iommu.h
+index a7fce2713f..3a999a8c5b 100644
+--- a/drivers/media/platform/apple/isp/isp-iommu.h
++++ b/drivers/media/platform/apple/isp/isp-iommu.h
+@@ -10,6 +10,8 @@ struct isp_surf *__isp_alloc_surface(struct apple_isp *isp, u64 size, bool gc);
+ #define isp_alloc_surface(isp, size)	(__isp_alloc_surface(isp, size, false))
+ #define isp_alloc_surface_gc(isp, size) (__isp_alloc_surface(isp, size, true))
+ struct isp_surf *isp_alloc_surface_vmap(struct apple_isp *isp, u64 size);
++struct isp_surf *isp_alloc_surface_at(struct apple_isp *isp, dma_addr_t iova,
++				      u64 size);
+ int isp_surf_vmap(struct apple_isp *isp, struct isp_surf *surf);
+ void isp_free_surface(struct apple_isp *isp, struct isp_surf *surf);
+ void isp_free_released_surfaces(struct apple_isp *isp);

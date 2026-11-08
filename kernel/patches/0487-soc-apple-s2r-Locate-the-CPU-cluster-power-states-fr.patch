@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 02:38:52 +0000
+Subject: [PATCH] soc: apple: s2r: Locate the CPU cluster power states from the
+ device tree
+
+apple-s2r hard-codes the CPU cluster power state words at PMGR + 0x8000,
+the T6021 layout. On T8132 they are elsewhere: Aurora's recording of
+macOS's own suspend-to-RAM on a J713 (aura PR #109, sptm_virt_s2r)
+shows macOS arming the CPU complexes off at 0x380780000/4/8 and turning
+both clusters back on at 0x380780000/4 on wake, i.e. PMGR + 0x80000,
+not PMGR + 0x8000. On T8132, PMGR + 0x8000 is some other PMGR word, so
+the T6021 offset would write a target of 0 to an unrelated power state.
+
+Take the location from an optional apple,cluster-power-state = <&syscon offset>
+property. Keep PMGR + 0x8000 for T6021, and on every other SoC leave the
+CPU cluster step out until the device tree names the words. The J604 DT
+does not name them yet: the J713 address is a candidate to be checked on
+the J604 itself (read-only probe) before it goes into the DT.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ .../bindings/power/apple,pmgr-s2r.yaml        | 10 +++++
+ drivers/soc/apple/apple-s2r.c                 | 41 +++++++++++++++----
+ 2 files changed, 43 insertions(+), 8 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/power/apple,pmgr-s2r.yaml b/Documentation/devicetree/bindings/power/apple,pmgr-s2r.yaml
+index 16b9697c45..902797dd78 100644
+--- a/Documentation/devicetree/bindings/power/apple,pmgr-s2r.yaml
++++ b/Documentation/devicetree/bindings/power/apple,pmgr-s2r.yaml
+@@ -69,6 +69,16 @@ properties:
+     description:
+       Physical SoC cluster IDs of the CPU clusters, in power-down order
+ 
++  apple,cluster-power-state:
++    $ref: /schemas/types.yaml#/definitions/phandle-array
++    items:
++      - items:
++          - description: syscon holding the CPU cluster power state words
++          - description: offset of cluster 0's word; cluster N is at +4 * N
++    description:
++      Where the CPU cluster power states are. Without it, T6021 uses
++      PMGR + 0x8000 and other SoCs leave the CPU cluster power-down out.
++
+   apple,sep-domain:
+     $ref: /schemas/types.yaml#/definitions/phandle
+     description: SEP power state node, forced back on after wake
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index a7d4290497..2cde5a1cb5 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -72,7 +72,8 @@
+ #define S2R_POLL_TIMEOUT_US	8000
+ 
+ /* SoC cluster power control, in the PMGR syscon */
+-#define CLUSTER_PS(phys)	(0x8000 + 4 * (phys))
++#define CLUSTER_PS_T6021	0x8000
++#define CLUSTER_PS(s2r, phys)	((s2r)->cluster_ps_base + 4 * (phys))
+ #define CLUSTER_PS_TARGET	GENMASK(3, 0)
+ #define CLUSTER_PS_BUSY		BIT(4)
+ #define CLUSTER_PS_ON		0xf
+@@ -174,6 +175,9 @@ static const char *const apple_s2r_step_names[] = {
+ struct apple_s2r {
+ 	struct device *dev;
+ 	struct regmap *pmgr;
++	/* CPU cluster power states; NULL leaves the CPU cluster step out */
++	struct regmap *cluster_ps;
++	u32 cluster_ps_base;
+ 	struct regmap *sep;
+ 	u32 sep_reg;
+ 	void __iomem *clkgen;
+@@ -252,12 +256,12 @@ static void apple_s2r_cpu_clusters_off(struct apple_s2r *s2r)
+ 	 * cores are in a non-retention WFI, the boot CPU's own cluster last.
+ 	 */
+ 	for (i = 0; i < s2r->nr_cpu_clusters; i++) {
+-		u32 reg = CLUSTER_PS(s2r->cpu_clusters[i]);
++		u32 reg = CLUSTER_PS(s2r, s2r->cpu_clusters[i]);
+ 		u32 val;
+ 
+-		regmap_read(s2r->pmgr, reg, &val);
++		regmap_read(s2r->cluster_ps, reg, &val);
+ 		s2r->cpu_cluster_saved[i] = FIELD_GET(CLUSTER_PS_TARGET, val);
+-		regmap_write(s2r->pmgr, reg, val & ~CLUSTER_PS_TARGET);
++		regmap_write(s2r->cluster_ps, reg, val & ~CLUSTER_PS_TARGET);
+ 	}
+ }
+ 
+@@ -266,18 +270,18 @@ static void apple_s2r_cpu_clusters_restore(struct apple_s2r *s2r)
+ 	int i;
+ 
+ 	for (i = s2r->nr_cpu_clusters - 1; i >= 0; i--) {
+-		u32 reg = CLUSTER_PS(s2r->cpu_clusters[i]);
++		u32 reg = CLUSTER_PS(s2r, s2r->cpu_clusters[i]);
+ 		u32 target = s2r->cpu_cluster_saved[i];
+ 		u32 val;
+ 
+-		regmap_update_bits(s2r->pmgr, reg, CLUSTER_PS_TARGET,
++		regmap_update_bits(s2r->cluster_ps, reg, CLUSTER_PS_TARGET,
+ 				   FIELD_PREP(CLUSTER_PS_TARGET, target));
+ 		if (!target)
+ 			continue;
+ 		if (read_poll_timeout_atomic(apple_s2r_regmap_read, val,
+ 					     !(val & CLUSTER_PS_BUSY), 1,
+ 					     S2R_POLL_TIMEOUT_US, false,
+-					     s2r->pmgr, reg))
++					     s2r->cluster_ps, reg))
+ 			s2r->restore_ret = -ETIMEDOUT;
+ 	}
+ }
+@@ -436,7 +440,7 @@ static int apple_s2r_enter(suspend_state_t state)
+ 	if (ret)
+ 		goto fail;
+ 
+-	if (!(skip & S2R_DONE_CPU_CLUSTERS)) {
++	if (s2r->cluster_ps && !(skip & S2R_DONE_CPU_CLUSTERS)) {
+ 		s2r->done |= S2R_DONE_CPU_CLUSTERS;
+ 		apple_s2r_cpu_clusters_off(s2r);
+ 	}
+@@ -604,6 +608,7 @@ static int apple_s2r_probe(struct platform_device *pdev)
+ 	struct device *dev = &pdev->dev;
+ 	struct device_node *np = dev->of_node;
+ 	struct device_node *sep_np;
++	struct of_phandle_args args;
+ 	struct apple_s2r *s2r;
+ 	u64 mailbox;
+ 	int ret;
+@@ -654,6 +659,26 @@ static int apple_s2r_probe(struct platform_device *pdev)
+ 	if (IS_ERR(s2r->pmgr))
+ 		return dev_err_probe(dev, PTR_ERR(s2r->pmgr), "no PMGR syscon\n");
+ 
++	/*
++	 * Where the CPU cluster power states are: apple,cluster-power-state, or on
++	 * T6021 PMGR + 0x8000. Elsewhere (T8132) the step is left out until the
++	 * device tree names them, so no guessed PMGR word is ever written.
++	 */
++	ret = of_parse_phandle_with_fixed_args(np, "apple,cluster-power-state", 1, 0, &args);
++	if (!ret) {
++		s2r->cluster_ps = syscon_node_to_regmap(args.np);
++		s2r->cluster_ps_base = args.args[0];
++		of_node_put(args.np);
++		if (IS_ERR(s2r->cluster_ps))
++			return dev_err_probe(dev, PTR_ERR(s2r->cluster_ps),
++					     "bad apple,cluster-power-state\n");
++	} else if (of_device_is_compatible(np, "apple,t6021-pmgr-s2r")) {
++		s2r->cluster_ps = s2r->pmgr;
++		s2r->cluster_ps_base = CLUSTER_PS_T6021;
++	} else {
++		dev_warn(dev, "no apple,cluster-power-state: CPU cluster power-down left out\n");
++	}
++
+ 	ret = of_property_read_variable_u32_array(np, "apple,cpu-clusters",
+ 						  s2r->cpu_clusters, 1,
+ 						  S2R_MAX_CLUSTERS);

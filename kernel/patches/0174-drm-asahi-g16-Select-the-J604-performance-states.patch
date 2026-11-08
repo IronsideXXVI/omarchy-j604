@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 4 Nov 2026 20:29:28 -0600
+Subject: [PATCH] drm/asahi: g16: Select the J604 performance states
+
+The G16 firmware takes ten DVFS rows, each a main and an auxiliary
+frequency at one voltage, chosen from the sixteen states of the
+machine's original ADT. The selection is J713's: four common low
+states, then six equal-voltage pairs (4, 5) to (14, 15).
+
+The J604's 25G83 table has the same sixteen states but its pairs sit one
+state higher, (5, 6) to (13, 14); state 4 and the top state 15 are
+unpaired. The J713 selection rejects it at row 4 (952 MHz at 780 mV
+paired with 928 MHz at 725 mV), so the probe would fail before anything
+is published.
+
+Make the selection a per-board layout and add the J604's: the four
+common low states, the five pairs, and the top state as its own row
+with main = auxiliary, as the low rows are. State 4 (928 MHz) is the
+one left out, so the J604 keeps its 1578 MHz top state. The J604 table
+then passes Performance::valid() (frequencies and auxiliaries strictly
+increasing, voltages non-decreasing, SRAM at or above core).
+
+The values still come from the machine's own ADT; only the indices are
+per board. The J713 layout is unchanged.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/gpu/drm/asahi/g16/board.rs      | 10 ++++++--
+ drivers/gpu/drm/asahi/g16/board/data.rs | 31 ++++++++++++++++++++-----
+ 2 files changed, 33 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/board.rs b/drivers/gpu/drm/asahi/g16/board.rs
+index 0ee62758e8..6ca9d8da71 100644
+--- a/drivers/gpu/drm/asahi/g16/board.rs
++++ b/drivers/gpu/drm/asahi/g16/board.rs
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ 
+-//! J713 board admission for the qualified M4 firmware graph.
++//! J713 and J604 board admission for the qualified M4 firmware graph.
+ //!
+ //! M4 uses ten firmware rows selected from sixteen source states, including off, and sixteen
+ //! voltage lanes. The source values belong to this machine's preserved original ADT.
+@@ -8,13 +8,19 @@
+ pub(crate) mod data;
+ 
+ use super::adt::GpuAdt;
++use super::boot::glue;
+ use super::fw::initdata::{Performance, PERF_STATES};
+ use kernel::{device, prelude::*};
+ 
+ /// Admit the qualified table layout while preserving every machine-specific source value.
+ /// Differently shaped tables and inconsistent voltage pairs fail before publication.
+ pub(crate) fn qualify(dev: &device::Device, adt: &GpuAdt) -> Result<Performance> {
+-    let performance = data::select(&adt.performance).map_err(|error| {
++    let layout = if glue::j604_board() {
++        &data::J604
++    } else {
++        &data::J713
++    };
++    let performance = data::select(&adt.performance, layout).map_err(|error| {
+         dev_err!(
+             dev,
+             "M4 original ADT performance layout rejected: {:?}\n",
+diff --git a/drivers/gpu/drm/asahi/g16/board/data.rs b/drivers/gpu/drm/asahi/g16/board/data.rs
+index a67dfa3a77..acfb2877c3 100644
+--- a/drivers/gpu/drm/asahi/g16/board/data.rs
++++ b/drivers/gpu/drm/asahi/g16/board/data.rs
+@@ -1,19 +1,38 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ 
+-//! Qualified J713/25G83 selection of the original ADT's sixteen performance states.
++//! Qualified 25G83 selections of the original ADT's sixteen performance states.
+ //!
+-//! Four common low states are followed by six equal-voltage pairs. These are indices into
+-//! the machine's original ADT, not frequencies or voltages copied from a reference machine.
++//! J713: four common low states are followed by six equal-voltage pairs.
++//! J604: its equal-voltage pairs sit one state higher, (5, 6) to (13, 14), with 4 and the top
++//! state 15 unpaired. Its ten rows are the four common low states, the five pairs and the top
++//! state on its own, as the low rows are; state 4 is the one left out.
++//! These are indices into the machine's original ADT, not frequencies or voltages copied from
++//! a reference machine.
+ 
+ pub(crate) const SOURCE_STATES: usize = 16;
+-pub(crate) const MAIN: [usize; 10] = [0, 1, 2, 3, 5, 7, 9, 11, 13, 15];
+-pub(crate) const AUXILIARY: [usize; 10] = [0, 1, 2, 3, 4, 6, 8, 10, 12, 14];
++
++/// One board's choice of ten firmware rows among the sixteen source states.
++pub(crate) struct Layout {
++    pub(crate) main: [usize; 10],
++    pub(crate) auxiliary: [usize; 10],
++}
++
++pub(crate) const J713: Layout = Layout {
++    main: [0, 1, 2, 3, 5, 7, 9, 11, 13, 15],
++    auxiliary: [0, 1, 2, 3, 4, 6, 8, 10, 12, 14],
++};
++
++pub(crate) const J604: Layout = Layout {
++    main: [0, 1, 2, 3, 6, 8, 10, 12, 14, 15],
++    auxiliary: [0, 1, 2, 3, 5, 7, 9, 11, 13, 15],
++};
+ 
+ use super::super::fw::initdata::{Performance, PERF_STATES};
+ 
+ /// Allocation-free selection, also exercised directly by the host-side source-data tests.
+ pub(crate) fn select(
+     source: &super::super::adt::perf::Source,
++    layout: &Layout,
+ ) -> core::result::Result<Performance, super::super::adt::perf::Error> {
+     use super::super::adt::perf::Error;
+     if source.count != SOURCE_STATES {
+@@ -26,7 +45,7 @@ pub(crate) fn select(
+         sram: [0; PERF_STATES],
+     };
+     for i in 0..PERF_STATES {
+-        let (main, aux) = (MAIN[i], AUXILIARY[i]);
++        let (main, aux) = (layout.main[i], layout.auxiliary[i]);
+         if source.frequency_mhz[main] != source.sram_frequency_mhz[main]
+             || source.frequency_mhz[aux] != source.sram_frequency_mhz[aux]
+             || source.core_mv[main] != source.core_mv[aux]

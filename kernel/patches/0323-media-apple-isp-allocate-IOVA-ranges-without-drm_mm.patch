@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Fri, 30 Oct 2026 02:34:36 +0000
+Subject: [PATCH] media: apple: isp: allocate IOVA ranges without drm_mm
+
+The driver hands out its IOVA ranges with drm_mm, which is part of the
+DRM core, but VIDEO_APPLE_ISP does not depend on DRM. With DRM=n, or
+with DRM=m and the ISP built in, the drm_mm symbols are missing and the
+build fails at link time. A V4L2 camera driver should not need the DRM
+core for this.
+
+Track the ranges in a maple tree with MT_FLAGS_ALLOC_RANGE instead,
+indexed in IOMMU pages, and store the owning surface as the entry.
+mtree_alloc_range() returns the lowest free range, the bottom-up order
+the old comment asked for, and the tree has its own lock, so iovad_lock
+goes away. The range and the page granule are unchanged.
+
+The Kconfig entry also selects APPLE_PMP_REPORT, which depends on PM.
+Depend on PM so the select cannot leave that dependency unmet.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(cherry picked from commit f72960557264ac5760d16f11b4fe61bff3a8a0d2)
+---
+ drivers/media/platform/apple/isp/Kconfig     |  1 +
+ drivers/media/platform/apple/isp/isp-drv.c   |  8 ++--
+ drivers/media/platform/apple/isp/isp-drv.h   | 10 ++---
+ drivers/media/platform/apple/isp/isp-iommu.c | 42 +++++++++-----------
+ 4 files changed, 28 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/Kconfig b/drivers/media/platform/apple/isp/Kconfig
+index 7a797a1a7e..64f84a2471 100644
+--- a/drivers/media/platform/apple/isp/Kconfig
++++ b/drivers/media/platform/apple/isp/Kconfig
+@@ -8,6 +8,7 @@ config VIDEO_APPLE_ISP
+ 	select APPLE_PMP_REPORT
+ 	depends on ARCH_APPLE || COMPILE_TEST
+ 	depends on OF_ADDRESS
++	depends on PM
+ 	depends on V4L_PLATFORM_DRIVERS
+ 	depends on VIDEO_DEV
+ 	help
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index 1f2dfbfa9a..6726a2398c 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -230,11 +230,11 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
+ 
+ 	// FIXME: refactor this, maybe use regular iova stuff?
+ 	isp->iova_size = vm_size - (heap_base & 0xffffffff);
+-	drm_mm_init(&isp->iovad, isp->fw.heap_top, isp->iova_size);
++	mt_init_flags(&isp->iovas, MT_FLAGS_ALLOC_RANGE);
+ 
+ 	err = apple_isp_map_fw_mmio(isp);
+ 	if (err) {
+-		drm_mm_takedown(&isp->iovad);
++		mtree_destroy(&isp->iovas);
+ 		return err;
+ 	}
+ 
+@@ -244,7 +244,8 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
+ static void apple_isp_free_iommu(struct apple_isp *isp)
+ {
+ 	apple_isp_unmap_fw_mmio(isp, isp->hw->num_fw_mmio);
+-	drm_mm_takedown(&isp->iovad);
++	WARN_ON(!mtree_empty(&isp->iovas));
++	mtree_destroy(&isp->iovas);
+ }
+ 
+ static int isp_of_read_coord(struct device *dev, struct device_node *np,
+@@ -541,7 +542,6 @@ static int apple_isp_probe(struct platform_device *pdev)
+ 		goto detach_genpd;
+ 	}
+ 
+-	mutex_init(&isp->iovad_lock);
+ 	mutex_init(&isp->video_lock);
+ 	spin_lock_init(&isp->buf_lock);
+ 	init_waitqueue_head(&isp->wait);
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index dbe6b6ed5a..34560fe986 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -6,11 +6,11 @@
+ 
+ #include <linux/hrtimer.h>
+ #include <linux/list.h>
++#include <linux/maple_tree.h>
+ #include <linux/mutex.h>
+ #include <linux/types.h>
+ #include <linux/spinlock.h>
+ 
+-#include <drm/drm_mm.h>
+ #include <media/v4l2-ctrls.h>
+ #include <media/v4l2-device.h>
+ #include <media/videobuf2-core.h>
+@@ -82,7 +82,6 @@ enum isp_firmware_version {
+ };
+ 
+ struct isp_surf {
+-	struct drm_mm_node *mm;
+ 	struct list_head head;
+ 	u64 size;
+ 	u64 type;
+@@ -94,6 +93,7 @@ struct isp_surf {
+ 	refcount_t refcount;
+ 	bool gc;
+ 	bool submitted;
++	bool iova_reserved; /* @iova comes from &apple_isp.iovas */
+ };
+ 
+ struct isp_message {
+@@ -325,10 +325,10 @@ struct apple_isp {
+ 
+ 	struct iommu_domain *domain;
+ 	unsigned long shift;
+-	struct drm_mm iovad; /* TODO iova.c can't allocate bottom-up */
+-	u64 iova_size; /* size of the iovad range */
++	/* allocated IOVA ranges, in IOMMU pages, lowest free range first */
++	struct maple_tree iovas;
++	u64 iova_size; /* size of the range @iovas allocates from */
+ 	u64 fw_iova_mask; /* see isp_fw_iova() */
+-	struct mutex iovad_lock;
+ 
+ 	struct isp_firmware {
+ 		u64 heap_base;
+diff --git a/drivers/media/platform/apple/isp/isp-iommu.c b/drivers/media/platform/apple/isp/isp-iommu.c
+index 8e77a71f93..12dbf6d47c 100644
+--- a/drivers/media/platform/apple/isp/isp-iommu.c
++++ b/drivers/media/platform/apple/isp/isp-iommu.c
+@@ -56,41 +56,35 @@ static void isp_surf_vunmap(struct apple_isp *isp, struct isp_surf *surf)
+ static void isp_surf_unreserve_iova(struct apple_isp *isp,
+ 				    struct isp_surf *surf)
+ {
+-	if (surf->mm) {
+-		mutex_lock(&isp->iovad_lock);
+-		drm_mm_remove_node(surf->mm);
+-		mutex_unlock(&isp->iovad_lock);
+-		kfree(surf->mm);
+-	}
+-	surf->mm = NULL;
++	if (surf->iova_reserved)
++		mtree_erase(&isp->iovas, surf->iova >> isp->shift);
++	surf->iova_reserved = false;
+ }
+ 
++/*
++ * The IOVA range starts at the top of the firmware heap. Hand out the lowest
++ * free range of whole IOMMU pages above it.
++ */
+ static int isp_surf_reserve_iova(struct apple_isp *isp, struct isp_surf *surf)
+ {
++	unsigned long first = DIV_ROUND_UP_ULL(isp->fw.heap_top, 1ULL << isp->shift);
++	unsigned long last = ((isp->fw.heap_top + isp->iova_size) >> isp->shift) - 1;
++	unsigned long pages = DIV_ROUND_UP_ULL(surf->size, 1ULL << isp->shift);
++	unsigned long index;
+ 	int err;
+ 
+-	surf->mm = kzalloc(sizeof(*surf->mm), GFP_KERNEL);
+-	if (!surf->mm)
+-		return -ENOMEM;
+-
+-	mutex_lock(&isp->iovad_lock);
+-	err = drm_mm_insert_node_generic(&isp->iovad, surf->mm,
+-					 ALIGN(surf->size, 1UL << isp->shift),
+-					 1UL << isp->shift, 0, 0);
+-	mutex_unlock(&isp->iovad_lock);
++	err = mtree_alloc_range(&isp->iovas, &index, surf, pages, first, last,
++				GFP_KERNEL);
+ 	if (err < 0) {
+ 		dev_err(isp->dev, "failed to reserve 0x%llx of iova space\n",
+ 			surf->size);
+-		goto mm_free;
++		return err;
+ 	}
+ 
+-	surf->iova = surf->mm->start;
++	surf->iova = (dma_addr_t)index << isp->shift;
++	surf->iova_reserved = true;
+ 
+ 	return 0;
+-mm_free:
+-	kfree(surf->mm);
+-	surf->mm = NULL;
+-	return err;
+ }
+ 
+ static void isp_surf_iommu_unmap(struct apple_isp *isp, struct isp_surf *surf)
+@@ -129,7 +123,7 @@ static int isp_surf_iommu_map(struct apple_isp *isp, struct isp_surf *surf)
+ static void __isp_surf_init(struct apple_isp *isp, struct isp_surf *surf,
+ 			    u64 size, bool gc)
+ {
+-	surf->mm = NULL;
++	surf->iova_reserved = false;
+ 	surf->virt = NULL;
+ 	surf->size = ALIGN(size, 1UL << isp->shift);
+ 	surf->num_pages = surf->size >> isp->shift;
+@@ -291,7 +285,7 @@ int apple_isp_iommu_map_sgt(struct apple_isp *isp, struct isp_surf *surf,
+ 	ssize_t mapped;
+ 
+ 	// TODO userptr sends unaligned sizes
+-	surf->mm = NULL;
++	surf->iova_reserved = false;
+ 	surf->size = size;
+ 
+ 	err = isp_surf_reserve_iova(isp, surf);

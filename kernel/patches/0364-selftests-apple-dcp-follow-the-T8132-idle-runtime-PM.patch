@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Wed, 28 Oct 2026 11:23:28 +1100
+Subject: [PATCH] selftests: apple-dcp: follow the T8132 idle runtime PM
+
+The J713 idle power-down wraps the ATC mux callback in atcphy_rpm_get()
+and atcphy_rpm_put(), brings a USB2-only PHY back through
+atcphy_setup_pipehandler() after its domain was off, and gives the
+dwc3-apple glue a pre_core_rpm flag.
+
+Extract the production runtime PM wrappers next to the mux callback,
+and atcphy_setup_pipehandler() where the restore calls it, and add the
+idle_rpm, rpm_held and pre_core_rpm fields to the fixture structs. The
+fixture PHYs and controllers are not T8132, so all three stay false: a
+PHY runtime PM call would trip the existing root-port mocks or the new
+pm_runtime_get_noresume() stub. No assertion changes.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(backported from commit 94921e7f184bbd3291844583f181af0b86ed28d0)
+[j604: on the 1.607 harness, whose dwc3_apple fixture has neither
+ shutting_down nor host_only and whose lifecycle.py does not import
+ firmware_lineage: the fixture gets the idle_rpm, rpm_held and
+ pre_core_rpm fields the T8132 glue of this branch has, and lifecycle.py
+ imports atc_restore_helpers next to the base list. With it the apple-dcp
+ host suite reads 27 ok / 30 not ok, as on the base (without it 19 / 38).]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ .../selftests/drivers/gpu/apple-dcp/common.py   | 17 +++++++++++++++++
+ .../drivers/gpu/apple-dcp/dwc3/mocks.c          |  2 ++
+ .../drivers/gpu/apple-dcp/lifecycle.py          |  6 +++++-
+ .../selftests/drivers/gpu/apple-dcp/phy.py      |  5 ++++-
+ .../selftests/drivers/gpu/apple-dcp/pm.py       |  6 +++++-
+ .../drivers/gpu/apple-dcp/teardown_pm.py        |  3 ++-
+ 6 files changed, 35 insertions(+), 4 deletions(-)
+
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/common.py b/tools/testing/selftests/drivers/gpu/apple-dcp/common.py
+index 4097d7db7d..48a0edadbe 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/common.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/common.py
+@@ -109,6 +109,23 @@ def atc_function(source, name):
+     return block(source, marker.start()) + '\n' if marker else ''
+ 
+ 
++# The runtime PM wrappers of a PHY that powers down while idle (T8132 idle_power_off).
++# Fixture PHYs leave idle_rpm false, so the wrappers must not reach runtime PM; older
++# sources have none and atc_function() then yields ''.
++ATC_RPM = ('atcphy_rpm_get', 'atcphy_rpm_busy', 'atcphy_rpm_sync', 'atcphy_rpm_put')
++
++
++def atc_restore_helpers(source):
++    """What atcphy_restore_after_pd_off() needs beyond the parking helpers.
++
++    With T8132 idle runtime PM a USB2-only PHY is brought back as at probe, through
++    atcphy_setup_pipehandler(); older sources only park the PIPE. '' when unused.
++    """
++    if 'atcphy_setup_pipehandler(' not in atc_function(source, 'atcphy_restore_after_pd_off'):
++        return ''
++    return atc_function(source, 'atcphy_setup_pipehandler')
++
++
+ def atc_mux_without_pm(source):
+     """Lane/teardown fixtures omit USB PM, keeping mode mapping and lane work real.
+ 
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c b/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c
+index 10d238b922..29006a4c34 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c
+@@ -77,6 +77,8 @@ struct dwc3_apple {
+ 	void *dev;
+ 	struct phy *usb2_phy, *usb3_phy;
+ 	bool fixed_hub, core_active, core_exit_pending, reset_pending;
++	/* T8132 only: runtime PM of an idle controller; never set here. */
++	bool idle_rpm, rpm_held, pre_core_rpm;
+ 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
+ };
+ static unsigned int polls, fail_poll, reset_calls, reset_writes, core_writes;
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/lifecycle.py b/tools/testing/selftests/drivers/gpu/apple-dcp/lifecycle.py
+index 96fd0b5dce..ca30ad95a7 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/lifecycle.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/lifecycle.py
+@@ -3,7 +3,7 @@
+ """Actual disconnect authority, DWC3 teardown and firmware resource admission."""
+ from pathlib import Path
+ import re
+-from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header
++from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header, atc_restore_helpers
+ 
+ def disconnect(root):
+     # Copyright 2026 Ryan Murray
+@@ -1045,6 +1045,10 @@ def teardown(root):
+                      'dwc3_core_exit_after_phy_power_off', 'dwc3_core_exit',
+                      'dwc3_core_remove_common', 'dwc3_core_remove', 'dwc3_core_remove_no_shutdown')
+     names['atc'] += ('atcphy_dwc3_reset_deassert',)
++    if atc_restore_helpers(files['atc']):
++        # A USB2-only PHY is brought back as at probe after its domain was off.
++        at = names['atc'].index('atcphy_restore_after_pd_off')
++        names['atc'] = names['atc'][:at] + ('atcphy_setup_pipehandler',) + names['atc'][at:]
+     names['atc'] = tuple(name for name in names['atc'] if name not in ('atcphy_get_mode_config', 'j700_field_update'))
+     names = {n: tuple(name for name in group if re.search(r'^(?:static [^\n]*\b|(?:int|void) )' + name + r'\(', files[n], re.M))
+              for n, group in names.items()}
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/phy.py b/tools/testing/selftests/drivers/gpu/apple-dcp/phy.py
+index 18bc3c78c9..9235010f2b 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/phy.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/phy.py
+@@ -4,7 +4,7 @@
+ from pathlib import Path
+ import re
+ from common import (block, source_defines, atc_mux_without_pm, ATC_POST_TUNABLE,
+-                    atc_function, ATC_SPLIT, ATC_T8103_LIVE)
++                    atc_function, ATC_SPLIT, ATC_T8103_LIVE, atc_restore_helpers)
+ 
+ def parking(root):
+ 
+@@ -47,6 +47,8 @@ struct apple_atcphy {
+     bool usb3_port_off, park_owed;
+     bool t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround;
+     bool dp_only, pd_was_off, tunnel_clock_on;
++    /* T8132 idle runtime PM; these PHYs never power down while idle. */
++    bool idle_rpm, rpm_held;
+     unsigned int tunnel_rate, tunnel_users;
+     struct { bool aux, pll; unsigned int pairs, rate; } dp_t8122;
+     enum atcphy_mode mode, typec_mode;
+@@ -166,6 +168,7 @@ static int atcphy_configure(struct apple_atcphy *, enum atcphy_mode);
+     for name in ('core_read32', 'atcphy_get_mode_config', 'j700_field_update', 'j700_pma_idle'):
+         parts.append(function(atc, name))
+     parts.append(dp)
++    parts.append(atc_restore_helpers(atc))
+     for name in ('atcphy_configure_lanes', 'j700_aux_enable', 'j700_aux_disable',
+                  'atcphy_enable_dp_aux', 'atcphy_disable_dp_aux', 'atcphy_power_off',
+                  'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_set_orientation',
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/pm.py b/tools/testing/selftests/drivers/gpu/apple-dcp/pm.py
+index 189f1e678d..3872506124 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/pm.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/pm.py
+@@ -4,7 +4,7 @@
+ from pathlib import Path
+ import os, re, subprocess
+ import phy
+-from common import block, tipd_pm_header, atc_function
++from common import block, tipd_pm_header, atc_function, ATC_RPM
+ 
+ def ownership(root, usb_unreachable=False):
+     ns=phy.parking(root)
+@@ -171,6 +171,8 @@ static void usb_mark_last_busy(struct usb_device *u) {
+  assert(root_locked&&!pm_phy->lock);
+  if(u==&link_device)assert(link_locked);else assert(u==&roots[3]&&!link_locked);
+ }
++/* Only an idle-power-off PHY takes a hold of its own; the fixture PHY never does. */
++static void __attribute__((unused)) pm_runtime_get_noresume(struct device *d) { (void)d; assert(!"PHY runtime PM hold"); }
+ static void pm_runtime_put_autosuspend(struct device *d) {
+  assert(root_locked&&!pm_phy->lock);
+  if(d==&link_device.dev){assert(link_locked&&link_pm_refs==1);link_pm_refs--;}
+@@ -428,6 +430,8 @@ int main(void)
+        ('atcphy_park_retry_delay','atcphy_park_retry','atcphy_park_due','atcphy_mux_change'))
+      helpers+=ns['function'](s,'atcphy_mux_update')+'\n'
+      # Lane fixtures provide the target mapping and locked body; use the real callback here.
++     # The mux callback powers an idle-power-off PHY first; this PHY is not one.
++     helpers+=''.join(atc_function(s,name) for name in ATC_RPM)
+      marker=re.search(r'^static int atcphy_mux_set\(',s,re.M).group()
+      helpers+=ns['block'](s,marker)+'\n'
+     else:
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/teardown_pm.py b/tools/testing/selftests/drivers/gpu/apple-dcp/teardown_pm.py
+index b4a4b18a8f..7381092399 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/teardown_pm.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/teardown_pm.py
+@@ -94,7 +94,8 @@ static struct xhci_hcd xhci_context;
+ #define hcd_to_xhci(h) (&xhci_context)
+ struct dwc3 { bool sys_wakeup; struct platform_device *xhci; };
+ enum { DWC3_APPLE_PROBE_PENDING, DWC3_APPLE_NO_CABLE, DWC3_APPLE_HOST, DWC3_APPLE_DEVICE };
+-struct dwc3_apple { struct dwc3 dwc; struct device *dev; int lock,state; void *role_sw; };
++/* pre_core_rpm is T8132 only: runtime PM before the first core probe; never set here. */
++struct dwc3_apple { struct dwc3 dwc; struct device *dev; int lock,state; void *role_sw; bool pre_core_rpm; };
+ static struct dwc3_apple apple_context;
+ #define to_dwc3_apple(d) container_of(d,struct dwc3_apple,dwc)
+ static bool inside_host_remove;

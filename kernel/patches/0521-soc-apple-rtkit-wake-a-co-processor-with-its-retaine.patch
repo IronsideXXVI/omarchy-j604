@@ -1,0 +1,666 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bartosz Nitka <niteria@gmail.com>
+Date: Fri, 6 Nov 2026 18:37:47 +0100
+Subject: [PATCH] soc: apple: rtkit: wake a co-processor with its retained
+ session
+
+apple_rtkit_idle() leaves a co-processor's firmware, endpoints and shared
+buffers in place, but waking it again goes through INIT and starts the
+system endpoints anew. The J713 DCP is to stop its CPU after the idle
+handshake, power its domains down and start the CPU again later. Its
+firmware then says HELLO by itself, and macOS answers the endpoint map
+with the endpoints that are still running, without INIT and without
+starting any endpoint.
+
+Add apple_rtkit_wake_retained(). From the idle state, with RX held by the
+caller since the idle, it restores the mailbox (apple_mbox_restore(), as
+its power domain may have been off), resumes RX and lets the caller start
+the CPU. While it runs, the endpoint map is answered with the endpoints
+started in this session, which RTKit now records, and nothing is started
+again; a started endpoint missing from the map fails the wake. A
+co-processor that first reports QUIESCED gets one ON request, any other
+IOP state before ON fails the wake. The usual boot wait then requires IOP
+ON and requests AP ON. Nothing is allocated, freed or reinitialized.
+
+A signal to the caller does not interrupt the wake's waits: the CPU is
+running by then, and nothing would undo that. An unexpected IOP state
+ends whichever wait the wake is in, the map or IOP ON after it. A last
+map part cannot echo endpoint 32 * base, as bit 0 of the reply is also
+MORE: such a wake fails. The DCP's map has two parts, with its endpoint 0
+in the first.
+
+Also accept management message 0xc, which some co-processors send once
+idle after the IOP IDLE request, instead of warning about it.
+
+apple_mbox_restore() sets the mailbox-level enables of a started mailbox
+again, as apple_mbox_start() does.
+
+Host test: the retained endpoint map replies for the DCP's map, a missing
+started endpoint, a last part that cannot be echoed, QUIESCED before ON,
+an unexpected state before and after the map, the unchanged
+acknowledgment outside a retained wake, and which waits a signal can
+interrupt. The OSLog test's RTKit stub gains the started endpoint bitmap.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Bartosz Nitka <niteria@gmail.com>
+(cherry picked from commit f5c0fe0da453e9f16e8564281766c026ac7c500b)
+[j604: mailbox.c conflict resolved by hand: a15y lacks the Aurora ASCWrap v8 receive poller block in the context; only the apple_mbox_start -> apple_mbox_enable_hw split applied on the a15y body; tools/asahi/run-host-tests.py not carried on a15y, dropped]
+---
+ drivers/soc/apple/mailbox.c         |  60 +++++---
+ drivers/soc/apple/rtkit-internal.h  |   9 ++
+ drivers/soc/apple/rtkit.c           | 153 ++++++++++++++++++++-
+ include/linux/soc/apple/mailbox.h   |   1 +
+ include/linux/soc/apple/rtkit.h     |   8 ++
+ tools/asahi/rtkit-oslog-tests.py    |   2 +-
+ tools/asahi/rtkit-retained-tests.py | 203 ++++++++++++++++++++++++++++
+ 7 files changed, 414 insertions(+), 22 deletions(-)
+ create mode 100755 tools/asahi/rtkit-retained-tests.py
+
+diff --git a/drivers/soc/apple/mailbox.c b/drivers/soc/apple/mailbox.c
+index 2c5a90e703..52b9cabd2b 100644
+--- a/drivers/soc/apple/mailbox.c
++++ b/drivers/soc/apple/mailbox.c
+@@ -454,25 +454,10 @@ int apple_mbox_poll(struct apple_mbox *mbox)
+ }
+ EXPORT_SYMBOL(apple_mbox_poll);
+ 
+-int apple_mbox_start(struct apple_mbox *mbox)
++/* The mailbox-level enables, which the mailbox's power domain does not keep. */
++static void apple_mbox_enable_hw(struct apple_mbox *mbox)
+ {
+ 	u32 control;
+-	int ret = 0;
+-
+-	mutex_lock(&mbox->lifecycle_lock);
+-	if (mbox->removing) {
+-		ret = -ENODEV;
+-		goto out_unlock;
+-	}
+-	if (mbox->active)
+-		goto out_unlock;
+-
+-	ret = pm_runtime_resume_and_get(mbox->dev);
+-	if (ret) {
+-		dev_err(mbox->dev, "mailbox start: runtime resume failed: %d\n", ret);
+-		apple_mbox_clear_resume_error(mbox);
+-		goto out_unlock;
+-	}
+ 
+ 	if (mbox->hw->ap_initializes_mailboxes) {
+ 		/* The primary T8140 outbox requires its enable bit before use. */
+@@ -493,6 +478,28 @@ int apple_mbox_start(struct apple_mbox *mbox)
+ 				       mbox->hw->irq_bit_send_empty,
+ 			       mbox->regs + mbox->hw->irq_enable);
+ 	}
++}
++
++int apple_mbox_start(struct apple_mbox *mbox)
++{
++	int ret = 0;
++
++	mutex_lock(&mbox->lifecycle_lock);
++	if (mbox->removing) {
++		ret = -ENODEV;
++		goto out_unlock;
++	}
++	if (mbox->active)
++		goto out_unlock;
++
++	ret = pm_runtime_resume_and_get(mbox->dev);
++	if (ret) {
++		dev_err(mbox->dev, "mailbox start: runtime resume failed: %d\n", ret);
++		apple_mbox_clear_resume_error(mbox);
++		goto out_unlock;
++	}
++
++	apple_mbox_enable_hw(mbox);
+ 
+ 	enable_irq(mbox->irq_recv_not_empty);
+ 	mbox->active = true;
+@@ -522,6 +529,25 @@ void apple_mbox_stop(struct apple_mbox *mbox)
+ }
+ EXPORT_SYMBOL(apple_mbox_stop);
+ 
++/*
++ * The mailbox's power domain was off while it stayed started (its consumer
++ * powered its co-processor down and up again around it): set the
++ * mailbox-level enables again before the co-processor runs.
++ */
++int apple_mbox_restore(struct apple_mbox *mbox)
++{
++	int ret = 0;
++
++	mutex_lock(&mbox->lifecycle_lock);
++	if (mbox->removing || !mbox->active)
++		ret = -ENODEV;
++	else
++		apple_mbox_enable_hw(mbox);
++	mutex_unlock(&mbox->lifecycle_lock);
++	return ret;
++}
++EXPORT_SYMBOL(apple_mbox_restore);
++
+ void apple_mbox_hold_rx(struct apple_mbox *mbox)
+ {
+ 	disable_irq(mbox->irq_recv_not_empty);
+diff --git a/drivers/soc/apple/rtkit-internal.h b/drivers/soc/apple/rtkit-internal.h
+index dbbb6f2086..859c8fa009 100644
+--- a/drivers/soc/apple/rtkit-internal.h
++++ b/drivers/soc/apple/rtkit-internal.h
+@@ -63,6 +63,15 @@ struct apple_rtkit {
+ 	struct work_struct sync_ack_work;
+ 
+ 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
++	/* Endpoints started in this session; kept by a retained wake. */
++	DECLARE_BITMAP(started, APPLE_RTKIT_MAX_ENDPOINTS);
++	/*
++	 * apple_rtkit_wake_retained() in progress: the endpoint map is answered
++	 * with the started endpoints and nothing is started again; a QUIESCED
++	 * report gets one ON request.
++	 */
++	bool retained_wake;
++	bool retained_on_sent;
+ 
+ 	struct apple_rtkit_shmem ioreport_buffer;
+ 	struct apple_rtkit_shmem coreanalytics_buffer;
+diff --git a/drivers/soc/apple/rtkit.c b/drivers/soc/apple/rtkit.c
+index ad08ec2c14..d41396404f 100644
+--- a/drivers/soc/apple/rtkit.c
++++ b/drivers/soc/apple/rtkit.c
+@@ -43,6 +43,8 @@ enum {
+ 	APPLE_RTKIT_MGMT_EPMAP_REPLY = 8,
+ 	APPLE_RTKIT_MGMT_SET_AP_PWR_STATE = 0xb,
+ 	APPLE_RTKIT_MGMT_SET_AP_PWR_STATE_ACK = 0xb,
++	/* Sent by some co-processors once idle after an IOP IDLE request. */
++	APPLE_RTKIT_MGMT_IDLE_NOTIFY = 0xc,
+ };
+ 
+ #define APPLE_RTKIT_MGMT_HELLO_MINVER GENMASK_ULL(15, 0)
+@@ -212,6 +214,55 @@ abort_boot:
+ 	complete_all(&rtk->epmap_completion);
+ }
+ 
++/*
++ * Endpoint map of a retained wake: the endpoints and their buffers are still
++ * set up, so answer with the started endpoints of this part of the map, as
++ * the native retained wake does, and start nothing. A started endpoint that
++ * the firmware no longer offers fails the wake.
++ */
++static void apple_rtkit_management_rx_epmap_retained(struct apple_rtkit *rtk, u64 msg,
++						     u32 base, unsigned long bitmap)
++{
++	unsigned long started = 0;
++	u64 reply;
++	int i;
++
++	for (i = 0; i < 32 && 32 * base + i < APPLE_RTKIT_MAX_ENDPOINTS; i++)
++		if (test_bit(32 * base + i, rtk->started))
++			started |= BIT(i);
++	if (started & ~bitmap) {
++		dev_err(rtk->dev, "RTKit: retained endpoints %#lx missing from map %#lx (base %u)\n",
++			started & ~bitmap, bitmap, base);
++		rtk->boot_result = -EPROTO;
++		complete_all(&rtk->epmap_completion);
++		return;
++	}
++	/*
++	 * Bit 0 of a reply is also MORE: a last part cannot echo endpoint
++	 * 32 * base there. The DCP's map has two parts, and its endpoint 0
++	 * (management) is in the first.
++	 */
++	if ((msg & APPLE_RTKIT_MGMT_EPMAP_LAST) && (started & APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE)) {
++		dev_err(rtk->dev, "RTKit: retained endpoint %u cannot be echoed in the last map part\n",
++			32 * base);
++		rtk->boot_result = -EPROTO;
++		complete_all(&rtk->epmap_completion);
++		return;
++	}
++
++	reply = FIELD_PREP(APPLE_RTKIT_MGMT_EPMAP_BASE, base) | started;
++	if (msg & APPLE_RTKIT_MGMT_EPMAP_LAST)
++		reply |= APPLE_RTKIT_MGMT_EPMAP_LAST;
++	else
++		reply |= APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE;
++	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_EPMAP_REPLY, reply);
++
++	if (msg & APPLE_RTKIT_MGMT_EPMAP_LAST) {
++		rtk->boot_result = 0;
++		complete_all(&rtk->epmap_completion);
++	}
++}
++
+ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
+ {
+ 	int i, ep, ret;
+@@ -243,6 +294,11 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
+ 		}
+ 	}
+ 
++	if (rtk->retained_wake) {
++		apple_rtkit_management_rx_epmap_retained(rtk, msg, base, bitmap);
++		return;
++	}
++
+ 	reply = FIELD_PREP(APPLE_RTKIT_MGMT_EPMAP_BASE, base);
+ 	if (msg & APPLE_RTKIT_MGMT_EPMAP_LAST)
+ 		reply |= APPLE_RTKIT_MGMT_EPMAP_LAST;
+@@ -313,6 +369,28 @@ static void apple_rtkit_management_rx_iop_pwr_ack(struct apple_rtkit *rtk,
+ 		rtk->iop_power_state, new_state);
+ 	rtk->iop_power_state = new_state;
+ 
++	/*
++	 * A retained wake: a co-processor may report QUIESCED when it starts
++	 * running and wait for an ON request before its HELLO. Ask once, and
++	 * wait for ON.
++	 */
++	if (rtk->retained_wake && new_state != APPLE_RTKIT_PWR_STATE_ON) {
++		if (new_state == APPLE_RTKIT_PWR_STATE_QUIESCED && !rtk->retained_on_sent) {
++			rtk->retained_on_sent = true;
++			apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE,
++						    FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE,
++							       APPLE_RTKIT_PWR_STATE_ON));
++			return;
++		}
++		dev_err(rtk->dev, "RTKit: unexpected IOP power state 0x%x on retained wake\n",
++			new_state);
++		/* Whichever wait the wake is in: the map, or IOP ON after it. */
++		rtk->boot_result = -EPROTO;
++		complete_all(&rtk->epmap_completion);
++		complete_all(&rtk->iop_pwr_ack_completion);
++		return;
++	}
++
+ 	complete_all(&rtk->iop_pwr_ack_completion);
+ }
+ 
+@@ -345,6 +423,9 @@ static void apple_rtkit_management_rx(struct apple_rtkit *rtk, u64 msg)
+ 	case APPLE_RTKIT_MGMT_SET_AP_PWR_STATE_ACK:
+ 		apple_rtkit_management_rx_ap_pwr_ack(rtk, msg);
+ 		break;
++	case APPLE_RTKIT_MGMT_IDLE_NOTIFY:
++		dev_dbg(rtk->dev, "RTKit: co-processor idle\n");
++		break;
+ 	default:
+ 		dev_warn(
+ 			rtk->dev,
+@@ -1174,6 +1255,8 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
+ 			 endpoint);
+ 		ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_STARTEP, msg);
+ 	}
++	if (!ret)
++		set_bit(endpoint, rtk->started);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
+@@ -1349,6 +1432,7 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
+ 
+ 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
+ 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
++	set_bit(APPLE_RTKIT_EP_MGMT, rtk->started);
+ 
+ 	if (mbox_name)
+ 		rtk->mbox = apple_mbox_get_byname(dev, mbox_name);
+@@ -1412,6 +1496,18 @@ EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted);
+ 
+ static int apple_rtkit_wait_for_completion(struct completion *c);
+ 
++/*
++ * A retained wake is not interrupted by a signal to its caller: it has
++ * already started the co-processor's CPU, and nothing would undo that.
++ */
++static long apple_rtkit_wait_timeout(struct apple_rtkit *rtk, struct completion *c,
++				     unsigned long timeout)
++{
++	if (READ_ONCE(rtk->retained_wake))
++		return wait_for_completion_timeout(c, timeout);
++	return wait_for_completion_interruptible_timeout(c, timeout);
++}
++
+ /*
+  * apple,sync-syslog-ack (AsahiLinux/linux#607): the mailbox can leave
+  * messages queued without another interrupt during bootstrap, so poll it
+@@ -1423,8 +1519,12 @@ static int apple_rtkit_wait(struct apple_rtkit *rtk, struct completion *c)
+ 	long t;
+ 	int ret;
+ 
+-	if (!rtk->sync_syslog_ack)
+-		return apple_rtkit_wait_for_completion(c);
++	if (!rtk->sync_syslog_ack) {
++		t = apple_rtkit_wait_timeout(rtk, c, msecs_to_jiffies(1000));
++		if (t < 0)
++			return t;
++		return t ? 0 : -ETIME;
++	}
+ 
+ 	timeout = jiffies + msecs_to_jiffies(1000);
+ 	do {
+@@ -1432,8 +1532,7 @@ static int apple_rtkit_wait(struct apple_rtkit *rtk, struct completion *c)
+ 		if (ret < 0)
+ 			return ret;
+ 
+-		t = wait_for_completion_interruptible_timeout(c,
+-							      msecs_to_jiffies(10));
++		t = apple_rtkit_wait_timeout(rtk, c, msecs_to_jiffies(10));
+ 		if (t < 0)
+ 			return t;
+ 		if (t > 0)
+@@ -1496,6 +1595,8 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
+ 
+ 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
+ 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
++	bitmap_zero(rtk->started, APPLE_RTKIT_MAX_ENDPOINTS);
++	set_bit(APPLE_RTKIT_EP_MGMT, rtk->started);
+ 
+ 	reinit_completion(&rtk->epmap_completion);
+ 	reinit_completion(&rtk->coreanalytics_completion);
+@@ -1620,6 +1721,9 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
+ 		dev_err(rtk->dev, "RTKit: IOP power acknowledgment failed: %d\n", ret);
+ 		return ret;
+ 	}
++	/* A retained wake fails on any IOP state but ON (still 0 otherwise). */
++	if (rtk->boot_result)
++		return rtk->boot_result;
+ 
+ 	return early_ap_power ? 0 :
+ 		apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
+@@ -1754,6 +1858,47 @@ int apple_rtkit_wake_early_ap(struct apple_rtkit *rtk)
+ }
+ EXPORT_SYMBOL_GPL(apple_rtkit_wake_early_ap);
+ 
++/*
++ * Wake a co-processor whose CPU was stopped after apple_rtkit_idle(), with
++ * its firmware, endpoints and shared buffers kept (and its power domain
++ * possibly off meanwhile). The caller holds RX since the idle; this restores
++ * the mailbox, resumes RX and calls @start, which starts the CPU. The
++ * firmware then says HELLO (possibly after reporting QUIESCED, which gets an
++ * ON request) and sends its endpoint map, answered with the started
++ * endpoints; no INIT is sent and nothing is started or allocated again.
++ * Then IOP ON is awaited and AP ON requested, as for any boot.
++ */
++int apple_rtkit_wake_retained(struct apple_rtkit *rtk, int (*start)(void *), void *ctx)
++{
++	int ret;
++
++	if (apple_rtkit_is_running(rtk) || rtk->crashed || rtk->shutting_down ||
++	    rtk->iop_power_state != APPLE_RTKIT_PWR_STATE_IDLE || !start)
++		return -EINVAL;
++
++	reinit_completion(&rtk->epmap_completion);
++	reinit_completion(&rtk->iop_pwr_ack_completion);
++	reinit_completion(&rtk->ap_pwr_ack_completion);
++	rtk->boot_result = -EINPROGRESS;
++	rtk->retained_on_sent = false;
++	WRITE_ONCE(rtk->retained_wake, true);
++
++	ret = apple_mbox_restore(rtk->mbox);
++	if (ret)
++		goto out;
++	apple_rtkit_resume_rx(rtk);
++	ret = start(ctx);
++	if (ret)
++		goto out;
++	ret = apple_rtkit_boot_common(rtk, false);
++out:
++	WRITE_ONCE(rtk->retained_wake, false);
++	if (ret)
++		dev_err(rtk->dev, "RTKit: retained wake failed: %d\n", ret);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_rtkit_wake_retained);
++
+ void apple_rtkit_free(struct apple_rtkit *rtk)
+ {
+ 	apple_rtkit_stop_rx(rtk);
+diff --git a/include/linux/soc/apple/mailbox.h b/include/linux/soc/apple/mailbox.h
+index 6877b575f4..6f7b4a5d2a 100644
+--- a/include/linux/soc/apple/mailbox.h
++++ b/include/linux/soc/apple/mailbox.h
+@@ -92,6 +92,7 @@ struct apple_mbox *apple_mbox_get_byname(struct device *dev, const char *name);
+ 
+ int apple_mbox_start(struct apple_mbox *mbox);
+ void apple_mbox_stop(struct apple_mbox *mbox);
++int apple_mbox_restore(struct apple_mbox *mbox);
+ int apple_mbox_poll(struct apple_mbox *mbox);
+ /*
+  * Leave received messages in the hardware FIFO, without an interrupt, until
+diff --git a/include/linux/soc/apple/rtkit.h b/include/linux/soc/apple/rtkit.h
+index af6cb59809..a77d218471 100644
+--- a/include/linux/soc/apple/rtkit.h
++++ b/include/linux/soc/apple/rtkit.h
+@@ -206,6 +206,14 @@ int apple_rtkit_wake(struct apple_rtkit *rtk);
+ /* Wake helpers which require AP readiness before their IOP power acknowledgment. */
+ int apple_rtkit_wake_early_ap(struct apple_rtkit *rtk);
+ 
++/*
++ * Wake a co-processor stopped after apple_rtkit_idle() with its firmware,
++ * endpoints and buffers kept: restore the mailbox, resume RX, call @start to
++ * start its CPU, then complete HELLO, the endpoint map (with the started
++ * endpoints, no INIT and no new endpoint start) and IOP/AP ON.
++ */
++int apple_rtkit_wake_retained(struct apple_rtkit *rtk, int (*start)(void *), void *ctx);
++
+ /*
+  * Shutdown the co-processor
+  */
+diff --git a/tools/asahi/rtkit-oslog-tests.py b/tools/asahi/rtkit-oslog-tests.py
+index 5f8eb290eb..a9076f5272 100644
+--- a/tools/asahi/rtkit-oslog-tests.py
++++ b/tools/asahi/rtkit-oslog-tests.py
+@@ -49,7 +49,7 @@ struct apple_rtkit {
+  int sync_ack_fifo;
+  bool sync_syslog_ack, oslog_inherited, syslog_inherited, crashlog_inherited, crashed, shutting_down;
+  unsigned iop_power_state, ap_power_state;
+- unsigned long endpoints[4];
++ unsigned long endpoints[4], started[4];
+  char *syslog_msg_buffer;
+  size_t syslog_n_entries, syslog_msg_size;
+  int epmap_completion, iop_pwr_ack_completion, ap_pwr_ack_completion;
+diff --git a/tools/asahi/rtkit-retained-tests.py b/tools/asahi/rtkit-retained-tests.py
+new file mode 100755
+index 0000000000..b79a9cd542
+--- /dev/null
++++ b/tools/asahi/rtkit-retained-tests.py
+@@ -0,0 +1,203 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only OR MIT
++"""Check the retained-wake endpoint map reply and IOP power acknowledgment."""
++import argparse
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[2]
++DRIVER = 'drivers/soc/apple/rtkit.c'
++
++
++def function(source, name):
++    match = re.search(r'^(?:static )?(?:void|int|long) ' + name + r'\(', source, re.M)
++    assert match, name
++    opening = source.index('{', match.end())
++    depth, end = 1, opening + 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[match.start():end] + '\n'
++
++
++def constants(source):
++    out = []
++    for line in source.splitlines():
++        if re.match(r'#define APPLE_RTKIT_MGMT_(TYPE|EPMAP_\w+|PWR_STATE)\b', line):
++            out.append(line)
++    enum = re.search(r'enum \{\n\tAPPLE_RTKIT_MGMT_HELLO = 1,.*?\n\};', source, re.S)
++    states = re.search(r'enum \{\n\tAPPLE_RTKIT_PWR_STATE_OFF.*?\n\};', source, re.S)
++    assert enum and states
++    return '\n'.join(out) + '\n' + enum.group(0) + '\n' + states.group(0) + '\n'
++
++
++PREFIX = r'''
++#include <assert.h>
++#include <errno.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
++#define BIT(n) (1UL << (n))
++#define BIT_ULL(n) (1ULL << (n))
++#define GENMASK_ULL(h,l) ((~0ULL << (l)) & (~0ULL >> (63-(h))))
++#define FIELD_GET(m,v) (((v) & (m)) >> __builtin_ctzll(m))
++#define FIELD_PREP(m,v) (((u64)(v) << __builtin_ctzll(m)) & (m))
++#define APPLE_RTKIT_MAX_ENDPOINTS 256
++#define dev_err(...) ((void)0)
++#define dev_dbg(...) ((void)0)
++struct apple_rtkit {
++	void *dev;
++	unsigned long started[APPLE_RTKIT_MAX_ENDPOINTS / 64];
++	bool retained_wake, retained_on_sent;
++	int boot_result;
++	unsigned int iop_power_state;
++	int epmap_completion, iop_pwr_ack_completion;
++};
++static bool test_bit(unsigned n, const unsigned long *b) { return b[n / 64] >> (n % 64) & 1; }
++static void set_bit(unsigned n, unsigned long *b) { b[n / 64] |= 1UL << (n % 64); }
++static void complete_all(int *c) { (*c)++; }
++static unsigned sent;
++static u8 sent_type;
++static u64 sent_data;
++static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type, u64 data)
++{
++	(void)rtk; sent++; sent_type = type; sent_data = data; return 0;
++}
++/* A signal is pending for every interruptible wait. */
++#define ERESTARTSYS 512
++#define READ_ONCE(x) (x)
++struct completion { int unused; };
++static unsigned waited_uninterruptible, waited_interruptible;
++static unsigned long wait_for_completion_timeout(struct completion *c, unsigned long t)
++{
++	(void)c; waited_uninterruptible++; return t;
++}
++static long wait_for_completion_interruptible_timeout(struct completion *c, unsigned long t)
++{
++	(void)c; (void)t; waited_interruptible++; return -ERESTARTSYS;
++}
++'''
++
++MAIN = r'''
++static struct apple_rtkit fresh(void)
++{
++	struct apple_rtkit r = { .retained_wake = true, .boot_result = -EINPROGRESS };
++
++	/* Management, syslog, crashlog, debug, ioreport, oslog, tracekit, DCP 0x37. */
++	for (unsigned ep = 0; ep < 11; ep++)
++		if ((0x51dUL >> ep) & 1)
++			set_bit(ep, r.started);
++	set_bit(0x37, r.started);
++	sent = 0;
++	return r;
++}
++
++int main(void)
++{
++	struct apple_rtkit r = fresh();
++	u64 map0 = FIELD_PREP(APPLE_RTKIT_MGMT_EPMAP_BASE, 0) | 0x51d;
++	u64 map1 = APPLE_RTKIT_MGMT_EPMAP_LAST | FIELD_PREP(APPLE_RTKIT_MGMT_EPMAP_BASE, 1) |
++		   0x00867f3f;
++
++	/* Each part of the map: exactly the started endpoints, MORE until the last. */
++	apple_rtkit_management_rx_epmap_retained(&r, map0, 0, 0x51d);
++	assert(sent == 1 && sent_type == APPLE_RTKIT_MGMT_EPMAP_REPLY);
++	assert(sent_data == (0x51d | APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE));
++	assert(r.epmap_completion == 0 && r.boot_result == -EINPROGRESS);
++	apple_rtkit_management_rx_epmap_retained(&r, map1, 1, 0x00867f3f);
++	assert(sent == 2 && sent_data == (APPLE_RTKIT_MGMT_EPMAP_LAST |
++					   FIELD_PREP(APPLE_RTKIT_MGMT_EPMAP_BASE, 1) | BIT(0x37 - 32)));
++	assert(r.epmap_completion == 1 && r.boot_result == 0);
++
++	/* A started endpoint missing from the map fails the wake; nothing is sent. */
++	r = fresh();
++	apple_rtkit_management_rx_epmap_retained(&r, map1 & ~(u64)BIT(0x37 - 32), 1,
++						 0x00867f3f & ~BIT(0x37 - 32));
++	assert(sent == 0 && r.boot_result == -EPROTO && r.epmap_completion == 1);
++
++	/* QUIESCED gets one ON request, then ON completes. */
++	r = fresh();
++	apple_rtkit_management_rx_iop_pwr_ack(&r, APPLE_RTKIT_PWR_STATE_QUIESCED);
++	assert(sent == 1 && sent_type == APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE);
++	assert(sent_data == APPLE_RTKIT_PWR_STATE_ON && r.iop_pwr_ack_completion == 0);
++	apple_rtkit_management_rx_iop_pwr_ack(&r, APPLE_RTKIT_PWR_STATE_ON);
++	assert(sent == 1 && r.iop_pwr_ack_completion == 1);
++	assert(r.iop_power_state == APPLE_RTKIT_PWR_STATE_ON);
++
++	/* A last part cannot echo endpoint 32 * base: bit 0 is also MORE. */
++	r = fresh();
++	set_bit(32, r.started);
++	apple_rtkit_management_rx_epmap_retained(&r, map1, 1, 0x00867f3f);
++	assert(sent == 0 && r.boot_result == -EPROTO && r.epmap_completion == 1);
++
++	/*
++	 * A second QUIESCED, or any other state, fails the wake, before the map
++	 * or while the wake waits for IOP ON after it.
++	 */
++	r = fresh();
++	apple_rtkit_management_rx_iop_pwr_ack(&r, APPLE_RTKIT_PWR_STATE_QUIESCED);
++	apple_rtkit_management_rx_iop_pwr_ack(&r, APPLE_RTKIT_PWR_STATE_QUIESCED);
++	assert(sent == 1 && r.boot_result == -EPROTO);
++	assert(r.epmap_completion == 1 && r.iop_pwr_ack_completion == 1);
++	r = fresh();
++	apple_rtkit_management_rx_epmap_retained(&r, map0, 0, 0x51d);
++	apple_rtkit_management_rx_epmap_retained(&r, map1, 1, 0x00867f3f);
++	assert(r.epmap_completion == 1 && r.boot_result == 0);
++	apple_rtkit_management_rx_iop_pwr_ack(&r, APPLE_RTKIT_PWR_STATE_IDLE);
++	assert(r.boot_result == -EPROTO && r.iop_pwr_ack_completion == 1);
++
++	/* Outside a retained wake every acknowledgment completes, as before. */
++	r = fresh();
++	r.retained_wake = false;
++	apple_rtkit_management_rx_iop_pwr_ack(&r, APPLE_RTKIT_PWR_STATE_QUIESCED);
++	assert(sent == 0 && r.iop_pwr_ack_completion == 1);
++	assert(r.iop_power_state == APPLE_RTKIT_PWR_STATE_QUIESCED);
++
++	/* A retained wake waits through a signal; other waits stay interruptible. */
++	struct completion c;
++	r = fresh();
++	assert(apple_rtkit_wait_timeout(&r, &c, 7) == 7);
++	assert(waited_uninterruptible == 1 && waited_interruptible == 0);
++	r.retained_wake = false;
++	assert(apple_rtkit_wait_timeout(&r, &c, 7) == -ERESTARTSYS);
++	assert(waited_uninterruptible == 1 && waited_interruptible == 1);
++
++	puts("PASS retained endpoint map replies, IOP acknowledgments and waits");
++	return 0;
++}
++'''
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--out', type=Path, help='keep build and result files here')
++    parser.add_argument('--cc', default='cc')
++    args = parser.parse_args()
++    source = (ROOT / DRIVER).read_text()
++    code = PREFIX + constants(source)
++    code += function(source, 'apple_rtkit_management_rx_epmap_retained')
++    code += function(source, 'apple_rtkit_management_rx_iop_pwr_ack')
++    code += function(source, 'apple_rtkit_wait_timeout') + MAIN
++
++    def run(out):
++        out.mkdir(parents=True, exist_ok=True)
++        cfile, exe = out / 'retained.c', out / 'retained'
++        cfile.write_text(code)
++        subprocess.run([args.cc, '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
++                        '-Wno-unused-parameter', '-fsanitize=address,undefined',
++                        '-fno-sanitize-recover=all', str(cfile), '-o', str(exe)], check=True)
++        result = subprocess.run([str(exe)], capture_output=True, text=True)
++        print(result.stdout or result.stderr, end='')
++        return result.returncode
++
++    if args.out:
++        return run(args.out)
++    with tempfile.TemporaryDirectory(prefix='rtkit-retained-') as out:
++        return run(Path(out))
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())

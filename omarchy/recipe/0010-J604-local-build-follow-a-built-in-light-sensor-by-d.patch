@@ -1,0 +1,525 @@
+From 834537175ffcf046463f5a7b97b7bdc4bd24275c Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 03:32:03 +0000
+Subject: [PATCH 10/10] J604 local build: follow a built-in light sensor by
+ default, keys included
+
+macOS adjusts the built-in display from its ambient light sensor out of
+the box, lights the keyboard in low light, and turns it off in bright
+light. The automatic brightness service (pull request #8025) is opt-in
+and drives displays only. On the J604 the AOP light sensor is an IIO
+device on the platform bus (aop-sensors-als, in_illuminance_input in lux,
+0.0-0.5 in a dark room and about 55 with the room lights on, measured on
+1.608), and the keyboard backlight is the kbd_backlight LED (0-255).
+
+- omarchy-brightness-auto default turns the service on once when the
+  machine has a built-in light sensor (one not below a USB device, so a
+  Studio Display's sensor does not count) and the user has never chosen:
+  on, off and toggle (the Display panel switch) now record the choice in
+  ~/.local/state/omarchy/brightness-auto-choice. First-run calls it, and
+  migration 1794108600 calls it once for installed systems.
+- With a built-in sensor the service also drives the keyboard backlight:
+  lit below 15 lux, off above 40 lux, unchanged in between, faded in
+  eighths of the range, one step per poll. The lit level is the keys'
+  own (or the level the idle blank restores, or half the range). A key
+  press becomes the new lit level, and turning the keys off by hand holds
+  until the room is bright again. It never writes while the idle timeout
+  or the lock holds the keys blank (omarchy-brightness-keyboard's record)
+  and writes under that command's lock. omarchy-brightness-auto keyboard
+  off|on keeps the display part only or brings the keys back; status
+  reports "keyboard".
+- A write to a built-in panel that Hyprland reports DPMS-off is held and
+  retried every retry_seconds until the panel is lit, so the service never
+  changes the backlight of a blanked panel.
+
+The 15/40 lux thresholds and the 50% default are a first choice from the
+1.608 readings, not a measurement of macOS. New test
+brightness-auto-default-test.sh covers the sensor kind, the default and
+the user's choice, the keyboard follow (fade, hysteresis, manual level,
+manual off, idle blank, setting) and the DPMS hold.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ bin/omarchy-brightness-auto                  | 248 ++++++++++++++++++-
+ install/user/first-run/enable-user-units.sh  |   4 +
+ migrations/1794108600.sh                     |   6 +
+ test/shell.d/brightness-auto-default-test.sh | 109 ++++++++
+ 4 files changed, 364 insertions(+), 3 deletions(-)
+ create mode 100644 migrations/1794108600.sh
+ create mode 100755 test/shell.d/brightness-auto-default-test.sh
+
+diff --git a/bin/omarchy-brightness-auto b/bin/omarchy-brightness-auto
+index b6b7e90d..0de98947 100755
+--- a/bin/omarchy-brightness-auto
++++ b/bin/omarchy-brightness-auto
+@@ -18,6 +18,23 @@ last_status=""
+ events=""
+ next_tick=0
+ monitors_changed=0
++# The keyboard backlight follows a built-in sensor like macOS "Adjust keyboard
++# brightness in low light": lit below keyboard_on_lux, off above
++# keyboard_off_lux, unchanged in between.
++keyboard_on_lux=15
++keyboard_off_lux=40
++keyboard_default_percent=50
++leds_root=${OMARCHY_AUTO_BRIGHTNESS_LEDS_ROOT:-/sys/class/leds}
++state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy"
++choice_file="$state_dir/brightness-auto-choice"
++keyboard_setting="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/brightness-auto-keyboard"
++kbd_dev=""
++kbd_max=0
++kbd_level=0
++kbd_last=-1
++kbd_dark=0
++kbd_user_off=0
++kbd_pending=0
+ 
+ is_apple_sensor() {
+   local path=""
+@@ -294,6 +311,194 @@ log_state() {
+   log_message "$status"
+ }
+ 
++# A sensor below a USB device belongs to a display or a dongle; any other
++# light sensor is the machine's own.
++is_usb_sensor() {
++  local path=""
++
++  path="$(realpath -e "$1")" || return 1
++  while [[ -n $path && $path != "/" ]]; do
++    [[ -r $path/idVendor ]] && return 0
++    path="${path%/*}"
++  done
++  return 1
++}
++
++builtin_sensor_present() {
++  local root="${1:-$iio_root}"
++  local sensor=""
++
++  for sensor in "$root"/iio:device*; do
++    [[ -e $sensor ]] || continue
++    find_illuminance_channel "$sensor" >/dev/null || continue
++    is_usb_sensor "$sensor" || return 0
++  done
++  return 1
++}
++
++record_choice() {
++  mkdir -p "${choice_file%/*}" && printf '%s\n' "$1" >"$choice_file"
++}
++
++# macOS adjusts a built-in display from its own light sensor out of the box.
++# A machine with a built-in sensor gets the service once, unless its user has
++# chosen on or off.
++default_service() {
++  [[ -s $choice_file ]] && return 0
++  builtin_sensor_present "$iio_root" || return 0
++  service_enabled && return 0
++  enable_service
++}
++
++keyboard_follow_enabled() {
++  local setting=""
++
++  [[ -r $keyboard_setting ]] || return 0
++  read -r setting <"$keyboard_setting" || return 0
++  [[ $setting != "off" ]]
++}
++
++find_keyboard_led() {
++  local led=""
++
++  for led in "$leds_root"/*kbd_backlight*; do
++    [[ -r $led/brightness && -r $led/max_brightness ]] || continue
++    printf '%s\n' "$led"
++    return 0
++  done
++  return 1
++}
++
++lux_below() {
++  awk -v lux="$1" -v limit="$2" 'BEGIN { exit !(lux + 0 < limit + 0) }'
++}
++
++# The idle timeout and the lock blank the keys through omarchy-brightness-keyboard,
++# which keeps the level to restore in this record while they are blank.
++keyboard_blank_record() {
++  printf '%s\n' "$state_dir/brightness-keyboard-${kbd_dev##*/}"
++}
++
++# Under omarchy-brightness-keyboard's lock, so a blank or a key press is never
++# overwritten; 75 when the keys are busy or blank.
++write_keyboard() {
++  local level="$1"
++  local device="${kbd_dev##*/}"
++  local record=""
++
++  record="$(keyboard_blank_record)"
++  (
++    flock -n 9 || exit 75
++    [[ -s $record ]] && exit 75
++    brightnessctl -d "$device" set "$level" >/dev/null
++  ) 9>"${XDG_RUNTIME_DIR:-/tmp}/omarchy-brightness-keyboard-$device.lock"
++}
++
++keyboard_setup() {
++  local current=0
++  local saved=""
++  local record=""
++
++  kbd_dev=""
++  kbd_last=-1
++  kbd_pending=0
++  kbd_user_off=0
++  keyboard_follow_enabled || return 0
++  kbd_dev="$(find_keyboard_led)" || {
++    kbd_dev=""
++    return 0
++  }
++  read -r kbd_max <"$kbd_dev/max_brightness" || kbd_max=0
++  if [[ ! $kbd_max =~ ^[0-9]+$ ]] || (( kbd_max <= 0 )); then
++    kbd_dev=""
++    return 0
++  fi
++  read -r current <"$kbd_dev/brightness" || current=0
++  [[ $current =~ ^[0-9]+$ ]] || current=0
++  record="$(keyboard_blank_record)"
++  [[ -s $record ]] && read -r saved <"$record"
++  # The lit level: the keys' own while lit, else the one a wake restores, else
++  # the default.
++  if (( current > 0 )); then
++    kbd_level=$current
++  elif [[ $saved =~ ^[0-9]+$ ]] && (( saved > 0 )); then
++    kbd_level=$saved
++  else
++    kbd_level=$(( kbd_max * keyboard_default_percent / 100 ))
++    (( kbd_level < 1 )) && kbd_level=1
++  fi
++  (( current > 0 )) && kbd_dark=1 || kbd_dark=0
++}
++
++keyboard_update() {
++  local lux="$1"
++  local current=""
++  local target=0
++  local step=0
++  local next=0
++  local record=""
++
++  [[ -n $kbd_dev ]] || return 0
++  record="$(keyboard_blank_record)"
++  # Blank: the wake restores the keys, and the next reading adjusts them.
++  if [[ -s $record ]]; then
++    kbd_pending=0
++    return 0
++  fi
++  read -r current <"$kbd_dev/brightness" || return 0
++  [[ $current =~ ^[0-9]+$ ]] || return 0
++  # A key press is the new lit level, or an off that holds until the room is
++  # bright again.
++  if (( kbd_last >= 0 && current != kbd_last )); then
++    if (( current > 0 )); then
++      kbd_level=$current
++      kbd_user_off=0
++    else
++      kbd_user_off=1
++    fi
++    kbd_last=$current
++    kbd_pending=0
++    return 0
++  fi
++  if lux_below "$lux" "$keyboard_on_lux"; then
++    kbd_dark=1
++  elif ! lux_below "$lux" "$keyboard_off_lux"; then
++    kbd_dark=0
++    kbd_user_off=0
++  fi
++  (( kbd_dark && ! kbd_user_off )) && target=$kbd_level
++  if (( current == target )); then
++    kbd_last=$current
++    kbd_pending=0
++    return 0
++  fi
++  # A fade in eighths, one step per poll.
++  step=$(( kbd_max / 8 ))
++  (( step < 1 )) && step=1
++  if (( target > current )); then
++    next=$(( current + step ))
++    (( next > target )) && next=$target
++  else
++    next=$(( current - step ))
++    (( next < target )) && next=$target
++  fi
++  if write_keyboard "$next"; then
++    kbd_last=$next
++    (( next != target )) && kbd_pending=1 || kbd_pending=0
++  else
++    kbd_last=$current
++    kbd_pending=0
++  fi
++}
++
++# Hyprland's DPMS state of a display; lit unless it says otherwise.
++monitor_lit() {
++  local monitors=""
++
++  monitors="$(hyprctl monitors -j 2>/dev/null)" || return 0
++  ! jq -e --arg name "$1" 'any(.[]; .name == $name and .dpmsStatus == false)' <<<"$monitors" >/dev/null 2>&1
++}
++
+ control_session() {
+   local sensor="$1"
+   local kind="$2"
+@@ -331,6 +536,10 @@ control_session() {
+   last_auto="$current"
+   target="$current"
+   log_state "controlling $monitor from $sensor at $current%"
++  if [[ $kind == generic ]]; then
++    keyboard_setup
++    keyboard_update "$lux"
++  fi
+ 
+   monitors_changed=0
+   next_tick=0
+@@ -353,7 +562,7 @@ control_session() {
+     # Steady light: the reading is about the same, the smoothing has settled,
+     # and no write is still pending.
+     if [[ $smoothed_lux == $lux ]] && ! reading_changed "$last_raw" "$raw" &&
+-      ! needs_adjustment "$target" "$last_auto"; then
++      ! needs_adjustment "$target" "$last_auto" && (( ! kbd_pending )); then
+       continue
+     fi
+     last_raw="$raw"
+@@ -362,6 +571,7 @@ control_session() {
+       return 1
+     }
+     smoothed_lux="$(smooth_lux "$smoothed_lux" "$lux")" || return 1
++    [[ $kind == generic ]] && keyboard_update "$smoothed_lux"
+     base_target="$(curve_brightness "$smoothed_lux")" || return 1
+     target="$(target_with_offset "$base_target" "$offset")"
+     needs_adjustment "$target" "$last_auto" || continue
+@@ -381,6 +591,14 @@ control_session() {
+       continue
+     fi
+ 
++    # A blanked panel keeps its level until it is lit again; the write is
++    # retried then, as after a contended write.
++    if [[ $kind == generic ]] && ! monitor_lit "$monitor"; then
++      log_state "holding $monitor while it is blanked"
++      next_tick=$(( ${EPOCHREALTIME//[!0-9]/} + retry_seconds * 1000000 ))
++      continue
++    fi
++    log_state "controlling $monitor from $sensor"
+     next="$(step_toward "$target" "$last_auto")"
+     if write_brightness "$monitor" "$next"; then
+       last_auto="$next"
+@@ -469,11 +687,14 @@ print_status() {
+   automatic_brightness_supported && supported=true
+   service_enabled && enabled=true
+   systemctl --user is-active --quiet "$service" 2>/dev/null && active=true
+-  printf '{"supported":%s,"enabled":%s,"active":%s}\n' "$supported" "$enabled" "$active"
++  local keyboard=false
++
++  keyboard_follow_enabled && find_keyboard_led >/dev/null && keyboard=true
++  printf '{"supported":%s,"enabled":%s,"active":%s,"keyboard":%s}\n' "$supported" "$enabled" "$active" "$keyboard"
+ }
+ 
+ usage() {
+-  printf 'Usage: omarchy-brightness-auto <on|off|toggle|status>\n' >&2
++  printf 'Usage: omarchy-brightness-auto <on|off|toggle|status|default|keyboard <on|off>>\n' >&2
+ }
+ 
+ main() {
+@@ -482,6 +703,20 @@ main() {
+     return
+   fi
+ 
++  if [[ $1 == keyboard ]]; then
++    case "${2:-}" in
++    on | off)
++      mkdir -p "${keyboard_setting%/*}" && printf '%s\n' "$2" >"$keyboard_setting" || return 1
++      systemctl --user try-restart "$service" 2>/dev/null || true
++      return 0
++      ;;
++    *)
++      usage
++      return 2
++      ;;
++    esac
++  fi
++
+   (( $# == 1 )) || {
+     usage
+     return 2
+@@ -489,18 +724,25 @@ main() {
+ 
+   case "$1" in
+   on)
++    record_choice on
+     enable_service
+     ;;
+   off)
++    record_choice off
+     disable_service
+     ;;
+   toggle)
+     if service_enabled; then
++      record_choice off
+       disable_service
+     else
++      record_choice on
+       enable_service
+     fi
+     ;;
++  default)
++    default_service
++    ;;
+   status)
+     print_status
+     ;;
+diff --git a/install/user/first-run/enable-user-units.sh b/install/user/first-run/enable-user-units.sh
+index 0f732622..c5dddda5 100755
+--- a/install/user/first-run/enable-user-units.sh
++++ b/install/user/first-run/enable-user-units.sh
+@@ -29,5 +29,9 @@ for unit in \
+   systemctl --user enable --now "$unit" || failed=1
+ done
+ 
++# A built-in ambient light sensor drives its display (and keyboard backlight)
++# from the first session, as macOS does; a missing sensor leaves it off.
++omarchy-brightness-auto default || echo "Automatic brightness deferred; turn it on in the Display panel." >&2
++
+ omarchy-hook-install theme-set /usr/share/owe/10-owe-sync
+ exit "$failed"
+diff --git a/migrations/1794108600.sh b/migrations/1794108600.sh
+new file mode 100644
+index 00000000..6e22f829
+--- /dev/null
++++ b/migrations/1794108600.sh
+@@ -0,0 +1,6 @@
++echo "Turn on automatic brightness for a built-in ambient light sensor"
++
++# Machines that already ran first-run get the macOS default once: the service
++# starts when the machine has its own light sensor and the user has never
++# turned automatic brightness on or off.
++omarchy-brightness-auto default || true
+diff --git a/test/shell.d/brightness-auto-default-test.sh b/test/shell.d/brightness-auto-default-test.sh
+new file mode 100755
+index 00000000..682585ed
+--- /dev/null
++++ b/test/shell.d/brightness-auto-default-test.sh
+@@ -0,0 +1,109 @@
++#!/bin/bash
++
++set -euo pipefail
++
++source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
++
++script="$ROOT/bin/omarchy-brightness-auto"
++source "$script"
++
++test_tmp=$(mktemp -d)
++trap 'rm -rf "$test_tmp"' EXIT
++
++# A built-in sensor (platform device) and a USB one (a display's).
++builtin="$test_tmp/devices/platform/soc/aop/als.5.auto/iio:device0"
++usb="$test_tmp/devices/usb/1-1/1-1:1.8/iio:device1"
++mkdir -p "$builtin" "$usb" "$test_tmp/iio" "$test_tmp/iio-usb" "$test_tmp/iio-none"
++printf '0.5\n' >"$builtin/in_illuminance_input"
++printf '05ac\n' >"$test_tmp/devices/usb/1-1/idVendor"
++printf '10\n' >"$usb/in_illuminance_raw"
++ln -s "$builtin" "$test_tmp/iio/iio:device0"
++ln -s "$usb" "$test_tmp/iio/iio:device1"
++ln -s "$usb" "$test_tmp/iio-usb/iio:device1"
++
++builtin_sensor_present "$test_tmp/iio" || fail "a platform light sensor is a built-in sensor"
++builtin_sensor_present "$test_tmp/iio-usb" && fail "a display's USB light sensor is not a built-in sensor"
++builtin_sensor_present "$test_tmp/iio-none" && fail "no light sensor is no built-in sensor"
++pass "automatic brightness tells a built-in light sensor from a display's"
++
++(
++  iio_root="$test_tmp/iio"
++  choice_file="$test_tmp/state/brightness-auto-choice"
++  enabled=0
++  enable_calls=0
++  service_enabled() { (( enabled )); }
++  enable_service() { enabled=1; enable_calls=$(( enable_calls + 1 )); }
++  default_service
++  (( enable_calls == 1 )) || fail "a built-in sensor turns automatic brightness on by default"
++  default_service
++  (( enable_calls == 1 )) || fail "the default does not enable a running service again"
++  enabled=0
++  record_choice off
++  default_service
++  (( enable_calls == 1 )) || fail "the default keeps a user's choice to turn automatic brightness off"
++  iio_root="$test_tmp/iio-usb"
++  rm -f "$choice_file"
++  default_service
++  (( enable_calls == 1 )) || fail "a display's sensor alone does not turn automatic brightness on by default"
++)
++pass "automatic brightness defaults on for a built-in sensor and keeps the user's choice"
++
++(
++  leds_root="$test_tmp/leds"
++  state_dir="$test_tmp/state"
++  keyboard_setting="$test_tmp/config/brightness-auto-keyboard"
++  led="$leds_root/kbd_backlight"
++  writes="$test_tmp/kbd-writes"
++  mkdir -p "$led" "$state_dir"
++  printf '255\n' >"$led/max_brightness"
++  printf '0\n' >"$led/brightness"
++  : >"$writes"
++  write_keyboard() { printf '%s\n' "$1" >"$led/brightness"; printf '%s\n' "$1" >>"$writes"; }
++
++  keyboard_setup
++  [[ $kbd_dev == "$led" ]] || fail "the keyboard backlight LED is found"
++  (( kbd_level == 127 )) || fail "unlit keys start from the default lit level"
++  keyboard_update 0.2
++  keyboard_update 0.2
++  [[ $(cat "$led/brightness") == 62 ]] || fail "dim light fades the keys up in steps"
++  for _ in 1 2 3 4 5 6; do keyboard_update 0.2; done
++  [[ $(cat "$led/brightness") == 127 ]] || fail "dim light lights the keys at their lit level"
++  keyboard_update 25
++  [[ $(cat "$led/brightness") == 127 ]] || fail "light between the thresholds leaves the keys alone"
++  for _ in 1 2 3 4 5; do keyboard_update 300; done
++  [[ $(cat "$led/brightness") == 0 ]] || fail "bright light turns the keys off"
++  keyboard_update 300
++  for _ in 1 2 3 4 5 6 7 8; do keyboard_update 0.2; done
++  printf '200\n' >"$led/brightness"
++  keyboard_update 0.2
++  (( kbd_level == 200 )) || fail "a key press sets the lit level"
++  printf '0\n' >"$led/brightness"
++  keyboard_update 0.2
++  keyboard_update 0.2
++  [[ $(cat "$led/brightness") == 0 ]] || fail "keys turned off by hand stay off in the dark"
++  for _ in 1 2 3; do keyboard_update 300; done
++  for _ in 1 2 3 4 5 6 7 8 9; do keyboard_update 0.2; done
++  [[ $(cat "$led/brightness") == 200 ]] || fail "a bright room ends a manual off, and the dark lights the keys again"
++  printf '0\n' >"$led/brightness"
++  printf '200\n' >"$state_dir/brightness-keyboard-kbd_backlight"
++  before=$(wc -l <"$writes")
++  keyboard_update 0.2
++  [[ $(wc -l <"$writes") == "$before" ]] || fail "keys blanked by the idle timeout are left to its wake"
++  rm -f "$state_dir/brightness-keyboard-kbd_backlight"
++
++  mkdir -p "${keyboard_setting%/*}"
++  printf 'off\n' >"$keyboard_setting"
++  keyboard_setup
++  [[ -z $kbd_dev ]] || fail "the keyboard setting turns the keyboard follow off"
++)
++pass "keyboard backlight follows a built-in light sensor like macOS"
++
++(
++  monitors_json='[{"name":"eDP-1","dpmsStatus":false},{"name":"DP-1","dpmsStatus":true}]'
++  hyprctl() { printf '%s\n' "$monitors_json"; }
++  monitor_lit eDP-1 && fail "a blanked panel is not lit"
++  monitor_lit DP-1 || fail "a lit display is lit"
++  hyprctl() { return 1; }
++  monitor_lit eDP-1 || fail "without Hyprland a display counts as lit"
++)
++pass "automatic brightness holds its writes while the panel is blanked"
+-- 
+2.43.0
+

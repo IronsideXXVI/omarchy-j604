@@ -1,0 +1,233 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erik Bourget <erik@ebourget.net>
+Date: Sun, 25 Oct 2026 20:20:13 -0400
+Subject: [PATCH] drm/apple: m4: Power the display down for system sleep
+
+The J713 DCP refused system sleep: the retained T8132 session had no
+qualified handshake. setPowerState (A473) out of band is that handshake
+on IOMFB 26.x: with the panel blanked, setPowerState(0) powers the
+display pipeline down (the firmware logs "power on -> off" and disables
+its M3 helpers) and setPowerState(1) brings it back, after which the
+next present scans out again.
+
+apple-drm is a consumer of the DCP, so its suspend handler has blanked
+the panel when the DCP suspends, and its resume handler restores the
+CRTC after the DCP resumed. Power the display down in between, with the
+coprocessor running and its power domains kept on through the wakeup
+path, as on the older DCPs; refuse sleep should the panel still scan
+out. Presents while the display is down are refused.
+
+The request is the 16-byte {u64 state; u8 flags[4]; u8 result_null;
+u8 pad[3]}, the reply {u32 value; u32 status}; a nonzero status fails
+the transition and the session.
+
+Signed-off-by: Erik Bourget <erik@ebourget.net>
+[eryk: keep hibernation refused, as before: SYSTEM_SLEEP_PM_OPS also made
+ this the freeze and poweroff handler, so a blanked J713 could hibernate
+ and restore a session iBoot had restarted; and count the startup
+ surface, shown before the first frame, as scanning out]
+Signed-off-by: Eryk Wieliczko <eryk@wieliczko.ninja>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 53899593311d1e6fd10e7ba91861b970cad63419)
+[dylan: dcp_platform_suspend(): the dcp_takeover_was_aborted() check
+ that aurora carries ahead of the T8132 hunk is not taken; omacom does
+ not carry the aborted-takeover tracking it belongs to. The
+ tools/testing/selftests/drivers/gpu/apple-dcp/m4.py hunk is dropped:
+ omacom does not carry that file, which aurora 4c254113bf adds.]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp.c      | 34 ++++++++++++--
+ drivers/gpu/drm/apple/iomfb_m4.c | 81 ++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/apple/iomfb_m4.h |  4 ++
+ 3 files changed, 114 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index 582df6b7e7..3f0ef15d05 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -5115,9 +5115,17 @@ static int dcp_platform_suspend(struct device *dev)
+ {
+ 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+ 
+-	/* The retained T8132 session has no qualified system-sleep handshake. */
+-	if (iomfb_is_m4(dcp))
+-		return -EBUSY;
++	/*
++	 * T8132: setPowerState powers the display down; the coprocessor keeps
++	 * running and its power domains stay on, as below.
++	 */
++	if (iomfb_is_m4(dcp)) {
++		int ret = iomfb_m4_suspend(dcp);
++
++		if (!ret)
++			device_set_wakeup_path(dev);
++		return ret;
++	}
+ 	if (READ_ONCE(dcp->ext_dead))
+ 		return 0;
+ 	iomfb_v14_7_backlight_suspend(dcp);
+@@ -5195,7 +5203,7 @@ static int dcp_platform_resume(struct device *dev)
+ 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+ 
+ 	if (iomfb_is_m4(dcp))
+-		return iomfb_m4_health(dcp);
++		return iomfb_m4_resume(dcp);
+ 	if (READ_ONCE(dcp->ext_dead))
+ 		return 0;
+ 
+@@ -5217,10 +5225,26 @@ static int dcp_platform_resume(struct device *dev)
+ 	return 0;
+ }
+ 
++/*
++ * Hibernation: the T8132 power-down keeps the retained session, which a
++ * hibernation image cannot carry across the boot that restores it.
++ */
++static int dcp_platform_freeze(struct device *dev)
++{
++	if (iomfb_is_m4(dev_get_drvdata(dev)))
++		return -EBUSY;
++	return dcp_platform_suspend(dev);
++}
++
+ static const struct dev_pm_ops dcp_platform_pm_ops = {
+ 	.prepare = pm_sleep_ptr(dcp_platform_prepare),
+ 	.complete = pm_sleep_ptr(dcp_platform_complete),
+-	SYSTEM_SLEEP_PM_OPS(dcp_platform_suspend, dcp_platform_resume)
++	.suspend = pm_sleep_ptr(dcp_platform_suspend),
++	.resume = pm_sleep_ptr(dcp_platform_resume),
++	.freeze = pm_sleep_ptr(dcp_platform_freeze),
++	.thaw = pm_sleep_ptr(dcp_platform_resume),
++	.poweroff = pm_sleep_ptr(dcp_platform_freeze),
++	.restore = pm_sleep_ptr(dcp_platform_resume),
+ };
+ 
+ static const struct apple_dcp_hw_data apple_dcp_hw_t6020 = {
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 0940bb01a8..f30610ee88 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -69,6 +69,7 @@ struct iomfb_m4 {
+ 	size_t allocated;
+ 	int error;
+ 	bool started, init_sent, ready, startup_started;
++	bool powered_off; /* setPowerState(0) for system sleep */
+ 	/* Exact completed successor or blank is the only framebuffer retirement. */
+ 	struct drm_framebuffer *active_fb;
+ 	struct drm_framebuffer *uncertain_fb;
+@@ -1293,6 +1294,8 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+ 		return ret;
+ 	mutex_lock(&dcp->lock);
+ 	ret = dcp_m4_runtime_live(dcp->runtime);
++	if (!ret && dcp->powered_off)
++		ret = -EAGAIN;
+ 	if (!ret)
+ 		ret = iomfb_m4_check_frame(&frame);
+ 	if (ret)
+@@ -1343,6 +1346,84 @@ int iomfb_m4_blank(struct apple_dcp *owner)
+ 	return ret;
+ }
+ 
++/* setPowerState (A473), on the out-of-band stream on IOMFB 26.x. */
++struct dcp_m4_power_state_req {
++	__le64 state;
++	u8 flags[4];
++	u8 result_null;
++	u8 padding[3];
++} __packed;
++static_assert(sizeof(struct dcp_m4_power_state_req) == 16);
++
++struct dcp_m4_power_state_reply {
++	__le32 value;
++	__le32 status;
++} __packed;
++static_assert(sizeof(struct dcp_m4_power_state_reply) == 8);
++
++static int dcp_m4_set_power_state(struct iomfb_m4 *dcp, bool on)
++{
++	struct dcp_m4_power_state_req req = { .state = cpu_to_le64(on) };
++	struct dcp_m4_power_state_reply reply = {};
++	int ret;
++
++	lockdep_assert_held(&dcp->lock);
++	ret = dcp_m4_runtime_live(dcp->runtime);
++	if (!ret)
++		ret = dcp_m4_runtime_call_stream(dcp->runtime, 473, 1, false, &req,
++						 sizeof(req), &reply, sizeof(reply));
++	if (!ret && reply.status) {
++		dev_err(dcp->dev, "display power %s refused: status %#x\n",
++			on ? "on" : "off", le32_to_cpu(reply.status));
++		ret = -EIO;
++		dcp_m4_failed(dcp, ret);
++	}
++	return ret;
++}
++
++/* apple-drm, a consumer of this device, has blanked the panel before this. */
++int iomfb_m4_suspend(struct apple_dcp *owner)
++{
++	struct iomfb_m4 *dcp = owner->v26_6;
++	int ret;
++
++	if (!dcp || !dcp->runtime)
++		return -ENODEV;
++	mutex_lock(&dcp->lock);
++	/* Also the startup surface, shown before the first frame */
++	if (dcp->active_fb || dcp->active_frame.dva) {
++		dev_warn(dcp->dev, "panel still scanning out: refusing system sleep\n");
++		ret = -EBUSY;
++	} else {
++		ret = dcp_m4_set_power_state(dcp, false);
++	}
++	if (!ret)
++		dcp->powered_off = true;
++	mutex_unlock(&dcp->lock);
++	return ret;
++}
++
++int iomfb_m4_resume(struct apple_dcp *owner)
++{
++	struct iomfb_m4 *dcp = owner->v26_6;
++	int ret;
++
++	if (!dcp || !dcp->runtime)
++		return -ENODEV;
++	mutex_lock(&dcp->lock);
++	if (dcp->powered_off) {
++		ret = dcp_m4_set_power_state(dcp, true);
++		if (!ret)
++			dcp->powered_off = false;
++	} else {
++		ret = dcp_m4_runtime_health(dcp->runtime);
++		if (ret)
++			dcp_m4_failed(dcp, ret);
++	}
++	mutex_unlock(&dcp->lock);
++	return ret;
++}
++
+ static void iomfb_m4_backlight_work(struct work_struct *work)
+ {
+ 	struct iomfb_m4 *dcp = container_of(work, struct iomfb_m4, backlight_work);
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.h b/drivers/gpu/drm/apple/iomfb_m4.h
+index 29296e527f..f89ddcf084 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.h
++++ b/drivers/gpu/drm/apple/iomfb_m4.h
+@@ -27,6 +27,8 @@ int iomfb_m4_error(struct apple_dcp *dcp);
+ int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer *fb,
+ 		     dma_addr_t dva, size_t mapped);
+ int iomfb_m4_blank(struct apple_dcp *dcp);
++int iomfb_m4_suspend(struct apple_dcp *dcp);
++int iomfb_m4_resume(struct apple_dcp *dcp);
+ void iomfb_m4_configure_backlight(struct apple_dcp *dcp);
+ void iomfb_m4_quiesce(struct apple_dcp *dcp);
+ void iomfb_m4_debugfs_init(struct apple_dcp *dcp, struct dentry *root);
+@@ -50,6 +52,8 @@ static inline int iomfb_m4_present(struct apple_dcp *dcp, struct drm_framebuffer
+ 	return -ENODEV;
+ }
+ static inline int iomfb_m4_blank(struct apple_dcp *dcp) { return -ENODEV; }
++static inline int iomfb_m4_suspend(struct apple_dcp *dcp) { return -ENODEV; }
++static inline int iomfb_m4_resume(struct apple_dcp *dcp) { return -ENODEV; }
+ static inline void iomfb_m4_configure_backlight(struct apple_dcp *dcp) { }
+ static inline void iomfb_m4_quiesce(struct apple_dcp *dcp) { }
+ static inline void iomfb_m4_debugfs_init(struct apple_dcp *dcp, struct dentry *root) { }

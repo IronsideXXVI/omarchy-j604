@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 18:29:40 +1100
+Subject: [PATCH] wifi: brcmfmac: msgbuf: keep the flowring tx count from going
+ negative
+
+Every Wi-Fi disconnect before system sleep logged
+"brcmf_msgbuf_delete_flowring: timed out waiting for txstatus", one or
+two per sleep cycle on BCM4387 Macs (M1 Pro, M2).
+
+A kprobe on brcmf_msgbuf_delete_flowring() reading each flowring's
+outstanding_tx showed two cases, 10 timeouts in 12 sleep cycles:
+
+- the count is positive: frames were queued to the AP when the link
+  went down, and the firmware completes them only when it flushes the
+  ring for the delete request, so the wait before that request cannot
+  succeed;
+- the count is negative: after a timeout the count is set to zero,
+  the late completions then take it below zero, and nothing resets it
+  when the flowid is used again, so the next delete on that flowid
+  waits out its full timeout as well.
+
+Reset the count when a ring is created, never decrement it below zero,
+and report the timeout at debug level with the count: it is expected
+when the peer is gone, and the ring is deleted either way.
+
+Signed-off-by: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Assisted-by: LLM
+(cherry picked from commit 393fefb80fc518083beb4bccb5fcb8dd9800466f)
+---
+ .../broadcom/brcm80211/brcmfmac/msgbuf.c      | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c
+index 5806a0b140..b3b22d16be 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c
+@@ -729,6 +729,10 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
+ 		return BRCMF_FLOWRING_INVALID_ID;
+ 	}
+ 
++	/* A new ring has nothing in flight, whatever the previous ring on
++	 * this flowid left behind.
++	 */
++	atomic_set(&msgbuf->flowrings[flowid]->outstanding_tx, 0);
+ 	brcmf_commonring_config(msgbuf->flowrings[flowid],
+ 				BRCMF_H2D_TXFLOWRING_MAX_ITEM,
+ 				BRCMF_H2D_TXFLOWRING_ITEMSIZE, dma_buf);
+@@ -1043,7 +1047,13 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
+ 
+ 	set_bit(flowid, msgbuf->txstatus_done_map);
+ 	commonring = msgbuf->flowrings[flowid];
+-	atomic_dec(&commonring->outstanding_tx);
++	/* brcmf_msgbuf_delete_flowring() zeroes the count when it stops
++	 * waiting, and the firmware completes those frames later, when it
++	 * flushes the ring. Don't let them take the count below zero: a
++	 * negative count outlives the ring, and the next delete on this
++	 * flowid then waits out its full timeout.
++	 */
++	atomic_dec_if_positive(&commonring->outstanding_tx);
+ 
+ 	ifp = brcmf_get_ifp(msgbuf->drvr, tx_status->msg.ifidx);
+ 	/* Key on the flowring's ifidx, which the host assigned when it queued
+@@ -1610,7 +1620,12 @@ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid)
+ 		retry--;
+ 	}
+ 	if (!retry) {
+-		brcmf_err("timed out waiting for txstatus\n");
++		/* Expected when the peer is gone (disconnect, suspend): the
++		 * firmware completes these frames only when it flushes the
++		 * ring for the delete request below.
++		 */
++		brcmf_dbg(MSGBUF, "flowring %u: %d tx outstanding, deleting it anyway\n",
++			  flowid, atomic_read(&commonring_del->outstanding_tx));
+ 		atomic_set(&commonring_del->outstanding_tx, 0);
+ 	}
+ 

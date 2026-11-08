@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 6 Nov 2026 00:40:28 +0000
+Subject: [PATCH] thermal: apple: pmp: Run the PMP CPU policy on the J604 as
+ well
+
+The PMP CPU/GPU thermal policy (c4d87e269d, "thermal: apple: add the
+J713 PMP CPU policy") binds only on the J713. The J604 already publishes
+the same PMP telemetry: pmp-telemetry admits it and registers the
+apple-pmp-thermal device, and the PMP die records read on the J604
+(MEASURED on -11.3: aggregate hotspot plus Ta000m, Te000m, Te001m,
+Tp000m and Tp001m in the apple_pmp hwmon). Its CPU clusters are the ones
+the policy hard-codes (MEASURED: cpufreq policy0 = CPUs 0 and 7-9, P;
+policy1 = CPUs 1-6, E). So nothing but the board gate keeps the policy
+off the J604, which instead carried a device-tree zone with
+unqualified trips.
+
+Replace the gate by a table of qualified boards and admit the J604.
+The trips, cooling envelope, 5 ms sampling and the confirmed 120 C
+shutdown stay the J713's. The measured-rail power budget does not apply
+to the J604: it is the J713's fanless envelope and, once the burst
+energy is spent, regulates the CPU/GPU rails toward an 85 C die. The
+J604's fan, which its SMC runs, is the heat path that budget stands in
+for, so the J604 takes the temperature policy alone. Its rails are still
+read and reported through the apple_pmp_power hwmon, and a rail read
+error neither restricts the CPUs nor the GPU there.
+
+The J604 qualification is a sustained all-core load with temperatures,
+clocks and throttling recorded .
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ Documentation/soc/apple/t8132-pmp-thermal.rst |  6 +++
+ drivers/thermal/Kconfig                       |  3 +-
+ drivers/thermal/apple-pmp-thermal.c           | 48 ++++++++++++++++---
+ 3 files changed, 49 insertions(+), 8 deletions(-)
+
+diff --git a/Documentation/soc/apple/t8132-pmp-thermal.rst b/Documentation/soc/apple/t8132-pmp-thermal.rst
+index e0b4872cdb..3055833746 100644
+--- a/Documentation/soc/apple/t8132-pmp-thermal.rst
++++ b/Documentation/soc/apple/t8132-pmp-thermal.rst
+@@ -23,6 +23,12 @@ temperature trips, power envelope and unmanaged CPU ceiling must not be
+ described as Apple firmware limits or thermal parity with another SoC. T8132
+ does not currently have a qualified effort lane in the PMP report driver.
+ 
++The J604 (MacBook Pro 14-inch, M4) has the same PMP records and CPU
++clusters and takes the same temperature policy. It runs without the
++measured-rail budget, which is the J713's fanless envelope: the J604's fan,
++run by its SMC, is the heat path that budget stands in for. Its rails are
++still read and reported.
++
+ The historical emergency shutdown threshold is kept in
+ ``pmp-emergency-policy.h`` separately from ordinary cooling tuning. This
+ separation does not qualify that threshold: it remains an existing development
+diff --git a/drivers/thermal/Kconfig b/drivers/thermal/Kconfig
+index d7d03fa915..fa8127b961 100644
+--- a/drivers/thermal/Kconfig
++++ b/drivers/thermal/Kconfig
+@@ -570,7 +570,8 @@ config APPLE_PMP_THERMAL
+ 	help
+ 	  CPU/GPU cooling, measured-rail power budgets and fault guards fed by the PMP
+ 	  firmware owner. Higher CPU states remain capped until protection is
+-	  installed. The sensor topology is qualified for J713 only. Cooling,
++	  installed. The sensor topology is qualified for J713 and J604; the
++	  J604, which has a fan, runs without the rail budget. Cooling,
+ 	  measured-rail budgets and the separate emergency shutdown are provisional
+ 	  Linux policies, not Apple firmware limits. A T8132 firmware effort lane,
+ 	  emergency limit and advancing telemetry heartbeat remain unqualified.
+diff --git a/drivers/thermal/apple-pmp-thermal.c b/drivers/thermal/apple-pmp-thermal.c
+index 203ea9f560..46dc59af88 100644
+--- a/drivers/thermal/apple-pmp-thermal.c
++++ b/drivers/thermal/apple-pmp-thermal.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ /*
+- * J713 CPU/GPU thermal policy using read-only samples from the PMP owner.
++ * T8132 (J713, J604) CPU/GPU thermal policy using read-only samples from the
++ * PMP owner.
+  * The policy and thresholds are carried from the existing M4 implementation;
+  * these are Linux operating limits, not inferred Apple hardware safety limits.
+  * Guards are installed before cpufreq relinquishes its unmanaged ceiling.
+@@ -40,6 +41,25 @@
+ #define APPLE_PMP_POLL_MS		5
+ #define APPLE_PMP_GOVERNOR_NS	100000000ULL
+ 
++/*
++ * Boards whose sensor topology and operating policy are qualified: the PMP
++ * die records, P cores 0 and 7-9, E cores 1-6. The measured-rail budget is
++ * the J713's fanless envelope (it regulates toward 85 C once the burst
++ * energy is spent). The J604 has a fan that its SMC runs, so it takes the
++ * temperature policy alone: the same trips, cooling envelope and shutdown
++ * backstop, without the rail budget. Its rails are still read and reported.
++ */
++struct apple_pmp_board {
++	const char *compatible;
++	const char *name;
++	bool rail_budget;
++};
++
++static const struct apple_pmp_board apple_pmp_boards[] = {
++	{ .compatible = "apple,j713", .name = "J713", .rail_budget = true },
++	{ .compatible = "apple,j604", .name = "J604", .rail_budget = false },
++};
++
+ struct apple_pmp_cluster {
+ 	struct cpufreq_policy *policy;
+ 	struct thermal_cooling_device *cdev;
+@@ -47,6 +67,7 @@ struct apple_pmp_cluster {
+ };
+ 
+ static struct {
++	const struct apple_pmp_board *board;
+ 	const struct apple_pmp_sensor_data *sensors;
+ 	struct thermal_zone_device *zone;
+ 	struct apple_pmp_cluster clusters[2];
+@@ -199,14 +220,15 @@ static void apple_pmp_power_work(struct work_struct *work)
+ 		active |= BIT(2);
+ 	apple_pmp_power_set_active(p, active);
+ 	apple_pmp_power_sample(p, now, mw, pmp_thermal.cached_mc, ret);
+-	apple_pmp_gpu_publish(pmp_thermal.sensors, epoch, p->level[2],
++	apple_pmp_gpu_publish(pmp_thermal.sensors, epoch,
++			      pmp_thermal.board->rail_budget ? p->level[2] : 0,
+ 			      active & BIT(2) ? p->last_ns : 0);
+ 	pr_debug("apple-pmp-thermal: power ns=%llu mc=%ld p_mw=%u e_mw=%u gpu_mw=%u total_mw=%d sustainable_mw=%d allowed_mw=%d credit_mj=%lld p_level=%u e_level=%u gpu_level=%u error=%d\n",
+ 		now, pmp_thermal.cached_mc, mw[0], mw[1], mw[2], p->total_mw,
+ 		p->sustainable_mw, p->allowed_mw, p->credit_mj,
+ 		p->level[0], p->level[1], p->level[2], ret);
+ 	mutex_unlock(&pmp_thermal.lock);
+-	if (ret)
++	if (ret && pmp_thermal.board->rail_budget)
+ 		pr_warn_ratelimited("apple-pmp-thermal: power telemetry error %d, retaining minimum CPU/GPU ceilings\n",
+ 				    ret);
+ 	schedule_delayed_work(&pmp_thermal.power_work, msecs_to_jiffies(500));
+@@ -329,7 +351,9 @@ static int apple_pmp_guard(unsigned int level)
+ 		unsigned int power_level = pmp_thermal.power.level[i];
+ 		unsigned int effective;
+ 
+-		if (!pmp_thermal.power.last_ns || ktime_get_ns() -
++		if (!pmp_thermal.board->rail_budget)
++			power_level = 0;
++		else if (!pmp_thermal.power.last_ns || ktime_get_ns() -
+ 		    pmp_thermal.power.last_ns > APPLE_PMP_POWER_STALE_NS)
+ 			power_level = 8;
+ 		effective = max(level, power_level);
+@@ -713,7 +737,9 @@ static int apple_pmp_thermal_setup(void)
+ 		if (ret)
+ 			goto fail;
+ 	}
+-	pr_info("apple-pmp-thermal: J713 provisional policy: CPU/GPU cooling from 106 C, target 110 C, full protection 115 C, three >=120 C samples for shutdown, 5 ms sampling/100 ms governor, shared measured-rail power budget\n");
++	pr_info("apple-pmp-thermal: %s provisional policy: CPU/GPU cooling from 106 C, target 110 C, full protection 115 C, three >=120 C samples for shutdown, 5 ms sampling/100 ms governor, %s\n",
++		pmp_thermal.board->name, pmp_thermal.board->rail_budget ?
++		"shared measured-rail power budget" : "no rail budget (fan under SMC control)");
+ 	pmp_thermal.ready = true;
+ 	return 0;
+ fail:
+@@ -738,12 +764,20 @@ static void apple_pmp_thermal_setup_work(struct work_struct *work)
+ static int apple_pmp_thermal_probe(struct platform_device *pdev)
+ {
+ 	const struct apple_pmp_sensor_data *sensors = dev_get_platdata(&pdev->dev);
++	const struct apple_pmp_board *board = NULL;
++	unsigned int i;
+ 
+-	/* Only this board's sensor topology and operating policy are qualified. */
+-	if (!of_machine_is_compatible("apple,j713"))
++	/* Only these boards' sensor topology and operating policy are qualified. */
++	for (i = 0; i < ARRAY_SIZE(apple_pmp_boards); i++)
++		if (of_machine_is_compatible(apple_pmp_boards[i].compatible)) {
++			board = &apple_pmp_boards[i];
++			break;
++		}
++	if (!board)
+ 		return -ENODEV;
+ 	if (!sensors || !sensors->read || !sensors->dev)
+ 		return -EINVAL;
++	pmp_thermal.board = board;
+ 	pmp_thermal.sensors = sensors;
+ 	pmp_thermal.cached_error = -EAGAIN;
+ 	pmp_thermal.power_error = -EAGAIN;

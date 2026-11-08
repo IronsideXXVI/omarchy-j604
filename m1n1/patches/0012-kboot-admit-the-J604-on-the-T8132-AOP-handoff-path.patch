@@ -1,0 +1,275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 4 Nov 2026 05:51:37 -0600
+Subject: [PATCH] kboot: admit the J604 on the T8132 AOP handoff path
+
+8333079a held the J604 back from T8132_PATH_AOP because its iop-aop-nub
+aop-target (0) differs from the J713's (1). That property does not
+reach the handoff: no m1n1, U-Boot or Linux code reads aop-target, and
+the J713-qualified Linux AOP configuration writes the AOPt boot argument
+0 whatever the ADT says.
+
+What the AOP path reads matches. dt_set_t8132_aop() checks the AOP is
+halted, programs the dart-aop bank selected by instance[1], reserves
+iop-aop-nub segment-ranges and reserves the bank's merged windows. On
+the J604:
+
+- the 25G83 and 26B123 template ADTs carry the same dart-aop instance
+  table, reg and dapf-instance-0 (16 slices) as the J713 ones;
+- a 27.2 (26B123) runtime ADT of the J604 equals
+  tests/data/j713-dapf-instance.json, the J713 runtime fixture the
+  writer tests run on, in every field: the dart-aop, dart-mtp and
+  dart-pmp instance tables, their reg windows after the arm-io ranges,
+  dapf-instance-0, and the consumers' clock-gates;
+- that runtime ADT has the five AOP segments (__TEXT, __DATA, __ETEXT,
+  __EDATA, __OS_LOG), __ETEXT remapped to 0x10000000000 as on J713.
+
+Every step still checks the live ADT and disables the AOP on any
+failure, and the handoff only runs when the kernel DT asks for it in
+/chosen linux-enablement-mac,dapf-handoff. The segments under the 25G83
+stub iBoot, and that it leaves the AOP halted, are first-boot checks.
+
+tests: test_t8132_aop_handoff_gate runs the production
+dt_set_aop_firmware() and dt_set_t8132_aop() on libfdt trees for the
+J604, J713 and an unqualified T8132 board, with the hardware steps
+stubbed; it fails against the previous board table.
+test_t8132_board_admission now expects the J604 on every path.
+
+Hardware tested on: NOT YET
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ docs/j604.md                                |   4 +-
+ src/t8132_board.h                           |  14 +-
+ tests/python/test_t8132_aop_handoff_gate.py | 156 ++++++++++++++++++++
+ tests/python/test_t8132_board_admission.py  |   4 +-
+ 4 files changed, 166 insertions(+), 12 deletions(-)
+ create mode 100644 tests/python/test_t8132_aop_handoff_gate.py
+
+diff --git a/docs/j604.md b/docs/j604.md
+index 95d4ee62..847f2956 100644
+--- a/docs/j604.md
++++ b/docs/j604.md
+@@ -32,7 +32,7 @@ Phandle numbering is ignored.
+ | DISPLAY (DCP firmware mappings, inherited display DART) | dart-disp0 0x30a300000/0xc000 + 0x30a314000/0x4000, mapper-disp0-piodma reg 0x10 (stream 16), dart-dcp 0x30a340000/0x20000, dcp 0x30ae00000/0x88000 | SAME. dcp differs only in `audio` and `hdcp-parent` (phandles). disp0 panel properties differ (dot-pitch, supports-apt). | admitted; segment list and UUID are runtime and validated |
+ | GPU (G16 handoff) | sgx 0x300000000/0x4000000, gfx-asc 0x302600000/0x88000, gfx-asc interrupts 994/993/996/995 (compared on the whole node) | SAME (gfx-asc identical). sgx differs only in `agx-pmu-loops-unsupported` and `gpu-turbo-controller-input`, which m1n1 does not read. | admitted; the code re-checks these values against the live ADT |
+ | DAPF (mtp/pmp/isp consumers requested by the kernel DT) | dart-mtp, dart-pmp, dart-isp nodes incl. `dapf-instance-0` | SAME | admitted |
+-| AOP (AOP DAPF bank, firmware segments, windows) | dart-aop SAME; **aop/iop-aop-nub `aop-target` = 0 on J604, 1 on J713** | DIFF | **not admitted, TO-VERIFY**: what aop-target selects, and whether dart-aop DAPF instance 1 applies |
++| AOP (AOP DAPF bank, firmware segments, windows) | dart-aop `instance` (index 1 = DAPF bank 0), `dapf-instance-0` (16 slices), its `reg` windows and the aop `clock-gates`; iop-aop-nub `segment-ranges` (runtime). Not read: iop-aop-nub `aop-target` (0 on J604, 1 on J713), which no boot stage or Linux driver reads | SAME, and the J604 27.2 runtime ADT equals `tests/data/j713-dapf-instance.json` on every one of these fields | admitted; the AOP must be halted and its handoff requested in the kernel DT `/chosen`, the bank must read back and the segments must reserve, or the AOP is disabled |
+ | ATC_USB3 (T8132 USB3 tunables copied from the ADT) | atc-phy0/1 nodes; tunables are read from the live ADT | atc-phy0/1 SAME; J604 also has atc-phy2 (third USB-C port) | admitted; the extra port is described by the kernel DT |
+ | PCIE_RADIO (SMC gP13 rail, SID16 bypass, PCIe disable on failure) | amfm `function-reg_on` = SMC GPIO `gP13`, action `pKW4`, argument 0x00800000 (`SMC_J713_RADIO_REG_ON_TEMPLATE`); dart-apcie0 0x490000000/0x20000; apcie 0x1cb0000000/0x10000000 ECAM | SAME (only the SMC phandle differs). J604 also has apcie pci-bridge2/pcie-sdreader (`sd_pwr_en` = gP19, argument 0) and dart-apcie2. pci-bridge0 `default-apcie-options` differs, but m1n1 does not read it. | admitted for the radio; see the risk below |
+ 
+@@ -46,7 +46,7 @@ identical on J604 and J713 at 26B123. The boot CPU is a runtime value
+ 1. `/chosen` board-id, dram-base/dram-size, and the carveout memory map (STORAGE).
+ 2. DCP `segment-ranges` and the firmware UUID (DISPLAY). The code validates both and refuses on a mismatch.
+ 3. sgx `gpu-region`, `gfx-shared-region`, `gfx-handoff`, `gfx-shared-l2-region`, and the gfx-asc segments (GPU).
+-4. aop/iop-aop-nub `aop-target` and `segment-ranges`, and the dart-aop DAPF instances (AOP; held back until then).
++4. aop/iop-aop-nub `segment-ranges` under the 25G83 stub iBoot, and that the AOP is halted at handoff (the J604 27.2 runtime ADT, booted by the macOS iBoot, has the five segments __TEXT/__DATA/__ETEXT/__EDATA/__OS_LOG and the same DAPF bank). The code refuses and disables the AOP on either mismatch.
+ 5. The boot CPU, and the PMGR CPU_START status before and after secondary start (logged by m1n1 around each CPU start).
+ 6. The kernel DT compatible for J604 (`apple,j604`) and its PCIe port description (kernel device tree).
+ 
+diff --git a/src/t8132_board.h b/src/t8132_board.h
+index eff16ee7..a14ac4bb 100644
+--- a/src/t8132_board.h
++++ b/src/t8132_board.h
+@@ -42,15 +42,13 @@ static inline bool t8132_board_admitted(const void *fdt, enum t8132_board_path p
+         /* The board aurora-silicon/m1n1 #35-#48 were qualified on. */
+         {"apple,j713", T8132_PATHS_ALL},
+         /*
+-         * J604 (MacBook Pro 14-inch, M4, Mac16,1). AOP is held back: its
+-         * iop-aop-nub aop-target differs from the J713's (0 vs 1 in the
+-         * 26B123 template ADT) and the effect on the J713 AOP handoff is not
+-         * known. See docs/j604.md.
++         * J604 (MacBook Pro 14-inch, M4, Mac16,1). The AOP path reads the
++         * AOP DART's instance table, DAPF bank and windows, and the AOP's
++         * firmware segments; the J604 values match the J713 ones. Its
++         * iop-aop-nub aop-target (0, J713 1) is not read by this path.
++         * See docs/j604.md.
+          */
+-        {"apple,j604", T8132_PATH_BIT(T8132_PATH_STORAGE) | T8132_PATH_BIT(T8132_PATH_DISPLAY) |
+-                           T8132_PATH_BIT(T8132_PATH_GPU) | T8132_PATH_BIT(T8132_PATH_DAPF) |
+-                           T8132_PATH_BIT(T8132_PATH_ATC_USB3) |
+-                           T8132_PATH_BIT(T8132_PATH_PCIE_RADIO)},
++        {"apple,j604", T8132_PATHS_ALL},
+     };
+ 
+     if (!fdt || (unsigned int)path >= T8132_PATH_COUNT)
+diff --git a/tests/python/test_t8132_aop_handoff_gate.py b/tests/python/test_t8132_aop_handoff_gate.py
+new file mode 100644
+index 00000000..b8b84458
+--- /dev/null
++++ b/tests/python/test_t8132_aop_handoff_gate.py
+@@ -0,0 +1,156 @@
++# SPDX-License-Identifier: MIT
++"""Run kboot's T8132 AOP handoff gate (dt_set_aop_firmware, dt_set_t8132_aop) per board.
++
++The production functions are cut out of src/kboot.c and run against real
++libfdt trees. The hardware steps they call (ASC state, the DAPF writer, the
++segment and window reservations) are stubs that count their calls, so the
++test checks the gate: which board and /chosen request reach the handoff, and
++that every refusal disables the AOP before any hardware step that follows it.
++"""
++
++from pathlib import Path
++import subprocess
++
++from test_j713_dapf_instance import block
++
++PREFIX = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "libfdt.h"
++typedef uint32_t u32;
++typedef unsigned long u64;
++#define T8132 0x8132
++#define T8140 0x8140
++#define bail(...) do { printf(__VA_ARGS__); return -1; } while (0)
++static int chip_id = T8132;
++static void *dt;
++typedef struct asc_dev asc_dev_t;
++struct asc_dev { int unused; };
++static struct asc_dev the_asc;
++static bool asc_ok, cpu_running;
++static int dapf_ret, seg_ret, win_ret;
++static unsigned asc_calls, dapf_calls, seg_calls, win_calls;
++static asc_dev_t *asc_init(const char *path)
++{ assert(!strcmp(path, "/arm-io/aop")); asc_calls++; return asc_ok ? &the_asc : NULL; }
++static bool asc_cpu_running(asc_dev_t *asc) { assert(asc == &the_asc); return cpu_running; }
++static void asc_free(asc_dev_t *asc) { assert(asc == &the_asc); }
++static int dapf_init_t8132_halted(const char *path, int index)
++{ assert(!strcmp(path, "/arm-io/dart-aop") && index == 1); dapf_calls++; return dapf_ret; }
++static int dt_reserve_asc_segments(const char *adt_path, const char *adt_path_alt,
++                                   const char *fdt_path, bool remap, u64 base, bool dram_only)
++{
++    assert(!strcmp(adt_path, "/arm-io/aop/iop-aop-nub") && !adt_path_alt);
++    assert(!strcmp(fdt_path, "/soc/aop@390600000") && remap && !base && dram_only);
++    seg_calls++; return seg_ret;
++}
++static int dt_reserve_t8132_aop_windows(const char *path)
++{ assert(!strcmp(path, "/soc/aop@390600000")); win_calls++; return win_ret; }
++'''
++
++TESTS = r'''
++static char tree[8192];
++/* A kernel DT: the board compatible, /chosen with the requested handoffs (a
++ * NUL-separated list, or none) and an AOP node with the given status. */
++static void make(const char *compatible, int clen, const char *request, int rlen, const char *status)
++{
++    int soc, aop, chosen;
++    assert(!fdt_create_empty_tree(tree, sizeof(tree)));
++    assert(!fdt_setprop(tree, 0, "compatible", compatible, clen));
++    chosen = fdt_add_subnode(tree, 0, "chosen");
++    assert(chosen >= 0);
++    if (request)
++        assert(!fdt_setprop(tree, chosen, "linux-enablement-mac,dapf-handoff", request, rlen));
++    soc = fdt_add_subnode(tree, 0, "soc");
++    assert(soc >= 0);
++    aop = fdt_add_subnode(tree, soc, "aop@390600000");
++    assert(aop >= 0);
++    assert(!fdt_setprop_string(tree, aop, "compatible", "apple,t8132-aop"));
++    if (status)
++        assert(!fdt_setprop_string(tree, aop, "status", status));
++    assert(!fdt_setprop_u32(tree, aop, "phandle", 7));
++    dt = tree;
++    chip_id = T8132; asc_ok = true; cpu_running = false;
++    dapf_ret = seg_ret = win_ret = 0;
++    asc_calls = dapf_calls = seg_calls = win_calls = 0;
++}
++static const char *status(void)
++{
++    const char *s = fdt_getprop(dt, fdt_path_offset(dt, "/soc/aop@390600000"), "status", NULL);
++    return s ? s : "(none)";
++}
++static void calls(unsigned a, unsigned d, unsigned s, unsigned w)
++{ assert(asc_calls == a && dapf_calls == d && seg_calls == s && win_calls == w); }
++
++static const char J604[] = "apple,j604\0apple,t8132\0apple,arm-platform";
++static const char J713[] = "apple,j713\0apple,t8132\0apple,arm-platform";
++static const char J715[] = "apple,j715\0apple,t8132\0apple,arm-platform";
++static const char AOP_MTP[] = "/arm-io/aop\0/arm-io/mtp";
++static const char MTP[] = "/arm-io/mtp";
++
++static void admitted(const char *board, int blen)
++{
++    /* Requested, halted, every step succeeds: handed over, left enabled. */
++    make(board, blen, AOP_MTP, sizeof(AOP_MTP), "okay");
++    assert(!dt_set_aop_firmware() && !strcmp(status(), "okay")); calls(1, 1, 1, 1);
++    make(board, blen, AOP_MTP, sizeof(AOP_MTP), NULL);
++    assert(!dt_set_aop_firmware() && !strcmp(status(), "(none)")); calls(1, 1, 1, 1);
++    /* Not requested: disabled before the ASC is touched. */
++    make(board, blen, NULL, 0, "okay");
++    assert(!dt_set_aop_firmware() && !strcmp(status(), "disabled")); calls(0, 0, 0, 0);
++    make(board, blen, MTP, sizeof(MTP), "okay");
++    assert(!dt_set_aop_firmware() && !strcmp(status(), "disabled")); calls(0, 0, 0, 0);
++    /* Each failing step disables the AOP and stops the steps after it. */
++    make(board, blen, AOP_MTP, sizeof(AOP_MTP), "okay"); asc_ok = false;
++    assert(!dt_set_aop_firmware() && !strcmp(status(), "disabled")); calls(1, 0, 0, 0);
++    make(board, blen, AOP_MTP, sizeof(AOP_MTP), "okay"); cpu_running = true;
++    assert(!dt_set_aop_firmware() && !strcmp(status(), "disabled")); calls(1, 0, 0, 0);
++    make(board, blen, AOP_MTP, sizeof(AOP_MTP), "okay"); dapf_ret = -1;
++    assert(!dt_set_aop_firmware() && !strcmp(status(), "disabled")); calls(1, 1, 0, 0);
++    make(board, blen, AOP_MTP, sizeof(AOP_MTP), "okay"); seg_ret = -1;
++    assert(!dt_set_aop_firmware() && !strcmp(status(), "disabled")); calls(1, 1, 1, 0);
++    make(board, blen, AOP_MTP, sizeof(AOP_MTP), "okay"); win_ret = -1;
++    assert(!dt_set_aop_firmware() && !strcmp(status(), "disabled")); calls(1, 1, 1, 1);
++    /* A disabled AOP node, or another SoC, is left alone. */
++    make(board, blen, AOP_MTP, sizeof(AOP_MTP), "disabled");
++    assert(!dt_set_aop_firmware() && !strcmp(status(), "disabled")); calls(0, 0, 0, 0);
++    make(board, blen, AOP_MTP, sizeof(AOP_MTP), "okay"); chip_id = T8140;
++    assert(!dt_set_aop_firmware() && !strcmp(status(), "okay")); calls(0, 0, 0, 0);
++}
++
++int main(void)
++{
++    admitted(J604, sizeof(J604));
++    admitted(J713, sizeof(J713));
++    /* An unqualified T8132 board: neither handed over nor disabled, requested or not. */
++    make(J715, sizeof(J715), AOP_MTP, sizeof(AOP_MTP), "okay");
++    assert(!dt_set_aop_firmware() && !strcmp(status(), "okay")); calls(0, 0, 0, 0);
++    make(J715, sizeof(J715), NULL, 0, "okay");
++    assert(!dt_set_aop_firmware() && !strcmp(status(), "okay")); calls(0, 0, 0, 0);
++    puts("T8132 AOP handoff gate: J604 and J713 admitted, J715 skipped, every refusal disables");
++    return 0;
++}
++'''
++
++
++def test_t8132_aop_handoff_gate(tmp_path):
++    repo = Path(__file__).resolve().parents[2]
++    kboot = (repo / "src/kboot.c").read_text()
++    production = (block(kboot, "static int dt_set_t8132_aop(const char *path)") + "\n" +
++                  block(kboot, "static int dt_set_aop_firmware(void)") + "\n")
++    board = "\n".join(line for line in (repo / "src/t8132_board.h").read_text().splitlines()
++                      if not line.startswith("#include"))
++    source = tmp_path / "aop-gate.c"
++    binary = tmp_path / "aop-gate"
++    source.write_text(PREFIX + board + "\n" + production + TESTS)
++    libfdt = repo / "src/libfdt"
++    sources = [libfdt / (n + ".c") for n in ("fdt", "fdt_ro", "fdt_rw", "fdt_sw", "fdt_wip",
++                                             "fdt_empty_tree", "fdt_check", "fdt_strerror",
++                                             "fdt_addresses")]
++    subprocess.run(["cc", "-D_GNU_SOURCE", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
++                    "-Wno-unused-parameter", "-Wno-unused-function", "-I", str(libfdt),
++                    str(source), *map(str, sources), "-o", str(binary)], check=True)
++    result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
++    assert "J604 and J713 admitted" in result.stdout
+diff --git a/tests/python/test_t8132_board_admission.py b/tests/python/test_t8132_board_admission.py
+index 5fde1b82..6c22af47 100644
+--- a/tests/python/test_t8132_board_admission.py
++++ b/tests/python/test_t8132_board_admission.py
+@@ -33,10 +33,10 @@ int main(void)
+     }
+     assert(all == T8132_PATHS_ALL);
+ 
+-    /* J604: every path but the AOP handoff (see docs/j604.md). */
++    /* J604: every path, the AOP handoff included (see docs/j604.md). */
+     TREE(dt, "apple,j604\0apple,t8132\0apple,arm-platform");
+     for (int p = 0; p < T8132_PATH_COUNT; p++)
+-        assert(t8132_board_admitted(dt, p) == (p != T8132_PATH_AOP));
++        assert(t8132_board_admitted(dt, p));
+ 
+     /* Other T8132 boards, and look-alike names, are admitted nowhere. */
+     const char *others[] = {"apple,j715", "apple,j604x", "apple,j60", "apple,t8132"};

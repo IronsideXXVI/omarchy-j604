@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 6 Nov 2026 04:34:56 +0000
+Subject: [PATCH] drm/apple: m4: time-stamp the J604 panel's swaps for 120 Hz
+
+The J604 (MacBook Pro 14-inch, M4) record admits the panel's 120 Hz timing
+(PreciseSyncRate 0x78001f, 120.0 Hz), but its swaps go out with the timing
+words zeroed: dcp_m4_swap_encode_full() clears the whole record. The
+firmware then completes at most one swap per 16.7 ms, so the mode reports
+120 Hz while a vsync-locked client measures 60 fps. On the J604, vkmark
+with the FIFO present mode runs every scene at exactly 16.667 ms per frame.
+
+The M4 swap record is the 26.6.2 (25G83) one of the J613 v26 backend: the
+same size and the same offsets for the ID, masks, background, brightness,
+surface, DVA and nullable bytes. That backend documents the timing
+words at 0x00, 0x08 and 0x30 (dcp_v26_swap_set_timing()): with all of
+them zero, back-to-back swaps on a 120 Hz panel complete about 16.7 ms
+apart. The J516C and T6030 records on 14.7 firmware went from 60 to 120
+fps by writing the constant 120 in the same words
+(dcp_v14_swap_timestamps()). A counter value makes the firmware time out
+on the first swap.
+
+Add swap_timestamps to the M4 board record, set it only for the J604,
+and write 120 in the three words of a present (primary plane with a
+frame and no intent) on such a board. Blanks, upper-plane-only updates
+and the idle-cache registration swap keep zero words, byte for byte as
+before, and the J713's 60 Hz record is unchanged. The swap_timestamps
+parameter (default on) turns the words off again for an A/B measurement.
+
+D003 still declines realtime bandwidth service: the J613 v26 backend
+declines it the same way, and Documentation/gpu/apple-dcp-m4.rst keeps it
+declined until a PMC bandwidth owner exists.
+
+Not yet measured on the J604 (needs an on-device run).
+
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp-m4-frame.h   | 20 ++++++++++++++++++++
+ drivers/gpu/drm/apple/dcp-m4-profile.h |  1 +
+ drivers/gpu/drm/apple/iomfb_m4.c       | 11 +++++++++++
+ 3 files changed, 32 insertions(+)
+
+diff --git a/drivers/gpu/drm/apple/dcp-m4-frame.h b/drivers/gpu/drm/apple/dcp-m4-frame.h
+index e822e2cc8b..c84893cf7d 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-frame.h
++++ b/drivers/gpu/drm/apple/dcp-m4-frame.h
+@@ -254,6 +254,26 @@ static inline int dcp_m4_swap_encode_full(void *output, size_t length, u32 swap_
+ 	return 0;
+ }
+ 
++/*
++ * The 26.6.2 swap record opens with the presentation timing words of the
++ * 12.x/13.x firmware, at 0x00, 0x08 and 0x30, as dcp_v26_swap_set_timing()
++ * describes for the same record. With all of them zero, the firmware completes
++ * at most one swap per 16.7 ms on a 120 Hz panel. The constant 120 is a target
++ * that is always past, so a swap is shown at the next refresh; counter values
++ * make the firmware time out (dcp_v14_swap_timestamps()). Call after
++ * dcp_m4_swap_encode_full(), which zeroes the record.
++ */
++#define DCP_M4_SWAP_TIMESTAMP_VALUE	120
++
++static inline void dcp_m4_swap_set_timing(void *output)
++{
++	u8 *data = output;
++
++	put_unaligned_le64(DCP_M4_SWAP_TIMESTAMP_VALUE, data + 0x00);
++	put_unaligned_le64(DCP_M4_SWAP_TIMESTAMP_VALUE, data + 0x08);
++	put_unaligned_le64(DCP_M4_SWAP_TIMESTAMP_VALUE, data + 0x30);
++}
++
+ /* Swap intent that registers surface 0 as the idle-cache surface. */
+ #define DCP_M4_SWAP_INTENT_IDLE_CACHE	8
+ 
+diff --git a/drivers/gpu/drm/apple/dcp-m4-profile.h b/drivers/gpu/drm/apple/dcp-m4-profile.h
+index 3cd83799ce..e05f902c21 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-profile.h
++++ b/drivers/gpu/drm/apple/dcp-m4-profile.h
+@@ -23,6 +23,7 @@ struct dcp_m4_profile {
+ 	u32 swap_tail;			/* final two bytes */
+ 	u32 swap_nits;			/* binary64 brightness */
+ 	u32 swap_intent;		/* swap intent, 0 for a present */
++	bool swap_timestamps;		/* 120 Hz panel: dcp_m4_swap_set_timing() */
+ 	u32 disabled_color;		/* background with no surface */
+ 	u16 done_method;		/* swap completion callback */
+ 	u32 done_size;
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index f4bd4534e3..0fedc1652e 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -89,6 +89,8 @@ static const struct dcp_m4_profile dcp_m4_profiles[] = {
+ 		.swap_intent = 0x17c,
+ 		.disabled_color = 0xff000000,
+ 		.done_method = 590, .done_size = 0x730, .open_method = 457,
++		/* 120 Hz panel: without the timing words it presents at 60 Hz. */
++		.swap_timestamps = true,
+ 		.brightness_max = 600, .brightness_default = 140,
+ 		.width_mm = 0, .height_mm = 0,
+ 		.timing = {
+@@ -134,6 +136,11 @@ module_param_cb(idle_cache_ms, &idle_cache_ms_ops, &idle_cache_ms, 0644);
+ MODULE_PARM_DESC(idle_cache_ms,
+ 		 "J713: cache a static frame after this many ms without a flip (0: never, at most 60000; applies from the next swap)");
+ 
++static bool swap_timestamps = true;
++module_param(swap_timestamps, bool, 0644);
++MODULE_PARM_DESC(swap_timestamps,
++		 "J604: stamp presents with the swap timing words so the 120 Hz panel shows them at 120 Hz, not 60 Hz (default: on; applies from the next swap; J713: no effect)");
++
+ struct iomfb_m4 {
+ 	struct apple_dcp *owner;
+ 	struct device *dev;
+@@ -992,6 +999,10 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
+ 	if (!ret)
+ 		ret = dcp_m4_swap_encode_full(input, DCP_M4_SWAP_SIZE, id, primary, frame, upper,
+ 					      keep, brightness_change, nits, dcp_m4_frame_check);
++	/* Presents only: a blank, an upper-only update and an intent keep zero words. */
++	if (!ret && primary && frame && !intent && dcp_m4_pf->swap_timestamps &&
++	    READ_ONCE(swap_timestamps))
++		dcp_m4_swap_set_timing(input);
+ 	if (!ret && intent)
+ 		dcp_m4_swap_set_intent(input, intent, surface_id);
+ 	if (!ret)

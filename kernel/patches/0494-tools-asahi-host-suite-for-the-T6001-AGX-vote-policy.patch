@@ -1,0 +1,571 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 08:45:54 -0600
+Subject: [PATCH] tools: asahi: host suite for the T6001 AGX vote policy, with
+ mutant controls
+
+The vote policy is a header of static inline transition functions, so the
+suite compiles pmp-agx-vote-tests.c against a copy of it and drives the same
+begin, decide, next and applied calls the kernel glue makes, with a fake
+clock, a fake PMP bit and a fake timer. 18 cases: the parameter off, the set
+and idle drop, decode-like bursts, a drop cancelled by new work, the failed
+set backoff, unbalanced ends, the parameter switched off mid-flight, the zero
+idle tick, millisecond clock wraps, release and refuse, resume with and
+without work in flight, sleep and resume, and the two asserts from review
+(the begin inside a clear write must be re-set, and begin must refuse while
+stopped).
+
+--mutation and --mutations remove one guard each (the owed-set branch, the
+!failures in it, and the stopped check in begin and decide) and require the
+suite to fail. The two mutants that survived before the races fix (begin not
+refusing while stopped, and the retry deadline indistinguishable from the 1 ms
+owed-set kick) are the stopped-in-begin and owed-set-branch controls: at
+5b54de31 (the pre-fix header) both survive because the guarded lines do not
+exist; at this head each is caught at the case that pins it.
+
+Registered in tools/aurora-ci/host-tests.json (base, --mutations, four
+single-mutant entries, the .c as a helper).
+
+Proof: plain run passes (18 cases, AGX-VOTE-SELFCHECK-OK); --mutations exits 0
+with all four caught; --ref 5b54de31 --mutation stopped-in-begin and
+--mutation owed-set-branch print SURVIVED there.
+
+Signed-off-by: Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
+(cherry picked from commit 1142df92a11668749f5946f69f5f1b48e20153c5)
+---
+ tools/asahi/pmp-agx-vote-tests.c  | 304 ++++++++++++++++++++++++++++++
+ tools/asahi/pmp-agx-vote-tests.py | 112 +++++++++++
+ tools/aurora-ci/host-tests.json   |  83 +++++++-
+ 3 files changed, 498 insertions(+), 1 deletion(-)
+ create mode 100644 tools/asahi/pmp-agx-vote-tests.c
+ create mode 100755 tools/asahi/pmp-agx-vote-tests.py
+
+diff --git a/tools/asahi/pmp-agx-vote-tests.c b/tools/asahi/pmp-agx-vote-tests.c
+new file mode 100644
+index 0000000000..1d13e835ef
+--- /dev/null
++++ b/tools/asahi/pmp-agx-vote-tests.c
+@@ -0,0 +1,304 @@
++// Unit test and simulation of pmp-agx-vote.h: the policy that decides when the T6001 AGX request (PS-REQ bit 9) is set and cleared.
++// A fake clock, a fake PMP bit and a fake timer drive the same transition functions the kernel glue calls. No kernel, no hardware.
++#include <limits.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "pmp-agx-vote.h"
++
++struct sim {
++	struct agx_vote v;
++	uint32_t now;
++	bool bit;            // the PMP's PS-REQ bit 9
++	int sets, clears;    // register writes that tried to set / clear it
++	int fail_sets;       // the next N set attempts are not acknowledged
++	bool armed;
++	uint32_t timer_at;
++	int begin_in_write;  // begin this many operations while the register write of the next reconcile is in progress
++};
++
++static void arm(struct sim *s, uint32_t delay_ms)
++{
++	uint32_t at = s->now + delay_ms;
++	if (!s->armed || (int32_t)(at - s->timer_at) < 0) {
++		s->armed = true;
++		s->timer_at = at;
++	}
++}
++
++static void begin(struct sim *s);
++
++// What the kernel work function does.
++static void reconcile(struct sim *s)
++{
++	enum agx_vote_action act = agx_vote_decide(&s->v, s->now);
++	int ret = 0;
++
++	s->armed = false;
++	if (act == AGX_VOTE_SET) {
++		s->sets++;
++		if (s->fail_sets > 0) {
++			s->fail_sets--;
++			ret = -110;
++			s->bit = false;      // glue force-clears a request that was not acknowledged
++		} else {
++			s->bit = true;
++		}
++	} else if (act == AGX_VOTE_CLEAR) {
++		s->clears++;
++		s->bit = false;
++	}
++	while (s->begin_in_write > 0) {
++		s->begin_in_write--;
++		begin(s);
++	}
++	if (act != AGX_VOTE_NONE)
++		agx_vote_applied(&s->v, act, ret, s->now);
++	uint32_t next = agx_vote_next(&s->v, s->now);
++	if (next)
++		arm(s, next);
++}
++
++static void begin(struct sim *s)
++{
++	if (agx_vote_begin(&s->v))
++		arm(s, 0);
++}
++
++static void end(struct sim *s)
++{
++	uint32_t d = agx_vote_end(&s->v, s->now);
++	if (d)
++		arm(s, d);
++}
++
++static void advance_to(struct sim *s, uint32_t t)
++{
++	while (s->armed && (int32_t)(s->timer_at - t) <= 0) {
++		if ((int32_t)(s->timer_at - s->now) > 0)
++			s->now = s->timer_at;
++		reconcile(s);
++	}
++	s->now = t;
++}
++
++static struct sim fresh(bool enabled, unsigned long idle_ms, uint32_t start)
++{
++	struct sim s = {.now = start};
++	s.v.enabled = enabled;
++	s.v.idle_ms = idle_ms;
++	return s;
++}
++
++#define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #cond); exit(1); } } while (0)
++
++int main(void)
++{
++	// 1. parameter off: nothing is ever written, however much the GPU runs
++	{
++		struct sim s = fresh(false, 100, 1000);
++		for (int i = 0; i < 50; i++) { begin(&s); advance_to(&s, s.now + 4); end(&s); advance_to(&s, s.now + 7); }
++		advance_to(&s, s.now + 1000);
++		CHECK(s.sets == 0 && s.clears == 0 && !s.bit);
++	}
++	// 2. one operation: set at once, kept for idle_ms, then cleared
++	{
++		struct sim s = fresh(true, 100, 1000);
++		begin(&s); advance_to(&s, 1000);
++		CHECK(s.bit && s.sets == 1);
++		advance_to(&s, 1004); end(&s);
++		advance_to(&s, 1103); CHECK(s.bit);              // 99 ms after the end: still voted
++		advance_to(&s, 1104); CHECK(!s.bit && s.clears == 1);   // 100 ms after the end: dropped
++	}
++	// 3. decode-like bursts every 10.58 ms for one second: one set, no clear until the idle time after the last burst
++	{
++		struct sim s = fresh(true, 100, 5000);
++		uint32_t last_end = 0;
++		for (int i = 0; i < 95; i++) {
++			uint32_t t0 = 5000 + (uint32_t)(i * 10.58);
++			advance_to(&s, t0); begin(&s);
++			advance_to(&s, t0 + 4); end(&s); last_end = s.now;
++		}
++		CHECK(s.sets == 1 && s.clears == 0 && s.bit);
++		advance_to(&s, last_end + 99); CHECK(s.bit);
++		advance_to(&s, last_end + 100); CHECK(!s.bit && s.clears == 1 && s.sets == 1);
++	}
++	// 4. work arrives while the drop is pending: the drop is cancelled, then rescheduled from the new end
++	{
++		struct sim s = fresh(true, 100, 0);
++		begin(&s); advance_to(&s, 0); end(&s);
++		advance_to(&s, 50); begin(&s);
++		advance_to(&s, 100); CHECK(s.bit && s.clears == 0);
++		advance_to(&s, 120); end(&s);
++		advance_to(&s, 219); CHECK(s.bit);
++		advance_to(&s, 220); CHECK(!s.bit && s.clears == 1 && s.sets == 1);
++	}
++	// 5. a set that is not acknowledged is cleared again, not retried in a hot loop, and retried after the backoff
++	{
++		struct sim s = fresh(true, 100, 0);
++		s.fail_sets = 1;
++		begin(&s); advance_to(&s, 0);
++		CHECK(s.sets == 1 && !s.bit && !s.v.voted && s.v.failures == 1);
++		advance_to(&s, AGX_VOTE_RETRY_MS - 1); CHECK(s.sets == 1);
++		advance_to(&s, AGX_VOTE_RETRY_MS); CHECK(s.sets == 2 && s.bit && s.v.voted && s.v.failures == 0);
++	}
++	// 6. an end without a begin is ignored: no underflow, the next begin still works
++	{
++		struct sim s = fresh(true, 100, 0);
++		end(&s); end(&s);
++		CHECK(s.v.users == 0 && !s.armed);
++		begin(&s); advance_to(&s, 0);
++		CHECK(s.v.users == 1 && s.bit);
++	}
++	// 7. the parameter is switched off while voted and busy: cleared at the next reconcile, even with work in flight
++	{
++		struct sim s = fresh(true, 100, 0);
++		begin(&s); advance_to(&s, 0); CHECK(s.bit);
++		s.v.enabled = false; arm(&s, 0); advance_to(&s, 1);
++		CHECK(!s.bit && s.clears == 1 && !s.v.voted);
++		s.v.enabled = true; arm(&s, 0); advance_to(&s, 2);       // switched on again with work still in flight
++		CHECK(s.bit && s.sets == 2);
++	}
++	// 8. zero idle time still waits one tick (no clear inside the end call's own tick)
++	{
++		struct sim s = fresh(true, 0, 0);
++		begin(&s); advance_to(&s, 0); end(&s);
++		CHECK(s.armed && s.bit);
++		advance_to(&s, 1); CHECK(!s.bit);
++	}
++	// 9. the millisecond clock wraps: idle_at + idle_ms overflows, the decision stays right
++	{
++		struct sim s = fresh(true, 100, UINT32_MAX - 50);
++		begin(&s); advance_to(&s, s.now); end(&s);
++		advance_to(&s, s.now + 99); CHECK(s.bit);
++		advance_to(&s, s.now + 1); CHECK(!s.bit && s.clears == 1);
++	}
++	// 10. release (GPU driver unbind): a held vote is cleared once, at once, and the idle timer is not needed afterwards
++	{
++		struct sim s = fresh(true, 100, 0);
++		begin(&s); advance_to(&s, 0); end(&s);
++		CHECK(s.bit && s.armed);
++		if (agx_vote_release(&s.v)) { s.clears++; s.bit = false; }
++		CHECK(!s.bit && s.clears == 1 && !s.v.voted);
++		advance_to(&s, 500);                       // the pending timer fires and finds nothing to do
++		CHECK(s.clears == 1 && !s.armed);
++		CHECK(!agx_vote_release(&s.v));            // a second release writes nothing
++	}
++	// 11. w7X's reproduction: jiffies_to_msecs is 32 bits wide, so a vote whose last operation ended at 0xFFFFFFF0 must still clear
++	// 100 ms later, after the clock has wrapped to 0x54 (a 64-bit compare of idle_at + idle_ms never decided it)
++	{
++		struct sim s = fresh(true, 100, 0xFFFFFFF0u);
++		begin(&s); advance_to(&s, s.now); end(&s);
++		CHECK(s.v.idle_at == 0xFFFFFFF0u);
++		advance_to(&s, 0xFFFFFFF0u + 99u); CHECK(s.bit && s.now == 0x53u);
++		advance_to(&s, 0x54u); CHECK(!s.bit && s.clears == 1);
++		CHECK(agx_vote_next(&s.v, s.now) == 0);
++	}
++	// 12. a retry deadline across the same wrap
++	{
++		struct sim s = fresh(true, 100, 0xFFFFFC00u);
++		s.fail_sets = 1;
++		begin(&s); advance_to(&s, s.now);
++		CHECK(s.sets == 1 && !s.bit);
++		advance_to(&s, 0xFFFFFC00u + AGX_VOTE_RETRY_MS - 1u); CHECK(s.sets == 1);
++		advance_to(&s, 0xFFFFFC00u + AGX_VOTE_RETRY_MS); CHECK(s.sets == 2 && s.bit);
++	}
++	// 13. the shipped default hold: w7X measured gaps of up to 111.5 ms inside one 9B generation (ctx 8192, once per process), over the old
++	// 100 ms hold. The default must ride through that gap with one vote, and still drop the vote after a long idle.
++	{
++		struct sim s = fresh(true, AGX_VOTE_IDLE_MS_DEFAULT, 1000);
++		CHECK(AGX_VOTE_IDLE_MS_DEFAULT >= 250);
++		begin(&s); advance_to(&s, s.now); end(&s);
++		advance_to(&s, s.now + 112);               // the 111.5 ms interval rounded up
++		begin(&s); advance_to(&s, s.now); end(&s);
++		CHECK(s.sets == 1 && s.clears == 0 && s.bit);
++		advance_to(&s, s.now + AGX_VOTE_IDLE_MS_DEFAULT - 1); CHECK(s.bit);
++		advance_to(&s, s.now + 1); CHECK(!s.bit && s.clears == 1);
++	}
++	// 14. review finding 2: an operation begins while the clear is being written (voted is still true, so begin does not kick). After the clear is
++	// applied the vote must be set again without waiting for another operation.
++	{
++		struct sim s = fresh(true, 100, 0);
++		begin(&s); advance_to(&s, 0); end(&s);
++		CHECK(s.bit && s.armed);
++		s.begin_in_write = 1;
++		advance_to(&s, 100);                               // the idle hold expires: reconcile decides CLEAR, begin lands inside the write
++		CHECK(s.v.users == 1);
++		advance_to(&s, 101);                               // the owed set runs
++		CHECK(s.bit && s.v.voted && s.sets == 2 && s.clears == 1);
++		// the header alone, as the reviewer reproduced it: decide (CLEAR), begin, applied, next
++		struct agx_vote v = {.enabled = true, .voted = true, .idle_ms = 100, .idle_at = 0};
++		CHECK(agx_vote_decide(&v, 100) == AGX_VOTE_CLEAR);
++		CHECK(!agx_vote_begin(&v));
++		agx_vote_applied(&v, AGX_VOTE_CLEAR, 0, 100);
++		CHECK(v.users == 1 && !v.voted);
++		CHECK(agx_vote_next(&v, 100) == 1);                // not 0: a set is owed
++		CHECK(agx_vote_decide(&v, 101) == AGX_VOTE_SET);
++	}
++	// 15. review finding 3: after release (GPU unbind or report removal) no begin may vote again, until the GPU probes again
++	{
++		struct sim s = fresh(true, 100, 0);
++		begin(&s); advance_to(&s, 0);
++		CHECK(s.bit && s.v.users == 1);
++		if (agx_vote_release(&s.v)) { s.clears++; s.bit = false; }
++		CHECK(!s.bit && s.v.stopped && s.clears == 1);
++		end(&s); begin(&s); advance_to(&s, 50);            // an ioctl already past the unplug check starts an operation
++		CHECK(!s.bit && s.sets == 1 && !s.armed);
++		CHECK(agx_vote_decide(&s.v, 50) == AGX_VOTE_NONE);
++		CHECK(agx_vote_next(&s.v, 50) == 0);
++		// a work item that was queued before the release finds nothing to set
++		arm(&s, 0); advance_to(&s, 51);
++		CHECK(!s.bit && s.sets == 1);
++		// the GPU probes again: the vote is allowed, and the operation still in flight gets its set
++		CHECK(agx_vote_resume(&s.v));
++		arm(&s, 0); advance_to(&s, 52);
++		CHECK(s.bit && s.sets == 2 && !s.v.stopped);
++	}
++	// 16. review finding 4: system sleep. The vote is withdrawn before suspend and re-decided on resume: with work still in flight it is set
++	// again (the PMP may have dropped the word), with an idle GPU nothing is written.
++	{
++		struct sim s = fresh(true, 250, 0);
++		begin(&s); advance_to(&s, 0);
++		CHECK(s.bit);
++		if (agx_vote_release(&s.v)) { s.clears++; s.bit = false; }     // suspend prepare
++		CHECK(!s.bit && s.v.stopped && s.clears == 1);
++		if (agx_vote_resume(&s.v)) arm(&s, 0);                         // resume
++		advance_to(&s, 10);
++		CHECK(s.bit && s.sets == 2 && s.v.voted);
++		end(&s);
++		if (agx_vote_release(&s.v)) { s.clears++; s.bit = false; }     // a second sleep while idle inside the hold
++		CHECK(!s.bit && s.clears == 2);
++		CHECK(!agx_vote_resume(&s.v));                                 // idle: nothing is owed
++		advance_to(&s, 1000);
++		CHECK(!s.bit && s.sets == 2 && s.clears == 2);
++		begin(&s); advance_to(&s, 1001);                               // the next operation after resume votes as usual
++		CHECK(s.bit && s.sets == 3);
++	}
++	// 17. disabled and stopped never set, whatever begins
++	{
++		struct sim s = fresh(false, 100, 0);
++		s.v.stopped = true;
++		begin(&s); advance_to(&s, 1);
++		CHECK(!s.bit && s.sets == 0 && !s.armed);
++		CHECK(!agx_vote_resume(&s.v));                                 // disabled: resume owes nothing
++	}
++	// 18. mutants that survived the first review: begin() must itself refuse while stopped (not only decide()), a failed set must schedule the retry
++	// deadline and not the 1 ms owed-set kick (a 1 kHz spin for the whole 1000 ms window otherwise), and agx_vote_refuse() must stop votes.
++	{
++		struct agx_vote v = {.enabled = true, .idle_ms = 100};
++		agx_vote_refuse(&v);
++		CHECK(v.stopped && !v.voted);
++		CHECK(!agx_vote_begin(&v));                            // a user, but no kick
++		CHECK(agx_vote_decide(&v, 0) == AGX_VOTE_NONE && agx_vote_next(&v, 0) == 0);
++		CHECK(agx_vote_resume(&v));                            // work in flight: the reconcile step must run
++		struct agx_vote w = {.enabled = true, .idle_ms = 100};
++		CHECK(agx_vote_begin(&w));
++		agx_vote_applied(&w, AGX_VOTE_SET, -110, 500);          // the set was not acknowledged
++		CHECK(w.failures == 1 && w.retry_at == 500 + AGX_VOTE_RETRY_MS);
++		CHECK(agx_vote_next(&w, 500) == AGX_VOTE_RETRY_MS);      // the retry deadline, not 1 ms
++		CHECK(agx_vote_next(&w, 500 + AGX_VOTE_RETRY_MS - 1) == 1);
++	}
++	printf("AGX-VOTE-SELFCHECK-OK\n");
++	return 0;
++}
+diff --git a/tools/asahi/pmp-agx-vote-tests.py b/tools/asahi/pmp-agx-vote-tests.py
+new file mode 100755
+index 0000000000..e3c8533ba0
+--- /dev/null
++++ b/tools/asahi/pmp-agx-vote-tests.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Host test for the T6001 AGX vote policy (drivers/pmdomain/apple/pmp-agx-vote.h).
++
++The policy is a header of static inline transition functions, so the suite
++compiles tools/asahi/pmp-agx-vote-tests.c against a copy of that header: a
++fake clock, a fake PMP bit and a fake timer drive the same begin, decide,
++next and applied calls the kernel glue makes. No kernel, no hardware.
++
++--mutation NAME / --mutations apply textual mutants to the header copy and
++require the suite to fail; like the other self-checking suites, exit status 0
++means every mutant was caught. --ref reads the header at a Git revision (a
++pre-fix header fails the suite itself, which is the point of those cases).
++"""
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path
++import shlex
++import subprocess
++
++ROOT = Path(__file__).resolve().parents[2]
++HEADER = 'drivers/pmdomain/apple/pmp-agx-vote.h'
++
++# Each mutant removes one guard. The first two are the mutants that survived
++# the first review round, when begin() did not refuse while stopped and the
++# retry deadline was not distinguished from the 1 ms owed-set kick.
++CONTROLS = [
++    ('owed-set-branch', '\tif (v->users && !v->voted && !v->failures)\n\t\treturn 1;\n', ''),
++    ('owed-failures', 'if (v->users && !v->voted && !v->failures)\n\t\treturn 1;', 'if (v->users && !v->voted)\n\t\treturn 1;'),
++    ('stopped-in-begin', 'return v->enabled && !v->voted && !v->stopped;', 'return v->enabled && !v->voted;'),
++    ('stopped-in-decide', 'if (!v->enabled || v->stopped)\n\t\treturn v->voted ? AGX_VOTE_CLEAR : AGX_VOTE_NONE;',
++     'if (!v->enabled)\n\t\treturn v->voted ? AGX_VOTE_CLEAR : AGX_VOTE_NONE;'),
++]
++
++
++def header_text(ref):
++    if ref:
++        return subprocess.check_output(['git', '-C', str(ROOT), 'show', f'{ref}:{HEADER}'], text=True)
++    return (ROOT / HEADER).read_text()
++
++
++def compile_and_run(out, text):
++    out.mkdir(parents=True, exist_ok=True)
++    (out / 'pmp-agx-vote.h').write_text(text)
++    compiler = shlex.split(os.environ.get('CC', 'clang'))
++    command = compiler + ['-std=gnu11', '-g', '-O1', '-Wall', '-Wextra', '-Werror',
++                          '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
++                          '-I', str(out), str(ROOT / 'tools/asahi/pmp-agx-vote-tests.c'),
++                          '-o', str(out / 'vote')]
++    built = subprocess.run(command, capture_output=True, text=True)
++    (out / 'build.log').write_text(built.stdout + built.stderr)
++    if built.returncode:
++        return {'build_rc': built.returncode, 'run_rc': None, 'note': 'compilation failure is not regression evidence'}
++    ran = subprocess.run([str(out / 'vote')], capture_output=True, text=True)
++    (out / 'run.log').write_text(ran.stdout + ran.stderr)
++    return {'build_rc': 0, 'run_rc': ran.returncode}
++
++
++def main():
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--ref', help='read the header at a Git revision (negative control)')
++    p.add_argument('--mutation', help='apply one named mutant and require the suite to fail')
++    p.add_argument('--mutations', action='store_true', help='apply every mutant and require each to fail')
++    p.add_argument('--output', required=True, type=Path)
++    args = p.parse_args()
++    args.output.mkdir(parents=True, exist_ok=False)
++    text = header_text(args.ref)
++
++    base = compile_and_run(args.output, text)
++    print(Path(args.output / 'run.log').read_text() if base['run_rc'] is not None else Path(args.output / 'build.log').read_text())
++
++    mutations = []
++    if args.mutations or args.mutation:
++        names = [c[0] for c in CONTROLS] if args.mutations else [args.mutation]
++        for name in names:
++            old, new = next((c[1], c[2]) for c in CONTROLS if c[0] == name)
++            count = text.count(old)
++            result = {}
++            result['applied'] = count == 1
++            if count == 1:
++                result.update(compile_and_run(args.output / name, text.replace(old, new)))
++            else:
++                # A guard that does not exist in this revision cannot be removed: the
++                # behaviour the guard carries is absent, so the mutant survives there.
++                result.update({'build_rc': None, 'run_rc': 0, 'note': f'{HEADER} at this revision has no such line ({count} matches)'})
++            result['name'] = name
++            mutations.append(result)
++            caught = result['applied'] and result['build_rc'] == 0 and result['run_rc'] not in (0, None)
++            log = args.output / name / ('run.log' if result.get('run_rc') is not None else 'build.log')
++            detail = log.read_text().strip().splitlines()[-1][:150] if log.exists() else result.get('note', '')
++            print(f"{name}: {'CAUGHT' if caught else 'SURVIVED'} | {detail}")
++
++    if args.mutations:
++        assert all(m['applied'] and m['build_rc'] == 0 and m['run_rc'] not in (0, None) for m in mutations), mutations
++        print('PASS: 18 actual vote-policy cases and every mutant caught')
++        return 0
++    if args.mutation:
++        m = mutations[0]
++        assert m['applied'] and m['build_rc'] == 0 and m['run_rc'] not in (0, None), m
++        return 0
++
++    (args.output / 'receipt.json').write_text(json.dumps({
++        'source_ref': args.ref, 'source_sha256': hashlib.sha256(text.encode()).hexdigest(),
++        'command': [], 'returncode': base['run_rc'] if base['run_rc'] is not None else base['build_rc'],
++        'mutations': mutations}, indent=2) + '\n')
++    return bool(base['run_rc']) if base['run_rc'] is not None else bool(base['build_rc'])
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/tools/aurora-ci/host-tests.json b/tools/aurora-ci/host-tests.json
+index a1b93d695d..7d55400ba6 100644
+--- a/tools/aurora-ci/host-tests.json
++++ b/tools/aurora-ci/host-tests.json
+@@ -2238,6 +2238,86 @@
+    ],
+    "note": "Compile J514S/J516S default and static PMP profiles; check supplier nodes and alias in the resulting DTBs."
+   },
++  {
++   "name": "tools/asahi/pmp-agx-vote-tests.py",
++   "group": "tools",
++   "argv": [
++    "python3",
++    "tools/asahi/pmp-agx-vote-tests.py",
++    "--output",
++    "{output}"
++   ],
++   "note": "T6001 AGX vote policy host suite: fake clock, PMP bit and timer against the static inline header; --mutations self-checks the guards"
++  },
++  {
++   "name": "tools/asahi/pmp-agx-vote-tests.py --mutations",
++   "group": "tools",
++   "argv": [
++    "python3",
++    "tools/asahi/pmp-agx-vote-tests.py",
++    "--mutations",
++    "--output",
++    "{output}"
++   ],
++   "expect": "pass",
++   "note": "self-checking: exits 0 when every mutant aborts"
++  },
++  {
++   "name": "tools/asahi/pmp-agx-vote-tests.py --mutation owed-set-branch",
++   "group": "tools",
++   "argv": [
++    "python3",
++    "tools/asahi/pmp-agx-vote-tests.py",
++    "--mutation",
++    "owed-set-branch",
++    "--output",
++    "{output}"
++   ],
++   "expect": "pass",
++   "note": "self-checking: exits 0 when the mutant aborts"
++  },
++  {
++   "name": "tools/asahi/pmp-agx-vote-tests.py --mutation owed-failures",
++   "group": "tools",
++   "argv": [
++    "python3",
++    "tools/asahi/pmp-agx-vote-tests.py",
++    "--mutation",
++    "owed-failures",
++    "--output",
++    "{output}"
++   ],
++   "expect": "pass",
++   "note": "self-checking: exits 0 when the mutant aborts"
++  },
++  {
++   "name": "tools/asahi/pmp-agx-vote-tests.py --mutation stopped-in-begin",
++   "group": "tools",
++   "argv": [
++    "python3",
++    "tools/asahi/pmp-agx-vote-tests.py",
++    "--mutation",
++    "stopped-in-begin",
++    "--output",
++    "{output}"
++   ],
++   "expect": "pass",
++   "note": "self-checking: exits 0 when the mutant aborts"
++  },
++  {
++   "name": "tools/asahi/pmp-agx-vote-tests.py --mutation stopped-in-decide",
++   "group": "tools",
++   "argv": [
++    "python3",
++    "tools/asahi/pmp-agx-vote-tests.py",
++    "--mutation",
++    "stopped-in-decide",
++    "--output",
++    "{output}"
++   ],
++   "expect": "pass",
++   "note": "self-checking: exits 0 when the mutant aborts"
++  },
+   {
+    "name": "tools/asahi/t6030-pmp-graph-tests.py",
+    "group": "tools",
+@@ -2289,7 +2369,8 @@
+   "tools/testing/selftests/drivers/gpu/asahi-g15/uat-owner.c": "compiled and executed by the registered asahi-g15/run.py actual reservation-owner fixture",
+   "tools/testing/selftests/drivers/gpu/asahi-g15/pmp-bridge.c": "compiled and executed by the registered asahi-g15/run.py maintained PMP fixture",
+   "tools/asahi/t6030-pmp-graph-tests.c": "compiled and executed by the corresponding registered Python actual-body host suite",
+-  "tools/asahi/t6030-display-admission-tests.c": "compiled and executed by the corresponding registered Python actual-body host suite"
++  "tools/asahi/t6030-display-admission-tests.c": "compiled and executed by the corresponding registered Python actual-body host suite",
++  "tools/asahi/pmp-agx-vote-tests.c": "compiled and executed by the registered pmp-agx-vote-tests.py policy suite"
+  },
+  "excluded": {
+   "tools/aurora-sep/tests/coordinator/runtime-check.sh": "Needs /dev/sep-bio, a running kernel booted with trusted.source=applesep, the hw_random sysfs interface and fprintd. Coordinator payload for an approved device.",

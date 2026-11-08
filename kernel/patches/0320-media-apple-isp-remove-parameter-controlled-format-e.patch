@@ -1,0 +1,487 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Mon, 26 Oct 2026 14:03:02 +1100
+Subject: [PATCH] media: apple: isp: remove parameter-controlled format
+ exposure
+
+Remove the inherited multiplanar module parameter. T6040/IMX958 supports normal V4L2 negotiation for contiguous NV12 and P010 through either API, with one memory plane containing the two ISP components. Keep NV12 first and initial; other sensors retain their shipped single-planar API. Do not advertise the old non-contiguous NV12M alias.
+
+Cache complete sensor configuration replies with the video state and print them on the standard log-status ioctl, so collecting the firmware list needs no driver or boot parameter. Free the cache on probe failure and final video release, and test failed discovery without publishing partial state. No module/kernel parameters or platform Kconfig options are added.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+---
+ .../media/drivers/apple-isp-j616s.rst         | 25 ++++---
+ .../media/platform/apple/isp/isp-cam-test.c   | 41 +++++++++++
+ drivers/media/platform/apple/isp/isp-cam.c    | 20 ++++--
+ drivers/media/platform/apple/isp/isp-drv.c    |  1 +
+ drivers/media/platform/apple/isp/isp-drv.h    |  5 +-
+ .../media/platform/apple/isp/isp-v4l2-test.c  | 14 +++-
+ drivers/media/platform/apple/isp/isp-v4l2.c   | 70 ++++++-------------
+ 7 files changed, 111 insertions(+), 65 deletions(-)
+
+diff --git a/Documentation/driver-api/media/drivers/apple-isp-j616s.rst b/Documentation/driver-api/media/drivers/apple-isp-j616s.rst
+index d671f1981f..0b0a503eeb 100644
+--- a/Documentation/driver-api/media/drivers/apple-isp-j616s.rst
++++ b/Documentation/driver-api/media/drivers/apple-isp-j616s.rst
+@@ -46,9 +46,9 @@ Mode and format selection
+ 
+ On T6040/IMX958, probe queries every advertised configuration, bounded at 64,
+ using the 0x120-byte H17 ``CH_CAMERA_CONFIG_GET`` exchange. The complete list
+-is available through dynamic debug at probe and cached for
+-``VIDIOC_LOG_STATUS`` (``v4l2-ctl --log-status``), without sending commands
+-during a stream. The log includes
++is available through dynamic debug at probe and cached in full for
++``VIDIOC_LOG_STATUS`` (``v4l2-ctl --log-status``), without sending firmware
++commands. Collect this diagnostic dump before starting a stress run. It includes
+ input/output dimensions and the sensor clock word; that word is not FPS.
+ 
+ The board's existing config-5 1920x1080 and 1280x720 presets stay first and
+@@ -68,9 +68,9 @@ the runtime input geometry matches the source profile. An unspecified P010
+ size selects 1280x720 first. Larger P010 modes require a consistent firmware
+ output reply. P010 uses two little-endian 16-bit component planes with ten useful
+ MSB-aligned bits, and equal 64-byte-aligned Y/UV strides. UV immediately
+-follows Y, as required for contiguous P010. The optional multi-planar V4L2
+-API also reports P010 as **one memory plane** containing both component
+-planes. The firmware still receives two component addresses.
++follows Y, as required for contiguous P010. The standard multi-planar V4L2
++API on T6040/IMX958 reports both NV12 and P010 as **one memory plane**
++containing both component planes. The firmware still receives two component addresses.
+ 
+ At 1920x1080, stride is 3840, Y is 4147200 bytes, UV is 2073600 bytes and
+ ``sizeimage`` is 6220800. At 1280x720, stride is 2560 and ``sizeimage`` is
+@@ -86,8 +86,17 @@ or both zero-extended low-32-bit plane addresses, plus plane count, pool 9
+ and a fresh 64-bit submission tag; an old tag
+ cannot release a new lease. Buffer completion is published to videobuf2
+ only after the firmware report ACK and doorbell have been published.
+-NV12 pool sizes and the T8140/Neo formats, presets and command path retain
+-their existing behavior.
++NV12 pool sizes and the T8140/Neo default formats, presets and command path
++retain their existing behavior.
++
++The inherited ``multiplanar`` module parameter is removed. T6040/IMX958
++supports standard single-planar and multi-planar V4L2 negotiation for these
++contiguous formats without a parameter; the non-contiguous NV12M alias is not
++advertised. Other sensors retain their shipped single-planar API. No driver
++module/kernel parameter, platform flag or per-platform Kconfig option selects
++support. NV12 stays first and is the initial format because browsers/WebRTC
++and many applications do not support P010 or simply choose the first format.
++Applications can select P010 explicitly with ``VIDIOC_S_FMT``.
+ 
+ Endpoints
+ ---------
+diff --git a/drivers/media/platform/apple/isp/isp-cam-test.c b/drivers/media/platform/apple/isp/isp-cam-test.c
+index aef545b27c..27c9e23f34 100644
+--- a/drivers/media/platform/apple/isp/isp-cam-test.c
++++ b/drivers/media/platform/apple/isp/isp-cam-test.c
+@@ -186,9 +186,15 @@ static int isp_test_config_reply(struct apple_isp *isp, void *args, u32 insize,
+ 	config->out_height2 = config->out_height;
+ 	if (config->preset == 2)
+ 		config->out_height2 = 2160;
++	reply->unknown[sizeof(reply->unknown) - 1] = 0x5a;
+ 	return 0;
+ }
+ 
++static void isp_test_free_configs(void *ptr)
++{
++	kfree(ptr);
++}
++
+ static void isp_test_sensor_config_list(struct kunit *test)
+ {
+ 	struct apple_isp *isp = isp_test_capture_alloc(test);
+@@ -199,6 +205,7 @@ static void isp_test_sensor_config_list(struct kunit *test)
+ 		  .output_dim = {1280, 720}, .crop_size = {1280, 720} },
+ 	};
+ 	u32 count = 0;
++	int err;
+ 
+ 	isp->cmd_virt = kunit_kzalloc(test, 0x120, GFP_KERNEL);
+ 	KUNIT_ASSERT_NOT_NULL(test, isp->cmd_virt);
+@@ -207,6 +214,10 @@ static void isp_test_sensor_config_list(struct kunit *test)
+ 	test->priv = &count;
+ 	kunit_activate_static_stub(test, isp_cmd_send, isp_test_config_reply);
+ 	KUNIT_ASSERT_EQ(test, isp_ch_cache_sensor_configs(isp, 0, 6), 0);
++	err = kunit_add_action_or_reset(test, isp_test_free_configs, isp->sensor_configs);
++	KUNIT_ASSERT_EQ(test, err, 0);
++	KUNIT_EXPECT_EQ(test, get_unaligned_le32(isp->sensor_configs[5].reply + 0xc), 5);
++	KUNIT_EXPECT_EQ(test, isp->sensor_configs[5].reply[ISP_SENSOR_CONFIG_SIZE - 1], 0x5a);
+ 	KUNIT_EXPECT_EQ(test, count, 6);
+ 	KUNIT_EXPECT_EQ(test, isp->num_sensor_configs, 6);
+ 	KUNIT_EXPECT_EQ(test, isp->num_presets, 3);
+@@ -223,6 +234,35 @@ static void isp_test_sensor_config_list(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, count, 6);
+ }
+ 
++static int isp_test_bad_config_reply(struct apple_isp *isp, void *args, u32 insize,
++				     u32 outsize, int timeout)
++{
++	struct cmd_ch_camera_config_h17 *reply = isp->cmd_virt;
++
++	isp_test_config_reply(isp, args, insize, outsize, timeout);
++	reply->config.preset = 65;
++	return 0;
++}
++
++static void isp_test_sensor_config_failure(struct kunit *test)
++{
++	struct apple_isp *isp = isp_test_capture_alloc(test);
++	struct isp_preset preset = {};
++	u32 count = 0;
++
++	isp->cmd_virt = kunit_kzalloc(test, ISP_SENSOR_CONFIG_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, isp->cmd_virt);
++	isp->presets = &preset;
++	isp->num_presets = 1;
++	test->priv = &count;
++	kunit_activate_static_stub(test, isp_cmd_send, isp_test_bad_config_reply);
++	KUNIT_EXPECT_EQ(test, isp_ch_cache_sensor_configs(isp, 0, 6), -EIO);
++	KUNIT_EXPECT_EQ(test, count, 1);
++	KUNIT_EXPECT_EQ(test, isp->num_sensor_configs, 0);
++	KUNIT_EXPECT_PTR_EQ(test, isp->sensor_configs, NULL);
++	KUNIT_EXPECT_PTR_EQ(test, isp->presets, &preset);
++}
++
+ struct isp_test_ack_state {
+ 	unsigned int fault, calls;
+ };
+@@ -282,6 +322,7 @@ static struct kunit_case isp_cam_test_cases[] = {
+ 	KUNIT_CASE(isp_test_command_ack_failure_latches),
+ 	KUNIT_CASE(isp_test_sensor_geometry),
+ 	KUNIT_CASE(isp_test_sensor_config_list),
++	KUNIT_CASE(isp_test_sensor_config_failure),
+ 	KUNIT_CASE(isp_test_preview_stream),
+ 	KUNIT_CASE(isp_test_preview_command_failures),
+ 	{}
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 59f19e571b..a5cbb2b4d8 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -233,6 +233,7 @@ static bool isp_sensor_config_usable(const struct cmd_ch_camera_config *config)
+ static int isp_ch_cache_sensor_configs(struct apple_isp *isp, u32 ch, u32 count)
+ {
+ 	struct cmd_ch_camera_config_h17 args;
++	struct isp_sensor_config *configs;
+ 	struct isp_preset *presets;
+ 	unsigned int num = isp->num_presets;
+ 	int err;
+@@ -247,19 +248,25 @@ static int isp_ch_cache_sensor_configs(struct apple_isp *isp, u32 ch, u32 count)
+ 	if (!presets)
+ 		return -ENOMEM;
+ 	memcpy(presets, isp->presets, num * sizeof(*presets));
++	configs = kcalloc(count, sizeof(*configs), GFP_KERNEL);
++	if (!configs)
++		return -ENOMEM;
+ 
+ 	for (u32 i = 0; i < count; i++) {
+ 		struct cmd_ch_camera_config *config = &args.config;
+-		struct isp_sensor_config *cached = &isp->sensor_configs[i];
++		struct isp_sensor_config *cached = &configs[i];
+ 		bool duplicate = false;
+ 
+ 		err = isp_cmd_ch_camera_config_get(isp, ch, i, &args);
+ 		if (err)
+-			return err;
++			goto free_configs;
+ 		if (config->opcode != (u64)CISP_CMD_CH_CAMERA_CONFIG_GET << 32 ||
+-		    config->chan != ch || config->preset != i)
+-			return -EIO;
++		    config->chan != ch || config->preset != i) {
++			err = -EIO;
++			goto free_configs;
++		}
+ 
++		memcpy(cached->reply, &args, sizeof(args));
+ 		cached->input_dim = (struct coord){config->in_width, config->in_height};
+ 		cached->output_dim = (struct coord){config->out_width, config->out_height};
+ 		cached->sensor_clk = config->sensor_clk;
+@@ -313,10 +320,15 @@ static int isp_ch_cache_sensor_configs(struct apple_isp *isp, u32 ch, u32 count)
+ 			.p010 = true,
+ 		};
+ 	}
++	isp->sensor_configs = configs;
+ 	isp->num_sensor_configs = count;
+ 	isp->presets = presets;
+ 	isp->num_presets = num;
+ 	return 0;
++
++free_configs:
++	kfree(configs);
++	return err;
+ }
+ 
+ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index c1c290360a..1f2dfbfa9a 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -598,6 +598,7 @@ destroy_wq:
+ detach_genpd:
+ 	apple_isp_detach_genpd(isp);
+ free_isp:
++	kfree(isp->sensor_configs);
+ 	/* Nothing else can reach it before the video device is registered. */
+ 	kfree(isp);
+ 	return err;
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index db042f94ae..dbe6b6ed5a 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -31,6 +31,7 @@
+ /* used to limit the user space buffers to the buffer_pool_config */
+ #define ISP_MAX_BUFFERS 16
+ #define ISP_MAX_SENSOR_CONFIGS 64
++#define ISP_SENSOR_CONFIG_SIZE 0x120
+ 
+ /* capture metadata buffers, for firmware that has that pool */
+ #define ISP_CAPMETA_BUFFERS 8
+@@ -265,6 +266,7 @@ struct isp_sensor_config {
+ 	struct coord output_dim;
+ 	u32 sensor_clk;
+ 	bool usable;
++	u8 reply[ISP_SENSOR_CONFIG_SIZE];
+ };
+ 
+ struct isp_format {
+@@ -289,7 +291,7 @@ struct apple_isp {
+ 	int num_presets;
+ 	/* Read-only sensor configuration replies, cached before video registration. */
+ 	unsigned int num_sensor_configs;
+-	struct isp_sensor_config sensor_configs[ISP_MAX_SENSOR_CONFIGS];
++	struct isp_sensor_config *sensor_configs;
+ 
+ 	int num_channels;
+ 	struct isp_format fmts[ISP_MAX_CHANNELS];
+@@ -303,7 +305,6 @@ struct apple_isp {
+ 	struct vb2_queue vbq;
+ 	struct mutex video_lock;
+ 	unsigned int sequence;
+-	bool multiplanar;
+ 	/* capture rate in frames per second, changes under video_lock */
+ 	unsigned int frame_rate;
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2-test.c b/drivers/media/platform/apple/isp/isp-v4l2-test.c
+index 6af295a7da..b3c8d26dfd 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2-test.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2-test.c
+@@ -102,6 +102,12 @@ static void isp_test_create_bufs_limit(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, isp_test_setup(test, ISP_MAX_BUFFERS, &nbuffers,
+ 					     &num_planes, sizes), -ENOBUFS);
+ 
++	/* The contiguous API must refuse a second independent memory plane. */
++	nbuffers = 1;
++	num_planes = 2;
++	KUNIT_EXPECT_EQ(test, isp_test_setup(test, 0, &nbuffers, &num_planes,
++					     sizes), -EINVAL);
++
+ 	/* A plane smaller than a frame is still refused. */
+ 	nbuffers = 1;
+ 	num_planes = 1;
+@@ -158,6 +164,10 @@ static void isp_test_p010_format(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, fmt->total_size, (size_t)1382400);
+ 	KUNIT_EXPECT_EQ(test, isp_num_rendered(isp), ISP_MAX_BUFFERS);
+ 	KUNIT_EXPECT_EQ(test, isp_num_meta(isp), ISP_MAX_BUFFERS);
++	isp_get_mp_pix_format(isp, &f, fmt);
++	KUNIT_EXPECT_EQ(test, f.fmt.pix_mp.pixelformat, V4L2_PIX_FMT_NV12);
++	KUNIT_EXPECT_EQ(test, f.fmt.pix_mp.num_planes, 1);
++	KUNIT_EXPECT_EQ(test, f.fmt.pix_mp.plane_fmt[0].sizeimage, 1382400);
+ }
+ 
+ static void isp_test_p010_admission(struct kunit *test)
+@@ -179,9 +189,7 @@ static void isp_test_p010_admission(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, desc.pixelformat, V4L2_PIX_FMT_P010);
+ 	desc.index = 2;
+ 	KUNIT_EXPECT_EQ(test, isp_enum_pixelformat(isp, &desc), -EINVAL);
+-	isp->multiplanar = true;
+-	KUNIT_ASSERT_EQ(test, isp_enum_pixelformat(isp, &desc), 0);
+-	KUNIT_EXPECT_EQ(test, desc.pixelformat, V4L2_PIX_FMT_P010);
++	desc.index = 1;
+ 	isp->hw = &neo;
+ 	KUNIT_EXPECT_EQ(test, isp_enum_pixelformat(isp, &desc), -EINVAL);
+ 	KUNIT_ASSERT_EQ(test, isp_set_preset(isp, fmt, &preset, V4L2_PIX_FMT_P010), 0);
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index b5bfea73e2..bc270e06be 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -27,10 +27,6 @@
+ /* Capture rates offered to userspace, in frames per second */
+ static const unsigned int isp_frame_rates[] = { 30, 25, 24, 20, 15 };
+ 
+-static bool multiplanar = false;
+-module_param(multiplanar, bool, 0644);
+-MODULE_PARM_DESC(multiplanar, "Enable multiplanar API");
+-
+ struct isp_buflist_buffer {
+ 	u64 iovas[ISP_MAX_PLANES];
+ 	u32 flags[ISP_MAX_PLANES];
+@@ -362,7 +358,7 @@ static int isp_vb2_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
+ 			  isp_num_rendered(isp) - q_num_bufs);
+ 
+ 	if (*num_planes) {
+-		if (sizes[0] < fmt->total_size)
++		if (*num_planes != 1 || sizes[0] < fmt->total_size)
+ 			return -EINVAL;
+ 
+ 		return 0;
+@@ -693,25 +689,13 @@ static int isp_vidioc_querycap(struct file *file, void *priv,
+ 
+ static int isp_enum_pixelformat(struct apple_isp *isp, struct v4l2_fmtdesc *f)
+ {
+-	switch (f->index) {
+-	case 0:
++	/* Browser/WebRTC compatibility: the shipped first format remains NV12. */
++	if (!f->index)
+ 		f->pixelformat = V4L2_PIX_FMT_NV12;
+-		break;
+-	case 1:
+-		if (isp->multiplanar) {
+-			f->pixelformat = V4L2_PIX_FMT_NV12M;
+-			break;
+-		}
+-		fallthrough;
+-	case 2:
+-		if (!isp_has_p010(isp) || f->index != (isp->multiplanar ? 2 : 1))
+-			return -EINVAL;
++	else if (f->index == 1 && isp_has_p010(isp))
+ 		f->pixelformat = V4L2_PIX_FMT_P010;
+-		break;
+-	default:
++	else
+ 		return -EINVAL;
+-	}
+-
+ 	return 0;
+ }
+ 
+@@ -729,7 +713,6 @@ static int isp_vidioc_enum_framesizes(struct file *file, void *fh,
+ 	u32 index = 0;
+ 
+ 	if (f->pixel_format != V4L2_PIX_FMT_NV12 &&
+-	    f->pixel_format != V4L2_PIX_FMT_NV12M &&
+ 	    !(f->pixel_format == V4L2_PIX_FMT_P010 && isp_has_p010(isp)))
+ 		return -EINVAL;
+ 
+@@ -760,7 +743,6 @@ static int isp_vidioc_enum_frameintervals(struct file *file, void *fh,
+ 		return -EINVAL;
+ 
+ 	if (interval->pixel_format != V4L2_PIX_FMT_NV12 &&
+-	    interval->pixel_format != V4L2_PIX_FMT_NV12M &&
+ 	    !(interval->pixel_format == V4L2_PIX_FMT_P010 && isp_has_p010(isp)))
+ 		return -EINVAL;
+ 
+@@ -827,27 +809,17 @@ static inline void isp_get_mp_pix_format(struct apple_isp *isp,
+ {
+ 	f->fmt.pix_mp.width = fmt->preset->output_dim.x;
+ 	f->fmt.pix_mp.height = fmt->preset->output_dim.y;
+-	f->fmt.pix_mp.num_planes = fmt->num_planes;
+-	for (int i = 0; i < fmt->num_planes; i++) {
+-		f->fmt.pix_mp.plane_fmt[i].sizeimage = fmt->plane_size[i];
+-		f->fmt.pix_mp.plane_fmt[i].bytesperline = fmt->strides[i];
+-	}
+-
++	/* Both contiguous formats have one memory plane and two ISP components. */
++	f->fmt.pix_mp.num_planes = 1;
++	memset(f->fmt.pix_mp.plane_fmt, 0, sizeof(f->fmt.pix_mp.plane_fmt));
++	f->fmt.pix_mp.plane_fmt[0].sizeimage = fmt->total_size;
++	f->fmt.pix_mp.plane_fmt[0].bytesperline = fmt->strides[0];
+ 	f->fmt.pix_mp.field = V4L2_FIELD_NONE;
+-	f->fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12M;
+-	/* P010 is contiguous, including through the multi-planar API. */
+-	if (fmt->pixelformat == V4L2_PIX_FMT_P010) {
+-		f->fmt.pix_mp.pixelformat = V4L2_PIX_FMT_P010;
+-		f->fmt.pix_mp.num_planes = 1;
+-		f->fmt.pix_mp.plane_fmt[0].sizeimage = fmt->total_size;
+-		memset(&f->fmt.pix_mp.plane_fmt[1], 0,
+-		       sizeof(f->fmt.pix_mp.plane_fmt[1]));
+-	}
++	f->fmt.pix_mp.pixelformat = fmt->pixelformat;
+ 	f->fmt.pix_mp.colorspace = V4L2_COLORSPACE_REC709;
+ 	f->fmt.pix_mp.ycbcr_enc = V4L2_YCBCR_ENC_709;
+ 	f->fmt.pix_mp.xfer_func = V4L2_XFER_FUNC_709;
+-	if (fmt->pixelformat == V4L2_PIX_FMT_P010)
+-		f->fmt.pix_mp.quantization = V4L2_QUANTIZATION_LIM_RANGE;
++	f->fmt.pix_mp.quantization = V4L2_QUANTIZATION_LIM_RANGE;
+ }
+ 
+ static int isp_vidioc_get_format(struct file *file, void *fh,
+@@ -911,7 +883,7 @@ static int isp_vidioc_get_format_mplane(struct file *file, void *fh,
+ 	struct apple_isp *isp = video_drvdata(file);
+ 	struct isp_format *fmt = isp_get_current_format(isp);
+ 
+-	if (!isp->multiplanar)
++	if (!isp_supports_p010(isp))
+ 		return -ENOTTY;
+ 
+ 	isp_get_mp_pix_format(isp, f, fmt);
+@@ -927,7 +899,7 @@ static int isp_vidioc_set_format_mplane(struct file *file, void *fh,
+ 	struct isp_preset *preset;
+ 	int err;
+ 
+-	if (!isp->multiplanar)
++	if (!isp_supports_p010(isp))
+ 		return -ENOTTY;
+ 
+ 	if (vb2_is_busy(&isp->vbq))
+@@ -954,7 +926,7 @@ static int isp_vidioc_try_format_mplane(struct file *file, void *fh,
+ 	struct isp_preset *preset;
+ 	int err;
+ 
+-	if (!isp->multiplanar)
++	if (!isp_supports_p010(isp))
+ 		return -ENOTTY;
+ 
+ 	preset = isp_select_preset(isp, f->fmt.pix_mp.width, f->fmt.pix_mp.height,
+@@ -1001,7 +973,7 @@ static int isp_vidioc_get_param(struct file *file, void *fh,
+ 	struct apple_isp *isp = video_drvdata(file);
+ 
+ 	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
+-	    (!isp->multiplanar ||
++	    (!isp_supports_p010(isp) ||
+ 	     a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE))
+ 		return -EINVAL;
+ 
+@@ -1019,7 +991,7 @@ static int isp_vidioc_set_param(struct file *file, void *fh,
+ 	struct v4l2_fract *tpf = &a->parm.capture.timeperframe;
+ 
+ 	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
+-	    (!isp->multiplanar ||
++	    (!isp_supports_p010(isp) ||
+ 	     a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE))
+ 		return -EINVAL;
+ 
+@@ -1055,6 +1027,9 @@ static int isp_vidioc_log_status(struct file *file, void *fh)
+ 			  config->output_dim.x, config->output_dim.y,
+ 			  config->sensor_clk,
+ 			  config->usable ? "" : " (unverified geometry)");
++		/* This explicit diagnostic ioctl replaces a probe-time parameter. */
++		print_hex_dump(KERN_INFO, "apple-isp config: ", DUMP_PREFIX_OFFSET,
++			       16, 4, config->reply, sizeof(config->reply), false);
+ 	}
+ 	return 0;
+ }
+@@ -1120,6 +1095,7 @@ static void apple_isp_release(struct v4l2_device *v4l2_dev)
+ 
+ 	v4l2_ctrl_handler_free(&isp->ctrl_handler);
+ 	media_device_cleanup(&isp->mdev);
++	kfree(isp->sensor_configs);
+ 	kfree(isp);
+ }
+ 
+@@ -1206,8 +1182,6 @@ int apple_isp_setup_video(struct apple_isp *isp)
+ 		goto media_cleanup;
+ 	}
+ 
+-	isp->multiplanar = multiplanar;
+-
+ 	/*
+ 	 * Auto exposure is always on. By default it holds the frame rate, as
+ 	 * V4L2 specifies; with exposure priority it may slow down in low light.
+@@ -1239,7 +1213,7 @@ int apple_isp_setup_video(struct apple_isp *isp)
+ 	vdev->fops = &isp_v4l2_fops;
+ 	vdev->ioctl_ops = &isp_v4l2_ioctl_ops;
+ 	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+-	if (isp->multiplanar)
++	if (isp_supports_p010(isp))
+ 		vdev->device_caps |= V4L2_CAP_VIDEO_CAPTURE_MPLANE;
+ 	vdev->entity.flags = MEDIA_ENT_FL_DEFAULT;
+ 	vdev->v4l2_dev = &isp->v4l2_dev;

@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 08:52:41 -0600
+Subject: [PATCH] tools: asahi: pin the vote clock wrap and require a passing
+ base in the mutation modes
+
+Review of 1142df92 by w7X, two non-blocking items folded in before push.
+
+Case 19 pins the signed 32-bit compare in agx_vote_reached: with idle_at
+0xFFFFFFF0, idle_ms 100 and voted, decide at 0xFFFFFFF8 must be NONE and next
+must return the 92 ms to the wrapped deadline, and a retry_at that has wrapped
+must not read as reached either. The wrap-reached mutant (now >= t) survives
+the old cases because they jump straight to the wrapped deadline; it dies at
+line 306. Registered as a fifth mutation entry.
+
+The mutation modes now assert the unmutated suite passed first, so a base
+failure cannot make every mutant read as caught. The negative control (--ref)
+is exempt: the pre-fix header cannot compile this suite, which is the point.
+
+The suite runs under setarch -R when available; ASan startup crashes under
+ASLR on a loaded host otherwise.
+
+Proof: plain run passes; --mutations exits 0 with all five mutants caught;
+wrap-reached CAUGHT at line 306; at 5b54de31 the owed-set-branch and
+stopped-in-begin mutants still print SURVIVED.
+
+Signed-off-by: Joshua Warren <816217+joshuaswarren@users.noreply.github.com>
+(cherry picked from commit db48e985728e23e35119de564cfc9bd0f0f266f2)
+---
+ tools/asahi/pmp-agx-vote-tests.c  |  9 +++++++++
+ tools/asahi/pmp-agx-vote-tests.py | 11 +++++++++--
+ tools/aurora-ci/host-tests.json   | 14 ++++++++++++++
+ 3 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/tools/asahi/pmp-agx-vote-tests.c b/tools/asahi/pmp-agx-vote-tests.c
+index 1d13e835ef..9ffb3541d6 100644
+--- a/tools/asahi/pmp-agx-vote-tests.c
++++ b/tools/asahi/pmp-agx-vote-tests.c
+@@ -299,6 +299,15 @@ int main(void)
+ 		CHECK(agx_vote_next(&w, 500) == AGX_VOTE_RETRY_MS);      // the retry deadline, not 1 ms
+ 		CHECK(agx_vote_next(&w, 500 + AGX_VOTE_RETRY_MS - 1) == 1);
+ 	}
++	// 19. w7X's wrap mutant: reached() must compare in signed 32-bit arithmetic, so a deadline that has
++	// wrapped into the low range is not "already reached" on the pre-wrap side
++	{
++		struct agx_vote v = {.enabled = true, .voted = true, .idle_ms = 100, .idle_at = 0xFFFFFFF0u};
++		CHECK(agx_vote_decide(&v, 0xFFFFFFF8u) == AGX_VOTE_NONE);
++		CHECK(agx_vote_next(&v, 0xFFFFFFF8u) == 0x5Cu);
++		struct agx_vote w = {.enabled = true, .idle_ms = 100, .users = 1, .failures = 1, .retry_at = 0x54u};
++		CHECK(agx_vote_decide(&w, 0xFFFFFFF8u) == AGX_VOTE_NONE);
++	}
+ 	printf("AGX-VOTE-SELFCHECK-OK\n");
+ 	return 0;
+ }
+diff --git a/tools/asahi/pmp-agx-vote-tests.py b/tools/asahi/pmp-agx-vote-tests.py
+index e3c8533ba0..7377d14a07 100755
+--- a/tools/asahi/pmp-agx-vote-tests.py
++++ b/tools/asahi/pmp-agx-vote-tests.py
+@@ -18,6 +18,7 @@ import json
+ import os
+ from pathlib import Path
+ import shlex
++import shutil
+ import subprocess
+ 
+ ROOT = Path(__file__).resolve().parents[2]
+@@ -32,6 +33,7 @@ CONTROLS = [
+     ('stopped-in-begin', 'return v->enabled && !v->voted && !v->stopped;', 'return v->enabled && !v->voted;'),
+     ('stopped-in-decide', 'if (!v->enabled || v->stopped)\n\t\treturn v->voted ? AGX_VOTE_CLEAR : AGX_VOTE_NONE;',
+      'if (!v->enabled)\n\t\treturn v->voted ? AGX_VOTE_CLEAR : AGX_VOTE_NONE;'),
++    ('wrap-reached', 'return (agx_sms_t)(now - t) >= 0;', 'return now >= t;'),
+ ]
+ 
+ 
+@@ -53,7 +55,8 @@ def compile_and_run(out, text):
+     (out / 'build.log').write_text(built.stdout + built.stderr)
+     if built.returncode:
+         return {'build_rc': built.returncode, 'run_rc': None, 'note': 'compilation failure is not regression evidence'}
+-    ran = subprocess.run([str(out / 'vote')], capture_output=True, text=True)
++    prefix = ['setarch', '-R'] if shutil.which('setarch') else []  # ASan startup can crash under ASLR on a loaded host
++    ran = subprocess.run(prefix + [str(out / 'vote')], capture_output=True, text=True)
+     (out / 'run.log').write_text(ran.stdout + ran.stderr)
+     return {'build_rc': 0, 'run_rc': ran.returncode}
+ 
+@@ -73,6 +76,10 @@ def main():
+ 
+     mutations = []
+     if args.mutations or args.mutation:
++        # A base failure would fail every mutant at the same case and read as caught.
++        # The negative control (--ref) has no passing base: the pre-fix header cannot compile this suite.
++        if not args.ref:
++            assert base['run_rc'] == 0, base
+         names = [c[0] for c in CONTROLS] if args.mutations else [args.mutation]
+         for name in names:
+             old, new = next((c[1], c[2]) for c in CONTROLS if c[0] == name)
+@@ -94,7 +101,7 @@ def main():
+ 
+     if args.mutations:
+         assert all(m['applied'] and m['build_rc'] == 0 and m['run_rc'] not in (0, None) for m in mutations), mutations
+-        print('PASS: 18 actual vote-policy cases and every mutant caught')
++        print('PASS: every vote-policy case passed and every mutant caught')
+         return 0
+     if args.mutation:
+         m = mutations[0]
+diff --git a/tools/aurora-ci/host-tests.json b/tools/aurora-ci/host-tests.json
+index 7d55400ba6..9e4702adda 100644
+--- a/tools/aurora-ci/host-tests.json
++++ b/tools/aurora-ci/host-tests.json
+@@ -2318,6 +2318,20 @@
+    "expect": "pass",
+    "note": "self-checking: exits 0 when the mutant aborts"
+   },
++  {
++   "name": "tools/asahi/pmp-agx-vote-tests.py --mutation wrap-reached",
++   "group": "tools",
++   "argv": [
++    "python3",
++    "tools/asahi/pmp-agx-vote-tests.py",
++    "--mutation",
++    "wrap-reached",
++    "--output",
++    "{output}"
++   ],
++   "expect": "pass",
++   "note": "self-checking: exits 0 when the mutant aborts"
++  },
+   {
+    "name": "tools/asahi/t6030-pmp-graph-tests.py",
+    "group": "tools",

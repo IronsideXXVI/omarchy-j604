@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erik Bourget <erik@ebourget.net>
+Date: Wed, 4 Nov 2026 22:19:15 -0500
+Subject: [PATCH] thunderbolt: apple: enable DisplayPort tunnels on T8132
+
+Give T8132 a DP IN policy of its own, apple_dpin_m4: the M3 flow (tunnel
+changed notifications, capacity retry, deferred bring-up) with the t8103
+handshake, which writes only DPTX_INACTIVE (+0x0c bit 0) and polls its ACK
+(+0x10 bit 0), gated on HPD. The DP IN interrupts are not set up. Its
+tunnels take TB_HOST_DP_HBR2_MAX, which keeps the DP IN streams of a PHY at
+one link rate where the connection manager decides it.
+
+A new policy flag, lazy_idle: a tunnel whose DP IN block the DCP never
+activated is torn down without touching the block, neither the inactive
+handshake nor the interrupt mask.
+
+Qualify apple,t8132.
+
+Signed-off-by: Erik Bourget <erik@ebourget.net>
+(cherry picked from commit 1f2afbb57d00d382943538d65dfabd665eff221b)
+---
+ drivers/thunderbolt/apple-dpin-state.c | 16 +++++++++++++++
+ drivers/thunderbolt/apple-dpin-state.h |  3 +++
+ drivers/thunderbolt/apple-dpin-test.c  | 28 ++++++++++++++++++++++++++
+ drivers/thunderbolt/apple.c            | 17 +++++++++++++---
+ 4 files changed, 61 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/thunderbolt/apple-dpin-state.c b/drivers/thunderbolt/apple-dpin-state.c
+index 18817e7848..2c3eadc4ad 100644
+--- a/drivers/thunderbolt/apple-dpin-state.c
++++ b/drivers/thunderbolt/apple-dpin-state.c
+@@ -33,6 +33,22 @@ const struct apple_dpin_policy apple_dpin_m3 = {
+ 	.host_policy = TB_HOST_DP_NOTIFY,
+ };
+ 
++/*
++ * M4 (T8132): the M3 flow. The DP IN handshake is the t8103 one, which
++ * writes only DPTX_INACTIVE (+0x0c bit 0) and polls its ACK (+0x10 bit 0),
++ * gated on HPD. The DP IN interrupts are not set up (nothing handles them),
++ * and a tunnel that DCP never activated is torn down without touching the
++ * block at all. Both DP IN streams of an ATC PHY need one link rate, so
++ * every tunnel gets HBR2 at most.
++ */
++const struct apple_dpin_policy apple_dpin_m4 = {
++	.flow = APPLE_DPIN_CHANGED,
++	.capacity_retry = true,
++	.defer_new_bringup = true,
++	.host_policy = TB_HOST_DP_NOTIFY | TB_HOST_DP_HBR2_MAX,
++	.lazy_idle = true,
++};
++
+ enum apple_dpin_flow apple_dpin_hooks(const struct apple_dpin_policy *policy,
+ 				      bool queue_present, bool display_enabled)
+ {
+diff --git a/drivers/thunderbolt/apple-dpin-state.h b/drivers/thunderbolt/apple-dpin-state.h
+index 5ccfef1c45..dcf3e53c0a 100644
+--- a/drivers/thunderbolt/apple-dpin-state.h
++++ b/drivers/thunderbolt/apple-dpin-state.h
+@@ -23,12 +23,15 @@ struct apple_dpin_policy {
+ 	bool t602x_handshake;
+ 	bool defer_new_bringup;
+ 	unsigned long host_policy;
++	/* teardown touches the DP IN block only after DCP's Activate/Deactivate did */
++	bool lazy_idle;
+ };
+ 
+ extern const struct apple_dpin_policy apple_dpin_disabled;
+ extern const struct apple_dpin_policy apple_dpin_m1;
+ extern const struct apple_dpin_policy apple_dpin_m2;
+ extern const struct apple_dpin_policy apple_dpin_m3;
++extern const struct apple_dpin_policy apple_dpin_m4;
+ 
+ enum apple_dpin_phase {
+ 	APPLE_DPIN_IDLE,
+diff --git a/drivers/thunderbolt/apple-dpin-test.c b/drivers/thunderbolt/apple-dpin-test.c
+index c22da168bd..c9664ffb5e 100644
+--- a/drivers/thunderbolt/apple-dpin-test.c
++++ b/drivers/thunderbolt/apple-dpin-test.c
+@@ -358,6 +358,8 @@ static void apple_dpin_qualification_profiles(struct kunit *test)
+ 		{ "apple,t6022", &apple_dpin_m2, true, &apple_dpin_disabled },
+ 		{ "apple,t6030", &apple_dpin_m3, true, &apple_dpin_m3 },
+ 		{ "apple,t6031", &apple_dpin_m3, true, &apple_dpin_disabled },
++		{ "apple,t8132", &apple_dpin_m4, true, &apple_dpin_m4 },
++		{ "apple,t8132", &apple_dpin_m4, false, &apple_dpin_m4 },
+ 		{ "apple,unknown", &apple_dpin_m1, true, &apple_dpin_disabled },
+ 	};
+ 	unsigned int i;
+@@ -377,6 +379,31 @@ static void apple_dpin_qualification_profiles(struct kunit *test)
+ 			    &apple_dpin_disabled);
+ }
+ 
++/*
++ * M4 (T8132): the M3 flow without DP IN interrupts, a lazy teardown, and
++ * DP tunnels capped at HBR2.
++ */
++static void apple_dpin_m4_policy(struct kunit *test)
++{
++	const struct apple_dpin_policy *p = &apple_dpin_m4;
++
++	KUNIT_EXPECT_EQ(test, p->flow, APPLE_DPIN_CHANGED);
++	KUNIT_EXPECT_TRUE(test, p->capacity_retry);
++	KUNIT_EXPECT_FALSE(test, p->setup_irqs);
++	KUNIT_EXPECT_FALSE(test, p->t602x_handshake);
++	KUNIT_EXPECT_TRUE(test, p->defer_new_bringup);
++	KUNIT_EXPECT_TRUE(test, p->lazy_idle);
++	KUNIT_EXPECT_EQ(test, p->host_policy, TB_HOST_DP_NOTIFY | TB_HOST_DP_HBR2_MAX);
++	/* The hooks of the M3 flow: a queue and a display pipeline both. */
++	KUNIT_EXPECT_EQ(test, apple_dpin_hooks(p, true, true), APPLE_DPIN_CHANGED);
++	KUNIT_EXPECT_EQ(test, apple_dpin_hooks(p, true, false), APPLE_DPIN_DISABLED);
++	KUNIT_EXPECT_EQ(test, apple_dpin_hooks(p, false, true), APPLE_DPIN_DISABLED);
++	/* No other Apple host is capped. */
++	KUNIT_EXPECT_FALSE(test, apple_dpin_m3.host_policy & TB_HOST_DP_HBR2_MAX);
++	KUNIT_EXPECT_FALSE(test, apple_dpin_m2.host_policy & TB_HOST_DP_HBR2_MAX);
++	KUNIT_EXPECT_FALSE(test, apple_dpin_m1.host_policy & TB_HOST_DP_HBR2_MAX);
++}
++
+ static void apple_dpin_all_policy_fields(struct kunit *test)
+ {
+ 	const struct apple_dpin_policy * const actual[] = {
+@@ -1191,6 +1218,7 @@ static struct kunit_case apple_dpin_cases[] = {
+ 	KUNIT_CASE(apple_dpin_readiness_budgets),
+ 	KUNIT_CASE(apple_dpin_qualification_profiles),
+ 	KUNIT_CASE(apple_dpin_all_policy_fields),
++	KUNIT_CASE(apple_dpin_m4_policy),
+ 	KUNIT_CASE(apple_dpin_policy_independent_of_hooks),
+ 	{},
+ };
+diff --git a/drivers/thunderbolt/apple.c b/drivers/thunderbolt/apple.c
+index 077d04621c..96b1aafd3a 100644
+--- a/drivers/thunderbolt/apple.c
++++ b/drivers/thunderbolt/apple.c
+@@ -163,8 +163,8 @@ static const struct apple_cio_hw apple_cio_t6030_hw = {
+  * T8132 has the T6030 ACIO layout and MxWrap CPU block, but the CIO reconfig
+  * already starts the CPU from its preloaded SRAM: RUN is never written. LSTX
+  * is handed over once RTKit is up, followed by the LSTX pin. Its links can
+- * retrain shortly after CL states are enabled, so they stay in CL0. It has
+- * no qualified DP route yet.
++ * retrain shortly after CL states are enabled, so they stay in CL0. Its
++ * DP IN adapters take the M4 policy, see apple_dpin_m4.
+  */
+ static const struct apple_cio_hw apple_cio_t8132_hw = {
+ 	.mxwrap = true,
+@@ -173,7 +173,7 @@ static const struct apple_cio_hw apple_cio_t8132_hw = {
+ 	.lstx_after_boot = true,
+ 	.strict_fw_ready = true,
+ 	.no_host_clx = true,
+-	.dp = &apple_dpin_disabled,
++	.dp = &apple_dpin_m4,
+ };
+ 
+ /* Type 7 uses its existing ready-state check and has no qualified DP route. */
+@@ -358,6 +358,7 @@ struct apple_cio {
+ 		struct apple_dpin_state state;
+ 		struct apple_dpin_tokens tokens;
+ 		struct apple_dpin_binding *binding; /* worker-owned, handed to DCP */
++		bool dcp_touched;	/* DCP ran the handshake on this mapping */
+ 	} dpin[2];
+ };
+ 
+@@ -406,6 +407,7 @@ static const struct of_device_id apple_dpin_qualified_soc[] = {
+ 	{ .compatible = "apple,t6020" },
+ 	{ .compatible = "apple,t6021" },
+ 	{ .compatible = "apple,t6030" },
++	{ .compatible = "apple,t8132" },
+ 	{},
+ };
+ 
+@@ -527,6 +529,9 @@ static void apple_dpin_request_inactive(void *data)
+ {
+ 	struct apple_dpin_ctx *c = data;
+ 
++	/* Never woken by DCP: the block is still as the tunnel found it. */
++	if (c->acio->dp->lazy_idle && !c->dcp_touched)
++		return;
+ 	apple_dpin_set_active(c->acio, c->regs, c->idx, false);
+ }
+ 
+@@ -534,6 +539,10 @@ static void apple_dpin_request_mask_irqs(void *data)
+ {
+ 	struct apple_dpin_ctx *c = data;
+ 
++	/* Nothing to mask where the interrupts were never enabled. */
++	if (c->acio->dp->lazy_idle && !c->acio->dp->setup_irqs)
++		return;
++
+ 	writel(readl(c->regs + APPLE_DPIN_IRQ_ENABLE) & ~3,
+ 	       c->regs + APPLE_DPIN_IRQ_ENABLE);
+ }
+@@ -563,6 +572,7 @@ static int apple_dpin_dcp_set_active(void *data, bool active)
+ 	/* the tunnel is being torn down: the block may already be off */
+ 	if (!c->state.alive || !c->regs)
+ 		return -ENODEV;
++	c->dcp_touched = true;
+ 	return apple_dpin_set_active(c->acio, c->regs, c->idx, active);
+ }
+ 
+@@ -735,6 +745,7 @@ static void apple_dpin_down(struct apple_dpin_ctx *c)
+ 	scoped_guard(mutex, &c->lock) {
+ 		regs = c->regs;
+ 		c->regs = NULL;
++		c->dcp_touched = false;
+ 		apple_dpin_step(&c->state, c->acio->dp, APPLE_DPIN_DROPPED, false, 0);
+ 	}
+ 	if (regs)

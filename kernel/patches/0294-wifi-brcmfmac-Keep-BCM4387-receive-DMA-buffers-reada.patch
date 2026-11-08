@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Wed, 21 Oct 2026 10:23:12 +1100
+Subject: [PATCH] wifi: brcmfmac: Keep BCM4387 receive DMA buffers readable
+
+Honoring the packet-ID pool direction changes receive buffers from
+bidirectional mappings to DMA_FROM_DEVICE. On permission-enforcing
+IOMMUs that removes device read access. BCM4387 firmware can read posted
+receive buffers, so this exposes read faults followed by a stalled
+message-buffer control path.
+
+Select DMA_BIDIRECTIONAL for the BCM4387 PCI device's receive packet-ID
+pool. This includes data, event and ioctl-response buffers and keeps all
+map/unmap paths consistent. Preserve DMA_TO_DEVICE for transmit and the
+normal receive direction for other devices. Do not relax DART permissions
+for unrelated devices or change buffer lifetime.
+
+The fault signatures and direction change identify this as a candidate
+for hardware verification; an actual failing IOVA still needs correlation
+with a live packet-ID mapping to establish its exact buffer class.
+
+Fixes: f0ba5fd51ff2 ("wifi: brcmfmac: Set DMA direction for msgbuf packet IDs")
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+---
+ .../broadcom/brcm80211/brcmfmac/msgbuf.c      | 28 ++++++++++++++++++-
+ 1 file changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c
+index 3d79b6ed47..7db5523c83 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c
+@@ -10,9 +10,11 @@
+ 
+ #include <linux/types.h>
+ #include <linux/netdevice.h>
++#include <linux/pci.h>
+ #include <linux/etherdevice.h>
+ #include <linux/ratelimit.h>
+ 
++#include <brcm_hw_ids.h>
+ #include <brcmu_utils.h>
+ #include <brcmu_wifi.h>
+ 
+@@ -332,6 +334,30 @@ struct brcmf_msgbuf_pktids {
+ static void brcmf_msgbuf_rxbuf_ioctlresp_post(struct brcmf_msgbuf *msgbuf);
+ 
+ 
++/*
++ * BCM4387 firmware can read buffers posted for receive. Since the packet-ID
++ * direction is now honored, DMA_FROM_DEVICE makes those buffers write-only
++ * on permission-enforcing IOMMUs. Keep RX data, event and ioctl-response
++ * buffers readable, with the same direction used for mapping and unmapping.
++ */
++static enum dma_data_direction
++brcmf_msgbuf_rx_dma_direction(struct device *dev)
++{
++	struct pci_dev *pdev;
++
++	if (!dev_is_pci(dev))
++		return DMA_FROM_DEVICE;
++
++	pdev = to_pci_dev(dev);
++	if (pdev->vendor == PCI_VENDOR_ID_BROADCOM &&
++	    pdev->device == BRCM_PCIE_4387_DEVICE_ID) {
++		dev_info(dev, "BCM4387: using bidirectional receive DMA\n");
++		return DMA_BIDIRECTIONAL;
++	}
++
++	return DMA_FROM_DEVICE;
++}
++
+ static struct brcmf_msgbuf_pktids *
+ brcmf_msgbuf_init_pktids(u32 nr_array_entries,
+ 			 enum dma_data_direction direction)
+@@ -1802,7 +1828,7 @@ int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr)
+ 	if (!msgbuf->tx_pktids)
+ 		goto fail;
+ 	msgbuf->rx_pktids = brcmf_msgbuf_init_pktids(NR_RX_PKTIDS,
+-						     DMA_FROM_DEVICE);
++			brcmf_msgbuf_rx_dma_direction(drvr->bus_if->dev));
+ 	if (!msgbuf->rx_pktids)
+ 		goto fail;
+ 

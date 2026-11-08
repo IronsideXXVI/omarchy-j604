@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Fri, 30 Oct 2026 19:51:30 +1100
+Subject: [PATCH] pmdomain: apple: pmgr-pwrstate: power every parent of a
+ domain left on
+
+genpd adds a power state that is on only below parents that are on. For
+a power state with one parent this always holds: the platform bus
+attaches the device to its domain and powers it on before probe. With
+more than one power-domains entry the bus attaches to none, so a domain
+that the boot loader left on cannot be added below a parent that is off.
+
+On the J616s DISPEXT1_SYS has two parents, FAB7_SOC and the PMP DISPEXT1
+request. iBoot leaves DISPEXT1_SYS and DISPEXT1_FE on when a display is
+plugged into a Type-C port at boot, and the PMP request entry starts off
+(the PMP starts with no requests), so every such boot logged
+
+  apple-pmgr-pwrstate 502800000.power-management:power-controller@490: failed to add to parent domain: -22 (report -> power-controller)
+  platform 502800000.power-management:power-controller@498: deferred probe pending: ... supplier power-controller@490 not ready
+
+DISPEXT0_SYS, left on the same way below its single PMP entry, never
+failed, because the bus powered that entry on first.
+
+When a domain with several parents is on at probe, attach a virtual
+device to each parent and hold it powered until the domain is added below
+them all; the subdomain links keep them on from there. The PMP request
+for DISPEXT1 is then made and handed to the PMP when it runs (requests
+0x63c00 instead of 0x23c00).
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+(cherry picked from commit 3db9b1f2bbb7e8c7d727f45e28486200e512f151)
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/pmdomain/apple/pmgr-pwrstate.c | 60 ++++++++++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+diff --git a/drivers/pmdomain/apple/pmgr-pwrstate.c b/drivers/pmdomain/apple/pmgr-pwrstate.c
+index 942c994030..fae56d91ca 100644
+--- a/drivers/pmdomain/apple/pmgr-pwrstate.c
++++ b/drivers/pmdomain/apple/pmgr-pwrstate.c
+@@ -12,6 +12,7 @@
+ #include <linux/of_address.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
++#include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/reset-controller.h>
+@@ -307,12 +308,63 @@ static int apple_pmgr_reset_xlate(struct reset_controller_dev *rcdev,
+ 	return 0;
+ }
+ 
++/*
++ * genpd adds a power state that is on only below parents that are on. With a
++ * single parent the platform bus has already attached this device to it and
++ * powered it on before probe; with more than one it attaches to none, so a
++ * domain the boot loader left on (DISPEXT1_SYS on the J616s, below FAB7_SOC
++ * and its PMP request) could not be added. Power every parent on through a
++ * virtual device until the subdomain links hold them.
++ */
++static int apple_pmgr_ps_hold_parents(struct apple_pmgr_ps *ps, bool active,
++				      struct dev_pm_domain_list **parents)
++{
++	static const struct dev_pm_domain_attach_data data = {
++		.pd_flags = PD_FLAG_NO_DEV_LINK,
++	};
++	struct dev_pm_domain_list *list = NULL;
++	unsigned int i;
++	int ret;
++
++	*parents = NULL;
++	if (!active || of_count_phandle_with_args(ps->dev->of_node, "power-domains",
++						  "#power-domain-cells") < 2)
++		return 0;
++
++	ret = dev_pm_domain_attach_list(ps->dev, &data, &list);
++	if (ret <= 0)
++		return ret;
++	for (i = 0; i < list->num_pds; i++) {
++		ret = pm_runtime_resume_and_get(list->pd_devs[i]);
++		if (ret < 0) {
++			while (i--)
++				pm_runtime_put(list->pd_devs[i]);
++			dev_pm_domain_detach_list(list);
++			return dev_err_probe(ps->dev, ret, "cannot power parent domain %u\n", i);
++		}
++	}
++	*parents = list;
++	return 0;
++}
++
++static void apple_pmgr_ps_release_parents(struct dev_pm_domain_list *parents)
++{
++	unsigned int i;
++
++	if (!parents)
++		return;
++	for (i = 0; i < parents->num_pds; i++)
++		pm_runtime_put(parents->pd_devs[i]);
++	dev_pm_domain_detach_list(parents);
++}
++
+ static int apple_pmgr_ps_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct device_node *node = dev->of_node;
+ 	struct apple_pmgr_ps *ps;
+ 	struct regmap *regmap;
++	struct dev_pm_domain_list *parents = NULL;
+ 	struct of_phandle_iterator it;
+ 	int ret;
+ 	const char *name;
+@@ -421,6 +473,10 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
++	ret = apple_pmgr_ps_hold_parents(ps, active, &parents);
++	if (ret < 0)
++		goto err_remove;
++
+ 	of_for_each_phandle(&it, ret, node, "power-domains", "#power-domain-cells", -1) {
+ 		struct of_phandle_args parent, child;
+ 
+@@ -441,6 +497,9 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	/* The subdomain links hold the parents now. */
++	apple_pmgr_ps_release_parents(parents);
++
+ 	/*
+ 	 * Do not participate in regular PM; parent power domains are handled via the
+ 	 * genpd hierarchy.
+@@ -460,6 +519,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
+ 
+ 	return 0;
+ err_remove:
++	apple_pmgr_ps_release_parents(parents);
+ 	of_genpd_del_provider(node);
+ 	pm_genpd_remove(&ps->genpd);
+ 	return ret;

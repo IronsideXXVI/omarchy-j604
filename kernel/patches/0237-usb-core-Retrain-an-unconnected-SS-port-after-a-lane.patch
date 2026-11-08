@@ -1,0 +1,371 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Sat, 31 Oct 2026 01:59:53 +1100
+Subject: [PATCH] usb: core: Retrain an unconnected SS port after a lane
+ handover
+
+A fixed-hub host can enumerate a dock over USB2 before Type-C has
+brought up the SuperSpeed lanes. Restoring the SS root port's power
+already queues a warm reset, but that alone need not restart receiver
+detection after the partner has abandoned the earlier training attempt.
+Rebinding the PD port can repeat the same sequence without producing a
+working SS connection.
+
+Let the lane provider consume that queued reset immediately after it has
+restored the port, while retaining the hub lock and a runtime PM
+reference to the port. Send one warm reset and, only if it completes
+with no receiver, restart the link once through Disabled and RxDetect.
+Reuse the existing bounded reset-status wait and hub rescan; add no
+delayed recovery loop. Skip connected links, USB2 and non-root hubs,
+ports with children or owners, administrative disables, power holds and
+ports without the queued reset.
+
+Use this only after successful SS power restoration on a T8140 fixed-hub
+PHY. A training failure is reported without pretending that the PHY
+still owns a power hold which power_on() has already released. M1/M2 and
+ordinary Type-C ports retain their existing path. The late-SS asymmetric
+peer fix handles devices which had already enumerated on USB2 once the
+SS hub arrives.
+
+Exercise the actual helper on a software HCD: success on the warm reset,
+success only after receiver-detection restart, persistent absence with
+no new attempts, an already healthy link, a control error and port
+ownership. The host PM fixture also checks that retraining runs only
+after the lanes and PIPE are ready and port power has been restored.
+
+Fixes: 70f7c21e7d32 ("phy: apple: atc: Route the PIPE from the Type-C mux on a fixed-hub port")
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(cherry picked from commit 8df6578502e77c519fb6cbf2c83823ecc5367c9b)
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/phy/apple/atc.c                       |   7 +
+ drivers/usb/core/hub.c                        |  87 ++++++++++
+ drivers/usb/core/port-power-test.c            | 150 +++++++++++++++++-
+ include/linux/usb.h                           |   1 +
+ .../selftests/drivers/gpu/apple-dcp/pm.py     |   7 +
+ 5 files changed, 251 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/phy/apple/atc.c b/drivers/phy/apple/atc.c
+index 150ea38ad8..e831e597fd 100644
+--- a/drivers/phy/apple/atc.c
++++ b/drivers/phy/apple/atc.c
+@@ -4566,6 +4566,13 @@ static int atcphy_usb3_port_on(struct apple_atcphy *atcphy, struct atcphy_usb3_p
+ 	ret = usb_hub_port_power_on(pm->root, 1);
+ 	if (ret < 0)
+ 		dev_warn(atcphy->dev, "Failed to power the SuperSpeed port on: %d\n", ret);
++	else if (!ret && atcphy->fixed_usb2 && atcphy->hw->has_t8140_dp) {
++		int retrain = usb_hub_port_retrain(pm->root, 1);
++
++		if (retrain < 0)
++			dev_warn(atcphy->dev, "SuperSpeed handover retrain failed: %d\n", retrain);
++		/* Power was restored even if no receiver answered the bounded retrain. */
++	}
+ #endif
+ 	return ret;
+ }
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index 214c4d0233..2f8ce16fff 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -3479,6 +3479,93 @@ static void usb_unlock_port(struct usb_port *port_dev)
+ 	__release(&port_dev->status_lock);
+ }
+ 
++/**
++ * usb_hub_port_retrain - restart an unconnected SuperSpeed root port
++ * @hdev: SuperSpeed root hub
++ * @port1: port number
++ *
++ * Called immediately after usb_hub_port_power_on(), under the same hub lock,
++ * once the caller has finished bringing up the lanes behind the port. Consume
++ * the queued warm reset here while keeping the port runtime-active. If that
++ * reset finds no receiver, restart detection once through Disabled/RxDetect.
++ * Each operation has a bounded wait; no further recovery work is scheduled.
++ * Connected links and ports with a child, an owner or a power hold are left
++ * alone. Only the caller's newly restored port is eligible.
++ *
++ * Return: 0 for a usable link, 1 for a port left alone, or a negative error.
++ * A failure does not reclaim the power hold released by power_on().
++ */
++int usb_hub_port_retrain(struct usb_device *hdev, int port1)
++{
++	struct usb_hub *hub = usb_hub_to_struct_hub(hdev);
++	struct usb_interface *intf;
++	struct usb_port *port_dev;
++	u16 status, change;
++	int ret;
++
++	device_lock_assert(&hdev->dev);
++	if (!hub || hub->disconnected || hub->quiescing)
++		return -ENODEV;
++	if (hdev->parent || !hub_is_superspeed(hdev))
++		return -EOPNOTSUPP;
++	if (port1 < 1 || port1 > hdev->maxchild)
++		return -EINVAL;
++	port_dev = hub->ports[port1 - 1];
++	if (port_dev->disabled || port_dev->held_off || port_dev->port_owner ||
++	    port_dev->child || port_dev->ignore_event || port_dev->early_stop ||
++	    !test_bit(port1, hub->warm_reset_bits))
++		return 1;
++
++	intf = to_usb_interface(hub->intfdev);
++	ret = usb_autopm_get_interface(intf);
++	if (ret < 0)
++		return ret;
++	ret = pm_runtime_resume_and_get(&port_dev->dev);
++	if (ret < 0)
++		goto put_intf;
++	usb_lock_port(port_dev);
++	ret = usb_hub_port_status(hub, port1, &status, &change);
++	if (ret)
++		goto unlock;
++	if (!usb_port_is_power_on(hub, status)) {
++		ret = 1;
++		goto unlock;
++	}
++	/* The caller still holds the hub lock from power_on(): this is its reset. */
++	clear_bit(port1, hub->warm_reset_bits);
++	if ((status & (USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE)) ==
++	    (USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE) &&
++	    (status & USB_PORT_STAT_LINK_STATE) <= USB_SS_PORT_LS_U3) {
++		ret = 0;
++		goto unlock;
++	}
++
++	dev_dbg(&port_dev->dev, "SS handover: warm reset after lane readiness\n");
++	ret = set_port_feature(hdev, port1, USB_PORT_FEAT_BH_PORT_RESET);
++	if (!ret)
++		ret = hub_port_wait_reset(hub, port1, NULL, HUB_BH_RESET_TIME, true);
++	if (ret != -ENOTCONN)
++		goto rescan;
++
++	dev_dbg(&port_dev->dev, "SS handover: restarting receiver detection\n");
++	ret = hub_set_port_link_state(hub, port1, USB_SS_PORT_LS_SS_DISABLED);
++	if (!ret)
++		ret = hub_set_port_link_state(hub, port1, USB_SS_PORT_LS_RX_DETECT);
++	if (!ret)
++		ret = hub_port_wait_reset(hub, port1, NULL, HUB_BH_RESET_TIME, true);
++rescan:
++	dev_dbg(&port_dev->dev, "SS handover: retrain result %d\n", ret);
++	set_bit(port1, hub->change_bits);
++	kick_hub_wq(hub);
++unlock:
++	usb_unlock_port(port_dev);
++	pm_runtime_put(&port_dev->dev);
++put_intf:
++	usb_autopm_put_interface(intf);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(usb_hub_port_retrain);
++
+ #ifdef	CONFIG_PM
+ 
+ /* Check if a port is suspended(USB2.0 port) or in U3 state(USB3.0 port) */
+diff --git a/drivers/usb/core/port-power-test.c b/drivers/usb/core/port-power-test.c
+index 4a105a2580..fe2d696300 100644
+--- a/drivers/usb/core/port-power-test.c
++++ b/drivers/usb/core/port-power-test.c
+@@ -31,6 +31,11 @@ struct port_power_test_hc {
+ 	u16 change;
+ 	unsigned int power_ons;
+ 	bool fail_power_off;
++	unsigned int warm_resets;
++	unsigned int detect_restarts;
++	bool connect_on_warm;
++	bool connect_on_detect;
++	bool fail_warm_reset;
+ };
+ 
+ struct port_power_test {
+@@ -171,8 +176,31 @@ static int port_power_test_hub_control(struct usb_hcd *hcd, u16 type_req, u16 va
+ 			port_power_test_set_power(hcd, true);
+ 		else if (value == USB_PORT_FEAT_RESET)
+ 			hc->change |= USB_PORT_STAT_C_RESET;
+-		else if (value == USB_PORT_FEAT_BH_PORT_RESET)
++		else if (value == USB_PORT_FEAT_BH_PORT_RESET) {
++			hc->warm_resets++;
++			if (hc->fail_warm_reset)
++				return -EIO;
+ 			hc->change |= USB_PORT_STAT_C_RESET | USB_PORT_STAT_C_BH_RESET;
++			if (hc->connect_on_warm) {
++				hc->status &= ~USB_PORT_STAT_LINK_STATE;
++				hc->status |= USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE;
++			}
++		} else if (value == USB_PORT_FEAT_LINK_STATE) {
++			u16 state = (index >> 3) & USB_PORT_STAT_LINK_STATE;
++
++			hc->status &= ~USB_PORT_STAT_LINK_STATE;
++			hc->status |= state;
++			if (state == USB_SS_PORT_LS_SS_DISABLED)
++				hc->status &= ~(USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE);
++			if (state == USB_SS_PORT_LS_RX_DETECT) {
++				hc->detect_restarts++;
++				if (hc->connect_on_detect) {
++					hc->status &= ~USB_PORT_STAT_LINK_STATE;
++					hc->status |= USB_PORT_STAT_CONNECTION |
++						      USB_PORT_STAT_ENABLE;
++				}
++			}
++		}
+ 		return 0;
+ 	case ClearPortFeature:
+ 		if (value == USB_PORT_FEAT_POWER && hc->fail_power_off) {
+@@ -916,7 +944,127 @@ static void port_power_test_connector_graph_legacy(struct kunit *test)
+ }
+ #endif
+ 
++/* Keep the root locked from power-on through retraining, as the PHY does. */
++static struct port_power_test_hc *
++port_power_test_retrain_begin(struct kunit *test, bool warm, bool detect)
++{
++	struct port_power_test *t = test->priv;
++	struct port_power_test_hc *hc = port_power_test_hc(t->shared_hcd);
++
++	usb_lock_device(t->ss_root);
++	KUNIT_EXPECT_EQ(test, usb_hub_port_power_off(t->ss_root, 1), 0);
++	KUNIT_EXPECT_EQ(test, usb_hub_port_power_on(t->ss_root, 1), 0);
++	scoped_guard(spinlock_irqsave, &hc->lock) {
++		hc->warm_resets = 0;
++		hc->detect_restarts = 0;
++		hc->connect_on_warm = warm;
++		hc->connect_on_detect = detect;
++	}
++	return hc;
++}
++
++static void port_power_test_retrain_end(struct kunit *test)
++{
++	struct port_power_test *t = test->priv;
++	struct port_power_test_hc *hc = port_power_test_hc(t->shared_hcd);
++
++	/* The synthetic controller has no device to enumerate after the check. */
++	scoped_guard(spinlock_irqsave, &hc->lock) {
++		hc->status &= ~(USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE |
++				USB_PORT_STAT_LINK_STATE);
++		hc->status |= USB_SS_PORT_LS_RX_DETECT;
++	}
++	usb_unlock_device(t->ss_root);
++}
++
++static void port_power_test_retrain_warm(struct kunit *test)
++{
++	struct port_power_test *t = test->priv;
++	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, true, false);
++	int usage = port_power_test_usage(t->ss_port);
++
++	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 0);
++	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
++	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 0U);
++	KUNIT_EXPECT_EQ(test, port_power_test_usage(t->ss_port), usage);
++	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 1);
++	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
++	port_power_test_retrain_end(test);
++}
++
++static void port_power_test_retrain_detect(struct kunit *test)
++{
++	struct port_power_test *t = test->priv;
++	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, true);
++
++	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 0);
++	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
++	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 1U);
++	port_power_test_retrain_end(test);
++}
++
++static void port_power_test_retrain_bounded(struct kunit *test)
++{
++	struct port_power_test *t = test->priv;
++	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, false);
++
++	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), -ENOTCONN);
++	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 1);
++	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
++	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 1U);
++	port_power_test_retrain_end(test);
++}
++
++static void port_power_test_retrain_healthy(struct kunit *test)
++{
++	struct port_power_test *t = test->priv;
++	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, false);
++
++	scoped_guard(spinlock_irqsave, &hc->lock) {
++		hc->status &= ~USB_PORT_STAT_LINK_STATE;
++		hc->status |= USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE;
++	}
++	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 0);
++	KUNIT_EXPECT_EQ(test, hc->warm_resets, 0U);
++	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 0U);
++	port_power_test_retrain_end(test);
++}
++
++static void port_power_test_retrain_error(struct kunit *test)
++{
++	struct port_power_test *t = test->priv;
++	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, false);
++
++	hc->fail_warm_reset = true;
++	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), -EIO);
++	KUNIT_EXPECT_EQ(test, hc->warm_resets, 1U);
++	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 0U);
++	port_power_test_retrain_end(test);
++}
++
++static void port_power_test_retrain_owner(struct kunit *test)
++{
++	struct port_power_test *t = test->priv;
++	struct port_power_test_hc *hc = port_power_test_retrain_begin(test, false, false);
++
++	KUNIT_EXPECT_EQ(test, usb_hub_claim_port(t->ss_root, 1, (void *)t), 0);
++	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->ss_root, 1), 1);
++	KUNIT_EXPECT_EQ(test, usb_hub_release_port(t->ss_root, 1, (void *)t), 0);
++	KUNIT_EXPECT_EQ(test, hc->warm_resets, 0U);
++	KUNIT_EXPECT_EQ(test, hc->detect_restarts, 0U);
++	port_power_test_retrain_end(test);
++	usb_lock_device(t->hs_root);
++	KUNIT_EXPECT_EQ(test, usb_hub_port_retrain(t->hs_root, 1), -EOPNOTSUPP);
++	usb_unlock_device(t->hs_root);
++}
++
+ static struct kunit_case port_power_test_cases[] = {
++	KUNIT_CASE(port_power_test_retrain_warm),
++	KUNIT_CASE(port_power_test_retrain_detect),
++	KUNIT_CASE(port_power_test_retrain_bounded),
++	KUNIT_CASE(port_power_test_retrain_healthy),
++	KUNIT_CASE(port_power_test_retrain_error),
++	KUNIT_CASE(port_power_test_retrain_owner),
+ #if IS_ENABLED(CONFIG_OF_DYNAMIC)
+ 	KUNIT_CASE(port_power_test_connector_graph),
+ 	KUNIT_CASE(port_power_test_connector_graph_legacy),
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index 8c14a6bd3e..25f6b0c2fb 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -958,6 +958,7 @@ int usb_hub_release_port(struct usb_device *hdev, unsigned port1,
+ /* port power switching for a driver that moves the lanes behind a port */
+ int usb_hub_port_power_off(struct usb_device *hdev, int port1);
+ int usb_hub_port_power_on(struct usb_device *hdev, int port1);
++int usb_hub_port_retrain(struct usb_device *hdev, int port1);
+ 
+ /**
+  * usb_make_path - returns stable device path in the usb tree
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/pm.py b/tools/testing/selftests/drivers/gpu/apple-dcp/pm.py
+index 4ff0321363..189f1e678d 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/pm.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/pm.py
+@@ -212,6 +212,13 @@ static int usb_hub_port_power_on(struct usb_device *u, int port)
+  usb3_port_down=false;
+  return 0;
+ }
++static int usb_hub_port_retrain(struct usb_device *u, int port)
++{
++ assert(u==&roots[3]&&port==1&&root_locked&&pm_refs==1&&!pm_phy->lock);
++ assert(!usb3_port_down&&pm_phy->host_active&&!pm_phy->mode_dirty&&!pm_phy->pipe_pending);
++ assert(pm_phy->pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);
++ return 0;
++}
+ #endif
+ '''
+     suffix=ns['suffix'].replace('int main(', 'int __attribute__((unused)) fixture_main(',1)

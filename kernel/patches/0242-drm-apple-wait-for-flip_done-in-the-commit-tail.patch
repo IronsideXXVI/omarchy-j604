@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Artyom Astafurov <artyom.astafurov@gmail.com>
+Date: Wed, 28 Oct 2026 17:12:36 -0400
+Subject: [PATCH] drm/apple: wait for flip_done in the commit tail
+
+A DCP commit signals flip_done from its swap completion, after the rest
+of the commit tail has run. drm_atomic_helper_commit_tail_rpm() waits
+with drm_atomic_helper_wait_for_vblanks(), but appledrm never calls
+drm_vblank_init(), so drm_crtc_vblank_get() fails and that wait returns
+at once. A blocking commit therefore returned before flip_done, and
+drm_atomic_helper_setup_commit() refuses a nonblocking commit on the
+same plane until flip_done. A page flip right after drmModeSetCrtc()
+failed with -EBUSY ("busy with a previous commit"), which is what
+glmark2-es2-drm hit on the J616c.
+
+Wait with drm_atomic_helper_wait_for_flip_done() instead. The rest is
+the sequence of drm_atomic_helper_commit_tail_rpm(), in its order. That
+helper makes no runtime PM calls: its name stands for enabling CRTCs
+before committing active planes, and this keeps that.
+
+The change is not scoped to the J616c. Neither the empty vblank wait
+nor the -EBUSY check depends on the SoC, so a per-machine tail would
+only leave the race on the others. On every appledrm machine:
+
+- A blocking commit returns after the swap completes and holds its
+  modeset locks until then.
+- A nonblocking commit's worker finishes later. The next commit was
+  already held back by flip_done, so the flip rate does not change.
+- Nothing waits when flip_done is complete early: CRTCs that stay off,
+  legacy cursor updates, and the T8132 backend, which sends the event
+  from its flush.
+- A lost event costs 10 s and an error in the commit that lost it. The
+  next commit's dependency wait already has the same bound, so this
+  adds no new hang.
+
+Framebuffer lifetime does not depend on this wait: displaced scanout is
+already retained until its swap completes.
+
+Seen and tested on the J616c only.
+
+Assisted-by: LLM
+Signed-off-by: Artyom Astafurov <artyom.astafurov@gmail.com>
+(cherry picked from commit 4014d3c56b59fde90df3603e63096468828094f4)
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/gpu/drm/apple/apple_drv.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/apple/apple_drv.c b/drivers/gpu/drm/apple/apple_drv.c
+index 710fd49000..745127658e 100644
+--- a/drivers/gpu/drm/apple/apple_drv.c
++++ b/drivers/gpu/drm/apple/apple_drv.c
+@@ -501,7 +501,14 @@ static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
+ 		dcp_retain_framebuffer(to_apple_crtc(old->crtc)->dcp, entry);
+ 	}
+ 
+-	drm_atomic_helper_commit_tail_rpm(state);
++	drm_atomic_helper_commit_modeset_disables(state->dev, state);
++	drm_atomic_helper_commit_modeset_enables(state->dev, state);
++	drm_atomic_helper_commit_planes(state->dev, state,
++					DRM_PLANE_COMMIT_ACTIVE_ONLY);
++	drm_atomic_helper_fake_vblank(state);
++	drm_atomic_helper_commit_hw_done(state);
++	drm_atomic_helper_wait_for_flip_done(state->dev, state);
++	drm_atomic_helper_cleanup_planes(state->dev, state);
+ }
+ 
+ static const struct drm_mode_config_helper_funcs apple_mode_config_helpers = {

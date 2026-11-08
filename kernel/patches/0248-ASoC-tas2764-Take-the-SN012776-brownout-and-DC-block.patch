@@ -1,0 +1,520 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 18:15:26 +1100
+Subject: [PATCH] ASoC: tas2764: Take the SN012776 brownout and DC blocker
+ setup from the DT
+
+The driver wrote a brownout prevention block typed in from a trace to
+every SN012776, and left the DC blockers at their reset values. The
+Mac's ADT carries both for each amp group (bop-config and
+amp-dcblocker-config), and the boot loader now copies them to every
+amp's node as apple,bop-config and apple,amp-dcblocker-config.
+
+Program BOP_CFG0..BOP_CFG24 from apple,bop-config, and DC_BLK0 and
+DC_BLK1 from the first two bytes of apple,amp-dcblocker-config (the
+rest is padding), and drop the copy in the driver. PVDD stays the
+brownout source on every SN012776, as before. Without a property its
+registers keep their reset values; a property of the wrong length is
+a broken device tree and fails the probe.
+
+KUnit tas2764-bop (8 cases): each block is the property byte for byte,
+absent means none, a wrong length fails, a TAS2764 ignores both.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+(cherry picked from commit aca03d5c075873218e3be77881662f7db83ce218)
+Assisted-by: Claude:claude-opus-5.5
+---
+ .../devicetree/bindings/sound/ti,tas27xx.yaml |  19 ++
+ sound/soc/codecs/Kconfig                      |   8 +
+ sound/soc/codecs/Makefile                     |   1 +
+ sound/soc/codecs/tas2764-bop-test.h           | 196 ++++++++++++++++++
+ sound/soc/codecs/tas2764-kunit.dtso           |  33 +++
+ sound/soc/codecs/tas2764.c                    | 107 +++++++++-
+ sound/soc/codecs/tas2764.h                    |   3 +
+ 7 files changed, 359 insertions(+), 8 deletions(-)
+ create mode 100644 sound/soc/codecs/tas2764-bop-test.h
+ create mode 100644 sound/soc/codecs/tas2764-kunit.dtso
+
+diff --git a/Documentation/devicetree/bindings/sound/ti,tas27xx.yaml b/Documentation/devicetree/bindings/sound/ti,tas27xx.yaml
+index 05c2ab00c4..07ea476d4e 100644
+--- a/Documentation/devicetree/bindings/sound/ti,tas27xx.yaml
++++ b/Documentation/devicetree/bindings/sound/ti,tas27xx.yaml
+@@ -66,6 +66,25 @@ properties:
+       down, and no member enables it again until the driver is reloaded.
+       A member needs its fault interrupt.
+ 
++  apple,bop-config:
++    $ref: /schemas/types.yaml#/definitions/uint8-array
++    minItems: 24
++    maxItems: 24
++    description:
++      SN012776 only. The brownout prevention registers BOP_CFG0 to BOP_CFG24,
++      in register order, as the Mac's boot ADT gives them for the amplifier's
++      group (its bop-config). The boot loader copies it into the device tree;
++      without it the block keeps its reset values.
++
++  apple,amp-dcblocker-config:
++    $ref: /schemas/types.yaml#/definitions/uint8-array
++    minItems: 2
++    description:
++      SN012776 only. The DC blocker setting of the amplifier's group, as the
++      Mac's boot ADT gives it (its amp-dcblocker-config), copied by the boot
++      loader; its first two bytes are DC_BLK0 and DC_BLK1. Absent when the
++      ADT has none, and the registers then keep their reset values.
++
+   apple,deferred-shutdown:
+     type: boolean
+     description:
+diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
+index fbd8b94453..b057c8e533 100644
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -2206,6 +2206,14 @@ config SND_SOC_TAS2764
+ 	tristate "Texas Instruments TAS2764 Mono Audio amplifier"
+ 	depends on I2C
+ 
++config SND_SOC_TAS2764_KUNIT_TEST
++	bool "KUnit tests for the TAS2764 device tree configuration" if !KUNIT_ALL_TESTS
++	depends on KUNIT && SND_SOC_TAS2764=y && OF_OVERLAY
++	default KUNIT_ALL_TESTS
++	help
++	  Tests of how the TAS2764/SN012776 driver reads the amplifier
++	  configuration that the boot loader copies from the Mac's ADT.
++
+ config SND_SOC_TAS2770
+ 	tristate "Texas Instruments TAS2770 speaker amplifier"
+ 	depends on I2C
+diff --git a/sound/soc/codecs/Makefile b/sound/soc/codecs/Makefile
+index 1ed18ec77c..1c2f67f866 100644
+--- a/sound/soc/codecs/Makefile
++++ b/sound/soc/codecs/Makefile
+@@ -436,6 +436,7 @@ snd-soc-tpa6130a2-y := tpa6130a2.o
+ snd-soc-tas2552-y := tas2552.o
+ snd-soc-tas2562-y := tas2562.o
+ snd-soc-tas2764-y := tas2764.o
++snd-soc-tas2764-$(CONFIG_SND_SOC_TAS2764_KUNIT_TEST) += tas2764-kunit.dtbo.o
+ snd-soc-tas2780-y := tas2780.o
+ # Mux
+ snd-soc-simple-mux-y := simple-mux.o
+diff --git a/sound/soc/codecs/tas2764-bop-test.h b/sound/soc/codecs/tas2764-bop-test.h
+new file mode 100644
+index 0000000000..d6fa20cedb
+--- /dev/null
++++ b/sound/soc/codecs/tas2764-bop-test.h
+@@ -0,0 +1,196 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * KUnit tests of tas2764_parse_bop_config() and
++ * tas2764_parse_dcblocker_config(): the SN012776 brownout block and DC
++ * blockers come from the device tree's apple,bop-config and
++ * apple,amp-dcblocker-config, which the boot loader copies from the Mac's
++ * ADT, and from nowhere else.
++ */
++#include <kunit/of.h>
++#include <kunit/test.h>
++
++/* A device on the test node @node, and a driver state not from the device tree */
++static struct tas2764_priv *tas2764_test_priv(struct kunit *test, const char *node,
++					      enum tas2764_devid devid,
++					      struct device **devp)
++{
++	struct tas2764_priv *tas2764;
++	struct device *dev;
++
++	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
++	tas2764 = kunit_kzalloc(test, sizeof(*tas2764), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	KUNIT_ASSERT_NOT_NULL(test, tas2764);
++
++	dev->of_node = of_find_node_by_name(NULL, node);
++	KUNIT_ASSERT_NOT_NULL(test, dev->of_node);
++	of_node_put_kunit(test, dev->of_node);
++
++	tas2764->devid = devid;
++	/* A value that did not come from the device tree must not survive */
++	tas2764->have_bop_config = true;
++	memset(tas2764->bop_config, 0xee, sizeof(tas2764->bop_config));
++	tas2764->have_dc_blk = true;
++	memset(tas2764->dc_blk, 0xee, sizeof(tas2764->dc_blk));
++
++	*devp = dev;
++	return tas2764;
++}
++
++static struct tas2764_priv *tas2764_bop_test_parse(struct kunit *test,
++						   const char *node,
++						   enum tas2764_devid devid,
++						   int *ret)
++{
++	struct tas2764_priv *tas2764;
++	struct device *dev;
++
++	tas2764 = tas2764_test_priv(test, node, devid, &dev);
++	*ret = tas2764_parse_bop_config(dev, tas2764);
++	return tas2764;
++}
++
++/* The block is the property, byte for byte and in register order */
++static void tas2764_bop_from_dt(struct kunit *test)
++{
++	struct tas2764_priv *tas2764;
++	int ret, i;
++
++	tas2764 = tas2764_bop_test_parse(test, "tas2764-kunit-bop-good",
++					 DEVID_SN012776, &ret);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_TRUE(test, tas2764->have_bop_config);
++	for (i = 0; i < TAS2764_BOP_CFG_LEN; i++)
++		KUNIT_EXPECT_EQ(test, tas2764->bop_config[i], i);
++}
++
++/* No property: no block, and no value from anywhere else */
++static void tas2764_bop_absent(struct kunit *test)
++{
++	struct tas2764_priv *tas2764;
++	int ret;
++
++	tas2764 = tas2764_bop_test_parse(test, "tas2764-kunit-bop-none",
++					 DEVID_SN012776, &ret);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_FALSE(test, tas2764->have_bop_config);
++}
++
++/* A block of the wrong length is a broken device tree: the probe fails */
++static void tas2764_bop_wrong_length(struct kunit *test)
++{
++	struct tas2764_priv *tas2764;
++	int ret;
++
++	tas2764 = tas2764_bop_test_parse(test, "tas2764-kunit-bop-short",
++					 DEVID_SN012776, &ret);
++	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
++	KUNIT_EXPECT_FALSE(test, tas2764->have_bop_config);
++
++	tas2764 = tas2764_bop_test_parse(test, "tas2764-kunit-bop-long",
++					 DEVID_SN012776, &ret);
++	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
++	KUNIT_EXPECT_FALSE(test, tas2764->have_bop_config);
++}
++
++/* The TAS2764 itself has no such block: the property is not its */
++static void tas2764_bop_not_sn012776(struct kunit *test)
++{
++	struct tas2764_priv *tas2764;
++	int ret;
++
++	tas2764 = tas2764_bop_test_parse(test, "tas2764-kunit-bop-good",
++					 DEVID_TAS2764, &ret);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_FALSE(test, tas2764->have_bop_config);
++}
++
++/* As tas2764_bop_test_parse(), for the DC blockers */
++static struct tas2764_priv *tas2764_dcb_test_parse(struct kunit *test,
++						   const char *node,
++						   enum tas2764_devid devid,
++						   int *ret)
++{
++	struct tas2764_priv *tas2764;
++	struct device *dev;
++
++	tas2764 = tas2764_test_priv(test, node, devid, &dev);
++	*ret = tas2764_parse_dcblocker_config(dev, tas2764);
++	return tas2764;
++}
++
++/* DC_BLK0 and DC_BLK1 are the property's first two bytes; the rest is padding */
++static void tas2764_dcb_from_dt(struct kunit *test)
++{
++	struct tas2764_priv *tas2764;
++	int ret;
++
++	tas2764 = tas2764_dcb_test_parse(test, "tas2764-kunit-bop-good",
++					 DEVID_SN012776, &ret);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_TRUE(test, tas2764->have_dc_blk);
++	KUNIT_EXPECT_EQ(test, tas2764->dc_blk[0], 0x5a);
++	KUNIT_EXPECT_EQ(test, tas2764->dc_blk[1], 0xa5);
++}
++
++/* No property: the registers keep their reset values */
++static void tas2764_dcb_absent(struct kunit *test)
++{
++	struct tas2764_priv *tas2764;
++	int ret;
++
++	tas2764 = tas2764_dcb_test_parse(test, "tas2764-kunit-bop-none",
++					 DEVID_SN012776, &ret);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_FALSE(test, tas2764->have_dc_blk);
++}
++
++/* One byte cannot hold both registers: the probe fails */
++static void tas2764_dcb_short(struct kunit *test)
++{
++	struct tas2764_priv *tas2764;
++	int ret;
++
++	tas2764 = tas2764_dcb_test_parse(test, "tas2764-kunit-bop-short",
++					 DEVID_SN012776, &ret);
++	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
++	KUNIT_EXPECT_FALSE(test, tas2764->have_dc_blk);
++}
++
++/* Not the TAS2764's */
++static void tas2764_dcb_not_sn012776(struct kunit *test)
++{
++	struct tas2764_priv *tas2764;
++	int ret;
++
++	tas2764 = tas2764_dcb_test_parse(test, "tas2764-kunit-bop-good",
++					 DEVID_TAS2764, &ret);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_FALSE(test, tas2764->have_dc_blk);
++}
++
++static struct kunit_case tas2764_bop_test_cases[] = {
++	KUNIT_CASE(tas2764_bop_from_dt),
++	KUNIT_CASE(tas2764_bop_absent),
++	KUNIT_CASE(tas2764_bop_wrong_length),
++	KUNIT_CASE(tas2764_bop_not_sn012776),
++	KUNIT_CASE(tas2764_dcb_from_dt),
++	KUNIT_CASE(tas2764_dcb_absent),
++	KUNIT_CASE(tas2764_dcb_short),
++	KUNIT_CASE(tas2764_dcb_not_sn012776),
++	{}
++};
++
++/* The test nodes, for each case; the overlay goes again at the case's end */
++static int tas2764_bop_test_init(struct kunit *test)
++{
++	return of_overlay_apply_kunit(test, tas2764_kunit);
++}
++
++static struct kunit_suite tas2764_bop_test_suite = {
++	.name = "tas2764-bop",
++	.init = tas2764_bop_test_init,
++	.test_cases = tas2764_bop_test_cases,
++};
++
++kunit_test_suite(tas2764_bop_test_suite);
+diff --git a/sound/soc/codecs/tas2764-kunit.dtso b/sound/soc/codecs/tas2764-kunit.dtso
+new file mode 100644
+index 0000000000..7e9fddceac
+--- /dev/null
++++ b/sound/soc/codecs/tas2764-kunit.dtso
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Nodes for the TAS2764 KUnit tests (tas2764-bop-test.h). The values are made
++ * up; only their length and placement matter.
++ */
++/dts-v1/;
++/plugin/;
++
++&{/} {
++	tas2764-kunit-bop-good {
++		compatible = "test,tas2764-kunit";
++		apple,bop-config = [00 01 02 03 04 05 06 07 08 09 0a 0b
++				    0c 0d 0e 0f 10 11 12 13 14 15 16 17];
++		apple,amp-dcblocker-config = [5a a5 00 00];
++	};
++
++	tas2764-kunit-bop-short {
++		compatible = "test,tas2764-kunit";
++		apple,amp-dcblocker-config = [5a];
++		apple,bop-config = [00 01 02 03 04 05 06 07 08 09 0a 0b
++				    0c 0d 0e 0f 10 11 12 13 14 15 16];
++	};
++
++	tas2764-kunit-bop-long {
++		compatible = "test,tas2764-kunit";
++		apple,bop-config = [00 01 02 03 04 05 06 07 08 09 0a 0b
++				    0c 0d 0e 0f 10 11 12 13 14 15 16 17 18];
++	};
++
++	tas2764-kunit-bop-none {
++		compatible = "test,tas2764-kunit";
++	};
++};
+diff --git a/sound/soc/codecs/tas2764.c b/sound/soc/codecs/tas2764.c
+index a5c2c7c462..11523b43af 100644
+--- a/sound/soc/codecs/tas2764.c
++++ b/sound/soc/codecs/tas2764.c
+@@ -76,6 +76,13 @@ struct tas2764_priv {
+ 		unsigned int tx_mask;
+ 	} idle_slot_config;
+ 
++	/* apple,bop-config: the SN012776 brownout prevention block */
++	u8 bop_config[TAS2764_BOP_CFG_LEN];
++	bool have_bop_config;
++	/* apple,amp-dcblocker-config: the SN012776 DC_BLK0 and DC_BLK1 */
++	u8 dc_blk[2];
++	bool have_dc_blk;
++
+ 	/* apple,deferred-shutdown: software shutdown waits for the bus clock to stop */
+ 	bool deferred_shutdown;
+ 	/* Muted at a stream's end, until the next one: the bus clock may stop */
+@@ -908,12 +915,6 @@ static struct snd_soc_dai_driver tas2764_dai_driver[] = {
+ 	},
+ };
+ 
+-static uint8_t sn012776_bop_presets[] = {
+-	0x01, 0x32, 0x02, 0x22, 0x83, 0x2d, 0x80, 0x02, 0x06,
+-	0x32, 0x46, 0x30, 0x02, 0x06, 0x38, 0x40, 0x30, 0x02,
+-	0x06, 0x3e, 0x37, 0x30, 0xff, 0xe6
+-};
+-
+ static const struct regmap_config tas2764_i2c_regmap;
+ 
+ static int tas2764_apply_init_quirks(struct tas2764_priv *tas2764)
+@@ -1091,17 +1092,33 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
+ 
+ 	switch (tas2764->devid) {
+ 	case DEVID_SN012776:
++		/*
++		 * PVDD is the brownout source on every SN012776, and the
++		 * brownout prevention block is the one the Mac's boot ADT
++		 * gives, when it gives one.
++		 */
+ 		ret = snd_soc_component_update_bits(component, TAS2764_PWR_CTRL,
+ 					TAS2764_PWR_CTRL_BOP_SRC,
+ 					TAS2764_PWR_CTRL_BOP_SRC);
+ 		if (ret < 0)
+ 			goto err_sdz;
+ 
+-		for (i = 0; i < ARRAY_SIZE(sn012776_bop_presets); i++) {
++		for (i = 0; tas2764->have_bop_config && i < TAS2764_BOP_CFG_LEN; i++) {
+ 			ret = snd_soc_component_write(component,
+ 						TAS2764_BOP_CFG0 + i,
+-						sn012776_bop_presets[i]);
++						tas2764->bop_config[i]);
++			if (ret < 0)
++				goto err_sdz;
++		}
+ 
++		/* The DC blockers (the playback and sense high-pass corners) */
++		if (tas2764->have_dc_blk) {
++			ret = snd_soc_component_write(component, TAS2764_DC_BLK0,
++						      tas2764->dc_blk[0]);
++			if (ret < 0)
++				goto err_sdz;
++			ret = snd_soc_component_write(component, TAS2764_DC_BLK1,
++						      tas2764->dc_blk[1]);
+ 			if (ret < 0)
+ 				goto err_sdz;
+ 		}
+@@ -1265,6 +1282,68 @@ static const struct regmap_config tas2764_i2c_regmap = {
+ 	.max_register = 0xffff,
+ };
+ 
++/*
++ * The SN012776's brownout prevention block (BOP_CFG0 on, TAS2764_BOP_CFG_LEN
++ * registers), from the device tree's apple,bop-config: the boot loader copies
++ * it from the amp group's configuration in the Mac's ADT, which macOS programs
++ * into every amp of the group. Without it the block stays at its reset values.
++ * A property of the wrong length is a broken device tree, not a reason to
++ * guess.
++ */
++static int tas2764_parse_bop_config(struct device *dev, struct tas2764_priv *tas2764)
++{
++	int len;
++
++	tas2764->have_bop_config = false;
++	if (tas2764->devid != DEVID_SN012776)
++		return 0;
++
++	len = of_property_count_u8_elems(dev->of_node, "apple,bop-config");
++	if (len == -EINVAL) {
++		dev_info(dev, "no brownout configuration in the device tree\n");
++		return 0;
++	}
++	if (len != TAS2764_BOP_CFG_LEN)
++		return dev_err_probe(dev, -EINVAL,
++				     "apple,bop-config: %d bytes, the block has %d\n",
++				     len, TAS2764_BOP_CFG_LEN);
++
++	of_property_read_u8_array(dev->of_node, "apple,bop-config",
++				  tas2764->bop_config, TAS2764_BOP_CFG_LEN);
++	tas2764->have_bop_config = true;
++	return 0;
++}
++
++/*
++ * The SN012776's DC blockers, DC_BLK0 and DC_BLK1, from the device tree's
++ * apple,amp-dcblocker-config: the boot loader copies it from the amp group's
++ * configuration in the Mac's ADT, whose first two bytes are the two registers
++ * (the rest is padding), the same for every amp of the group. Without it the
++ * registers keep their reset values.
++ */
++static int tas2764_parse_dcblocker_config(struct device *dev, struct tas2764_priv *tas2764)
++{
++	int len, ret;
++
++	tas2764->have_dc_blk = false;
++	if (tas2764->devid != DEVID_SN012776)
++		return 0;
++
++	len = of_property_count_u8_elems(dev->of_node, "apple,amp-dcblocker-config");
++	if (len == -EINVAL)
++		return 0;
++	if (len < 2)
++		return dev_err_probe(dev, -EINVAL,
++				     "apple,amp-dcblocker-config: %d bytes, need 2\n", len);
++
++	ret = of_property_read_u8_array(dev->of_node, "apple,amp-dcblocker-config",
++					tas2764->dc_blk, 2);
++	if (ret)
++		return ret;
++	tas2764->have_dc_blk = true;
++	return 0;
++}
++
+ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
+ {
+ 	int ret = 0;
+@@ -1313,6 +1392,14 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
+ 	tas2764->deferred_shutdown = of_property_read_bool(dev->of_node,
+ 							   "apple,deferred-shutdown");
+ 
++	ret = tas2764_parse_bop_config(dev, tas2764);
++	if (ret)
++		return ret;
++
++	ret = tas2764_parse_dcblocker_config(dev, tas2764);
++	if (ret)
++		return ret;
++
+ 	return tas2764_group_join(dev, tas2764);
+ }
+ 
+@@ -1403,3 +1490,7 @@ module_i2c_driver(tas2764_i2c_driver);
+ MODULE_AUTHOR("Dan Murphy <dmurphy@ti.com>");
+ MODULE_DESCRIPTION("TAS2764 I2C Smart Amplifier driver");
+ MODULE_LICENSE("GPL v2");
++
++#if IS_ENABLED(CONFIG_SND_SOC_TAS2764_KUNIT_TEST)
++#include "tas2764-bop-test.h"
++#endif
+diff --git a/sound/soc/codecs/tas2764.h b/sound/soc/codecs/tas2764.h
+index 4494bc4889..e6c6b064d6 100644
+--- a/sound/soc/codecs/tas2764.h
++++ b/sound/soc/codecs/tas2764.h
+@@ -37,6 +37,7 @@
+ /* DC Blocker Control */
+ #define TAS2764_DC_BLK0			TAS2764_REG(0x0, 0x04)
+ #define TAS2764_DC_BLK0_HPF_FREQ_PB_SHIFT  0
++#define TAS2764_DC_BLK1			TAS2764_REG(0x0, 0x05)
+ 
+ /* Digital Volume Control */
+ #define TAS2764_DVC	TAS2764_REG(0X0, 0x1a)
+@@ -125,6 +126,8 @@
+ #define TAS2764_INT_CLK_CFG_IRQZ_CLR    BIT(2)
+ 
+ #define TAS2764_BOP_CFG0                TAS2764_REG(0X0, 0x1d)
++/* BOP_CFG0 to BOP_CFG24, page 0 0x1d to 0x34 */
++#define TAS2764_BOP_CFG_LEN		24
+ 
+ #define TAS2764_SDOUT_HIZ_1            TAS2764_REG(0x1, 0x3d)
+ #define TAS2764_SDOUT_HIZ_2            TAS2764_REG(0x1, 0x3e)

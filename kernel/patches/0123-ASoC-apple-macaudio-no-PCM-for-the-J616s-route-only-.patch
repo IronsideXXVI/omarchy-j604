@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Fri, 30 Oct 2026 12:34:26 +1100
+Subject: [PATCH] ASoC: apple: macaudio: no PCM for the J616s route-only
+ front-ends
+
+The J616s speaker card has no headphone codec (the jack is a card of
+its own), and the jack card has no second output. Their CPU DAIs
+j616-pcm-0 and j616-jack-pcm-1 exist only so the fixed Speaker and
+Headphone mux routes resolve; the AOP component has no stream for
+them. The cards still create PCM devices for them, hw:AppleJ616,0 and
+hw:AppleJack,1. When the PipeWire pro-audio profile probes every PCM
+of the speaker card at session start, opening hw:AppleJ616,0 finds no
+back-end and logs at boot
+
+  Primary: ASoC: no backend DAIs enabled for Primary, possibly missing
+  ALSA mixer-based routing or UCM profile
+
+even though UCM routes the speakers through Secondary as it should.
+
+Mark those front-ends in the machine data and leave their links
+unbound. The DAI widgets still exist, since a component creates them
+for all its DAIs, so the mux routes and controls do not change and
+UCM sets "Speaker Playback Mux" to Secondary as before. The AOP
+component uses the link number as the PCM device number, so the
+speakers stay hw:AppleJ616,1 and the speaker sense hw:AppleJ616,2,
+which UCM, asahi-audio and the speaker protection daemons open by
+number. Back-end internal PCMs move above the front-ends.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(cherry picked from commit f0fb0a51b1e5c49cb9205046d693d56142ac308d)
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ sound/soc/apple/aop_spkr.rs |  7 +++++++
+ sound/soc/apple/macaudio.c  | 13 +++++++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/sound/soc/apple/aop_spkr.rs b/sound/soc/apple/aop_spkr.rs
+index 9c25303287..fcf0c166c4 100644
+--- a/sound/soc/apple/aop_spkr.rs
++++ b/sound/soc/apple/aop_spkr.rs
+@@ -1542,9 +1542,16 @@ fn to_kvec<const N: usize>(
+     Ok(v)
+ }
+ 
++/// The first PCM device number of the back-ends' internal PCMs, above every front-end's.
++const BE_PCM_BASE: i32 = 16;
++
+ fn component_driver(name: &'static CStr) -> bindings::snd_soc_component_driver {
+     bindings::snd_soc_component_driver {
+         name: name.as_char_ptr(),
++        // A front-end's PCM device is its link number, so a front-end that macaudio leaves
++        // unbound (one that only completes the fixed routes) does not renumber the others.
++        use_dai_pcm_id: true,
++        be_pcm_base: BE_PCM_BASE,
+         open: Some(pcm_open),
+         close: Some(pcm_close),
+         hw_params: Some(pcm_hw_params),
+diff --git a/sound/soc/apple/macaudio.c b/sound/soc/apple/macaudio.c
+index 1d1c8924eb..b366282f33 100644
+--- a/sound/soc/apple/macaudio.c
++++ b/sound/soc/apple/macaudio.c
+@@ -120,6 +120,14 @@ struct macaudio_platform_cfg {
+ 	 * for its own card).
+ 	 */
+ 	bool fe_cpu_is_platform;
++	/*
++	 * Front-ends (bits by link index) whose CPU DAI only completes the
++	 * fixed DAPM routes and can never carry a stream on this machine.
++	 * Their links are not bound, so the card has no PCM device for them
++	 * that userspace could probe and fail to open. The CPU component
++	 * keeps the other front-ends on their link numbers.
++	 */
++	unsigned int route_only_fes;
+ 	/*
+ 	 * The highest headphone volume, a "Jack DAC Playback Volume" value
+ 	 * (CS42L84_DAC_DB()), 0 for the codec's own maximum.
+@@ -859,6 +867,8 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
+ 		memcpy(link_props, &macaudio_fe_link_props[i], sizeof(struct macaudio_link_props));
+ 		if (ma->cfg->fe_dai_names[i])
+ 			link->cpus[0].dai_name = ma->cfg->fe_dai_names[i];
++		if (ma->cfg->route_only_fes & BIT(i))
++			link->ignore = 1;
+ 		if (ma->cfg->dai_fmt && !link_props->is_sense)
+ 			link->dai_fmt = ma->cfg->dai_fmt;
+ 		if (i == 0 && ma->cfg->primary_bclk_ratio)
+@@ -2117,6 +2127,8 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
+ 		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+ 	.secondary_bclk_ratio = 250,
+ 	.fe_cpu_is_platform = true,
++	/* No headphone codec on this card: the jack is a card of its own. */
++	.route_only_fes = BIT(0),
+ };
+ 
+ /*
+@@ -2133,6 +2145,7 @@ struct macaudio_platform_cfg macaudio_j616_jack_cfg = {
+ 	.fe_dai_names = { "j616-jack-pcm-0", "j616-jack-pcm-1" },
+ 	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
+ 	.fe_cpu_is_platform = true,
++	.route_only_fes = BIT(1),
+ 	/*
+ 	 * Above 0 dB the DAC only adds digital gain, which clips a full-scale
+ 	 * signal. The 6 dB below that are margin: the analog full scale of
