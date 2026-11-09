@@ -23,14 +23,28 @@ MEASURED 2026-11-09 (`pacman -Q` and `uname -r` on the machine):
 | Channel | Omarchy **edge** since 2026-11-09 (official `omarchy-channel-set edge`) | official |
 | Desktop | `omarchy-dev` / `omarchy-settings-dev` 4.0.0.r7634.gcbd0029, local pkgrel `1.3`: stock edge plus only the keyboard-backlight series (4 patches); Hyprland 0.57.1, stock | official recipe + 4 patches |
 | Mac add-on | `omarchy-mac` 0.2.3, local `2.7`: keyboard-backlight idle default, Apple F-row key names, Touch ID eligibility | official recipe + 3 patches |
-| Kernel | `linux-aurora` 7.2.11.aurora15, local `1.614` (736 patches) | official recipe + J604 series |
+| Kernel | `linux-aurora` 7.2.11.aurora15, local `1.617` (766 patches), running `7.2.11-15-1.617-ARCH` since 2026-11-09 | official recipe + J604 series |
 | Boot chain | `m1n1-aurora` 1.6.1.aurora22 (local `1.608`), `uboot-aurora` 2026.07.aurora6 (local `1.604`), `omarchy-mac-boot` 20261104 (local `1.614`), `plymouth` 26.134.222 (local `3.604`), `asahi-scripts` 20261023 (local `1.1`) | official recipes + J604 patches |
 | Graphics | `mesa-aurora` / `vulkan-aurora` with the T8132 GPU admitted (local `1.8132`) | official recipe + 1 patch |
 | Audio | `alsa-ucm-conf-aurora` (local `1.605`), `aurora-audio` (local `3.607`), `speakersafetyd` (local `1.605`) with J604 profiles | official recipes + J604 files |
 | Firmware | `asahi-fwextract` 0.9.2 (local `1.608`): extra camera tuning files | official recipe + 1 patch |
 | Neural Engine userland | `omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`: official edge builds, not carried by us | official |
 
-Next kernel (not installed): `linux-aurora` 1.617 is built; the J604 series is being rebased onto aurora-silicon/linux `integration/aurora` 7.3.0.
+Next kernel (not installed): the J604 series is being rebased onto aurora-silicon/linux `integration/aurora` 7.3.0. A 1.618 build is planned for the camera fix below.
+
+## What changed in kernel 1.617 (over 1.614)
+
+CODE (the 30 patches 0737-0766 in `kernel/`). Each item is code in the installed kernel; none of it is a measured result unless a row below says so.
+
+- **External displays (USB-C / Thunderbolt):** 10 bits per component scanout, HDR10 colour and static metadata, the sink's EDID and SDR primaries, and DisplayPort audio for a T8132 external display controller bound on its own (patches 0739-0748, 0754). No external monitor has been tested yet.
+- **Idle external display controllers power down** when nothing is attached, and power up on request (0755-0757).
+- **Internal panel:** recovery when the panel refuses a brightness-range probe, instead of losing the session (0737, 0738); EDR headroom groundwork that takes the headroom from the content (0764, 0765). No EDR claim.
+- **ProRes encoder driver** imported from Aurora, probing only on the T8132 (0759-0763). Its device-tree nodes are disabled, so the driver does not load.
+- **Neural Engine:** the ANE's DARTs may suspend once the device is bound (0752, 0753).
+- **ISP DART filter ranges** described in the device tree, and the DART probes without them too (0749-0751). See the camera row: this is what now collides with the ISP driver.
+- **Bluetooth:** the BCM4388 advertises wideband speech (0743), for headset microphones.
+- **SIO** (the DisplayPort audio coprocessor) held off until its power domain is qualified (0758). On 1.617 its earlier deferred probe is gone (MEASURED 2026-11-09).
+- 0766 only changes a log message about the external display controller's Type-C ports.
 
 The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on stable aurora14 and edge aurora15). The stock `linux-aurora` ships a J604 device tree that describes only the CPUs, interrupt controller, power states, pin control and serial port: no storage controller, display, keyboard or trackpad, USB, Wi-Fi or GPU. Stock m1n1 and U-Boot accept only the J713 (MacBook Air M4) on their M4 hand-off paths (INFERENCE 2026-11-09, from reading their source).
 
@@ -53,6 +67,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | External display (USB-C / Thunderbolt), HDMI | In progress | TO-VERIFY 2026-11-09 |
 | USB-C data | Working (USB devices) | MEASURED 2026-11-09 |
 | Thunderbolt / USB4 | In progress (no USB4 domains found) | MEASURED 2026-11-09 |
+| External display 10-bit / HDR10 / EDID / DP audio, idle power-down | In the kernel since 1.617, not tested | TO-VERIFY 2026-11-09 |
 | SD card reader | In progress (controller up, no card tested) | TO-VERIFY 2026-11-09 |
 | Storage (NVMe) | Working | MEASURED 2026-11-09 |
 | Keyboard, trackpad | Working | MEASURED 2026-11-09 |
@@ -62,9 +77,9 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | Speakers (with speaker protection) | Working | MEASURED 2026-11-06 (playback); 2026-11-09 (sink and `speakersafetyd` active) |
 | Headphone jack | Working | MEASURED 2026-11-06 |
 | Microphones | In progress | TO-VERIFY 2026-11-09 |
-| Camera | In progress (no capture tested on the current build) | TO-VERIFY 2026-11-09 |
+| Camera | In progress: `apple-isp` unbound (probe fails with -EBUSY on 1.617); fix planned for 1.618 | MEASURED 2026-11-09 |
 | Hardware video decode (H.264) | Working | MEASURED 2026-11-08 |
-| Video encode (AVE), JPEG, scaler, ProRes | In progress | TO-VERIFY 2026-11-09 |
+| Video encode (AVE), JPEG, scaler, ProRes | In progress (ProRes driver in 1.617, nodes disabled, not loaded) | TO-VERIFY 2026-11-09 |
 | Neural Engine (ANE) | Driver bound, not powered up; no `/dev/accel` | MEASURED 2026-11-09 |
 | Ambient light sensor | Sensor reads; nothing uses it by default | MEASURED 2026-11-08 |
 | Accelerometer, gyroscope, lid angle | In progress (devices present, readings unchecked) | TO-VERIFY 2026-11-09 |
@@ -72,16 +87,18 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | SMC sensors, fan, thermal readouts | Working (readouts) | MEASURED 2026-11-09 |
 | Battery and charger | Working | MEASURED 2026-11-09 |
 | Suspend (s2idle) | Working | MEASURED 2026-11-09 |
+| Idle power on AC | About 10.5 W with the stock edge `performance` power profile (7.5-7.7 W before 2026-11-09 04:56Z) | MEASURED 2026-11-09 |
 | Deep sleep (suspend to RAM) | In progress (only s2idle offered) | MEASURED 2026-11-09 |
 | Battery life vs macOS | Not measured yet | TO-VERIFY 2026-11-09 |
 | Touch ID (sudo, polkit, lock screen) | Working | MEASURED 2026-11-09 |
-| Boot chain (m1n1, U-Boot, Limine, disk unlock) | Working, no failed units | MEASURED 2026-11-09 |
+| Boot chain (m1n1, U-Boot, Limine, disk unlock) | Working, no failed units on 1.617 | MEASURED 2026-11-09 |
 
 ## Per block
 
 ### CPU
 - **Working.** MEASURED 2026-11-09: 10 cores online; `apple-cpufreq` maximums 4464 MHz (performance) and 2892 MHz (efficiency); `apple_idle` cpuidle.
-- The PMU counter device (`apple_t8132_pmu`, 8 counters) is present on 1.614 (MEASURED 2026-11-09). It comes from kernel patch 0616, which is marked test-only: the node is enabled for good only after a counter measurement passes (TO-VERIFY 2026-11-09).
+- On AC with the stock edge power profile (`performance`), both CPU policies run the `performance` governor and idle at their top clock (MEASURED 2026-11-09). See Power.
+- The PMU counter device (`apple_t8132_pmu`, 8 counters) is present (MEASURED 2026-11-09 on 1.614). It comes from kernel patch 0616, which is marked test-only: the node is enabled for good only after a counter measurement passes (TO-VERIFY 2026-11-09).
 - Carried by: kernel series (CPU nodes, cluster frequency control, cpuidle, energy model). Aurora has an open pull request for M4 DVFS (#1035), which we test instead of sending our own.
 
 ### GPU
@@ -93,12 +110,12 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 - **Working.** MEASURED 2026-11-09: 3024x1964 at 120 Hz, scale 2.
 - 10-bit: the compositor scans out XRGB2101010 because of one line in the owner's `~/.config/hypr/monitors.lua` (MEASURED 2026-11-09). That is a user setting, not a package change. The panel link itself is most likely 8 bits per channel with dithering (INFERENCE 2026-11-09).
 - P3 colour and VRR as per-panel package defaults: built, not installed (pending, TO-VERIFY 2026-11-09).
-- EDR / HDR: no claim on the current build (TO-VERIFY 2026-11-09).
+- EDR / HDR: no claim on the current build (TO-VERIFY 2026-11-09). 1.617 adds groundwork that takes the EDR headroom from the content (CODE); it needs an HDR client to be measured.
 - Glassy bar: stock holds about 59 fps on this 120 Hz panel; 119 fps needs the xray change in omacom/omarchy#18176 (MEASURED 2026-11-09). That change is not in our packages; the owner's own user toggle restores it locally.
 - Brightness: the panel backlight works (MEASURED 2026-11-09). There is no automatic brightness in the installed packages.
 
 ### External displays, HDMI
-- **In progress.** The kernel has the external display controllers, crossbar, DP PHY and HDMI bridge. No external monitor has been tested on the current build (TO-VERIFY 2026-11-09).
+- **In progress.** The kernel has the external display controllers, crossbar, DP PHY and HDMI bridge. 1.617 adds 10-bit scanout, HDR10, the sink's EDID and primaries, DP audio for an external controller, and power-down of an idle external controller (CODE). No external monitor has been tested on the current build (TO-VERIFY 2026-11-09).
 
 ### USB-C, Thunderbolt / USB4, SD card
 - USB-C data: **Working** for USB devices (MEASURED 2026-11-09).
@@ -115,7 +132,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 
 ### Wi-Fi and Bluetooth
 - **Working.** MEASURED 2026-11-09: BCM4388 Wi-Fi connected; Bluetooth powered. A2DP playback MEASURED 2026-11-06.
-- Bluetooth headset microphone (wideband): TO-VERIFY 2026-11-09.
+- Bluetooth headset microphone (wideband): 1.617 makes the BCM4388 advertise wideband speech (CODE); headset check TO-VERIFY 2026-11-09.
 
 ### Audio
 - Speakers: **Working**, with `speakersafetyd` protecting them (MEASURED 2026-11-06 playback; 2026-11-09 sink and daemon active).
@@ -124,16 +141,20 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 - Carried by: J604 files in `alsa-ucm-conf-aurora`, `aurora-audio` and `speakersafetyd`, and the speaker amp configuration m1n1 passes on. Without `speakersafetyd` the kernel keeps the speakers muted.
 
 ### Camera
-- **In progress.** No camera capture has been tested on the current build (TO-VERIFY 2026-11-09).
+- **In progress.** MEASURED 2026-11-09: the `apple-isp` driver is not bound, so there is no camera device.
+  - On 1.617 its probe fails with -EBUSY (error -16): the ISP's DART (`apple-dart`) maps its address-filter (`dapf`) register window, and the ISP driver then asks for the same window exclusively.
+  - On 1.614 the probe also failed, earlier, with -19: the ISP's DART had no filter ranges and did not probe (MEASURED 2026-11-09 on 1.614).
+  - The camera power domain stays on while the ISP is unbound (INFERENCE 2026-11-09).
+  - Tracked; the fix (one driver owns the `dapf` window) is planned for 1.618.
 - Carried by: kernel ISP series, m1n1 camera firmware hand-off, `asahi-fwextract` (extra sensor tuning files).
 
 ### Media engines
 - H.264 hardware decode: **Working** (MEASURED 2026-11-08, 4K through VA-API). With stock settings, mpv's system default does not use it (omacom/omarchy#18229).
-- Video encode (AVE), JPEG, scaler, ProRes: **In progress** (TO-VERIFY 2026-11-09).
+- Video encode (AVE), JPEG, scaler, ProRes: **In progress** (TO-VERIFY 2026-11-09). 1.617 carries the ProRes encoder driver from Aurora; its device-tree nodes are disabled and the module does not load (MEASURED 2026-11-09).
 
 ### Neural Engine (ANE)
 - **In progress.** MEASURED 2026-11-09: the ANE is detected and the `ane_t6021` driver is bound; on the T8132 the driver stops before power-up, by design for now. There is no `/dev/accel`.
-- m1n1 1.608 hands the preloaded ANE firmware over (m1n1 patch 0028). The ANE userland (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`) is the official edge build; our earlier rebuilds are withdrawn.
+- m1n1 1.608 hands the preloaded ANE firmware over (m1n1 patch 0028). 1.617 lets the ANE's DARTs suspend once the device is bound (CODE). The ANE userland (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`) is the official edge build; our earlier rebuilds are withdrawn.
 
 ### Sensors
 - Ambient light: the sensor reads (MEASURED 2026-11-08). Nothing uses it by default; automatic brightness is not shipped.
@@ -145,6 +166,9 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 ### Power
 - Suspend (s2idle): **Working** (MEASURED 2026-11-09; the kernel offers only `s2idle`).
 - Deep sleep (suspend to RAM): **In progress**; kernel and m1n1 parts are built and off (TO-VERIFY 2026-11-09).
+- Idle power on AC: about 10.5 W (SMC system power, 120 s idle, screen on; MEASURED 2026-11-09 on 1.617), against 7.5-7.7 W in the same check on 1.614 before 2026-11-09 04:56Z.
+  - The cause is userland, not the kernel: since that time the J604 runs the edge `omarchy-power-profiles-daemon` 0.30-7, which adds Apple Silicon CPU profiles (SOURCE: its package description). With the stock profile on AC, `performance`, both CPU policies use the `performance` governor, so the cores idle at their top clock (MEASURED 2026-11-09). The earlier 0.30-3 had no Apple Silicon profile, and the kernel default `schedutil` applied.
+  - This is the stock edge default, left as it is. A comparison with the `balanced` profile is TO-VERIFY.
 - Battery life vs macOS: not measured yet (TO-VERIFY 2026-11-09).
 
 ### Touch ID
@@ -152,7 +176,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 - Carried by: kernel series (Secure Enclave sensor node) and one `omarchy-mac` change (stock lists the J604 as not eligible).
 
 ### Boot chain
-- **Working.** MEASURED 2026-11-09: m1n1 → U-Boot → Limine → kernel; passphrase prompt with the keyboard working; no failed units.
+- **Working.** MEASURED 2026-11-09 (first boot of 1.617): m1n1 → U-Boot → Limine → kernel; passphrase prompt with the keyboard working; no failed units; no kernel warnings or oopses.
 - `omarchy-mac-boot` 1.614 drops the earlier first-boot drop-in for `omarchy-plymouth-quit.service`, a unit stock does not ship.
 
 ## Known differences from stock Omarchy on this Mac
@@ -162,3 +186,4 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 3. **Touch ID not offered by stock `omarchy-mac`** on the T8132. We carry a two-line change.
 4. **Unlock prompt can go black while typing** with stock Plymouth on device-tree Macs. We carry a small Plymouth patch.
 5. **Glassy bar at about 59 fps** on this 120 Hz panel with stock (MEASURED 2026-11-09). 119 fps needs omacom/omarchy#18176.
+6. **CPU power profile on AC.** The edge `omarchy-power-profiles-daemon` 0.30-7 applies its `performance` profile on AC to Apple Silicon, so the CPUs idle at their top clock and idle power on AC is about 10.5 W (MEASURED 2026-11-09). This is the stock default, not a J604 change.

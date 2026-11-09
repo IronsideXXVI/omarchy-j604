@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 21:56:24 +0000
+Subject: [PATCH] drm: apple: audio: give a T8132 external DCP its card
+ without the opt-in
+
+DP/HDMI audio cards need the hdmi_audio module parameter, off by default,
+on every DCP. For the interface of a T8132 external DCP that switch guards
+nothing any more: the interface attaches only once its DCP runs an AV audio
+service, so the card can only appear where the firmware offers audio. Left
+as it is, a user would have to flip a module parameter to hear HDMI audio
+from such a port.
+
+Create that interface's card without the opt-in when its DCP runs the AV
+audio service (dcp_audiosrv_ready(), asked again at card creation). Every
+other interface keeps the opt-in unchanged, and the parameter's default
+stays off. Nothing changes on the J604 yet: its dpaudio1 node is disabled
+and its external DCP starts no AV audio service in the kernel.
+
+KUnit (apple-dcpaud-ext): with the opt-in off, no card without the service,
+a card with it, and none for an interface that is not on the external path
+even next to a running service.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+(cherry picked from commit 83ad949b55b8d860c22f5266041a11005999b126)
+---
+ drivers/gpu/drm/apple/audio-no-sio-test.c | 85 +++++++++++++++++++++++
+ drivers/gpu/drm/apple/audio.c             | 16 ++++-
+ 2 files changed, 100 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/apple/audio-no-sio-test.c b/drivers/gpu/drm/apple/audio-no-sio-test.c
+index 2b43cbc348..b3d9fce30d 100644
+--- a/drivers/gpu/drm/apple/audio-no-sio-test.c
++++ b/drivers/gpu/drm/apple/audio-no-sio-test.c
+@@ -12,6 +12,9 @@
+  * service: no attach, no card, no reference kept, no error. The production
+  * lookup runs on device-tree nodes; the bound DCP and its service are
+  * stubbed.
++ *
++ * Its card needs no hdmi_audio opt-in once the service runs; without the
++ * service it gets none, and every other interface keeps the opt-in.
+  */
+ #include <kunit/device.h>
+ #include <kunit/of.h>
+@@ -218,12 +221,94 @@ static void dcpaud_ext_service_test(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, kref_read(&t->dcp->kobj.kref), refs);
+ }
+ 
++static void dcpaud_ext_restore_opt_in(void *data)
++{
++	hdmi_audio = *(bool *)data;
++}
++
++/* hdmi_audio is @on for the rest of the test case, then back as it was */
++static void dcpaud_ext_opt_in(struct kunit *test, bool on)
++{
++	bool *old = kunit_kzalloc(test, sizeof(*old), GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, old);
++	*old = hdmi_audio;
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, dcpaud_ext_restore_opt_in, old), 0);
++	hdmi_audio = on;
++}
++
++static void dcpaud_ext_free_card(void *data)
++{
++	struct dcp_audio *dcpaud = data;
++
++	if (dcpaud->card)
++		snd_card_free(dcpaud->card);
++	dcpaud->card = NULL;
++}
++
++/* An interface attached to the stubbed DCP as dcpaud_attach_dcp() leaves it */
++static struct dcp_audio *dcpaud_ext_attached(struct kunit *test, struct dcpaud_ext_test *t,
++					     bool ext)
++{
++	struct dcp_audio *dcpaud = dcpaud_ext_audio(test, "dpaudio-t8132");
++
++	dcpaud->ext = ext;
++	dcpaud->dcp_dev = t->dcp;
++	/* Freed before its device goes: actions run last in, first out. */
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, dcpaud_ext_free_card, dcpaud), 0);
++	return dcpaud;
++}
++
++/* Opt-in off, external DCP without an AV audio service: no card. */
++static void dcpaud_ext_card_no_service_test(struct kunit *test)
++{
++	struct dcpaud_ext_test *t = dcpaud_ext_setup(test, true, false);
++	struct dcp_audio *dcpaud;
++
++	dcpaud_ext_opt_in(test, false);
++	dcpaud = dcpaud_ext_attached(test, t, true);
++	KUNIT_EXPECT_EQ(test, dcpaud_init_snd_card(dcpaud), -ENODEV);
++	KUNIT_EXPECT_NULL(test, dcpaud->card);
++	KUNIT_EXPECT_EQ(test, t->asked, 1);
++}
++
++/* Opt-in off, the service runs: the card is there without the opt-in. */
++static void dcpaud_ext_card_service_test(struct kunit *test)
++{
++	struct dcpaud_ext_test *t = dcpaud_ext_setup(test, true, true);
++	struct dcp_audio *dcpaud;
++
++	dcpaud_ext_opt_in(test, false);
++	dcpaud = dcpaud_ext_attached(test, t, true);
++	KUNIT_EXPECT_EQ(test, dcpaud_init_snd_card(dcpaud), 0);
++	KUNIT_ASSERT_NOT_NULL(test, dcpaud->card);
++	KUNIT_EXPECT_STREQ(test, dcpaud->card->driver, "apple_dcp");
++	KUNIT_EXPECT_EQ(test, t->asked, 1);
++}
++
++/* Every other interface keeps the opt-in, even next to a running service. */
++static void dcpaud_ext_card_component_test(struct kunit *test)
++{
++	struct dcpaud_ext_test *t = dcpaud_ext_setup(test, true, true);
++	struct dcp_audio *dcpaud;
++
++	dcpaud_ext_opt_in(test, false);
++	dcpaud = dcpaud_ext_attached(test, t, false);
++	KUNIT_EXPECT_EQ(test, dcpaud_init_snd_card(dcpaud), -ENODEV);
++	KUNIT_EXPECT_NULL(test, dcpaud->card);
++	hdmi_audio = true;
++	KUNIT_EXPECT_TRUE(test, dcpaud_card_allowed(dcpaud));
++}
++
+ static struct kunit_case dcpaud_ext_cases[] = {
+ 	KUNIT_CASE(dcpaud_ext_linked_test),
+ 	KUNIT_CASE(dcpaud_ext_lookup_test),
+ 	KUNIT_CASE(dcpaud_ext_unbound_test),
+ 	KUNIT_CASE(dcpaud_ext_no_service_test),
+ 	KUNIT_CASE(dcpaud_ext_service_test),
++	KUNIT_CASE(dcpaud_ext_card_no_service_test),
++	KUNIT_CASE(dcpaud_ext_card_service_test),
++	KUNIT_CASE(dcpaud_ext_card_component_test),
+ 	{}
+ };
+ 
+diff --git a/drivers/gpu/drm/apple/audio.c b/drivers/gpu/drm/apple/audio.c
+index f9302bb0a4..8fce798b95 100644
+--- a/drivers/gpu/drm/apple/audio.c
++++ b/drivers/gpu/drm/apple/audio.c
+@@ -1331,10 +1331,24 @@ static void dcpaud_expose_debugfs_blob(struct dcp_audio *dcpaud, const char *nam
+ 
+ extern bool hdmi_audio;
+ 
++/*
++ * A card needs the driver's opt-in (hdmi_audio, off by default) on every
++ * path but one: the interface of a T8132 external DCP attaches only once that
++ * DCP runs an AV audio service (dcpaud_ext_attach()), and that service is the
++ * safety the opt-in stands for elsewhere, so its HDMI/DP audio is on by
++ * default. The service is asked again here, not taken from the attach.
++ */
++static bool dcpaud_card_allowed(struct dcp_audio *dcpaud)
++{
++	if (hdmi_audio)
++		return true;
++	return dcpaud->ext && dcpaud->dcp_dev && dcp_audiosrv_ready(dcpaud->dcp_dev);
++}
++
+ static int dcpaud_init_snd_card(struct dcp_audio *dcpaud)
+ {
+ 	int ret;
+-	if (!hdmi_audio)
++	if (!dcpaud_card_allowed(dcpaud))
+ 		return -ENODEV;
+ 
+ 

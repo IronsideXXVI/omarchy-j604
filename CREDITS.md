@@ -6,8 +6,8 @@ Omarchy for Apple Silicon contributors. Thank you.
 
 | Author | Patches |
 | --- | --- |
-| Dylan Ironside | 321 |
-| Ryan Murray | 165 |
+| Dylan Ironside | 350 |
+| Ryan Murray | 166 |
 | Erik Bourget | 99 |
 | Diljit Singh | 47 |
 | Jonathan Goyvaerts | 46 |

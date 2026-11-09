@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 9 Nov 2026 00:23:37 +0000
+Subject: [PATCH] drm/apple: m4: take the EDR headroom from the
+ compositor's MaxCLL
+
+Read the MaxCLL of the HDR_OUTPUT_METADATA with each commit's PQ state
+and hand it to the EDR ramp with the frame, so the panel's headroom
+follows what the compositor says is on screen. A compositor that
+sends no MaxCLL (0) keeps today's behaviour. Hyprland's metadata for
+a fullscreen HDR window today carries the panel EDID's maximum
+(1600 nits), which the panel's bound clamps as before.
+
+debugfs: the edr line ends with cll=, the MaxCLL in use.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+(cherry picked from commit 2fb9299f5b91008789c764b13d3faeda479a6a58)
+---
+ drivers/gpu/drm/apple/iomfb_m4.c              | 22 ++++++++++++++++---
+ .../selftests/drivers/gpu/apple-dcp/m4.py     |  2 ++
+ 2 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index dcfb623fca..fa9229f980 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -353,10 +353,12 @@ struct iomfb_m4 {
+ 	/*
+ 	 * EDR (panel_edr): the ADT peak in nits and potential headroom x1000;
+ 	 * capable once the panel EDID offers HDR; output_edr while the compositor
+-	 * asks for BT.2020 PQ; the ramp state of dcp-m4-edr.h.
++	 * asks for BT.2020 PQ, output_cll its MaxCLL then (0: not given); the
++	 * ramp state of dcp-m4-edr.h.
+ 	 */
+ 	u32 panel_peak, edr_ceiling;
+ 	bool edr_capable, output_edr;
++	u32 output_cll;
+ 	/* SDR frames in BT.2020 primaries: Colorspace BT2020_RGB without PQ */
+ 	bool output_bt2020;
+ 	bool edr_latched; /* the offer is decided once, at the first publication */
+@@ -3738,6 +3740,17 @@ static u8 iomfb_m4_eotf(const struct drm_connector_state *conn_state)
+ 	return hdr->hdmi_metadata_type1.eotf;
+ }
+ 
++/* The MaxCLL the compositor gives with its metadata, nits; 0: none. */
++static u32 iomfb_m4_max_cll(const struct drm_connector_state *conn_state)
++{
++	const struct hdr_output_metadata *hdr;
++
++	if (!conn_state || !conn_state->hdr_output_metadata)
++		return 0;
++	hdr = conn_state->hdr_output_metadata->data;
++	return hdr->hdmi_metadata_type1.max_cll;
++}
++
+ /* SDR always; PQ only on a panel that offers EDR; nothing else. */
+ int iomfb_m4_atomic_check_hdr(struct apple_dcp *owner, struct drm_crtc *crtc,
+ 			      struct drm_atomic_commit *commit)
+@@ -3783,6 +3796,8 @@ void iomfb_m4_atomic_hdr(struct apple_dcp *owner, struct drm_crtc *crtc,
+ 	if (bt2020 != dcp->output_bt2020)
+ 		dev_info(dcp->dev, "panel SDR colour: %s\n",
+ 			 bt2020 ? "BT.2020 primaries" : "Display P3");
++	/* The headroom follows the content's MaxCLL (dcp_m4_edr_content()). */
++	dcp->output_cll = edr ? iomfb_m4_max_cll(conn_state) : 0;
+ 	dcp->output_edr = edr;
+ 	dcp->output_bt2020 = bt2020;
+ 	mutex_unlock(&dcp->lock);
+@@ -4448,6 +4463,7 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+ 	/* The compositor encoded the frame for the HDR sink: BT.2020 PQ. */
+ 	frame.pq = dcp->output_edr;
+ 	frame.bt2020 = dcp->output_bt2020;
++	dcp->edr.cll = dcp->output_cll;
+ 	ret = dcp_m4_runtime_live(dcp->runtime);
+ 	if (!ret && dcp->powered_off)
+ 		ret = -EAGAIN;
+@@ -7199,9 +7215,9 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
+ 			   READ_ONCE(panel_vrr_min_hz), dcp->vrr_min_sent, dcp->vrr_calls,
+ 			   dcp->vrr_status);
+ 	if (READ_ONCE(panel_edr))
+-		seq_printf(s, "edr capable=%u output=%u peak=%u ceiling=%u hm=%u sdr=%u sent=%u swaps=%llu\n",
++		seq_printf(s, "edr capable=%u output=%u peak=%u ceiling=%u hm=%u sdr=%u sent=%u swaps=%llu cll=%u\n",
+ 			   dcp->edr_capable, dcp->output_edr, dcp->panel_peak, dcp->edr_ceiling,
+-			   dcp->edr.hm, dcp->edr.sdr, dcp->edr.sent, dcp->edr_swaps);
++			   dcp->edr.hm, dcp->edr.sdr, dcp->edr.sent, dcp->edr_swaps, dcp->edr.cll);
+ 	if (r)
+ 		seq_printf(s, "idle_cache=%u state=%u fences=%u registered=%u entries=%llu\n",
+ 			   !r->idle_unavailable && READ_ONCE(idle_cache_ms), r->idle_state,
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/m4.py b/tools/testing/selftests/drivers/gpu/apple-dcp/m4.py
+index 00ccd63c13..291862298f 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/m4.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/m4.py
+@@ -547,6 +547,8 @@ def blank_extras(root, backend):
+         stubs += 'static unsigned int panel_boost_nits;\n' + block(backend, 'static u32 iomfb_m4_boost_ceiling(') + '\n'
+     if 'dcp->output_bt2020' in present:
+         state += '    bool output_bt2020;\n'
++    if 'dcp->output_cll' in present:
++        state += '    u32 output_cll;\n'
+     if 'dcp->last_flip_ns' in present:
+         state += '    u64 last_flip_ns,flip_interval_ns,brightness_carried;\n'
+         stubs += 'static u64 ktime_get_ns(void) { return (u64)(clock_ns += 1000); }\n'

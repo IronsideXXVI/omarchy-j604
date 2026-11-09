@@ -1,0 +1,737 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 20:36:30 +0000
+Subject: [PATCH] drm: apple: audio: bind a T8132 external DCP's DP
+ audio on its own
+
+A T8132 external DCP is adopted outside the DRM device and is no
+component of it, so no component master ever binds the DP audio
+interface its port@0 links: dcpaud_probe() only calls component_add(),
+and add_dcp_components() never walks that DCP's endpoints.
+
+Bind such an interface on its own instead. It is no component of the
+DRM device, so the DRM device and its internal panel never wait for it,
+and its probe never fails for want of audio. It attaches to its DCP,
+taking the device reference and the DMA device and creating the card,
+only once that DCP is bound and runs an AV audio service
+(dcp_audiosrv_ready(), new); until then it stays without a card, as on
+the J604 today, whose external DCP runs no AV audio service in the
+kernel yet. dcpaud_ext_service_up() lets the service start attach it
+later. Interfaces linked to any other DCP stay components, unchanged:
+the attach step is split out of dcpaud_comp_bind() as is.
+
+The J604's dpaudio1 node stays disabled; nothing changes at run time
+until the AV audio service and the node are enabled.
+
+KUnit (suite apple-dcpaud-ext, added to audio-no-sio-test.c and its
+overlay): which interfaces take this path, the device tree lookup, no
+attach while the DCP is unbound, no attach and no reference kept without
+the service, one attach and one reference with it, and the reference
+given back on removal.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+(cherry picked from commit 10c667ce18dc0441ab697f692f436979bd0a26d8)
+---
+ drivers/gpu/drm/apple/audio-no-sio-test.c    | 188 ++++++++++++++-
+ drivers/gpu/drm/apple/audio-no-sio-test.dtso | 116 ++++++++++
+ drivers/gpu/drm/apple/audio.c                | 227 +++++++++++++++----
+ drivers/gpu/drm/apple/audio.h                |   5 +
+ drivers/gpu/drm/apple/av.c                   |   8 +
+ 5 files changed, 503 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/audio-no-sio-test.c b/drivers/gpu/drm/apple/audio-no-sio-test.c
+index 8ea2387ff4..2b43cbc348 100644
+--- a/drivers/gpu/drm/apple/audio-no-sio-test.c
++++ b/drivers/gpu/drm/apple/audio-no-sio-test.c
+@@ -1,13 +1,26 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ /*
+- * Included by audio.c: a DP audio interface whose SIO never registers its
+- * DMA controller (refused for an earlier boot loader's tables) gets no TX
+- * channel; a PCM open fails with -ENXIO, each time, and nothing is kept.
++ * Included by audio.c: DP audio interfaces without a working audio path.
++ *
++ * One whose SIO never registers its DMA controller (refused for an earlier
++ * boot loader's tables) gets no TX channel; a PCM open fails with -ENXIO,
++ * each time, and nothing is kept.
++ *
++ * One linked to a T8132 external DCP binds on its own, not as a component
++ * of the DRM device, and attaches to that DCP (taking its reference, once)
++ * only when the DCP is bound and runs an AV audio service. Without the
++ * service: no attach, no card, no reference kept, no error. The production
++ * lookup runs on device-tree nodes; the bound DCP and its service are
++ * stubbed.
+  */
+ #include <kunit/device.h>
+ #include <kunit/of.h>
++#include <kunit/static_stub.h>
+ #include <kunit/test.h>
+ 
++/* The fake DCP's driver data: an apple_dcp of no native external role */
++#include "dcp-internal.h"
++
+ OF_OVERLAY_DECLARE(audio_no_sio_test);
+ 
+ static void dcpaud_no_sio_put(void *data)
+@@ -51,3 +64,172 @@ static struct kunit_suite dcpaud_no_sio_suite = {
+ };
+ 
+ kunit_test_suite(dcpaud_no_sio_suite);
++
++struct dcpaud_ext_test {
++	struct device *dcp;	/* the bound DCP the lookup finds, or NULL */
++	bool service;		/* whether it runs an AV audio service */
++	unsigned int lookups;
++	unsigned int asked;
++};
++
++static struct dcpaud_ext_test *dcpaud_ext_current;
++
++static struct device *dcpaud_ext_test_dcp(struct dcp_audio *dcpaud)
++{
++	struct dcpaud_ext_test *t = dcpaud_ext_current;
++
++	t->lookups++;
++	/* As of_find_device_by_node(): a reference for the caller */
++	return t->dcp ? get_device(t->dcp) : NULL;
++}
++
++static bool dcpaud_ext_test_ready(struct device *dev)
++{
++	dcpaud_ext_current->asked++;
++	return dcpaud_ext_current->service;
++}
++
++static void dcpaud_ext_put_node(void *data)
++{
++	struct device *dev = data;
++
++	of_node_put(dev->of_node);
++	dev->of_node = NULL;
++}
++
++/* A dcp_audio on the overlay node /dcpaud-ext-test/@name */
++static struct dcp_audio *dcpaud_ext_audio(struct kunit *test, const char *name)
++{
++	struct dcp_audio *dcpaud = kunit_kzalloc(test, sizeof(*dcpaud), GFP_KERNEL);
++	char path[64];
++	struct device *dev;
++
++	KUNIT_ASSERT_NOT_NULL(test, dcpaud);
++	dev = kunit_device_register(test, name);
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
++	snprintf(path, sizeof(path), "/dcpaud-ext-test/%s", name);
++	dev->of_node = of_find_node_by_path(path);
++	KUNIT_ASSERT_NOT_NULL(test, dev->of_node);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, dcpaud_ext_put_node, dev), 0);
++	dcpaud->dev = dev;
++	dcpaud->elements = kunit_kzalloc(test, DCPAUD_ELEMENTS_MAXSIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dcpaud->elements);
++	mutex_init(&dcpaud->data_lock);
++	mutex_init(&dcpaud->ext_lock);
++	return dcpaud;
++}
++
++static struct dcpaud_ext_test *dcpaud_ext_setup(struct kunit *test, bool bound, bool service)
++{
++	struct dcpaud_ext_test *t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, t);
++	KUNIT_ASSERT_EQ(test, 0, of_overlay_apply_kunit(test, audio_no_sio_test));
++	if (bound) {
++		t->dcp = kunit_device_register(test, "dcpaud-ext-dcp");
++		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, t->dcp);
++		dev_set_drvdata(t->dcp, kunit_kzalloc(test, sizeof(struct apple_dcp), GFP_KERNEL));
++		KUNIT_ASSERT_NOT_NULL(test, dev_get_drvdata(t->dcp));
++	}
++	t->service = service;
++	dcpaud_ext_current = t;
++	kunit_activate_static_stub(test, dcpaud_ext_dcp, dcpaud_ext_test_dcp);
++	kunit_activate_static_stub(test, dcp_audiosrv_ready, dcpaud_ext_test_ready);
++	return t;
++}
++
++/* Which interfaces take the standalone path; the others stay components. */
++static void dcpaud_ext_linked_test(struct kunit *test)
++{
++	KUNIT_ASSERT_EQ(test, 0, of_overlay_apply_kunit(test, audio_no_sio_test));
++
++	struct dcp_audio *t8132 = dcpaud_ext_audio(test, "dpaudio-t8132");
++	struct dcp_audio *off = dcpaud_ext_audio(test, "dpaudio-off");
++	struct dcp_audio *comp = dcpaud_ext_audio(test, "dpaudio-component");
++	struct dcp_audio *unlinked = dcpaud_ext_audio(test, "dpaudio-unlinked");
++
++	KUNIT_EXPECT_TRUE(test, dcpaud_ext_linked(t8132->dev));
++	/* A disabled T8132 DCP: still not a component (it finds no DCP later). */
++	KUNIT_EXPECT_TRUE(test, dcpaud_ext_linked(off->dev));
++	KUNIT_EXPECT_FALSE(test, dcpaud_ext_linked(comp->dev));
++	KUNIT_EXPECT_FALSE(test, dcpaud_ext_linked(unlinked->dev));
++}
++
++/* The production lookup: a disabled DCP, and one without a device, find nothing. */
++static void dcpaud_ext_lookup_test(struct kunit *test)
++{
++	KUNIT_ASSERT_EQ(test, 0, of_overlay_apply_kunit(test, audio_no_sio_test));
++
++	KUNIT_EXPECT_NULL(test, dcpaud_ext_dcp(dcpaud_ext_audio(test, "dpaudio-off")));
++	KUNIT_EXPECT_NULL(test, dcpaud_ext_dcp(dcpaud_ext_audio(test, "dpaudio-t8132")));
++	KUNIT_EXPECT_NULL(test, dcpaud_ext_dcp(dcpaud_ext_audio(test, "dpaudio-unlinked")));
++}
++
++/* The external DCP is not bound (yet): nothing attached, its service not asked. */
++static void dcpaud_ext_unbound_test(struct kunit *test)
++{
++	struct dcpaud_ext_test *t = dcpaud_ext_setup(test, false, true);
++	struct dcp_audio *dcpaud = dcpaud_ext_audio(test, "dpaudio-t8132");
++
++	dcpaud_ext_attach(dcpaud);
++	KUNIT_EXPECT_EQ(test, t->lookups, 1);
++	KUNIT_EXPECT_EQ(test, t->asked, 0);
++	KUNIT_EXPECT_NULL(test, dcpaud->dcp_dev);
++	KUNIT_EXPECT_NULL(test, dcpaud->card);
++}
++
++/* Bound, without an AV audio service (the M4 session today): no card, no reference. */
++static void dcpaud_ext_no_service_test(struct kunit *test)
++{
++	struct dcpaud_ext_test *t = dcpaud_ext_setup(test, true, false);
++	struct dcp_audio *dcpaud = dcpaud_ext_audio(test, "dpaudio-t8132");
++	unsigned int refs = kref_read(&t->dcp->kobj.kref);
++
++	dcpaud_ext_attach(dcpaud);
++	dcpaud_ext_attach(dcpaud);
++	KUNIT_EXPECT_EQ(test, t->asked, 2);
++	KUNIT_EXPECT_NULL(test, dcpaud->dcp_dev);
++	KUNIT_EXPECT_NULL(test, dcpaud->dma_dev);
++	KUNIT_EXPECT_NULL(test, dcpaud->card);
++	KUNIT_EXPECT_EQ(test, kref_read(&t->dcp->kobj.kref), refs);
++}
++
++/*
++ * The service is up: attached, its reference kept, once. The DMA controller
++ * has no device here, so it stops before the card ("No DMA device").
++ */
++static void dcpaud_ext_service_test(struct kunit *test)
++{
++	struct dcpaud_ext_test *t = dcpaud_ext_setup(test, true, true);
++	struct dcp_audio *dcpaud = dcpaud_ext_audio(test, "dpaudio-t8132");
++	unsigned int refs = kref_read(&t->dcp->kobj.kref);
++
++	dcpaud_ext_attach(dcpaud);
++	KUNIT_EXPECT_PTR_EQ(test, dcpaud->dcp_dev, t->dcp);
++	KUNIT_EXPECT_EQ(test, kref_read(&t->dcp->kobj.kref), refs + 1);
++	dcpaud_ext_attach(dcpaud);
++	KUNIT_EXPECT_EQ(test, t->lookups, 1);
++	KUNIT_EXPECT_EQ(test, kref_read(&t->dcp->kobj.kref), refs + 1);
++	KUNIT_EXPECT_NULL(test, dcpaud->card);
++
++	/* Removal gives the reference back. */
++	dcpaud_ext_remove(dcpaud);
++	KUNIT_EXPECT_NULL(test, dcpaud->dcp_dev);
++	KUNIT_EXPECT_EQ(test, kref_read(&t->dcp->kobj.kref), refs);
++}
++
++static struct kunit_case dcpaud_ext_cases[] = {
++	KUNIT_CASE(dcpaud_ext_linked_test),
++	KUNIT_CASE(dcpaud_ext_lookup_test),
++	KUNIT_CASE(dcpaud_ext_unbound_test),
++	KUNIT_CASE(dcpaud_ext_no_service_test),
++	KUNIT_CASE(dcpaud_ext_service_test),
++	{}
++};
++
++static struct kunit_suite dcpaud_ext_suite = {
++	.name = "apple-dcpaud-ext",
++	.test_cases = dcpaud_ext_cases,
++};
++
++kunit_test_suite(dcpaud_ext_suite);
+diff --git a/drivers/gpu/drm/apple/audio-no-sio-test.dtso b/drivers/gpu/drm/apple/audio-no-sio-test.dtso
+index 9719e7078b..6eb6b87947 100644
+--- a/drivers/gpu/drm/apple/audio-no-sio-test.dtso
++++ b/drivers/gpu/drm/apple/audio-no-sio-test.dtso
+@@ -6,6 +6,11 @@
+  * A DP audio interface whose DMA controller never registers, as the T6030
+  * SIO with an earlier boot loader's tables: its probe refuses it. Nothing
+  * binds to these nodes; the test requests the channel itself.
++ *
++ * DP audio interfaces and the DCPs their port@0 links: a T8132 external DCP
++ * (adopted outside the DRM device), a disabled one, and an earlier external
++ * DCP that is a component of the DRM device. Nested in a node that is no
++ * bus, so no device is created for them and no driver binds.
+  */
+ &{/} {
+ 	dcpaud-no-sio-test {
+@@ -21,4 +26,115 @@
+ 			dma-names = "tx";
+ 		};
+ 	};
++
++	dcpaud-ext-test {
++		dma_stub: dma-stub {
++			#dma-cells = <1>;
++		};
++
++		dcpext-t8132 {
++			compatible = "apple,t8132-dcpext";
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					t8132_audio: endpoint {
++						remote-endpoint = <&dpaudio_t8132>;
++					};
++				};
++			};
++		};
++
++		dcpext-t8132-off {
++			compatible = "apple,t8132-dcpext";
++			status = "disabled";
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					t8132_off_audio: endpoint {
++						remote-endpoint = <&dpaudio_off>;
++					};
++				};
++			};
++		};
++
++		dcpext-component {
++			compatible = "apple,dcpext";
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					comp_audio: endpoint {
++						remote-endpoint = <&dpaudio_comp>;
++					};
++				};
++			};
++		};
++
++		dpaudio-t8132 {
++			dmas = <&dma_stub 0x66>;
++			dma-names = "tx";
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					dpaudio_t8132: endpoint {
++						remote-endpoint = <&t8132_audio>;
++					};
++				};
++			};
++		};
++
++		dpaudio-off {
++			dmas = <&dma_stub 0x66>;
++			dma-names = "tx";
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					dpaudio_off: endpoint {
++						remote-endpoint = <&t8132_off_audio>;
++					};
++				};
++			};
++		};
++
++		dpaudio-component {
++			dmas = <&dma_stub 0x64>;
++			dma-names = "tx";
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@0 {
++					reg = <0>;
++					dpaudio_comp: endpoint {
++						remote-endpoint = <&comp_audio>;
++					};
++				};
++			};
++		};
++
++		dpaudio-unlinked {
++			dmas = <&dma_stub 0x66>;
++			dma-names = "tx";
++		};
++	};
+ };
+diff --git a/drivers/gpu/drm/apple/audio.c b/drivers/gpu/drm/apple/audio.c
+index 92b37fbcdf..f9302bb0a4 100644
+--- a/drivers/gpu/drm/apple/audio.c
++++ b/drivers/gpu/drm/apple/audio.c
+@@ -93,6 +93,13 @@ struct dcp_audio {
+ 	void *productattrs;
+ 
+ 	struct snd_pcm_chmap *chmap_info;
++	/*
++	 * Linked to a T8132 external DCP: bound on its own, not as a component
++	 * of the DRM device; attached to that DCP once it runs an AV audio
++	 * service (dcpaud_ext_attach()), under ext_lock.
++	 */
++	bool ext;
++	struct mutex ext_lock; /* serialises the external attach and removal */
+ #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+ 	/*
+ 	 * DCP firmware 14.7, external role (T6030 external processor): the
+@@ -1387,61 +1394,55 @@ void dcpaud_disconnect(struct platform_device *pdev)
+ #endif
+ }
+ 
+-static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
++/* The DCP @dev's port@0 links (a reference), or NULL */
++static struct device_node *dcpaud_dcp_node(struct device *dev)
+ {
+-	struct dcp_audio *dcpaud = dev_get_drvdata(dev);
+ 	struct device_node *endpoint, *dcp_node = NULL;
+-	struct platform_device *dcp_pdev, *dma_pdev;
+-	struct of_phandle_args dma_spec;
+-	int index;
+-	int ret;
+ 
+-	pm_runtime_get_noresume(dev);
+-	pm_runtime_set_active(dev);
+-
+-	ret = devm_pm_runtime_enable(dev);
+-	if (ret)
+-		return dev_err_probe(dev, ret, "Failed to enable runtime PM: %d\n", ret);
+-
+-	/* find linked DCP instance */
+ 	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
+ 	if (endpoint) {
+ 		dcp_node = of_graph_get_remote_port_parent(endpoint);
+ 		of_node_put(endpoint);
+ 	}
+-	if (!dcp_node || !of_device_is_available(dcp_node)) {
+-		of_node_put(dcp_node);
+-		dev_info(dev, "No audio support\n");
+-		goto rpm_put;
+-	}
++	return dcp_node;
++}
++
++/*
++ * Attach to the DCP @dcp_dev (whose reference it then keeps): the DMA
++ * device, and the card. Not an error for the display side if the card
++ * fails. Non-zero only if nothing was attached; the caller keeps the
++ * reference then.
++ */
++static int dcpaud_attach_dcp(struct dcp_audio *dcpaud, struct device *dcp_dev)
++{
++	struct device *dev = dcpaud->dev;
++	struct platform_device *dma_pdev;
++	struct of_phandle_args dma_spec;
++	int index;
++	int ret;
+ 
+ 	index = of_property_match_string(dev->of_node, "dma-names", "tx");
+ 	if (index < 0) {
+ 		dev_err(dev, "No dma-names property\n");
+-		goto rpm_put;
++		return -EINVAL;
+ 	}
+ 
+ 	if (of_parse_phandle_with_args(dev->of_node, "dmas", "#dma-cells", index,
+ 				       &dma_spec) || !dma_spec.np) {
+ 		dev_err(dev, "Failed to parse dmas property\n");
+-		goto rpm_put;
+-	}
+-
+-	dcp_pdev = of_find_device_by_node(dcp_node);
+-	of_node_put(dcp_node);
+-	if (!dcp_pdev) {
+-		dev_info(dev, "No DP/HDMI audio device, dcp not ready\n");
+-		goto rpm_put;
++		return -EINVAL;
+ 	}
+-	dcpaud->dcp_dev = &dcp_pdev->dev;
++	dcpaud->dcp_dev = dcp_dev;
+ 
+ #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+ 	/* Native external roles share the link lifecycle and element catalog. */
+ 	if (dcp_audiosrv_native_link(dcpaud->dcp_dev)) {
+ 		void *elements = devm_kzalloc(dev, DCPAUD_ELEMENTS_V14_7, GFP_KERNEL);
+ 
+-		if (!elements)
+-			goto rpm_put;
++		if (!elements) {
++			of_node_put(dma_spec.np);
++			return 0;
++		}
+ 		devm_kfree(dev, dcpaud->elements);
+ 		dcpaud->elements = elements;
+ 		dcpaud->native_link = true;
+@@ -1452,7 +1453,7 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
+ 	of_node_put(dma_spec.np);
+ 	if (!dma_pdev) {
+ 		dev_info(dev, "No DMA device\n");
+-		goto rpm_put;
++		return 0;
+ 	}
+ 	dcpaud->dma_dev = &dma_pdev->dev;
+ 
+@@ -1472,6 +1473,39 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
+ 		dcpaud_expose_debugfs_blob(dcpaud, "product_attrs", dcpaud->productattrs,
+ 					DCPAUD_PRODUCTATTRS_MAXSIZE);
+ 	}
++	return 0;
++}
++
++static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
++{
++	struct dcp_audio *dcpaud = dev_get_drvdata(dev);
++	struct device_node *dcp_node;
++	struct platform_device *dcp_pdev;
++	int ret;
++
++	pm_runtime_get_noresume(dev);
++	pm_runtime_set_active(dev);
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "Failed to enable runtime PM: %d\n", ret);
++
++	/* find linked DCP instance */
++	dcp_node = dcpaud_dcp_node(dev);
++	if (!dcp_node || !of_device_is_available(dcp_node)) {
++		of_node_put(dcp_node);
++		dev_info(dev, "No audio support\n");
++		goto rpm_put;
++	}
++
++	dcp_pdev = of_find_device_by_node(dcp_node);
++	of_node_put(dcp_node);
++	if (!dcp_pdev) {
++		dev_info(dev, "No DP/HDMI audio device, dcp not ready\n");
++		goto rpm_put;
++	}
++	if (dcpaud_attach_dcp(dcpaud, &dcp_pdev->dev))
++		put_device(&dcp_pdev->dev);
+ 
+ rpm_put:
+ 	pm_runtime_put(dev);
+@@ -1479,11 +1513,9 @@ rpm_put:
+ 	return 0;
+ }
+ 
+-static void dcpaud_comp_unbind(struct device *dev, struct device *main,
+-			       void *data)
++/* Undo dcpaud_attach_dcp() bar the DCP reference */
++static void dcpaud_detach(struct dcp_audio *dcpaud)
+ {
+-	struct dcp_audio *dcpaud = dev_get_drvdata(dev);
+-
+ 	/* snd_card_free_when_closed() checks for NULL */
+ 	snd_card_free_when_closed(dcpaud->card);
+ 
+@@ -1515,11 +1547,122 @@ static void dcpaud_comp_unbind(struct device *dev, struct device *main,
+ 		device_link_del(dcpaud->dma_link);
+ }
+ 
++static void dcpaud_comp_unbind(struct device *dev, struct device *main,
++			       void *data)
++{
++	dcpaud_detach(dev_get_drvdata(dev));
++}
++
+ static const struct component_ops dcpaud_comp_ops = {
+ 	.bind	= dcpaud_comp_bind,
+ 	.unbind	= dcpaud_comp_unbind,
+ };
+ 
++/*
++ * T8132: an external DCP is adopted outside the DRM device and is no
++ * component of it (dcp.c: "An external DCP is no component of the DRM
++ * device"), so no component master would ever bind the DP audio interface
++ * its port@0 links. That interface binds on its own instead: the DRM device
++ * never waits for it, and it never fails its probe for want of audio. It
++ * gets a card only once that DCP is bound and runs an AV audio service; the
++ * service start calls dcpaud_ext_service_up() for a later attach.
++ */
++static bool dcpaud_ext_linked(struct device *dev)
++{
++	struct device_node *dcp_node = dcpaud_dcp_node(dev);
++	bool ext = dcp_node && of_device_is_compatible(dcp_node, "apple,t8132-dcpext");
++
++	of_node_put(dcp_node);
++	return ext;
++}
++
++/* The bound DCP @dcpaud's port@0 links (a device reference), or NULL */
++static struct device *dcpaud_ext_dcp(struct dcp_audio *dcpaud)
++{
++	struct device_node *dcp_node;
++	struct platform_device *dcp_pdev;
++
++	KUNIT_STATIC_STUB_REDIRECT(dcpaud_ext_dcp, dcpaud);
++
++	dcp_node = dcpaud_dcp_node(dcpaud->dev);
++	if (!dcp_node || !of_device_is_available(dcp_node)) {
++		of_node_put(dcp_node);
++		return NULL;
++	}
++	dcp_pdev = of_find_device_by_node(dcp_node);
++	of_node_put(dcp_node);
++	if (!dcp_pdev)
++		return NULL;
++	/* Its driver data is the DCP's from its probe on; a failed probe clears it. */
++	if (!platform_get_drvdata(dcp_pdev)) {
++		put_device(&dcp_pdev->dev);
++		return NULL;
++	}
++	return &dcp_pdev->dev;
++}
++
++/* Attach to the external DCP if it is bound and runs an AV audio service; once. */
++static void dcpaud_ext_attach(struct dcp_audio *dcpaud)
++{
++	struct device *dcp_dev;
++
++	guard(mutex)(&dcpaud->ext_lock);
++	if (dcpaud->dcp_dev)
++		return;
++	dcp_dev = dcpaud_ext_dcp(dcpaud);
++	if (!dcp_dev) {
++		dev_dbg(dcpaud->dev, "external DCP not bound: no card yet\n");
++		return;
++	}
++	if (!dcp_audiosrv_ready(dcp_dev)) {
++		dev_dbg(dcpaud->dev, "%s runs no AV audio service: no card\n", dev_name(dcp_dev));
++		put_device(dcp_dev);
++		return;
++	}
++	if (dcpaud_attach_dcp(dcpaud, dcp_dev))
++		put_device(dcp_dev);
++}
++
++void dcpaud_ext_service_up(struct platform_device *pdev)
++{
++	struct dcp_audio *dcpaud = platform_get_drvdata(pdev);
++
++	if (!dcpaud || !dcpaud->ext || pm_runtime_resume_and_get(dcpaud->dev))
++		return;
++	dcpaud_ext_attach(dcpaud);
++	pm_runtime_put(dcpaud->dev);
++}
++
++static int dcpaud_ext_probe(struct dcp_audio *dcpaud)
++{
++	struct device *dev = dcpaud->dev;
++	int ret;
++
++	dcpaud->ext = true;
++	pm_runtime_get_noresume(dev);
++	pm_runtime_set_active(dev);
++	ret = devm_pm_runtime_enable(dev);
++	if (ret) {
++		pm_runtime_put_noidle(dev);
++		return dev_err_probe(dev, ret, "Failed to enable runtime PM: %d\n", ret);
++	}
++	dcpaud_ext_attach(dcpaud);
++	pm_runtime_put(dev);
++	return 0;
++}
++
++static void dcpaud_ext_remove(struct dcp_audio *dcpaud)
++{
++	guard(mutex)(&dcpaud->ext_lock);
++	if (!dcpaud->dcp_dev)
++		return;
++	dcpaud_detach(dcpaud);
++	dcpaud->card = NULL;
++	dcpaud->dma_link = NULL;
++	put_device(dcpaud->dcp_dev);
++	dcpaud->dcp_dev = NULL;
++}
++
+ static int dcpaud_probe(struct platform_device *pdev)
+ {
+ 	struct dcp_audio *dcpaud;
+@@ -1545,19 +1688,27 @@ static int dcpaud_probe(struct platform_device *pdev)
+ 	INIT_WORK(&dcpaud->stale_work, dcpaud_stale_work);
+ #endif
+ 	INIT_DELAYED_WORK(&dcpaud->void_work, dcpaud_void_work);
++	mutex_init(&dcpaud->ext_lock);
+ 	platform_set_drvdata(pdev, dcpaud);
+ 
++	if (dcpaud_ext_linked(&pdev->dev))
++		return dcpaud_ext_probe(dcpaud);
+ 	return component_add(&pdev->dev, &dcpaud_comp_ops);
+ }
+ 
+ static void dcpaud_remove(struct platform_device *pdev)
+ {
+-	component_del(&pdev->dev, &dcpaud_comp_ops);
++	struct dcp_audio *dcpaud = platform_get_drvdata(pdev);
++
++	if (dcpaud->ext)
++		dcpaud_ext_remove(dcpaud);
++	else
++		component_del(&pdev->dev, &dcpaud_comp_ops);
+ }
+ 
+ static void dcpaud_shutdown(struct platform_device *pdev)
+ {
+-	component_del(&pdev->dev, &dcpaud_comp_ops);
++	dcpaud_remove(pdev);
+ }
+ 
+ static __maybe_unused int dcpaud_suspend(struct device *dev)
+diff --git a/drivers/gpu/drm/apple/audio.h b/drivers/gpu/drm/apple/audio.h
+index 79bee44bce..9184a2cc44 100644
+--- a/drivers/gpu/drm/apple/audio.h
++++ b/drivers/gpu/drm/apple/audio.h
+@@ -17,6 +17,11 @@ int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsi
+ void dcpaud_connect(struct platform_device *pdev, bool connected);
+ void dcpaud_disconnect(struct platform_device *pdev);
+ 
++/* Whether the DCP @dev runs an AV audio service: a card's precondition */
++bool dcp_audiosrv_ready(struct device *dev);
++/* A T8132 external DCP's AV audio service is up: attach its DP audio @pdev. */
++void dcpaud_ext_service_up(struct platform_device *pdev);
++
+ #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+ /* Native link methods for 14.7 and desktop 26.x external roles. */
+ enum dcp_audio_link {
+diff --git a/drivers/gpu/drm/apple/av.c b/drivers/gpu/drm/apple/av.c
+index 5e11c704a8..848108dfaf 100644
+--- a/drivers/gpu/drm/apple/av.c
++++ b/drivers/gpu/drm/apple/av.c
+@@ -195,6 +195,14 @@ static void av_audiosrv_teardown(struct apple_epic_service *service)
+ 		afk_service_put(service);
+ }
+ 
++bool dcp_audiosrv_ready(struct device *dev)
++{
++	struct apple_dcp *dcp = dev_get_drvdata(dev);
++
++	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_ready, dev);
++	return dcp && READ_ONCE(dcp->audiosrv);
++}
++
+ int dcp_audiosrv_prepare(struct device *dev, struct dcp_sound_cookie *cookie)
+ {
+ 	struct apple_dcp *dcp = dev_get_drvdata(dev);

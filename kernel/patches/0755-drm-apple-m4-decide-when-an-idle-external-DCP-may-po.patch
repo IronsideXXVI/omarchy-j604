@@ -1,0 +1,359 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 22:09:27 +0000
+Subject: [PATCH] drm/apple: m4: decide when an idle external DCP may
+ power down
+
+A T8132 external display coprocessor (dcpext) keeps its CPU running
+and its firmware DART and dispext CPU, frontend and system domains
+powered as long as the machine is up, also with nothing attached:
+its only power-down runs for a sleep that powers the SoC down.
+
+Nothing needs it then. A display only appears through the AP: the
+HDMI port's hot-plug GPIO or a Type-C route, and each of them asks
+the firmware to connect first. Add the pure decision for powering an
+idle dcpext down, for the KUnit suite:
+- never with the knob at 0, without the board's power-down or on a
+  failed session; nothing to do once it is down;
+- not yet while its session or DPTX service is starting, the HDMI
+  output is starting, a Type-C reconnect is queued, teardown calls
+  are unanswered, a call or swap is in flight, or the system is
+  sleeping: look again after the delay;
+- not while anything is attached (a DPTX port connected, a Type-C
+  route, HDMI hot-plug high, a sink reported, the display or its
+  DART on): the event that removes it looks again;
+- else power it down.
+The delay knob is kept within 1 s to 10 min; 0 turns it off.
+
+New KUnit suite apple-dcp-m4-ext-idle (6 cases).
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+(cherry picked from commit 8b425ce0146f2dee41ebecd4a6fc4f64a5d7bdc5)
+---
+ drivers/gpu/drm/apple/Makefile               |   1 +
+ drivers/gpu/drm/apple/dcp-m4-ext-idle-test.c | 161 +++++++++++++++++++
+ drivers/gpu/drm/apple/dcp-m4-ext-idle.h      | 134 +++++++++++++++
+ 3 files changed, 296 insertions(+)
+ create mode 100644 drivers/gpu/drm/apple/dcp-m4-ext-idle-test.c
+ create mode 100644 drivers/gpu/drm/apple/dcp-m4-ext-idle.h
+
+diff --git a/drivers/gpu/drm/apple/Makefile b/drivers/gpu/drm/apple/Makefile
+index 931ca172f7..4038090808 100644
+--- a/drivers/gpu/drm/apple/Makefile
++++ b/drivers/gpu/drm/apple/Makefile
+@@ -36,6 +36,7 @@ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-m4-frame-test.o
+ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-m4-xdr-test.o
+ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-m4-ext-colour-test.o
+ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-m4-ext-sink-test.o
++appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-m4-ext-idle-test.o
+ appledrm-y += iomfb_v26_6.o iomfb_v26_6_link.o j613_dcp_activate.o
+ appledrm-y += epic/dpavservep.o
+ appledrm-y += plane.o
+diff --git a/drivers/gpu/drm/apple/dcp-m4-ext-idle-test.c b/drivers/gpu/drm/apple/dcp-m4-ext-idle-test.c
+new file mode 100644
+index 0000000000..f28d164e00
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-m4-ext-idle-test.c
+@@ -0,0 +1,161 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++/*
++ * A T8132 dcpext with nothing attached (dcp-m4-ext-idle.h): when it may be
++ * powered down, and what keeps it up.
++ */
++
++#include <kunit/test.h>
++#include <linux/stddef.h>
++
++#include "dcp-m4-ext-idle.h"
++
++/* A started session on a board with the power-down, nothing attached. */
++static struct dcp_m4_ext_idle_in idle(void)
++{
++	return (struct dcp_m4_ext_idle_in) {
++		.enabled = true,
++		.capable = true,
++		.session = true,
++		.services = true,
++	};
++}
++
++struct idle_flag {
++	size_t offset;
++	bool value;
++	enum dcp_m4_ext_idle_verdict verdict;
++	const char *reason;
++};
++
++#define FLAG(f, v, verdict, reason) \
++	{ offsetof(struct dcp_m4_ext_idle_in, f), v, DCP_M4_EXT_IDLE_##verdict, reason }
++
++/* Each input on its own, from the idle state. */
++static const struct idle_flag flags[] = {
++	FLAG(enabled, false, NEVER, "dcpext_idle_ms is 0"),
++	FLAG(capable, false, NEVER, "no power-down on this board"),
++	FLAG(failed, true, NEVER, "session failed"),
++	FLAG(gated, true, DOWN, "down"),
++	FLAG(stopping, true, RECHECK, "stopping"),
++	FLAG(session, false, RECHECK, "session starting"),
++	FLAG(services, false, RECHECK, "DPTX service not published yet"),
++	FLAG(hdmi_starting, true, RECHECK, "HDMI output starting"),
++	FLAG(reconnect, true, RECHECK, "Type-C reconnect queued"),
++	FLAG(orphans, true, RECHECK, "teardown calls unanswered"),
++	FLAG(busy, true, RECHECK, "firmware call or swap in flight"),
++	FLAG(connected, true, ATTACHED, "DPTX port connected"),
++	FLAG(route, true, ATTACHED, "Type-C route active"),
++	FLAG(hpd, true, ATTACHED, "HDMI hot-plug high"),
++	FLAG(sink, true, ATTACHED, "sink reported"),
++	FLAG(powered, true, ATTACHED, "display powered"),
++	FLAG(dart_on, true, ATTACHED, "display DART on"),
++};
++
++static void set_flag(struct dcp_m4_ext_idle_in *in, const struct idle_flag *f)
++{
++	*(bool *)((u8 *)in + f->offset) = f->value;
++}
++
++static void ext_idle_nothing_attached(struct kunit *test)
++{
++	struct dcp_m4_ext_idle_in in = idle();
++
++	KUNIT_EXPECT_EQ(test, dcp_m4_ext_idle_check(&in), DCP_M4_EXT_IDLE_GATE);
++	KUNIT_EXPECT_STREQ(test, dcp_m4_ext_idle_reason(&in), "nothing attached");
++}
++
++/* Every input decides on its own, and the reason names it. */
++static void ext_idle_each_input(struct kunit *test)
++{
++	for (unsigned int i = 0; i < ARRAY_SIZE(flags); i++) {
++		struct dcp_m4_ext_idle_in in = idle();
++
++		set_flag(&in, &flags[i]);
++		KUNIT_EXPECT_EQ_MSG(test, dcp_m4_ext_idle_check(&in), flags[i].verdict,
++				    "input %u (%s)", i, flags[i].reason);
++		KUNIT_EXPECT_STREQ_MSG(test, dcp_m4_ext_idle_reason(&in), flags[i].reason,
++				       "input %u", i);
++	}
++}
++
++/* An attached display keeps it up whatever else is going on, and is re-checked by its event. */
++static void ext_idle_attached_waits_for_event(struct kunit *test)
++{
++	struct dcp_m4_ext_idle_in in = idle();
++
++	in.hpd = true;
++	in.sink = true;
++	in.connected = true;
++	KUNIT_EXPECT_EQ(test, dcp_m4_ext_idle_check(&in), DCP_M4_EXT_IDLE_ATTACHED);
++	/* Something passing is re-checked by time: it may also clear without an event. */
++	in.busy = true;
++	KUNIT_EXPECT_EQ(test, dcp_m4_ext_idle_check(&in), DCP_M4_EXT_IDLE_RECHECK);
++	/* Unplugged with the call done: power-down. */
++	in = idle();
++	in.hpd = true;
++	KUNIT_EXPECT_EQ(test, dcp_m4_ext_idle_check(&in), DCP_M4_EXT_IDLE_ATTACHED);
++	in.hpd = false;
++	KUNIT_EXPECT_EQ(test, dcp_m4_ext_idle_check(&in), DCP_M4_EXT_IDLE_GATE);
++}
++
++/* Down is down: it is never powered down twice, and a failed session is left alone. */
++static void ext_idle_down_and_failed(struct kunit *test)
++{
++	struct dcp_m4_ext_idle_in in = idle();
++
++	in.gated = true;
++	in.hpd = true;
++	in.busy = true;
++	KUNIT_EXPECT_EQ(test, dcp_m4_ext_idle_check(&in), DCP_M4_EXT_IDLE_DOWN);
++	in.failed = true;
++	KUNIT_EXPECT_EQ(test, dcp_m4_ext_idle_check(&in), DCP_M4_EXT_IDLE_NEVER);
++	KUNIT_EXPECT_STREQ(test, dcp_m4_ext_idle_reason(&in), "session failed");
++	in = idle();
++	in.enabled = false;
++	in.gated = true;
++	KUNIT_EXPECT_EQ(test, dcp_m4_ext_idle_check(&in), DCP_M4_EXT_IDLE_NEVER);
++}
++
++/* Every verdict but GATE leaves the DCP as it is: no input set reaches GATE. */
++static void ext_idle_gate_only_when_idle(struct kunit *test)
++{
++	for (unsigned int i = 0; i < ARRAY_SIZE(flags); i++) {
++		for (unsigned int j = 0; j < ARRAY_SIZE(flags); j++) {
++			struct dcp_m4_ext_idle_in in = idle();
++
++			set_flag(&in, &flags[i]);
++			set_flag(&in, &flags[j]);
++			KUNIT_EXPECT_NE_MSG(test, dcp_m4_ext_idle_check(&in), DCP_M4_EXT_IDLE_GATE,
++					    "inputs %u and %u", i, j);
++		}
++	}
++}
++
++static void ext_idle_delay(struct kunit *test)
++{
++	KUNIT_EXPECT_EQ(test, dcp_m4_ext_idle_delay_ms(0), 0U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_ext_idle_delay_ms(1), DCP_M4_EXT_IDLE_MS_MIN);
++	KUNIT_EXPECT_EQ(test, dcp_m4_ext_idle_delay_ms(999), DCP_M4_EXT_IDLE_MS_MIN);
++	KUNIT_EXPECT_EQ(test, dcp_m4_ext_idle_delay_ms(DCP_M4_EXT_IDLE_MS_DEFAULT),
++			DCP_M4_EXT_IDLE_MS_DEFAULT);
++	KUNIT_EXPECT_EQ(test, dcp_m4_ext_idle_delay_ms(600001), DCP_M4_EXT_IDLE_MS_MAX);
++	KUNIT_EXPECT_EQ(test, dcp_m4_ext_idle_delay_ms(~0U), DCP_M4_EXT_IDLE_MS_MAX);
++}
++
++static struct kunit_case m4_ext_idle_cases[] = {
++	KUNIT_CASE(ext_idle_nothing_attached),
++	KUNIT_CASE(ext_idle_each_input),
++	KUNIT_CASE(ext_idle_attached_waits_for_event),
++	KUNIT_CASE(ext_idle_down_and_failed),
++	KUNIT_CASE(ext_idle_gate_only_when_idle),
++	KUNIT_CASE(ext_idle_delay),
++	{}
++};
++
++static struct kunit_suite m4_ext_idle_suite = {
++	.name = "apple-dcp-m4-ext-idle",
++	.test_cases = m4_ext_idle_cases,
++};
++
++kunit_test_suite(m4_ext_idle_suite);
+diff --git a/drivers/gpu/drm/apple/dcp-m4-ext-idle.h b/drivers/gpu/drm/apple/dcp-m4-ext-idle.h
+new file mode 100644
+index 0000000000..acd61e3c46
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-m4-ext-idle.h
+@@ -0,0 +1,134 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/*
++ * A T8132 external display coprocessor (dcpext) with nothing attached.
++ *
++ * Its session starts at probe whether or not a display is attached, and
++ * until now its CPU kept running and its firmware DART and dispext CPU,
++ * frontend and system domains stayed powered for as long as the machine was
++ * up. Nothing needs them then: a display only appears through the AP, by
++ * the HDMI port's hot-plug GPIO or a Type-C route (DP alt mode or a DP
++ * tunnel), and every one of those asks the firmware to connect (DPTX), which
++ * can power it up first. So once nothing is attached for dcpext_idle_ms the
++ * DCP takes the power-down it takes for a SoC power-down sleep
++ * (iomfb_m4_ext_power_gate()), and the next request to its firmware powers
++ * it up again (iomfb_m4_ext_power_ungate()).
++ *
++ * Which of those it may do now: decisions only, no hardware, for the KUnit
++ * suite (dcp-m4-ext-idle-test.c).
++ */
++#ifndef APPLE_DCP_M4_EXT_IDLE_H
++#define APPLE_DCP_M4_EXT_IDLE_H
++
++#include <linux/minmax.h>
++#include <linux/types.h>
++
++/* appledrm.dcpext_idle_ms: 0 never powers a dcpext down while idle. */
++#define DCP_M4_EXT_IDLE_MS_DEFAULT	5000U
++#define DCP_M4_EXT_IDLE_MS_MIN		1000U
++#define DCP_M4_EXT_IDLE_MS_MAX		600000U
++
++struct dcp_m4_ext_idle_in {
++	/* Of the DCP driver (dcp.c), under its hpd_mutex. */
++	bool enabled;		/* dcpext_idle_ms is not 0 */
++	bool stopping;		/* system sleep, remove or shutdown under way */
++	bool services;		/* the DPTX service of port 0 is published */
++	bool connected;		/* a DPTX port is connected */
++	bool route;		/* a Type-C route drives this DCP */
++	bool hpd;		/* the HDMI port's hot-plug level is high */
++	bool hdmi_starting;	/* the HDMI output has not started yet */
++	bool reconnect;		/* a Type-C reconnect is queued */
++	bool orphans;		/* teardown calls the firmware has not answered */
++	/* Of the session (iomfb_m4.c), under its lock. */
++	bool capable;		/* the board describes its power-down */
++	bool session;		/* the session finished starting */
++	bool failed;		/* the session failed */
++	bool gated;		/* the DCP and its domains are down */
++	bool sink;		/* the firmware reports a sink (D575) */
++	bool powered;		/* its display is powered on */
++	bool dart_on;		/* its display DART is on (last D572 was 1) */
++	bool busy;		/* a swap or a firmware call is under way */
++};
++
++enum dcp_m4_ext_idle_verdict {
++	/* Power it down now. */
++	DCP_M4_EXT_IDLE_GATE,
++	/* Down already. */
++	DCP_M4_EXT_IDLE_DOWN,
++	/* Not now, for a while: look again after dcpext_idle_ms. */
++	DCP_M4_EXT_IDLE_RECHECK,
++	/* Something is attached: the event that removes it looks again. */
++	DCP_M4_EXT_IDLE_ATTACHED,
++	/* Never on this DCP (until the knob is set again). */
++	DCP_M4_EXT_IDLE_NEVER,
++};
++
++/*
++ * The reason, for the log and debugfs. One input decides, checked in this
++ * order: what rules it out for good, then down already, then what passes
++ * by itself (start-up, a sleep, calls in flight), then what is attached.
++ */
++static inline const char *
++dcp_m4_ext_idle_reason(const struct dcp_m4_ext_idle_in *in)
++{
++	if (!in->enabled)
++		return "dcpext_idle_ms is 0";
++	if (!in->capable)
++		return "no power-down on this board";
++	if (in->failed)
++		return "session failed";
++	if (in->gated)
++		return "down";
++	if (in->stopping)
++		return "stopping";
++	if (!in->session)
++		return "session starting";
++	if (!in->services)
++		return "DPTX service not published yet";
++	if (in->hdmi_starting)
++		return "HDMI output starting";
++	if (in->reconnect)
++		return "Type-C reconnect queued";
++	if (in->orphans)
++		return "teardown calls unanswered";
++	if (in->busy)
++		return "firmware call or swap in flight";
++	if (in->connected)
++		return "DPTX port connected";
++	if (in->route)
++		return "Type-C route active";
++	if (in->hpd)
++		return "HDMI hot-plug high";
++	if (in->sink)
++		return "sink reported";
++	if (in->powered)
++		return "display powered";
++	if (in->dart_on)
++		return "display DART on";
++	return "nothing attached";
++}
++
++static inline enum dcp_m4_ext_idle_verdict
++dcp_m4_ext_idle_check(const struct dcp_m4_ext_idle_in *in)
++{
++	if (!in->enabled || !in->capable || in->failed)
++		return DCP_M4_EXT_IDLE_NEVER;
++	if (in->gated)
++		return DCP_M4_EXT_IDLE_DOWN;
++	if (in->stopping || !in->session || !in->services || in->hdmi_starting ||
++	    in->reconnect || in->orphans || in->busy)
++		return DCP_M4_EXT_IDLE_RECHECK;
++	if (in->connected || in->route || in->hpd || in->sink || in->powered ||
++	    in->dart_on)
++		return DCP_M4_EXT_IDLE_ATTACHED;
++	return DCP_M4_EXT_IDLE_GATE;
++}
++
++/* The knob as a delay: 0 stays 0 (off), others are kept in range. */
++static inline unsigned int dcp_m4_ext_idle_delay_ms(unsigned int ms)
++{
++	if (!ms)
++		return 0;
++	return clamp(ms, DCP_M4_EXT_IDLE_MS_MIN, DCP_M4_EXT_IDLE_MS_MAX);
++}
++
++#endif

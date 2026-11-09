@@ -32,7 +32,7 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | Touch ID | Working for sudo, polkit and the lock screen |
 | Keyboard backlight | Working with the local `omarchy-dev` / `omarchy-settings-dev` 1.3 builds |
 | Neural Engine | Driver bound; not powered up on the T8132 yet (the driver stops before power-up by design), no `/dev/accel` |
-| Power | Suspend (s2idle) on lid close working. Deep sleep in progress |
+| Power | Suspend (s2idle) on lid close working. Idle on AC is about 10.5 W with the stock edge `performance` power profile (see `STATUS.md`). Deep sleep in progress |
 | In progress | GPU idle power, deep sleep, camera, microphones, Thunderbolt/USB4, external displays and HDMI |
 
 ## Install
@@ -53,7 +53,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora`, `linux-aurora-headers` | 7.2.11.aurora15, omacom/linux-aurora `integration/aurora` (`b798f2b0c7`), 736 patches | `1.614` |
+| `linux-aurora`, `linux-aurora-headers` | 7.2.11.aurora15, omacom/linux-aurora `integration/aurora` (`b798f2b0c7`), 766 patches | `1.617` |
 | `m1n1-aurora` | 1.6.1.aurora22, omacom/m1n1 (`bc79acc434`), 37 patches | `1.608` |
 | `uboot-aurora` | 2026.07.aurora6, aurora-silicon/u-boot (`d30213eadc`) | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261031, omacom/mesa (`a196911147`) | `1.8132` |
@@ -69,7 +69,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 Also installed, unchanged from the official repositories: Hyprland 0.57.1 and the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
-Coming next (not installed): `linux-aurora` 1.617 is built; a rebase of the J604 series onto aurora-silicon/linux `integration/aurora` 7.3.0 is in progress.
+Coming next (not installed): a rebase of the J604 series onto aurora-silicon/linux `integration/aurora` 7.3.0 is in progress. `STATUS.md` lists what 1.617 added over 1.614.
 
 ## Layout
 
@@ -99,7 +99,7 @@ Every component directory has the same shape:
 
 `kernel/` has `BASE`, `series`, `patches/` and the kernel's license files.
 
-One kernel patch is a test-only change that the installed 1.614 build does ship: `0616-TEST-ONLY-arm64-dts-apple-t8132-j604-Enable-the-CPU-.patch` enables the CPU performance-counter (PMU) node on the J604 for a counter measurement. It is published because 1.614 carries it, and it is not proposed upstream as it is; the node is enabled for good only after that measurement passes.
+One kernel patch is a test-only change that the installed 1.617 build does ship: `0616-TEST-ONLY-arm64-dts-apple-t8132-j604-Enable-the-CPU-.patch` enables the CPU performance-counter (PMU) node on the J604 for a counter measurement. It is published because the installed kernel carries it, and it is not proposed upstream as it is; the node is enabled for good only after that measurement passes.
 
 Each patch keeps its original author. Patches whose subject starts with "J604 local build" are carried only here so far. Patches made with an AI coding assistant say so in an `Assisted-by:` trailer, and pull requests disclose it per each repository's policy. Apart from the pull requests and issues listed in `UPSTREAM.md`, these patches have not been submitted upstream yet.
 

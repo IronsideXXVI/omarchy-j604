@@ -76,6 +76,7 @@ Ordered by dependency. Kernel items assume Aurora's J604 tree and the 7.3 rebase
 | 16 | GPU idle power-off for G16 | aurora-silicon/linux | Needs idle power measured across boots |
 | 17 | Mesa: admit the T8132 GPU | omacom/mesa: answer omacom/mesa#25 with conformance results | Needs a Vulkan/GL conformance run on the J604 |
 | 18 | m1n1 hand-offs used by later blocks (speaker amp config, camera, ANE and encoder firmware, external display, PCIe port power, sleep warm-boot) | omacom/m1n1 | One PR per hand-off, as each block reaches Working |
+| 19b | BCM4388 wideband speech flag (in our 1.617 as patch 0743) | aurora-silicon/linux | Needs the Bluetooth headset microphone check |
 | 19 | Audio: J604 UCM, speaker DSP graph, microphone config, `speakersafetyd` safety profile | AsahiLinux asahi-audio / alsa-ucm-conf-asahi / speakersafetyd, then the omarchy-pkgs recipes | Speaker safety review with the audio maintainers first |
 | 20 | Touch ID kernel side (Secure Enclave sensor node for T8132) | aurora-silicon/linux, with the Touch ID owners | Coordinate, don't duplicate; unblocks #5 |
 | 21 | CPU PMU node for the J604 (kernel patch 0616 is test-only today) | aurora-silicon/linux | Needs the counter measurement first |
@@ -84,6 +85,6 @@ Not ready to propose (still being brought up, see `STATUS.md`): camera, micropho
 
 ## Kernel: what's next
 
-- Installed: `linux-aurora` 7.2.11.aurora15, local `1.614` (the series in `kernel/`).
-- Built, not installed: local `1.617`.
+- Installed: `linux-aurora` 7.2.11.aurora15, local `1.617` (the series in `kernel/`, 766 patches).
+- Planned: local `1.618`, with the fix for the camera probe (one driver owns the ISP DART's `dapf` window; see `STATUS.md`).
 - In progress: the rebase of the J604 series onto aurora-silicon/linux `integration/aurora` 7.3.0, keeping only what goes beyond Aurora's own J604 / M4 work.

@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 21:13:05 +0000
+Subject: [PATCH] drm/apple: t8132: tag external SDR frames with the
+ sink's primaries
+
+Every SDR frame on a T8132 external link is tagged Display P3 with the
+sRGB transfer, as the internal panel is calibrated. For an sRGB sink
+that is wrong: the firmware takes sRGB code values for P3 ones.
+
+At the mode set, choose the primaries of the link's frames from the
+sink (dcp-m4-ext-sink.h): BT.709 unless its own EDID's or its
+DisplayAttributes' primaries make it wide gamut (Display P3), and
+BT.2020 for PQ and for a BT2020_RGB Colorspace without PQ, as the
+internal panel takes a compositor's wide-gamut SDR mode. A sink about
+which nothing is known gets BT.709. A Colorspace change is a mode set
+(only the frames' tags change when the colour element does not).
+
+The "external link colour" line names the frames' primaries.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+(cherry picked from commit a7cb852a83c5391ea7a7aa6088db741cf02bbb96)
+---
+ drivers/gpu/drm/apple/iomfb_m4.c      | 62 +++++++++++++++++++++++----
+ drivers/gpu/drm/apple/iomfb_m4.h      |  8 +++-
+ drivers/gpu/drm/apple/t8132_ext_drm.c | 17 +++++---
+ 3 files changed, 71 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 830d87eebf..39b30702a6 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -1163,9 +1163,13 @@ struct dcp_m4_runtime {
+ 	 */
+ 	bool ext_powered;
+ 	u32 ext_cur_timing, ext_cur_color;
+-	/* The link's depth and whether it runs PQ, as the last enable set them */
++	/*
++	 * The link's depth, whether it runs PQ and the primaries of its
++	 * frames, as the last enable set them
++	 */
+ 	u32 ext_depth;
+ 	bool ext_pq;
++	u8 ext_primaries;
+ 	void *ext_buf_cpu[2];
+ 	struct dcp_m4_frame ext_buf[2];
+ 	bool ext_buf_stale[2];
+@@ -3848,11 +3852,33 @@ static bool dcp_m4_ext_fits(const struct iomfb_m4_ext_mode *e, u64 capacity)
+ 	return !capacity || (u64)e->mode.clock * (e->dsc ? 8 : 24) <= capacity;
+ }
+ 
++/*
++ * Whether the current sink is wide gamut (dcp-m4-ext-sink.h), from its
++ * own EDID's primaries, else its DisplayAttributes'; not known: no.
++ * ext_modes_lock held.
++ */
++static bool dcp_m4_ext_sink_wide_locked(struct iomfb_m4 *dcp)
++{
++	u32 c[3][2];
++
++	switch (dcp_m4_ext_edid_pick(dcp->ext_edid, dcp->ext_meta_ok, dcp->ext_attr_gen,
++				     atomic_read(&dcp->ext_sink_gen))) {
++	case DCP_M4_EXT_EDID_SINK:
++		dcp_m4_edid_chromaticity(dcp->ext_edid, c);
++		return dcp_m4_ext_sink_wide(c, dcp->ext_meta_ok && dcp->ext_meta.bt2020_rgb);
++	case DCP_M4_EXT_EDID_BUILT:
++		return dcp_m4_ext_sink_wide(dcp->ext_meta.chromaticity, dcp->ext_meta.bt2020_rgb);
++	default:
++		return false;
++	}
++}
++
+ /*
+  * The firmware's IDs of a mode iomfb_m4_ext_get_modes()
+  * offered, with the colour element @want takes (dcp-m4-ext-colour.h; NULL:
+- * 8 bpc SDR): -ENOENT for any other mode, -ENOSPC for one over the link,
+- * -EINVAL for PQ on a timing without an HDR10 element that fits.
++ * 8 bpc SDR), and the primaries of its frames: -ENOENT for any other mode,
++ * -ENOSPC for one over the link, -EINVAL for PQ on a timing without an
++ * HDR10 element that fits.
+  */
+ int iomfb_m4_ext_mode_ids(struct apple_dcp *owner, const struct drm_display_mode *mode,
+ 			  const struct iomfb_m4_ext_want *want, struct iomfb_m4_ext_ids *ids)
+@@ -3888,6 +3914,8 @@ int iomfb_m4_ext_mode_ids(struct apple_dcp *owner, const struct drm_display_mode
+ 		ids->bootstrap = e->bootstrap;
+ 		ids->depth = choice.depth;
+ 		ids->pq = choice.pq;
++		ids->primaries = dcp_m4_ext_primaries(choice.pq, want && want->bt2020,
++						      dcp_m4_ext_sink_wide_locked(dcp));
+ 		dev_dbg(dcp->dev, "mode %ux%u@%d: timing %u, colour %u (%u bpc%s)%s\n",
+ 			e->mode.hdisplay, e->mode.vdisplay, drm_mode_vrefresh(&e->mode),
+ 			e->timing, choice.color, choice.depth, choice.pq ? ", PQ BT.2020" : "",
+@@ -5312,6 +5340,14 @@ static int dcp_m4_ext_scanout_gate(struct iomfb_m4 *dcp)
+ 	return ret ?: apple_dart_dcp_dispext_qualify(&dcp->piodma->dev);
+ }
+ 
++/* The colour tags of an external frame, as the last enable set the link. */
++static void dcp_m4_ext_frame_colour(const struct dcp_m4_runtime *r, struct dcp_m4_frame *f)
++{
++	f->pq = r->ext_pq;
++	f->bt2020 = !r->ext_pq && r->ext_primaries == DCP_M4_PRIMARIES_BT2020;
++	f->bt709 = r->ext_primaries == DCP_M4_PRIMARIES_BT709;
++}
++
+ /*
+  * Two host-written XRGB8888 surfaces in the display DART's SID0, each allocated
+  * once for the largest mode (3840x2160) and reused for every mode, so that
+@@ -5351,7 +5387,7 @@ static int dcp_m4_ext_drm_buffers(struct dcp_m4_runtime *r)
+ 		f->height = height;
+ 		f->stride = stride;
+ 		f->format = DCP_M4_XRGB8888;
+-		f->pq = r->ext_pq;
++		dcp_m4_ext_frame_colour(r, f);
+ 		ret = dcp_m4_frame_check_ext(f) ?:
+ 			dcp_m4_direct_extent(f->dva, f->backing_size, (u64)stride * height);
+ 		if (ret)
+@@ -5508,12 +5544,19 @@ int iomfb_m4_ext_enable(struct apple_dcp *owner, const struct iomfb_m4_ext_ids *
+ 		r->ext_cur_color = ids->color;
+ 		WRITE_ONCE(r->ext_cur_timing, ids->timing);
+ 	}
+-	/* Frames on a PQ link are BT.2020 PQ code values (the compositor's HDR). */
+-	if (r->ext_depth != ids->depth || r->ext_pq != ids->pq)
+-		dev_info(dcp->dev, "external link colour %u: %u bpc RGB, %s\n", ids->color,
+-			 ids->depth ?: 8, ids->pq ? "HDR10 (ST 2084, BT.2020)" : "SDR");
++	/*
++	 * Frames on a PQ link are BT.2020 PQ code values (the compositor's
++	 * HDR); SDR frames are in the primaries of the sink (or BT.2020).
++	 */
++	if (r->ext_depth != ids->depth || r->ext_pq != ids->pq ||
++	    r->ext_primaries != ids->primaries)
++		dev_info(dcp->dev, "external link colour %u: %u bpc RGB, %s; frames in %s primaries\n",
++			 ids->color, ids->depth ?: 8,
++			 ids->pq ? "HDR10 (ST 2084, BT.2020)" : "SDR",
++			 dcp_m4_primaries_name(ids->primaries));
+ 	r->ext_depth = ids->depth;
+ 	r->ext_pq = ids->pq;
++	r->ext_primaries = ids->primaries;
+ 	/* A mode set starts the link without HDR10 metadata: sent again on PQ. */
+ 	scoped_guard(spinlock_irqsave, &dcp->ext_av_lock) {
+ 		dcp->ext_hdr_valid = false;
+@@ -6196,8 +6239,9 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
+ 	f = (struct dcp_m4_frame) {
+ 		.dva = r->ext_win[w].dva, .backing_size = (u64)r->ext_win[w].count * SZ_16K,
+ 		.width = fb->width, .height = fb->height, .stride = fb->pitch,
+-		.format = DCP_M4_XRGB8888, .pq = r->ext_pq,
++		.format = DCP_M4_XRGB8888,
+ 	};
++	dcp_m4_ext_frame_colour(r, &f);
+ 	r->ext_hold_probe = false;
+ 	r->ext_swap_surface = -1;
+ 	r->ext_swap_win = w;
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.h b/drivers/gpu/drm/apple/iomfb_m4.h
+index efc9ed6a9a..8e18246ffa 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.h
++++ b/drivers/gpu/drm/apple/iomfb_m4.h
+@@ -25,12 +25,18 @@ struct iomfb_m4_ext_ids {
+ 	/* The link's bits per component, and whether it runs PQ (HDR10) */
+ 	u32 depth;
+ 	bool pq;
++	/* The H.273 primaries its frames are tagged with (dcp-m4-ext-sink.h) */
++	u8 primaries;
+ };
+ 
+-/* What a commit asks of an external link: PQ in BT.2020 RGB, its max bpc. */
++/*
++ * What a commit asks of an external link: PQ in BT.2020 RGB, its max bpc,
++ * and whether its Colorspace is BT2020_RGB (with or without PQ).
++ */
+ struct iomfb_m4_ext_want {
+ 	bool pq;
+ 	u32 max_bpc;
++	bool bt2020;
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/apple/t8132_ext_drm.c b/drivers/gpu/drm/apple/t8132_ext_drm.c
+index 0bdc8bda4e..c191977715 100644
+--- a/drivers/gpu/drm/apple/t8132_ext_drm.c
++++ b/drivers/gpu/drm/apple/t8132_ext_drm.c
+@@ -549,27 +549,32 @@ static void t8132_ext_crtc_flush(struct drm_crtc *crtc, struct drm_atomic_commit
+ /*
+  * What a connector state asks of the link: PQ while HDR_OUTPUT_METADATA
+  * says ST 2084 and Colorspace is BT2020_RGB (both, as the internal panel
+- * takes them), and its max bpc.
++ * takes them), its max bpc, and BT.2020 primaries for SDR frames while
++ * Colorspace is BT2020_RGB without PQ.
+  */
+ static struct iomfb_m4_ext_want t8132_ext_want(const struct drm_connector_state *s)
+ {
+ 	const struct hdr_output_metadata *hdr = NULL;
+ 
++	bool bt2020;
++
+ 	if (!s)
+ 		return (struct iomfb_m4_ext_want){ .max_bpc = 8 };
++	bt2020 = s->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB;
+ 	if (s->hdr_output_metadata &&
+ 	    s->hdr_output_metadata->length == sizeof(struct hdr_output_metadata))
+ 		hdr = s->hdr_output_metadata->data;
+ 	return (struct iomfb_m4_ext_want){
+-		.pq = hdr && hdr->hdmi_metadata_type1.eotf == HDMI_EOTF_SMPTE_ST2084 &&
+-		      s->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB,
++		.pq = hdr && hdr->hdmi_metadata_type1.eotf == HDMI_EOTF_SMPTE_ST2084 && bt2020,
+ 		.max_bpc = s->max_requested_bpc,
++		.bt2020 = bt2020,
+ 	};
+ }
+ 
+ /*
+- * A new HDR state or max bpc is a new colour element on the link: a mode
+- * set (A364 with that colour), decided here, before the core decides which
++ * A new HDR state or max bpc is a new colour element on the link, a new
++ * Colorspace new primaries on its frames: a mode set (A364 with that
++ * colour; the frames' tags), decided here, before the core decides which
+  * CRTCs need one.
+  */
+ static int t8132_ext_connector_check(struct drm_connector *connector,
+@@ -584,7 +589,7 @@ static int t8132_ext_connector_check(struct drm_connector *connector,
+ 		return 0;
+ 	a = t8132_ext_want(old);
+ 	b = t8132_ext_want(new);
+-	if (a.pq == b.pq && a.max_bpc == b.max_bpc)
++	if (a.pq == b.pq && a.max_bpc == b.max_bpc && a.bt2020 == b.bt2020)
+ 		return 0;
+ 	cs = drm_atomic_get_crtc_state(state, new->crtc);
+ 	if (IS_ERR(cs))

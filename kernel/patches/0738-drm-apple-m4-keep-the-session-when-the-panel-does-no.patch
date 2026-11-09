@@ -1,0 +1,462 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 20:18:48 +0000
+Subject: [PATCH] drm/apple: m4: keep the session when the panel does
+ not take an XDR probe
+
+A swap that asks the internal panel for more than the XDR guard has
+taken is a probe. When the firmware refuses it, or answers its A407
+but never sends its D590, give it up instead of quarantining the
+session, as the dcpext path already does for a missing D590:
+
+ - the guard refuses and every level goes back to the level taken;
+ - the swap ends for the host so that the next one may begin, and its
+   ID is kept until its D590 so that a late D590 is dropped;
+ - the commit completes; its frame and the one before it stay
+   referenced until the next confirmed swap or blank retires both;
+ - the next present re-sends the standing level, EDR from 1.0;
+ - A406 giving a kept ID again still fails the session, as do an
+   ordinary swap's failures and any failure with more outstanding.
+
+debugfs shows given_up, late and lost_fb on the xdr line. The m4
+blank host test calls the real give-up and late-D590 helpers from its
+swap stub: a stalled probe, a probe refused by its A407 status, the
+late D590, a blank, and an ordinary swap that must still fail.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+(cherry picked from commit 5d6e303d2772ee2b8055a0510824b3c4c531f4ce)
+---
+ drivers/gpu/drm/apple/iomfb_m4.c              | 130 ++++++++++++++++--
+ .../selftests/drivers/gpu/apple-dcp/m4.py     | 116 +++++++++++++++-
+ 2 files changed, 234 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 68c477cbfd..2a7d9f9cb2 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -252,7 +252,7 @@ static const struct kernel_param_ops panel_xdr_ops = {
+ 
+ module_param_cb(panel_xdr, &panel_xdr_ops, &panel_xdr, 0644);
+ MODULE_PARM_DESC(panel_xdr,
+-		 "J604: ask the internal panel for levels above the user maximum (EDR highlights, a raised SDR ceiling) only as far as its firmware has been seen to take them, climbing to the ADT aurora maximum; a level not taken goes back at once to the last one taken (default: on; off holds every level at the user maximum; a write starts over)");
++		 "J604: ask the internal panel for levels above the user maximum (EDR highlights, a raised SDR ceiling) only as far as its firmware has been seen to take them, climbing to the ADT aurora maximum; a level not taken goes back at once to the last one taken, and a probe the firmware refuses or leaves without its D590 is given up with the session kept (default: on; off holds every level at the user maximum; a write starts over)");
+ 
+ struct iomfb_m4 {
+ 	struct apple_dcp *owner;
+@@ -306,6 +306,11 @@ struct iomfb_m4 {
+ 	/* Exact completed successor or blank is the only framebuffer retirement. */
+ 	struct drm_framebuffer *active_fb;
+ 	struct drm_framebuffer *uncertain_fb;
++	/*
++	 * The frame of an XDR probe given up, the session kept: on screen or
++	 * not, as the one before it, until the next confirmed swap retires both.
++	 */
++	struct drm_framebuffer *lost_fb;
+ 	struct dcp_m4_frame active_frame;
+ 	u64 flips, blanks, brightness_swaps;
+ 	/*
+@@ -1033,6 +1038,14 @@ struct dcp_m4_runtime {
+ 	u32 level;
+ 	/* The internal panel's last D590, and whether it said displayed. */
+ 	bool int_shown_valid, int_shown;
++	/*
++	 * The next internal swap is an XDR probe (iomfb_m4_swap()), how it was
++	 * given up if it was (dcp_m4_int_swap_give_up()), and the probes given
++	 * up whose D590 may still come.
++	 */
++	bool int_probe;
++	enum dcp_m4_xdr_give_up int_given_up;
++	struct dcp_m4_xdr_lost int_lost;
+ 	struct completion received;
+ 	struct workqueue_struct *wq;
+ 	struct work_struct idle;
+@@ -1560,14 +1573,61 @@ static int dcp_m4_ext_q_find(struct dcp_m4_runtime *r, u32 id)
+ 	return -1;
+ }
+ 
++/*
++ * An internal XDR probe swap that the firmware refused (@refused: A407
++ * answered with an error status) or left without its D590 until its deadline,
++ * given up without ending the session when dcp_m4_xdr_give_up() lets it:
++ * its ID is kept until its D590, the swap ends for the host so that the next
++ * may begin, and iomfb_m4_swap() makes the guard refuse and re-send the
++ * standing level. False: the session's failure as before.
++ */
++static bool dcp_m4_int_swap_give_up(struct dcp_m4_runtime *r, int error, bool refused)
++{
++	struct iomfb_m4 *dcp = r->dcp;
++	struct dcp_m4_transaction *t = &dcp->transaction;
++	struct dcp_m4_xdr_end end = {
++		.id = r->swap.id, .error = error, .probe = r->int_probe,
++		.quiet = !READ_ONCE(dcp->error) && !t->error && !t->calls && !t->callbacks,
++		.replied = r->swap.replied, .refused = refused,
++		.completed = r->swap.completed,
++	};
++	enum dcp_m4_xdr_give_up how;
++
++	if (dcp->external)
++		return false;
++	how = dcp_m4_xdr_give_up(&r->int_lost, &end);
++	if (how == DCP_M4_XDR_KEEP_NONE || !dcp_m4_xdr_lost_add(&r->int_lost, end.id))
++		return false;
++	r->swap = (struct dcp_m4_swap_state){ .id = end.id, .emitted = true };
++	r->int_given_up = how;
++	dev_warn(dcp->dev, "swap %u: an XDR probe the firmware %s: given up, session kept\n",
++		 end.id, dcp_m4_xdr_give_up_name(how));
++	return true;
++}
++
++/* The late D590 of the given-up internal probe @id: dropped. False if none's. */
++static bool dcp_m4_int_late_d590(struct dcp_m4_runtime *r, u32 id)
++{
++	if (!dcp_m4_xdr_lost_drop(&r->int_lost, id))
++		return false;
++	/* Its displayed byte is not that of the swap in flight. */
++	r->int_shown_valid = false;
++	dev_info(r->dcp->dev, "swap %u: its D590 came after it was given up: dropped\n", id);
++	return true;
++}
++
+ static int dcp_m4_runtime_swap_done(void *cookie, u32 id)
+ {
+ 	struct dcp_m4_runtime *r = cookie;
+ 	struct dcp_m4_ext_done done = r->ext_done;
+ 	int ret, i, slot;
+ 
+-	if (!r->dcp->external)
++	if (!r->dcp->external) {
++		/* The late D590 of a probe given up is not this swap's. */
++		if (dcp_m4_int_late_d590(r, id))
++			return 0;
+ 		return dcp_m4_swap_record_done(&r->swap, id);
++	}
+ 	r->ext_done.valid = false;
+ 	/* Its payload unread: shown, and no earlier swap named. */
+ 	if (!done.valid)
+@@ -2428,6 +2488,8 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
+ 	/* The link this swap is for, and whether only its D590 was missing */
+ 	int link_gen = ext ? atomic_read(&r->ext_link_gen) : 0;
+ 	bool d590_missing = false;
++	/* A407 answered with an error status */
++	bool refused = false;
+ 	u8 *input;
+ 	u32 id;
+ 	u64 word;
+@@ -2487,6 +2549,15 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
+ 		kfree(input);
+ 		return -EBUSY;
+ 	}
++	/*
++	 * Internal: an ID whose given-up probe's D590 may still come fails the
++	 * session, as that probe would have without being given up.
++	 */
++	if (!ret && !ext && dcp_m4_xdr_lost_find(&r->int_lost, id) >= 0) {
++		dev_err(dcp->dev, "A406 gave swap %u again, an XDR probe given up whose D590 may still come\n",
++			id);
++		ret = -EPROTO;
++	}
+ 	if (!ret)
+ 		ret = dcp_m4_swap_begin(&r->swap, id);
+ 	if (!ret)
+@@ -2508,8 +2579,10 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
+ 	if (!ret)
+ 		ret = dcp_m4_runtime_call(r, 407, false, input, DCP_M4_SWAP_SIZE,
+ 					 submitted, sizeof(submitted));
+-	if (!ret)
++	if (!ret) {
+ 		ret = dcp_m4_swap_record_reply(&r->swap, submitted, sizeof(submitted));
++		refused = ret && dcp_m4_swap_submit_reply(submitted, sizeof(submitted)) == -EPROTO;
++	}
+ 	/*
+ 	 * A direct swap does not wait for its D590: it joins the swaps in flight
+ 	 * and is tracked there (r->swap may begin the next one) until its D590,
+@@ -2572,6 +2645,9 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
+ 	/* Only its D590 missing: given up, the session kept. */
+ 	if (ret && d590_missing && dcp_m4_ext_swap_give_up(r, &r->swap, -1, false, ret))
+ 		return ret;
++	/* An internal XDR probe refused or without its D590: given up, the session kept. */
++	if (ret && !ext && dcp_m4_int_swap_give_up(r, ret, refused))
++		return ret;
+ 	if (ret) {
+ 		dcp_m4_swap_fail(&r->swap, ret);
+ 		dcp_m4_transaction_fail(&dcp->transaction, ret);
+@@ -4067,14 +4143,29 @@ static int iomfb_m4_swap(struct iomfb_m4 *dcp, const struct dcp_m4_frame *frame)
+ 	}
+ 	if (!frame)
+ 		dcp->edr.restart = true;
++	/*
++	 * Asking for more than the guard has taken, while it ramps, is a probe:
++	 * one the firmware refuses or leaves without its D590 is given up
++	 * without ending the session (dcp_m4_int_swap_give_up()), while no
++	 * frame of another one given up is pending.
++	 */
++	dcp->runtime->int_probe = frame && !dcp->lost_fb && asked > dcp->xdr.taken &&
++				  dcp->xdr.state == DCP_M4_XDR_RAMP;
++	dcp->runtime->int_given_up = DCP_M4_XDR_KEEP_NONE;
+ 	dcp->runtime->int_shown_valid = false;
+ 	start = ktime_get();
+ 	ret = dcp_m4_runtime_swap_brightness(dcp->runtime, frame,
+ 					    !prepared && !level, present.nits);
+ 	us = min_t(s64, ktime_us_delta(ktime_get(), start), U32_MAX);
+ 	shown = !dcp->runtime->int_shown_valid || dcp->runtime->int_shown;
++	dcp->runtime->int_probe = false;
+ 	if (frame)
+ 		iomfb_m4_xdr_after(dcp, asked, !ret, shown, us);
++	/* Given up: the next present re-sends the standing level, EDR from 1.0. */
++	if (ret && dcp->runtime->int_given_up) {
++		dcp->boost_sent = U32_MAX;
++		dcp->edr.restart = true;
++	}
+ 	if (dcp->runtime->edr && !ret)
+ 		dcp->edr_swaps++;
+ 	if (level && !ret)
+@@ -4091,7 +4182,7 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+ 		     dma_addr_t dva, size_t mapped)
+ {
+ 	struct iomfb_m4 *dcp = owner->v26_6;
+-	struct drm_framebuffer *retire = NULL;
++	struct drm_framebuffer *retire = NULL, *retire_lost = NULL;
+ 	enum dcp_m4_frame_format format;
+ 	struct dcp_m4_frame frame;
+ 	u64 now;
+@@ -4135,6 +4226,17 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+ 	/* Keep the source before the first work descriptor can become visible. */
+ 	drm_framebuffer_get(fb);
+ 	ret = iomfb_m4_swap(dcp, &frame);
++	if (ret && dcp->runtime->int_given_up) {
++		/*
++		 * An XDR probe given up, the session kept: this frame may be on
++		 * screen or not, and the one before it too, until the next
++		 * confirmed swap retires both. The commit completes; the next
++		 * frame goes out at the level taken.
++		 */
++		dcp->lost_fb = fb;
++		ret = 0;
++		goto out;
++	}
+ 	if (ret) {
+ 		/* Neither the old surface nor this successor has a release receipt. */
+ 		dcp->uncertain_fb = fb;
+@@ -4142,6 +4244,8 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+ 		goto out;
+ 	}
+ 	retire = dcp->active_fb;
++	retire_lost = dcp->lost_fb;
++	dcp->lost_fb = NULL;
+ 	dcp->active_fb = fb;
+ 	dcp->active_frame = frame;
+ 	dcp->flips++;
+@@ -4157,13 +4261,15 @@ out:
+ 	mutex_unlock(&dcp->lock);
+ 	if (retire)
+ 		drm_framebuffer_put(retire);
++	if (retire_lost)
++		drm_framebuffer_put(retire_lost);
+ 	return ret;
+ }
+ 
+ int iomfb_m4_blank(struct apple_dcp *owner)
+ {
+ 	struct iomfb_m4 *dcp = owner->v26_6;
+-	struct drm_framebuffer *retire = NULL;
++	struct drm_framebuffer *retire = NULL, *retire_lost = NULL;
+ 	int ret;
+ 
+ 	if (!dcp || !dcp->runtime)
+@@ -4181,7 +4287,9 @@ int iomfb_m4_blank(struct apple_dcp *owner)
+ 		dcp_m4_failed(dcp, ret);
+ 	} else {
+ 		retire = dcp->active_fb;
++		retire_lost = dcp->lost_fb;
+ 		dcp->active_fb = NULL;
++		dcp->lost_fb = NULL;
+ 		memset(&dcp->active_frame, 0, sizeof(dcp->active_frame));
+ 		dcp->blanks++;
+ 		/*
+@@ -4208,6 +4316,8 @@ int iomfb_m4_blank(struct apple_dcp *owner)
+ 	mutex_unlock(&dcp->lock);
+ 	if (retire)
+ 		drm_framebuffer_put(retire);
++	if (retire_lost)
++		drm_framebuffer_put(retire_lost);
+ 	return ret;
+ }
+ 
+@@ -4310,7 +4420,7 @@ static int iomfb_m4_power_gate(struct iomfb_m4 *dcp)
+ 
+ 	lockdep_assert_held(&dcp->lock);
+ 	if (!dcp->gate_capable || dcp->gated || !dcp->display_off || dcp->powered_off ||
+-	    dcp->active_fb || dcp->active_frame.dva || dcp->transaction.calls)
++	    dcp->active_fb || dcp->lost_fb || dcp->active_frame.dva || dcp->transaction.calls)
+ 		return -EBUSY;
+ 	ret = dcp_m4_runtime_live(r);
+ 	if (ret)
+@@ -6192,7 +6302,7 @@ int iomfb_m4_suspend(struct apple_dcp *owner)
+ 	cancel_delayed_work_sync(&dcp->gate_work);
+ 	mutex_lock(&dcp->lock);
+ 	/* Also the startup surface, shown before the first frame */
+-	if (dcp->active_fb || dcp->active_frame.dva) {
++	if (dcp->active_fb || dcp->lost_fb || dcp->active_frame.dva) {
+ 		dev_warn(dcp->dev, "panel still scanning out: refusing system sleep\n");
+ 		ret = -EBUSY;
+ 	} else if (dcp->display_off) {
+@@ -6514,13 +6624,15 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
+ 			   READ_ONCE(panel_boost_nits), iomfb_m4_boost_ceiling(dcp),
+ 			   dcp->boost_sent);
+ 	if (!dcp->external && dcp->xdr_ready)
+-		seq_printf(s, "xdr state=%s cap=%u limit=%u taken=%u trying=%u good=%u bad=%u reverts=%u reason=%s shown_seen=%u thermal=%u/%u min_cap=%u asked=%u last_us=%u\n",
++		seq_printf(s, "xdr state=%s cap=%u limit=%u taken=%u trying=%u good=%u bad=%u reverts=%u reason=%s shown_seen=%u thermal=%u/%u min_cap=%u asked=%u last_us=%u given_up=%u late=%u lost_fb=%u\n",
+ 			   dcp_m4_xdr_state_name(dcp->xdr.state), dcp_m4_xdr_cap(&dcp->xdr),
+ 			   dcp_m4_xdr_limit(&dcp->xdr, READ_ONCE(dcp->thermal_state)),
+ 			   dcp->xdr.taken, dcp->xdr.trying, dcp->xdr.good, dcp->xdr.bad,
+ 			   dcp->xdr.reverts, dcp_m4_xdr_reason_name(dcp->xdr.reason),
+ 			   dcp->xdr.shown_seen, READ_ONCE(dcp->thermal_state), dcp->thermal_max,
+-			   dcp->xdr.min_cap, dcp->xdr_asked, dcp->xdr_last_us);
++			   dcp->xdr.min_cap, dcp->xdr_asked, dcp->xdr_last_us,
++			   dcp->runtime ? dcp->runtime->int_lost.given_up : 0,
++			   dcp->runtime ? dcp->runtime->int_lost.late : 0, !!dcp->lost_fb);
+ 	if (READ_ONCE(panel_vrr_min_hz))
+ 		seq_printf(s, "vrr min_hz=%u min_sent=%#x calls=%llu status=%#x\n",
+ 			   READ_ONCE(panel_vrr_min_hz), dcp->vrr_min_sent, dcp->vrr_calls,
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/m4.py b/tools/testing/selftests/drivers/gpu/apple-dcp/m4.py
+index a5d2a99f45..00ccd63c13 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/m4.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/m4.py
+@@ -590,7 +590,117 @@ def blank_extras(root, backend):
+                   '{ assert(dcp->lock==1); xdr_afters++; iomfb_m4_xdr_after_real(dcp,asked,ok,shown,us); }\n')
+         d590 = '    r->int_shown_valid=true; r->int_shown=xdr_shown; xdr_level=r->level;\n'
+         xdr_main = XDR_MAIN
+-    return types, runtime, state, stubs, d590, xdr_main
++    # An XDR probe the firmware refuses or leaves without its D590 (G-xdr-1):
++    # the backend's real give-up and late-D590 drop, called from the swap stub
++    # as dcp_m4_runtime_swap_full() and the D590 hook call them.
++    giveup = ''
++    if 'int_given_up' in swap:
++        runtime += (' bool int_probe; enum dcp_m4_xdr_give_up int_given_up;'
++                    ' struct dcp_m4_xdr_lost int_lost; struct dcp_m4_swap_state swap;')
++        state += ('    struct drm_framebuffer *lost_fb;\n'
++                  '    struct dcp_m4_transaction transaction;\n    bool external;\n')
++        types += 'struct dcp_m4_transaction { unsigned int calls, callbacks; int error; };\n'
++        stubs += ('static unsigned xdr_end;\n' +
++                  block(backend, 'static bool dcp_m4_int_swap_give_up(') + '\n' +
++                  block(backend, 'static bool dcp_m4_int_late_d590(') + '\n')
++        giveup = GIVEUP
++        xdr_main += XDR_RECOVER_MAIN
++    return types, runtime, state, stubs, d590, xdr_main, giveup
++
++
++# The swap stub ends a swap as dcp_m4_runtime_swap_full() does one it did not
++# complete: xdr_end 1, A407 answered and no D590 by the deadline; 2, A407
++# answered with an error status (the real reply parser). The real give-up
++# decides; the backend fails the session when it does not give the swap up.
++GIVEUP = r'''    if(xdr_end) {
++        int err=-ETIMEDOUT;
++        bool refused=false;
++        r->swap=swap;
++        if(xdr_end==2) {
++            u8 no[12]={0};
++            no[5]=1;
++            r->swap=(struct dcp_m4_swap_state){.id=publications};
++            err=dcp_m4_swap_record_reply(&r->swap,no,sizeof(no));
++            refused=err && dcp_m4_swap_submit_reply(no,sizeof(no))==-EPROTO;
++            assert(err==-EPROTO && refused);
++        }
++        dcp_m4_int_swap_give_up(r,err,refused);
++        return err;
++    }
++'''
++
++
++# G-xdr-1 in the blank test: a probe (a raised ceiling over the user maximum)
++# that the firmware leaves without its D590, or refuses, is given up with the
++# session kept; the guard refuses, the frame is held until the next confirmed
++# swap, which re-sends the standing level; the late D590 is dropped once. The
++# control: an ordinary swap without its D590 still fails the session.
++XDR_RECOVER_MAIN = r'''
++    {
++        struct drm_format_info fmt={.format=DRM_FORMAT_XRGB8888,.num_planes=1};
++        struct drm_framebuffer fb={.format=&fmt,.width=2560,.height=1664,.pitches={10240},.refs=1};
++        struct drm_framebuffer next=fb,third=fb;
++        struct apple_dcp owner={0};
++        struct iomfb_m4 dcp={.owner=&owner,.dev="dcp"};
++        struct dcp_m4_runtime runtime={.dcp=&dcp};
++        const u32 U=dcp_m4_pf->brightness_max;
++        unsigned warns;
++        u32 lost;
++        owner.v26_6=&dcp; dcp.runtime=&runtime;
++        /* The user level at its maximum: a raised ceiling asks above it. */
++        assert(!dcp_bl_init(&owner.backlight.state,U,true,U,false,0));
++        dcp.boost_max=1000; dcp.thermal_min_cap=300; xdr_shown=true; xdr_end=0;
++        assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
++        assert(dcp.active_fb==&fb && fb.refs==2 && dcp.xdr.state==DCP_M4_XDR_RAMP && !runtime.int_probe);
++        /* A raised ceiling: a probe at the first rung; the firmware leaves it without its D590. */
++        panel_boost_nits=1000; xdr_end=1; warns=xdr_warns;
++        assert(!iomfb_m4_present(&owner,&next,0x10000300000ULL,0x2000000));
++        lost=publications;
++        assert(!dcp.error && runtime.int_given_up==DCP_M4_XDR_KEEP_STALLED && !runtime.int_probe);
++        assert(dcp.xdr.state==DCP_M4_XDR_REFUSED && dcp_m4_xdr_cap(&dcp.xdr)==U && dcp.xdr.reverts==1);
++        assert(xdr_warns>=warns+2);
++        assert(runtime.int_lost.given_up==1 && dcp_m4_xdr_lost_find(&runtime.int_lost,lost)>=0);
++        assert(runtime.swap.emitted && !runtime.swap.error && runtime.swap.id==lost);
++        assert(dcp.lost_fb==&next && next.refs==2 && dcp.active_fb==&fb && fb.refs==2 && !dcp.uncertain_fb);
++        assert(dcp.boost_sent==U32_MAX && dcp.edr.restart);
++        /* The next frame, ordinary: the standing level re-sent at the level taken; both older frames retire. */
++        xdr_end=0;
++        assert(!iomfb_m4_present(&owner,&third,0x10000500000ULL,0x2000000));
++        assert(!dcp.error && xdr_level==U && dcp.boost_sent==0);
++        assert(!dcp.lost_fb && next.refs==1 && fb.refs==1 && dcp.active_fb==&third && third.refs==2);
++        /* Its late D590: dropped once; its displayed byte is not the swap in flight's. */
++        runtime.int_shown_valid=true;
++        assert(dcp_m4_int_late_d590(&runtime,lost) && runtime.int_lost.late==1 && !runtime.int_shown_valid);
++        assert(!dcp_m4_int_late_d590(&runtime,lost) && !dcp_m4_int_late_d590(&runtime,lost+1000));
++        assert(dcp_m4_xdr_lost_find(&runtime.int_lost,lost)<0);
++        /* Started over (panel_xdr written): a probe refused by its A407 status is given up too. */
++        panel_xdr_gen++; xdr_end=2;
++        assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
++        assert(!dcp.error && runtime.int_given_up==DCP_M4_XDR_KEEP_REFUSED);
++        assert(dcp.xdr.state==DCP_M4_XDR_REFUSED && dcp.xdr.reverts==2 && runtime.int_lost.given_up==2);
++        assert(dcp.lost_fb==&fb && fb.refs==2 && dcp.active_fb==&third && third.refs==2);
++        /* A blank retires the frame given up with the one before it. */
++        xdr_end=0;
++        assert(!dcp_backlight_dpms(&owner,false));
++        assert(!iomfb_m4_blank(&owner));
++        assert(!dcp.lost_fb && fb.refs==1 && !dcp.active_fb && third.refs==1);
++        assert(!dcp_backlight_dpms(&owner,true));
++        /*
++         * Control, while the guard ramps again (panel_xdr written, no raised ceiling): the standing
++         * level re-sent, no more than the level taken, is an ordinary swap; without its D590 the
++         * session fails.
++         */
++        panel_boost_nits=0; panel_xdr_gen++; xdr_end=1;
++        assert(iomfb_m4_present(&owner,&next,0x10000300000ULL,0x2000000)==-ETIMEDOUT);
++        assert(dcp.error==-ETIMEDOUT && dcp.uncertain_fb==&next && !dcp.lost_fb);
++        assert(runtime.int_lost.given_up==2 && runtime.int_given_up==DCP_M4_XDR_KEEP_NONE);
++        assert(dcp.xdr.state==DCP_M4_XDR_RAMP && xdr_afters>0);
++        xdr_end=0; panel_boost_nits=0; panel_xdr_gen++;
++        puts("PASS an XDR probe left without its D590 is given up: session kept, guard refused, its frame held");
++        puts("PASS the next frame re-sends the standing level at the level taken and retires both; the late D590 is dropped once");
++        puts("PASS a probe refused by its A407 status is given up too, a blank retires it, an ordinary swap without its D590 fails the session");
++    }
++'''
+ 
+ 
+ # The XDR guard in the blank test: every frame swap feeds the real guard once
+@@ -658,7 +768,7 @@ def blank(root):
+                      block(backlight, 'static bool dcp_backlight_presents_nits(') +
+                      '\n' + functions)
+     div = '' if has_edr(root) else 'static u64 div_u64(u64 x,u32 y) { return x/y; }\n'
+-    TYPES, RUNTIME_EXTRA, STATE_EXTRA, STUBS, D590, XDR_MAIN_PART = blank_extras(root, backend)
++    TYPES, RUNTIME_EXTRA, STATE_EXTRA, STUBS, D590, XDR_MAIN_PART, GIVEUP = blank_extras(root, backend)
+     return production(root) + r'''
+ #define min(x,y) ((x)<(y)?(x):(y))
+ #define max(x,y) ((x)>(y)?(x):(y))
+@@ -743,7 +853,7 @@ static int dcp_m4_runtime_swap_brightness(struct dcp_m4_runtime *r,
+     else assert(!dcp_m4_swap_record_done(&swap,publications));
+     assert(!dcp_m4_swap_take_completion(&swap));
+     assert(r->dcp->owner->backlight.state.actual==before);
+-    if(failure) return -ETIMEDOUT;
++''' + GIVEUP + r'''    if(failure) return -ETIMEDOUT;
+     if(order) assert(!dcp_m4_swap_record_done(&swap,publications));
+     else assert(!dcp_m4_swap_record_reply(&swap,reply,sizeof(reply)));
+     assert(dcp_m4_swap_take_completion(&swap)==1);
