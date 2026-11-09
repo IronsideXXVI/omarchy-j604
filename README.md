@@ -30,7 +30,7 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | Glassy bar | Stock holds about 59 fps on this 120 Hz panel. 119 fps needs the change in [omacom/omarchy#18176](https://github.com/omacom/omarchy/pull/18176), which is not carried here |
 | Wi-Fi and Bluetooth | Working |
 | Audio | Speakers (with speaker protection) and headphone jack working; microphones in progress |
-| Media | H.264 hardware decode worked on the 7.2 kernel; on 7.3 it needs a VA-API driver alias for the renamed GPU driver (in progress); video encode in progress |
+| Media | H.264 hardware decode worked on the 7.2 kernel. On 7.3 VA-API does not load with the stock driver package, so players decode in software; a driver alias for the renamed GPU driver waits for a GPU fault fix (in progress, see `STATUS.md`); video encode in progress |
 | Touch ID | Working for sudo, polkit and the lock screen |
 | Keyboard backlight | Working with the local `omarchy-dev` / `omarchy-settings-dev` builds |
 | Neural Engine | Driver bound; not powered up on the T8132 yet (the driver stops before power-up by design), no `/dev/accel` |
@@ -116,7 +116,7 @@ What goes to which upstream, in what order, and what's already open is in [`UPST
 
 - [omacom/omarchy#18176](https://github.com/omacom/omarchy/pull/18176): blur the Glassy bar from the cached wallpaper blur (59 to 119 fps on this panel); reopened; the same change as [#18191](https://github.com/omacom/omarchy/pull/18191)
 - [omacom/omarchy#18228](https://github.com/omacom/omarchy/pull/18228): retry the kyber scheduler write while a sibling NVMe namespace switches
-- [omacom/omarchy#18229](https://github.com/omacom/omarchy/issues/18229) (issue): `omarchy-mac`'s mpv default never installs because `omarchy-settings` owns `/etc/mpv/mpv.conf`; linked from [omacom/omarchy-mac-pkgs#66](https://github.com/omacom/omarchy-mac-pkgs/issues/66)
+- [omacom/omarchy#18229](https://github.com/omacom/omarchy/issues/18229) (issue): `omarchy-mac`'s mpv default never installs because `omarchy-settings` owns `/etc/mpv/mpv.conf`; linked from [omacom/omarchy-mac-pkgs#66](https://github.com/omacom/omarchy-mac-pkgs/issues/66). An M1 user's measurements there showed that the stock default (`hwdec=auto-safe`) is the right one on the M1; our reply (2026-11-09) agrees and adds M4 numbers
 - [omacom/linux-aurora#432](https://github.com/omacom/linux-aurora/issues/432) (issue): J604 test results
 - Closed without merging: [omacom/omarchy#18177](https://github.com/omacom/omarchy/pull/18177) (keybindings menu leaves out absent keys)
 
