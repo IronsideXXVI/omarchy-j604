@@ -32,3 +32,5 @@ Omarchy for Apple Silicon contributors. Thank you.
 | ewb | 1 |
 
 Also credited in a patch message: the built-in panel defaults (`omarchy-settings-dev/patches/disp-0201`) follow omacom/omarchy#10549 by j-c-m, which set `cm = "dp3"` for the Dell XPS OLED panel.
+
+`libfprint-git/patches/aurora-touchid-v5.patch` carries patches 0004 and 0005 from aurora-silicon/aurora-sep-userspace (shipped in aurora-silicon/alarm-aurora `libfprint-aurora`), renamed to the omacom driver's names. The patch has no single `From:` author, so it is not counted in the table.

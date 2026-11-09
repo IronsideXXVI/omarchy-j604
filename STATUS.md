@@ -28,6 +28,7 @@ MEASURED 2026-11-09 (`pacman -Q` and `uname -r` on the machine):
 | Graphics | `mesa-aurora` / `vulkan-aurora` with the T8132 GPU admitted (local `1.8132`) | official recipe + 1 patch |
 | Audio | `alsa-ucm-conf-aurora` (local `1.605`), `aurora-audio` (local `3.607`), `speakersafetyd` (local `1.605`) with J604 profiles | official recipes + J604 files |
 | Firmware | `asahi-fwextract` 0.9.2 (local `1.608`): extra camera tuning files | official recipe + 1 patch |
+| Touch ID library | `libfprint-git` 1:1.94.100.r10.g6f9479c, local `5.604`: accepts Secure Enclave biometric interface v4 and v5 | official recipe + 1 patch |
 | Neural Engine userland | `omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`: official edge builds, not carried by us | official |
 
 Next kernel (not installed): the J604 series is being rebased onto aurora-silicon/linux `integration/aurora` 7.3.0. The camera fix below goes into that kernel.
@@ -176,7 +177,8 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 
 ### Touch ID
 - **Working.** MEASURED 2026-11-09: used for sudo, polkit and the lock screen.
-- Carried by: kernel series (Secure Enclave sensor node) and one `omarchy-mac` change (stock lists the J604 as not eligible).
+- Carried by: kernel series (Secure Enclave sensor node), one `omarchy-mac` change (stock lists the J604 as not eligible), and `libfprint-git` 5.604.
+- The 7.3 kernel base moves the Secure Enclave biometric interface from version 4 to 5 (SOURCE: aurora-silicon/linux f70f1acd35). Stock `libfprint-git` -5 accepts only version 4, so on a 7.3 kernel fprintd ignores the sensor ("interface version 5, expected 4"; MEASURED 2026-11-09). `libfprint-git` 5.604 (installed 2026-11-09) accepts 4 and 5; with it fprintd finds the sensor on the 7.3 kernel (MEASURED 2026-11-09). Touch ID for sudo on the 7.3 kernel, and whether prints enrolled under version 4 still match, are TO-VERIFY 2026-11-09.
 
 ### Boot chain
 - **Working.** MEASURED 2026-11-09 (first boot of 1.617): m1n1 → U-Boot → Limine → kernel; passphrase prompt with the keyboard working; no failed units; no kernel warnings or oopses.

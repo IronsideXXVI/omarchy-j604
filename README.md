@@ -6,7 +6,7 @@ This repository is the working set for running [Omarchy](https://github.com/omac
 
 The J604 runs the official Omarchy **edge** channel (switched with the official `omarchy-channel-set edge` on 2026-11-09): `omarchy-dev` and `omarchy-settings-dev` built from the `quattro` branch, plus the official `omarchy-mac`. This repository carries only what the stock packages lack for this Mac:
 
-- the hardware enablement (kernel, boot chain, Mesa admission, audio profiles, firmware extraction, initramfs and unlock-prompt fixes, Touch ID eligibility);
+- the hardware enablement (kernel, boot chain, Mesa admission, audio profiles, firmware extraction, initramfs and unlock-prompt fixes, Touch ID eligibility, and the Touch ID library update the 7.3 kernel's Secure Enclave interface needs);
 - two userland additions:
   - the keyboard-backlight series in `omarchy-dev` / `omarchy-settings-dev` (the backlight comes on with activity, goes off after 10 s idle, Ctrl+F1/F2 change it, and Super+K leaves out keys a MacBook doesn't have);
   - built-in panel defaults: `omarchy-settings-dev` reads a `panel` line from the platform package, and `omarchy-mac` names this Mac's panel there (10-bit, Display P3). A setting in the user's `monitors.lua` still wins.
@@ -65,6 +65,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 | `asahi-fwextract` | 0.9.2, asahi-alarm/asahi-alarm-installer | `1.608` |
 | `asahi-scripts` | 20261023, asahi-alarm/asahi-scripts | `1.1` |
 | `plymouth` | 26.134.222, Plymouth (Arch Linux recipe) | `3.604` |
+| `libfprint-git` | 1:1.94.100.r10.g6f9479c, libfprint (`6f9479c3d5`), omacom recipe | `5.604` (accepts Secure Enclave interface v4 and v5) |
 | `omarchy-mac-boot` | 20261104, omacom/omarchy-mac-pkgs (`7e50e937b5`) | `1.614` |
 | `omarchy-mac` | 0.2.3, omacom/omarchy-mac-pkgs (`ea0097a523`) | `2.12` (adds the panel line) |
 | `omarchy-dev` | 4.0.0.r7634.gcbd0029 (edge), omacom/omarchy `quattro` (`cbd0029fdd`) | `1.3` (keyboard-backlight patches only) |
@@ -86,6 +87,7 @@ Coming next (not installed): a rebase of the J604 series onto aurora-silicon/lin
 | `aurora-audio/` | J604 speaker graph and microphone, plus upstream audio fixes | aurora-silicon/asahi-audio | MIT |
 | `speakersafetyd/` | J604 speaker protection profile | AsahiLinux/speakersafetyd | MIT |
 | `asahi-fwextract/` | camera tuning firmware extraction for the J604 | asahi-alarm/asahi-alarm-installer | MIT |
+| `libfprint-git/` | Touch ID on the 7.3 kernel: the Apple Secure Enclave driver accepts biometric interface v4 and v5 (two upstream Aurora patches as one) | libfprint (omacom recipe) | LGPL-2.1-or-later |
 | `asahi-scripts/` | adds the `apple_nvmem_spmi` module to the initramfs | asahi-alarm/asahi-scripts | MIT |
 | `plymouth/` | SimpleDRM recognized by driver name, so the disk unlock prompt opens on the panel | Plymouth | GPL-2.0 |
 | `omarchy-mac-boot/` | boot package fixes for the J604 | omacom/omarchy-mac-pkgs | MIT |

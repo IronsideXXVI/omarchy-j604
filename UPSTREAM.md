@@ -87,6 +87,15 @@ Ordered by dependency. Kernel items assume Aurora's J604 tree and the 7.3 rebase
 
 Not ready to propose (still being brought up, see `STATUS.md`): camera, microphones, ANE power-up, video encoder, external displays and HDMI, Thunderbolt/USB4, deep sleep.
 
+## Notes for upstream (found 2026-11-09; nothing posted)
+
+Findings from moving the J604 to the Aurora 7.3 kernel base. Each is a note to raise with the owners, with Dylan's sign-off; none is a J604-only problem.
+
+- **(a) omacom `libfprint-git` and the version 5 Secure Enclave interface.** omacom/omarchy-pkgs `libfprint-git` -5 (`dd8988f747`) accepts only interface version 4. The 7.3 base moves it to 5 (aurora-silicon/linux f70f1acd35; aurora-silicon/linux#660, which proposed holding it back until the userspace shipped, was closed without merging). On such a kernel fprintd ignores the sensor and Touch ID is lost (MEASURED 2026-11-09). The fix exists upstream: aurora-silicon/alarm-aurora#56 and aurora-silicon/aurora-sep-userspace#3 (both merged 2026-10-31). We carry their 0004 + 0005 as `libfprint-git` 5.604. A later official -6 without them would replace ours and lose Touch ID again on 7.3.
+- **(b) boot.bin size with the 7.3 device trees.** The 7.3 kernel package ships 137 DTBs (1.617: 115). `update-m1n1`'s default takes all of them, and the resulting boot.bin (13,576,387 B) did not boot: m1n1 stage 1 (1.608) refused it and stopped in its proxy (MEASURED 2026-11-09). The largest image measured to boot on the J604 is 10,492,247 B; the image parses correctly, so size is the cause, and the exact chainload check that refused it is INFERENCE. A J604-only DTB selection gives 4,700,263 B. Where the fix belongs (the DTB selection in the boot package, or the stage-1 chainload limit in m1n1) is for the owners to decide.
+- **(c) Aurora `t8132-platform-handoff` on the J604.** It logs "cannot resolve PMGR policy for /soc/power-management@380780000: -1" and stops before changing anything: the J604 tree has a PMGR node (`pmgr_cio`, from `t8132-usb4.dtsi`) that its embedded platform data lacks (CODE, MEASURED 2026-11-09). Harmless today: the result equals 1.617, which had no handoff. We do not skip the node, because that would apply the J713's PMGR policy to the J604 without J604 proof.
+- **(d) omacom `mesa-aurora` and the "aurora" DRM driver name.** The 7.3 base names the GPU's DRM driver "aurora" (aurora-silicon/linux a97f7b8be0). omacom/omarchy-pkgs `mesa-aurora` pins omacom/mesa `a19691114759`, which recognises only "asahi"; the fix is aurora-silicon/mesa 6edf62bcfd0 ("asahi: accept the aurora kernel driver name", SOURCE). With the old Mesa, GL falls back to software and Vulkan finds no device (INFERENCE, from the code); on the J604 the 7.3 kernel with Mesa 1.8132 starts no Hyprland session (MEASURED 2026-11-09). Our Mesa build adds 6edf62bcfd0 (local 1.8133, in progress).
+
 ## Kernel: what's next
 
 - Installed: `linux-aurora` 7.2.11.aurora15, local `1.617` (the series in `kernel/`, 766 patches).

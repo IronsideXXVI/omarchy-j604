@@ -13,11 +13,12 @@ This repository collects patches and package recipes for several projects. Each 
 | `speakersafetyd/` | MIT, Copyright The Asahi Linux Contributors | `speakersafetyd/LICENSE` (copied from AsahiLinux/speakersafetyd 2.0.1) |
 | `asahi-fwextract/` | MIT, Copyright (c) 2021 The Asahi Linux contributors | `asahi-fwextract/LICENSE` (copied from asahi-alarm/asahi-alarm-installer v0.9.2) |
 | `asahi-scripts/` | MIT, Copyright The Asahi Linux Contributors | `asahi-scripts/LICENSE` (copied from asahi-alarm/asahi-scripts 20261023) |
+| `libfprint-git/` | LGPL-2.1-or-later | `libfprint-git/LICENSE` (copied from libfprint 6f9479c3d5 `COPYING`) |
 | `plymouth/` | GPL-2.0 | `plymouth/LICENSE` (copied from Plymouth 26.134.222 `COPYING`) |
 | `omarchy-mac-boot/` | MIT, Copyright (c) David Heinemeier Hansson | `omarchy-mac-boot/LICENSE` (copied from omacom/omarchy-mac-pkgs) |
 | `omarchy-mac/` | MIT, Copyright (c) David Heinemeier Hansson | `omarchy-mac/LICENSE` (copied from omacom/omarchy-mac-pkgs) |
 | `omarchy-dev/`, `omarchy-settings-dev/` | MIT, Copyright (c) David Heinemeier Hansson | `omarchy-dev/LICENSE`, `omarchy-settings-dev/LICENSE` (copied from omacom/omarchy) |
-| `*/recipe/PKGBUILD` | The license of the official recipe each one changes: MIT for the omacom/omarchy-pkgs recipes (`m1n1`, `uboot-aurora`, `mesa`, `alsa-ucm-conf-aurora`, `aurora-audio`, `omarchy-mac-boot`, `omarchy-mac`, `omarchy-dev`, `omarchy-settings-dev`); 0BSD for the Arch Linux `plymouth` recipe; the asahi-alarm/PKGBUILDs recipes (`speakersafetyd`, `asahi-fwextract`, `asahi-scripts`) as published there | the official recipe named on line 3 of each `BASE` |
+| `*/recipe/PKGBUILD` | The license of the official recipe each one changes: MIT for the omacom/omarchy-pkgs recipes (`m1n1`, `uboot-aurora`, `mesa`, `alsa-ucm-conf-aurora`, `aurora-audio`, `omarchy-mac-boot`, `omarchy-mac`, `omarchy-dev`, `omarchy-settings-dev`, `libfprint-git`); 0BSD for the Arch Linux `plymouth` recipe; the asahi-alarm/PKGBUILDs recipes (`speakersafetyd`, `asahi-fwextract`, `asahi-scripts`) as published there | the official recipe named on line 3 of each `BASE` |
 | `README.md`, `LICENSE.md`, `CREDITS.md`, `STATUS.md`, `UPSTREAM.md`, `not-installed/README.md` | MIT | `omarchy-mac/LICENSE` terms |
 
 Every patch keeps its original author. Contributions from other people are redistributed under their projects' licenses.
