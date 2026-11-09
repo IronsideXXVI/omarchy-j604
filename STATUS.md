@@ -23,7 +23,7 @@ MEASURED 2026-11-09 (`pacman -Q` and `uname -r` on the machine):
 | Channel | Omarchy **edge** since 2026-11-09 (official `omarchy-channel-set edge`) | official |
 | Desktop | `omarchy-dev` 4.0.0.r7641.gf97d3e7, local pkgrel `1.1` (stock edge + the keyboard-backlight series, 4 patches); `omarchy-settings-dev` same version, local `1.1` (the same 4 patches + the built-in panel defaults, 1 patch); Hyprland 0.57.1, stock | official recipes + 4 / 5 patches |
 | Mac add-on | `omarchy-mac` 0.2.3, local `2.12`: keyboard-backlight idle default, Apple F-row key names, Touch ID eligibility, the 14-inch MacBook Pro panel line (10-bit, Display P3) | official recipe + 4 patches |
-| Kernel | `linux-aurora` 7.3.0.aurora1, local `1.704` (164 patches on aurora-silicon/linux `integration/aurora` `6ff31cbfa2`: 1.703 plus the GPU fix 0164), running `7.3.0-1-1.704-ARCH` since 2026-11-09 | official recipe (source moved to the 7.3 base) + J604 series |
+| Kernel | `linux-aurora` 7.3.0.aurora1, local `1.705` (175 patches on aurora-silicon/linux `integration/aurora` `6ff31cbfa2`: 1.704 plus 0165-0175), running `7.3.0-1-1.705-ARCH` since 2026-11-09 | official recipe (source moved to the 7.3 base) + J604 series |
 | Boot chain | `m1n1-aurora` 1.6.1.aurora22 (local `1.608`), `uboot-aurora` 2026.07.aurora6 (local `1.604`), `omarchy-mac-boot` 20261104 (local `1.616`), `plymouth` 26.134.222 (local `3.604`), `asahi-scripts` 20261023 (local `1.1`); boot image (`boot.bin`): m1n1 + the J604 device tree (the same in 1.703 and 1.704) + U-Boot, 4,700,171 bytes | official recipes + J604 patches |
 | Graphics | `mesa-aurora` / `vulkan-aurora` with the T8132 GPU admitted and the 7.3 kernel's "aurora" driver name accepted (local `1.8133`) | official recipe + 2 patches |
 | Audio | `alsa-ucm-conf-aurora` (local `1.605`), `aurora-audio` (local `3.607`), `speakersafetyd` (local `1.605`) with J604 profiles | official recipes + J604 files |
@@ -36,7 +36,7 @@ Kernel 7.3 gate (MEASURED 2026-11-09, first boot of 1.703 with its J604 device t
 
 Kernel 1.704 gate (MEASURED 2026-11-09, first boot of 1.704, one reboot): Hyprland running; no failed units; no driver probe failures; no firmware load failures; PCIe links up with no failures. The install left `boot.bin` unchanged (same J604 device tree as 1.703).
 
-## What changed with kernel 7.3 (1.703 and 1.704, over 1.617)
+## What changed with kernel 7.3 (1.703 to 1.705, over 1.617)
 
 CODE unless a line says otherwise.
 
@@ -50,6 +50,8 @@ CODE unless a line says otherwise.
 - **0162**: the external display controller dcpext0 uses the J604's ATC2 PHY (MEASURED 2026-11-09: it starts, with no probe timeout).
 - **0163**: a mailbox send that waits can be killed again, but not interrupted (as in 1.617).
 - **0164** (1.704, the only change over 1.703): the GPU driver's GPUVM exec lock takes a reservation that two GEM objects share only once (`DRM_EXEC_IGNORE_DUPLICATES`, as the C users of `drm_gpuvm_exec` and `drm_exec` do). Without it, a client that closes an imported dma-buf and imports the same dma-buf again while the GPU is still busy got its next submission refused with EFAULT: `VK_ERROR_DEVICE_LOST` and a blank picture for 1080p zero-copy video (MEASURED 2026-11-09 on 1.703). The same code is in 1.617, and upstream aurora-silicon/linux `integration/aurora` still has it (SOURCE, checked 2026-11-09 at `d7303c39e215`). 1.704 is otherwise the same build as 1.703: same kernel config, byte-identical device trees, the package's own tests pass as on 1.703 (MEASURED 2026-11-09, build), so `boot.bin` keeps the same J604 device tree. With 1.704, stock mpv's zero-copy video shows the correct picture at 1080p and the kernel logs no submit error (MEASURED 2026-11-09).
+- **0165-0167** (1.705): the suspend-to-RAM driver is now offered whenever the boot firmware publishes its mailbox and reset vector and every core's reset vector is locked to it; suspend-to-idle stays the default (a new `suspend_set_ops_keep_s2idle()` helper). On 1.705 `/sys/power/mem_sleep` reads `[s2idle] deep` (MEASURED 2026-11-09). A real deep sleep is not possible yet: the GPU driver refuses any sleep that powers the SoC down once its firmware has run, because the M4 GPU has no firmware stop and warm restart yet (CODE).
+- **0168-0175** (1.705): eight USB4/Thunderbolt and USB-C PD fixes from aurora-silicon/linux `integration/aurora` that landed after our base and apply to the M4 (NHI started only with its DART, XDomain teardown and DMA-path checks, DROM entries for missing ports, the TI PD controller's LDCM startup and removal, a port restart when the peer link is lost, the USB4 router taken again after a rebind). Kept with their upstream authors. They act only when a USB4/Thunderbolt partner is plugged in; nothing plugged in behaves as on 1.704 (MEASURED 2026-11-09, gate).
 - Two 7.3 base changes need userland updates, both installed: the GPU's DRM driver is now called "aurora" (Mesa 1.8133), and the Secure Enclave biometric interface is version 5 (`libfprint-git` 5.604). The renamed GPU driver also needs a VA-API driver alias: `libva-v4l2_request-avd` 1.604, installed again with kernel 1.704 on 2026-11-09 (the first install was rolled back because of the GPU fault that 0164 fixes; see Media engines).
 - **Boot image.** Since 2026-11-09 `boot.bin` holds only the J604 device tree from the 1.703 package (4,700,171 bytes); it booted and was confirmed (MEASURED 2026-11-09). The default `update-m1n1` takes all 137 device trees of the 7.3 package (13.58 MB), which m1n1 stage 1 refuses (MEASURED 2026-11-09; see `UPSTREAM.md` note (b)). Since `omarchy-mac-boot` 1.616 (installed 2026-11-09) `update-m1n1` builds that J604-only image itself: its config picks the one device tree of the newest kernel whose first compatible is the running Mac's. The image it wrote was byte-identical to the confirmed one every time (three runs, at the 1.615 and the 1.616 install), and the official boot check passes (MEASURED 2026-11-09).
 
@@ -96,7 +98,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | Battery and charger | Working | MEASURED 2026-11-09 |
 | Suspend (s2idle) | Working | MEASURED 2026-11-09 |
 | Idle power on AC | About 10.5 W with the stock edge `performance` power profile (7.5-7.7 W before 2026-11-09 04:56Z) | MEASURED 2026-11-09 |
-| Deep sleep (suspend to RAM) | In progress (only s2idle offered) | MEASURED 2026-11-09 |
+| Deep sleep (suspend to RAM) | In progress: deep is offered on 1.705, suspend-to-idle stays the default; the GPU still blocks a real deep sleep | MEASURED 2026-11-09 (offered); TO-VERIFY 2026-11-09 (a full sleep) |
 | Battery life vs macOS | Not measured yet | TO-VERIFY 2026-11-09 |
 | Touch ID (sudo, polkit, lock screen) | Working (sudo also on the 7.3 kernel, owner's check) | MEASURED 2026-11-09 |
 | Boot chain (m1n1, U-Boot, Limine, disk unlock) | Working, no failed units on 1.703 and 1.704 with the 7.3 J604 device tree | MEASURED 2026-11-09 |
@@ -179,7 +181,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 
 ### Power
 - Suspend (s2idle): **Working** (MEASURED 2026-11-09; the kernel offers only `s2idle`).
-- Deep sleep (suspend to RAM): **In progress**; kernel and m1n1 parts are built and off (TO-VERIFY 2026-11-09).
+- Deep sleep (suspend to RAM): **In progress.** Since 1.705 the kernel offers it (`[s2idle] deep`, MEASURED 2026-11-09); the boot firmware already publishes what it needs (no m1n1 change). Suspend-to-idle stays the default, so closing the lid behaves as before. A full deep sleep needs a GPU firmware stop and warm restart first (CODE; TO-VERIFY 2026-11-09).
 - Idle power on AC: about 10.5 W (SMC system power, 120 s idle, screen on; MEASURED 2026-11-09 on 1.617), against 7.5-7.7 W in the same check on 1.614 before 2026-11-09 04:56Z.
   - The cause is userland, not the kernel: since that time the J604 runs the edge `omarchy-power-profiles-daemon` 0.30-7, which adds Apple Silicon CPU profiles (SOURCE: its package description). With the stock profile on AC, `performance`, both CPU policies use the `performance` governor, so the cores idle at their top clock (MEASURED 2026-11-09). The earlier 0.30-3 had no Apple Silicon profile, and the kernel default `schedutil` applied.
   - This is the stock edge default, left as it is. A comparison with the `balanced` profile is TO-VERIFY.

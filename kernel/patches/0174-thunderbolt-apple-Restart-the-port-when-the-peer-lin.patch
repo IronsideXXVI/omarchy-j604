@@ -1,0 +1,291 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 01:11:48 +1100
+Subject: [PATCH] thunderbolt: apple: Restart the port when the peer
+ link is lost
+
+When the peer on the USB4 port drops the link but the cable stays
+attached, the ACIO firmware puts the port group into its dead end state
+and waits for the host to power the block off:
+
+  ... lane_init.c:1110: SBX disconnected!
+  ... port_group.c:1528: Port Group - entering Dead End state
+  thunderbolt-apple-nhi 381f00000.nhi: 0:1: xdomain unplugged
+  ... port_group.c:1511: ACIO was not powered off after 2 seconds in Dead-End state
+  ... (repeated every 2 s)
+
+A peer that reboots or powers off is reported by the Type-C controller as
+a cable change about 0.5 s later, which stops and restarts the ACIO, so
+the port recovers. When no cable change follows, for example when the
+peer resets its own port right after the lanes were bonded, nothing
+restarts it and the port stays down until a reboot. This was seen on an
+M4 Pro (T6040) connected to an M2 in 1 of 17 M2 reboots: the link came
+up while the M2 was booting, the M2 reset its port 0.5 s after bonding,
+and the M4 Pro port never trained again.
+
+Add a link_lost hook to struct tb_nhi_ops that the software connection
+manager calls when the router or host on a host router lane adapter is
+unplugged. The Apple NHI arms a 3 s check. If the cable is still
+attached, the port was not restarted meanwhile and no peer came back, it
+asks CD321x to revalidate the cable with a failed connection check, which
+cycles the ACIO and the PHY. Do this at most three times until a peer is
+found again.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+(cherry picked from commit e847be17c139b0aff6f272fd5a741a4bb8de4d57)
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/thunderbolt/apple.c | 113 +++++++++++++++++++++++++++++++++++-
+ drivers/thunderbolt/nhi.h   |   5 ++
+ drivers/thunderbolt/tb.c    |  11 ++++
+ 3 files changed, 128 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/thunderbolt/apple.c b/drivers/thunderbolt/apple.c
+index 8bd53321be..8b68e14d4a 100644
+--- a/drivers/thunderbolt/apple.c
++++ b/drivers/thunderbolt/apple.c
+@@ -219,6 +219,14 @@ static const struct apple_cio_hw apple_cio_t6040_hw = {
+ #define APPLE_CIO_SLEEP_RESTART_FALLBACK_MS 10000
+ /* How long a forced cable cycle may take before it no longer counts. */
+ #define APPLE_CIO_RESUME_RECOVERY_WINDOW_MS 30000
++/*
++ * After a peer drops the link without the cable going away, the ACIO
++ * firmware parks the port and waits for the host to power it off. A peer
++ * that reboots or goes away electrically is reported as a cable change
++ * within about 0.5 s and restarts the port anyway.
++ */
++#define APPLE_CIO_LINK_LOST_MS 3000
++#define APPLE_CIO_LINK_LOST_CYCLES 3
+ 
+ static bool resume_recovery;
+ module_param(resume_recovery, bool, 0644);
+@@ -329,6 +337,12 @@ struct apple_cio {
+ 	bool resume_recovery_failed; /* terminal recovery failure */
+ 	bool resume_link_failed; /* protected by lock */
+ 	bool resume_link_pending; /* set by NHI resume, consumed by ACIO complete */
++	struct delayed_work link_lost_work;
++	unsigned int start_gen; /* protected by lock: bumped by every start */
++	unsigned int link_lost_gen; /* start_gen when the peer went away */
++	unsigned int link_lost_cycles; /* protected by lock */
++	u64 link_lost_cycle_activity; /* remote activity at the last cycle */
++	bool link_lost_restart; /* protected by lock: cycle requested */
+ 	struct notifier_block pm_notifier;
+ 	struct delayed_work sleep_restart_work;
+ 	enum {
+@@ -2057,8 +2071,27 @@ static bool apple_nhi_add_links(struct tb_nhi *nhi)
+ 	return true;
+ }
+ 
++/*
++ * Called with the domain lock held when the peer on a host router lane
++ * adapter went away: only (re)arm the check.
++ */
++static void apple_nhi_link_lost(struct tb_nhi *nhi)
++{
++	struct apple_nhi *anhi = nhi_to_anhi(nhi);
++	struct apple_cio *acio = anhi->acio;
++	u64 activity = atomic64_read(&anhi->tb->remote_activity);
++
++	/* A peer was found since the last cycle: that cycle worked */
++	if (activity != READ_ONCE(acio->link_lost_cycle_activity))
++		WRITE_ONCE(acio->link_lost_cycles, 0);
++	WRITE_ONCE(acio->link_lost_gen, READ_ONCE(acio->start_gen));
++	mod_delayed_work(system_freezable_wq, &acio->link_lost_work,
++			 msecs_to_jiffies(APPLE_CIO_LINK_LOST_MS));
++}
++
+ static const struct tb_nhi_ops apple_nhi_ops = {
+ 	.add_links = apple_nhi_add_links,
++	.link_lost = apple_nhi_link_lost,
+ 	.request_ring_irq = apple_nhi_request_irq,
+ 	.release_ring_irq = apple_nhi_release_irq,
+ 	.ring_interrupt_active = apple_nhi_ring_interrupt_active,
+@@ -2707,6 +2740,7 @@ static void apple_cio_stop(struct apple_cio *acio)
+ 
+ 	acio->current_cable_info = 0;
+ 	acio->resume_link_failed = false;
++	acio->link_lost_restart = false;
+ }
+ 
+ /* Only called while the ACIO power domains are on. */
+@@ -2923,6 +2957,7 @@ static int apple_cio_start(struct apple_cio *acio)
+ 	}
+ 
+ 	acio->current_cable_info = acio->target_cable_info;
++	acio->start_gen++;
+ 	return 0;
+ 
+ err_depopulate:
+@@ -2953,7 +2988,7 @@ static int apple_cio_check_connection(struct apple_cio *acio)
+ 
+ 	lockdep_assert_held(&acio->lock);
+ 	/* Ask CD321x to cycle ACIO and the PHY using a fresh cable snapshot. */
+-	if (acio->resume_link_failed)
++	if (acio->resume_link_failed || acio->link_lost_restart)
+ 		return -ENOLINK;
+ 	guard(mutex)(&acio->pcie_tunnel_lock);
+ 	if (!READ_ONCE(acio->nhi_pdev) || acio->pcie_tunnel_stopping ||
+@@ -3018,6 +3053,79 @@ unlock:
+ 	return verdict;
+ }
+ 
++/* Whether a router or host is connected to a lane adapter of the host router */
++static bool apple_cio_has_peer(struct apple_cio *acio, u64 *activity)
++{
++	struct platform_device *pdev = READ_ONCE(acio->nhi_pdev);
++	struct apple_nhi *anhi;
++	struct tb_port *port;
++	bool peer = true;
++
++	lockdep_assert_held(&acio->lock);
++	if (!pdev)
++		return true;
++	device_lock(&pdev->dev);
++	anhi = platform_get_drvdata(pdev);
++	if (!pdev->dev.driver || !anhi || !anhi->tb)
++		goto unlock;
++
++	scoped_guard(mutex, &anhi->tb->lock) {
++		*activity = atomic64_read(&anhi->tb->remote_activity);
++		peer = false;
++		tb_switch_for_each_port(anhi->tb->root_switch, port) {
++			if (!tb_port_is_null(port))
++				continue;
++			if ((port->xdomain && !port->xdomain->is_unplugged) ||
++			    (port->remote && !port->remote->sw->is_unplugged))
++				peer = true;
++		}
++	}
++unlock:
++	device_unlock(&pdev->dev);
++	return peer;
++}
++
++/*
++ * The peer dropped the link but the cable is still attached and no cable
++ * change followed. The firmware leaves the port down until it is powered
++ * off, so have CD321x cycle it with a fresh cable snapshot, a few times.
++ */
++static void apple_cio_link_lost_work(struct work_struct *work)
++{
++	struct apple_cio *acio = container_of(to_delayed_work(work),
++					      struct apple_cio, link_lost_work);
++	u64 activity = 0;
++	bool notify = false;
++
++	scoped_guard(mutex, &acio->lock) {
++		if (acio->removing || !acio->current_cable_info ||
++		    !acio->target_cable_info ||
++		    acio->sleep_phase != APPLE_CIO_SLEEP_OPEN ||
++		    acio->resume_recovery_failed ||
++		    acio->start_gen != READ_ONCE(acio->link_lost_gen))
++			return;
++		if (apple_cio_has_peer(acio, &activity))
++			return;
++		if (acio->link_lost_cycles >= APPLE_CIO_LINK_LOST_CYCLES) {
++			dev_warn(acio->dev,
++				 "peer link still down after %u port restarts, leaving the port alone\n",
++				 acio->link_lost_cycles);
++			return;
++		}
++		acio->link_lost_cycles++;
++		WRITE_ONCE(acio->link_lost_cycle_activity, activity);
++		acio->link_lost_restart = true;
++		dev_info(acio->dev,
++			 "peer link lost with the cable attached, restarting the port (%u/%u)\n",
++			 acio->link_lost_cycles, APPLE_CIO_LINK_LOST_CYCLES);
++		notify = true;
++	}
++
++	/* CD321x may tear down the NHI: never notify under either driver lock. */
++	if (notify)
++		typec_thunderbolt_switch_notify(acio->tbt_switch);
++}
++
+ static void apple_cio_resume_link_work(struct work_struct *work)
+ {
+ 	struct apple_cio *acio = container_of(to_delayed_work(work),
+@@ -3061,6 +3169,7 @@ static int apple_cio_prepare(struct device *dev)
+ 
+ 	/* Drain before taking lock; the worker acquires it to check the link. */
+ 	cancel_delayed_work_sync(&acio->resume_link_work);
++	cancel_delayed_work_sync(&acio->link_lost_work);
+ 	scoped_guard(mutex, &acio->lock) {
+ 		WRITE_ONCE(acio->resume_link_pending, false);
+ 		acio->resume_link_failed = false;
+@@ -3364,6 +3473,7 @@ static int apple_cio_probe(struct platform_device *pdev)
+ 	INIT_DELAYED_WORK(&acio->pcie_tunnel_work,
+ 			  apple_cio_pcie_tunnel_work);
+ 	INIT_DELAYED_WORK(&acio->resume_link_work, apple_cio_resume_link_work);
++	INIT_DELAYED_WORK(&acio->link_lost_work, apple_cio_link_lost_work);
+ 	INIT_DELAYED_WORK(&acio->sleep_restart_work, apple_cio_sleep_restart_work);
+ 	init_completion(&acio->nhi_boot_completion);
+ 	acio->dev = &pdev->dev;
+@@ -3564,6 +3674,7 @@ static void apple_cio_remove(struct platform_device *pdev)
+ 	disable_delayed_work_sync(&acio->sleep_restart_work);
+ 
+ 	disable_delayed_work_sync(&acio->resume_link_work);
++	disable_delayed_work_sync(&acio->link_lost_work);
+ 	/* The worker can notify this switch; stop current and future enqueues. */
+ 	disable_delayed_work_sync(&acio->pcie_tunnel_work);
+ 	/* A set may hold the switch read lock while waiting for acio->lock. */
+diff --git a/drivers/thunderbolt/nhi.h b/drivers/thunderbolt/nhi.h
+index 75795fbf86..dbf1e4b407 100644
+--- a/drivers/thunderbolt/nhi.h
++++ b/drivers/thunderbolt/nhi.h
+@@ -106,6 +106,10 @@ struct tb_nhi_ring_layout {
+  *	       %true if the host orders all of its tunneled native ports, so
+  *	       none is left without a link.
+  * @is_present: Whether the device is currently present on the parent bus
++ * @link_lost: Called with the domain lock held when the router or host
++ *	       connected to a lane adapter of the host router is unplugged.
++ *	       Lets the NHI recover a port whose link went down while the
++ *	       cable stays attached.
+  * @init_interrupts: NHI specific interrupt initialization hook
+  * @reset_interface: Resets the host interface
+  */
+@@ -134,6 +138,7 @@ struct tb_nhi_ops {
+ 				     struct tb_port *out, u64 generation);
+ 	bool (*add_links)(struct tb_nhi *nhi);
+ 	bool (*is_present)(struct tb_nhi *nhi);
++	void (*link_lost)(struct tb_nhi *nhi);
+ 	void (*dp_tunnel_changed)(struct tb_nhi *nhi, u8 in_port, u64 generation, bool active);
+ 	bool (*dp_tunnel_awaits_display)(struct tb_nhi *nhi, struct tb_port *in);
+ 	int (*init_interrupts)(struct tb_nhi *nhi);
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+index 19c1389c63..ad59f4ede6 100644
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -3258,6 +3258,15 @@ static int tb_disconnect_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
+ 
+ /* hotplug handling */
+ 
++/* The partner on a host router lane adapter went away */
++static void tb_host_link_lost(struct tb *tb, struct tb_port *port)
++{
++	if (tb_route(port->sw) || !tb_port_is_null(port))
++		return;
++	if (tb->nhi->ops && tb->nhi->ops->link_lost)
++		tb->nhi->ops->link_lost(tb->nhi);
++}
++
+ /*
+  * tb_handle_hotplug() - handle hotplug event
+  *
+@@ -3322,6 +3331,7 @@ static void tb_handle_hotplug(struct work_struct *work)
+ 			tb_recalc_estimated_bandwidth(tb);
+ 			tb_tunnel_dp(tb);
+ 			tb_dp_host_tunnel_gone(tb, dp_up);
++			tb_host_link_lost(tb, port);
+ 		} else if (port->xdomain) {
+ 			struct tb_xdomain *xd = tb_xdomain_get(port->xdomain);
+ 
+@@ -3339,6 +3349,7 @@ static void tb_handle_hotplug(struct work_struct *work)
+ 			__tb_disconnect_xdomain_paths(tb, xd, -1, -1, -1, -1);
+ 			tb_xdomain_put(xd);
+ 			tb_port_unconfigure_xdomain(port);
++			tb_host_link_lost(tb, port);
+ 		} else if (tb_port_is_dpout(port) || tb_port_is_dpin(port)) {
+ 			tb_dp_resource_unavailable(tb, port, "adapter unplug");
+ 			/* A display went: the DP tunnel left may take a higher rate. */
