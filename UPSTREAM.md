@@ -64,7 +64,7 @@ Each needs Dylan's sign-off.
 | 7 | asahi-scripts: add `apple_nvmem_spmi` to the initramfs hook | asahi-alarm/asahi-scripts | Needs measurement | CODE |
 | 8 | asahi-fwextract: extra camera sensor tuning files | asahi-alarm / AsahiLinux | Needs a camera capture first | CODE |
 | 9 | omarchy-mac-boot generic fixes (`dtb-overlays` under `pipefail`, vendor-firmware hook `timeout`) | omacom/omarchy-mac-pkgs | Ready (boot-critical: attach cold-boot evidence) | CODE; in daily use on the J604 |
-| 10 | Panel defaults for verified Apple panels (10-bit, Display P3) as per-panel package data | omacom/omarchy (`panel-defaults.lua`, reads `displays.conf`) + omacom/omarchy-mac-pkgs (the panel line) | **Drafts ready, not opened** (see above); installed on the J604 since 2026-11-09. VRR is left at the upstream default (off), decision pending. If the panel link is dithered, the claim is "10-bit compositing" | MEASURED 2026-11-09: package defaults give XRGB2101010 and `cm dp3`; P3 visual TO-VERIFY |
+| 10 | Panel defaults for verified Apple panels (10-bit, Display P3) as per-panel package data | omacom/omarchy (`panel-defaults.lua`, reads `displays.conf`) + omacom/omarchy-mac-pkgs (the panel line) | **Drafts ready, not opened** (see above); installed on the J604 since 2026-11-09. VRR stays at the upstream default (off, fixed 120 Hz), by the owner's decision. If the panel link is dithered, the claim is "10-bit compositing" | MEASURED 2026-11-09: package defaults give XRGB2101010 and `cm dp3`; P3 passed the owner's visual check |
 
 ## Wave 2: the hardware series
 

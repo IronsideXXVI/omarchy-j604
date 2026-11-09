@@ -59,8 +59,8 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | RAM (16 GB) | Working | MEASURED 2026-11-09 |
 | Internal display (3024x1964 at 120 Hz, scale 2) | Working | MEASURED 2026-11-09 |
 | 10-bit | Package default: compositor scans out XRGB2101010 with no user setting; panel link most likely 8 bpc with dithering | MEASURED 2026-11-09 (scanout); INFERENCE 2026-11-09 (link depth) |
-| Display P3 | Package default (`cm = dp3`, kernel colour target Display P3); visual check pending | MEASURED 2026-11-09 (setting); TO-VERIFY 2026-11-09 (visual) |
-| VRR | Off, the upstream Omarchy default (since 58443c82c); decision pending | MEASURED 2026-11-09 |
+| Display P3 | Package default (`cm = dp3`, kernel colour target Display P3); passed the visual check | MEASURED 2026-11-09 (setting, and the owner's visual check) |
+| VRR | Off, fixed 120 Hz: the upstream Omarchy default (since 58443c82c), kept by the owner's decision | MEASURED 2026-11-09 |
 | EDR / HDR | No claim on the current build | TO-VERIFY 2026-11-09 |
 | Glassy bar frame rate | Stock: about 59 fps at 120 Hz; 119 fps only with omacom/omarchy#18176 | MEASURED 2026-11-09 |
 | Brightness | Working (panel backlight) | MEASURED 2026-11-09 |
@@ -111,8 +111,8 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 - **Working.** MEASURED 2026-11-09: 3024x1964 at 120 Hz, scale 2.
 - Package defaults since 2026-11-09 (MEASURED 2026-11-09 after a reboot, with no display line in the owner's `monitors.lua`): 3024x1964 at 120 Hz (the panel's only mode), scale 2, 10-bit (the compositor scans out XRGB2101010) and Display P3 (Hyprland `cm = dp3`; the kernel logs "panel SDR colour: Display P3"; the connector stays on its default colorspace).
   - Carried by: `omarchy-mac` 2.12, whose `displays.conf` names the panel (`panel eDP 3024x1964 bitdepth=10 cm=dp3`), and `omarchy-settings-dev` 1.4, whose `panel-defaults.lua` applies that line to the built-in panel's monitor rules. A `bitdepth` or `cm` set in `monitors.lua` still wins. Mode and scale need no package setting: Hyprland picks 3024x1964 at 120 Hz and scale 2 on its own (CODE).
-  - The panel link itself is most likely 8 bits per channel with dithering (INFERENCE 2026-11-09). Whether the P3 picture looks right is TO-VERIFY (visual check).
-- VRR: off (MEASURED 2026-11-09). That is the upstream Omarchy default: Omarchy turned VRR on and took it out again in 58443c82c because it adds a small lag (SOURCE). The panel supports 24-120 Hz. Whether to carry VRR on is a decision still pending.
+  - The panel link itself is most likely 8 bits per channel with dithering (INFERENCE 2026-11-09). The P3 picture passed the owner's visual check (MEASURED 2026-11-09: "Looks great").
+- VRR: off (MEASURED 2026-11-09). That is the upstream Omarchy default: Omarchy turned VRR on and took it out again in 58443c82c because it adds a small lag (SOURCE). The panel supports 24-120 Hz. It stays off: a fixed 120 Hz, by the owner's decision (2026-11-09).
 - EDR / HDR: no claim on the current build (TO-VERIFY 2026-11-09). 1.617 adds groundwork that takes the EDR headroom from the content (CODE); it needs an HDR client to be measured.
 - Glassy bar: stock holds about 59 fps on this 120 Hz panel; 119 fps needs the xray change in omacom/omarchy#18176 (MEASURED 2026-11-09). That change is not in our packages; the owner's own user toggle restores it locally.
 - Brightness: the panel backlight works (MEASURED 2026-11-09). There is no automatic brightness in the installed packages.
