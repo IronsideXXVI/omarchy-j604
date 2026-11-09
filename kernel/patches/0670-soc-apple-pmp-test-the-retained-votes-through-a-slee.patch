@@ -1,0 +1,258 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 14:56:56 +0000
+Subject: [PATCH] soc: apple: pmp: test the retained votes through a sleep that
+ stops the PMP
+
+Drive pmp-display-sleep.h through a model of the bridge's vote state in
+the order the PM core and the DCP go through a sleep that stops the PMP:
+refused without a consumer that releases DISP, whatever the votes;
+refused while DISP is still held, with AGX held, with a request in
+flight or a failed stream; with a consumer, the DCP's put, the stop, no
+vote while stopped, the wake and the DCP's get, twice; enter and leave
+repeated. No hardware, no PMP driver needed.
+
+[j604: new cases for the teardown/restore order and for the refusal that
+ stays without a consumer. Run with the KUnit pmp config.]
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/Kconfig                  |  14 ++
+ drivers/soc/apple/Makefile                 |   1 +
+ drivers/soc/apple/pmp-display-sleep-test.c | 190 +++++++++++++++++++++
+ 3 files changed, 205 insertions(+)
+ create mode 100644 drivers/soc/apple/pmp-display-sleep-test.c
+
+diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
+index 66eb055b2a..bc63461043 100644
+--- a/drivers/soc/apple/Kconfig
++++ b/drivers/soc/apple/Kconfig
+@@ -235,6 +235,20 @@ config APPLE_PMP
+ 
+ 	  Say 'y' here if you have an Apple SoC.
+ 
++config APPLE_PMP_DISPLAY_SLEEP_KUNIT_TEST
++	tristate "KUnit tests for the retained PMP votes in system sleep" if !KUNIT_ALL_TESTS
++	depends on KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  Tests when the PMP may stop for a system sleep on boards whose PMP
++	  carries the retained display and GPU votes: never without a display
++	  consumer that releases its vote for such a sleep, never with a vote
++	  held or in flight, and no vote taken until the PMP is back, in the
++	  order the PM core and the display driver go through it. The tests
++	  touch no hardware and do not need the PMP driver.
++
++	  If unsure, say N.
++
+ config APPLE_CLPC
+ 	tristate "Apple host performance controller floors"
+ 	depends on ARCH_APPLE || COMPILE_TEST
+diff --git a/drivers/soc/apple/Makefile b/drivers/soc/apple/Makefile
+index d9f12314d6..462289ba38 100644
+--- a/drivers/soc/apple/Makefile
++++ b/drivers/soc/apple/Makefile
+@@ -50,6 +50,7 @@ apple-sep-y := sep.o hwrng_shim.o store_shim.o bio_shim.o sha_shim.o \
+ 
+ obj-$(CONFIG_APPLE_PMP) += apple-pmp.o
+ apple-pmp-y := pmp.o pmp-export.o pmp-display.o pmp-telemetry.o
++obj-$(CONFIG_APPLE_PMP_DISPLAY_SLEEP_KUNIT_TEST) += pmp-display-sleep-test.o
+ 
+ obj-$(CONFIG_APPLE_MCC) += apple-mcc.o
+ apple-mcc-y := mcc.o
+diff --git a/drivers/soc/apple/pmp-display-sleep-test.c b/drivers/soc/apple/pmp-display-sleep-test.c
+new file mode 100644
+index 0000000000..32f84e5253
+--- /dev/null
++++ b/drivers/soc/apple/pmp-display-sleep-test.c
+@@ -0,0 +1,190 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/*
++ * KUnit tests for the retained PMP votes through a system sleep that stops
++ * the PMP (pmp-display-sleep.h). No hardware: a model of the bridge's vote
++ * state, driven in the order the PM core and the DCP drive the real one.
++ */
++#include <kunit/test.h>
++#include <linux/errno.h>
++#include <linux/module.h>
++#include <linux/string.h>
++
++#include "pmp-display-sleep.h"
++
++/* The bridge's vote state as the model drives it: get/put as the consumer calls them. */
++struct model {
++	struct pmp_display_sleep s;
++	struct pmp_display_sleep_votes v;
++	unsigned int sends;
++};
++
++/* apple_pmp_j713_display_get(): sends only when admitted and not yet held. */
++static int model_get_disp(struct model *m)
++{
++	if (!pmp_display_sleep_admits(&m->s))
++		return -EBUSY;
++	if (!m->v.disp_held) {
++		m->sends++;
++		m->v.disp_held = true;
++	}
++	return 0;
++}
++
++/* apple_pmp_j713_display_put(): a vote not held needs nothing sent. */
++static int model_put_disp(struct model *m)
++{
++	if (m->v.disp_held) {
++		m->sends++;
++		m->v.disp_held = false;
++	}
++	return 0;
++}
++
++static void model_boot(struct model *m)
++{
++	*m = (struct model) {};
++	/* Probe: the DCP takes DISP at bring-up. */
++	model_get_disp(m);
++}
++
++/* No consumer: refused, as before the check, whatever the votes are; nothing changes. */
++static void pmp_sleep_refused_without_consumer(struct kunit *test)
++{
++	struct model m;
++
++	model_boot(&m);
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_enter(&m.s, &m.v), PMP_DISPLAY_SLEEP_NO_CONSUMER);
++	KUNIT_EXPECT_FALSE(test, m.s.asleep);
++	/* Even with every vote released, the refusal stays until a consumer opts in. */
++	model_put_disp(&m);
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_enter(&m.s, &m.v), PMP_DISPLAY_SLEEP_NO_CONSUMER);
++	KUNIT_EXPECT_FALSE(test, m.s.asleep);
++	KUNIT_EXPECT_TRUE(test, pmp_display_sleep_admits(&m.s));
++	KUNIT_EXPECT_EQ(test, model_get_disp(&m), 0);
++}
++
++/* The consumer's suspend runs first and releases DISP; the PMP stops; resume reverses it. */
++static void pmp_sleep_teardown_restore_order(struct kunit *test)
++{
++	struct model m;
++
++	model_boot(&m);
++	m.s.consumer = true;			/* apple_pmp_j713_display_sleep_enable() */
++	/* DCP .suspend: power gate, put. */
++	KUNIT_EXPECT_EQ(test, model_put_disp(&m), 0);
++	KUNIT_EXPECT_EQ(test, m.sends, 2U);
++	/* PMP suspend_late. */
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_enter(&m.s, &m.v), PMP_DISPLAY_SLEEP_OK);
++	KUNIT_EXPECT_TRUE(test, m.s.asleep);
++	/* Nothing reaches the stopped PMP. */
++	KUNIT_EXPECT_EQ(test, model_get_disp(&m), -EBUSY);
++	KUNIT_EXPECT_FALSE(test, m.v.disp_held);
++	KUNIT_EXPECT_EQ(test, m.sends, 2U);
++	/* PMP resume_early, then DCP .resume: ungate, get. */
++	pmp_display_sleep_leave(&m.s);
++	KUNIT_EXPECT_EQ(test, model_get_disp(&m), 0);
++	KUNIT_EXPECT_TRUE(test, m.v.disp_held);
++	KUNIT_EXPECT_EQ(test, m.sends, 3U);
++	/* A second sleep goes the same way. */
++	model_put_disp(&m);
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_enter(&m.s, &m.v), PMP_DISPLAY_SLEEP_OK);
++	pmp_display_sleep_leave(&m.s);
++	KUNIT_EXPECT_EQ(test, model_get_disp(&m), 0);
++}
++
++/* Wrong order: the PMP asked before its consumer released DISP. Refused; nothing changes. */
++static void pmp_sleep_refused_disp_held(struct kunit *test)
++{
++	struct model m;
++
++	model_boot(&m);
++	m.s.consumer = true;
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_enter(&m.s, &m.v), PMP_DISPLAY_SLEEP_DISP_HELD);
++	KUNIT_EXPECT_FALSE(test, m.s.asleep);
++	KUNIT_EXPECT_TRUE(test, m.v.disp_held);
++	KUNIT_EXPECT_EQ(test, model_get_disp(&m), 0);
++	KUNIT_EXPECT_EQ(test, m.sends, 1U);
++}
++
++/* AGX has no release: once the GPU took it, every such sleep is refused. */
++static void pmp_sleep_refused_agx_held(struct kunit *test)
++{
++	struct model m;
++
++	model_boot(&m);
++	m.s.consumer = true;
++	model_put_disp(&m);
++	m.v.agx_held = true;
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_enter(&m.s, &m.v), PMP_DISPLAY_SLEEP_AGX_HELD);
++	KUNIT_EXPECT_FALSE(test, m.s.asleep);
++}
++
++static void pmp_sleep_refused_pending_or_failed(struct kunit *test)
++{
++	struct model m;
++
++	model_boot(&m);
++	m.s.consumer = true;
++	model_put_disp(&m);
++	m.v.pending = true;
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_enter(&m.s, &m.v), PMP_DISPLAY_SLEEP_PENDING);
++	m.v.pending = false;
++	m.v.error = -EPROTO;		/* closed stream: DISP could not be taken again */
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_enter(&m.s, &m.v), PMP_DISPLAY_SLEEP_FAILED);
++	m.v.error = 0;
++	m.v.provider_error = -EIO;	/* failed owner: before any other reason */
++	m.v.pending = true;
++	m.v.agx_held = true;
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_enter(&m.s, &m.v), PMP_DISPLAY_SLEEP_FAILED);
++	KUNIT_EXPECT_FALSE(test, m.s.asleep);
++}
++
++/* suspend_late for a PMP still stopped from a refused sleep; wake twice. */
++static void pmp_sleep_enter_leave_idempotent(struct kunit *test)
++{
++	struct model m;
++
++	model_boot(&m);
++	m.s.consumer = true;
++	model_put_disp(&m);
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_enter(&m.s, &m.v), PMP_DISPLAY_SLEEP_OK);
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_enter(&m.s, &m.v), PMP_DISPLAY_SLEEP_OK);
++	KUNIT_EXPECT_TRUE(test, m.s.asleep);
++	pmp_display_sleep_leave(&m.s);
++	pmp_display_sleep_leave(&m.s);
++	KUNIT_EXPECT_TRUE(test, pmp_display_sleep_admits(&m.s));
++	/* Leave without enter (resume after a refused suspend_late) changes nothing. */
++	pmp_display_sleep_leave(&m.s);
++	KUNIT_EXPECT_FALSE(test, m.s.asleep);
++}
++
++static void pmp_sleep_reasons(struct kunit *test)
++{
++	enum pmp_display_sleep_verdict v;
++
++	for (v = PMP_DISPLAY_SLEEP_OK; v <= PMP_DISPLAY_SLEEP_DISP_HELD; v++)
++		KUNIT_EXPECT_STRNEQ(test, pmp_display_sleep_reason(v), "unknown");
++	KUNIT_EXPECT_NOT_NULL(test, strstr(pmp_display_sleep_reason(PMP_DISPLAY_SLEEP_NO_CONSUMER),
++					   "retained power votes have no teardown"));
++}
++
++static struct kunit_case pmp_display_sleep_cases[] = {
++	KUNIT_CASE(pmp_sleep_refused_without_consumer),
++	KUNIT_CASE(pmp_sleep_teardown_restore_order),
++	KUNIT_CASE(pmp_sleep_refused_disp_held),
++	KUNIT_CASE(pmp_sleep_refused_agx_held),
++	KUNIT_CASE(pmp_sleep_refused_pending_or_failed),
++	KUNIT_CASE(pmp_sleep_enter_leave_idempotent),
++	KUNIT_CASE(pmp_sleep_reasons),
++	{}
++};
++
++static struct kunit_suite pmp_display_sleep_suite = {
++	.name = "apple-pmp-display-sleep",
++	.test_cases = pmp_display_sleep_cases,
++};
++
++kunit_test_suite(pmp_display_sleep_suite);
++
++MODULE_DESCRIPTION("Apple PMP retained vote system sleep tests");
++MODULE_LICENSE("Dual MIT/GPL");

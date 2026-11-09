@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 04:07:19 +0000
+Subject: [PATCH 25/27] s2r: take the warm boot path first thing on a core
+ reset (T8132)
+
+The suspend-to-RAM wake resets the boot core at its locked RVBAR with
+the MMU and caches off and the SoC-domain devices still powered down.
+Until now the mailbox check sat at the top of _cpu_reset_c, so a waking
+core first ran debug_putc twice, looked up a reset stack in
+smp_reset_stacks and entered C on whatever stack it found there.
+debug_putc is a plain return in the recipe build (no TARGET, so no
+EARLY_UART_BASE), but any build that sets TARGET would poll a powered-off
+UART on that path and never get further.
+
+Check at the very top of cpu_reset instead, in assembly: on an EL2 T8132
+boot, on the core whose MPIDR matches boot_cpu_mpidr, with the mailbox
+magic present, point sp at a dedicated 8 KiB warm boot stack in .bss and
+call s2r_warm_resume(). Every other reset falls through to the unchanged
+path: a cold boot never comes through cpu_reset (iBoot enters the raw
+image at _start, entry 0x800), the secondaries started at kboot and the
+cores Linux restarts are not the boot core, and the mailbox is zero
+unless apple-s2r armed it right before the final WFI. The C check in
+_cpu_reset_c stays as a second line.
+
+Why this vector is what the wake reaches on T8132 (CODE): the installer
+configures stage 1 as a raw image (kmutil --raw --entry-point 2048), so
+its base is its _vectors_start, which iBoot locks as the RVBAR;
+chainload_image() copies the next stage over its own _base; and
+smp_prepare_rvbar() starts a secondary on T8132 only when the locked
+RVBAR equals this image's _vectors_start. kboot reserves _base.._end, so
+the vector, the mailbox in .data and the warm stack in .bss stay intact
+while Linux runs (the block is no-map "reserved" in /proc/iomem on the
+J604, MEASURED).
+
+The mailbox becomes a global symbol so start.S can reach it; its layout
+and the /chosen/asahi,s2r-mailbox contract are unchanged. s2r_layout.h
+carries the magic halfwords and the stack size shared with start.S, with
+static asserts against S2R_MAGIC and the 32-byte mailbox.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ src/s2r.c        | 12 ++++++++++--
+ src/s2r.h        | 10 ++++++++++
+ src/s2r_layout.h | 17 +++++++++++++++++
+ src/start.S      | 45 +++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 82 insertions(+), 2 deletions(-)
+ create mode 100644 src/s2r_layout.h
+
+diff --git a/src/s2r.c b/src/s2r.c
+index 83226ae9..036d0d63 100644
+--- a/src/s2r.c
++++ b/src/s2r.c
+@@ -51,9 +51,17 @@ static void __attribute__((noreturn)) s2r_reboot(void)
+ 
+ /*
+  * In .data, so it lives in this image's reserved memory; 64-byte aligned
+- * so it shares no cache line with anything Linux could see.
++ * so it shares no cache line with anything Linux could see. Global: the
++ * reset trampoline at the top of cpu_reset (start.S) reads its magic.
+  */
+-static struct s2r_mailbox s2r_mailbox __attribute__((section(".data"), aligned(64))) = {0};
++struct s2r_mailbox s2r_mailbox __attribute__((section(".data"), aligned(64))) = {0};
++
++/*
++ * The warm boot path's own stack (start.S points sp at its top before it
++ * calls s2r_warm_resume). In .bss, inside the _base.._end reservation, and
++ * never shared with the reset stacks the secondaries use.
++ */
++u8 s2r_warm_stack[S2R_WARM_STACK_SIZE] __attribute__((aligned(64)));
+ 
+ bool s2r_supported(void)
+ {
+diff --git a/src/s2r.h b/src/s2r.h
+index b60bd2ba..45a629df 100644
+--- a/src/s2r.h
++++ b/src/s2r.h
+@@ -3,6 +3,7 @@
+ #ifndef S2R_H
+ #define S2R_H
+ 
++#include "s2r_layout.h"
+ #include "types.h"
+ 
+ /*
+@@ -26,6 +27,15 @@ struct s2r_mailbox {
+ #define S2R_FLAG_REBOOT_AT_BRANCH BIT(4)
+ #define S2R_FLAG_RESUMED          BIT(63)
+ 
++/* start.S checks the magic as these four halfwords (movz/movk, low first) */
++_Static_assert(S2R_MAGIC == (((u64)S2R_MAGIC_H3 << 48) | ((u64)S2R_MAGIC_H2 << 32) |
++                             ((u64)S2R_MAGIC_H1 << 16) | (u64)S2R_MAGIC_H0),
++               "start.S s2r trampoline magic");
++_Static_assert(sizeof(struct s2r_mailbox) == 32, "apple-s2r mailbox is four u64 words");
++
++extern struct s2r_mailbox s2r_mailbox;
++extern u8 s2r_warm_stack[S2R_WARM_STACK_SIZE];
++
+ /* Set while the warm boot path runs: everything that would print stays quiet */
+ extern bool s2r_warm_quiet;
+ 
+diff --git a/src/s2r_layout.h b/src/s2r_layout.h
+new file mode 100644
+index 00000000..21995adb
+--- /dev/null
++++ b/src/s2r_layout.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: MIT */
++
++#ifndef S2R_LAYOUT_H
++#define S2R_LAYOUT_H
++
++/* Shared by s2r.c and the reset trampoline in start.S (no C types here). */
++
++/* S2R_MAGIC "m1n1S2R!" as the four halfwords start.S builds it from, low first */
++#define S2R_MAGIC_H0 0x316d
++#define S2R_MAGIC_H1 0x316e
++#define S2R_MAGIC_H2 0x3253
++#define S2R_MAGIC_H3 0x2152
++
++/* The warm boot path's own stack, in .bss (s2r.c) */
++#define S2R_WARM_STACK_SIZE 0x2000
++
++#endif
+diff --git a/src/start.S b/src/start.S
+index 7ade7fc5..2a1f6ac9 100644
+--- a/src/start.S
++++ b/src/start.S
+@@ -2,6 +2,7 @@
+ 
+ #include "../build/build_cfg.h"
+ #include "chainload.h"
++#include "s2r_layout.h"
+ #include "smp_asm.h"
+ #include "soc.h"
+ 
+@@ -341,6 +342,50 @@ exc_unk:
+ .globl cpu_reset
+ .type cpu_reset, @function
+ cpu_reset:
++    /*
++     * Suspend-to-RAM warm boot trampoline (T8132, s2r.c). The first thing a
++     * core runs after a reset at its locked RVBAR. On T8132 that RVBAR is
++     * this image's _vectors_start: stage 1 is a raw image whose base iBoot
++     * locked as the RVBAR, chainload_image() copies this stage over that
++     * base, and smp.c starts a secondary only when the locked RVBAR equals
++     * _vectors_start. The suspend-to-RAM wake resets the boot core here with
++     * the MMU and caches off and the SoC-domain devices (UARTs, USB) still
++     * powered down, so decide before anything else runs: no debug_putc, no
++     * reset stack lookup, no C. Only the boot core of an EL2 T8132 boot with
++     * an armed mailbox leaves here; every other reset (cold boot never comes
++     * through here at all, secondaries at kboot, cores Linux restarts, an
++     * unarmed mailbox) falls through to the unchanged path below.
++     * x0-x8 are free: nothing below expects a value in them.
++     */
++    adrp x1, chip_id
++    ldr w1, [x1, :lo12:chip_id]
++    mov w2, #T8132
++    cmp w1, w2
++    b.ne 8f
++    mrs x8, CurrentEL
++    cmp x8, #0x8
++    b.ne 8f
++    adrp x1, boot_cpu_mpidr
++    ldr x1, [x1, :lo12:boot_cpu_mpidr]
++    mrs x2, mpidr_el1
++    cmp x1, x2
++    b.ne 8f
++    adrp x1, s2r_mailbox
++    add x1, x1, :lo12:s2r_mailbox
++    ldr x2, [x1]
++    movz x3, #S2R_MAGIC_H0
++    movk x3, #S2R_MAGIC_H1, lsl #16
++    movk x3, #S2R_MAGIC_H2, lsl #32
++    movk x3, #S2R_MAGIC_H3, lsl #48
++    cmp x2, x3
++    b.ne 8f
++    adrp x1, s2r_warm_stack
++    add x1, x1, :lo12:s2r_warm_stack
++    add x1, x1, #(S2R_WARM_STACK_SIZE >> 12), lsl #12
++    mov sp, x1
++    bl s2r_warm_resume
++    b .
++8:
+     mov w0, 'O'
+     bl debug_putc
+ 

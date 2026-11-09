@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 04:20:03 +0000
+Subject: [PATCH 26/27] tests: run the s2r reset trampoline natively
+
+Assemble the production instructions from the top of start.S cpu_reset
+up to its fall-through label into a test function and run them on an
+arm64 Linux host, the way test_start_run_base.py runs the run base move.
+Only the two system register reads a reset core makes, CurrentEL and
+MPIDR_EL1, are replaced with loads of test values; the test asserts that
+each appears exactly once so the substitution cannot silently miss.
+
+Ten cases: an EL2 T8132 boot core with the mailbox magic calls
+s2r_warm_resume on the top of the warm boot stack (16-byte aligned);
+a zero mailbox, a magic one bit off, swapped halves, a secondary core,
+an unset boot_cpu_mpidr, EL1, EL3, T8140 and T8152 all fall through with
+sp untouched. The trampoline never writes the mailbox. The magic is
+checked against "m1n1S2R!" and the halfwords in s2r_layout.h. Skips on
+every other host, like the other native start.S test.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ tests/python/test_s2r_trampoline.py | 160 ++++++++++++++++++++++++++++
+ 1 file changed, 160 insertions(+)
+ create mode 100644 tests/python/test_s2r_trampoline.py
+
+diff --git a/tests/python/test_s2r_trampoline.py b/tests/python/test_s2r_trampoline.py
+new file mode 100644
+index 00000000..86b7155e
+--- /dev/null
++++ b/tests/python/test_s2r_trampoline.py
+@@ -0,0 +1,160 @@
++# SPDX-License-Identifier: MIT
++"""Run the suspend-to-RAM warm boot trampoline at the top of start.S cpu_reset.
++
++The production instructions, from cpu_reset: up to its fall-through label, are
++assembled into a test function and run natively (arm64 Linux only). The two
++system register reads a reset core makes, CurrentEL and MPIDR_EL1, cannot be
++controlled at EL0, so exactly those two lines are replaced with loads of test
++values; everything else is the code m1n1 runs. Only an EL2 T8132 boot core
++with the mailbox magic may call s2r_warm_resume, on the warm boot stack; every
++other reset must fall through with sp untouched, and the trampoline must never
++write the mailbox.
++"""
++import platform
++import subprocess
++import sys
++
++import pytest
++
++from test_smp_timeouts import REPO
++
++MRS_EL = "    mrs x8, CurrentEL\n"
++MRS_MPIDR = "    mrs x2, mpidr_el1\n"
++
++
++def trampoline_block():
++    source = (REPO / "src/start.S").read_text()
++    start = source.index("cpu_reset:\n") + len("cpu_reset:\n")
++    end = source.index("\n8:\n", start) + len("\n8:\n")
++    block = source[start:end]
++    assert block.count(MRS_EL) == 1 and block.count(MRS_MPIDR) == 1
++    assert "bl s2r_warm_resume\n" in block
++    block = block.replace(MRS_EL, "    adrp x8, test_current_el\n    ldr x8, [x8, :lo12:test_current_el]\n")
++    return block.replace(MRS_MPIDR, "    adrp x2, test_mpidr\n    ldr x2, [x2, :lo12:test_mpidr]\n")
++
++
++@pytest.mark.skipif(sys.platform != "linux" or platform.machine() not in ("aarch64", "arm64"),
++                    reason="runs arm64 code natively")
++def test_s2r_trampoline(tmp_path):
++    image = r'''
++#include "soc.h"
++#include "s2r_layout.h"
++    .text
++    .p2align 2
++    .globl test_trampoline
++test_trampoline:
++    stp x29, x30, [sp, #-32]!
++    stp x19, x20, [sp, #16]
++    mov x19, sp
++''' + trampoline_block() + r'''
++    mov x0, #0
++    b 9f
++s2r_warm_resume:
++    mov x1, sp
++    adrp x2, test_seen_sp
++    str x1, [x2, :lo12:test_seen_sp]
++    mov sp, x19
++    mov x0, #1
++9:
++    ldp x19, x20, [sp, #16]
++    ldp x29, x30, [sp], #32
++    ret
++
++    .data
++    .p2align 6
++    .globl s2r_mailbox
++s2r_mailbox:
++    .quad 0, 0, 0, 0
++    .globl chip_id
++chip_id:
++    .long 0
++    .p2align 3
++    .globl boot_cpu_mpidr
++boot_cpu_mpidr:
++    .quad 0
++    .globl test_current_el
++test_current_el:
++    .quad 0
++    .globl test_mpidr
++test_mpidr:
++    .quad 0
++    .globl test_seen_sp
++test_seen_sp:
++    .quad 0
++    .bss
++    .p2align 6
++    .globl s2r_warm_stack
++s2r_warm_stack:
++    .skip S2R_WARM_STACK_SIZE
++'''
++    harness = r'''
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "s2r_layout.h"
++
++extern uint64_t s2r_mailbox[4], boot_cpu_mpidr, test_current_el, test_mpidr, test_seen_sp;
++extern uint32_t chip_id;
++extern unsigned char s2r_warm_stack[];
++uint64_t test_trampoline(void);
++
++#define MAGIC 0x21523253316e316dULL /* "m1n1S2R!", the apple-s2r contract */
++#define BOOT 0x80010100ULL         /* J604 boot core cpu@10100, MPIDR bit 31 RES1 */
++#define OTHER 0x80010101ULL
++
++static int n;
++
++static void run(const char *what, uint32_t chip, uint64_t el, uint64_t mpidr, uint64_t boot,
++                uint64_t magic, int warm)
++{
++    chip_id = chip;
++    test_current_el = el << 2;
++    test_mpidr = mpidr;
++    boot_cpu_mpidr = boot;
++    uint64_t box[4] = {magic, 0x1234000, 0x5678, 0x1};
++    memcpy(s2r_mailbox, box, sizeof(box));
++    test_seen_sp = 0;
++    uint64_t r = test_trampoline();
++    assert(!memcmp(s2r_mailbox, box, sizeof(box))); /* the trampoline only reads */
++    if (warm) {
++        assert(r == 1);
++        assert(test_seen_sp == (uint64_t)(s2r_warm_stack + S2R_WARM_STACK_SIZE));
++        assert(test_seen_sp % 16 == 0);
++    } else {
++        assert(r == 0);
++        assert(test_seen_sp == 0);
++    }
++    printf("ok %s\n", what);
++    n++;
++}
++
++int main(void)
++{
++    assert(((uint64_t)S2R_MAGIC_H3 << 48 | (uint64_t)S2R_MAGIC_H2 << 32 |
++            (uint64_t)S2R_MAGIC_H1 << 16 | S2R_MAGIC_H0) == MAGIC);
++    assert(!memcmp("m1n1S2R!", &(uint64_t){MAGIC}, 8));
++    run("warm wake: T8132 EL2 boot core armed", 0x8132, 2, BOOT, BOOT, MAGIC, 1);
++    run("mailbox zero", 0x8132, 2, BOOT, BOOT, 0, 0);
++    run("magic one bit off", 0x8132, 2, BOOT, BOOT, MAGIC ^ (1ULL << 63), 0);
++    run("magic halves swapped", 0x8132, 2, BOOT, BOOT, (MAGIC << 32) | (MAGIC >> 32), 0);
++    run("secondary core armed", 0x8132, 2, OTHER, BOOT, MAGIC, 0);
++    run("boot_cpu_mpidr unset", 0x8132, 2, BOOT, 0, MAGIC, 0);
++    run("EL1", 0x8132, 1, BOOT, BOOT, MAGIC, 0);
++    run("EL3", 0x8132, 3, BOOT, BOOT, MAGIC, 0);
++    run("T8140 armed", 0x8140, 2, BOOT, BOOT, MAGIC, 0);
++    run("T8152 armed", 0x8152, 2, BOOT, BOOT, MAGIC, 0);
++    printf("s2r trampoline PASS (%d cases)\n", n);
++    return 0;
++}
++'''
++    asm = tmp_path / "trampoline.S"
++    asm.write_text(image)
++    binary = tmp_path / "s2r-trampoline"
++    subprocess.run(
++        ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-I", str(REPO / "src"), "-x", "c", "-",
++         "-x", "assembler-with-cpp", str(asm), "-o", str(binary)],
++        input=harness, text=True, check=True,
++    )
++    out = subprocess.run([str(binary)], check=True, timeout=60, capture_output=True, text=True).stdout
++    assert "s2r trampoline PASS (10 cases)" in out

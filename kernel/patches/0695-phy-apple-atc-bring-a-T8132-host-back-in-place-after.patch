@@ -1,0 +1,354 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 17:06:42 +0000
+Subject: [PATCH] phy: apple: atc: bring a T8132 host back in place after a
+ sleep that cut its power
+
+A sleep that powers the SoC down (pm_suspend_via_firmware(), set by
+apple-s2r) takes a T8132 PHY and its USB controller's core down with
+it: the T8132 PHY has no controller power control to keep the core in
+hibernation (atcphy_can_sleep_in_place() needs has_t8140_dp and a pwrctl
+window, which T8132 lacks). So far the DWC3 glue stops the controller
+before every such sleep and starts it after, the way a cable disconnect
+does, and every USB device enumerates again: a mounted disk does not
+survive a sleep. macOS keeps them.
+
+The host can come back in place instead. What the PHY loses in the sleep
+is what a switch-off of its power domain loses, and
+atcphy_restore_after_pd_off() already sets that up again: the baseline
+(controller in reset, USB2 off, PIPE on the dummy backend), then the
+tracked mode. The controller can then be brought up in the order of a
+cable attach while its xHCI device and devices stay.
+
+Add three calls for the glue:
+
+ - apple_atcphy_sleep_lose_prepare(), before the sleep: 0 for a T8132
+   host in a plain USB mode (USB2 or USB3) with nothing half done (no
+   pending PIPE handoff, mode change or USB off, no tunnel users, no
+   failed T8132 epoch, not the DisplayPort-only PHY). It records that the
+   host loses its power with the sleep. DisplayPort and tunnels keep
+   their current paths: their users would have to set them up again.
+ - apple_atcphy_sleep_lost(), in the resume once the glue has seen the
+   core come back without its registers: a T8132 common-power epoch went
+   with the power and is forgotten, but only if the block reads cold
+   (atcphy_t8132_cold()); one still up was not lost and is left alone
+   (-EBUSY, the glue then restarts the host as before). Then the restore
+   runs, and a failed restore says so.
+ - apple_atcphy_sleep_lose_finish() ends it.
+
+atcphy_suspend() refused a deep sleep with a T8132 USB3 epoch, as it
+would be lost. A host that comes back in place loses it on purpose and
+admits a new one at the wake, so the refusal now stands only without
+that.
+
+Only T8132 takes this path; other generations are unchanged. KUnit: the
+gate, the suspend admission with and without the host, and the restore
+after the power loss (not prepared, epoch still up, cold block).
+
+TO-VERIFY on the J604: that a T8132 USB3 epoch is admitted again after
+a SoC power-down as after a cold attach (code path identical, hardware
+unproven).
+
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+
+---
+ drivers/phy/apple/atc-test.c  | 98 +++++++++++++++++++++++++++++++++++
+ drivers/phy/apple/atc.c       | 94 ++++++++++++++++++++++++++++++++-
+ include/linux/phy/apple-atc.h | 33 ++++++++++++
+ 3 files changed, 223 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/phy/apple/atc-test.c b/drivers/phy/apple/atc-test.c
+index 95619c67af..ea083c4aff 100644
+--- a/drivers/phy/apple/atc-test.c
++++ b/drivers/phy/apple/atc-test.c
+@@ -1150,10 +1150,106 @@ static void atcphy_test_t8132_system_suspend(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
+ 	KUNIT_EXPECT_FALSE(test, atcphy->t8132_suspended);
+ 
++	/* A host that comes back in place after losing its power lets the epoch go */
++	atcphy->sleep_lose = true;
++	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), 0);
++	KUNIT_EXPECT_TRUE(test, atcphy->t8132_suspended);
++	KUNIT_EXPECT_EQ(test, atcphy_resume(atcphy->dev), 0);
++	/* but not without the host */
++	atcphy->host_active = false;
++	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
++	atcphy->sleep_lose = false;
++
+ 	pm_suspend_target_state = target;
+ }
+ #endif
+ 
++static struct apple_atcphy *atcphy_test_alloc_t8132_pd_off(struct kunit *test,
++							   enum atcphy_mode mode);
++static int atcphy_test_configure_record(struct apple_atcphy *atcphy, enum atcphy_mode mode);
++
++/* Only a T8132 host in a plain USB mode, with nothing half done, may lose its power. */
++static void atcphy_test_t8132_lose_gate(struct kunit *test)
++{
++	struct apple_atcphy *atcphy = atcphy_test_alloc_powered_off(test);
++
++	atcphy->hw = &atcphy_hw_t8132;
++	atcphy->mode = APPLE_ATCPHY_MODE_USB3;
++	atcphy->host_active = true;
++	scoped_guard(mutex, &atcphy->lock) {
++		KUNIT_EXPECT_EQ(test, atcphy_sleep_lose_prepare(atcphy), 0);
++		KUNIT_EXPECT_TRUE(test, atcphy->sleep_lose);
++
++		atcphy->mode = APPLE_ATCPHY_MODE_USB2;
++		KUNIT_EXPECT_EQ(test, atcphy_sleep_lose_prepare(atcphy), 0);
++
++		atcphy->mode = APPLE_ATCPHY_MODE_USB3_DP;
++		KUNIT_EXPECT_EQ(test, atcphy_sleep_lose_prepare(atcphy), -EBUSY);
++		KUNIT_EXPECT_FALSE(test, atcphy->sleep_lose);
++		atcphy->mode = APPLE_ATCPHY_MODE_USB3;
++
++		atcphy->host_active = false;
++		KUNIT_EXPECT_EQ(test, atcphy_sleep_lose_prepare(atcphy), -EBUSY);
++		atcphy->host_active = true;
++
++		atcphy->mode_dirty = true;
++		KUNIT_EXPECT_EQ(test, atcphy_sleep_lose_prepare(atcphy), -EBUSY);
++		atcphy->mode_dirty = false;
++
++		atcphy->pipe_pending = true;
++		KUNIT_EXPECT_EQ(test, atcphy_sleep_lose_prepare(atcphy), -EBUSY);
++		atcphy->pipe_pending = false;
++
++		atcphy->tunnel_users = 1;
++		KUNIT_EXPECT_EQ(test, atcphy_sleep_lose_prepare(atcphy), -EBUSY);
++		atcphy->tunnel_users = 0;
++
++		atcphy->t8132_failed = true;
++		KUNIT_EXPECT_EQ(test, atcphy_sleep_lose_prepare(atcphy), -EBUSY);
++		atcphy->t8132_failed = false;
++
++		/* Other generations keep stopping their controller */
++		atcphy->hw = &atcphy_hw_t8122;
++		KUNIT_EXPECT_EQ(test, atcphy_sleep_lose_prepare(atcphy), -EBUSY);
++	}
++}
++
++/* After the power loss: a cold block gives its epoch up and the tracked mode comes back. */
++static void atcphy_test_t8132_sleep_lost(struct kunit *test)
++{
++	struct apple_atcphy *atcphy = atcphy_test_alloc_t8132_pd_off(test, APPLE_ATCPHY_MODE_USB2);
++	struct atcphy_test_configure config = {};
++
++	test->priv = &config;
++	kunit_activate_static_stub(test, atcphy_configure, atcphy_test_configure_record);
++	atcphy->pd_was_off = false;
++	atcphy->host_active = true;
++
++	scoped_guard(mutex, &atcphy->lock) {
++		/* Not prepared for it */
++		KUNIT_EXPECT_EQ(test, atcphy_sleep_lost(atcphy), -EINVAL);
++		KUNIT_EXPECT_EQ(test, config.calls, 0U);
++
++		atcphy->sleep_lose = true;
++		/* An epoch still up wasn't lost: left alone */
++		atcphy->t8132_common_owned = true;
++		KUNIT_EXPECT_EQ(test, atcphy_sleep_lost(atcphy), -EBUSY);
++		KUNIT_EXPECT_TRUE(test, atcphy->t8132_common_owned);
++		KUNIT_EXPECT_EQ(test, config.calls, 0U);
++		KUNIT_EXPECT_FALSE(test, atcphy->pd_was_off);
++
++		/* A cold block: forgotten, baseline, then the mode again */
++		writel(ATCPHY_POWER_CLAMP_EN, atcphy->regs.core + ATCPHY_POWER_CTRL);
++		KUNIT_EXPECT_EQ(test, atcphy_sleep_lost(atcphy), 0);
++		KUNIT_EXPECT_FALSE(test, atcphy->t8132_common_owned);
++		KUNIT_EXPECT_FALSE(test, atcphy->pd_was_off);
++		KUNIT_EXPECT_FALSE(test, atcphy->host_active);
++		KUNIT_EXPECT_EQ(test, config.calls, 1U);
++		KUNIT_EXPECT_EQ(test, config.lane_requests, 1U);
++		KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_USB2);
++	}
++}
++
+ /* The hold follows the busy state, with one reference at most. */
+ static void atcphy_test_t8132_rpm_hold(struct kunit *test)
+ {
+@@ -1353,6 +1449,8 @@ static struct kunit_case atcphy_t8132_pm_test_cases[] = {
+ #ifdef CONFIG_SUSPEND
+ 	KUNIT_CASE(atcphy_test_t8132_system_suspend),
+ #endif
++	KUNIT_CASE(atcphy_test_t8132_lose_gate),
++	KUNIT_CASE(atcphy_test_t8132_sleep_lost),
+ 	{}
+ };
+ 
+diff --git a/drivers/phy/apple/atc.c b/drivers/phy/apple/atc.c
+index 8ac28884b0..f28029d032 100644
+--- a/drivers/phy/apple/atc.c
++++ b/drivers/phy/apple/atc.c
+@@ -887,6 +887,11 @@ struct apple_atcphy {
+ 	int sleep_ret;
+ 	/* Going through hibernation failed on this boot: the controller stops from now on. */
+ 	bool sleep_no_keep;
++	/*
++	 * The host loses its power in this system sleep and comes back in place, see
++	 * apple_atcphy_sleep_lose_prepare().
++	 */
++	bool sleep_lose;
+ 	bool usb3_port_off;
+ 	struct delayed_work usb3_port_work;
+ 	unsigned int usb3_port_retries;
+@@ -6926,6 +6931,88 @@ void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
+ }
+ EXPORT_SYMBOL_GPL(apple_atcphy_sleep_finish);
+ 
++/*
++ * A T8132 PHY has no controller power control (see atcphy_can_sleep_in_place()), so a sleep
++ * that reaches its commit takes the PHY and the controller's core down with the SoC. Its host
++ * can still come back in place: the PHY loses what a switch-off of its power domain loses,
++ * which atcphy_restore_after_pd_off() sets up again, and the controller is then brought up in
++ * the order of a cable attach. Only a plain USB mode with the host running qualifies; a
++ * DisplayPort side or a tunnel has users of its own that would have to set it up again.
++ */
++static bool atcphy_can_lose_host(const struct apple_atcphy *atcphy)
++{
++	return atcphy->hw->gen == ATCPHY_GENERATION_T8132 && atcphy->hw->restore_after_pd_off &&
++	       !atcphy->dp_only && !atcphy->t8132_failed && atcphy->host_active &&
++	       (atcphy->mode == APPLE_ATCPHY_MODE_USB2 || atcphy->mode == APPLE_ATCPHY_MODE_USB3) &&
++	       !atcphy->mode_dirty && !atcphy->pipe_pending && !atcphy->usb_off_pending &&
++	       !atcphy->tunnel_users;
++}
++
++static int atcphy_sleep_lose_prepare(struct apple_atcphy *atcphy)
++{
++	lockdep_assert_held(&atcphy->lock);
++	atcphy->sleep_lose = atcphy_can_lose_host(atcphy);
++	return atcphy->sleep_lose ? 0 : -EBUSY;
++}
++
++int apple_atcphy_sleep_lose_prepare(struct phy *usb2_phy)
++{
++	struct apple_atcphy *atcphy = atcphy_from_usb2_phy(usb2_phy);
++
++	if (!atcphy)
++		return -EOPNOTSUPP;
++	guard(mutex)(&atcphy->lock);
++	return atcphy_sleep_lose_prepare(atcphy);
++}
++EXPORT_SYMBOL_GPL(apple_atcphy_sleep_lose_prepare);
++
++/*
++ * The controller's core came back without its registers: the PHY lost its state as well. A
++ * T8132 common-power epoch went with the power, so it is forgotten, but only if the block
++ * reads cold; one that is still up wasn't lost and is not set up a second time. Then the
++ * baseline and the tracked mode come back, which leaves the controller in reset and the
++ * USB2 PHY off for the controller's bring-up.
++ */
++static int atcphy_sleep_lost(struct apple_atcphy *atcphy)
++{
++	lockdep_assert_held(&atcphy->lock);
++	if (!atcphy->sleep_lose)
++		return -EINVAL;
++	if (atcphy->t8132_common_owned) {
++		if (!atcphy_t8132_cold(atcphy))
++			return -EBUSY;
++		atcphy->t8132_common_owned = false;
++	}
++	WRITE_ONCE(atcphy->pd_was_off, true);
++	atcphy_restore_after_pd_off(atcphy);
++	if (atcphy->t8132_failed || atcphy->mode == APPLE_ATCPHY_MODE_OFF)
++		return -EIO;
++	dev_dbg(atcphy->dev, "power lost in the sleep: mode %d set up again\n", atcphy->mode);
++	return 0;
++}
++
++int apple_atcphy_sleep_lost(struct phy *usb2_phy)
++{
++	struct apple_atcphy *atcphy = atcphy_from_usb2_phy(usb2_phy);
++
++	if (!atcphy)
++		return -EOPNOTSUPP;
++	guard(mutex)(&atcphy->lock);
++	return atcphy_sleep_lost(atcphy);
++}
++EXPORT_SYMBOL_GPL(apple_atcphy_sleep_lost);
++
++void apple_atcphy_sleep_lose_finish(struct phy *usb2_phy)
++{
++	struct apple_atcphy *atcphy = atcphy_from_usb2_phy(usb2_phy);
++
++	if (!atcphy)
++		return;
++	guard(mutex)(&atcphy->lock);
++	atcphy->sleep_lose = false;
++}
++EXPORT_SYMBOL_GPL(apple_atcphy_sleep_lose_finish);
++
+ static int atcphy_suspend(struct device *dev)
+ {
+ 	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
+@@ -6940,12 +7027,15 @@ static int atcphy_suspend(struct device *dev)
+ 	/*
+ 	 * An active one survives suspend-to-idle while a host runs on it: DWC3
+ 	 * then keeps the power domain on across system sleep, so the link stays
+-	 * as it is. Without a host, or in a deeper sleep state, it is lost.
++	 * as it is. Without a host, or in a deeper sleep state, it is lost; a host
++	 * that comes back in place after losing its power gives it up with the
++	 * power and admits a new one at the wake (apple_atcphy_sleep_lost()).
+ 	 * DisplayPort on a DisplayPort-only PHY is set up again after its
+ 	 * domain was off, see atcphy_restore_after_pd_off().
+ 	 */
+ 	if (atcphy->t8132_common_owned && !atcphy->dp_only &&
+-	    (!atcphy->host_active || pm_suspend_target_state != PM_SUSPEND_TO_IDLE))
++	    (!atcphy->host_active || pm_suspend_target_state != PM_SUSPEND_TO_IDLE) &&
++	    !(atcphy->sleep_lose && atcphy->host_active))
+ 		return -EBUSY;
+ 	/* Do not admit a new epoch after this check and before resume. */
+ 	atcphy->t8132_suspended = true;
+diff --git a/include/linux/phy/apple-atc.h b/include/linux/phy/apple-atc.h
+index 180e97e6e8..bdb444be62 100644
+--- a/include/linux/phy/apple-atc.h
++++ b/include/linux/phy/apple-atc.h
+@@ -33,6 +33,25 @@ int apple_atcphy_sleep_result(struct phy *usb2_phy);
+  * controller stop for later sleeps.
+  */
+ void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept);
++
++/*
++ * For a firmware-driven system sleep whose commit cuts the PHY's and the controller's power,
++ * before any device suspends and without the controller's locks held. 0 means the host may
++ * keep its xHCI and devices: the PHY lets the sleep go with the host running, and
++ * apple_atcphy_sleep_lost() sets it up again if the core comes back without its registers.
++ * Otherwise the controller has to be stopped for the sleep.
++ */
++int apple_atcphy_sleep_lose_prepare(struct phy *usb2_phy);
++
++/*
++ * In the resume, before the controller is brought up again in place: set the PHY up as after
++ * a power-domain switch-off, in its tracked mode, with the controller in reset and USB2 off.
++ * An error means the host can't come back in place.
++ */
++int apple_atcphy_sleep_lost(struct phy *usb2_phy);
++
++/* Ends a sleep that apple_atcphy_sleep_lose_prepare() took on, whatever came of it. */
++void apple_atcphy_sleep_lose_finish(struct phy *usb2_phy);
+ #else
+ static inline int apple_atcphy_sleep_prepare(struct phy *usb2_phy)
+ {
+@@ -47,6 +66,20 @@ static inline int apple_atcphy_sleep_result(struct phy *usb2_phy)
+ static inline void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
+ {
+ }
++
++static inline int apple_atcphy_sleep_lose_prepare(struct phy *usb2_phy)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int apple_atcphy_sleep_lost(struct phy *usb2_phy)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline void apple_atcphy_sleep_lose_finish(struct phy *usb2_phy)
++{
++}
+ #endif
+ 
+ #endif

@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Diljit Singh <hey@djdev.me>
+Date: Sat, 7 Nov 2026 07:09:37 -0500
+Subject: [PATCH] PM: suspend: Go back to sleep from a dark wake
+
+A platform can find that what woke the system needs nothing from user
+space. On Apple laptops the SMC wakes the SoC for the lid closing as well
+as for it opening. macOS takes the closing as a dark wake: every driver
+wakes as usual, the display stays off, and the power management root
+domain puts the system back to sleep once it sees the lid closed. In
+macOS's 25G83 kernel, read statically, AppleSMC sends
+kIOPMClamshellClosed, and the dark wake policy sleeps with reason
+Maintenance when the clamshell is closed and the machine isn't in
+desktop mode on AC.
+
+suspend_again() can't do the same. It goes back to sleep after the early
+resume only, so drivers that do their sleep work in the normal suspend
+and resume phases are left half way.
+
+Add a dark wake flag for the platform to set during the noirq resume.
+Devices still resume fully but may leave out what the user would see.
+Once dpm_resume_end() is done, enter_state() runs
+suspend_devices_and_enter() again with user space still frozen, so user
+space sees one sleep. Only a wake from the sleep state can be dark, and
+each pass starts with the flags cleared.
+
+Signed-off-by: Diljit Singh <hey@djdev.me>
+---
+ include/linux/suspend.h | 29 +++++++++++++++++++++++++++++
+ kernel/power/suspend.c  | 12 ++++++++++++
+ 2 files changed, 41 insertions(+)
+
+diff --git a/include/linux/suspend.h b/include/linux/suspend.h
+index b02876f1ae..365437ce2c 100644
+--- a/include/linux/suspend.h
++++ b/include/linux/suspend.h
+@@ -159,6 +159,7 @@ extern unsigned int pm_suspend_global_flags;
+ #define PM_SUSPEND_FLAG_FW_SUSPEND	BIT(0)
+ #define PM_SUSPEND_FLAG_FW_RESUME	BIT(1)
+ #define PM_SUSPEND_FLAG_NO_PLATFORM	BIT(2)
++#define PM_SUSPEND_FLAG_DARK_WAKE	BIT(3)
+ 
+ static inline void pm_suspend_clear_flags(void)
+ {
+@@ -180,6 +181,11 @@ static inline void pm_set_suspend_no_platform(void)
+ 	pm_suspend_global_flags |= PM_SUSPEND_FLAG_NO_PLATFORM;
+ }
+ 
++static inline void pm_set_dark_wake(void)
++{
++	pm_suspend_global_flags |= PM_SUSPEND_FLAG_DARK_WAKE;
++}
++
+ /**
+  * pm_suspend_via_firmware - Check if platform firmware will suspend the system.
+  *
+@@ -237,6 +243,27 @@ static inline bool pm_suspend_no_platform(void)
+ 	return !!(pm_suspend_global_flags & PM_SUSPEND_FLAG_NO_PLATFORM);
+ }
+ 
++/**
++ * pm_dark_wake - Check if the system woke up for nothing user space has to see.
++ *
++ * To be called during system-wide power management transitions from sleep
++ * states.
++ *
++ * Return 'true' if the platform found that the event that woke up the system
++ * needs nothing from user space (for example, a laptop lid closing while the
++ * system slept). Every device then resumes as usual, and the system goes back
++ * to the same sleep state with user space still frozen. A device should not do
++ * what the user would notice, such as lighting a display, during such a wake.
++ *
++ * Only a wake from the sleep state can be dark. A device that had to leave out
++ * part of its resume finishes it in a later resume that is not dark, or in
++ * ->complete() if the next suspend fails before suspending it.
++ */
++static inline bool pm_dark_wake(void)
++{
++	return !!(pm_suspend_global_flags & PM_SUSPEND_FLAG_DARK_WAKE);
++}
++
+ /* Suspend-to-idle state machnine. */
+ enum s2idle_states {
+ 	S2IDLE_STATE_NONE,      /* Not suspended/suspending. */
+@@ -287,6 +314,8 @@ static inline void pm_set_resume_via_firmware(void) {}
+ static inline bool pm_suspend_via_firmware(void) { return false; }
+ static inline bool pm_resume_via_firmware(void) { return false; }
+ static inline bool pm_suspend_no_platform(void) { return false; }
++static inline void pm_set_dark_wake(void) {}
++static inline bool pm_dark_wake(void) { return false; }
+ static inline bool pm_suspend_default_s2idle(void) { return false; }
+ 
+ static inline void suspend_set_ops(const struct platform_suspend_ops *ops) {}
+diff --git a/kernel/power/suspend.c b/kernel/power/suspend.c
+index 57c4426869..34253036bb 100644
+--- a/kernel/power/suspend.c
++++ b/kernel/power/suspend.c
+@@ -532,6 +532,9 @@ int suspend_devices_and_enter(suspend_state_t state)
+ 	do {
+ 		error = suspend_enter(state, &wakeup);
+ 	} while (!error && !wakeup && platform_suspend_again(state));
++	/* Only a wake from the sleep state can be dark. */
++	if (error)
++		pm_suspend_global_flags &= ~PM_SUSPEND_FLAG_DARK_WAKE;
+ 
+  Resume_devices:
+ 	suspend_test_start();
+@@ -616,6 +619,15 @@ static int enter_state(suspend_state_t state)
+ 	trace_suspend_resume(TPS("suspend_enter"), state, false);
+ 	pm_pr_dbg("Suspending system (%s)\n", mem_sleep_labels[state]);
+ 	error = suspend_devices_and_enter(state);
++	/*
++	 * Every device has resumed, but nothing woke the system that user space
++	 * needs to see: go back to sleep with user space still frozen.
++	 */
++	while (!error && pm_dark_wake()) {
++		pr_info("dark wake: suspending again (%s)\n", mem_sleep_labels[state]);
++		pm_suspend_clear_flags();
++		error = suspend_devices_and_enter(state);
++	}
+ 
+  Finish:
+ 	events_check_enabled = false;

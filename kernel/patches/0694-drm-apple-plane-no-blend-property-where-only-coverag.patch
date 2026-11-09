@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 18:05:52 +0000
+Subject: [PATCH] drm/apple: plane: no blend property where only coverage
+ blends
+
+apple_plane_init() offered "Coverage" alone when the firmware cannot
+pre-multiply: apple_drv.c sets premultiplied false for
+DCP_FIRMWARE_H17P, whose swap surface has no is_premultiplied flag.
+The core refuses a blend mask without "Pre-multiplied" (WARN_ON,
+-EINVAL), so every plane, and with it the DRM device, failed to probe
+on H17P (T8140, T8122). The J604 internal panel uses
+apple_plane_init_v26_6() and the dcpext its own plane, so neither
+runs this path.
+
+Offering "Pre-multiplied" there would advertise a blend the firmware
+cannot do. Such planes now offer no blend property:
+apple_plane_blend_modes() returns 0 for them. Planes on firmware with
+the flag keep "Coverage" and "Pre-multiplied" as before.
+
+The apple-drm-blend KUnit suite gains both cases; the coverage-only
+one fails if the helper hands the core "Coverage" alone, or claims
+"Pre-multiplied".
+
+Fixes: f55cd5650824 ("drm/apple: sync to Aurora integration/aurora 50d5865ea6 (file-level)")
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/apple_blend.h      | 12 ++++++++++++
+ drivers/gpu/drm/apple/apple_blend_test.c | 24 ++++++++++++++++++++++++
+ drivers/gpu/drm/apple/plane.c            | 18 +++++++++++-------
+ 3 files changed, 47 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/apple_blend.h b/drivers/gpu/drm/apple/apple_blend.h
+index fcfd93d99a..71cfaef490 100644
+--- a/drivers/gpu/drm/apple/apple_blend.h
++++ b/drivers/gpu/drm/apple/apple_blend.h
+@@ -20,4 +20,16 @@
+ #define T8132_EXT_BLEND_MODES \
+ 	(BIT(DRM_MODE_BLEND_PIXEL_NONE) | BIT(DRM_MODE_BLEND_PREMULTI))
+ 
++/*
++ * apple_plane_init(): firmware whose swap surface has is_premultiplied
++ * offers both modes. Without the flag (H17P) DCP blends only by coverage,
++ * which the core cannot take alone: 0, no property.
++ */
++static inline unsigned int apple_plane_blend_modes(bool premultiplied)
++{
++	if (!premultiplied)
++		return 0;
++	return BIT(DRM_MODE_BLEND_COVERAGE) | BIT(DRM_MODE_BLEND_PREMULTI);
++}
++
+ #endif /* __APPLE_BLEND_H__ */
+diff --git a/drivers/gpu/drm/apple/apple_blend_test.c b/drivers/gpu/drm/apple/apple_blend_test.c
+index 96ab3b821e..9aa749cfec 100644
+--- a/drivers/gpu/drm/apple/apple_blend_test.c
++++ b/drivers/gpu/drm/apple/apple_blend_test.c
+@@ -80,9 +80,33 @@ static void blend_t8132_ext_offers_none(struct kunit *test)
+ 				 BIT(DRM_MODE_BLEND_COVERAGE));
+ }
+ 
++/* Planes on firmware with is_premultiplied probe, offering both modes. */
++static void blend_apple_plane_premultiplied(struct kunit *test)
++{
++	unsigned int modes = apple_plane_blend_modes(true);
++
++	KUNIT_EXPECT_TRUE(test, modes & BIT(DRM_MODE_BLEND_COVERAGE));
++	expect_blend_property(test, modes);
++}
++
++/*
++ * H17P planes blend only by coverage: they offer no property, so they
++ * neither fail to probe nor advertise "Pre-multiplied".
++ */
++static void blend_apple_plane_coverage_only(struct kunit *test)
++{
++	unsigned int modes = apple_plane_blend_modes(false);
++
++	if (modes)
++		expect_blend_property(test, modes);
++	KUNIT_EXPECT_EQ(test, modes, 0U);
++}
++
+ static struct kunit_case blend_cases[] = {
+ 	KUNIT_CASE(blend_t8132_ext_accepted),
+ 	KUNIT_CASE(blend_t8132_ext_offers_none),
++	KUNIT_CASE(blend_apple_plane_premultiplied),
++	KUNIT_CASE(blend_apple_plane_coverage_only),
+ 	{}
+ };
+ 
+diff --git a/drivers/gpu/drm/apple/plane.c b/drivers/gpu/drm/apple/plane.c
+index 5bfddbb38c..15bef110be 100644
+--- a/drivers/gpu/drm/apple/plane.c
++++ b/drivers/gpu/drm/apple/plane.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "plane.h"
++#include "apple_blend.h"
+ #include "dcp.h"
+ 
+ #include "dcp-internal.h"
+@@ -804,14 +805,17 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
+ 	/*
+ 	 * The surface flag is_premultiplied selects pre-multiplied blending;
+ 	 * without it DCP applies the alpha channel as coverage. Firmware whose
+-	 * swap surface has no such flag only blends by coverage.
++	 * swap surface has no such flag only blends by coverage, and the core
++	 * takes no blend property without "Pre-multiplied": such planes offer
++	 * none (apple_blend.h).
+ 	 */
+-	blend_modes = BIT(DRM_MODE_BLEND_COVERAGE);
+-	if (premultiplied)
+-		blend_modes |= BIT(DRM_MODE_BLEND_PREMULTI);
+-	ret = drm_plane_create_blend_mode_property(&plane->base, blend_modes);
+-	if (ret)
+-		return ERR_PTR(ret);
++	blend_modes = apple_plane_blend_modes(premultiplied);
++	if (blend_modes) {
++		ret = drm_plane_create_blend_mode_property(&plane->base,
++							   blend_modes);
++		if (ret)
++			return ERR_PTR(ret);
++	}
+ 
+ 	drm_plane_create_color_properties(&plane->base,
+ 					  (1 << DRM_COLOR_ENCODING_MAX) - 1,

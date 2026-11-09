@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 16:47:00 +0000
+Subject: [PATCH] drm/apple: m4: name the external DCP's refusal of a SoC
+ power-down sleep
+
+The T8132 external display processor (the J604 dcpext, HDMI and Type-C)
+runs on the same m4 backend as the panel's. It has no firmware stop for
+a sleep that powers the SoC down, and its display power-down is the
+internal DCP's only (gate_capable is false for an external one). So
+iomfb_m4_suspend_firmware() refuses such a sleep for it, as the driver
+did before, but with the reason "no display session to stop" or "no
+display firmware stop on this board (no display power-down)", which
+points at the wrong thing.
+
+Give it its own verdict, checked first: "external display processor: no
+firmware stop for this sleep yet". The sleep is refused exactly when it
+was before. A firmware stop and restart for it, as the T8140 DCPEXT has
+(A500, AP and IOP idle, the run bit), is still to be written; until then
+a bound dcpext keeps every SoC power-down sleep refused and
+suspend-to-idle goes on.
+
+KUnit: dcp_m4_sleep_external.
+
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp-m4-sleep-test.c | 19 +++++++++++++++++++
+ drivers/gpu/drm/apple/dcp-m4-sleep.h      | 10 ++++++++++
+ drivers/gpu/drm/apple/iomfb_m4.c          |  1 +
+ 3 files changed, 30 insertions(+)
+
+diff --git a/drivers/gpu/drm/apple/dcp-m4-sleep-test.c b/drivers/gpu/drm/apple/dcp-m4-sleep-test.c
+index 5ce1863917..dda0233e76 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-sleep-test.c
++++ b/drivers/gpu/drm/apple/dcp-m4-sleep-test.c
+@@ -80,6 +80,24 @@ static void dcp_m4_sleep_no_gate_board(struct kunit *test)
+ 					   "no display firmware stop"));
+ }
+ 
++/*
++ * An external DCP (the J604 dcpext) refuses with its own reason whatever else
++ * holds: it has no firmware stop, and the power-down is the internal one's.
++ */
++static void dcp_m4_sleep_external(struct kunit *test)
++{
++	struct dcp_m4_fw_sleep_state s = ready();
++
++	s.external = true;
++	KUNIT_EXPECT_EQ(test, dcp_m4_fw_sleep_check(&s), DCP_M4_FW_SLEEP_EXTERNAL);
++	s.gated = true;
++	KUNIT_EXPECT_EQ(test, dcp_m4_fw_sleep_check(&s), DCP_M4_FW_SLEEP_EXTERNAL);
++	s = (struct dcp_m4_fw_sleep_state) { .external = true };
++	KUNIT_EXPECT_EQ(test, dcp_m4_fw_sleep_check(&s), DCP_M4_FW_SLEEP_EXTERNAL);
++	KUNIT_EXPECT_NOT_NULL(test, strstr(dcp_m4_fw_sleep_reason(DCP_M4_FW_SLEEP_EXTERNAL),
++					   "external display processor"));
++}
++
+ static void dcp_m4_sleep_reasons(struct kunit *test)
+ {
+ 	enum dcp_m4_fw_sleep_verdict v;
+@@ -95,6 +113,7 @@ static struct kunit_case dcp_m4_sleep_cases[] = {
+ 	KUNIT_CASE(dcp_m4_sleep_each_refusal),
+ 	KUNIT_CASE(dcp_m4_sleep_gated_ok),
+ 	KUNIT_CASE(dcp_m4_sleep_no_gate_board),
++	KUNIT_CASE(dcp_m4_sleep_external),
+ 	KUNIT_CASE(dcp_m4_sleep_reasons),
+ 	{}
+ };
+diff --git a/drivers/gpu/drm/apple/dcp-m4-sleep.h b/drivers/gpu/drm/apple/dcp-m4-sleep.h
+index 73b7bafcaa..0d95c39571 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-sleep.h
++++ b/drivers/gpu/drm/apple/dcp-m4-sleep.h
+@@ -19,6 +19,11 @@
+ 
+ enum dcp_m4_fw_sleep_verdict {
+ 	DCP_M4_FW_SLEEP_OK,
++	/*
++	 * An external DCP (T8132 dcpext, the same backend): it has no firmware
++	 * stop for this sleep, and its display power-down is the internal one's.
++	 */
++	DCP_M4_FW_SLEEP_EXTERNAL,
+ 	/* No display session was started: nothing here can stop that firmware. */
+ 	DCP_M4_FW_SLEEP_NO_SESSION,
+ 	/* The session failed. */
+@@ -38,6 +43,7 @@ enum dcp_m4_fw_sleep_verdict {
+ };
+ 
+ struct dcp_m4_fw_sleep_state {
++	bool external;		/* an external DCP (T8132 dcpext) */
+ 	bool runtime;		/* a display session was started */
+ 	bool failed;		/* it failed */
+ 	bool gated;		/* the DCP and its domains are down already */
+@@ -51,6 +57,8 @@ struct dcp_m4_fw_sleep_state {
+ static inline enum dcp_m4_fw_sleep_verdict
+ dcp_m4_fw_sleep_check(const struct dcp_m4_fw_sleep_state *s)
+ {
++	if (s->external)
++		return DCP_M4_FW_SLEEP_EXTERNAL;
+ 	if (!s->runtime)
+ 		return DCP_M4_FW_SLEEP_NO_SESSION;
+ 	if (s->failed)
+@@ -74,6 +82,8 @@ static inline const char *dcp_m4_fw_sleep_reason(enum dcp_m4_fw_sleep_verdict ve
+ 	switch (verdict) {
+ 	case DCP_M4_FW_SLEEP_OK:
+ 		return "display powered down";
++	case DCP_M4_FW_SLEEP_EXTERNAL:
++		return "external display processor: no firmware stop for this sleep yet";
+ 	case DCP_M4_FW_SLEEP_NO_SESSION:
+ 		return "no display session to stop";
+ 	case DCP_M4_FW_SLEEP_FAILED:
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index d746e500a9..5504ebadbe 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -5934,6 +5934,7 @@ int iomfb_m4_suspend_firmware(struct apple_dcp *owner)
+ 	cancel_delayed_work_sync(&dcp->gate_work);
+ 	mutex_lock(&dcp->lock);
+ 	st = (struct dcp_m4_fw_sleep_state) {
++		.external = dcp->external,
+ 		.runtime = !!dcp->runtime,
+ 		.failed = READ_ONCE(dcp->error) != 0,
+ 		.gated = dcp->gated,

@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 6 Nov 2026 04:24:00 +0000
+Subject: [PATCH] ply-device-manager: Recognize SimpleDRM by its driver name
+
+SimpleDRM devices are only used once DeviceTimeout has elapsed, unless
+UseSimpledrm is set, so that the splash and the disk unlock prompt open
+directly on the native KMS device. The device is recognized by its sysfs
+path, which ends in simple-framebuffer.0 only for the platform device that
+sysfb registers for an EFI or VESA framebuffer.
+
+On device-tree machines simpledrm binds to the firmware's framebuffer
+node, which is named after its address. On Apple silicon that is, for
+example, /sys/devices/platform/103e0126880.framebuffer/drm/card0. Plymouth
+takes it for a native device, shows the splash and the unlock prompt on it
+at once, and when the display driver binds a few seconds later the screen
+goes black while the passphrase is being typed and the prompt is drawn
+again on the new device.
+
+Also ask the DRM driver for its name, as the drm renderer already does,
+and treat a "simpledrm" device as SimpleDRM whatever its parent is called.
+The path match stays.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ src/libply-splash-core/ply-device-manager.c | 54 +++++++++++++++++++--
+ 1 file changed, 49 insertions(+), 5 deletions(-)
+
+diff --git a/src/libply-splash-core/ply-device-manager.c b/src/libply-splash-core/ply-device-manager.c
+index 016ac332..54ee7d92 100644
+--- a/src/libply-splash-core/ply-device-manager.c
++++ b/src/libply-splash-core/ply-device-manager.c
+@@ -27,8 +27,11 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <sys/inotify.h>
++#include <sys/ioctl.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
++#include <unistd.h>
++#include <drm/drm.h>
+ 
+ #ifdef HAVE_UDEV
+ #include <libudev.h>
+@@ -346,12 +349,54 @@ syspath_is_simpledrm (const char *syspath)
+         return ply_string_has_suffix (syspath, "simple-framebuffer.0/drm/card0");
+ }
+ 
++/*
++ * The path above only matches the simple-framebuffer device that sysfb
++ * registers for an EFI/VESA framebuffer. On device-tree machines simpledrm
++ * binds to the firmware's DT framebuffer node instead, which is named after
++ * its address (e.g. 103e0126880.framebuffer), so ask the DRM driver for its
++ * name, as the drm renderer does.
++ */
++static bool
++device_is_simpledrm (struct udev_device *device)
++{
++        const char *syspath = udev_device_get_syspath (device);
++        const char *devnode = udev_device_get_devnode (device);
++        char name[32] = "";
++        struct drm_version version = {
++                .name_len = sizeof(name) - 1,
++                .name     = name,
++        };
++        int fd;
++        bool simpledrm = false;
++
++        if (syspath != NULL && syspath_is_simpledrm (syspath))
++                return true;
++
++        if (devnode == NULL || !ply_string_has_prefix (devnode, "/dev/dri/card"))
++                return false;
++
++        fd = open (devnode, O_RDONLY | O_CLOEXEC | O_NOCTTY);
++        if (fd < 0)
++                return false;
++
++        if (ioctl (fd, DRM_IOCTL_VERSION, &version) == 0) {
++                name[MIN (version.name_len, sizeof(name) - 1)] = '\0';
++                simpledrm = strcmp (name, "simpledrm") == 0;
++        }
++        close (fd);
++
++        if (simpledrm)
++                ply_trace ("%s is a SimpleDRM device", devnode);
++
++        return simpledrm;
++}
++
+ /* Only use SimpleDRM devices if requested to do so */
+ static bool
+ verify_drm_device (ply_device_manager_t *manager,
+                    struct udev_device   *device)
+ {
+-        if (!syspath_is_simpledrm (udev_device_get_syspath (device)))
++        if (!device_is_simpledrm (device))
+                 return true; /* Not a SimpleDRM device */
+ 
+         return manager->flags & PLY_DEVICE_MANAGER_FLAGS_USE_SIMPLEDRM;
+@@ -361,7 +406,7 @@ static bool
+ create_devices_for_udev_device (ply_device_manager_t *manager,
+                                 struct udev_device   *device)
+ {
+-        const char *device_path, *device_sysname, *device_syspath;
++        const char *device_path, *device_sysname;
+         bool created = false;
+         bool force_fb = false;
+ 
+@@ -370,7 +415,6 @@ create_devices_for_udev_device (ply_device_manager_t *manager,
+ 
+         device_path = udev_device_get_devnode (device);
+         device_sysname = udev_device_get_sysname (device);
+-        device_syspath = udev_device_get_syspath (device);
+ 
+         if (device_path != NULL) {
+                 const char *subsystem;
+@@ -390,7 +434,7 @@ create_devices_for_udev_device (ply_device_manager_t *manager,
+                                 return false;
+                         }
+                         ply_trace ("found DRM device %s", device_path);
+-                        if (syspath_is_simpledrm (device_syspath))
++                        if (device_is_simpledrm (device))
+                                 renderer_type = PLY_RENDERER_TYPE_SIMPLEDRM;
+                         else
+                                 renderer_type = PLY_RENDERER_TYPE_DRM;
+@@ -487,7 +531,7 @@ create_devices_for_subsystem (ply_device_manager_t *manager,
+                 /* If device isn't fully initialized, we'll get an add event later */
+                 initialized = udev_device_get_is_initialized (device);
+                 /* Simpledrm can be handled uninitialized and this shows the splash sooner */
+-                if (initialized || syspath_is_simpledrm (path)) {
++                if (initialized || device_is_simpledrm (device)) {
+                         ply_trace ("device is initialized %d", initialized);
+ 
+                         node = udev_device_get_devnode (device);

@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Diljit Singh <hey@djdev.me>
+Date: Sat, 7 Nov 2026 07:40:10 -0500
+Subject: [PATCH] pmdomain: apple: resync domains and PMC floors after a
+ firmware suspend
+
+A firmware-driven suspend changes domain states behind genpd's back.
+macOS's wake record on T8140 shows AUTO_ENABLE gone from 22 domains and
+many others left clock gated: it raises the first group and lowers 30 of
+the second within 5 ms of a wake. genpd only powers a domain on if it
+turned it off, so a domain it left on stays wrong.
+
+On a resume from such a suspend, put each domain where genpd's books say
+it is. Follow the books rather than macOS's two lists, since the rule
+behind those lists hasn't been worked out. Firmware-owned domains stay
+untouched.
+
+Some domains need their driver's order on the way back. For the GPU's
+that is the target, the bridge, and only then automatic power
+management, and a resync would raise it with AUTO_ENABLE well before the
+GPU driver runs. Add apple,sleep-driver-owned for a domain whose driver
+lowers it before a sleep and brings it back afterwards; the resync
+leaves it alone.
+
+The PMC driver keeps which agents it enabled on each rail and the floors
+its domains hold, and writes neither again on its own. Restore them from
+the books in resume_early: a register that kept its value isn't written,
+and CLPC's sampling starts again only in resume, after this.
+
+Only pm_resume_via_firmware() runs any of this, so other paths are
+unchanged.
+
+Signed-off-by: Diljit Singh <hey@djdev.me>
+
+[j604 backport: pmc.c: only the resume_early restore and pm_ops (T8142/T6040/T8152 tables not taken); pmgr-pwrstate.c: only the apple,sleep-driver-owned read; Aurora's inherited_on term dropped from the resync gate (that contract is not in this tree; our consumer-switched domains are firmware-owned and already skipped); AUTO_ENABLE in the resync follows our power-on (!no_auto_pm; no Aurora no_auto_enable here)]
+Assisted-by: Claude:claude-opus-5.5
+
+---
+ drivers/pmdomain/apple/pmc.c           | 36 +++++++++++++++++++
+ drivers/pmdomain/apple/pmgr-pwrstate.c | 48 ++++++++++++++++++++++++++
+ 2 files changed, 84 insertions(+)
+
+diff --git a/drivers/pmdomain/apple/pmc.c b/drivers/pmdomain/apple/pmc.c
+index c2d777bef8..558d97d2f8 100644
+--- a/drivers/pmdomain/apple/pmc.c
++++ b/drivers/pmdomain/apple/pmc.c
+@@ -54,6 +54,7 @@
+ #include <linux/soc/apple/pmc.h>
+ #include <linux/spinlock.h>
+ #include <linux/string_choices.h>
++#include <linux/suspend.h>
+ #include <linux/thermal.h>
+ #include <linux/workqueue.h>
+ 
+@@ -1449,6 +1450,40 @@ static const struct apple_pmc_hw apple_pmc_hw_t8140 = {
+ 	.ap_agent = 3,
+ };
+ 
++/*
++ * A system sleep that reached the hardware may have taken the enables and floors
++ * with it. Put back what the driver's books say: these are no-ops if they stayed.
++ */
++static int apple_pmc_resume_early(struct device *dev)
++{
++	struct apple_pmc *pmc = dev_get_drvdata(dev);
++	unsigned long flags;
++	unsigned int rail;
++	int ret = 0, err;
++
++	if (!pm_resume_via_firmware() || !pmc)
++		return 0;
++
++	raw_spin_lock_irqsave(&pmc->lock, flags);
++	for (rail = 0; rail < pmc->hw->rails; rail++) {
++		err = apple_pmc_enable_write(pmc, rail);
++		ret = ret ?: err;
++		if (pmc->floor_rails & BIT(rail)) {
++			err = apple_pmc_floor_apply(pmc, rail);
++			ret = ret ?: err;
++		}
++	}
++	raw_spin_unlock_irqrestore(&pmc->lock, flags);
++	if (ret)
++		dev_err(dev, "state not restored after sleep: %d\n", ret);
++
++	return 0;
++}
++
++static const struct dev_pm_ops apple_pmc_pm_ops = {
++	LATE_SYSTEM_SLEEP_PM_OPS(NULL, apple_pmc_resume_early)
++};
++
+ static const struct of_device_id apple_pmc_of_match[] = {
+ 	{ .compatible = "apple,t8132-pmc", .data = &apple_pmc_hw_t8132 },
+ 	{ .compatible = "apple,t8140-pmc", .data = &apple_pmc_hw_t8140 },
+@@ -1461,6 +1496,7 @@ static struct platform_driver apple_pmc_driver = {
+ 	.driver = {
+ 		.name = "apple-pmc",
+ 		.of_match_table = apple_pmc_of_match,
++		.pm = pm_sleep_ptr(&apple_pmc_pm_ops),
+ 		/* Power-domain providers are not intended for manual unbinding. */
+ 		.suppress_bind_attrs = true,
+ 	},
+diff --git a/drivers/pmdomain/apple/pmgr-pwrstate.c b/drivers/pmdomain/apple/pmgr-pwrstate.c
+index c2bbff4ec8..1c3a085de9 100644
+--- a/drivers/pmdomain/apple/pmgr-pwrstate.c
++++ b/drivers/pmdomain/apple/pmgr-pwrstate.c
+@@ -14,6 +14,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
++#include <linux/suspend.h>
+ #include <linux/regmap.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/reset-controller.h>
+@@ -63,6 +64,8 @@ struct apple_pmgr_ps {
+ 	bool firmware_owned;
+ 	/* apple,sleep-retained: kept on while the system sleeps */
+ 	bool sleep_retained;
++	/* apple,sleep-driver-owned: the driver behind it brings it back after a sleep */
++	bool sleep_driver_owned;
+ 	/* Never enable automatic power management (apple,no-auto-pm). */
+ 	bool no_auto_pm;
+ 	/*
+@@ -300,6 +303,49 @@ static int apple_pmgr_ps_resume_early(struct device *dev)
+ 	return 0;
+ }
+ 
++/*
++ * A firmware-driven suspend powers the SoC down and its sleep engine leaves the
++ * domains in states of its own: AUTO_ENABLE cleared, some at clock gating. genpd
++ * only powers a domain back on if it turned it off itself, so its idea of a
++ * domain it left on is now wrong. Put each domain back where genpd thinks it is.
++ *
++ * On T8140 macOS re-raises 22 domains in the first 5 ms after a wake and lowers
++ * 30 others (measured under aura). Which of them Linux needs isn't established,
++ * so this follows genpd's books rather than a list.
++ */
++static int apple_pmgr_ps_resume_noirq(struct device *dev)
++{
++	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
++	unsigned long flags;
++	u32 reg;
++	int ret;
++
++	if (!pm_resume_via_firmware() || ps->firmware_owned || ps->sleep_driver_owned)
++		return 0;
++
++	spin_lock_irqsave(&ps->genpd.slock, flags);
++	ret = regmap_read(ps->regmap, ps->offset, &reg);
++	if (!ret) {
++		if (ps->genpd.status == GENPD_STATE_OFF) {
++			if (FIELD_GET(APPLE_PMGR_PS_TARGET, reg) != APPLE_PMGR_PS_PWRGATE)
++				ret = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_PWRGATE,
++							false);
++		} else {
++			bool auto_enable = !ps->no_auto_pm;
++
++			if (FIELD_GET(APPLE_PMGR_PS_TARGET, reg) != APPLE_PMGR_PS_ACTIVE ||
++			    (auto_enable && !(reg & APPLE_PMGR_AUTO_ENABLE)))
++				ret = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_ACTIVE,
++							auto_enable);
++		}
++	}
++	spin_unlock_irqrestore(&ps->genpd.slock, flags);
++	if (ret)
++		dev_err(dev, "PS %s: resync after sleep failed: %d\n", ps->genpd.name, ret);
++
++	return 0;
++}
++
+ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned long id)
+ {
+ 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
+@@ -507,6 +553,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
+ 				     "retention workaround needs a consumer switch\n");
+ 	}
+ 	ps->sleep_retained = of_property_read_bool(node, "apple,sleep-retained");
++	ps->sleep_driver_owned = of_property_read_bool(node, "apple,sleep-driver-owned");
+ 
+ 	ret = of_property_read_u32(node, "apple,min-state", &ps->min_state);
+ 	if (ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE && !ps->firmware_owned)
+@@ -875,6 +922,7 @@ MODULE_DEVICE_TABLE(of, apple_pmgr_ps_of_match);
+ 
+ static const struct dev_pm_ops apple_pmgr_ps_pm_ops = {
+ 	LATE_SYSTEM_SLEEP_PM_OPS(apple_pmgr_ps_suspend_late, apple_pmgr_ps_resume_early)
++	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, apple_pmgr_ps_resume_noirq)
+ };
+ 
+ static struct platform_driver apple_pmgr_ps_driver = {

@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 19:48:47 +0000
+Subject: [PATCH] selftests: apple-dcp: model the XDR guard in the m4 blank
+ test
+
+iomfb_m4_swap() now feeds every frame swap to the XDR guard and reads
+the internal panel's D590 displayed byte, so the m4-dpms-retirement
+host test no longer built against its own runtime and state.
+
+Give the blank test the real guard instead of a stub: the pure
+dcp-m4-xdr.h, and the backend's own iomfb_m4_xdr_sync() and
+iomfb_m4_xdr_after(), the latter counted. The D590 stub reports
+displayed. A new case on the J604's ADT values checks that each frame
+swap feeds the guard exactly once and a blank none, that a "not
+displayed" D590 for an ordinary swap is not trusted, that a raised
+1000 nit SDR ceiling goes out bounded by the first rung, that the
+deepest cooling state holds the 300 nit floor, and that panel_xdr=0
+re-sends the unscaled level.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ .../selftests/drivers/gpu/apple-dcp/m4.py     | 84 ++++++++++++++++++-
+ 1 file changed, 80 insertions(+), 4 deletions(-)
+
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/m4.py b/tools/testing/selftests/drivers/gpu/apple-dcp/m4.py
+index 3862752469..a5d2a99f45 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/m4.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/m4.py
+@@ -566,7 +566,83 @@ def blank_extras(root, backend):
+     if stubs.startswith('struct delayed_work'):
+         types, stubs = stubs.split('\n', 1)
+         types += '\n'
+-    return types, runtime, state, stubs
++    # The XDR guard (dcp-m4-xdr.h): the real pure header and the real sync/after
++    # helpers of the backend, the latter counted; the D590 stub reports displayed.
++    d590, xdr_main = '', ''
++    if 'iomfb_m4_xdr_sync(' in swap:
++        runtime += ' bool int_shown_valid, int_shown;'
++        state += ('    struct dcp_m4_xdr xdr;\n    int xdr_gen;\n    bool xdr_ready;\n'
++                  '    u32 thermal_min_cap,thermal_max,thermal_state;\n'
++                  '    u32 xdr_asked,xdr_last_us;\n    const char *dev;\n')
++        types += ('#ifndef DIV_ROUND_UP\n#define DIV_ROUND_UP(n,d) (((n)+(d)-1)/(d))\n#endif\n' +
++                  header_body((root / APPLE / 'dcp-m4-xdr.h').read_text()))
++        after = block(backend, 'static void iomfb_m4_xdr_after(')
++        stubs += ('static bool panel_xdr = true;\nstatic int panel_xdr_gen;\n'
++                  '#define atomic_read(p) (*(p))\n'
++                  'static unsigned xdr_infos,xdr_warns,xdr_afters;\n'
++                  'static bool xdr_shown = true;\nstatic u32 xdr_level;\n'
++                  '#define dev_info(d, ...) ((void)(d), xdr_infos++)\n'
++                  '#define dev_warn(d, ...) ((void)(d), xdr_warns++)\n' +
++                  block(backend, 'static void iomfb_m4_xdr_sync(') + '\n' +
++                  after.replace('static void iomfb_m4_xdr_after(',
++                                'static void iomfb_m4_xdr_after_real(', 1) + '\n'
++                  'static void iomfb_m4_xdr_after(struct iomfb_m4 *dcp,u32 asked,bool ok,bool shown,u32 us)\n'
++                  '{ assert(dcp->lock==1); xdr_afters++; iomfb_m4_xdr_after_real(dcp,asked,ok,shown,us); }\n')
++        d590 = '    r->int_shown_valid=true; r->int_shown=xdr_shown; xdr_level=r->level;\n'
++        xdr_main = XDR_MAIN
++    return types, runtime, state, stubs, d590, xdr_main
++
++
++# The XDR guard in the blank test: every frame swap feeds the real guard once
++# (with the D590 displayed byte), a blank none; the guard bounds a raised SDR
++# ceiling to its first rung, the thermal floor holds, panel_xdr=0 undoes it.
++XDR_MAIN = r'''
++    {
++        struct drm_format_info fmt={.format=DRM_FORMAT_XRGB8888,.num_planes=1};
++        struct drm_framebuffer fb={.format=&fmt,.width=2560,.height=1664,.pitches={10240},.refs=1};
++        struct drm_framebuffer next=fb;
++        struct apple_dcp owner={0};
++        struct iomfb_m4 dcp={.owner=&owner,.dev="dcp"};
++        struct dcp_m4_runtime runtime={.dcp=&dcp};
++        unsigned n=xdr_afters,b;
++        owner.v26_6=&dcp; dcp.runtime=&runtime;
++        assert(!dcp_bl_init(&owner.backlight.state,500,true,120,false,0));
++        /* The J604's ADT over this profile's user maximum: aurora 1000, thermal floor 300. */
++        dcp.boost_max=1000; dcp.thermal_min_cap=300;
++        xdr_shown=false;
++        assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
++        assert(xdr_afters==n+1 && dcp.xdr_ready && dcp.xdr.state==DCP_M4_XDR_RAMP);
++        assert(dcp.xdr.user_max==dcp_m4_pf->brightness_max && dcp.xdr.top==1000 && dcp.xdr.min_cap==300);
++        assert(dcp_m4_xdr_cap(&dcp.xdr)==dcp_m4_pf->brightness_max+DCP_M4_XDR_STEP_NITS);
++        /* "Not displayed" for an ordinary swap: the byte is not trusted yet. */
++        assert(!dcp.xdr.shown_seen && dcp.xdr_last_us>0 && !xdr_warns);
++        xdr_shown=true;
++        assert(!iomfb_m4_present(&owner,&next,0x10000300000ULL,0x2000000));
++        assert(xdr_afters==n+2 && dcp.xdr.shown_seen);
++        /* A raised SDR ceiling of 1000 nits goes out bounded by the first rung. */
++        panel_boost_nits=1000;
++        assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
++        assert(xdr_afters==n+3 && dcp.boost_sent==dcp_m4_xdr_cap(&dcp.xdr));
++        assert(xdr_level==120*dcp_m4_xdr_cap(&dcp.xdr)/dcp_m4_pf->brightness_max);
++        /* The deepest cooling state: every level under the thermal floor, re-sent. */
++        dcp.thermal_state=dcp_m4_xdr_max_state(&dcp.xdr);
++        assert(!iomfb_m4_present(&owner,&next,0x10000300000ULL,0x2000000));
++        assert(xdr_afters==n+4 && dcp.boost_sent==300 && xdr_level==120);
++        /* panel_xdr=0: the guard off, the unscaled level re-sent once. */
++        dcp.thermal_state=0; panel_xdr=false; panel_xdr_gen++;
++        assert(!iomfb_m4_present(&owner,&fb,0x10000100000ULL,0x2000000));
++        assert(xdr_afters==n+5 && dcp.xdr.state==DCP_M4_XDR_OFF && !dcp.boost_sent && xdr_level==120);
++        assert(dcp.xdr.reverts==0 && !xdr_warns);
++        /* A blank swaps no frame: the guard is not fed. */
++        b=xdr_afters;
++        assert(!dcp_backlight_dpms(&owner,false));
++        assert(!iomfb_m4_blank(&owner));
++        assert(xdr_afters==b);
++        panel_boost_nits=0; panel_xdr=true; panel_xdr_gen++;
++        puts("PASS every frame swap feeds the real XDR guard once (D590 displayed byte included), a blank none");
++        puts("PASS the guard bounds a raised ceiling to its rung, holds the thermal floor, and panel_xdr=0 undoes it");
++    }
++'''
+ 
+ 
+ def blank(root):
+@@ -582,7 +658,7 @@ def blank(root):
+                      block(backlight, 'static bool dcp_backlight_presents_nits(') +
+                      '\n' + functions)
+     div = '' if has_edr(root) else 'static u64 div_u64(u64 x,u32 y) { return x/y; }\n'
+-    TYPES, RUNTIME_EXTRA, STATE_EXTRA, STUBS = blank_extras(root, backend)
++    TYPES, RUNTIME_EXTRA, STATE_EXTRA, STUBS, D590, XDR_MAIN_PART = blank_extras(root, backend)
+     return production(root) + r'''
+ #define min(x,y) ((x)<(y)?(x):(y))
+ #define max(x,y) ((x)>(y)?(x):(y))
+@@ -671,7 +747,7 @@ static int dcp_m4_runtime_swap_brightness(struct dcp_m4_runtime *r,
+     if(order) assert(!dcp_m4_swap_record_done(&swap,publications));
+     else assert(!dcp_m4_swap_record_reply(&swap,reply,sizeof(reply)));
+     assert(dcp_m4_swap_take_completion(&swap)==1);
+-    return 0;
++''' + D590 + r'''    return 0;
+ }
+ ''' + functions + '\n' + '\n'.join(block(backend, name) for name in (
+         'static int iomfb_m4_swap(', 'int iomfb_m4_present(', 'int iomfb_m4_blank(')) + r'''
+@@ -720,7 +796,7 @@ int main(void)
+         assert(fb.refs==2 && next.refs==2 && dcp.active_fb==&fb && dcp.uncertain_fb==&next);
+         failure=0;
+     }
+-    puts("PASS DPMS-off blank carries zero before delayed work and completes only after both exact receipts");
++''' + XDR_MAIN_PART + r'''    puts("PASS DPMS-off blank carries zero before delayed work and completes only after both exact receipts");
+     puts("PASS actual present/blank retain active+uncertain DMA framebuffer references across a missing receipt");
+     puts("PASS a present while the display is powered off for sleep is refused without a reference");
+     puts("PASS a blank powers the display down once, and the next frame powers it back up");

@@ -1,0 +1,200 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 15:58:32 +0000
+Subject: [PATCH] drm/apple: m4: show wide-gamut SDR frames in BT.2020 on the
+ J604 panel
+
+The T8132 panel tags every SDR frame Display P3 with the sRGB transfer,
+whatever the connector's Colorspace says. A compositor in a wide-gamut
+SDR mode encodes BT.2020 primaries and says so: Hyprland 0.56's cm
+"auto" (at 10 bits on an EDID with BT.2020 colorimetry, which the J604
+panel EDID has when it offers HDR), "wide" and "edid" set Colorspace to
+BT2020_RGB and send SDR code values in BT.2020 primaries. Read as P3,
+those colours come out washed out.
+
+Tag the frame as the connector asks: with Colorspace BT2020_RGB and no
+PQ, the surface carries BT.2020 primaries (9) with the sRGB transfer
+(13); PQ with BT2020_RGB stays EDR (9, 16); anything else stays P3-D65
+(12, 13), the panel's own colour. The decision (dcp_m4_output_colour())
+is taken with the EDR one in iomfb_m4_atomic_hdr(), so it needs the
+Colorspace property, which the panel has when it offers HDR. The idle
+cache surface takes the tag of the frame on screen, as it takes its
+depth.
+
+The firmware already takes primaries 9 for EDR frames; whether 26.6.2
+converts BT.2020 SDR frames into the panel's gamut is checked on the
+J604 with linux-aurora 1.613 (Hyprland cm "wide" at 10 bits).
+
+KUnit apple-dcp-m4-frame: the decision for Default, wide SDR, HDR, HDR
+with panel_edr off and PQ metadata left over a Default Colorspace, and
+the three surface tag pairs on a 10-bit surface.
+
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp-m4-frame-test.c | 47 +++++++++++++++++++++++
+ drivers/gpu/drm/apple/dcp-m4-frame.h      | 20 +++++++++-
+ drivers/gpu/drm/apple/iomfb_m4.c          | 17 ++++++--
+ 3 files changed, 78 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-m4-frame-test.c b/drivers/gpu/drm/apple/dcp-m4-frame-test.c
+index 728cc4c792..e321765337 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-frame-test.c
++++ b/drivers/gpu/drm/apple/dcp-m4-frame-test.c
+@@ -140,11 +140,58 @@ static void frame_j604_profile(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, dcp_m4_profile_j715.vrr_min_hz, 0);
+ }
+ 
++/* Colorspace and EOTF of the connector -> how the frame is tagged. */
++static void frame_output_colour(struct kunit *test)
++{
++	static const struct { bool pq, bt2020, on, edr, sdr2020; } t[] = {
++		{ false, false, true, false, false },	/* Default SDR: P3 */
++		{ false, true, true, false, true },	/* wide SDR: BT.2020 */
++		{ true, true, true, true, false },	/* HDR: EDR */
++		{ true, true, false, false, false },	/* HDR, panel_edr off */
++		{ true, false, true, false, false },	/* PQ metadata left, Default */
++		{ false, true, false, false, true },
++	};
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(t); i++) {
++		bool edr = !t[i].edr, sdr2020 = !t[i].sdr2020;
++
++		dcp_m4_output_colour(t[i].pq, t[i].bt2020, t[i].on, &edr, &sdr2020);
++		KUNIT_EXPECT_EQ(test, edr, t[i].edr);
++		KUNIT_EXPECT_EQ(test, sdr2020, t[i].sdr2020);
++	}
++}
++
++/* The surface tags: P3-D65/sRGB, BT.2020/sRGB (wide SDR), BT.2020/PQ (EDR). */
++static void frame_surface_colour_tags(struct kunit *test)
++{
++	static const struct { bool pq, bt2020; u8 prim, xfer; } t[] = {
++		{ false, false, 12, 13 }, { false, true, 9, 13 }, { true, false, 9, 16 },
++		{ true, true, 9, 16 },
++	};
++	u8 *s = kunit_kzalloc(test, DCP_M4_SURFACE_SIZE, GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, s);
++	for (unsigned int i = 0; i < ARRAY_SIZE(t); i++) {
++		struct dcp_m4_frame f = {
++			.dva = 1ULL << 40, .backing_size = 3072ULL * 4 * 1964,
++			.width = 3024, .height = 1964, .stride = 3072 * 4,
++			.format = DCP_M4_XRGB2101010, .pq = t[i].pq, .bt2020 = t[i].bt2020,
++		};
++
++		dcp_m4_surface_encode(s, &f);
++		KUNIT_EXPECT_EQ(test, s[DCP_M4_SURFACE_PRIMARIES], t[i].prim);
++		KUNIT_EXPECT_EQ(test, s[DCP_M4_SURFACE_XFER], t[i].xfer);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le32(s + 0x0b), 0x6c313072U);
++	}
++}
++
+ static struct kunit_case m4_frame_cases[] = {
+ 	KUNIT_CASE(frame_drm_formats),
+ 	KUNIT_CASE(frame_format_helpers),
+ 	KUNIT_CASE(frame_surface_encoding),
+ 	KUNIT_CASE(frame_j604_profile),
++	KUNIT_CASE(frame_output_colour),
++	KUNIT_CASE(frame_surface_colour_tags),
+ 	{}
+ };
+ 
+diff --git a/drivers/gpu/drm/apple/dcp-m4-frame.h b/drivers/gpu/drm/apple/dcp-m4-frame.h
+index fc6106f114..19405d2ae8 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-frame.h
++++ b/drivers/gpu/drm/apple/dcp-m4-frame.h
+@@ -101,8 +101,24 @@ struct dcp_m4_frame {
+ 	enum dcp_m4_frame_format format;
+ 	/* BT.2020 PQ code values, shown as EDR (dcp-m4-edr.h); else P3-D65 sRGB */
+ 	bool pq;
++	/* SDR code values in BT.2020 primaries (sRGB transfer), not P3-D65 */
++	bool bt2020;
+ };
+ 
++/*
++ * How the panel reads a commit's frames, from the connector state: EDR while
++ * PQ and BT.2020 RGB are both set and panel_edr is on; BT.2020 primaries with
++ * the sRGB transfer while BT.2020 RGB is set without PQ (a compositor's
++ * wide-gamut SDR mode, e.g. Hyprland cm "auto"/"wide" at 10 bits); else
++ * Display P3 with the sRGB transfer, as the panel is calibrated.
++ */
++static inline void dcp_m4_output_colour(bool pq_eotf, bool bt2020_rgb, bool edr_on,
++					bool *edr, bool *bt2020_sdr)
++{
++	*edr = pq_eotf && bt2020_rgb && edr_on;
++	*bt2020_sdr = bt2020_rgb && !pq_eotf;
++}
++
+ static inline int dcp_m4_frame_check(const struct dcp_m4_frame *frame)
+ {
+ 	u64 size = (u64)frame->stride * frame->height;
+@@ -175,8 +191,8 @@ static inline void dcp_m4_surface_encode(u8 *surface, const struct dcp_m4_frame
+ 	put_unaligned_le32(1, surface + 7);
+ 	put_unaligned_le32(dcp_m4_format_fourcc(frame->format), surface + 0x0b);
+ 	surface[DCP_M4_SURFACE_XFER] = frame->pq ? DCP_M4_XFER_PQ : DCP_M4_XFER_SRGB;
+-	surface[DCP_M4_SURFACE_PRIMARIES] = frame->pq ? DCP_M4_PRIMARIES_BT2020 :
+-						      DCP_M4_PRIMARIES_P3_D65;
++	surface[DCP_M4_SURFACE_PRIMARIES] = frame->pq || frame->bt2020 ? DCP_M4_PRIMARIES_BT2020 :
++								 DCP_M4_PRIMARIES_P3_D65;
+ 	put_unaligned_le32(frame->stride, surface + 0x15);
+ 	put_unaligned_le16(1, surface + 0x19);
+ 	surface[0x1b] = 1;
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 5490507d42..1589e30f5c 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -295,6 +295,8 @@ struct iomfb_m4 {
+ 	 */
+ 	u32 panel_peak, edr_ceiling;
+ 	bool edr_capable, output_edr;
++	/* SDR frames in BT.2020 primaries: Colorspace BT2020_RGB without PQ */
++	bool output_bt2020;
+ 	bool edr_latched; /* the offer is decided once, at the first publication */
+ 	struct dcp_m4_edr_state edr;
+ 	u64 edr_swaps;
+@@ -3443,19 +3445,23 @@ void iomfb_m4_atomic_hdr(struct apple_dcp *owner, struct drm_crtc *crtc,
+ {
+ 	struct iomfb_m4 *dcp = owner->v26_6;
+ 	const struct drm_connector_state *conn_state;
+-	bool edr;
++	bool edr, bt2020;
+ 
+ 	if (!dcp || !READ_ONCE(dcp->edr_capable))
+ 		return;
+ 	conn_state = iomfb_m4_connector_state(owner, crtc, commit);
+ 	/* panel_edr written off at run time: PQ commits stay valid, shown without EDR. */
+-	edr = iomfb_m4_eotf(conn_state) == HDMI_EOTF_SMPTE_ST2084 &&
+-	      conn_state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB &&
+-	      READ_ONCE(panel_edr);
++	dcp_m4_output_colour(iomfb_m4_eotf(conn_state) == HDMI_EOTF_SMPTE_ST2084,
++			     conn_state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB,
++			     READ_ONCE(panel_edr), &edr, &bt2020);
+ 	mutex_lock(&dcp->lock);
+ 	if (edr != dcp->output_edr)
+ 		dev_info(dcp->dev, "panel EDR %s\n", edr ? "on: BT.2020 PQ" : "off");
++	if (bt2020 != dcp->output_bt2020)
++		dev_info(dcp->dev, "panel SDR colour: %s\n",
++			 bt2020 ? "BT.2020 primaries" : "Display P3");
+ 	dcp->output_edr = edr;
++	dcp->output_bt2020 = bt2020;
+ 	mutex_unlock(&dcp->lock);
+ }
+ 
+@@ -3799,6 +3805,8 @@ static int dcp_m4_idle_cache_enter(struct iomfb_m4 *dcp)
+ 	 * formats are 4 bytes a pixel, so the surface size is the same.
+ 	 */
+ 	r->idle_frame.format = dcp_m4_format_opaque_of(dcp->active_frame.format);
++	/* ... and its primaries. */
++	r->idle_frame.bt2020 = dcp->active_frame.bt2020;
+ 	ret = dcp_m4_runtime_live(r);
+ 	if (ret)
+ 		return ret;
+@@ -3923,6 +3931,7 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+ 	mutex_lock(&dcp->lock);
+ 	/* The compositor encoded the frame for the HDR sink: BT.2020 PQ. */
+ 	frame.pq = dcp->output_edr;
++	frame.bt2020 = dcp->output_bt2020;
+ 	ret = dcp_m4_runtime_live(dcp->runtime);
+ 	if (!ret && dcp->powered_off)
+ 		ret = -EAGAIN;

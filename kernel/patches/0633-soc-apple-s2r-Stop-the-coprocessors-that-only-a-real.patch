@@ -1,0 +1,382 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 12:22:38 +0000
+Subject: [PATCH] soc: apple: s2r: Stop the coprocessors that only a real sleep
+ restarts
+
+Some coprocessors can't be stopped until a sleep is certain and don't come
+back from their stop without one: ANS acknowledges idle and then never
+answers a wake with its power kept. Their drivers need a place to put
+that last stop, after every refusal and with interrupts off, and a way to
+refuse the sleep at the last moment while their firmware can still carry
+on.
+
+Add that registry to apple-s2r, after Aurora's T8140 sleep controller
+(t8140-sleep.c): a coprocessor registers its device, optionally its ASC,
+a last check and a last stop; its driver marks it ready once quiesced.
+->enter() runs every ready coprocessor's last check, then the enclave's
+sleep request, and refuses the sleep on any error, all before the parked
+CPUs are powered down, which can't be undone. Past those it runs the last
+stops, those registered first before the others, and clears each ASC's
+run bit as Aurora does on ANS. apple_sleep_coproc_stopped() tells a
+resume path whether the stop happened.
+
+A bring-up run with abort_before set stops nothing, so that an abort
+never leaves a coprocessor down without a sleep. The new refusal step is
+numbered after the existing ones for the same reason.
+
+Not taken from Aurora: the PCIe ANS block (T8132's ANS is ANS2 on MMIO;
+pcie_ans is refused), the per-coprocessor power word (there is no T8132
+power word list), and the USB, debug link, radio, pin and lid hooks,
+which come with the drivers that use them. The ASC CPU control offset and
+run bit are the ones nvme-apple already uses on this SoC.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/soc/apple/apple-s2r.c   | 237 ++++++++++++++++++++++++++++++++
+ include/linux/soc/apple/sleep.h |  46 +++++++
+ 2 files changed, 283 insertions(+)
+
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index e1cb8b5ccc..16809868c1 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -37,6 +37,12 @@
+  * commit, pm_resume_via_firmware() tells their resume callbacks to restart
+  * the block instead of assuming its state survived.
+  *
++ * Coprocessors that only a real sleep restarts (ANS first) register with
++ * apple_sleep_coproc_register(). Their last refusals and the enclave's sleep
++ * request run first in ->enter(), before anything that can't be undone; then
++ * their last stops, past every refusal. A bring-up run with abort_before set
++ * stops none of them, so that an abort never leaves one down without a sleep.
++ *
+  * The SoC wakes the boot CPU at its reset vector. Boot firmware finds the
+  * armed mailbox, redoes the boot CPU setup and branches to cpu_resume. After
+  * the AIC syscore resume, this driver's syscore resume undoes the sequence:
+@@ -56,6 +62,9 @@
+ 
+ #include <linux/bitfield.h>
+ #include <linux/bits.h>
++#include <linux/cleanup.h>
++#include <linux/device.h>
++#include <linux/mutex.h>
+ #include <linux/cacheflush.h>
+ #include <linux/cpu.h>
+ #include <linux/io.h>
+@@ -171,10 +180,13 @@ enum apple_s2r_step {
+ 	S2R_STEP_CLKGEN,
+ 	S2R_STEP_PLL,
+ 	S2R_STEP_SUSPEND,
++	/* Appended, so that abort_before keeps its numbers */
++	S2R_STEP_COPROCS,
+ };
+ 
+ static const char *const apple_s2r_step_names[] = {
+ 	[S2R_STEP_NONE]		= "none",
++	[S2R_STEP_COPROCS]	= "coprocessor refusal",
+ 	[S2R_STEP_PARKED]	= "parked CPUs power-down",
+ 	[S2R_STEP_ACC]		= "CPU complex state save",
+ 	[S2R_STEP_CPM]		= "CPM power gating",
+@@ -225,6 +237,220 @@ struct apple_s2r {
+ 
+ static struct apple_s2r *apple_s2r;
+ 
++/* Coprocessor ASC: CPU control (run bit) and status, as nvme-apple's ANS */
++#define ASC_CPU_CONTROL		0x44
++#define ASC_CPU_CONTROL_RUN	BIT(4)
++#define ASC_CPU_STATUS		0x48
++
++/* ANS, DCP, DCPEXT, SIO, PMP, GPU, ISP, AOP */
++#define S2R_COPROCS		8
++
++static struct apple_s2r_coproc {
++	struct device *dev;
++	void __iomem *asc;
++	int (*last_check)(void *data);
++	int (*last_stop)(void *data);
++	void *data;
++	bool ready;
++	bool stopped;
++	/* Stopped before the others; its last stop clears its own run bits */
++	bool first;
++	u32 status;
++} apple_s2r_coprocs[S2R_COPROCS];
++static DEFINE_MUTEX(apple_s2r_coprocs_lock);
++
++/* The enclave's sleep request, the very last refusal */
++static struct {
++	struct device *dev;
++	int (*tell)(void *data);
++	void *data;
++} apple_s2r_enclave;
++
++static struct apple_s2r_coproc *apple_s2r_coproc_find(struct device *dev)
++{
++	int i;
++
++	for (i = 0; i < S2R_COPROCS; i++)
++		if (apple_s2r_coprocs[i].dev == dev)
++			return &apple_s2r_coprocs[i];
++	return NULL;
++}
++
++int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie_ans,
++				int (*last_stop)(void *data), void *data)
++{
++	struct apple_s2r_coproc *c;
++
++	/* The warm boot path comes back at EL2 only (probe) */
++	if (!is_kernel_in_hyp_mode())
++		return -ENODEV;
++	if (pcie_ans)
++		return -EOPNOTSUPP;
++
++	guard(mutex)(&apple_s2r_coprocs_lock);
++	if (apple_s2r_coproc_find(dev))
++		return -EEXIST;
++	c = apple_s2r_coproc_find(NULL);
++	if (!c)
++		return -ENOSPC;
++	*c = (struct apple_s2r_coproc) {
++		.asc = asc,
++		.last_stop = last_stop,
++		.data = data,
++		.dev = dev,
++	};
++	return 0;
++}
++EXPORT_SYMBOL_GPL(apple_sleep_coproc_register);
++
++int apple_sleep_coproc_register_first(struct device *dev, int (*last_stop)(void *data),
++				      void *data)
++{
++	struct apple_s2r_coproc *c;
++	int ret;
++
++	if (!last_stop)
++		return -EINVAL;
++	ret = apple_sleep_coproc_register(dev, NULL, false, last_stop, data);
++	if (ret)
++		return ret;
++
++	guard(mutex)(&apple_s2r_coprocs_lock);
++	c = apple_s2r_coproc_find(dev);
++	if (c)
++		c->first = true;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(apple_sleep_coproc_register_first);
++
++void apple_sleep_coproc_unregister(struct device *dev)
++{
++	struct apple_s2r_coproc *c;
++
++	guard(mutex)(&apple_s2r_coprocs_lock);
++	c = apple_s2r_coproc_find(dev);
++	if (c)
++		memset(c, 0, sizeof(*c));
++}
++EXPORT_SYMBOL_GPL(apple_sleep_coproc_unregister);
++
++int apple_sleep_coproc_set_last_check(struct device *dev, int (*last_check)(void *data))
++{
++	struct apple_s2r_coproc *c;
++
++	guard(mutex)(&apple_s2r_coprocs_lock);
++	c = apple_s2r_coproc_find(dev);
++	if (!c)
++		return -ENOENT;
++	c->last_check = last_check;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(apple_sleep_coproc_set_last_check);
++
++int apple_sleep_enclave_register(struct device *dev, int (*tell)(void *data), void *data)
++{
++	if (!is_kernel_in_hyp_mode())
++		return -ENODEV;
++
++	guard(mutex)(&apple_s2r_coprocs_lock);
++	if (apple_s2r_enclave.dev)
++		return -EBUSY;
++	apple_s2r_enclave.tell = tell;
++	apple_s2r_enclave.data = data;
++	apple_s2r_enclave.dev = dev;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(apple_sleep_enclave_register);
++
++void apple_sleep_enclave_unregister(struct device *dev)
++{
++	guard(mutex)(&apple_s2r_coprocs_lock);
++	if (apple_s2r_enclave.dev == dev)
++		memset(&apple_s2r_enclave, 0, sizeof(apple_s2r_enclave));
++}
++EXPORT_SYMBOL_GPL(apple_sleep_enclave_unregister);
++
++void apple_sleep_coproc_set_ready(struct device *dev, bool ready)
++{
++	struct apple_s2r_coproc *c;
++
++	guard(mutex)(&apple_s2r_coprocs_lock);
++	c = apple_s2r_coproc_find(dev);
++	if (!c)
++		return;
++	c->ready = ready;
++	c->stopped = false;
++}
++EXPORT_SYMBOL_GPL(apple_sleep_coproc_set_ready);
++
++bool apple_sleep_coproc_stopped(struct device *dev)
++{
++	struct apple_s2r_coproc *c;
++
++	guard(mutex)(&apple_s2r_coprocs_lock);
++	c = apple_s2r_coproc_find(dev);
++	return c && c->stopped;
++}
++EXPORT_SYMBOL_GPL(apple_sleep_coproc_stopped);
++
++/*
++ * The last refusals: interrupts are off and no other CPU is up, so the
++ * registry is read without its lock, which no one can hold now.
++ */
++static int apple_s2r_coprocs_check(struct apple_s2r *s2r)
++{
++	int i, ret;
++
++	for (i = 0; i < S2R_COPROCS; i++) {
++		struct apple_s2r_coproc *c = &apple_s2r_coprocs[i];
++
++		if (!c->dev || !c->ready || c->stopped || !c->last_check)
++			continue;
++		ret = c->last_check(c->data);
++		if (ret) {
++			dev_err(s2r->dev, "refused: %s: %d\n", dev_name(c->dev), ret);
++			return ret;
++		}
++	}
++	if (apple_s2r_enclave.tell) {
++		ret = apple_s2r_enclave.tell(apple_s2r_enclave.data);
++		if (ret) {
++			dev_err(s2r->dev, "refused: the enclave didn't take the sleep request: %d\n",
++				ret);
++			return ret;
++		}
++	}
++	return 0;
++}
++
++/*
++ * Past every refusal: a coprocessor stopped here comes back only through a
++ * real sleep. Those registered first go before the others; then each run bit
++ * is cleared from what it reads back, twice, as on Aurora's ANS stop.
++ */
++static void apple_s2r_coprocs_stop(bool first)
++{
++	int i;
++
++	for (i = 0; i < S2R_COPROCS; i++) {
++		struct apple_s2r_coproc *c = &apple_s2r_coprocs[i];
++
++		if (!c->dev || !c->ready || c->stopped || c->first != first)
++			continue;
++		if (c->last_stop)
++			c->last_stop(c->data);
++		if (c->asc) {
++			c->status = readl(c->asc + ASC_CPU_STATUS);
++			writel(readl(c->asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN,
++			       c->asc + ASC_CPU_CONTROL);
++			writel(readl(c->asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN,
++			       c->asc + ASC_CPU_CONTROL);
++		}
++		c->stopped = true;
++	}
++	dsb(sy);
++}
++
+ static bool enable;
+ module_param(enable, bool, 0444);
+ MODULE_PARM_DESC(enable, "Offer suspend-to-RAM (\"deep\" mem sleep); needs firmware warm boot support (default: off)");
+@@ -473,6 +699,17 @@ static int apple_s2r_enter(suspend_state_t state)
+ 			return ret;
+ 	}
+ 
++	/* The coprocessors' last refusals, before anything that can't be undone */
++	ret = apple_s2r_coprocs_check(s2r);
++	if (ret) {
++		s2r->failed_step = S2R_STEP_COPROCS;
++		goto fail;
++	}
++	if (!READ_ONCE(abort_before)) {
++		apple_s2r_coprocs_stop(true);
++		apple_s2r_coprocs_stop(false);
++	}
++
+ 	/* No printk from here on: the console may lose its clock */
+ 	ret = apple_s2r_step(s2r, S2R_STEP_PARKED, 0,
+ 			     apple_cpu_park_power_down_all);
+diff --git a/include/linux/soc/apple/sleep.h b/include/linux/soc/apple/sleep.h
+index f27f3a412c..688a4997e0 100644
+--- a/include/linux/soc/apple/sleep.h
++++ b/include/linux/soc/apple/sleep.h
+@@ -25,6 +25,10 @@
+ #define _LINUX_SOC_APPLE_SLEEP_H_
+ 
+ #include <linux/errno.h>
++#include <linux/kconfig.h>
++#include <linux/types.h>
++
++struct device;
+ 
+ #if IS_ENABLED(CONFIG_APPLE_SLEEP)
+ 
+@@ -56,4 +60,46 @@ static inline void apple_sleep_ap_wake_restore(void) { }
+ 
+ #endif
+ 
++/*
++ * Coprocessors that suspend-to-RAM takes down (apple-s2r). A coprocessor that
++ * can't be stopped until the sleep is certain, and comes back only through a
++ * real sleep, registers here. Once its driver has quiesced it and set it
++ * ready, ->enter() runs every registered @last_check with interrupts off and
++ * one CPU up (a negative return refuses the sleep, and the coprocessor must
++ * still be able to carry on), then the enclave's @tell, then, past the last
++ * refusal, each @last_stop: those registered with _first() before the others.
++ * For a coprocessor registered with an ASC, the run bit is cleared after its
++ * @last_stop. @last_stop can't refuse; the sleep goes on.
++ * apple_sleep_coproc_stopped() tells a resume path whether that happened: after
++ * a refused or aborted sleep, false means the coprocessor still runs.
++ * T8132 has no PCIe ANS block: @pcie_ans must be false.
++ */
++#if IS_ENABLED(CONFIG_APPLE_S2R)
++int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie_ans,
++				int (*last_stop)(void *data), void *data);
++int apple_sleep_coproc_register_first(struct device *dev, int (*last_stop)(void *data),
++				      void *data);
++void apple_sleep_coproc_unregister(struct device *dev);
++int apple_sleep_coproc_set_last_check(struct device *dev, int (*last_check)(void *data));
++int apple_sleep_enclave_register(struct device *dev, int (*tell)(void *data), void *data);
++void apple_sleep_enclave_unregister(struct device *dev);
++void apple_sleep_coproc_set_ready(struct device *dev, bool ready);
++bool apple_sleep_coproc_stopped(struct device *dev);
++#else
++static inline int apple_sleep_coproc_register(struct device *dev, void __iomem *asc,
++					      bool pcie_ans, int (*last_stop)(void *data),
++					      void *data) { return -EOPNOTSUPP; }
++static inline int apple_sleep_coproc_register_first(struct device *dev,
++						    int (*last_stop)(void *data),
++						    void *data) { return -EOPNOTSUPP; }
++static inline void apple_sleep_coproc_unregister(struct device *dev) { }
++static inline int apple_sleep_coproc_set_last_check(struct device *dev,
++						    int (*last_check)(void *data)) { return -EOPNOTSUPP; }
++static inline int apple_sleep_enclave_register(struct device *dev, int (*tell)(void *data),
++					       void *data) { return -EOPNOTSUPP; }
++static inline void apple_sleep_enclave_unregister(struct device *dev) { }
++static inline void apple_sleep_coproc_set_ready(struct device *dev, bool ready) { }
++static inline bool apple_sleep_coproc_stopped(struct device *dev) { return false; }
++#endif
++
+ #endif /* _LINUX_SOC_APPLE_SLEEP_H_ */

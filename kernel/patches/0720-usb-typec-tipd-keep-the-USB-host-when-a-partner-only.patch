@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 18:54:36 +0000
+Subject: [PATCH] usb: typec: tipd: keep the USB host when a partner only
+ completes PD
+
+A partner is first reported with a Type-C current, and its PD contract
+and identity follow in later interrupts. cd321x_connect() re-reads the
+identity on each PD power status interrupt and debounces the update by
+500 ms. cd321x_update_work() then compares the new state with the
+registered partner: a contract that has appeared, or an identity that
+has just been read, counts as a different partner. A different partner
+sets was_disconnected, which sets the USB role to none, the mux to safe,
+and then the same host role again.
+
+On the M4 MacBook Pro (sn201202x, which shares this worker) that removes
+and re-creates the xHCI host about half a second after the first device
+enumerated: with an iPhone on the front-left port, the host came up,
+enumerated the phone, was removed 517 ms after the PD controller's
+firmware logged its event, and came up again 10 ms later to enumerate the
+phone a second time. Every device on the port is disconnected once per
+attach.
+
+Treat a partner that only completes PD on the same plug as the same
+partner: no plug, orientation, tunnel or forced reset in the update, no
+change to any bit that routes the lanes or selects the USB role, and
+either the contract has just appeared or the identity has just been read.
+Refresh the partner object then, so it is registered with its PD
+identity, and leave the USB role and the mux as they are. A contract or
+identity that goes away, a different known identity, and any routing
+change still reconfigure the port as before.
+
+KUnit: the contract appearing, the identity arriving and unrelated bits
+keep the link; a different identity, a lost contract, each link reset and
+each routing bit reconfigure.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/usb/typec/tipd/cd321x-dp-test.c | 67 +++++++++++++++++++++++++
+ drivers/usb/typec/tipd/cd321x-dp.h      | 36 +++++++++++++
+ drivers/usb/typec/tipd/core.c           | 14 ++++--
+ 3 files changed, 114 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/usb/typec/tipd/cd321x-dp-test.c b/drivers/usb/typec/tipd/cd321x-dp-test.c
+index 1aed96431f..b139a4ebb5 100644
+--- a/drivers/usb/typec/tipd/cd321x-dp-test.c
++++ b/drivers/usb/typec/tipd/cd321x-dp-test.c
+@@ -343,6 +343,67 @@ static void cd321x_dp_retry_after_teardown_test(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, cd321x_dp_event(&u, true), CD321X_DP_EVENT_CONNECTED);
+ }
+ 
++/* A USB 2 link in host role, as an iPhone gives before and after its PD contract. */
++#define USB2_HOST	(TPS_DATA_STATUS_DATA_CONNECTION | TPS_DATA_STATUS_USB2_CONNECTION)
++
++/* Type-C current first, then the PD contract on the same plug: keep the USB link. */
++static void cd321x_partner_pd_contract_keeps_link_test(struct kunit *test)
++{
++	KUNIT_EXPECT_TRUE(test, cd321x_partner_completed(false, true, false, false, 0, 0));
++	KUNIT_EXPECT_TRUE(test, cd321x_partner_completed(false, true, false, true, 0, 0));
++	/* Only bits that do not route anything changed. */
++	KUNIT_EXPECT_TRUE(test, cd321x_partner_completed(false, true, false, true, 0,
++							 TPS_DATA_STATUS_USB3_GEN2 |
++							 TPS_DATA_STATUS_POWER_MISMATCH));
++}
++
++/* The identity read after the contract: still the same partner. */
++static void cd321x_partner_identity_arrives_test(struct kunit *test)
++{
++	KUNIT_EXPECT_TRUE(test, cd321x_partner_completed(true, true, false, true, 0, 0));
++}
++
++/* A partner whose identity differs from a known one is a different partner. */
++static void cd321x_partner_other_identity_test(struct kunit *test)
++{
++	KUNIT_EXPECT_FALSE(test, cd321x_partner_completed(true, true, true, true, 0, 0));
++}
++
++/* No contract now, or one that went away: full reconfiguration as before. */
++static void cd321x_partner_no_contract_test(struct kunit *test)
++{
++	KUNIT_EXPECT_FALSE(test, cd321x_partner_completed(false, false, false, false, 0, 0));
++	KUNIT_EXPECT_FALSE(test, cd321x_partner_completed(true, false, true, false, 0, 0));
++}
++
++/* A plug, flip, tunnel or forced reset in the same update always reconfigures. */
++static void cd321x_partner_link_reset_test(struct kunit *test)
++{
++	static const u32 resets[] = {
++		CD321X_DP_RESET_PLUG, CD321X_DP_RESET_FLIP, CD321X_DP_RESET_TUNNEL,
++		CD321X_DP_RESET_FORCED,
++	};
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(resets); i++)
++		KUNIT_EXPECT_FALSE(test, cd321x_partner_completed(false, true, false, true,
++								  resets[i], 0));
++}
++
++/* A routing change with the contract (role, USB 3, DP, TBT, USB4) reconfigures. */
++static void cd321x_partner_route_change_test(struct kunit *test)
++{
++	const u32 changes[] = {
++		TPS_DATA_STATUS_USB_DATA_ROLE, TPS_DATA_STATUS_USB3_CONNECTION,
++		TPS_DATA_STATUS_DP_CONNECTION, TPS_DATA_STATUS_TBT_CONNECTION,
++		CD321X_DATA_STATUS_USB4_CONNECTION, TPS_DATA_STATUS_USB2_CONNECTION,
++		USB2_HOST, FIELD_PREP(TPS_DATA_STATUS_DP_PIN_ASSIGNMENT_MASK, 1),
++	};
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(changes); i++)
++		KUNIT_EXPECT_FALSE(test, cd321x_partner_completed(false, true, false, true, 0,
++								  changes[i]));
++}
++
+ static struct kunit_case cd321x_dp_cases[] = {
+ 	KUNIT_CASE(cd321x_dp_first_hpd_connects_test),
+ 	KUNIT_CASE(cd321x_dp_route_without_hpd_test),
+@@ -364,6 +425,12 @@ static struct kunit_case cd321x_dp_cases[] = {
+ 	KUNIT_CASE(cd321x_dp_irq_hpd_with_link_reset_test),
+ 	KUNIT_CASE(cd321x_dp_retrain_needs_live_sink_test),
+ 	KUNIT_CASE(cd321x_dp_retry_after_teardown_test),
++	KUNIT_CASE(cd321x_partner_pd_contract_keeps_link_test),
++	KUNIT_CASE(cd321x_partner_identity_arrives_test),
++	KUNIT_CASE(cd321x_partner_other_identity_test),
++	KUNIT_CASE(cd321x_partner_no_contract_test),
++	KUNIT_CASE(cd321x_partner_link_reset_test),
++	KUNIT_CASE(cd321x_partner_route_change_test),
+ 	{}
+ };
+ 
+diff --git a/drivers/usb/typec/tipd/cd321x-dp.h b/drivers/usb/typec/tipd/cd321x-dp.h
+index 85b024ddc8..2f643b24e5 100644
+--- a/drivers/usb/typec/tipd/cd321x-dp.h
++++ b/drivers/usb/typec/tipd/cd321x-dp.h
+@@ -113,6 +113,42 @@ static inline bool cd321x_dp_teardown(const struct cd321x_dp_update *u)
+ 	       cd321x_dp_mode_changed(u->data_status, u->changed);
+ }
+ 
++/* DATA_STATUS bits that select how the port's lanes and the USB role are routed. */
++#define CD321X_ROUTE_BITS \
++	(TPS_DATA_STATUS_DATA_CONNECTION | TPS_DATA_STATUS_USB2_CONNECTION | \
++	 TPS_DATA_STATUS_USB3_CONNECTION | TPS_DATA_STATUS_USB_DATA_ROLE | \
++	 CD321X_DP_MODE_BITS | TPS_DATA_STATUS_TBT_CONNECTION | \
++	 CD321X_DATA_STATUS_USB4_CONNECTION)
++
++/**
++ * cd321x_partner_completed() - The partner on the plug finished its PD negotiation
++ * @was_pd: the registered partner had a PD contract
++ * @is_pd: the partner has a PD contract now
++ * @had_identity: the registered partner's PD identity was read (not all zero)
++ * @has_identity: the PD identity read now is not all zero
++ * @link_reset: CD321X_DP_RESET_* of this update before any partner comparison
++ * @changed: DATA_STATUS bits that changed since the previous update
++ *
++ * A partner shows up first with a Type-C current, its PD contract follows, and
++ * the identity is read after that, each in its own debounced update. That is
++ * the same partner on the same plug, and its USB link is up already: the
++ * partner object is refreshed, but the USB role and the mux must stay, or the
++ * USB host and every device on it are removed and created again.
++ *
++ * Return: true for that case only. A contract or identity that goes away, a
++ * different identity, a plug or orientation event, or any routing change is
++ * left to the full reconfiguration.
++ */
++static inline bool cd321x_partner_completed(bool was_pd, bool is_pd, bool had_identity,
++					    bool has_identity, u32 link_reset, u32 changed)
++{
++	if (link_reset || (changed & CD321X_ROUTE_BITS) || !is_pd)
++		return false;
++	if (!was_pd)
++		return true;
++	return !had_identity && has_identity;
++}
++
+ /* @route_up: the update left this port's display route up. */
+ static inline enum cd321x_dp_event
+ cd321x_dp_event(const struct cd321x_dp_update *u, bool route_up)
+diff --git a/drivers/usb/typec/tipd/core.c b/drivers/usb/typec/tipd/core.c
+index bd1102bca8..33a798b570 100644
+--- a/drivers/usb/typec/tipd/core.c
++++ b/drivers/usb/typec/tipd/core.c
+@@ -1075,7 +1075,15 @@ static void cd321x_update_work(struct work_struct *work)
+ 	}
+ 
+ 	bool is_pd = pwr_opmode == TYPEC_PWR_MODE_PD;
+-	bool new_partner = old_connected && new_connected &&
++	/* The same partner completing PD keeps its USB link: refresh it only. */
++	bool partner_completed = old_connected && new_connected &&
++		cd321x_partner_completed(cd321x->cur_partner_is_pd, is_pd,
++					 memchr_inv(&cd321x->cur_partner_identity, 0,
++						    sizeof(cd321x->cur_partner_identity)),
++					 memchr_inv(&st.partner_identity, 0,
++						    sizeof(st.partner_identity)),
++					 reset, st.data_status_changed);
++	bool new_partner = old_connected && new_connected && !partner_completed &&
+ 		(is_pd != cd321x->cur_partner_is_pd ||
+ 		 (is_pd && memcmp(&st.partner_identity,
+ 				  &cd321x->cur_partner_identity, sizeof(struct usb_pd_identity))));
+@@ -1145,8 +1153,8 @@ static void cd321x_update_work(struct work_struct *work)
+ 			goto retry;
+ 	}
+ 
+-	/* Process partner disconnection or change */
+-	if (!new_connected || partner_changed) {
++	/* Process partner disconnection or change, or refresh a completed one */
++	if (!new_connected || partner_changed || partner_completed) {
+ 		if (!IS_ERR(tps->partner))
+ 			typec_unregister_partner(tps->partner);
+ 		tps->partner = NULL;

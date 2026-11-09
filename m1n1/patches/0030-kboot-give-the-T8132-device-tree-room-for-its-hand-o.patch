@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 15:40:00 +0000
+Subject: [PATCH] kboot: give the T8132 device tree room for its hand-offs
+
+kboot_prepare_dt() opens the FDT into fdt_totalsize() + 96K, with more
+for T6030, T6031, T6032 and T8122, but nothing more for T8132, although
+a T8132 hands over its AOP (firmware segments and 15 DAPF windows in
+/reserved-memory), its external DCP firmware, its suspend-to-RAM
+mailbox, its AOP motion calibration and its ANE firmware.
+
+On the J604 with the linux-aurora 1.611 trees, the series without the
+external DCP, s2r and calibration hand-offs left 638 bytes ("free dt
+buffer space low, 638 bytes left"). With them, the first AOP DAPF window
+no longer fit ("FDT: failed to add node 'asc-mmio@3882b4000' to
+'/reserved-memory'"), dt_set_t8132_aop() disabled the AOP ("disabling
+the AOP: its DAPF windows are not reserved"), and 7 bytes were left. The
+AOP's audio child is the CPU DAI of both the speaker and the jack card
+of the J604 device tree, so neither card registered, and
+speakersafetyd had no speaker card.
+
+Give a T8132 4 x 16K more, as T6030 and T6031 get, and print the libfdt
+error when a reserved-memory node cannot be added.
+
+tests: test_t8132_dt_bufsize compiles the dt_bufsize block of
+src/kboot.c and checks every chip's budget (only T8132 changes, by 64K),
+and that the reserved-memory failure carries the libfdt error. Both
+cases fail against the previous kboot.c.
+
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ src/kboot.c                           |  9 +++-
+ tests/python/test_t8132_dt_bufsize.py | 66 +++++++++++++++++++++++++++
+ 2 files changed, 74 insertions(+), 1 deletion(-)
+ create mode 100644 tests/python/test_t8132_dt_bufsize.py
+
+diff --git a/src/kboot.c b/src/kboot.c
+index 03115e98..11e09579 100644
+--- a/src/kboot.c
++++ b/src/kboot.c
+@@ -2186,7 +2186,7 @@ static int dt_get_or_add_reserved_mem(const char *node_name, const char *compat,
+     if (node < 0) {
+         node = fdt_add_subnode(dt, resv_node, node_name);
+         if (node < 0)
+-            bail("FDT: failed to add node '%s' to  '/reserved-memory'\n", node_name);
++            bail("FDT: failed to add node '%s' to  '/reserved-memory': %d\n", node_name, node);
+ 
+         uint32_t phandle;
+         ret = fdt_generate_phandle(dt, &phandle);
+@@ -7636,6 +7636,13 @@ int kboot_prepare_dt(void *fdt)
+     // A T6032 takes only its firmware image UUID list (about 16K)
+     if (chip_id == T6032)
+         dt_bufsize += SZ_16K;
++    // A T8132 takes its AOP DAPF windows, firmware segments and motion calibration, its external
++    // DCP firmware, its suspend-to-RAM mailbox, its ANE firmware and, once qualified, its ISP
++    // firmware. The J604 left 638 bytes of the 96K before the external DCP, s2r and calibration
++    // hand-offs were added; with them the AOP's first DAPF window no longer fit and the AOP, and
++    // with it the speaker and jack cards, were disabled.
++    if (chip_id == T8132)
++        dt_bufsize += 4 * SZ_16K;
+     dt = memalign(DT_ALIGN, dt_bufsize);
+ 
+     if (fdt_open_into(fdt, dt, dt_bufsize) < 0)
+diff --git a/tests/python/test_t8132_dt_bufsize.py b/tests/python/test_t8132_dt_bufsize.py
+new file mode 100644
+index 00000000..e62211b1
+--- /dev/null
++++ b/tests/python/test_t8132_dt_bufsize.py
+@@ -0,0 +1,66 @@
++# SPDX-License-Identifier: MIT
++"""The FDT buffer budget: compile the dt_bufsize block of kboot_prepare_dt() as it is in
++src/kboot.c and check the extra space each chip gets. A T8132 needs room for its AOP DAPF
++windows after the external DCP, s2r, ANE and calibration hand-offs; with the plain 96K the J604
++AOP was disabled (no room for 'asc-mmio@...' in /reserved-memory)."""
++
++import os
++import re
++import shutil
++import subprocess
++import tempfile
++
++import pytest
++
++ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++SZ_16K = 16384
++CHIPS = ["T8103", "T6000", "T8112", "T6020", "T6030", "T6031", "T6032", "T8122", "T8132", "T8140"]
++# Extra 16K blocks on top of fdt_totalsize(): 6 for every chip, plus the per-chip terms.
++WANT = {"T8103": 6, "T6000": 6, "T8112": 6, "T6020": 6, "T6030": 12, "T6031": 10,
++        "T6032": 7, "T8122": 16, "T8132": 10, "T8140": 6}
++
++
++def budget_block():
++    src = open(os.path.join(ROOT, "src", "kboot.c")).read()
++    m = re.search(r"\n(\s*dt_bufsize = fdt_totalsize\(fdt\);.*?)\n\s*dt = memalign\(", src, re.S)
++    assert m, "dt_bufsize block not found in src/kboot.c"
++    block = m.group(1).replace("assert(dt_bufsize);", "")
++    return block
++
++
++@pytest.mark.skipif(shutil.which("cc") is None, reason="no host C compiler")
++def test_dt_bufsize_per_chip():
++    block = budget_block()
++    enum = ", ".join(CHIPS)
++    cases = "\n".join(
++        f'    chip_id = {c}; run(1000); printf("{c} %ld\\n", (long)dt_bufsize - 1000);'
++        for c in CHIPS)
++    prog = f"""
++#include <stdio.h>
++#define SZ_16K {SZ_16K}
++enum {{ {enum} }};
++static int chip_id;
++static long dt_bufsize;
++static long fdt_totalsize(long f) {{ return f; }}
++static void run(long fdt) {{
++{block}
++}}
++int main(void) {{
++{cases}
++    return 0;
++}}
++"""
++    with tempfile.TemporaryDirectory() as d:
++        c = os.path.join(d, "b.c")
++        exe = os.path.join(d, "b")
++        open(c, "w").write(prog)
++        subprocess.run(["cc", "-std=c11", "-Wall", "-Werror", "-o", exe, c], check=True)
++        out = subprocess.run([exe], check=True, capture_output=True, text=True).stdout
++    got = {l.split()[0]: int(l.split()[1]) for l in out.splitlines()}
++    for chip, blocks in WANT.items():
++        assert got[chip] == blocks * SZ_16K, (chip, got[chip], blocks * SZ_16K)
++
++
++def test_reserved_mem_failure_reports_the_libfdt_error():
++    src = open(os.path.join(ROOT, "src", "kboot.c")).read()
++    assert "failed to add node '%s' to  '/reserved-memory': %d\\n\", node_name, node)" in src

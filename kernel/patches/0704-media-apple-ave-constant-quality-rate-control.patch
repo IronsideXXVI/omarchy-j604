@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 23:43:50 +1100
+Subject: [PATCH] media: apple: ave: constant-quality rate control
+
+Offer V4L2_MPEG_VIDEO_BITRATE_MODE_CQ with
+V4L2_CID_MPEG_VIDEO_CONSTANT_QUALITY (0-100, 100 best). The session and
+frame writers already carry the constant-quality layout (rate-control
+mode 3); what was missing was the quality-to-QP mapping. Measured on
+macOS 27.0 on the M4 Pro from the slice QPs of its own VideoToolbox
+output at every quality step 0.00-1.00 (H.264 and HEVC agree, and so
+do the J700 captures at 0.30, 0.60 and 0.90): one QP for every frame,
+capped at 48. Use the same table, no data-rate limit, and twice the
+coded-data capacity, as macOS allows.
+
+Signed-off-by: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Assisted-by: LLM
+(cherry picked from commit a3044a6668c060b08c3d7e4a2a7e0daf4bb80c82)
+---
+ drivers/media/platform/apple/ave/ave-sess.c | 31 ++++++++++++++++++++-
+ drivers/media/platform/apple/ave/ave-v4l2.c | 11 +++++---
+ drivers/media/platform/apple/ave/ave.h      |  1 +
+ 3 files changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/platform/apple/ave/ave-sess.c b/drivers/media/platform/apple/ave/ave-sess.c
+index 902f6faf30..583d5c1998 100644
+--- a/drivers/media/platform/apple/ave/ave-sess.c
++++ b/drivers/media/platform/apple/ave/ave-sess.c
+@@ -27,6 +27,7 @@
+ 
+ #define AVE_RC_VBR 4
+ #define AVE_RC_CBR 2
++#define AVE_RC_CQ 3
+ 
+ /* Filler-data NAL unit types */
+ #define AVE_H264_NAL_FILLER 12
+@@ -106,6 +107,23 @@ static int ave_pick_level(const struct ave_params *p, u32 requested)
+ 	return -EINVAL;
+ }
+ 
++/*
++ * Constant quality: the QP macOS 27.0 encodes with for VideoToolbox quality
++ * q = index / 100 (read from the slice QPs of its own H.264 and HEVC output on
++ * the M4 Pro; the J700 captures at 0.30, 0.60 and 0.90 agree). Every frame of
++ * a constant-quality session uses this one QP, and the QP never exceeds 48.
++ */
++static const u8 ave_cq_qp[101] = {
++	48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 47, 47, 47, 46, 46, 46, 45, 45, 44,
++	44, 44, 43, 43, 43, 42, 42, 42, 41, 41, 40, 40, 40, 39, 39, 39, 38, 38, 37, 37,
++	37, 36, 36, 35, 35, 35, 34, 34, 33, 33, 33, 32, 32, 31, 31, 30, 30, 29, 29, 29,
++	28, 28, 27, 27, 26, 26, 25, 25, 24, 24, 23, 23, 22, 22, 21, 21, 20, 20, 19, 18,
++	18, 17, 17, 16, 15, 15, 14, 13, 12, 11, 10, 9,	8,  7,	6,  5,	4,  3,	2,  1,
++	0,
++};
++
++#define AVE_CQ_MAX_QP 48
++
+ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
+ {
+ 	bool baseline = false;
+@@ -178,7 +196,15 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
+ 	p->gop = ctx->gop_size ?: 120;
+ 
+ 	p->bitrate = ctx->bitrate;
+-	if (ctx->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CBR) {
++	if (ctx->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CQ) {
++		/* One QP for every frame, no data-rate limit, as macOS sets it. */
++		p->rc_mode = AVE_RC_CQ;
++		p->limit_bytes = 0;
++		p->initial_qp = ave_cq_qp[min(ctx->quality, 100U)];
++		p->max_qp = min_t(u32, p->max_qp, AVE_CQ_MAX_QP);
++		if (p->min_qp > (s32)p->max_qp)
++			p->min_qp = p->max_qp;
++	} else if (ctx->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CBR) {
+ 		p->rc_mode = AVE_RC_CBR;
+ 		p->limit_bytes = 0;
+ 	} else {
+@@ -205,6 +231,9 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
+ 	/* 10-bit sessions get a quarter more, as macOS sizes them. */
+ 	if (p->bit_depth == 10)
+ 		p->coded_cap = ALIGN(p->coded_cap * 5 / 4, SZ_16K);
++	/* Constant quality can exceed the bit-rate modes' frame size; macOS sizes up to 2x. */
++	if (p->rc_mode == AVE_RC_CQ)
++		p->coded_cap = ALIGN(p->coded_cap * 2, SZ_16K);
+ 	p->coded_cap = max_t(u32, p->coded_cap, AVE_CODED_MIN);
+ 	if (ctx->ave->layout->counted &&
+ 	    (p->fps_num != 30ULL * p->fps_den ||
+diff --git a/drivers/media/platform/apple/ave/ave-v4l2.c b/drivers/media/platform/apple/ave/ave-v4l2.c
+index ac86638f4c..0faf1cc707 100644
+--- a/drivers/media/platform/apple/ave/ave-v4l2.c
++++ b/drivers/media/platform/apple/ave/ave-v4l2.c
+@@ -420,6 +420,9 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
+ 	case V4L2_CID_MPEG_VIDEO_BITRATE_MODE:
+ 		ctx->bitrate_mode = ctrl->val;
+ 		break;
++	case V4L2_CID_MPEG_VIDEO_CONSTANT_QUALITY:
++		ctx->quality = ctrl->val;
++		break;
+ 	case V4L2_CID_MPEG_VIDEO_BITRATE:
+ 		WRITE_ONCE(ctx->bitrate, ctrl->val);
+ 		break;
+@@ -478,13 +481,13 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
+ 	const struct v4l2_ctrl_ops *ops = &ave_ctrl_ops;
+ 	struct v4l2_ctrl *c;
+ 
+-	v4l2_ctrl_handler_init(hdl, 17);
++	v4l2_ctrl_handler_init(hdl, 18);
+ 
+-	/* Constant quality needs a quality-to-QP mapping that is not known yet. */
+ 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+-			       V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
+-			       BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CQ),
++			       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ, 0,
+ 			       V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
++	/* Constant quality: 100 is the best; same scale as VideoToolbox's 0.0-1.0. */
++	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_CONSTANT_QUALITY, 0, 100, 1, 50);
+ 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE, 100000, 100000000, 1,
+ 			  4000000);
+ 	/*
+diff --git a/drivers/media/platform/apple/ave/ave.h b/drivers/media/platform/apple/ave/ave.h
+index 0f654aa842..bda3949208 100644
+--- a/drivers/media/platform/apple/ave/ave.h
++++ b/drivers/media/platform/apple/ave/ave.h
+@@ -332,6 +332,7 @@ struct ave_ctx {
+ 	struct delayed_work poll_work;
+ 
+ 	u32 bitrate_mode;
++	u32 quality; /* V4L2 constant quality, 0..100 */
+ 	u32 bitrate;
+ 	u32 bitrate_peak;
+ 	u32 gop_size;

@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Sun, 1 Nov 2026 14:34:23 +1100
+Subject: [PATCH] media: v4l2-mem2mem: support detached buffers for pipelined
+ dispatch
+
+Plain job_finish() warns for every HOLD_CAPTURE-capable queue, even when
+the current source is a final slice. buf_done_and_job_finish() releases
+OUTPUT and final CAPTURE immediately, so neither API can hand both active
+buffers to an asynchronous frame slot while releasing the scheduler.
+
+Add job_finish_detach() to atomically remove the current pair and finish
+dispatch without completing either buffer. Document the driver's DMA
+ownership and eventual completion obligations. Reject partial HOLD slices;
+they continue to use the existing held-buffer completion API.
+
+Use this handoff for AVD's final slices to preserve early dispatch and
+VP/PP overlap. Return slot-owned buffers only after tagged retirement or
+quiesced recovery. Reject stale deferred submit work whose context no
+longer owns the running m2m dispatch. Keep existing HOLD warnings intact.
+
+Exercise the production core helpers and AVD submit/send/retire with a
+strict host scheduler: held/final slices, overlapping pictures, two
+contexts, capacity and inbox retries, stale work and error paths.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+
+[j604: backport, v4l2-mem2mem.c and v4l2-mem2mem.h hunks only. The AVD hunks of this commit
+ (avd-queue.c/.h, avd-protocol.rst, tests/) arrive with the AVD driver sync that follows.]
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+(cherry picked from commit 6e3a36cd298ed36d9962641849a7596181b9171f)
+---
+ drivers/media/v4l2-core/v4l2-mem2mem.c | 28 ++++++++++++++++++++++++++
+ include/media/v4l2-mem2mem.h           | 18 +++++++++++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/drivers/media/v4l2-core/v4l2-mem2mem.c b/drivers/media/v4l2-core/v4l2-mem2mem.c
+index a65cbb124c..d8122b509d 100644
+--- a/drivers/media/v4l2-core/v4l2-mem2mem.c
++++ b/drivers/media/v4l2-core/v4l2-mem2mem.c
+@@ -503,6 +503,34 @@ void v4l2_m2m_job_finish(struct v4l2_m2m_dev *m2m_dev,
+ }
+ EXPORT_SYMBOL(v4l2_m2m_job_finish);
+ 
++void v4l2_m2m_job_finish_detach(struct v4l2_m2m_dev *m2m_dev,
++			      struct v4l2_m2m_ctx *m2m_ctx)
++{
++	struct vb2_v4l2_buffer *src_buf, *dst_buf;
++	bool schedule_next = false;
++	unsigned long flags;
++
++	spin_lock_irqsave(&m2m_dev->job_spinlock, flags);
++	if (WARN_ON(m2m_dev->curr_ctx != m2m_ctx))
++		goto unlock;
++	src_buf = v4l2_m2m_next_src_buf(m2m_ctx);
++	dst_buf = v4l2_m2m_next_dst_buf(m2m_ctx);
++	/* Partial slices must use buf_done_and_job_finish() and keep CAPTURE. */
++	if (WARN_ON(!src_buf || !dst_buf ||
++		    (src_buf->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF)))
++		goto unlock;
++
++	v4l2_m2m_src_buf_remove(m2m_ctx);
++	v4l2_m2m_dst_buf_remove(m2m_ctx);
++	dst_buf->is_held = false;
++	schedule_next = _v4l2_m2m_job_finish(m2m_dev, m2m_ctx);
++ unlock:
++	spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags);
++	if (schedule_next)
++		v4l2_m2m_schedule_next_job(m2m_dev, m2m_ctx);
++}
++EXPORT_SYMBOL_GPL(v4l2_m2m_job_finish_detach);
++
+ void v4l2_m2m_buf_done_and_job_finish(struct v4l2_m2m_dev *m2m_dev,
+ 				      struct v4l2_m2m_ctx *m2m_ctx,
+ 				      enum vb2_buffer_state state)
+diff --git a/include/media/v4l2-mem2mem.h b/include/media/v4l2-mem2mem.h
+index 31de25d792..5284bc506f 100644
+--- a/include/media/v4l2-mem2mem.h
++++ b/include/media/v4l2-mem2mem.h
+@@ -200,6 +200,24 @@ void v4l2_m2m_try_schedule(struct v4l2_m2m_ctx *m2m_ctx);
+ void v4l2_m2m_job_finish(struct v4l2_m2m_dev *m2m_dev,
+ 			 struct v4l2_m2m_ctx *m2m_ctx);
+ 
++/**
++ * v4l2_m2m_job_finish_detach() - detach buffers and release a dispatch
++ * @m2m_dev: mem2mem device
++ * @m2m_ctx: context of the running job
++ *
++ * Remove the current source and destination from their ready lists and finish
++ * the running job, without completing either buffer. The driver must save both
++ * buffer pointers before calling, retain ownership until hardware has stopped
++ * accessing them, and eventually complete them with v4l2_m2m_buf_done().
++ *
++ * This may be used by pipelined drivers on HOLD_CAPTURE-capable queues only
++ * for a source without V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF. Partial slices must
++ * instead use v4l2_m2m_buf_done_and_job_finish() to retain the capture buffer.
++ * The destination is no longer held or visible to subsequent m2m scheduling.
++ */
++void v4l2_m2m_job_finish_detach(struct v4l2_m2m_dev *m2m_dev,
++			      struct v4l2_m2m_ctx *m2m_ctx);
++
+ /**
+  * v4l2_m2m_buf_done_and_job_finish() - return source/destination buffers with
+  * state and inform the framework that a job has been finished and have it

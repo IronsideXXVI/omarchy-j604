@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 13:55:33 +0000
+Subject: [PATCH] soc: apple: s2r: Show the RVBARs it checked in debugfs
+
+apple_s2r_check_rvbar() reads every online core's RVBAR at probe and the
+sleeping core's before each arm, and refuses a suspend-to-RAM unless each
+is locked to the reset vector the boot firmware verified. Keep what it
+read, per core, and show it in debugfs apple-s2r/rvbar with the verified
+vector, so a dev-loop check can see the values without reading any
+register itself. Showing the file reads nothing: a core the driver never
+checked is listed as not read.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/soc/apple/apple-s2r.c | 58 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index 50dff16cb7..8f0c4067d7 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -68,6 +68,7 @@
+ #include <linux/mutex.h>
+ #include <linux/cacheflush.h>
+ #include <linux/cpu.h>
++#include <linux/debugfs.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ #include <linux/mfd/syscon.h>
+@@ -77,6 +78,7 @@
+ #include <linux/of_irq.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
++#include <linux/seq_file.h>
+ #include <linux/soc/apple/sleep.h>
+ #include <linux/suspend.h>
+ #include <linux/syscore_ops.h>
+@@ -217,6 +219,9 @@ struct apple_s2r {
+ 	/* The vector the boot firmware verified, and every core's RVBAR */
+ 	u64 reset_vector;
+ 	void __iomem **rvbar;
++	/* What apple_s2r_check_rvbar() last read, per core (debugfs only) */
++	u64 *rvbar_last;
++	cpumask_t rvbar_seen;
+ 
+ 	u32 cpu_clusters[S2R_MAX_CLUSTERS];
+ 	u32 cpu_cluster_saved[S2R_MAX_CLUSTERS];
+@@ -704,6 +709,9 @@ static int apple_s2r_check_rvbar(struct apple_s2r *s2r, unsigned int cpu)
+ {
+ 	u64 val = readq(s2r->rvbar[cpu]);
+ 
++	WRITE_ONCE(s2r->rvbar_last[cpu], val);
++	cpumask_set_cpu(cpu, &s2r->rvbar_seen);
++
+ 	if ((val & IMPL_RVBAR_LOCK) &&
+ 	    (val & IMPL_RVBAR_ADDR) == s2r->reset_vector)
+ 		return 0;
+@@ -714,6 +722,49 @@ static int apple_s2r_check_rvbar(struct apple_s2r *s2r, unsigned int cpu)
+ 	return -EIO;
+ }
+ 
++/*
++ * debugfs apple-s2r/rvbar: the RVBARs apple_s2r_check_rvbar() read, at probe
++ * for every online core and before each arm for the sleeping one. Showing
++ * them reads no register.
++ */
++static int apple_s2r_rvbar_show(struct seq_file *m, void *unused)
++{
++	struct apple_s2r *s2r = apple_s2r;
++	unsigned int cpu;
++
++	if (!s2r || !s2r->rvbar_last)
++		return -ENODEV;
++
++	seq_printf(m, "reset_vector %#llx\n", s2r->reset_vector);
++	for_each_possible_cpu(cpu) {
++		u64 val = READ_ONCE(s2r->rvbar_last[cpu]);
++		bool ok = (val & IMPL_RVBAR_LOCK) &&
++			  (val & IMPL_RVBAR_ADDR) == s2r->reset_vector;
++
++		if (!cpumask_test_cpu(cpu, &s2r->rvbar_seen))
++			seq_printf(m, "cpu%u not read\n", cpu);
++		else
++			seq_printf(m, "cpu%u %#018llx lock %u %s\n", cpu, val,
++				   (unsigned int)(val & IMPL_RVBAR_LOCK),
++				   ok ? "ok" : "MISMATCH");
++	}
++	return 0;
++}
++
++static void apple_s2r_debugfs_remove(void *dir)
++{
++	debugfs_remove_recursive(dir);
++}
++
++static void apple_s2r_debugfs_init(struct device *dev)
++{
++	struct dentry *dir = debugfs_create_dir("apple-s2r", NULL);
++
++	if (devm_add_action_or_reset(dev, apple_s2r_debugfs_remove, dir))
++		return;
++	debugfs_create_devm_seqfile(dev, "rvbar", dir, apple_s2r_rvbar_show);
++}
++
+ static int apple_s2r_check(struct apple_s2r *s2r, enum apple_s2r_step step)
+ {
+ 	s2r->failed_step = step;
+@@ -989,6 +1040,10 @@ static int apple_s2r_verify_reset_vector(struct apple_s2r *s2r)
+ 				  GFP_KERNEL);
+ 	if (!s2r->rvbar)
+ 		return -ENOMEM;
++	s2r->rvbar_last = devm_kcalloc(dev, nr_cpu_ids, sizeof(*s2r->rvbar_last),
++				       GFP_KERNEL);
++	if (!s2r->rvbar_last)
++		return -ENOMEM;
+ 	ret = devm_add_action_or_reset(dev, apple_s2r_unmap_rvbars, s2r);
+ 	if (ret)
+ 		return ret;
+@@ -1183,6 +1238,9 @@ static int apple_s2r_probe(struct platform_device *pdev)
+ 
+ 	suspend_set_ops(&apple_s2r_ops);
+ 
++	if (s2r->rvbar_last)
++		apple_s2r_debugfs_init(dev);
++
+ 	if (s2r->mailbox)
+ 		dev_info(dev, "suspend-to-RAM available (mailbox at %#llx, reset vector %#llx)%s\n",
+ 			 mailbox, s2r->reset_vector,

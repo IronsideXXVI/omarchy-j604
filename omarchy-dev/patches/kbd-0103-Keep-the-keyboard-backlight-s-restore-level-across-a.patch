@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 7 Nov 2026 03:10:00 +0000
+Subject: [PATCH 103/104] Keep the keyboard backlight's restore level across a
+ reboot
+
+`off` records the level it blanks in the runtime directory, which a reboot clears. A shutdown taken while the keys are dark (the lock's blank, or an idle timeout) makes systemd-backlight save the 0 it reads and bring it back at boot, and the next wake has no record to restore: the keys stay dark until a brightness key is pressed.
+
+The record now lives in the state directory, and a record an earlier version left in the runtime directory is taken over. `off` and `restore` keep their semantics otherwise.
+
+`up`, `down` and `cycle` take the same lock, and a key pressed while the keys are blanked steps from the recorded level and spends the record, so the key and the wake it causes agree whichever runs first.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ bin/omarchy-brightness-keyboard          | 41 ++++++++++++++----
+ test/shell.d/brightness-keyboard-test.sh | 54 ++++++++++++++++++++++--
+ 2 files changed, 83 insertions(+), 12 deletions(-)
+
+diff --git a/bin/omarchy-brightness-keyboard b/bin/omarchy-brightness-keyboard
+index fa71b8aecf8989d541890f93d6845b47da6c1019..a3a0d049d6581ce595e797dbf6866db8ed03db73 100755
+--- a/bin/omarchy-brightness-keyboard
++++ b/bin/omarchy-brightness-keyboard
+@@ -26,19 +26,28 @@ if [[ -z $device ]]; then
+ fi
+ 
+ # The level from before the first "off" since the last "restore", so the lock
+-# blanking again after a resume cannot save its own 0 over it.
+-saved="${XDG_RUNTIME_DIR:-/tmp}/omarchy-brightness-keyboard-$device"
++# blanking again after a resume cannot save its own 0 over it. It is kept in
++# the state directory, not the runtime one: a reboot taken while the keys are
++# blanked brings the LED back at 0 (systemd-backlight saves the level it reads
++# at shutdown), and the next wake still knows the level to restore.
++saved="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/brightness-keyboard-$device"
++# Where earlier versions kept the record, for a blank taken before an update.
++legacy_saved="${XDG_RUNTIME_DIR:-/tmp}/omarchy-brightness-keyboard-$device"
+ 
+-if [[ $direction == "off" || $direction == "restore" ]]; then
+-  # The lock runs blank and wake as separate processes that can overlap.
+-  exec {lock_fd}>"$saved.lock" || exit 1
+-  flock "$lock_fd" || exit 1
++# The lock runs blank and wake as separate processes that can overlap, and an
++# idle timeout's wake can run while a brightness key steps the level, so every
++# change to the level or its record takes the lock.
++exec {lock_fd}>"${XDG_RUNTIME_DIR:-/tmp}/omarchy-brightness-keyboard-$device.lock" || exit 1
++flock "$lock_fd" || exit 1
++
++if [[ ! -s $saved && -s $legacy_saved ]]; then
++  mkdir -p "${saved%/*}" 2>/dev/null && mv -f "$legacy_saved" "$saved" 2>/dev/null
+ fi
+ 
+ if [[ $direction == "off" ]]; then
+   if [[ ! -s $saved ]]; then
+     level="$(brightnessctl -d "$device" get)"
+-    if [[ $level =~ ^[0-9]+$ ]] && ! echo "$level" >"$saved"; then
++    if [[ $level =~ ^[0-9]+$ ]] && ! { mkdir -p "${saved%/*}" && echo "$level" >"$saved"; }; then
+       rm -f "$saved"
+     fi
+   fi
+@@ -59,6 +68,17 @@ fi
+ max_brightness="$(brightnessctl -d "$device" max)"
+ current_brightness="$(brightnessctl -d "$device" get)"
+ 
++# A key pressed while the keys are blanked steps from the level a wake would
++# bring back, not from the blank, whichever of the two runs first.
++blanked=0
++if [[ -s $saved ]]; then
++  level="$(<"$saved")"
++  if [[ $level =~ ^[0-9]+$ ]]; then
++    current_brightness=$level
++    blanked=1
++  fi
++fi
++
+ # Calculate step as 10% of max brightness. Keyboards with many levels (e.g. 512)
+ # need larger steps; keyboards with few levels (e.g. 3) fall back to step=1.
+ step=$(( max_brightness / 10 ))
+@@ -75,6 +95,9 @@ else
+   (( new_brightness < 0 )) && new_brightness=0
+ fi
+ 
+-# Set the new brightness.
+-brightnessctl -d "$device" set "$new_brightness" >/dev/null
++# Set the new brightness. The keys chose it, so a blank's record is spent.
++brightnessctl -d "$device" set "$new_brightness" >/dev/null || exit 1
++(( blanked )) && rm -f "$saved"
++# The OSD must not hold the lock.
++exec {lock_fd}>&-
+ (( no_osd )) || omarchy-osd -i keyboard -p "$(( new_brightness * 100 / max_brightness ))"
+diff --git a/test/shell.d/brightness-keyboard-test.sh b/test/shell.d/brightness-keyboard-test.sh
+index b0501735236bca2e465ee4bdaeeff0c9e104366f..50b8a124cefe00c9f78ca9844bf77bafc5831c91 100755
+--- a/test/shell.d/brightness-keyboard-test.sh
++++ b/test/shell.d/brightness-keyboard-test.sh
+@@ -11,7 +11,7 @@ trap 'touch "$test_tmp/pause.go"; wait || true; rm -rf "$test_tmp"' EXIT
+ mock_bin="$test_tmp/bin"
+ leds="$test_tmp/leds"
+ level_file="$test_tmp/level"
+-mkdir -p "$mock_bin" "$leds/asus::kbd_backlight" "$test_tmp/runtime"
++mkdir -p "$mock_bin" "$leds/asus::kbd_backlight" "$test_tmp/runtime" "$test_tmp/state"
+ 
+ # A device holding one level, as the LED class does.
+ cat >"$mock_bin/brightnessctl" <<SH
+@@ -41,7 +41,7 @@ sed -e "s|/sys/class/leds|$leds|g" "$ROOT/bin/omarchy-brightness-keyboard" >"$ke
+ chmod +x "$keyboard"
+ 
+ run_keyboard() {
+-  PATH="$mock_bin:$PATH" XDG_RUNTIME_DIR="$test_tmp/runtime" "$keyboard" "$@"
++  PATH="$mock_bin:$PATH" XDG_RUNTIME_DIR="$test_tmp/runtime" XDG_STATE_HOME="$test_tmp/state" "$keyboard" "$@"
+ }
+ 
+ level() {
+@@ -93,7 +93,8 @@ pass "restore with nothing saved leaves the backlight alone"
+ 
+ # An empty record, as a save that ran out of space leaves, is no record.
+ echo 3 >"$level_file"
+-: >"$test_tmp/runtime/omarchy-brightness-keyboard-asus::kbd_backlight"
++mkdir -p "$test_tmp/state/omarchy"
++: >"$test_tmp/state/omarchy/brightness-keyboard-asus::kbd_backlight"
+ run_keyboard off
+ [[ $(level) == "0" ]] || fail "off blanks over an empty record once it has saved the level (got $(level))"
+ run_keyboard restore
+@@ -114,3 +115,50 @@ touch "$pause.go"
+ wait "$blank" "$wake"
+ [[ $(level) == "3" ]] || fail "a wake overlapping a blank restores the level once the blank is done (got $(level))"
+ pass "a wake overlapping a blank waits for it"
++
++record="$test_tmp/state/omarchy/brightness-keyboard-asus::kbd_backlight"
++
++# A reboot taken while the keys are blanked: the runtime directory is gone and
++# systemd-backlight brings the LED back at the 0 it saved at shutdown.
++echo 3 >"$level_file"
++run_keyboard off
++rm -rf "$test_tmp/runtime" && mkdir -p "$test_tmp/runtime"
++echo 0 >"$level_file"
++run_keyboard restore
++[[ $(level) == "3" ]] || fail "a wake after a reboot taken while blanked restores the level from before the blank (got $(level))"
++[[ ! -e $record ]] || fail "the restore spends the record"
++pass "the blank's record survives a reboot"
++
++# A blank taken by an earlier version kept its record in the runtime directory.
++echo 0 >"$level_file"
++echo 2 >"$test_tmp/runtime/omarchy-brightness-keyboard-asus::kbd_backlight"
++run_keyboard restore
++[[ $(level) == "2" ]] || fail "a record an earlier version kept in the runtime directory is restored (got $(level))"
++[[ ! -e $test_tmp/runtime/omarchy-brightness-keyboard-asus::kbd_backlight ]] || fail "the earlier record is taken over"
++pass "an earlier version's runtime record is taken over"
++
++# A brightness key pressed while the keys are blanked steps from the level a
++# wake brings back, whichever of the key and the wake runs first.
++echo 2 >"$level_file"
++run_keyboard off
++run_keyboard --no-osd up
++[[ $(level) == "3" ]] || fail "up while blanked steps from the saved level (got $(level))"
++run_keyboard restore
++[[ $(level) == "3" ]] || fail "a wake after the key leaves the level the key chose (got $(level))"
++echo 2 >"$level_file"
++run_keyboard off
++run_keyboard restore
++run_keyboard --no-osd up
++[[ $(level) == "3" ]] || fail "up after the wake steps from the restored level (got $(level))"
++echo 2 >"$level_file"
++run_keyboard off
++run_keyboard --no-osd down
++[[ $(level) == "1" ]] || fail "down while blanked steps from the saved level (got $(level))"
++[[ ! -e $record ]] || fail "a key spends the record"
++pass "a key pressed while blanked steps from the level a wake brings back"
++
++# A key that steps the level never leaves a record behind.
++echo 1 >"$level_file"
++run_keyboard --no-osd up
++[[ $(level) == "2" && ! -e $record ]] || fail "up with no blank steps from the LED and writes no record (got $(level))"
++pass "a key with no blank before it steps from the LED"

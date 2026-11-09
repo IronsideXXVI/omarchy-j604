@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 19:03:28 +0000
+Subject: [PATCH] hwmon: macsmc: discover temperatures next to the described
+ ones
+
+apple,discover-temperatures exposes every readable 4-byte float
+temperature key of the running SMC, labelled with its key. It is refused
+when the device tree also describes temperature channels, so a machine
+has either a short labelled table or the full key list, not both.
+
+Allow both. The channels the device tree describes are set up first and
+keep their numbers, labels and thermal zones; the discovered keys follow
+them, without the keys already described. On a machine that describes
+nothing, discovery works as before.
+
+Factor out the key filter and the array growth so that KUnit can check
+them: a described key is not discovered again, keys that are not readable
+4-byte floats are skipped, and the described channels keep their slots
+and labels when the array grows.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/hwmon/macsmc-hwmon-test.c | 74 +++++++++++++++++++++++++++++++
+ drivers/hwmon/macsmc-hwmon.c      | 57 +++++++++++++++++++-----
+ 2 files changed, 119 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/hwmon/macsmc-hwmon-test.c b/drivers/hwmon/macsmc-hwmon-test.c
+index e7239986ce..761060c116 100644
+--- a/drivers/hwmon/macsmc-hwmon-test.c
++++ b/drivers/hwmon/macsmc-hwmon-test.c
+@@ -6,6 +6,7 @@
+  * Included by macsmc-hwmon.c.
+  */
+ 
++#include <kunit/device.h>
+ #include <kunit/test.h>
+ 
+ /* What macsmc_hwmon_create_sensor() leaves behind for one node. */
+@@ -73,9 +74,82 @@ static void macsmc_hwmon_test_temp_label(struct kunit *test)
+ 						      hwmon_temp_input, 1), 0444);
+ }
+ 
++static const struct apple_smc_key_info macsmc_hwmon_test_flt = {
++	.type_code = __SMC_KEY('f', 'l', 't', ' '),
++	.size = 4,
++	.flags = APPLE_SMC_READABLE,
++};
++
++/* Readable four-byte float T keys are discovered, unless the device tree has them. */
++static void macsmc_hwmon_test_discover_wanted(struct kunit *test)
++{
++	struct macsmc_hwmon_sensor sensors[2] = {};
++	struct macsmc_hwmon_sensors temp = { .sensors = sensors };
++	struct apple_smc_key_info info;
++
++	KUNIT_EXPECT_TRUE(test, macsmc_hwmon_discover_wanted(&temp, _SMC_KEY("TCMz"),
++							     &macsmc_hwmon_test_flt));
++	macsmc_hwmon_test_add(&temp, "TCMz", 0);
++	KUNIT_EXPECT_FALSE(test, macsmc_hwmon_discover_wanted(&temp, _SMC_KEY("TCMz"),
++							      &macsmc_hwmon_test_flt));
++	KUNIT_EXPECT_TRUE(test, macsmc_hwmon_discover_wanted(&temp, _SMC_KEY("Tp0Z"),
++							     &macsmc_hwmon_test_flt));
++	/* Not a temperature key. */
++	KUNIT_EXPECT_FALSE(test, macsmc_hwmon_discover_wanted(&temp, _SMC_KEY("F0Ac"),
++							      &macsmc_hwmon_test_flt));
++	info = macsmc_hwmon_test_flt;
++	info.flags = 0;
++	KUNIT_EXPECT_FALSE(test, macsmc_hwmon_discover_wanted(&temp, _SMC_KEY("Tp0Z"), &info));
++	info = macsmc_hwmon_test_flt;
++	info.flags |= APPLE_SMC_FUNCTION;
++	KUNIT_EXPECT_FALSE(test, macsmc_hwmon_discover_wanted(&temp, _SMC_KEY("Tp0Z"), &info));
++	info = macsmc_hwmon_test_flt;
++	info.type_code = __SMC_KEY('i', 'o', 'f', 't');
++	info.size = 8;
++	KUNIT_EXPECT_FALSE(test, macsmc_hwmon_discover_wanted(&temp, _SMC_KEY("TG0B"), &info));
++	info = macsmc_hwmon_test_flt;
++	info.type_code = __SMC_KEY('s', 'i', '3', '2');
++	KUNIT_EXPECT_FALSE(test, macsmc_hwmon_discover_wanted(&temp, _SMC_KEY("TVDi"), &info));
++}
++
++/* Described channels keep their numbers and labels when discovery adds channels. */
++static void macsmc_hwmon_test_temp_grow_keeps_channels(struct kunit *test)
++{
++	struct device *dev = kunit_device_register(test, "macsmc-hwmon-test");
++	struct macsmc_hwmon hwmon = {};
++	struct macsmc_hwmon_sensor *sensor;
++
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
++	hwmon.temp.sensors = devm_kcalloc(dev, 2, sizeof(*sensor), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, hwmon.temp.sensors);
++	macsmc_hwmon_test_add(&hwmon.temp, "TCMz", 0);
++	macsmc_hwmon_test_add(&hwmon.temp, "TH0x", 0);
++
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_temp_grow(dev, &hwmon.temp, 3), 0);
++	KUNIT_EXPECT_EQ(test, hwmon.temp.count, 2);
++	KUNIT_EXPECT_EQ(test, hwmon.temp.sensors[0].macsmc_key, _SMC_KEY("TCMz"));
++	KUNIT_EXPECT_STREQ(test, hwmon.temp.sensors[1].label, "TH0x");
++
++	sensor = &hwmon.temp.sensors[hwmon.temp.count++];
++	sensor->macsmc_key = _SMC_KEY("Tp0Z");
++	sensor->attrs = HWMON_T_INPUT | HWMON_T_LABEL;
++	strscpy_pad(sensor->label, "Tp0Z", sizeof(sensor->label));
++	KUNIT_EXPECT_EQ(test, hwmon.temp.count, 3);
++	KUNIT_EXPECT_EQ(test, macsmc_hwmon_is_visible(&hwmon, hwmon_temp, hwmon_temp_label, 2),
++			0444);
++
++	/* Nothing described yet: the same call sets the array up. */
++	hwmon.temp = (struct macsmc_hwmon_sensors){};
++	KUNIT_ASSERT_EQ(test, macsmc_hwmon_temp_grow(dev, &hwmon.temp, 4), 0);
++	KUNIT_EXPECT_NOT_NULL(test, hwmon.temp.sensors);
++	KUNIT_EXPECT_EQ(test, hwmon.temp.count, 0);
++}
++
+ static struct kunit_case macsmc_hwmon_test_cases[] = {
+ 	KUNIT_CASE(macsmc_hwmon_test_failed_temp_keeps_slot),
+ 	KUNIT_CASE(macsmc_hwmon_test_temp_label),
++	KUNIT_CASE(macsmc_hwmon_test_discover_wanted),
++	KUNIT_CASE(macsmc_hwmon_test_temp_grow_keeps_channels),
+ 	{}
+ };
+ 
+diff --git a/drivers/hwmon/macsmc-hwmon.c b/drivers/hwmon/macsmc-hwmon.c
+index 2d3a74c46f..cec171759b 100644
+--- a/drivers/hwmon/macsmc-hwmon.c
++++ b/drivers/hwmon/macsmc-hwmon.c
+@@ -804,7 +804,47 @@ static void macsmc_hwmon_add_temp_channel(struct macsmc_hwmon_sensors *temp,
+ 		sensor->attrs |= HWMON_T_LABEL;
+ }
+ 
+-/* Discover reporting-only temperatures without a board-specific key table. */
++/* Whether a key of the SMC's key table becomes a discovered temperature channel. */
++static bool macsmc_hwmon_discover_wanted(const struct macsmc_hwmon_sensors *temp, smc_key key,
++					 const struct apple_smc_key_info *info)
++{
++	u32 i;
++
++	if ((key >> 24) != 'T' || !(info->flags & APPLE_SMC_READABLE) ||
++	    (info->flags & APPLE_SMC_FUNCTION) ||
++	    info->type_code != __SMC_KEY('f', 'l', 't', ' ') || info->size != 4)
++		return false;
++	/* A key the device tree describes keeps its own channel and label. */
++	for (i = 0; i < temp->count; i++)
++		if (temp->sensors[i].macsmc_key == key)
++			return false;
++	return true;
++}
++
++/*
++ * Room for @extra more temperature channels. The channels set up so far keep
++ * their numbers, so their labels and the thermal zones on them stay put.
++ */
++static int macsmc_hwmon_temp_grow(struct device *dev, struct macsmc_hwmon_sensors *temp,
++				  u32 extra)
++{
++	struct macsmc_hwmon_sensor *sensors;
++
++	sensors = devm_kcalloc(dev, temp->count + extra, sizeof(*sensors), GFP_KERNEL);
++	if (!sensors)
++		return -ENOMEM;
++	if (temp->count)
++		memcpy(sensors, temp->sensors, temp->count * sizeof(*sensors));
++	if (temp->sensors)
++		devm_kfree(dev, temp->sensors);
++	temp->sensors = sensors;
++	return 0;
++}
++
++/*
++ * Discover the reporting-only temperatures of the running SMC: every readable
++ * temperature key the device tree does not describe, after the described ones.
++ */
+ static int macsmc_hwmon_discover_temperatures(struct macsmc_hwmon *hwmon)
+ {
+ 	struct apple_smc *smc = hwmon->smc;
+@@ -817,18 +857,13 @@ static int macsmc_hwmon_discover_temperatures(struct macsmc_hwmon *hwmon)
+ 	if (!of_property_read_bool(hwmon->dev->of_node, "apple,discover-temperatures"))
+ 		return 0;
+ 
+-	/* Dynamic channel numbers must not replace DT-described channels. */
+-	if (hwmon->temp.count)
+-		return -EINVAL;
+-
+ 	/* Bound both allocation and mailbox transactions for invalid firmware data. */
+ 	if (!smc->key_count || smc->key_count > U16_MAX)
+ 		return -EINVAL;
+ 
+-	hwmon->temp.sensors = devm_kcalloc(hwmon->dev, smc->key_count,
+-					   sizeof(*sensor), GFP_KERNEL);
+-	if (!hwmon->temp.sensors)
+-		return -ENOMEM;
++	ret = macsmc_hwmon_temp_grow(hwmon->dev, &hwmon->temp, smc->key_count);
++	if (ret)
++		return ret;
+ 
+ 	for (i = 0; i < smc->key_count; i++) {
+ 		ret = apple_smc_get_key_by_index(smc, i, &key);
+@@ -846,9 +881,7 @@ static int macsmc_hwmon_discover_temperatures(struct macsmc_hwmon *hwmon)
+ 		ret = apple_smc_get_key_info(smc, key, &info);
+ 		if (ret < 0)
+ 			return ret;
+-		if (!(info.flags & APPLE_SMC_READABLE) ||
+-		    (info.flags & APPLE_SMC_FUNCTION) ||
+-		    info.type_code != __SMC_KEY('f', 'l', 't', ' ') || info.size != 4)
++		if (!macsmc_hwmon_discover_wanted(&hwmon->temp, key, &info))
+ 			continue;
+ 
+ 		sensor = &hwmon->temp.sensors[hwmon->temp.count++];

@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 18:40:24 +0000
+Subject: [PATCH] iommu: apple-dart: let an external DCP power its DARTs down
+ for sleep
+
+A J713/J604 external DCP (dcpext0/1) refuses every sleep that powers
+the SoC down: its firmware DART, preserve_display, saves its state only
+for suspend-to-idle and returns -EBUSY otherwise, and so does its
+display DART (dispext). Only the internal display DARTs, with
+apple,clock-protection, have a power-down their DCP drives
+(apple_dart_dcp_power_off()/_on()).
+
+Give an external DCP's firmware DART that power-down too when its node
+names its clock-protection slice: the J604 runtime ADT gives
+dart-dcpext0 slice 5 and dart-dcpext1 slice 0x1e, and marks both
+retention/retention-force-quiesce like dart-dcp. A DART its DCP has
+powered down is command-gated, so its suspend and resume already leave
+it alone, as for the internal ones.
+
+Its display DART is powered by the firmware, which powers it off with
+the display (D572(0)). Let it take a sleep that powers the SoC down
+only when its own DCP has powered the firmware DART down for that
+sleep (apple_dart_dispext_dcp_down()): the DCP did that after stopping
+its CPU with the display off. Otherwise it refuses as before. Its
+state is checked when the firmware powers it up again, as after any
+sleep (apple_dart_dcp_dispext_state()).
+
+Boards whose DT has no clock-protection on the dcpext DARTs behave as
+before.
+
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/iommu/apple-dart.c | 65 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 62 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/iommu/apple-dart.c b/drivers/iommu/apple-dart.c
+index ff7bdd08ae..1db1882476 100644
+--- a/drivers/iommu/apple-dart.c
++++ b/drivers/iommu/apple-dart.c
+@@ -4368,6 +4368,52 @@ static void apple_dart_dapf_replay(struct apple_dart *dart)
+ 	dev_dbg(dart->dev, "DAPF: %u ranges written back after the sleep\n", dart->dapf_count);
+ }
+ 
++/*
++ * External DCPs: the firmware DART of dcpext0/1 whose DCP may power it down
++ * (apple,clock-protection), by instance. Read without a lock: set at its
++ * probe, cleared at its removal.
++ */
++static struct apple_dart *apple_dart_dcpext_fw[ARRAY_SIZE(dcp_adt_external)];
++
++static void apple_dart_dcpext_fw_unregister(void *data)
++{
++	struct apple_dart *dart = data;
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(apple_dart_dcpext_fw); i++)
++		if (READ_ONCE(apple_dart_dcpext_fw[i]) == dart)
++			WRITE_ONCE(apple_dart_dcpext_fw[i], NULL);
++}
++
++static int apple_dart_dcpext_fw_register(struct device *dev, struct apple_dart *dart,
++					 unsigned int instance)
++{
++	if (instance >= ARRAY_SIZE(apple_dart_dcpext_fw) ||
++	    READ_ONCE(apple_dart_dcpext_fw[instance]))
++		return -EINVAL;
++	WRITE_ONCE(apple_dart_dcpext_fw[instance], dart);
++	return devm_add_action_or_reset(dev, apple_dart_dcpext_fw_unregister, dart);
++}
++
++/*
++ * Whether the external display DART @dart may take a sleep that powers the
++ * SoC down: its DCP has stopped for it and powered its firmware DART down
++ * (apple_dart_dcp_power_off()), its display, and with it this DART, having
++ * gone down before (the firmware's D572(0)). Its state is then checked when
++ * the firmware powers it up again, as after any sleep.
++ */
++static bool apple_dart_dispext_dcp_down(struct apple_dart *dart)
++{
++	if (!pm_suspend_via_firmware())
++		return false;
++	for (unsigned int i = 0; i < ARRAY_SIZE(apple_dart_dcpext_fw); i++) {
++		struct apple_dart *fw = READ_ONCE(apple_dart_dcpext_fw[i]);
++
++		if (fw && fw->dcp_instance == dart->dcp_instance)
++			return READ_ONCE(fw->host_off);
++	}
++	return false;
++}
++
+ static int apple_dart_probe(struct platform_device *pdev)
+ {
+ 	int ret, sid;
+@@ -4489,8 +4535,13 @@ static int apple_dart_probe(struct platform_device *pdev)
+ 	dart->preserve_display = j713_display || j713_dcpext || j713_dispext;
+ 	dart->dispext = j713_dispext;
+ 	dart->power_gated = j713_dispext;
+-	if (j713_display && of_property_present(dev->of_node, "apple,clock-protection")) {
+-		/* Its DCP can power it down: see apple_dart_dcp_power_off(). */
++	/*
++	 * Its DCP can power it down: see apple_dart_dcp_power_off(). The
++	 * internal display DARTs while the display is blanked; an external
++	 * DCP's firmware DART for a sleep that powers the SoC down.
++	 */
++	if ((j713_display || j713_dcpext) &&
++	    of_property_present(dev->of_node, "apple,clock-protection")) {
+ 		dart->ps_prot = syscon_regmap_lookup_by_phandle_args(dev->of_node,
+ 								     "apple,clock-protection",
+ 								     1, &dart->ps_prot_slice);
+@@ -4509,6 +4560,13 @@ static int apple_dart_probe(struct platform_device *pdev)
+ 		dart->dcp_instance = &dcp_adt_external[res->start == 0x48a300000ULL];
+ 	else if (j713_display)
+ 		dart->dcp_instance = &dcp_adt_internal;
++	/* Its display DART asks it before a sleep: apple_dart_dispext_dcp_down(). */
++	if (j713_dcpext && dart->ps_prot) {
++		ret = apple_dart_dcpext_fw_register(dev, dart,
++						    res->start == 0x48a340000ULL);
++		if (ret)
++			return ret;
++	}
+ 	if (tunneled) {
+ 		pd_np = of_parse_phandle(dev->of_node, "power-domains", 0);
+ 		if (pd_np) {
+@@ -5370,7 +5428,8 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
+ 	 * again.
+ 	 */
+ 	if (dart->dispext) {
+-		if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
++		if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE &&
++		    !apple_dart_dispext_dcp_down(dart))
+ 			return -EBUSY;
+ 		if (apple_dart_has_borrowed(dart))
+ 			apple_dart_pm_invalidate(dart, true);

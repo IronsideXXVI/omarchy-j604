@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 21:13:49 +1100
+Subject: [PATCH 7/7] wireplumber: hide the microphone cards from clients
+
+The mic graph puts its filter in front of the raw microphone node and
+hides that node (software-dsp hide-parent), but not the card. Desktops
+build their device lists from card ports as well as from sinks and
+sources, so GNOME, KDE and other PulseAudio clients list the card's
+"Microphone" port as a second built-in microphone beside the filter's
+"MacBook ... Microphone" source. Picking it selects nothing.
+
+asahi-hide-devices.lua takes every permission on a device that sets
+asahi.hide-device = true away from every client but WirePlumber, the way
+software-dsp hides the node. WirePlumber keeps managing the card. The
+microphone cards (the HPAI cards and the J700's AOP card), whose only
+node is the hidden raw microphone, set it. speakerguardd v2 sets it on a
+speaker card that has no jack (the J616s), whose only port is the
+speakers that its voicing sink already is.
+
+Signed-off-by: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Assisted-by: LLM
+---
+ Makefile                    |  1 +
+ conf/asahi-hide-devices.lua | 58 +++++++++++++++++++++++++++++++++++++
+ conf/wireplumber.conf       | 24 +++++++++++++++
+ 3 files changed, 83 insertions(+)
+ create mode 100644 conf/asahi-hide-devices.lua
+
+diff --git a/Makefile b/Makefile
+index eccf688..23f8b7d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -47,6 +47,7 @@ core:
+ 	install -pm0644 conf/wireplumber.conf $(DESTDIR)/$(DATA_DIR)/wireplumber/wireplumber.conf.d/99-asahi.conf
+ 	install -pm0644 conf/asahi-lock-volume.lua $(DESTDIR)/$(DATA_DIR)/wireplumber/scripts/device/asahi-lock-volume.lua
+ 	install -pm0644 conf/asahi-unplugged-routes.lua $(DESTDIR)/$(DATA_DIR)/wireplumber/scripts/device/asahi-unplugged-routes.lua
++	install -pm0644 conf/asahi-hide-devices.lua $(DESTDIR)/$(DATA_DIR)/wireplumber/scripts/device/asahi-hide-devices.lua
+ 	install -pm0644 conf/asahi-restore-volume.lua $(DESTDIR)/$(DATA_DIR)/wireplumber/scripts/node/asahi-restore-volume.lua
+ 	install -pm0644 conf/pipewire.conf $(DESTDIR)/$(DATA_DIR)/pipewire/pipewire.conf.d/99-asahi.conf
+ 	install -pm0644 conf/pipewire.conf $(DESTDIR)/$(DATA_DIR)/pipewire/pipewire-pulse.conf.d/99-asahi.conf
+diff --git a/conf/asahi-hide-devices.lua b/conf/asahi-hide-devices.lua
+new file mode 100644
+index 0000000..3617136
+--- /dev/null
++++ b/conf/asahi-hide-devices.lua
+@@ -0,0 +1,58 @@
++-- SPDX-License-Identifier: MIT
++--
++-- Hide a sound card's device from clients.
++--
++-- software-dsp's hide-parent hides the raw node it puts a filter in front
++-- of, but not the card the node belongs to. Desktops (GNOME, KDE, anything
++-- on the PulseAudio API) build their device lists from the cards' ports as
++-- well as from the sinks and sources, so a card whose only node is hidden
++-- still shows its port: a second, dead "Microphone" beside the filter's
++-- source, or a "Speakers" port beside speakerguardd v2's voicing sink.
++--
++-- For devices that set asahi.hide-device = true, take every permission on
++-- the device away from every client but WirePlumber, as software-dsp does
++-- for the node. WirePlumber keeps managing the device (its profile, routes
++-- and nodes); clients see neither it nor its ports.
++
++cutils = require ("common-utils")
++log = Log.open_topic ("s-device")
++
++clients_om = ObjectManager {
++  Interest { type = "client" }
++}
++
++devices_om = ObjectManager {
++  Interest { type = "device" }
++}
++
++local function hidden (device)
++  return cutils.parseBool (device.properties ["asahi.hide-device"])
++end
++
++local function hide (client, id)
++  if not client.properties ["wireplumber.daemon"] then
++    client:update_permissions { [id] = "-" }
++  end
++end
++
++devices_om:connect ("object-added", function (_, device)
++  if not hidden (device) then
++    return
++  end
++  local id = device ["bound-id"]
++  log:info ("hiding device " .. tostring (device.properties ["device.name"]) .. " (" .. id .. ") from clients")
++  for client in clients_om:iterate () do
++    hide (client, id)
++  end
++end)
++
++clients_om:connect ("object-added", function (_, client)
++  for device in devices_om:iterate () do
++    if hidden (device) then
++      hide (client, device ["bound-id"])
++    end
++  end
++end)
++
++clients_om:activate ()
++devices_om:activate ()
+diff --git a/conf/wireplumber.conf b/conf/wireplumber.conf
+index 4b5196f..9c4d5ed 100644
+--- a/conf/wireplumber.conf
++++ b/conf/wireplumber.conf
+@@ -55,6 +55,23 @@ monitor.alsa.rules = [
+             }
+         }
+     }
++    # The microphone cards (the high-power audio interface, "MacBook ...
++    # HPAI", and the J700's AOP card) have the microphone as their only
++    # node, which the mic graph below hides behind its filter. Hide the
++    # card too (asahi-hide-devices.lua), or desktops list its "Microphone"
++    # port beside the filter's source. A device property: match the card
++    # device by name.
++    {
++        matches = [
++            { device.name = "~alsa_card.*", api.alsa.card.name = "~^Mac.* HPAI$" }
++            { device.name = "~alsa_card.*", api.alsa.card.name = "MacBook Neo J700 AOP" }
++        ]
++        actions = {
++            update-props = {
++                asahi.hide-device = true
++            }
++        }
++    }
+     # The built-in headphone jack of every Mac (the macaudio cards are named
+     # "MacBook ...", "Mac mini ..." and "Mac Studio ..."). With nothing
+     # plugged in, the jack's route is unavailable: WirePlumber would leave
+@@ -620,6 +637,12 @@ wireplumber.components = [
+         provides = hooks.asahi.restore-volume
+         before = [ support.standard-event-source ]
+     }
++    # Devices that set asahi.hide-device (the microphone cards above, and
++    # speakerguardd v2's speaker card when it has no jack)
++    {
++        name = device/asahi-hide-devices.lua, type = script/lua,
++        provides = custom.asahi-hide-devices
++    }
+ ]
+ 
+ wireplumber.profiles = {
+@@ -627,6 +650,7 @@ wireplumber.profiles = {
+         custom.asahi = required
+         custom.asahi-unplugged-routes = required
+         hooks.asahi.restore-volume = required
++        custom.asahi-hide-devices = required
+         node.software-dsp = required
+     }
+ }
+-- 
+2.43.0
+

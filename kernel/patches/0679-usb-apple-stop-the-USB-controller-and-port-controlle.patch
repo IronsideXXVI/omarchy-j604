@@ -1,0 +1,397 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Diljit Singh <hey@djdev.me>
+Date: Sat, 7 Nov 2026 07:40:22 -0500
+Subject: [PATCH] usb: apple: stop the USB controller and port controllers for
+ a deep sleep
+
+A deep sleep powers off the controller's domain, and the sleep engine
+needs ATC0_COMMON off, so keeping the core up as a syscore device can't
+work: the suspend is refused, and it would find a dead core if it
+weren't. xHCI can't resume across that either.
+
+dwc3-apple already knows how to stop everything and start again, for a
+cable disconnect. Do the same around a deep sleep: stop before the
+freezer runs and start once the system is back, when firmware for what's
+behind the hub can be found. USB devices come back as new devices, so a
+mounted USB disk doesn't survive this. The wakeup setting is turned off
+for the sleep, as it would keep the domain on, and a role that arrives
+during the sleep is applied afterwards. A controller is always stopped.
+
+macOS sends the port controllers SSPS with state 3 before a sleep. tipd
+does that where the tree asks for it with apple,sleep-ssps, and goes
+back to S0 after. A controller that doesn't take it only logs.
+
+The sleep controller ends the debug link with a cold reset of its port
+controller, which leaves that firmware's interrupt mask and power state
+at their defaults. tipd sets the controller up again when the link was
+cut, and rearms the link where the tree gives the board's key in
+apple,debug-lock-key, as a boot loader does: unlock, debug mode on,
+enable the debug VDM, debug mode off, lock. A failure only logs.
+
+The ATC PHY forgets what its DisplayPort side owned or was stopping once
+its domain has been off, since none of that survives.
+
+Signed-off-by: Diljit Singh <hey@djdev.me>
+
+[j604 backport: context conflicts only. dwc3-apple.c: this tree's glue has no T8132 tunables, drd_cfg or host_only, so only <linux/suspend.h>, pm_nb and the three sleep fields are added; selftest mocks.c: the sleep fields added to this tree's struct. Uses apple_sleep_debug_link_was_cut()/_cut_peek(), stubs in sleep.h (apple-s2r cuts no debug link). On J604 the tipd half is inert (no apple,sleep-ssps or apple,debug-lock-key in the DT); the glue stops and restarts the three controllers whenever "mem" is deep.]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/phy/apple/atc.c                       | 10 +++
+ drivers/usb/dwc3/dwc3-apple-state-test.c      |  9 +++
+ drivers/usb/dwc3/dwc3-apple-state.h           | 19 +++++
+ drivers/usb/dwc3/dwc3-apple.c                 | 79 ++++++++++++++++++-
+ drivers/usb/typec/tipd/core.c                 | 56 +++++++++++++
+ .../drivers/gpu/apple-dcp/dwc3/mocks.c        |  3 +
+ .../drivers/gpu/apple-dcp/lifecycle.py        |  3 +
+ .../drivers/gpu/apple-dcp/teardown_pm.py      |  2 +-
+ 8 files changed, 179 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/phy/apple/atc.c b/drivers/phy/apple/atc.c
+index da28bf9070..647138fc4a 100644
+--- a/drivers/phy/apple/atc.c
++++ b/drivers/phy/apple/atc.c
+@@ -4255,6 +4255,15 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy)
+ 	atcphy->tunnel_clock_on = false;
+ 	atcphy->tunnel_rate = 0;
+ 	atcphy->tunnel_users = 0;
++	/* Nothing the DisplayPort side owned or was stopping survived the domain. */
++	if (atcphy->hw->has_t8140_dp) {
++		atcphy->dp_owned_pmas = 0;
++		atcphy->dp_idle_pmas = 0;
++		atcphy->dp_usb_context_valid = 0;
++		atcphy->dp_usb_context_dirty = 0;
++		atcphy->aux_power_requested = false;
++		atcphy->mode_dirty = false;
++	}
+ 
+ 	if (!atcphy->dp_only) {
+ 		_atcphy_dwc3_reset_assert(atcphy);
+@@ -6626,6 +6635,7 @@ static const struct atcphy_hw atcphy_hw_t8140 = {
+ 	.has_usb2phy_reg = true,
+ 	.has_t8140_dp = true,
+ 	.optional_tunables = true,
++	.restore_after_pd_off = true,
+ };
+ 
+ static const struct atcphy_hw atcphy_hw_t8142 = {
+diff --git a/drivers/usb/dwc3/dwc3-apple-state-test.c b/drivers/usb/dwc3/dwc3-apple-state-test.c
+index 7a04604ddd..69abb0f326 100644
+--- a/drivers/usb/dwc3/dwc3-apple-state-test.c
++++ b/drivers/usb/dwc3/dwc3-apple-state-test.c
+@@ -38,10 +38,19 @@ static void dwc3_apple_non_role_test(struct kunit *test)
+ 	}
+ }
+ 
++/* A role that arrives during a sleep decides what comes back after it. */
++static void dwc3_apple_role_during_sleep_test(struct kunit *test)
++{
++	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_HOST), DWC3_APPLE_HOST);
++	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_DEVICE), DWC3_APPLE_DEVICE);
++	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_NONE), DWC3_APPLE_NO_CABLE);
++}
++
+ static struct kunit_case dwc3_apple_state_test_cases[] = {
+ 	KUNIT_CASE(dwc3_apple_host_left_to_xhci_test),
+ 	KUNIT_CASE(dwc3_apple_device_selected_before_reset_test),
+ 	KUNIT_CASE(dwc3_apple_non_role_test),
++	KUNIT_CASE(dwc3_apple_role_during_sleep_test),
+ 	{}
+ };
+ 
+diff --git a/drivers/usb/dwc3/dwc3-apple-state.h b/drivers/usb/dwc3/dwc3-apple-state.h
+index 42c13d9004..bb8d827fde 100644
+--- a/drivers/usb/dwc3/dwc3-apple-state.h
++++ b/drivers/usb/dwc3/dwc3-apple-state.h
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/errno.h>
+ #include <linux/phy/phy.h>
++#include <linux/usb/role.h>
+ 
+ /* See the comment at the top of dwc3-apple.c for how these states are used. */
+ enum dwc3_apple_state {
+@@ -47,4 +48,22 @@ static inline int dwc3_apple_usb2_mode_before_reset(enum dwc3_apple_state target
+ 	}
+ }
+ 
++/**
++ * dwc3_apple_state_for_role() - state a role asks for while the core is stopped for sleep
++ * @role: the role asked for
++ *
++ * Return: the state to bring the controller up in after the sleep.
++ */
++static inline enum dwc3_apple_state dwc3_apple_state_for_role(enum usb_role role)
++{
++	switch (role) {
++	case USB_ROLE_HOST:
++		return DWC3_APPLE_HOST;
++	case USB_ROLE_DEVICE:
++		return DWC3_APPLE_DEVICE;
++	default:
++		return DWC3_APPLE_NO_CABLE;
++	}
++}
++
+ #endif /* __DWC3_APPLE_STATE_H */
+diff --git a/drivers/usb/dwc3/dwc3-apple.c b/drivers/usb/dwc3/dwc3-apple.c
+index f8f9220d3b..c7e3112ee5 100644
+--- a/drivers/usb/dwc3/dwc3-apple.c
++++ b/drivers/usb/dwc3/dwc3-apple.c
+@@ -16,6 +16,7 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/pm_wakeup.h>
+ #include <linux/reset.h>
++#include <linux/suspend.h>
+ #include <linux/usb/phy.h>
+ 
+ #include "dwc3-apple-state.h"
+@@ -87,6 +88,10 @@
+  * dwc3_apple_init(). In host mode xHCI then keeps running in suspend-to-idle when a USB device
+  * may wake the system, as a halted xHC could not signal the wakeup.
+  *
++ * A deep sleep takes the controller's power domain away, so nothing can be kept running across
++ * it. The glue stops everything before the freezer runs, the way a cable disconnect does, and
++ * brings it back once the system has resumed. See dwc3_apple_pm_notify().
++ *
+  * Runtime PM (T6040 and T8132, see dwc3_apple_core_probe()): the glue holds a reference from
+  * the reset deassert to the end of the shutdown, so with no cable the controller can
+  * runtime-suspend and its power domain drop, its DARTs (which save and restore their state) and,
+@@ -147,6 +152,11 @@ struct dwc3_apple {
+ 	bool rpm_held;
+ 	bool pre_core_rpm;
+ 	bool dt_dis_u3_susphy;
++	struct notifier_block pm_nb;
++	/* Stopped for a deep sleep: the state to come back to, and the wakeup setting. */
++	bool sleep_stopped;
++	bool sleep_wakeup;
++	enum dwc3_apple_state sleep_state;
+ };
+ 
+ #define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
+@@ -622,6 +632,12 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role ro
+ 	if (appledwc->fixed_hub)
+ 		return 0;
+ 
++	/* Stopped for a sleep: this is what comes back after it. */
++	if (appledwc->sleep_stopped) {
++		appledwc->sleep_state = dwc3_apple_state_for_role(role);
++		return 0;
++	}
++
+ 	/*
+ 	 * Skip role switches if appledwc is already in the desired state. The
+ 	 * USB-C port controller on M2 and M1/M2 Pro/Max/Ultra devices issues
+@@ -667,7 +683,7 @@ static enum usb_role dwc3_usb_role_switch_get(struct usb_role_switch *sw)
+ 
+ 	guard(mutex)(&appledwc->lock);
+ 
+-	switch (appledwc->state) {
++	switch (appledwc->sleep_stopped ? appledwc->sleep_state : appledwc->state) {
+ 	case DWC3_APPLE_HOST:
+ 		return USB_ROLE_HOST;
+ 	case DWC3_APPLE_DEVICE:
+@@ -697,6 +713,59 @@ static int dwc3_apple_setup_role_switch(struct dwc3_apple *appledwc)
+ 	return 0;
+ }
+ 
++/*
++ * Runs before the freezer, when the sleep's real target isn't known yet, so this goes by the
++ * state "mem" means now. Writing "freeze" with deep selected costs a USB restart and nothing else.
++ * A stop that fails refuses the sleep. PM_POST_SUSPEND follows an abandoned sleep as well.
++ */
++static int dwc3_apple_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
++{
++	struct dwc3_apple *appledwc = container_of(nb, struct dwc3_apple, pm_nb);
++	struct device *dev = appledwc->dev;
++	int ret;
++
++	guard(mutex)(&appledwc->lock);
++
++	switch (action) {
++	case PM_SUSPEND_PREPARE:
++		if (pm_suspend_default_s2idle() || appledwc->shutting_down)
++			break;
++		appledwc->sleep_state = appledwc->state;
++		ret = dwc3_apple_exit(appledwc);
++		if (ret)
++			return notifier_from_errno(ret);
++		/* A wakeup path would keep the domain on, and it's going away. */
++		appledwc->sleep_wakeup = device_may_wakeup(dev);
++		device_set_wakeup_enable(dev, false);
++		appledwc->sleep_stopped = true;
++		break;
++	case PM_POST_SUSPEND:
++		if (!appledwc->sleep_stopped)
++			break;
++		appledwc->sleep_stopped = false;
++		device_set_wakeup_enable(dev, appledwc->sleep_wakeup);
++		if (appledwc->shutting_down ||
++		    (appledwc->sleep_state != DWC3_APPLE_HOST &&
++		     appledwc->sleep_state != DWC3_APPLE_DEVICE))
++			break;
++		ret = dwc3_apple_init(appledwc, appledwc->sleep_state);
++		if (ret)
++			dev_err(dev, "Failed to start after sleep, err=%d\n", ret);
++		break;
++	default:
++		break;
++	}
++
++	return NOTIFY_DONE;
++}
++
++static void dwc3_apple_pm_notifier_remove(void *data)
++{
++	struct dwc3_apple *appledwc = data;
++
++	unregister_pm_notifier(&appledwc->pm_nb);
++}
++
+ static bool dwc3_apple_has_fixed_hub(struct device *dev)
+ {
+ 	struct device_node *hub __free(device_node) =
+@@ -778,6 +847,13 @@ static int dwc3_apple_probe(struct platform_device *pdev)
+ 	 * details.
+ 	 */
+ 	appledwc->state = DWC3_APPLE_PROBE_PENDING;
++	appledwc->pm_nb.notifier_call = dwc3_apple_pm_notify;
++	ret = register_pm_notifier(&appledwc->pm_nb);
++	if (ret)
++		return ret;
++	ret = devm_add_action_or_reset(dev, dwc3_apple_pm_notifier_remove, appledwc);
++	if (ret)
++		return ret;
+ 	/*
+ 	 * Until the first cable there is no core to keep powered: let the controller
+ 	 * runtime-suspend, and its DARTs with it, so that its power domain can drop.
+@@ -826,6 +902,7 @@ static void dwc3_apple_remove(struct platform_device *pdev)
+ 
+ 	guard(mutex)(&appledwc->lock);
+ 
++	appledwc->shutting_down = true;
+ 	usb_role_switch_unregister(appledwc->role_sw);
+ 
+ 	/*
+diff --git a/drivers/usb/typec/tipd/core.c b/drivers/usb/typec/tipd/core.c
+index 09046ebc61..286ca0df27 100644
+--- a/drivers/usb/typec/tipd/core.c
++++ b/drivers/usb/typec/tipd/core.c
+@@ -16,6 +16,8 @@
+ #include <linux/regmap.h>
+ #include <linux/unaligned.h>
+ #include <linux/usb/pd.h>
++#include <linux/soc/apple/sleep.h>
++#include <linux/suspend.h>
+ #include <linux/usb/typec.h>
+ #include <linux/usb/typec_altmode.h>
+ #include <linux/usb/typec_dp.h>
+@@ -1485,6 +1487,51 @@ static void cd321x_prepare(struct tps6598x *tps)
+ 	/* Gate scheduling first; neither worker may be drained under its mutex. */
+ 	cancel_delayed_work_sync(&cd321x->resume_work);
+ 	cancel_delayed_work_sync(&cd321x->update_work);
++
++	/* As macOS does a second or so before the commit, measured on the same controller. */
++	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps")) {
++		int ret;
++
++		guard(mutex)(&tps->lock);
++		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S3);
++		if (ret)
++			dev_warn(tps->dev, "didn't take system power state S3: %d\n", ret);
++		else
++			dev_dbg(tps->dev, "system power state S3\n");
++	}
++}
++
++/*
++ * A sleep cut this port's debug link. Rearm it the way a boot loader does: unlock with
++ * the board's key, debug mode on, enable the debug VDM, debug mode off, lock.
++ */
++static void cd321x_rearm_debug_link(struct tps6598x *tps)
++{
++	static const u8 vdm[] = { 0x06, 0x46, 0x82, 0x01 };
++	static const u8 no_key[4];
++	const char *key;
++	u8 on = 1, off = 0, out = 0;
++	int ret;
++
++	if (device_property_read_string(tps->dev, "apple,debug-lock-key", &key) ||
++	    strlen(key) != sizeof(no_key) || !apple_sleep_debug_link_was_cut(tps->dev))
++		return;
++
++	ret = tps6598x_exec_cmd(tps, "LOCK", sizeof(no_key), (const u8 *)key, 1, &out);
++	if (!ret && !(out & 0xf))
++		ret = tps6598x_exec_cmd(tps, "DBMa", 1, &on, 1, &out);
++	if (!ret && !(out & 0xf))
++		ret = tps6598x_exec_cmd(tps, "DVEn", sizeof(vdm), vdm, 1, &out);
++	if (!ret && (out & 0xf))
++		ret = -EIO;
++	if (!ret)
++		ret = tps6598x_exec_cmd(tps, "DBMa", 1, &off, 0, NULL);
++	if (!ret)
++		ret = tps6598x_exec_cmd(tps, "LOCK", sizeof(no_key), no_key, 0, NULL);
++	if (ret)
++		dev_warn(tps->dev, "debug link not rearmed: %d\n", ret);
++	else
++		dev_dbg(tps->dev, "debug link rearmed\n");
+ }
+ 
+ static void cd321x_complete(struct tps6598x *tps)
+@@ -1492,6 +1539,15 @@ static void cd321x_complete(struct tps6598x *tps)
+ 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+ 
+ 	guard(mutex)(&tps->lock);
++	/*
++	 * The cut was a cold reset of this controller's firmware: its interrupt mask and power
++	 * state are back at their defaults, so set them up again whether or not an event comes.
++	 */
++	if (apple_sleep_debug_link_cut_peek(tps->dev))
++		cd321x->pm.setup_pending = true;
++	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps"))
++		tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
++	cd321x_rearm_debug_link(tps);
+ 	if (cd321x_pm_resume(&cd321x->pm))
+ 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
+ }
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c b/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c
+index 34ffd1d4de..843e6d0c89 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c
+@@ -84,6 +84,9 @@ struct dwc3_apple {
+ 	void *dev;
+ 	struct phy *usb2_phy, *usb3_phy;
+ 	bool fixed_hub, core_active, core_exit_pending, reset_pending;
++	/* Stopped for a deep sleep, and the state to bring back. */
++	bool sleep_stopped;
++	enum dwc3_apple_state sleep_state;
+ 	/* T8132 only: runtime PM of an idle controller; never set here. */
+ 	bool idle_rpm, rpm_held, pre_core_rpm;
+ 	bool dt_dis_u3_susphy;
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/lifecycle.py b/tools/testing/selftests/drivers/gpu/apple-dcp/lifecycle.py
+index b4d3b4f7a6..acfc6970eb 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/lifecycle.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/lifecycle.py
+@@ -1014,6 +1014,9 @@ def teardown(root):
+     for name in ('atcphy_mode_configuration', 'atcphy_hw', 'atcphy_dp_link_rate_configuration'):
+         decls.append(block(files['atc'], files['atc'].index('struct ' + name + ' {')) + ';')
+     decls.append(block(files['state'], files['state'].index('enum dwc3_apple_state {')) + ';')
++    role = 'static inline enum dwc3_apple_state dwc3_apple_state_for_role('
++    if role in files['state']:
++        decls.append(block(files['state'], files['state'].index(role)))
+     start = files['atc'].index('static const struct {\n\tconst struct atcphy_mode_configuration normal;')
+     end = files['atc'].index('\n};', start) + 3
+     decls.append(files['atc'][start:end])
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/teardown_pm.py b/tools/testing/selftests/drivers/gpu/apple-dcp/teardown_pm.py
+index b293087d49..c208cd9587 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/teardown_pm.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/teardown_pm.py
+@@ -95,7 +95,7 @@ static struct xhci_hcd xhci_context;
+ struct dwc3 { bool sys_wakeup, dis_u3_susphy_quirk; struct platform_device *xhci; };
+ enum { DWC3_APPLE_PROBE_PENDING, DWC3_APPLE_NO_CABLE, DWC3_APPLE_HOST, DWC3_APPLE_DEVICE };
+ /* pre_core_rpm is T8132 only: runtime PM before the first core probe; never set here. */
+-struct dwc3_apple { struct dwc3 dwc; struct device *dev; int lock,state; void *role_sw; bool pre_core_rpm, dt_dis_u3_susphy; };
++struct dwc3_apple { struct dwc3 dwc; struct device *dev; int lock,state; void *role_sw; bool pre_core_rpm, dt_dis_u3_susphy, shutting_down; };
+ static struct dwc3_apple apple_context;
+ #define to_dwc3_apple(d) container_of(d,struct dwc3_apple,dwc)
+ static bool inside_host_remove;

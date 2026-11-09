@@ -1,0 +1,367 @@
+From 32523bbc5abd189bb55c8a5524c3275db1dbcfd6 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 17:32:34 +0000
+Subject: [PATCH 32/32] tests: host test of the AVE encoder firmware hand-over
+
+tests/run-kboot-ave.sh copies dt_set_ave() and the helpers it calls out of
+src/kboot.c and runs it on the host (ASan/UBSan) against a Mac's binary
+ADT, read with aura's own ADT reader, and a kernel DTB with an
+apple,t8132-ave node, in six cases: an enabled node, the inert DT (status
+disabled: regions reserved, status kept), phys_base below the DATA
+segment, an ADT without pre-loaded, malformed segment-names, and a DT
+without a SoC compatible. Each case checks the node status, both
+reserved-memory regions (reg, no-map, compatible, iommu-addresses) and
+the exported CRC strings against values the caller passes.
+
+The firmware itself is not on the host: the CRC stub hashes a synthetic
+image derived from each segment's address, and the caller computes the
+expected CRCs independently (zlib). Neither input file is copied into the
+tree; only addresses and CRCs are printed.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ tests/kboot_ave_host.c | 204 +++++++++++++++++++++++++++++++++++++++++
+ tests/run-kboot-ave.sh | 119 ++++++++++++++++++++++++
+ 2 files changed, 323 insertions(+)
+ create mode 100644 tests/kboot_ave_host.c
+ create mode 100644 tests/run-kboot-ave.sh
+
+diff --git a/tests/kboot_ave_host.c b/tests/kboot_ave_host.c
+new file mode 100644
+index 00000000..4db6200a
+--- /dev/null
++++ b/tests/kboot_ave_host.c
+@@ -0,0 +1,204 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Host test of the AVE video encoder firmware hand-over (src/kboot.c dt_set_ave()), with aura's own
++ * ADT reader (rust/src/adt.rs, built for the host) and libfdt. The functions under test are copied
++ * out of src/kboot.c by tests/run-kboot-ave.sh into kboot_ave_extract.c.
++ *
++ *   kboot-ave-host <in.adt> <in.dtb> <phys_base> [option...]
++ *
++ * Options, applied before the hand-over:
++ *   enable      set the AVE node's status to "okay" (the DT ships it disabled)
++ *   nopreload   set the ADT /arm-io/ave "pre-loaded" word to 0
++ *   badnames    turn the ';' of the ADT segment-names into '.'
++ *   nocompat    give the DT's AVE node only the generic "apple,ave" compatible
++ *
++ * The firmware is not in host memory: tinf_crc32() here hashes a synthetic image derived from the
++ * segment's physical address (byte k = ((phys >> 14) & 0xff) ^ (k * 131) ^ (k >> 8)), with a
++ * bitwise CRC-32; the runner computes the expected values independently.
++ *
++ * Prints m1n1's own log lines, then one "ave ..." line per checked property: the AVE node's status,
++ * memory-region resolved to each region's node name, reg, no-map, compatible and iommu-addresses,
++ * the /chosen CRC strings, the number of asc-firmware@ nodes, the FDT growth and fdt_check_full().
++ */
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "types.h"
++#include "utils.h"
++#ifndef PACKED
++#define PACKED __attribute__((packed))
++#endif
++#include "adt.h"
++
++#include "libfdt/libfdt.h"
++
++#define DT_EXTRA 65536
++#define T6030    0x6030
++#define T8132    0x8132
++
++void *adt;
++void *dt;
++static u32 adt_size;
++u32 chip_id = T8132;
++
++struct {
++    u64 phys_base;
++} cur_boot_args;
++
++u32 adt_get_size(void)
++{
++    return adt_size;
++}
++
++unsigned int tinf_crc32(const void *data, unsigned int length)
++{
++    u64 phys = (u64)(uintptr_t)data;
++    u32 crc = 0xffffffff;
++
++    for (u64 k = 0; k < length; k++) {
++        crc ^= (u8)(((phys >> 14) & 0xff) ^ (k * 131) ^ (k >> 8));
++        for (int b = 0; b < 8; b++)
++            crc = (crc >> 1) ^ (0xedb88320 & -(crc & 1));
++    }
++    return ~crc;
++}
++
++#include "kboot_ave_extract.c"
++
++static void *slurp(const char *path, size_t extra, size_t *size)
++{
++    FILE *f = fopen(path, "rb");
++    long n;
++    void *buf;
++
++    if (!f || fseek(f, 0, SEEK_END) || (n = ftell(f)) < 0 || fseek(f, 0, SEEK_SET)) {
++        perror(path);
++        exit(2);
++    }
++    buf = calloc(1, n + extra);
++    if (!buf || fread(buf, 1, n, f) != (size_t)n) {
++        perror(path);
++        exit(2);
++    }
++    fclose(f);
++    *size = n;
++    return buf;
++}
++
++static int ave_node(void)
++{
++    int n = fdt_node_offset_by_compatible(dt, -1, "apple,t8132-ave");
++    return n >= 0 ? n : fdt_node_offset_by_compatible(dt, -1, "apple,ave");
++}
++
++static void *adt_ave_prop(const char *name, u32 *len)
++{
++    int n = adt_path_offset(adt, "/arm-io/ave");
++    void *p = n < 0 ? NULL : (void *)adt_getprop(adt, n, name, len);
++
++    if (!p) {
++        printf("setup: no ADT /arm-io/ave %s\n", name);
++        exit(2);
++    }
++    return p;
++}
++
++int main(int argc, char **argv)
++{
++    size_t asize, dsize;
++
++    if (argc < 4) {
++        fprintf(stderr,
++                "usage: %s <in.adt> <in.dtb> <phys_base> [enable|nopreload|badnames|nocompat]...\n",
++                argv[0]);
++        return 2;
++    }
++    adt = slurp(argv[1], 0, &asize);
++    adt_size = asize;
++    dt = slurp(argv[2], DT_EXTRA, &dsize);
++    cur_boot_args.phys_base = strtoull(argv[3], NULL, 0);
++    if (fdt_open_into(dt, dt, dsize + DT_EXTRA)) {
++        printf("setup: fdt_open_into failed\n");
++        return 2;
++    }
++    if (ave_node() < 0) {
++        printf("setup: no apple,t8132-ave node in the DT\n");
++        return 2;
++    }
++    for (int i = 4; i < argc; i++) {
++        u32 len;
++        if (!strcmp(argv[i], "enable")) {
++            fdt_setprop_string(dt, ave_node(), "status", "okay");
++        } else if (!strcmp(argv[i], "nopreload")) {
++            u32 *p = adt_ave_prop("pre-loaded", &len);
++            *p = 0;
++        } else if (!strcmp(argv[i], "badnames")) {
++            char *p = adt_ave_prop("segment-names", &len);
++            for (u32 k = 0; k < len; k++)
++                if (p[k] == ';')
++                    p[k] = '.';
++        } else if (!strcmp(argv[i], "nocompat")) {
++            fdt_setprop_string(dt, ave_node(), "compatible", "apple,ave");
++        } else {
++            printf("setup: unknown option %s\n", argv[i]);
++            return 2;
++        }
++    }
++
++    fdt_pack(dt);
++    int before = fdt_totalsize(dt);
++    fdt_open_into(dt, dt, dsize + DT_EXTRA);
++
++    int ret = dt_set_ave();
++    printf("ave ret=%d\n", ret);
++
++    int node = ave_node(), len;
++    u32 ave_ph = fdt_get_phandle(dt, node);
++    const char *s = fdt_getprop(dt, node, "status", &len);
++    printf("ave status=%s\n", s ? s : "(absent)");
++    const fdt32_t *mr = fdt_getprop(dt, node, "memory-region", &len);
++    printf("ave memory-region cells=%d\n", mr ? len / 4 : 0);
++    for (int i = 0; mr && i < len / 4; i++) {
++        int r = fdt_node_offset_by_phandle(dt, fdt32_ld(&mr[i]));
++        int l2 = 0, l3 = 0;
++        const void *reg = r < 0 ? NULL : fdt_getprop(dt, r, "reg", &l2);
++        const char *c = r < 0 ? NULL : fdt_getprop(dt, r, "compatible", NULL);
++        const u8 *ia = r < 0 ? NULL : fdt_getprop(dt, r, "iommu-addresses", &l3);
++        char path[128] = "?";
++        if (r >= 0)
++            fdt_get_path(dt, r, path, sizeof(path));
++        printf("ave region%d %s reg=", i, path);
++        if (reg && l2 == 16)
++            printf("0x%llx 0x%llx", (unsigned long long)fdt64_ld(reg),
++                   (unsigned long long)fdt64_ld((const fdt64_t *)((const u8 *)reg + 8)));
++        printf(" no-map=%s compatible=%s",
++               r >= 0 && fdt_getprop(dt, r, "no-map", NULL) ? "yes" : "no", c ? c : "-");
++        if (ia && l3 == 20)
++            printf(" iommu-addresses=%s 0x%llx 0x%llx\n",
++                   fdt32_ld((const fdt32_t *)ia) == ave_ph ? "&ave" : "&other",
++                   (unsigned long long)fdt64_ld((const fdt64_t *)(ia + 4)),
++                   (unsigned long long)fdt64_ld((const fdt64_t *)(ia + 12)));
++        else
++            printf(" iommu-addresses=(len %d)\n", l3);
++    }
++    const char *names = fdt_getprop(dt, node, "memory-region-names", &len);
++    printf("ave memory-region-names=%s\n", names ? names : "(absent)");
++    int chosen = fdt_path_offset(dt, "/chosen");
++    const char *t = fdt_getprop(dt, chosen, "aurora,ave-text-crc32", NULL);
++    const char *d = fdt_getprop(dt, chosen, "aurora,ave-data-crc32", NULL);
++    printf("ave chosen aurora,ave-text-crc32=%s\n", t ? t : "(absent)");
++    printf("ave chosen aurora,ave-data-crc32=%s\n", d ? d : "(absent)");
++    int resv = fdt_path_offset(dt, "/reserved-memory"), n = 0, sub;
++    fdt_for_each_subnode(sub, dt, resv)
++        if (!strncmp(fdt_get_name(dt, sub, NULL), "asc-firmware@", 13))
++            n++;
++    printf("ave reserved-memory asc-firmware@* nodes=%d\n", n);
++    fdt_pack(dt);
++    int grow = (int)fdt_totalsize(dt) - before;
++    printf("ave fdt growth %s\n", grow >= 0 && grow < 4096 ? "<4096" : "TOO BIG");
++    fprintf(stderr, "info: fdt growth %d bytes\n", grow);
++    printf("ave fdt_check_full=%d\n", fdt_check_full(dt, fdt_totalsize(dt)));
++    return 0;
++}
+diff --git a/tests/run-kboot-ave.sh b/tests/run-kboot-ave.sh
+new file mode 100644
+index 00000000..e4b87343
+--- /dev/null
++++ b/tests/run-kboot-ave.sh
+@@ -0,0 +1,119 @@
++#!/bin/sh
++# Host test of the AVE video encoder firmware hand-over (src/kboot.c dt_set_ave()).
++#
++#   sh tests/run-kboot-ave.sh <adt.bin> <kernel.dtb> <phys_base> <text_phys> <text_size> <data_phys> <data_size> \
++#       <text_remap> <data_remap> <text_crc> <data_crc>
++#
++# Runs dt_set_ave() against a Mac's binary ADT and a kernel DTB with an apple,t8132-ave node, in six
++# cases, and checks each result against the segment ranges given on the command line and the
++# CRC-32 of the synthetic firmware image (see tests/kboot_ave_host.c) computed by the caller.
++# Neither file is copied into the tree; nothing but addresses and CRCs is printed.
++set -eu
++cd "$(dirname "$0")/.."
++root=$(pwd)
++fail() {
++    echo "FAIL: $*" >&2
++    exit 1
++}
++[ "$#" = 11 ] || fail "usage: $0 <adt.bin> <kernel.dtb> <phys_base> <text_phys> <text_size> <data_phys> <data_size> <text_remap> <data_remap> <text_crc> <data_crc>"
++ADT=$1 DTB=$2 PB=$3 TP=$4 TS=$5 DP=$6 DS=$7 TR=$8 DR=$9
++shift 9
++TC=$1 DC=$2
++tmp=$(mktemp -d)
++trap 'rm -rf "$tmp"' EXIT HUP INT TERM
++
++# aura's ADT reader, built for the host as tests/run-kboot-ane.sh does
++mkdir -p "$tmp/rs" "$tmp/src"
++if grep -q 'CStr::from_bytes_until_nul(&self.name)' rust/src/adt.rs; then
++    sed 's|CStr::from_bytes_until_nul(&self.name)|CStr::from_bytes_until_nul(unsafe { \&*(\&self.name as *const [c_char; 32] as *const [u8; 32]) })|' \
++        rust/src/adt.rs > "$tmp/rs/adt.rs"
++elif grep -q 'from_raw_parts(self.name.as_ptr() as \*const u8, 32)' rust/src/adt.rs; then
++    cp rust/src/adt.rs "$tmp/rs/adt.rs"
++else
++    fail "rust/src/adt.rs changed; update the host build in $0"
++fi
++printf '#![allow(non_camel_case_types, dead_code, unused_imports)]\ntype c_size_t = usize;\nmod adt;\n' \
++    > "$tmp/rs/lib.rs"
++RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.89.0} rustc --edition 2021 --crate-type staticlib -O \
++    -o "$tmp/rs/libadt_host.a" "$tmp/rs/lib.rs" || fail "host build of the ADT reader"
++
++# The code under test, copied out of src/kboot.c: bail(), dt_device_set_reserved_mem(),
++# dt_get_or_add_reserved_mem(), dt_device_add_mem_region(), and dt_reserve_asc_segments() through
++# dt_set_ave() (dt_reserve_asc_firmware(), ave_compatibles[], dt_set_ave_node())
++{
++    echo '#define SZ_16K (1 << 14)'
++    awk '/^#define bail\(\.\.\.\)/{p=1} p{print} p&&/while \(0\)$/{exit}' src/kboot.c
++    awk '/^static int dt_device_set_reserved_mem\(/{p=1} p{print} p&&/^}$/{exit}' src/kboot.c
++    awk '/^static int dt_get_or_add_reserved_mem\(/{p=1} p{print} p&&/^}$/{exit}' src/kboot.c
++    awk '/^static int dt_device_add_mem_region\(/{p=1} p{print} p&&/^}$/{exit}' src/kboot.c
++    awk '/^static int dt_reserve_asc_segments\(/{p=1} p{print} /^static int dt_set_ave\(void\)/{q=1} p&&q&&/^}$/{exit}' src/kboot.c
++} > "$tmp/src/kboot_ave_extract.c"
++for f in dt_set_ave_node 'static int dt_set_ave(void)' '"apple,t8132-ave"' dt_reserve_asc_firmware \
++    dt_get_or_add_reserved_mem dt_device_add_mem_region dt_device_set_reserved_mem; do
++    grep -q -F "$f" "$tmp/src/kboot_ave_extract.c" || fail "extraction: $f"
++done
++cp src/adt.h tests/kboot_audio_host/*.h tests/kboot_ave_host.c "$tmp/src/"
++sed -i 's|^#endif$|#ifndef ALIGN_UP\n#define ALIGN_UP(x, a) (((x) + ((a) - 1)) \& ~((a) - 1))\n#endif\n#endif|' "$tmp/src/utils.h"
++${CC:-cc} -std=gnu11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
++    -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
++    -I"$tmp/src" -I"$root/src" -I"$root" \
++    "$tmp/src/kboot_ave_host.c" src/libfdt/fdt.c src/libfdt/fdt_ro.c src/libfdt/fdt_rw.c src/libfdt/fdt_wip.c \
++    src/libfdt/fdt_sw.c src/libfdt/fdt_empty_tree.c src/libfdt/fdt_strerror.c \
++    src/libfdt/fdt_check.c "$tmp/rs/libadt_host.a" -lm -lpthread -ldl -o "$tmp/kboot-ave-host" ||
++    fail "host build"
++export ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0}
++
++hx() { printf '%x' "$1"; }
++al() { printf '0x%x' $(( ($1 + 0x3fff) & ~0x3fff )); }
++TN="asc-firmware@$(hx "$TP")"
++DN="asc-firmware@$(hx "$DP")"
++R0="ave region0 /reserved-memory/$TN reg=0x$(hx "$TP") $(al "$TS") no-map=yes compatible=apple,asc-mem iommu-addresses=&ave 0x$(hx "$TR") $(al "$TS")"
++R1="ave region1 /reserved-memory/$DN reg=0x$(hx "$DP") $(al "$DS") no-map=yes compatible=apple,asc-mem iommu-addresses=&ave 0x$(hx "$DR") $(al "$DS")"
++CT="ave chosen aurora,ave-text-crc32=$TC"
++CD="ave chosen aurora,ave-data-crc32=$DC"
++NT="ave chosen aurora,ave-text-crc32=(absent)"
++ND="ave chosen aurora,ave-data-crc32=(absent)"
++fails=0
++case_() {
++    for e in "$@"; do
++        if ! printf '%s\n' "$out" | grep -q -F -x -e "$e"; then
++            echo "  MISSING: $e"; fails=$((fails + 1)); bad=1
++        fi
++    done
++}
++run() { # name args... -- expects...
++    name=$1; shift
++    args=""
++    while [ "$1" != -- ]; do args="$args $1"; shift; done; shift
++    # shellcheck disable=SC2086
++    out=$("$tmp/kboot-ave-host" "$ADT" "$DTB" $args 2>&1) || { echo "== $name: host binary failed"; printf '%s\n' "$out"; fails=$((fails + 1)); return; }
++    bad=0
++    echo "== $name"
++    printf '%s\n' "$out" | sed 's/^/  /'
++    case_ "$@"
++    [ $bad = 0 ] && echo "  OK" || echo "  CASE FAIL"
++}
++NOTHING() { # status, reason line (or "")
++    printf '%s\n' "ave ret=0" "ave status=$1" "ave memory-region cells=0" "$NT" "$ND" \
++        "ave reserved-memory asc-firmware@* nodes=0" "ave fdt_check_full=0"
++    [ -n "$2" ] && printf '%s\n' "$2"
++    return 0
++}
++q() { sed "s/.*/'&'/" | tr '\n' ' '; }
++
++run "1 enabled node: both segments handed over, CRCs exported" "$PB" enable -- \
++    "ave ret=0" "ave status=okay" "ave memory-region cells=2" "$R0" "$R1" "ave memory-region-names=(absent)" \
++    "$CT" "$CD" "ave reserved-memory asc-firmware@* nodes=2" "ave fdt growth <4096" "ave fdt_check_full=0"
++run "2 inert DT (status disabled, the 1.613 default): reserved, status kept" "$PB" -- \
++    "ave ret=0" "ave status=disabled" "ave memory-region cells=2" "$R0" "$R1" "$CT" "$CD" \
++    "ave reserved-memory asc-firmware@* nodes=2" "ave fdt_check_full=0"
++eval "set -- $(NOTHING disabled 'FDT: AVE disabled: invalid ADT firmware segments' | q)"
++run "3 phys_base at DATA: node disabled, nothing reserved" "$(printf '0x%x' $((DP)))" enable -- "$@"
++eval "set -- $(NOTHING disabled 'FDT: AVE disabled: firmware not preloaded' | q)"
++run "4 ADT pre-loaded 0: node disabled, nothing reserved" "$PB" enable nopreload -- "$@"
++eval "set -- $(NOTHING disabled 'FDT: AVE disabled: invalid ADT firmware segments' | q)"
++run "5 bad ADT segment-names: node disabled, nothing reserved" "$PB" enable badnames -- "$@"
++eval "set -- $(NOTHING okay '' | q)"
++run "6 no SoC compatible in the DT: nothing touched" "$PB" enable nocompat -- "$@"
++[ $fails = 0 ] || fail "$fails expectation(s) not met"
++echo "kboot-ave host test: 6/6 cases as expected"
+-- 
+2.43.0
+

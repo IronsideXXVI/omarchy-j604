@@ -1,0 +1,347 @@
+From df5aff9c05321600770642ba2b60b09a4bd85778 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 11:47:20 +0000
+Subject: [PATCH] tests: host test of the Neural Engine firmware hand-over
+
+Build dt_set_ane_firmware() and dt_get_or_add_reserved_mem(), copied out
+of src/kboot.c, for the host with aura's ADT reader and libfdt (as
+tests/run-kboot-audio.sh does), under ASan and UBSan, and run it against
+a Mac's binary ADT and a kernel DTB with an apple,t8132-ane node. Six
+cases check the result against the segment ranges given on the command
+line: the EL2 hand-over (two no-map apple,asc-mem regions named by
+physical address, memory-region, memory-region-names,
+apple,firmware-iovas and the /chosen cold-boot marker), no marker at EL1,
+an inert DT whose node stays disabled, DT placeholders filled in place,
+a second pass over the same DT, and a phys_base below the DATA segment,
+which disables the node and reserves nothing. Neither input file is
+copied into the tree and only addresses are printed.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ tests/kboot_ane_host.c | 194 +++++++++++++++++++++++++++++++++++++++++
+ tests/run-kboot-ane.sh | 111 +++++++++++++++++++++++
+ 2 files changed, 305 insertions(+)
+ create mode 100644 tests/kboot_ane_host.c
+ create mode 100644 tests/run-kboot-ane.sh
+
+diff --git a/tests/kboot_ane_host.c b/tests/kboot_ane_host.c
+new file mode 100644
+index 00000000..9b6d6413
+--- /dev/null
++++ b/tests/kboot_ane_host.c
+@@ -0,0 +1,194 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Host test of the Neural Engine firmware hand-over (src/kboot.c dt_set_ane_firmware()), with
++ * aura's own ADT reader (rust/src/adt.rs, built for the host) and libfdt. The functions under test
++ * are copied out of src/kboot.c by tests/run-kboot-ane.sh into kboot_ane_extract.c.
++ *
++ *   kboot-ane-host <in.adt> <in.dtb> <phys_base> <el2 0|1> [option...]
++ *
++ * Options, applied to the DT before the hand-over:
++ *   disabled       set the ANE node's status to "disabled" (the inert DT)
++ *   placeholders   add two empty /reserved-memory placeholders and point memory-region at them
++ *   twice          run the hand-over twice on the same DT (idempotence)
++ *
++ * Prints m1n1's own log lines, then one "ane ..." line per checked property: the ANE node's status,
++ * memory-region resolved to each region's node name, reg, no-map, compatible and status,
++ * memory-region-names, apple,firmware-iovas, the /chosen cold-boot marker, and fdt_check_full().
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "types.h"
++#include "utils.h"
++/* src/types.h has it; the host stand-in does not: adt.h's segment ranges are packed */
++#ifndef PACKED
++#define PACKED __attribute__((packed))
++#endif
++#include "adt.h"
++
++#include "libfdt/libfdt.h"
++
++#define DT_EXTRA 65536
++
++void *adt;
++void *dt;
++static u32 adt_size;
++static int el2;
++
++struct {
++    u64 phys_base;
++} cur_boot_args;
++
++u32 adt_get_size(void)
++{
++    return adt_size;
++}
++
++static bool in_el2(void)
++{
++    return el2;
++}
++
++#include "kboot_ane_extract.c"
++
++static void *slurp(const char *path, size_t extra, size_t *size)
++{
++    FILE *f = fopen(path, "rb");
++    long n;
++    void *buf;
++
++    if (!f || fseek(f, 0, SEEK_END) || (n = ftell(f)) < 0 || fseek(f, 0, SEEK_SET)) {
++        perror(path);
++        exit(2);
++    }
++    buf = calloc(1, n + extra);
++    if (!buf || fread(buf, 1, n, f) != (size_t)n) {
++        perror(path);
++        exit(2);
++    }
++    fclose(f);
++    *size = n;
++    return buf;
++}
++
++static void hex64s(const void *v, int len)
++{
++    for (int i = 0; i + 8 <= len; i += 8)
++        printf("%s0x%llx", i ? " " : "", (unsigned long long)fdt64_ld((const fdt64_t *)((const u8 *)v + i)));
++}
++
++static int ane_node(void)
++{
++    return fdt_node_offset_by_compatible(dt, -1, "apple,t8132-ane");
++}
++
++static void add_placeholders(void)
++{
++    int resv = fdt_path_offset(dt, "/reserved-memory");
++    u32 ph[2];
++    fdt32_t cells[2];
++    static const char *const names[2] = {"ane-text-placeholder", "ane-data-placeholder"};
++
++    for (int i = 0; i < 2; i++) {
++        int n = fdt_add_subnode(dt, resv, names[i]);
++        u64 reg[2] = {0, 0};
++        if (n < 0 || fdt_generate_phandle(dt, &ph[i]) || fdt_setprop_u32(dt, n, "phandle", ph[i]) ||
++            fdt_setprop(dt, n, "reg", reg, sizeof(reg)) ||
++            fdt_setprop_string(dt, n, "compatible", "apple,asc-mem") ||
++            fdt_setprop_string(dt, n, "status", "disabled")) {
++            printf("setup: placeholder failed\n");
++            exit(2);
++        }
++        resv = fdt_path_offset(dt, "/reserved-memory");
++        cells[i] = cpu_to_fdt32(ph[i]);
++    }
++    if (fdt_setprop(dt, ane_node(), "memory-region", cells, sizeof(cells))) {
++        printf("setup: memory-region failed\n");
++        exit(2);
++    }
++}
++
++int main(int argc, char **argv)
++{
++    size_t asize, dsize;
++    int twice = 0;
++
++    if (argc < 5) {
++        fprintf(stderr, "usage: %s <in.adt> <in.dtb> <phys_base> <el2> [disabled|placeholders|twice]...\n",
++                argv[0]);
++        return 2;
++    }
++    adt = slurp(argv[1], 0, &asize);
++    adt_size = asize;
++    dt = slurp(argv[2], DT_EXTRA, &dsize);
++    cur_boot_args.phys_base = strtoull(argv[3], NULL, 0);
++    el2 = atoi(argv[4]);
++    if (fdt_open_into(dt, dt, dsize + DT_EXTRA)) {
++        printf("setup: fdt_open_into failed\n");
++        return 2;
++    }
++    if (ane_node() < 0) {
++        printf("setup: no apple,t8132-ane node in the DT\n");
++        return 2;
++    }
++    for (int i = 5; i < argc; i++) {
++        if (!strcmp(argv[i], "disabled"))
++            fdt_setprop_string(dt, ane_node(), "status", "disabled");
++        else if (!strcmp(argv[i], "placeholders"))
++            add_placeholders();
++        else if (!strcmp(argv[i], "twice"))
++            twice = 1;
++        else {
++            printf("setup: unknown option %s\n", argv[i]);
++            return 2;
++        }
++    }
++
++    int ret = dt_set_ane_firmware();
++    if (twice && !ret)
++        ret = dt_set_ane_firmware();
++    printf("ane ret=%d\n", ret);
++
++    int node = ane_node(), len;
++    const char *s = fdt_getprop(dt, node, "status", &len);
++    printf("ane status=%s\n", s ? s : "(absent)");
++    const fdt32_t *mr = fdt_getprop(dt, node, "memory-region", &len);
++    printf("ane memory-region cells=%d\n", mr ? len / 4 : 0);
++    for (int i = 0; mr && i < len / 4; i++) {
++        int r = fdt_node_offset_by_phandle(dt, fdt32_ld(&mr[i]));
++        int l2;
++        const void *reg = r < 0 ? NULL : fdt_getprop(dt, r, "reg", &l2);
++        const char *c = r < 0 ? NULL : fdt_getprop(dt, r, "compatible", NULL);
++        const char *st = r < 0 ? NULL : fdt_getprop(dt, r, "status", NULL);
++        char path[128] = "?";
++        if (r >= 0)
++            fdt_get_path(dt, r, path, sizeof(path));
++        printf("ane region%d %s reg=", i, path);
++        if (reg)
++            hex64s(reg, l2);
++        printf(" no-map=%s compatible=%s status=%s\n",
++               r >= 0 && fdt_getprop(dt, r, "no-map", NULL) ? "yes" : "no", c ? c : "-",
++               st ? st : "(absent)");
++    }
++    const char *names = fdt_getprop(dt, node, "memory-region-names", &len);
++    printf("ane memory-region-names=");
++    for (int i = 0; names && i < len; i++)
++        putchar(names[i] ? names[i] : '|');
++    printf("\n");
++    const void *iovas = fdt_getprop(dt, node, "apple,firmware-iovas", &len);
++    printf("ane firmware-iovas=");
++    if (iovas)
++        hex64s(iovas, len);
++    printf("\n");
++    const char *m = fdt_getprop(dt, fdt_path_offset(dt, "/chosen"), "apple,ane-cold-boot", NULL);
++    printf("ane chosen apple,ane-cold-boot=%s\n", m ? m : "(absent)");
++    int resv = fdt_path_offset(dt, "/reserved-memory"), n = 0, sub;
++    fdt_for_each_subnode(sub, dt, resv)
++        if (!strncmp(fdt_get_name(dt, sub, NULL), "ane-", 4))
++            n++;
++    printf("ane reserved-memory ane-* nodes=%d\n", n);
++    fdt_pack(dt);
++    printf("ane fdt_check_full=%d\n", fdt_check_full(dt, fdt_totalsize(dt)));
++    return 0;
++}
+diff --git a/tests/run-kboot-ane.sh b/tests/run-kboot-ane.sh
+new file mode 100644
+index 00000000..187bd24d
+--- /dev/null
++++ b/tests/run-kboot-ane.sh
+@@ -0,0 +1,111 @@
++#!/bin/sh
++# Host test of the Neural Engine firmware hand-over (src/kboot.c dt_set_ane_firmware()).
++#
++#   sh tests/run-kboot-ane.sh <adt.bin> <kernel.dtb> <phys_base> <text_phys> <text_size> <data_phys> <data_size> <text_remap> <data_remap>
++#
++# Runs dt_set_ane_firmware() against a Mac's binary ADT and a kernel DTB with an apple,t8132-ane
++# node, in six cases, and checks each result against the segment ranges given on the command line
++# (16K-aligned sizes). Neither file is copied into the tree; nothing but addresses is printed.
++set -eu
++cd "$(dirname "$0")/.."
++root=$(pwd)
++fail() {
++    echo "FAIL: $*" >&2
++    exit 1
++}
++[ "$#" = 9 ] || fail "usage: $0 <adt.bin> <kernel.dtb> <phys_base> <text_phys> <text_size> <data_phys> <data_size> <text_remap> <data_remap>"
++ADT=$1 DTB=$2 PB=$3 TP=$4 TS=$5 DP=$6 DS=$7 TR=$8 DR=$9
++tmp=$(mktemp -d)
++trap 'rm -rf "$tmp"' EXIT HUP INT TERM
++
++# aura's ADT reader, built for the host as tests/run-kboot-audio.sh does
++mkdir -p "$tmp/rs" "$tmp/src"
++if grep -q 'CStr::from_bytes_until_nul(&self.name)' rust/src/adt.rs; then
++    sed 's|CStr::from_bytes_until_nul(&self.name)|CStr::from_bytes_until_nul(unsafe { \&*(\&self.name as *const [c_char; 32] as *const [u8; 32]) })|' \
++        rust/src/adt.rs > "$tmp/rs/adt.rs"
++elif grep -q 'from_raw_parts(self.name.as_ptr() as \*const u8, 32)' rust/src/adt.rs; then
++    cp rust/src/adt.rs "$tmp/rs/adt.rs"
++else
++    fail "rust/src/adt.rs changed; update the host build in $0"
++fi
++printf '#![allow(non_camel_case_types, dead_code, unused_imports)]\ntype c_size_t = usize;\nmod adt;\n' \
++    > "$tmp/rs/lib.rs"
++RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.89.0} rustc --edition 2021 --crate-type staticlib -O \
++    -o "$tmp/rs/libadt_host.a" "$tmp/rs/lib.rs" || fail "host build of the ADT reader"
++
++# The code under test, copied out of src/kboot.c: bail(), dt_get_or_add_reserved_mem(), and
++# ane_compatibles[] through dt_set_ane_firmware()
++{
++    echo '#define SZ_16K (1 << 14)'
++    awk '/^#define bail\(\.\.\.\)/{p=1} p{print} p&&/while \(0\)$/{exit}' src/kboot.c
++    awk '/^static int dt_get_or_add_reserved_mem\(/{p=1} p{print} p&&/^}$/{exit}' src/kboot.c
++    awk '/^static const char \*const ane_compatibles\[\] = \{/{p=1} p{print} /^static int dt_set_ane_firmware\(void\)/{q=1} p&&q&&/^}$/{exit}' src/kboot.c
++} > "$tmp/src/kboot_ane_extract.c"
++grep -q 'dt_set_ane_firmware' "$tmp/src/kboot_ane_extract.c" || fail "extraction"
++grep -q 'dt_get_or_add_reserved_mem' "$tmp/src/kboot_ane_extract.c" || fail "extraction"
++cp src/adt.h tests/kboot_audio_host/*.h tests/kboot_ane_host.c "$tmp/src/"
++sed -i 's|^#endif$|#ifndef ALIGN_UP\n#define ALIGN_UP(x, a) (((x) + ((a) - 1)) \& ~((a) - 1))\n#endif\n#endif|' "$tmp/src/utils.h"
++${CC:-cc} -std=gnu11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
++    -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
++    -I"$tmp/src" -I"$root/src" -I"$root" \
++    "$tmp/src/kboot_ane_host.c" src/libfdt/fdt.c src/libfdt/fdt_ro.c src/libfdt/fdt_rw.c src/libfdt/fdt_wip.c \
++    src/libfdt/fdt_sw.c src/libfdt/fdt_empty_tree.c src/libfdt/fdt_strerror.c \
++    src/libfdt/fdt_check.c "$tmp/rs/libadt_host.a" -lm -lpthread -ldl -o "$tmp/kboot-ane-host" ||
++    fail "host build"
++export ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0}
++
++hx() { printf '%x' "$1"; }
++TN="ane-firmware-text@$(hx "$TP")"
++DN="ane-firmware-data@$(hx "$DP")"
++REG0="reg=0x$(hx "$TP") 0x$(hx "$TS")"
++REG1="reg=0x$(hx "$DP") 0x$(hx "$DS")"
++IOV="ane firmware-iovas=0x$(hx "$TR") 0x$(hx "$DR")"
++fails=0
++case_() { # name expect-lines... (each a fixed string that must appear) ; uses $out
++    name=$1; shift
++    for e in "$@"; do
++        if ! printf '%s\n' "$out" | grep -q -F -x -e "$e"; then
++            echo "  MISSING: $e"; fails=$((fails + 1)); bad=1
++        fi
++    done
++}
++run() { # name args... -- expects...
++    name=$1; shift
++    args=""
++    while [ "$1" != -- ]; do args="$args $1"; shift; done; shift
++    # shellcheck disable=SC2086
++    out=$("$tmp/kboot-ane-host" "$ADT" "$DTB" $args 2>&1) || { echo "== $name: host binary failed"; printf '%s\n' "$out"; fails=$((fails + 1)); return; }
++    bad=0
++    echo "== $name"
++    printf '%s\n' "$out" | sed 's/^/  /'
++    case_ "$name" "$@"
++    [ $bad = 0 ] && echo "  OK" || echo "  CASE FAIL"
++}
++OKSET() {
++    printf '%s\n' "ane ret=0" "ane status=okay" "ane memory-region cells=2" \
++        "ane region0 /reserved-memory/$TN $REG0 no-map=yes compatible=apple,asc-mem status=$1" \
++        "ane region1 /reserved-memory/$DN $REG1 no-map=yes compatible=apple,asc-mem status=$1" \
++        "ane memory-region-names=firmware-text|firmware-data|" "$IOV" \
++        "ane reserved-memory ane-* nodes=2" "ane fdt_check_full=0"
++}
++MK="ane chosen apple,ane-cold-boot=raw-no-xnu-ane-untouched-v1"
++NOMK="ane chosen apple,ane-cold-boot=(absent)"
++
++eval "set -- $(OKSET '(absent)' | sed "s/.*/'&'/" | tr '\n' ' ')"
++run "1 EL2 hand-over" "$PB" 1 -- "$@" "$MK"
++run "2 EL1: no cold-boot marker" "$PB" 0 -- "$@" "$NOMK"
++run "3 inert DT (status disabled): regions reserved, status kept" "$PB" 1 disabled -- \
++    "ane ret=0" "ane status=disabled" "ane memory-region cells=2" \
++    "ane region0 /reserved-memory/$TN $REG0 no-map=yes compatible=apple,asc-mem status=(absent)" \
++    "ane region1 /reserved-memory/$DN $REG1 no-map=yes compatible=apple,asc-mem status=(absent)" "$IOV" "$MK" \
++    "ane fdt_check_full=0"
++eval "set -- $(OKSET okay | sed "s/.*/'&'/" | tr '\n' ' ')"
++run "4 DT placeholders: filled in place, renamed, enabled" "$PB" 1 placeholders -- "$@" "$MK"
++# The second pass finds the regions the first one added and takes the placeholder path: same
++# nodes, same addresses, now with status okay.
++run "5 twice: idempotent (second pass fills its own regions)" "$PB" 1 twice -- "$@" "$MK"
++run "6 phys_base below DATA: node disabled, nothing reserved" "$(printf '0x%x' $((DP)))" 1 -- \
++    "ane ret=0" "ane status=disabled" "ane memory-region cells=0" "ane reserved-memory ane-* nodes=0" \
++    "FDT: ANE disabled: invalid ADT firmware segments" "$NOMK" "ane fdt_check_full=0"
++[ $fails = 0 ] || fail "$fails expectation(s) not met"
++echo "kboot-ane host test: 6/6 cases as expected"
+-- 
+2.43.0
+
