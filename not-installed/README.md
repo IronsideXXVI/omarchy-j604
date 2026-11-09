@@ -1,6 +1,6 @@
 # Changes that are not installed
 
-The J604 runs the stock Omarchy **edge** userland (`omarchy-dev` and `omarchy-settings-dev` from the official recipes), with one local addition: the keyboard-backlight series in `omarchy-dev/` and `omarchy-settings-dev/` (local pkgrel 1.3). Everything on this page is **not installed** and **not in this tree**. Nothing was deleted from history: commit 96827b7 (the initial import) holds the last published version of most of it, in `omarchy/patches/` and `omarchy-settings/patches/` (built as local pkgrel 3.610 on Omarchy 4.5 then).
+The J604 runs the stock Omarchy **edge** userland (`omarchy-dev` and `omarchy-settings-dev` from the official recipes), with two local additions: the keyboard-backlight series in `omarchy-dev/` and `omarchy-settings-dev/`, and the built-in panel defaults in `omarchy-settings-dev/` and `omarchy-mac/`. Everything on this page is **not installed** and **not in this tree**. Nothing was deleted from history: commit 96827b7 (the initial import) holds the last published version of most of it, in `omarchy/patches/` and `omarchy-settings/patches/` (built as local pkgrel 3.610 on Omarchy 4.5 then).
 
 | Topic | What it did | Where it is now |
 | --- | --- | --- |
@@ -10,7 +10,7 @@ The J604 runs the stock Omarchy **edge** userland (`omarchy-dev` and `omarchy-se
 | Kyber retry | Retry the kyber scheduler write while a sibling disk switches | Not installed. Open upstream as [omacom/omarchy#18228](https://github.com/omacom/omarchy/pull/18228). 96827b7: `omarchy-settings/patches/0001` |
 | Battery charge threshold | Read the battery's own charge threshold | Not installed. 96827b7: `omarchy/patches/0007` |
 | Custom repository hook | Put the add-custom-repo hook into use | Not installed. 96827b7: `omarchy-settings/patches/0002` |
-| Internal display defaults | J604 panel defaults (bit depth, colour management, adaptive sync) | Never published here. P3 and VRR as per-panel package defaults are built and pending (see `STATUS.md`) |
+| Internal display defaults (`apple-display.lua`) | J604 panel defaults (bit depth, colour management, adaptive sync) | Never published here and not installed. Replaced on 2026-11-09 by the installed panel defaults (10-bit, Display P3; VRR left off) in `omarchy-settings-dev/` 1.4 and `omarchy-mac/` 2.12 |
 | Neural Engine userland rebuilds | Local rebuilds of the ANE packages | Withdrawn; the J604 uses the official edge builds of `omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler` and `omarchy-mac-ml`. Never published here |
 
 Two earlier topics are installed again, in a new form:

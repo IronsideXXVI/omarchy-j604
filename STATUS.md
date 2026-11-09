@@ -21,8 +21,8 @@ MEASURED 2026-11-09 (`pacman -Q` and `uname -r` on the machine):
 | Layer | What is installed | Source |
 | --- | --- | --- |
 | Channel | Omarchy **edge** since 2026-11-09 (official `omarchy-channel-set edge`) | official |
-| Desktop | `omarchy-dev` / `omarchy-settings-dev` 4.0.0.r7634.gcbd0029, local pkgrel `1.3`: stock edge plus only the keyboard-backlight series (4 patches); Hyprland 0.57.1, stock | official recipe + 4 patches |
-| Mac add-on | `omarchy-mac` 0.2.3, local `2.7`: keyboard-backlight idle default, Apple F-row key names, Touch ID eligibility | official recipe + 3 patches |
+| Desktop | `omarchy-dev` 4.0.0.r7634.gcbd0029, local pkgrel `1.3` (stock edge + the keyboard-backlight series, 4 patches); `omarchy-settings-dev` same version, local `1.4` (the same 4 patches + the built-in panel defaults, 1 patch); Hyprland 0.57.1, stock | official recipes + 4 / 5 patches |
+| Mac add-on | `omarchy-mac` 0.2.3, local `2.12`: keyboard-backlight idle default, Apple F-row key names, Touch ID eligibility, the 14-inch MacBook Pro panel line (10-bit, Display P3) | official recipe + 4 patches |
 | Kernel | `linux-aurora` 7.2.11.aurora15, local `1.617` (766 patches), running `7.2.11-15-1.617-ARCH` since 2026-11-09 | official recipe + J604 series |
 | Boot chain | `m1n1-aurora` 1.6.1.aurora22 (local `1.608`), `uboot-aurora` 2026.07.aurora6 (local `1.604`), `omarchy-mac-boot` 20261104 (local `1.614`), `plymouth` 26.134.222 (local `3.604`), `asahi-scripts` 20261023 (local `1.1`) | official recipes + J604 patches |
 | Graphics | `mesa-aurora` / `vulkan-aurora` with the T8132 GPU admitted (local `1.8132`) | official recipe + 1 patch |
@@ -30,7 +30,7 @@ MEASURED 2026-11-09 (`pacman -Q` and `uname -r` on the machine):
 | Firmware | `asahi-fwextract` 0.9.2 (local `1.608`): extra camera tuning files | official recipe + 1 patch |
 | Neural Engine userland | `omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`: official edge builds, not carried by us | official |
 
-Next kernel (not installed): the J604 series is being rebased onto aurora-silicon/linux `integration/aurora` 7.3.0. A 1.618 build is planned for the camera fix below.
+Next kernel (not installed): the J604 series is being rebased onto aurora-silicon/linux `integration/aurora` 7.3.0. The camera fix below goes into that kernel.
 
 ## What changed in kernel 1.617 (over 1.614)
 
@@ -58,8 +58,9 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | GPU idle power | In progress | TO-VERIFY 2026-11-09 |
 | RAM (16 GB) | Working | MEASURED 2026-11-09 |
 | Internal display (3024x1964 at 120 Hz, scale 2) | Working | MEASURED 2026-11-09 |
-| 10-bit | Compositor scans out XRGB2101010 through one user setting; panel link most likely 8 bpc with dithering | MEASURED 2026-11-09 (scanout); INFERENCE 2026-11-09 (link depth) |
-| P3 and VRR as panel defaults | Built, not installed (pending) | TO-VERIFY 2026-11-09 |
+| 10-bit | Package default: compositor scans out XRGB2101010 with no user setting; panel link most likely 8 bpc with dithering | MEASURED 2026-11-09 (scanout); INFERENCE 2026-11-09 (link depth) |
+| Display P3 | Package default (`cm = dp3`, kernel colour target Display P3); visual check pending | MEASURED 2026-11-09 (setting); TO-VERIFY 2026-11-09 (visual) |
+| VRR | Off, the upstream Omarchy default (since 58443c82c); decision pending | MEASURED 2026-11-09 |
 | EDR / HDR | No claim on the current build | TO-VERIFY 2026-11-09 |
 | Glassy bar frame rate | Stock: about 59 fps at 120 Hz; 119 fps only with omacom/omarchy#18176 | MEASURED 2026-11-09 |
 | Brightness | Working (panel backlight) | MEASURED 2026-11-09 |
@@ -77,7 +78,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | Speakers (with speaker protection) | Working | MEASURED 2026-11-06 (playback); 2026-11-09 (sink and `speakersafetyd` active) |
 | Headphone jack | Working | MEASURED 2026-11-06 |
 | Microphones | In progress | TO-VERIFY 2026-11-09 |
-| Camera | In progress: `apple-isp` unbound (probe fails with -EBUSY on 1.617); fix planned for 1.618 | MEASURED 2026-11-09 |
+| Camera | In progress: `apple-isp` unbound (probe fails with -EBUSY on 1.617); OPEN, fix goes into the 7.3 kernel | MEASURED 2026-11-09 |
 | Hardware video decode (H.264) | Working | MEASURED 2026-11-08 |
 | Video encode (AVE), JPEG, scaler, ProRes | In progress (ProRes driver in 1.617, nodes disabled, not loaded) | TO-VERIFY 2026-11-09 |
 | Neural Engine (ANE) | Driver bound, not powered up; no `/dev/accel` | MEASURED 2026-11-09 |
@@ -108,8 +109,10 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 
 ### Internal display
 - **Working.** MEASURED 2026-11-09: 3024x1964 at 120 Hz, scale 2.
-- 10-bit: the compositor scans out XRGB2101010 because of one line in the owner's `~/.config/hypr/monitors.lua` (MEASURED 2026-11-09). That is a user setting, not a package change. The panel link itself is most likely 8 bits per channel with dithering (INFERENCE 2026-11-09).
-- P3 colour and VRR as per-panel package defaults: built, not installed (pending, TO-VERIFY 2026-11-09).
+- Package defaults since 2026-11-09 (MEASURED 2026-11-09 after a reboot, with no display line in the owner's `monitors.lua`): 3024x1964 at 120 Hz (the panel's only mode), scale 2, 10-bit (the compositor scans out XRGB2101010) and Display P3 (Hyprland `cm = dp3`; the kernel logs "panel SDR colour: Display P3"; the connector stays on its default colorspace).
+  - Carried by: `omarchy-mac` 2.12, whose `displays.conf` names the panel (`panel eDP 3024x1964 bitdepth=10 cm=dp3`), and `omarchy-settings-dev` 1.4, whose `panel-defaults.lua` applies that line to the built-in panel's monitor rules. A `bitdepth` or `cm` set in `monitors.lua` still wins. Mode and scale need no package setting: Hyprland picks 3024x1964 at 120 Hz and scale 2 on its own (CODE).
+  - The panel link itself is most likely 8 bits per channel with dithering (INFERENCE 2026-11-09). Whether the P3 picture looks right is TO-VERIFY (visual check).
+- VRR: off (MEASURED 2026-11-09). That is the upstream Omarchy default: Omarchy turned VRR on and took it out again in 58443c82c because it adds a small lag (SOURCE). The panel supports 24-120 Hz. Whether to carry VRR on is a decision still pending.
 - EDR / HDR: no claim on the current build (TO-VERIFY 2026-11-09). 1.617 adds groundwork that takes the EDR headroom from the content (CODE); it needs an HDR client to be measured.
 - Glassy bar: stock holds about 59 fps on this 120 Hz panel; 119 fps needs the xray change in omacom/omarchy#18176 (MEASURED 2026-11-09). That change is not in our packages; the owner's own user toggle restores it locally.
 - Brightness: the panel backlight works (MEASURED 2026-11-09). There is no automatic brightness in the installed packages.
@@ -128,7 +131,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 
 ### Keyboard, trackpad, keyboard backlight
 - **Working.** MEASURED 2026-11-09: keyboard and multi-touch trackpad, also at the disk-unlock prompt.
-- Keyboard backlight: **Working** with the local `omarchy-dev` / `omarchy-settings-dev` 1.3 and `omarchy-mac` 2.7 builds (MEASURED 2026-11-09): on with activity, off after 10 s idle, Ctrl+F1/F2 change the level, and Super+K lists no keys the MacBook lacks.
+- Keyboard backlight: **Working** with the local `omarchy-dev` 1.3 / `omarchy-settings-dev` 1.4 and `omarchy-mac` 2.12 builds (MEASURED 2026-11-09): on with activity, off after 10 s idle, Ctrl+F1/F2 change the level, and Super+K lists no keys the MacBook lacks.
 
 ### Wi-Fi and Bluetooth
 - **Working.** MEASURED 2026-11-09: BCM4388 Wi-Fi connected; Bluetooth powered. A2DP playback MEASURED 2026-11-06.
@@ -145,7 +148,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
   - On 1.617 its probe fails with -EBUSY (error -16): the ISP's DART (`apple-dart`) maps its address-filter (`dapf`) register window, and the ISP driver then asks for the same window exclusively.
   - On 1.614 the probe also failed, earlier, with -19: the ISP's DART had no filter ranges and did not probe (MEASURED 2026-11-09 on 1.614).
   - The camera power domain stays on while the ISP is unbound (INFERENCE 2026-11-09).
-  - Tracked; the fix (one driver owns the `dapf` window) is planned for 1.618.
+  - OPEN. The fix (one driver owns the `dapf` window) goes into the 7.3 kernel. The same -EBUSY lines are in the log of the 2026-11-09 17:11Z boot.
 - Carried by: kernel ISP series, m1n1 camera firmware hand-off, `asahi-fwextract` (extra sensor tuning files).
 
 ### Media engines
@@ -187,3 +190,4 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 4. **Unlock prompt can go black while typing** with stock Plymouth on device-tree Macs. We carry a small Plymouth patch.
 5. **Glassy bar at about 59 fps** on this 120 Hz panel with stock (MEASURED 2026-11-09). 119 fps needs omacom/omarchy#18176.
 6. **CPU power profile on AC.** The edge `omarchy-power-profiles-daemon` 0.30-7 applies its `performance` profile on AC to Apple Silicon, so the CPUs idle at their top clock and idle power on AC is about 10.5 W (MEASURED 2026-11-09). This is the stock default, not a J604 change.
+7. **Built-in panel defaults.** Stock Omarchy drives every output at 8 bits per channel and gives Apple Silicon displays Hyprland's EDID colour preset. On this Mac our `omarchy-mac` 2.12 and `omarchy-settings-dev` 1.4 make the built-in panel 10-bit and Display P3 by default (MEASURED 2026-11-09); external monitors are left alone, and a `monitors.lua` setting still wins. Both changes are drafted for upstream (see `UPSTREAM.md`).

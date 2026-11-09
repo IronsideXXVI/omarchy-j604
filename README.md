@@ -7,7 +7,9 @@ This repository is the working set for running [Omarchy](https://github.com/omac
 The J604 runs the official Omarchy **edge** channel (switched with the official `omarchy-channel-set edge` on 2026-11-09): `omarchy-dev` and `omarchy-settings-dev` built from the `quattro` branch, plus the official `omarchy-mac`. This repository carries only what the stock packages lack for this Mac:
 
 - the hardware enablement (kernel, boot chain, Mesa admission, audio profiles, firmware extraction, initramfs and unlock-prompt fixes, Touch ID eligibility);
-- one userland addition: the keyboard-backlight series in `omarchy-dev` / `omarchy-settings-dev` (the backlight comes on with activity, goes off after 10 s idle, Ctrl+F1/F2 change it, and Super+K leaves out keys a MacBook doesn't have).
+- two userland additions:
+  - the keyboard-backlight series in `omarchy-dev` / `omarchy-settings-dev` (the backlight comes on with activity, goes off after 10 s idle, Ctrl+F1/F2 change it, and Super+K leaves out keys a MacBook doesn't have);
+  - built-in panel defaults: `omarchy-settings-dev` reads a `panel` line from the platform package, and `omarchy-mac` names this Mac's panel there (10-bit, Display P3). A setting in the user's `monitors.lua` still wins.
 
 Everything else is stock. Each piece is a patch on top of an official recipe, built with a local `pkgrel`. Earlier userland changes that are not installed are listed in [`not-installed/README.md`](not-installed/README.md).
 
@@ -24,13 +26,13 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | Boot chain (m1n1, U-Boot, Limine, disk unlock), storage, keyboard and trackpad, USB, battery, lid | Working |
 | CPU | Working: 10 cores at full clocks (performance 4.46 GHz, efficiency 2.89 GHz), cpufreq and cpuidle |
 | GPU | Accelerated (OpenGL 4.6 / Vulkan 1.4). GPU idle power in progress |
-| Internal display | 3024x1964 at 120 Hz, scale 2, 10-bit compositor scanout (XRGB2101010) through one user setting in `monitors.lua`. The panel link is most likely 8 bits per channel with dithering (not yet verified). P3 and VRR as panel defaults are built, not installed (pending) |
+| Internal display | 3024x1964 at 120 Hz, scale 2, 10-bit (XRGB2101010) and Display P3 as package defaults, with no user setting. The panel link is most likely 8 bits per channel with dithering (not yet verified). VRR stays off, as in upstream Omarchy |
 | Glassy bar | Stock holds about 59 fps on this 120 Hz panel. 119 fps needs the change in [omacom/omarchy#18176](https://github.com/omacom/omarchy/pull/18176), which is not carried here |
 | Wi-Fi and Bluetooth | Working |
 | Audio | Speakers (with speaker protection) and headphone jack working; microphones in progress |
 | Media | H.264 hardware decode working; video encode in progress |
 | Touch ID | Working for sudo, polkit and the lock screen |
-| Keyboard backlight | Working with the local `omarchy-dev` / `omarchy-settings-dev` 1.3 builds |
+| Keyboard backlight | Working with the local `omarchy-dev` 1.3 / `omarchy-settings-dev` 1.4 builds |
 | Neural Engine | Driver bound; not powered up on the T8132 yet (the driver stops before power-up by design), no `/dev/accel` |
 | Power | Suspend (s2idle) on lid close working. Idle on AC is about 10.5 W with the stock edge `performance` power profile (see `STATUS.md`). Deep sleep in progress |
 | In progress | GPU idle power, deep sleep, camera, microphones, Thunderbolt/USB4, external displays and HDMI |
@@ -64,8 +66,9 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 | `asahi-scripts` | 20261023, asahi-alarm/asahi-scripts | `1.1` |
 | `plymouth` | 26.134.222, Plymouth (Arch Linux recipe) | `3.604` |
 | `omarchy-mac-boot` | 20261104, omacom/omarchy-mac-pkgs (`7e50e937b5`) | `1.614` |
-| `omarchy-mac` | 0.2.3, omacom/omarchy-mac-pkgs (`ea0097a523`) | `2.7` |
-| `omarchy-dev`, `omarchy-settings-dev` | 4.0.0.r7634.gcbd0029 (edge), omacom/omarchy `quattro` (`cbd0029fdd`) | `1.3` (keyboard-backlight patches only) |
+| `omarchy-mac` | 0.2.3, omacom/omarchy-mac-pkgs (`ea0097a523`) | `2.12` (adds the panel line) |
+| `omarchy-dev` | 4.0.0.r7634.gcbd0029 (edge), omacom/omarchy `quattro` (`cbd0029fdd`) | `1.3` (keyboard-backlight patches only) |
+| `omarchy-settings-dev` | 4.0.0.r7634.gcbd0029 (edge), omacom/omarchy `quattro` (`cbd0029fdd`) | `1.4` (keyboard-backlight patches + built-in panel defaults) |
 
 Also installed, unchanged from the official repositories: Hyprland 0.57.1 and the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
@@ -86,8 +89,8 @@ Coming next (not installed): a rebase of the J604 series onto aurora-silicon/lin
 | `asahi-scripts/` | adds the `apple_nvmem_spmi` module to the initramfs | asahi-alarm/asahi-scripts | MIT |
 | `plymouth/` | SimpleDRM recognized by driver name, so the disk unlock prompt opens on the panel | Plymouth | GPL-2.0 |
 | `omarchy-mac-boot/` | boot package fixes for the J604 | omacom/omarchy-mac-pkgs | MIT |
-| `omarchy-mac/` | keyboard backlight idle timeout, Apple F-row key names, Touch ID on the J604 | omacom/omarchy-mac-pkgs | MIT |
-| `omarchy-dev/`, `omarchy-settings-dev/` | the keyboard-backlight series on the edge recipes (the same four patches in both; both packages build from the same patched source) | omacom/omarchy | MIT |
+| `omarchy-mac/` | keyboard backlight idle timeout, Apple F-row key names, Touch ID on the J604, the 14-inch MacBook Pro panel line (10-bit, Display P3) | omacom/omarchy-mac-pkgs | MIT |
+| `omarchy-dev/`, `omarchy-settings-dev/` | the keyboard-backlight series on the edge recipes (the same four patches in both); `omarchy-settings-dev` also carries the built-in panel defaults (`disp-0201`) | omacom/omarchy | MIT |
 | `not-installed/` | earlier userland changes that are not installed, and where they are | | |
 
 Every component directory has the same shape:
@@ -101,7 +104,7 @@ Every component directory has the same shape:
 
 One kernel patch is a test-only change that the installed 1.617 build does ship: `0616-TEST-ONLY-arm64-dts-apple-t8132-j604-Enable-the-CPU-.patch` enables the CPU performance-counter (PMU) node on the J604 for a counter measurement. It is published because the installed kernel carries it, and it is not proposed upstream as it is; the node is enabled for good only after that measurement passes.
 
-Each patch keeps its original author. Patches whose subject starts with "J604 local build" are carried only here so far. Patches made with an AI coding assistant say so in an `Assisted-by:` trailer, and pull requests disclose it per each repository's policy. Apart from the pull requests and issues listed in `UPSTREAM.md`, these patches have not been submitted upstream yet.
+Each patch keeps its original author. Patches whose subject starts with "J604 local build" are carried only here so far. Patches made with an AI coding assistant say so in an `Assisted-by:` trailer (or `Co-Authored-By:` where the target repository uses that, as for the two panel-defaults patches), and pull requests disclose it per each repository's policy. Apart from the pull requests and issues listed in `UPSTREAM.md`, these patches have not been submitted upstream yet.
 
 No Apple firmware, binaries or device dumps are in this repository. The firmware the machine needs is extracted on the machine itself at install time, as on every Omarchy Mac.
 

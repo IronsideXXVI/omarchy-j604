@@ -6,7 +6,7 @@ Omarchy for Apple Silicon contributors. Thank you.
 
 | Author | Patches |
 | --- | --- |
-| Dylan Ironside | 350 |
+| Dylan Ironside | 352 |
 | Ryan Murray | 166 |
 | Erik Bourget | 99 |
 | Diljit Singh | 47 |
@@ -30,3 +30,5 @@ Omarchy for Apple Silicon contributors. Thank you.
 | Janne Grunau | 1 |
 | Rolando Trevino | 1 |
 | ewb | 1 |
+
+Also credited in a patch message: the built-in panel defaults (`omarchy-settings-dev/patches/disp-0201`) follow omacom/omarchy#10549 by j-c-m, which set `cm = "dp3"` for the Dell XPS OLED panel.

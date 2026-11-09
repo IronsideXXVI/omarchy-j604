@@ -19,6 +19,10 @@ Labels:
 | [omacom/omarchy#18229](https://github.com/omacom/omarchy/issues/18229) | Issue: `omarchy-mac`'s mpv default never installs because `omarchy-settings` owns `/etc/mpv/mpv.conf`. Linked from the related [omacom/omarchy-mac-pkgs#66](https://github.com/omacom/omarchy-mac-pkgs/issues/66) | open |
 | [omacom/omarchy#18177](https://github.com/omacom/omarchy/pull/18177) | Keybindings menu leaves out keys a keyboard lacks | closed, not merged. The same change is now kbd-0104 in our edge build (see below) |
 
+Drafted, **not opened yet** (each waits for Dylan's yes):
+- omacom/omarchy `quattro` <- `panel-display-defaults` (commit f480a050, our `disp-0201`): a built-in panel gets the monitor settings its platform package names in `displays.conf`. Credits #10549 (j-c-m), which set `cm = "dp3"` for the Dell XPS OLED.
+- omacom/omarchy-mac-pkgs `main` <- `omarchy-mac-panel-display` (our `omarchy-mac` 0003): the 14-inch MacBook Pro panel line. It needs a fork of omacom/omarchy-mac-pkgs first, and goes after the omarchy pull request.
+
 ## Direction we follow (SOURCE: Omarchy M team decisions and chat, Sep–Nov 2026)
 
 - Integrate into the main omacom repositories wherever practical: omacom/omarchy, omacom/omarchy-pkgs, omacom/omarchy-mac-pkgs, omacom/linux-aurora, omacom/m1n1.
@@ -60,7 +64,7 @@ Each needs Dylan's sign-off.
 | 7 | asahi-scripts: add `apple_nvmem_spmi` to the initramfs hook | asahi-alarm/asahi-scripts | Needs measurement | CODE |
 | 8 | asahi-fwextract: extra camera sensor tuning files | asahi-alarm / AsahiLinux | Needs a camera capture first | CODE |
 | 9 | omarchy-mac-boot generic fixes (`dtb-overlays` under `pipefail`, vendor-firmware hook `timeout`) | omacom/omarchy-mac-pkgs | Ready (boot-critical: attach cold-boot evidence) | CODE; in daily use on the J604 |
-| 10 | Panel defaults for verified Apple panels (P3, VRR, 10-bit) as per-panel package data | omacom/omarchy-mac-pkgs (data) + omacom/omarchy (default rule) | Built, not installed; needs measurement on the J604 and other Macs. If the panel link is dithered, the claim is "10-bit compositing" | INFERENCE 2026-11-09: link most likely 8 bpc with dithering |
+| 10 | Panel defaults for verified Apple panels (10-bit, Display P3) as per-panel package data | omacom/omarchy (`panel-defaults.lua`, reads `displays.conf`) + omacom/omarchy-mac-pkgs (the panel line) | **Drafts ready, not opened** (see above); installed on the J604 since 2026-11-09. VRR is left at the upstream default (off), decision pending. If the panel link is dithered, the claim is "10-bit compositing" | MEASURED 2026-11-09: package defaults give XRGB2101010 and `cm dp3`; P3 visual TO-VERIFY |
 
 ## Wave 2: the hardware series
 
@@ -86,5 +90,4 @@ Not ready to propose (still being brought up, see `STATUS.md`): camera, micropho
 ## Kernel: what's next
 
 - Installed: `linux-aurora` 7.2.11.aurora15, local `1.617` (the series in `kernel/`, 766 patches).
-- Planned: local `1.618`, with the fix for the camera probe (one driver owns the ISP DART's `dapf` window; see `STATUS.md`).
-- In progress: the rebase of the J604 series onto aurora-silicon/linux `integration/aurora` 7.3.0, keeping only what goes beyond Aurora's own J604 / M4 work.
+- In progress: the rebase of the J604 series onto aurora-silicon/linux `integration/aurora` 7.3.0, keeping only what goes beyond Aurora's own J604 / M4 work. It also takes the fix for the camera probe (one driver owns the ISP DART's `dapf` window; see `STATUS.md`).
