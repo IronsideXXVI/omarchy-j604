@@ -60,7 +60,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | Block | State | Evidence |
 | --- | --- | --- |
 | CPU frequency scaling and idle (10 cores, full clocks) | Working | MEASURED 2026-11-09 |
-| CPU performance counters | Counter device present (test-only DT setting); counter accuracy not yet checked | MEASURED 2026-11-09 (device); TO-VERIFY 2026-11-09 (accuracy) |
+| CPU performance counters | Working: cycles and instructions count correctly on both core types (test-only DT setting) | MEASURED 2026-11-09 (1.704) |
 | GPU (OpenGL 4.6 / Vulkan 1.4) | Working | MEASURED 2026-11-09 |
 | GPU idle power | In progress | TO-VERIFY 2026-11-09 |
 | RAM (16 GB) | Working | MEASURED 2026-11-09 |
@@ -68,7 +68,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | 10-bit | Package default: compositor scans out XRGB2101010 with no user setting; panel link most likely 8 bpc with dithering | MEASURED 2026-11-09 (scanout); INFERENCE 2026-11-09 (link depth) |
 | Display P3 | Package default (`cm = dp3`, kernel colour target Display P3); passed the visual check | MEASURED 2026-11-09 (setting, and the owner's visual check) |
 | VRR | Off, fixed 120 Hz: the upstream Omarchy default (since 58443c82c), kept by the owner's decision | MEASURED 2026-11-09 |
-| EDR / HDR | No claim on the current build | TO-VERIFY 2026-11-09 |
+| EDR / HDR | Panel and connector advertise HDR; the desktop runs SDR; no EDR headroom path yet | MEASURED 2026-11-09 (properties); TO-VERIFY 2026-11-09 (HDR output) |
 | Glassy bar frame rate | Stock: about 59 fps at 120 Hz; 119 fps only with omacom/omarchy#18176 | MEASURED 2026-11-09 |
 | Brightness | Working (panel backlight) | MEASURED 2026-11-09 |
 | Automatic brightness | Not shipped | MEASURED 2026-11-09 (not in the installed packages) |
@@ -76,7 +76,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | USB-C data | Working (USB devices) | MEASURED 2026-11-09 |
 | Thunderbolt / USB4 | In progress (no USB4 domains found) | MEASURED 2026-11-09 |
 | External display 10-bit / HDR10 / EDID / DP audio, idle power-down | In the kernel since 1.617 (kept in 1.703), not tested | TO-VERIFY 2026-11-09 |
-| SD card reader | In progress (controller bound on 1.703, no card tested) | MEASURED 2026-11-09 (controller); TO-VERIFY 2026-11-09 (card) |
+| SD card reader | In progress (controller bound on 1.704, no card tested) | MEASURED 2026-11-09 (controller); TO-VERIFY 2026-11-09 (card) |
 | Storage (NVMe) | Working | MEASURED 2026-11-09 |
 | Keyboard, trackpad | Working | MEASURED 2026-11-09 |
 | Keyboard backlight | Working (on with activity, off after 10 s idle, Ctrl+F1/F2) | MEASURED 2026-11-09 |
@@ -84,13 +84,13 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | Bluetooth | Working | MEASURED 2026-11-09 |
 | Speakers (with speaker protection) | Working | MEASURED 2026-11-06 (playback); 2026-11-09 (owner's playback check on the 7.3 kernel; `speakersafetyd` active on 1.703) |
 | Headphone jack | Working | MEASURED 2026-11-06 |
-| Microphones | In progress | TO-VERIFY 2026-11-09 |
+| Microphones | Working: three-mic array captures room sound; the default source is the processed mono microphone | MEASURED 2026-11-09 (1.704) |
 | Camera | In progress: `apple-isp` bound on the 7.3 kernel (no -EBUSY); no picture taken yet | MEASURED 2026-11-09 (bound); TO-VERIFY 2026-11-09 (capture) |
 | Hardware video decode (H.264, HEVC, VP9) | Working in stock mpv (`hwdec=auto-safe`, no user settings): VA-API zero-copy with kernel 1.704 and the VA-API driver alias (`libva-v4l2_request-avd` 1.604); picture identical to software decoding at 1080p (H.264, HEVC, VP9) and 4K (H.264), no GPU submit errors. Not checked: AV1, 10-bit and HDR, 4K HEVC/VP9, other players and browsers, battery effect | MEASURED 2026-11-09 (1.704 + 1.604); TO-VERIFY 2026-11-09 (not checked) |
 | Video encode (AVE), JPEG, scaler, ProRes | In progress (ProRes driver in the kernel since 1.617, nodes disabled, not loaded) | TO-VERIFY 2026-11-09 |
 | Neural Engine (ANE) | Driver bound, not powered up; no `/dev/accel` | MEASURED 2026-11-09 |
 | Ambient light sensor | Sensor reads; nothing uses it by default | MEASURED 2026-11-08 |
-| Accelerometer, gyroscope, lid angle | In progress (devices present, readings unchecked) | TO-VERIFY 2026-11-09 |
+| Accelerometer, gyroscope, lid angle | Working at rest (plausible readings); lid-angle tracking while moving not checked | MEASURED 2026-11-09 (1.704, at rest); TO-VERIFY 2026-11-09 (moving lid) |
 | Lid switch, suspend on lid close | Working | MEASURED 2026-11-09 |
 | SMC sensors, fan, thermal readouts | Working (readouts) | MEASURED 2026-11-09 |
 | Battery and charger | Working | MEASURED 2026-11-09 |
@@ -106,7 +106,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 ### CPU
 - **Working.** MEASURED 2026-11-09: 10 cores online; `apple-cpufreq` maximums 4464 MHz (performance) and 2892 MHz (efficiency); `apple_idle` cpuidle.
 - On AC with the stock edge power profile (`performance`), both CPU policies run the `performance` governor and idle at their top clock (MEASURED 2026-11-09). See Power.
-- The PMU counter device (`apple_t8132_pmu`, 8 counters) is present (MEASURED 2026-11-09 on 1.614). Its device-tree node is enabled for a test only (patch 0616 in 1.617; the J604 device-tree file of patch 0157 in 1.703): it is enabled for good only after a counter measurement passes (TO-VERIFY 2026-11-09).
+- The PMU counter device (`apple_t8132_pmu`, 8 counters) is present (MEASURED 2026-11-09 on 1.614). Its device-tree node is enabled for a test only (patch 0616 in 1.617; the J604 device-tree file of patch 0157 in 1.703): it is enabled for good only after a counter measurement passes. That measurement passed on 1.704 (MEASURED 2026-11-09): a fixed user-space loop retires the same instruction count on an efficiency and a performance core; the efficiency core's cycles match its 2.89 GHz clock. On a performance core the cycle count shows about 3.93 GHz while cpufreq reports 4.46 GHz: the cpufreq driver reads back the requested state on this chip, not the delivered one (CODE), so the reported performance-core clock is a request, not a measurement.
 - Carried by: kernel series (CPU nodes, cluster frequency control, cpuidle, energy model). Aurora has an open pull request for M4 DVFS (#1035), which we test instead of sending our own.
 
 ### GPU
@@ -120,7 +120,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
   - Carried by: `omarchy-mac` 2.12, whose `displays.conf` names the panel (`panel eDP 3024x1964 bitdepth=10 cm=dp3`), and `omarchy-settings-dev` (1.4 on r7634, 1.1 on r7637, now 1.1 on r7641, same patch), whose `panel-defaults.lua` applies that line to the built-in panel's monitor rules. A `bitdepth` or `cm` set in `monitors.lua` still wins. Mode and scale need no package setting: Hyprland picks 3024x1964 at 120 Hz and scale 2 on its own (CODE).
   - The panel link itself is most likely 8 bits per channel with dithering (INFERENCE 2026-11-09). The P3 picture passed the owner's visual check (MEASURED 2026-11-09: "Looks great").
 - VRR: off (MEASURED 2026-11-09). That is the upstream Omarchy default: Omarchy turned VRR on and took it out again in 58443c82c because it adds a small lag (SOURCE). The panel supports 24-120 Hz. It stays off: a fixed 120 Hz, by the owner's decision (2026-11-09).
-- EDR / HDR: no claim on the current build (TO-VERIFY 2026-11-09). 1.617 adds groundwork that takes the EDR headroom from the content (CODE); it needs an HDR client to be measured.
+- EDR / HDR (MEASURED 2026-11-09 on 1.704, properties only): the panel's EDID carries an HDR static metadata block (SDR and PQ transfer functions), and the internal connector exposes HDR output metadata and colorspace properties. The desktop runs SDR (10-bit, Display P3, 80-nit SDR reference) with the backlight in its normal range; no path that hands EDR headroom above that range to the panel is exposed yet. 1.617 adds groundwork that takes the EDR headroom from the content (CODE); HDR output TO-VERIFY 2026-11-09.
 - Glassy bar: stock holds about 59 fps on this 120 Hz panel; 119 fps needs the xray change in omacom/omarchy#18176 (MEASURED 2026-11-09). That change is not in our packages; the owner's own user toggle restores it locally.
 - Brightness: the panel backlight works (MEASURED 2026-11-09). There is no automatic brightness in the installed packages.
 
@@ -130,7 +130,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 ### USB-C, Thunderbolt / USB4, SD card
 - USB-C data: **Working** for USB devices (MEASURED 2026-11-09).
 - Thunderbolt / USB4: **In progress.** No USB4 domains are found on the current build (MEASURED 2026-11-09).
-- SD reader: the controller (`sdhci-pci`) is bound on 1.703 (MEASURED 2026-11-09); no card tested (TO-VERIFY 2026-11-09).
+- SD reader: the controller (`sdhci-pci`, ADMA 64-bit) is bound on 1.704 with no error lines (MEASURED 2026-11-09); no card tested (TO-VERIFY 2026-11-09).
 
 ### Storage
 - **Working.** MEASURED 2026-11-09: Apple NVMe with three namespaces; root on LUKS2 + btrfs.
@@ -147,7 +147,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 ### Audio
 - Speakers: **Working**, with `speakersafetyd` protecting them (MEASURED 2026-11-06 playback; 2026-11-09 the owner's own playback on the 7.3 kernel, and the daemon active on 1.703).
 - Headphone jack: **Working** (MEASURED 2026-11-06).
-- Microphones: **In progress** (TO-VERIFY 2026-11-09).
+- Microphones: **Working** (MEASURED 2026-11-09 on 1.704, 3 s of room noise, nothing played): the raw array device has three live, distinct channels (about -90 to -95 dBFS in a quiet room); the default source "MacBook Microphone" (processed, mono output on two channels) records about -66 dBFS of room noise, not digital silence. Speech quality not judged.
 - Carried by: J604 files in `alsa-ucm-conf-aurora`, `aurora-audio` and `speakersafetyd`, and the speaker amp configuration m1n1 passes on. Without `speakersafetyd` the kernel keeps the speakers muted.
 
 ### Camera
@@ -172,7 +172,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 
 ### Sensors
 - Ambient light: the sensor reads (MEASURED 2026-11-08). Nothing uses it by default; automatic brightness is not shipped.
-- Accelerometer, gyroscope, lid angle: devices present, readings unchecked (TO-VERIFY 2026-11-09).
+- Accelerometer, gyroscope, lid angle (MEASURED 2026-11-09 on 1.704, at rest): the accelerometer reads 9.80 m/s2 total with the machine flat, the gyroscope reads near zero, the lid-angle sensor reads 127 degrees with the lid open, and the ambient light sensor changes with the room. Lid-angle tracking while the lid moves: TO-VERIFY 2026-11-09.
 - Lid switch: **Working**, suspend on lid close (MEASURED 2026-11-09).
 - SMC temperatures, fan, power rails: **Working** readouts (MEASURED 2026-11-09). Fan control parity with macOS: not started.
 - Battery and charger: **Working** (MEASURED 2026-11-09).
