@@ -32,7 +32,7 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | Audio | Speakers (with speaker protection) and headphone jack working; microphones in progress |
 | Media | H.264 hardware decode working; video encode in progress |
 | Touch ID | Working for sudo, polkit and the lock screen |
-| Keyboard backlight | Working with the local `omarchy-dev` 1.3 / `omarchy-settings-dev` 1.4 builds |
+| Keyboard backlight | Working with the local `omarchy-dev` / `omarchy-settings-dev` builds |
 | Neural Engine | Driver bound; not powered up on the T8132 yet (the driver stops before power-up by design), no `/dev/accel` |
 | Power | Suspend (s2idle) on lid close working. Idle on AC is about 10.5 W with the stock edge `performance` power profile (see `STATUS.md`). Deep sleep in progress |
 | In progress | GPU idle power, deep sleep, camera, microphones, Thunderbolt/USB4, external displays and HDMI |
@@ -68,8 +68,8 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 | `libfprint-git` | 1:1.94.100.r10.g6f9479c, libfprint (`6f9479c3d5`), omacom recipe | `5.604` (accepts Secure Enclave interface v4 and v5) |
 | `omarchy-mac-boot` | 20261104, omacom/omarchy-mac-pkgs (`7e50e937b5`) | `1.614` |
 | `omarchy-mac` | 0.2.3, omacom/omarchy-mac-pkgs (`ea0097a523`) | `2.12` (adds the panel line) |
-| `omarchy-dev` | 4.0.0.r7634.gcbd0029 (edge), omacom/omarchy `quattro` (`cbd0029fdd`) | `1.3` (keyboard-backlight patches only) |
-| `omarchy-settings-dev` | 4.0.0.r7634.gcbd0029 (edge), omacom/omarchy `quattro` (`cbd0029fdd`) | `1.4` (keyboard-backlight patches + built-in panel defaults) |
+| `omarchy-dev` | 4.0.0.r7637.g29f3bb6 (edge), omacom/omarchy `quattro` (`29f3bb655f`) | `1.1` (keyboard-backlight patches only) |
+| `omarchy-settings-dev` | 4.0.0.r7637.g29f3bb6 (edge), omacom/omarchy `quattro` (`29f3bb655f`) | `1.1` (keyboard-backlight patches + built-in panel defaults) |
 
 Also installed, unchanged from the official repositories: Hyprland 0.57.1 and the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
