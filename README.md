@@ -69,8 +69,8 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 | `libva-v4l2_request-avd` | 1.3.r11.r169.gc653eaa, omacom/libva-v4l2_request (`c653eaa623`), omacom recipe | `1.604` (adds the `aurora_drv_video.so` alias; the same change is open as [omacom/omarchy-pkgs#2375](https://github.com/omacom/omarchy-pkgs/pull/2375), and its official `-2` will replace this build) |
 | `omarchy-mac-boot` | 20261104, omacom/omarchy-mac-pkgs (`7e50e937b5`) | `1.616` |
 | `omarchy-mac` | 0.2.3, omacom/omarchy-mac-pkgs (`ea0097a523`) | `2.12` (adds the panel line) |
-| `omarchy-dev` | 4.0.0.r7637.g29f3bb6 (edge), omacom/omarchy `quattro` (`29f3bb655f`) | `1.1` (keyboard-backlight patches only) |
-| `omarchy-settings-dev` | 4.0.0.r7637.g29f3bb6 (edge), omacom/omarchy `quattro` (`29f3bb655f`) | `1.1` (keyboard-backlight patches + built-in panel defaults) |
+| `omarchy-dev` | 4.0.0.r7641.gf97d3e7 (edge), omacom/omarchy `quattro` (`f97d3e7dc8`) | `1.1` (keyboard-backlight patches only) |
+| `omarchy-settings-dev` | 4.0.0.r7641.gf97d3e7 (edge), omacom/omarchy `quattro` (`f97d3e7dc8`) | `1.1` (keyboard-backlight patches + built-in panel defaults) |
 
 Also installed, unchanged from the official repositories: Hyprland 0.57.1 and the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 

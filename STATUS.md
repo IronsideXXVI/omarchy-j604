@@ -21,7 +21,7 @@ MEASURED 2026-11-09 (`pacman -Q` and `uname -r` on the machine):
 | Layer | What is installed | Source |
 | --- | --- | --- |
 | Channel | Omarchy **edge** since 2026-11-09 (official `omarchy-channel-set edge`) | official |
-| Desktop | `omarchy-dev` 4.0.0.r7637.g29f3bb6, local pkgrel `1.1` (stock edge + the keyboard-backlight series, 4 patches); `omarchy-settings-dev` same version, local `1.1` (the same 4 patches + the built-in panel defaults, 1 patch); Hyprland 0.57.1, stock | official recipes + 4 / 5 patches |
+| Desktop | `omarchy-dev` 4.0.0.r7641.gf97d3e7, local pkgrel `1.1` (stock edge + the keyboard-backlight series, 4 patches); `omarchy-settings-dev` same version, local `1.1` (the same 4 patches + the built-in panel defaults, 1 patch); Hyprland 0.57.1, stock | official recipes + 4 / 5 patches |
 | Mac add-on | `omarchy-mac` 0.2.3, local `2.12`: keyboard-backlight idle default, Apple F-row key names, Touch ID eligibility, the 14-inch MacBook Pro panel line (10-bit, Display P3) | official recipe + 4 patches |
 | Kernel | `linux-aurora` 7.3.0.aurora1, local `1.704` (164 patches on aurora-silicon/linux `integration/aurora` `6ff31cbfa2`: 1.703 plus the GPU fix 0164), running `7.3.0-1-1.704-ARCH` since 2026-11-09 | official recipe (source moved to the 7.3 base) + J604 series |
 | Boot chain | `m1n1-aurora` 1.6.1.aurora22 (local `1.608`), `uboot-aurora` 2026.07.aurora6 (local `1.604`), `omarchy-mac-boot` 20261104 (local `1.616`), `plymouth` 26.134.222 (local `3.604`), `asahi-scripts` 20261023 (local `1.1`); boot image (`boot.bin`): m1n1 + the J604 device tree (the same in 1.703 and 1.704) + U-Boot, 4,700,171 bytes | official recipes + J604 patches |
@@ -117,7 +117,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 ### Internal display
 - **Working.** MEASURED 2026-11-09: 3024x1964 at 120 Hz, scale 2.
 - Package defaults since 2026-11-09 (MEASURED 2026-11-09 after a reboot, with no display line in the owner's `monitors.lua`): 3024x1964 at 120 Hz (the panel's only mode), scale 2, 10-bit (the compositor scans out XRGB2101010) and Display P3 (Hyprland `cm = dp3`; the kernel logs "panel SDR colour: Display P3"; the connector stays on its default colorspace).
-  - Carried by: `omarchy-mac` 2.12, whose `displays.conf` names the panel (`panel eDP 3024x1964 bitdepth=10 cm=dp3`), and `omarchy-settings-dev` (1.4 on r7634, now 1.1 on r7637, same patch), whose `panel-defaults.lua` applies that line to the built-in panel's monitor rules. A `bitdepth` or `cm` set in `monitors.lua` still wins. Mode and scale need no package setting: Hyprland picks 3024x1964 at 120 Hz and scale 2 on its own (CODE).
+  - Carried by: `omarchy-mac` 2.12, whose `displays.conf` names the panel (`panel eDP 3024x1964 bitdepth=10 cm=dp3`), and `omarchy-settings-dev` (1.4 on r7634, 1.1 on r7637, now 1.1 on r7641, same patch), whose `panel-defaults.lua` applies that line to the built-in panel's monitor rules. A `bitdepth` or `cm` set in `monitors.lua` still wins. Mode and scale need no package setting: Hyprland picks 3024x1964 at 120 Hz and scale 2 on its own (CODE).
   - The panel link itself is most likely 8 bits per channel with dithering (INFERENCE 2026-11-09). The P3 picture passed the owner's visual check (MEASURED 2026-11-09: "Looks great").
 - VRR: off (MEASURED 2026-11-09). That is the upstream Omarchy default: Omarchy turned VRR on and took it out again in 58443c82c because it adds a small lag (SOURCE). The panel supports 24-120 Hz. It stays off: a fixed 120 Hz, by the owner's decision (2026-11-09).
 - EDR / HDR: no claim on the current build (TO-VERIFY 2026-11-09). 1.617 adds groundwork that takes the EDR headroom from the content (CODE); it needs an HDR client to be measured.
@@ -138,7 +138,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 
 ### Keyboard, trackpad, keyboard backlight
 - **Working.** MEASURED 2026-11-09: keyboard and multi-touch trackpad, also at the disk-unlock prompt.
-- Keyboard backlight: **Working** with the local `omarchy-dev` / `omarchy-settings-dev` and `omarchy-mac` 2.12 builds (MEASURED 2026-11-09 on `omarchy-dev` 1.3 / `omarchy-settings-dev` 1.4; the r7637 builds, local 1.1, carry the same patches byte for byte): on with activity, off after 10 s idle, Ctrl+F1/F2 change the level, and Super+K lists no keys the MacBook lacks.
+- Keyboard backlight: **Working** with the local `omarchy-dev` / `omarchy-settings-dev` and `omarchy-mac` 2.12 builds (MEASURED 2026-11-09 on `omarchy-dev` 1.3 / `omarchy-settings-dev` 1.4; the r7637 and r7641 builds, local 1.1, carry the same patches byte for byte): on with activity, off after 10 s idle, Ctrl+F1/F2 change the level, and Super+K lists no keys the MacBook lacks.
 
 ### Wi-Fi and Bluetooth
 - **Working.** MEASURED 2026-11-09: BCM4388 Wi-Fi connected; Bluetooth powered (also on 1.703 with the 7.3 device tree). A2DP playback MEASURED 2026-11-06.
