@@ -4,14 +4,14 @@ Patches in this repository by author (from each patch's `From:` line). Many are 
 carried unchanged with their authorship from Aurora Silicon, the Asahi Linux project, Omarchy and the
 Omarchy for Apple Silicon contributors. Thank you.
 
-Since kernel 7.3 (local 1.703) the kernel series is 163 patches instead of 766: Aurora's 7.3 base already
+Since kernel 7.3 (local 1.703) the kernel series is 163 patches instead of 766 (164 since 1.704): Aurora's 7.3 base already
 contains much of what we carried before, under its authors' names there. Kernel patch 0157 folds the rest
 of the 1.617 J604 series into one integration commit; its authors are those of the 1.617 series, which
 the history of `kernel/` keeps (kernel 1.617 was added in commit 4407a2a).
 
 | Author | Patches |
 | --- | --- |
-| Dylan Ironside | 161 |
+| Dylan Ironside | 163 |
 | Diljit Singh | 20 |
 | Ryan Murray | 16 |
 | RJ Skerry-Ryan | 8 |

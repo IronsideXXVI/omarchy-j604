@@ -23,8 +23,8 @@ MEASURED 2026-11-09 (`pacman -Q` and `uname -r` on the machine):
 | Channel | Omarchy **edge** since 2026-11-09 (official `omarchy-channel-set edge`) | official |
 | Desktop | `omarchy-dev` 4.0.0.r7637.g29f3bb6, local pkgrel `1.1` (stock edge + the keyboard-backlight series, 4 patches); `omarchy-settings-dev` same version, local `1.1` (the same 4 patches + the built-in panel defaults, 1 patch); Hyprland 0.57.1, stock | official recipes + 4 / 5 patches |
 | Mac add-on | `omarchy-mac` 0.2.3, local `2.12`: keyboard-backlight idle default, Apple F-row key names, Touch ID eligibility, the 14-inch MacBook Pro panel line (10-bit, Display P3) | official recipe + 4 patches |
-| Kernel | `linux-aurora` 7.3.0.aurora1, local `1.703` (163 patches on aurora-silicon/linux `integration/aurora` `6ff31cbfa2`), running `7.3.0-1-1.703-ARCH` since 2026-11-09 | official recipe (source moved to the 7.3 base) + J604 series |
-| Boot chain | `m1n1-aurora` 1.6.1.aurora22 (local `1.608`), `uboot-aurora` 2026.07.aurora6 (local `1.604`), `omarchy-mac-boot` 20261104 (local `1.616`), `plymouth` 26.134.222 (local `3.604`), `asahi-scripts` 20261023 (local `1.1`); boot image (`boot.bin`): m1n1 + the 1.703 J604 device tree + U-Boot, 4,700,171 bytes | official recipes + J604 patches |
+| Kernel | `linux-aurora` 7.3.0.aurora1, local `1.704` (164 patches on aurora-silicon/linux `integration/aurora` `6ff31cbfa2`: 1.703 plus the GPU fix 0164), running `7.3.0-1-1.704-ARCH` since 2026-11-09 | official recipe (source moved to the 7.3 base) + J604 series |
+| Boot chain | `m1n1-aurora` 1.6.1.aurora22 (local `1.608`), `uboot-aurora` 2026.07.aurora6 (local `1.604`), `omarchy-mac-boot` 20261104 (local `1.616`), `plymouth` 26.134.222 (local `3.604`), `asahi-scripts` 20261023 (local `1.1`); boot image (`boot.bin`): m1n1 + the J604 device tree (the same in 1.703 and 1.704) + U-Boot, 4,700,171 bytes | official recipes + J604 patches |
 | Graphics | `mesa-aurora` / `vulkan-aurora` with the T8132 GPU admitted and the 7.3 kernel's "aurora" driver name accepted (local `1.8133`) | official recipe + 2 patches |
 | Audio | `alsa-ucm-conf-aurora` (local `1.605`), `aurora-audio` (local `3.607`), `speakersafetyd` (local `1.605`) with J604 profiles | official recipes + J604 files |
 | Firmware | `asahi-fwextract` 0.9.2 (local `1.608`): extra camera tuning files | official recipe + 1 patch |
@@ -33,7 +33,9 @@ MEASURED 2026-11-09 (`pacman -Q` and `uname -r` on the machine):
 
 Kernel 7.3 gate (MEASURED 2026-11-09, first boot of 1.703 with its J604 device tree): no failed units; no oops, panic or kernel warning; display, GPU, speakers (`speakersafetyd` active), keyboard backlight, Touch ID sensor, camera driver, Wi-Fi, Bluetooth and the SD reader controller bound; no deferred probes. Rows below that this gate did not check keep the build and date they were measured on.
 
-## What changed with kernel 7.3 (1.703, over 1.617)
+Kernel 1.704 gate (MEASURED 2026-11-09, first boot of 1.704, one reboot): Hyprland running; no failed units; no driver probe failures; no firmware load failures; PCIe links up with no failures. The install left `boot.bin` unchanged (same J604 device tree as 1.703).
+
+## What changed with kernel 7.3 (1.703 and 1.704, over 1.617)
 
 CODE unless a line says otherwise.
 
@@ -46,7 +48,8 @@ CODE unless a line says otherwise.
 - **0161**: the J604 keeps the PCIe radio setup it had on 1.617; with the MacBook Air setup from the shared device-tree file, the Wi-Fi port failed (CODE). With 0161, Wi-Fi and Bluetooth are bound on the 7.3 device tree (MEASURED 2026-11-09).
 - **0162**: the external display controller dcpext0 uses the J604's ATC2 PHY (MEASURED 2026-11-09: it starts, with no probe timeout).
 - **0163**: a mailbox send that waits can be killed again, but not interrupted (as in 1.617).
-- Two 7.3 base changes need userland updates, both installed: the GPU's DRM driver is now called "aurora" (Mesa 1.8133), and the Secure Enclave biometric interface is version 5 (`libfprint-git` 5.604). The renamed GPU driver also needs a VA-API driver alias; it is not installed (rolled back on 2026-11-09, see Media engines).
+- **0164** (1.704, the only change over 1.703): the GPU driver's GPUVM exec lock takes a reservation that two GEM objects share only once (`DRM_EXEC_IGNORE_DUPLICATES`, as the C users of `drm_gpuvm_exec` and `drm_exec` do). Without it, a client that closes an imported dma-buf and imports the same dma-buf again while the GPU is still busy got its next submission refused with EFAULT: `VK_ERROR_DEVICE_LOST` and a blank picture for 1080p zero-copy video (MEASURED 2026-11-09 on 1.703). The same code is in 1.617, and upstream aurora-silicon/linux `integration/aurora` still has it (SOURCE, checked 2026-11-09 at `d7303c39e215`). 1.704 is otherwise the same build as 1.703: same kernel config, byte-identical device trees, the package's own tests pass as on 1.703 (MEASURED 2026-11-09, build), so `boot.bin` keeps the same J604 device tree.
+- Two 7.3 base changes need userland updates, both installed: the GPU's DRM driver is now called "aurora" (Mesa 1.8133), and the Secure Enclave biometric interface is version 5 (`libfprint-git` 5.604). The renamed GPU driver also needs a VA-API driver alias; it is not installed (rolled back on 2026-11-09 because of the GPU fault that 0164 fixes; see Media engines).
 - **Boot image.** Since 2026-11-09 `boot.bin` holds only the J604 device tree from the 1.703 package (4,700,171 bytes); it booted and was confirmed (MEASURED 2026-11-09). The default `update-m1n1` takes all 137 device trees of the 7.3 package (13.58 MB), which m1n1 stage 1 refuses (MEASURED 2026-11-09; see `UPSTREAM.md` note (b)). Since `omarchy-mac-boot` 1.616 (installed 2026-11-09) `update-m1n1` builds that J604-only image itself: its config picks the one device tree of the newest kernel whose first compatible is the running Mac's. The image it wrote was byte-identical to the confirmed one every time (three runs, at the 1.615 and the 1.616 install), and the official boot check passes (MEASURED 2026-11-09).
 
 The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on stable aurora14 and edge aurora15). The stock `linux-aurora` ships a J604 device tree that describes only the CPUs, interrupt controller, power states, pin control and serial port: no storage controller, display, keyboard or trackpad, USB, Wi-Fi or GPU. Stock m1n1 and U-Boot accept only the J713 (MacBook Air M4) on their M4 hand-off paths (INFERENCE 2026-11-09, from reading their source).
@@ -82,7 +85,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | Headphone jack | Working | MEASURED 2026-11-06 |
 | Microphones | In progress | TO-VERIFY 2026-11-09 |
 | Camera | In progress: `apple-isp` bound on the 7.3 kernel (no -EBUSY); no picture taken yet | MEASURED 2026-11-09 (bound); TO-VERIFY 2026-11-09 (capture) |
-| Hardware video decode (H.264, HEVC, VP9) | In progress: H.264 worked on 1.617; on the 7.3 kernel VA-API does not load with the stock driver package, so players decode in software with a correct picture. A build with the VA-API driver alias was rolled back the same day: stock mpv's zero-copy path gave an empty window at 1080p | MEASURED 2026-11-08 (1.617); MEASURED 2026-11-09 (7.3) |
+| Hardware video decode (H.264, HEVC, VP9) | In progress: H.264 worked on 1.617; on the 7.3 kernel VA-API does not load with the stock driver package, so players decode in software with a correct picture. The GPU fault that blanked stock mpv's 1080p zero-copy picture with the VA-API driver alias is fixed in kernel 1.704 (patch 0164); the alias is not reinstalled yet | MEASURED 2026-11-08 (1.617); MEASURED 2026-11-09 (7.3: software decode, the fault on 1.703); TO-VERIFY 2026-11-09 (zero-copy on 1.704) |
 | Video encode (AVE), JPEG, scaler, ProRes | In progress (ProRes driver in the kernel since 1.617, nodes disabled, not loaded) | TO-VERIFY 2026-11-09 |
 | Neural Engine (ANE) | Driver bound, not powered up; no `/dev/accel` | MEASURED 2026-11-09 |
 | Ambient light sensor | Sensor reads; nothing uses it by default | MEASURED 2026-11-08 |
@@ -95,7 +98,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | Deep sleep (suspend to RAM) | In progress (only s2idle offered) | MEASURED 2026-11-09 |
 | Battery life vs macOS | Not measured yet | TO-VERIFY 2026-11-09 |
 | Touch ID (sudo, polkit, lock screen) | Working (sudo also on the 7.3 kernel, owner's check) | MEASURED 2026-11-09 |
-| Boot chain (m1n1, U-Boot, Limine, disk unlock) | Working, no failed units on 1.703 with the 7.3 J604 device tree | MEASURED 2026-11-09 |
+| Boot chain (m1n1, U-Boot, Limine, disk unlock) | Working, no failed units on 1.703 and 1.704 with the 7.3 J604 device tree | MEASURED 2026-11-09 |
 
 ## Per block
 
@@ -156,7 +159,8 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 - H.264 hardware decode: worked on 1.617 (MEASURED 2026-11-08, 4K through VA-API). With stock settings, mpv's system default does not use it (omacom/omarchy#18229).
   - On the 7.3 kernel: **In progress.** The GPU's DRM driver is now called "aurora", so libva looks for `aurora_drv_video.so`. The installed stock `libva-v4l2_request-avd` -1 ships only the `asahi` name, so VA-API does not load by itself and mpv with the stock config (`hwdec=auto-safe`) decodes in software (MEASURED 2026-11-09, after the rollback: `va_openDriver() returns -1`, then software decoding). The software-decoded picture is correct (MEASURED 2026-11-09, with the same package before the alias build was installed).
   - A build with the upstream alias (aurora-silicon/alarm-aurora aedcf240ca91, SOURCE), local `libva-v4l2_request-avd` 1.604, was installed for about 12 minutes on 2026-11-09 (21:31 to 21:43 UTC) and rolled back the same day. With VA-API loading, stock mpv (`hwdec=auto-safe`) took the zero-copy path into its Vulkan output and showed an empty window at 1080p for H.264, HEVC and VP9 (3 of 3 runs each), with `VK_ERROR_DEVICE_LOST` and a kernel GPU submit error (`EFAULT`); 4K H.264 was correct (MEASURED 2026-11-09). With a copy path (`--hwdec=vaapi-copy`) all three codecs decoded in hardware with a correct picture while it was installed (MEASURED 2026-11-09).
-  - The alias comes back once the GPU fault is fixed. The cause is being looked into: it was first seen on kernel 1.703, and the path was not exercised on earlier kernels, so whether it is new with 7.3 is not known.
+  - Cause found (2026-11-09): a kernel bug, not the alias. mpv re-imports the decoder surface every frame and closes the old handle; when the same dma-buf is imported again while the closed import still has GPU mappings (cleanup waits for the GPU's in-flight jobs), two GEM objects share one reservation, the GPU driver's exec lock meets it twice, and the submission is refused with EFAULT (MEASURED 2026-11-09 on 1.703 with an ioctl trace of mpv; CODE). At 4K the re-import got the old GPU address back, which removes the stale mapping first, so 4K was not hit (MEASURED 2026-11-09; the allocator reasoning is INFERENCE). The bug is old: 1.617 has the same code (CODE); it was not seen before because VA-API zero-copy into Vulkan had not run on this Mac. Patch 0164 in kernel 1.704 fixes it (CODE).
+  - The alias comes back once 1.704 passes the zero-copy test on this Mac (TO-VERIFY 2026-11-09).
 - Video encode (AVE), JPEG, scaler, ProRes: **In progress** (TO-VERIFY 2026-11-09). The kernel carries the ProRes encoder driver from Aurora (since 1.617); its device-tree nodes are disabled and the module does not load (MEASURED 2026-11-09 on 1.617).
 
 ### Neural Engine (ANE)
