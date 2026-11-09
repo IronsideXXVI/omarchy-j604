@@ -29,7 +29,6 @@ Drafted, **not opened yet** (each waits for Dylan's yes):
 - Integrate into the main omacom repositories wherever practical: omacom/omarchy, omacom/omarchy-pkgs, omacom/omarchy-mac-pkgs, omacom/linux-aurora, omacom/m1n1.
 - **The kernel work for M4, M5 and M6 is merged together with Linux 7.3.** Our kernel series now applies to aurora-silicon/linux `integration/aurora` 7.3.0 (local 1.704, installed 2026-11-09) for that merge, rather than being sent as a separate J604 tree.
 - Results are reported through [omarchy-m-testing.org](https://omarchy-m-testing.org), one result per check. "Not tested" is the default; an implementation alone is not a pass.
-- Agent-assisted work is disclosed the way each repository asks: the Linux kernel trees use an `Assisted-by:` trailer and a human `Signed-off-by:`; repositories without a policy get a plain note in the pull request description.
 
 ## How we work
 

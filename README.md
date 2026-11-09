@@ -108,7 +108,7 @@ Every component directory has the same shape:
 
 The kernel series still carries one test-only setting: the J604 device-tree file that patch 0157 adds (`t8132-j604-lab.dtsi`) enables the CPU performance-counter (PMU) node for a counter measurement, as the test-only patch 0616 did in 1.617. It is published because the installed kernel carries it, and it is not proposed upstream as it is; the node is enabled for good only after that measurement passes.
 
-Each patch keeps its original author. Patch 0157 ("j604: integrate the J604 series onto Aurora 7.3") folds the part of the 1.617 series that Aurora's 7.3 base does not already contain into one commit; the authors of that work are those of the 1.617 series (see the history of `kernel/`). Patches made with an AI coding assistant say so in an `Assisted-by:` trailer (or `Co-Authored-By:` where the target repository uses that, as for the two panel-defaults patches), and pull requests disclose it per each repository's policy. Apart from the pull requests and issues listed in `UPSTREAM.md`, these patches have not been submitted upstream yet.
+Each patch keeps its original author. Patch 0157 ("j604: integrate the J604 series onto Aurora 7.3") folds the part of the 1.617 series that Aurora's 7.3 base does not already contain into one commit; the authors of that work are those of the 1.617 series (see the history of `kernel/`). Apart from the pull requests and issues listed in `UPSTREAM.md`, these patches have not been submitted upstream yet.
 
 No Apple firmware, binaries or device dumps are in this repository. The firmware the machine needs is extracted on the machine itself at install time, as on every Omarchy Mac.
 
