@@ -15,7 +15,7 @@ Everything else is stock. Each piece is a patch on top of an official recipe, bu
 
 It uses the official chain only: the [linux-aurora](https://github.com/omacom/linux-aurora) kernel with a J604 patch series, omacom [m1n1](https://github.com/omacom/m1n1) and U-Boot, the official installer, Omarchy edge, and normal `omarchy update`.
 
-Changes go to the official repositories as reviewed pull requests, one topic at a time, in whatever shape the team prefers. Until each one lands, this repository holds the full set so anyone can read and rebuild it. Most of the kernel series is other people's work, carried with its authorship (see Credits and `CREDITS.md`).
+Changes go to the official repositories as reviewed pull requests, one topic at a time, in whatever shape the team prefers. Until each one lands, this repository holds the full set so anyone can read and rebuild it. Much of the kernel work is other people's: carried with its authorship, or already in Aurora's 7.3 base (see Credits and `CREDITS.md`).
 
 ## Status
 
@@ -55,7 +55,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora`, `linux-aurora-headers` | 7.2.11.aurora15, omacom/linux-aurora `integration/aurora` (`b798f2b0c7`), 766 patches | `1.617` |
+| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`6ff31cbfa2`), 163 patches | `1.703` |
 | `m1n1-aurora` | 1.6.1.aurora22, omacom/m1n1 (`bc79acc434`), 37 patches | `1.608` |
 | `uboot-aurora` | 2026.07.aurora6, aurora-silicon/u-boot (`d30213eadc`) | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261031, omacom/mesa (`a196911147`) | `1.8133` |
@@ -73,13 +73,13 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 Also installed, unchanged from the official repositories: Hyprland 0.57.1 and the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
-Coming next (not installed): a rebase of the J604 series onto aurora-silicon/linux `integration/aurora` 7.3.0 is in progress. `STATUS.md` lists what 1.617 added over 1.614.
+Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree (see `STATUS.md`, which lists what 1.703 changed over 1.617). Coming next (not installed): `omarchy-mac-boot` 1.615, which makes the boot package select the J604 device tree on its own.
 
 ## Layout
 
 | Directory | What | Upstream it applies to | License |
 | --- | --- | --- | --- |
-| `kernel/` | `git format-patch` series (apply in `series` order); `BASE` names the commit it applies to and the official recipe | omacom/linux-aurora | GPL-2.0 (see `kernel/COPYING`) |
+| `kernel/` | `git format-patch` series (apply in `series` order); `BASE` names the commit it applies to and the official recipe | aurora-silicon/linux `integration/aurora` (built with the omacom `linux-aurora` recipe) | GPL-2.0 (see `kernel/COPYING`) |
 | `m1n1/` | patches and the `m1n1-aurora` recipe | omacom/m1n1 | MIT |
 | `uboot-aurora/` | J604 board patch and the `uboot-aurora` recipe | aurora-silicon/u-boot | GPL-2.0+ |
 | `mesa/` | T8132 patch, the "aurora" driver-name patch and the `mesa-aurora` recipe (builds `mesa-aurora` and `vulkan-aurora`) | omacom/mesa | MIT (main code) |
@@ -104,9 +104,9 @@ Every component directory has the same shape:
 
 `kernel/` has `BASE`, `series`, `patches/` and the kernel's license files.
 
-One kernel patch is a test-only change that the installed 1.617 build does ship: `0616-TEST-ONLY-arm64-dts-apple-t8132-j604-Enable-the-CPU-.patch` enables the CPU performance-counter (PMU) node on the J604 for a counter measurement. It is published because the installed kernel carries it, and it is not proposed upstream as it is; the node is enabled for good only after that measurement passes.
+The kernel series still carries one test-only setting: the J604 device-tree file that patch 0157 adds (`t8132-j604-lab.dtsi`) enables the CPU performance-counter (PMU) node for a counter measurement, as the test-only patch 0616 did in 1.617. It is published because the installed kernel carries it, and it is not proposed upstream as it is; the node is enabled for good only after that measurement passes.
 
-Each patch keeps its original author. Patches whose subject starts with "J604 local build" are carried only here so far. Patches made with an AI coding assistant say so in an `Assisted-by:` trailer (or `Co-Authored-By:` where the target repository uses that, as for the two panel-defaults patches), and pull requests disclose it per each repository's policy. Apart from the pull requests and issues listed in `UPSTREAM.md`, these patches have not been submitted upstream yet.
+Each patch keeps its original author. Patch 0157 ("j604: integrate the J604 series onto Aurora 7.3") folds the part of the 1.617 series that Aurora's 7.3 base does not already contain into one commit; the authors of that work are those of the 1.617 series (see the history of `kernel/`). Patches made with an AI coding assistant say so in an `Assisted-by:` trailer (or `Co-Authored-By:` where the target repository uses that, as for the two panel-defaults patches), and pull requests disclose it per each repository's policy. Apart from the pull requests and issues listed in `UPSTREAM.md`, these patches have not been submitted upstream yet.
 
 No Apple firmware, binaries or device dumps are in this repository. The firmware the machine needs is extracted on the machine itself at install time, as on every Omarchy Mac.
 

@@ -1,0 +1,256 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 7 Nov 2026 09:09:09 +0000
+Subject: [PATCH] drm/apple: m4: raise the J604 panel's SDR ceiling for
+ bright surroundings
+
+macOS lets the J604 panel show SDR content at up to about 1000 nits in
+bright surroundings, above the 600 nit user-accessible maximum the
+brightness slider covers; the ADT gives the ceiling as
+aurora-maximum-nits (1001 on the J604). Deciding when it applies needs
+the ambient light sensor, which is not this driver's: the policy lives in
+user space with the sensor.
+
+Give that policy one control, appledrm.panel_boost_nits (default 0, off;
+writable at run time). Set above the user maximum, it is the panel level
+of the backlight's full scale, capped at the ADT ceiling, and every user
+level is scaled in proportion: the backlight device, its range and the
+brightness keys stay as they are. The next present carries the scaled
+level (a new ceiling re-sends the standing one), written after the
+encoder's own, whose 600 nit bound stays for every unscaled level. EDR
+takes the scaled level as SDR white, so its headroom shrinks to match.
+Setting it back to 0 sends the unscaled level once. debugfs iomfb_m4
+shows the ADT ceiling, the request and the level last carried.
+
+Without the parameter the swaps are as before: no level is scaled and
+none goes around the encoder. Whether the firmware keeps its thermal cap
+(ADT thermal-mitigation-min-cap 300 nits) over a raised level is to be
+checked in a window.
+
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+(cherry picked from commit f772cf764a28b4ae146fc6b95cfbf84dc2a0855c)
+(cherry picked from commit 54ee43a95747930cbe44fd8812c35440e2f7ba58)
+(cherry picked from commit 3cf600c41ac99ef057160758ca8c1b0942687e36)
+---
+ drivers/gpu/drm/apple/dcp-m4-edr-test.c | 21 ++++++++
+ drivers/gpu/drm/apple/dcp-m4-edr.h      | 20 ++++++++
+ drivers/gpu/drm/apple/iomfb_m4.c        | 64 +++++++++++++++++++++++--
+ 3 files changed, 101 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-m4-edr-test.c b/drivers/gpu/drm/apple/dcp-m4-edr-test.c
+index 50d814b267..72b511fbce 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-edr-test.c
++++ b/drivers/gpu/drm/apple/dcp-m4-edr-test.c
+@@ -177,6 +177,26 @@ static void edr_restart_and_unlit(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, st.restart);
+ }
+ 
++/* Bright surroundings: the user's 600 nit full scale shows the ADT 1001. */
++static void boost_scales_the_user_level(struct kunit *test)
++{
++	u8 *swap = kunit_kzalloc(test, SWAP_SIZE, GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, swap);
++	KUNIT_EXPECT_EQ(test, dcp_m4_boost_level(600, 600, 1001), 1001U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_boost_level(300, 600, 1001), 501U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_boost_level(0, 600, 1001), 0U);
++	/* No ceiling, or none above the user maximum: the level stands. */
++	KUNIT_EXPECT_EQ(test, dcp_m4_boost_level(140, 600, 0), 140U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_boost_level(140, 600, 600), 140U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_boost_level(700, 600, 1001), 1001U);
++	dcp_m4_swap_set_level(swap, 1001);
++	KUNIT_EXPECT_EQ(test, swap[0x354], 1);
++	KUNIT_EXPECT_EQ(test, swap[0x359], 0);
++	KUNIT_EXPECT_EQ(test, get_unaligned_le64(swap + 0x35e), dcp_m4_binary64_ratio(1001, 1));
++	KUNIT_EXPECT_EQ(test, get_unaligned_le64(swap + 0x35e), 0x408f480000000000ULL);
++}
++
+ static struct kunit_case m4_edr_cases[] = {
+ 	KUNIT_CASE(edr_binary64),
+ 	KUNIT_CASE(edr_words_land_at_the_desktop_offsets),
+@@ -187,6 +207,7 @@ static struct kunit_case m4_edr_cases[] = {
+ 	KUNIT_CASE(edr_brightness_change),
+ 	KUNIT_CASE(edr_ends_in_one_swap),
+ 	KUNIT_CASE(edr_restart_and_unlit),
++	KUNIT_CASE(boost_scales_the_user_level),
+ 	{}
+ };
+ 
+diff --git a/drivers/gpu/drm/apple/dcp-m4-edr.h b/drivers/gpu/drm/apple/dcp-m4-edr.h
+index d9efa31803..0ee57ccee4 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-edr.h
++++ b/drivers/gpu/drm/apple/dcp-m4-edr.h
+@@ -18,6 +18,7 @@
+ #define APPLE_DCP_M4_EDR_H
+ 
+ #include <linux/bits.h>
++#include <linux/math.h>
+ #include <linux/types.h>
+ #include <linux/unaligned.h>
+ 
+@@ -134,6 +135,25 @@ static inline bool dcp_m4_edr_step(struct dcp_m4_edr_state *st, bool edr, bool c
+ 	return true;
+ }
+ 
++/*
++ * The panel level with a raised SDR ceiling (bright surroundings): the user's
++ * full scale @user_max shows @ceiling nits, the rest in proportion.
++ * 0 (no ceiling) keeps the level.
++ */
++static inline u32 dcp_m4_boost_level(u32 nits, u32 user_max, u32 ceiling)
++{
++	if (!ceiling || !user_max || ceiling <= user_max)
++		return nits;
++	return min_t(u64, DIV_ROUND_CLOSEST_ULL((u64)nits * ceiling, user_max), ceiling);
++}
++
++/* A panel level above the user maximum, written after the encoder's own. */
++static inline void dcp_m4_swap_set_level(u8 *swap, u32 nits)
++{
++	swap[DCP_M4_SWAP_BL_UPDATE] = 1;
++	put_unaligned_le64(dcp_m4_binary64_ratio(nits, 1), swap + DCP_M4_SWAP_BL_NITS);
++}
++
+ /* Write @w into an encoded swap record (after dcp_m4_swap_encode_full()). */
+ static inline void dcp_m4_swap_set_edr(u8 *swap, const struct dcp_m4_edr_words *w)
+ {
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index cdfa5d71bc..a6e3f17eb9 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -152,6 +152,22 @@ module_param_cb(panel_vrr_min_hz, &panel_vrr_min_hz_ops, &panel_vrr_min_hz, 0444
+ MODULE_PARM_DESC(panel_vrr_min_hz,
+ 		 "J604 experiment: offer VRR on the internal panel; VRR_ENABLED sets the DCP adaptive-sync minimum to this rate (A442 IOMFBParameter 14, as desktop 26.6 ProMotion panels; 0: off, default; at most 119; boot time)");
+ 
++static unsigned int panel_boost_nits;
++
++static int panel_boost_nits_set(const char *val, const struct kernel_param *kp)
++{
++	return param_set_uint_minmax(val, kp, 0, DCP_M4_EDR_MAX_NITS);
++}
++
++static const struct kernel_param_ops panel_boost_nits_ops = {
++	.set = panel_boost_nits_set,
++	.get = param_get_uint,
++};
++
++module_param_cb(panel_boost_nits, &panel_boost_nits_ops, &panel_boost_nits, 0644);
++MODULE_PARM_DESC(panel_boost_nits,
++		 "J604: SDR ceiling for bright surroundings: the backlight's full scale shows this many nits, up to the panel's ADT aurora-maximum-nits (an ambient-light policy sets it; 0 or the user maximum: off, default; applies from the next present)");
++
+ struct iomfb_m4 {
+ 	struct apple_dcp *owner;
+ 	struct device *dev;
+@@ -208,6 +224,11 @@ struct iomfb_m4 {
+ 	u32 vrr_min_sent;
+ 	u32 vrr_status;
+ 	u64 vrr_calls;
++	/*
++	 * Bright surroundings (panel_boost_nits): the ADT ceiling (supports-aurora,
++	 * aurora-maximum-nits; 0: none) and the one the last carried level used.
++	 */
++	u32 boost_max, boost_sent;
+ 	struct delayed_work idle_cache;
+ 	/*
+ 	 * Framebuffer references a window let go of, put
+@@ -875,6 +896,8 @@ struct dcp_m4_runtime {
+ 	struct dcp_m4_swap_state swap;
+ 	/* EDR words for the next primary present (dcp->lock), NULL: none */
+ 	const struct dcp_m4_edr_words *edr;
++	/* A raised panel level for the next primary present, 0: none */
++	u32 level;
+ 	struct completion received;
+ 	struct workqueue_struct *wq;
+ 	struct work_struct idle;
+@@ -2324,6 +2347,8 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
+ 		dcp_m4_swap_set_timing(input);
+ 	if (!ret && intent)
+ 		dcp_m4_swap_set_intent(input, intent, surface_id);
++	if (!ret && primary && frame && !intent && r->level)
++		dcp_m4_swap_set_level(input, r->level);
+ 	if (!ret && primary && frame && !intent && r->edr)
+ 		dcp_m4_swap_set_edr(input, r->edr);
+ 	if (!ret)
+@@ -3071,6 +3096,8 @@ int iomfb_m4_panel_edid(struct apple_dcp *owner, struct drm_connector *connector
+ 		dcp->panel_p3 = !ret && adt.gamut == DCP_PANEL_GAMUT_DISPLAY_P3;
+ 		dcp->panel_edr_headroom = ret ? 0 : adt.edr_potential_headroom;
+ 		dcp->panel_peak = ret ? 0 : adt.lmax_product >> 16;
++		dcp->boost_max = ret || adt.aurora_max_nits <= dcp_m4_pf->brightness_max ? 0 :
++				 adt.aurora_max_nits;
+ 		dcp->edr_ceiling = dcp_edr_ceiling(dcp->panel_edr_headroom);
+ 		dev_info(dcp->dev, "panel ADT: %s; colour target %s; EDR headroom %u.%03u\n",
+ 			 ret ? "unavailable" : "parsed",
+@@ -3657,11 +3684,23 @@ static void iomfb_m4_idle_cache_work(struct work_struct *work)
+ }
+ 
+ /* dcp->lock is the single owner of swaps, active descriptors and brightness. */
++/* The raised SDR ceiling in nits, 0 while panel_boost_nits leaves it off. */
++static u32 iomfb_m4_boost_ceiling(struct iomfb_m4 *dcp)
++{
++	u32 want = READ_ONCE(panel_boost_nits);
++
++	if (!dcp->boost_max || want <= dcp_m4_pf->brightness_max)
++		return 0;
++	return min(want, dcp->boost_max);
++}
++
+ static int iomfb_m4_swap(struct iomfb_m4 *dcp, const struct dcp_m4_frame *frame)
+ {
+ 	struct dcp_backlight_present present = {};
+ 	struct dcp_m4_edr_words words;
+ 	int prepared = -ENODATA, ret;
++	u32 ceiling = iomfb_m4_boost_ceiling(dcp), sdr;
++	bool carries, level = false;
+ 
+ 	lockdep_assert_held(&dcp->lock);
+ 	if (dcp_backlight_active(dcp->owner))
+@@ -3669,20 +3708,33 @@ static int iomfb_m4_swap(struct iomfb_m4 *dcp, const struct dcp_m4_frame *frame)
+ 	if (prepared && prepared != -EALREADY && prepared != -ENODATA)
+ 		return prepared;
+ 	/*
+-	 * EDR: present.nits is SDR white, new (prepared) or standing. A blank
+-	 * carries no words; the ramp after it starts again from 1.0, as macOS's.
++	 * present.nits is the user level, new (prepared) or standing. In bright
++	 * surroundings SDR white is that level scaled to the raised ceiling, and
++	 * a new ceiling re-sends the standing level; without one, and none to
++	 * undo, the level goes through the encoder as before (an off level too).
++	 * EDR takes SDR white from here. A blank carries no EDR words; the ramp
++	 * after it starts again from 1.0, as macOS's.
+ 	 */
++	sdr = dcp_m4_boost_level(present.nits, dcp_m4_pf->brightness_max, ceiling);
++	carries = !prepared || (frame && present.nits && ceiling != dcp->boost_sent);
++	if (frame && carries && sdr && (ceiling || dcp->boost_sent)) {
++		dcp->runtime->level = sdr;
++		level = true;
++	}
+ 	if (frame && dcp->edr_capable &&
+-	    dcp_m4_edr_step(&dcp->edr, frame->pq, !prepared, present.nits,
++	    dcp_m4_edr_step(&dcp->edr, frame->pq, carries, sdr,
+ 			    dcp->panel_peak, dcp->edr_ceiling, &words))
+ 		dcp->runtime->edr = &words;
+ 	if (!frame)
+ 		dcp->edr.restart = true;
+ 	ret = dcp_m4_runtime_swap_brightness(dcp->runtime, frame,
+-					    !prepared, present.nits);
++					    !prepared && !level, present.nits);
+ 	if (dcp->runtime->edr && !ret)
+ 		dcp->edr_swaps++;
++	if (level && !ret)
++		dcp->boost_sent = ceiling;
+ 	dcp->runtime->edr = NULL;
++	dcp->runtime->level = 0;
+ 	if (!prepared)
+ 		dcp_backlight_complete(dcp->owner, present.sequence, !ret);
+ 	return ret;
+@@ -5579,6 +5631,10 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
+ 			   r->health_top[2].index, DCP_M4_US(r->health_top[2].ns),
+ 			   r->health_hist[0], r->health_hist[1], r->health_hist[2],
+ 			   r->health_hist[3], r->health_hist[4]);
++	if (dcp->boost_max)
++		seq_printf(s, "boost max=%u want=%u ceiling=%u sent=%u\n", dcp->boost_max,
++			   READ_ONCE(panel_boost_nits), iomfb_m4_boost_ceiling(dcp),
++			   dcp->boost_sent);
+ 	if (READ_ONCE(panel_vrr_min_hz))
+ 		seq_printf(s, "vrr min_hz=%u min_sent=%#x calls=%llu status=%#x\n",
+ 			   READ_ONCE(panel_vrr_min_hz), dcp->vrr_min_sent, dcp->vrr_calls,

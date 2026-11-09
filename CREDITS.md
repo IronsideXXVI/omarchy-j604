@@ -1,34 +1,30 @@
 # Credits
 
-Patches in this repository by author (from each patch's `From:` line). Most are other people's work,
+Patches in this repository by author (from each patch's `From:` line). Many are other people's work,
 carried unchanged with their authorship from Aurora Silicon, the Asahi Linux project, Omarchy and the
 Omarchy for Apple Silicon contributors. Thank you.
 
+Since kernel 7.3 (local 1.703) the kernel series is 163 patches instead of 766: Aurora's 7.3 base already
+contains much of what we carried before, under its authors' names there. Kernel patch 0157 folds the rest
+of the 1.617 J604 series into one integration commit; its authors are those of the 1.617 series, which
+the history of `kernel/` keeps (kernel 1.617 was added in commit 4407a2a).
+
 | Author | Patches |
 | --- | --- |
-| Dylan Ironside | 352 |
-| Ryan Murray | 167 |
-| Erik Bourget | 99 |
-| Diljit Singh | 47 |
-| Jonathan Goyvaerts | 46 |
-| Eryk Wieliczko | 34 |
-| Joshua Warren | 18 |
-| Sean Dolbec | 15 |
-| Bartosz Nitka | 13 |
-| RJ Skerry-Ryan | 12 |
-| DjDeveloperr | 5 |
-| František Balázsy | 3 |
-| Yureka Lilian | 3 |
-| AxxzyWasTaken | 2 |
+| Dylan Ironside | 161 |
+| Diljit Singh | 20 |
+| Ryan Murray | 16 |
+| RJ Skerry-Ryan | 8 |
+| Bartosz Nitka | 7 |
+| Erik Bourget | 5 |
 | Lucas Goossen | 2 |
-| Michael Reeves | 2 |
 | Naeem Malik | 2 |
-| Niklas Sheth | 2 |
-| Ryan | 2 |
-| Artyom Astafurov | 1 |
 | Daniel Fernau | 1 |
+| Eryk Wieliczko | 1 |
 | Janne Grunau | 1 |
-| Rolando Trevino | 1 |
+| Jonathan Goyvaerts | 1 |
+| Joshua Warren | 1 |
+| Sean Dolbec | 1 |
 | ewb | 1 |
 
 Also credited in a patch message: the built-in panel defaults (`omarchy-settings-dev/patches/disp-0201`) follow omacom/omarchy#10549 by j-c-m, which set `cm = "dp3"` for the Dell XPS OLED panel.

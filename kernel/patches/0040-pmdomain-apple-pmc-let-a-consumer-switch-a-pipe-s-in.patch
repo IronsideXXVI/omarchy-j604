@@ -1,0 +1,325 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bartosz Nitka <niteria@gmail.com>
+Date: Fri, 6 Nov 2026 17:56:12 +0100
+Subject: [PATCH] pmdomain: apple: pmc: let a consumer switch a pipe's
+ interface enables
+
+An interface node with apple,consumer-switched keeps its BWR and boost
+bits reserved but is not a genpd domain. Add
+apple_pmc_interface_consumer_off() and apple_pmc_interface_consumer_on()
+for the consumer that names it in apple,pmc-interface: off saves both bits
+and clears the boost, then the BWR enable, as a pipe's power-down does;
+on gives both back the values they had. If the BWR enable does not take
+the change on the way off, the boost enable gets its old value back.
+Nothing is retried, and the bits of other pipes are left alone. As for the
+other interface domains, the bits return to their values at probe when the
+PMC goes away. apple_pmc_interface_consumer_check() says, changing
+nothing, whether the bits can be cleared now.
+
+KUnit: the internal display's bits with the boost enable only (as Linux
+finds them) and with both set (as macOS keeps them), next to dispext0's
+boost bit, and a BWR enable that does not clear.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Bartosz Nitka <niteria@gmail.com>
+(cherry picked from commit 65169a5381dd14a0578a666c0d0ca98d9631d04d)
+(cherry picked from commit bb398d8cdd3a189fdf92ee2d8ae1ea0156f81d8e)
+(cherry picked from commit 9b84f196c4f15772a103dd398920157bf516156e)
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/pmdomain/apple/pmc-test.c |  60 ++++++++++++++
+ drivers/pmdomain/apple/pmc.c      | 125 +++++++++++++++++++++++++++++-
+ include/linux/soc/apple/pmc.h     |  23 ++++++
+ 3 files changed, 207 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/pmdomain/apple/pmc-test.c b/drivers/pmdomain/apple/pmc-test.c
+index d563a178dc..4e7f19d473 100644
+--- a/drivers/pmdomain/apple/pmc-test.c
++++ b/drivers/pmdomain/apple/pmc-test.c
+@@ -355,6 +355,64 @@ static void apple_pmc_test_interface_stuck(struct kunit *test)
+ 	test->priv = NULL;
+ }
+ 
++/*
++ * The internal display's consumer-switched interface (BWR and boost bit 0):
++ * off clears its bits only, on gives back the values they had, whether the
++ * boot loader left both set or only the boost enable.
++ */
++static void apple_pmc_test_interface_consumer(struct kunit *test)
++{
++	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
++	struct apple_pmc_domain dom = {
++		.pmc = pmc, .interface = true, .bwr_bit = 0, .boost_bit = 0,
++		.consumer_switched = true,
++	};
++	const struct apple_pmc_hw *hw = &apple_pmc_hw_t8132;
++
++	pmc->hw = hw;
++	/* As Linux finds them: the boost enable only, next to dispext0's. */
++	writel(BIT(0) | BIT(1), pmc->rails + hw->boost_enable);
++	KUNIT_EXPECT_EQ(test, apple_pmc_interface_consumer_set(&dom, true), -EALREADY);
++	KUNIT_ASSERT_EQ(test, apple_pmc_interface_consumer_set(&dom, false), 0);
++	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), 0U);
++	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(1));
++	KUNIT_EXPECT_EQ(test, apple_pmc_interface_consumer_set(&dom, false), -EALREADY);
++	KUNIT_ASSERT_EQ(test, apple_pmc_interface_consumer_set(&dom, true), 0);
++	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), 0U);
++	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(0) | BIT(1));
++
++	/* As macOS keeps them while the display is on: both set. */
++	writel(BIT(0), pmc->rails + hw->bwr_enable);
++	KUNIT_ASSERT_EQ(test, apple_pmc_interface_consumer_set(&dom, false), 0);
++	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), 0U);
++	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(1));
++	KUNIT_ASSERT_EQ(test, apple_pmc_interface_consumer_set(&dom, true), 0);
++	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->bwr_enable), BIT(0));
++	KUNIT_EXPECT_EQ(test, readl(pmc->rails + hw->boost_enable), BIT(0) | BIT(1));
++}
++
++/* A BWR enable that does not clear: the boost enable goes back, still on. */
++static void apple_pmc_test_interface_consumer_stuck(struct kunit *test)
++{
++	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
++	struct apple_pmc_domain dom = {
++		.pmc = pmc, .interface = true, .bwr_bit = 0, .boost_bit = 0,
++		.consumer_switched = true,
++	};
++	const struct apple_pmc_hw *hw = &apple_pmc_hw_t8132;
++	struct apple_pmc_test_stuck stuck = { .offset = hw->bwr_enable, .value = BIT(0) };
++
++	pmc->hw = hw;
++	writel(BIT(0), pmc->rails + hw->boost_enable);
++	test->priv = &stuck;
++	kunit_activate_static_stub(test, apple_pmc_interface_read, apple_pmc_test_stuck_read);
++	KUNIT_EXPECT_EQ(test, apple_pmc_interface_consumer_set(&dom, false), -EIO);
++	KUNIT_EXPECT_FALSE(test, dom.consumer_off);
++	KUNIT_EXPECT_EQ(test, apple_pmc_interface_read(pmc, hw->boost_enable), BIT(0));
++	kunit_deactivate_static_stub(test, apple_pmc_interface_read);
++	test->priv = NULL;
++}
++
+ static void apple_pmc_test_genpd_remove(void *genpd)
+ {
+ 	pm_genpd_remove(genpd);
+@@ -497,6 +555,8 @@ static struct kunit_case apple_pmc_test_cases[] = {
+ 	KUNIT_CASE(apple_pmc_test_floor_pending_timeout),
+ 	KUNIT_CASE(apple_pmc_test_interface),
+ 	KUNIT_CASE(apple_pmc_test_interface_stuck),
++	KUNIT_CASE(apple_pmc_test_interface_consumer),
++	KUNIT_CASE(apple_pmc_test_interface_consumer_stuck),
+ 	KUNIT_CASE(apple_pmc_test_interface_genpd),
+ 	KUNIT_CASE(apple_pmc_test_interface_boot_state),
+ 	{}
+diff --git a/drivers/pmdomain/apple/pmc.c b/drivers/pmdomain/apple/pmc.c
+index 3765e9a775..40392c9d46 100644
+--- a/drivers/pmdomain/apple/pmc.c
++++ b/drivers/pmdomain/apple/pmc.c
+@@ -152,6 +152,10 @@ struct apple_pmc {
+  * @interface: the domain is a display pipe's BWR and boost interface enables
+  * @bwr_bit: with @interface, the bit in the BWR interface enable word
+  * @boost_bit: with @interface, the bit in the boost interface enable word
++ * @consumer_switched: with @interface, not a genpd domain: its consumer clears
++ *	and restores its bits (apple_pmc_interface_consumer_off())
++ * @consumer_off: with @consumer_switched, cleared by its consumer, and the
++ *	bits it had then (@consumer_bwr, @consumer_boost); protected by pmc->lock
+  */
+ struct apple_pmc_domain {
+ 	struct generic_pm_domain genpd;
+@@ -168,6 +172,10 @@ struct apple_pmc_domain {
+ 	bool interface;
+ 	unsigned int bwr_bit;
+ 	unsigned int boost_bit;
++	bool consumer_switched;
++	bool consumer_off;
++	bool consumer_bwr;
++	bool consumer_boost;
+ 	bool provider;
+ };
+ 
+@@ -766,6 +774,107 @@ static int apple_pmc_interface_set(struct apple_pmc_domain *dom, bool on)
+ 	return ret;
+ }
+ 
++/*
++ * A consumer-switched interface: off clears the boost, then the BWR enable,
++ * as a pipe's power-down does, after saving both; on gives both back what
++ * they had then. If the BWR enable does not take the change on the way off,
++ * the boost enable gets its old value back. Nothing is retried.
++ */
++static int apple_pmc_interface_consumer_set(struct apple_pmc_domain *dom, bool on)
++{
++	struct apple_pmc *pmc = dom->pmc;
++	const struct apple_pmc_hw *hw = pmc->hw;
++	unsigned long flags;
++	int ret;
++
++	raw_spin_lock_irqsave(&pmc->lock, flags);
++	if (on != dom->consumer_off) {
++		ret = -EALREADY;
++	} else if (on) {
++		ret = apple_pmc_interface_update(pmc, hw->boost_enable, dom->boost_bit,
++						 dom->consumer_boost);
++		if (!ret)
++			ret = apple_pmc_interface_update(pmc, hw->bwr_enable, dom->bwr_bit,
++							 dom->consumer_bwr);
++		if (!ret)
++			dom->consumer_off = false;
++	} else {
++		dom->consumer_bwr = apple_pmc_interface_read(pmc, hw->bwr_enable) &
++				    BIT(dom->bwr_bit);
++		dom->consumer_boost = apple_pmc_interface_read(pmc, hw->boost_enable) &
++				      BIT(dom->boost_bit);
++		ret = apple_pmc_interface_update(pmc, hw->boost_enable, dom->boost_bit, false);
++		if (!ret) {
++			ret = apple_pmc_interface_update(pmc, hw->bwr_enable, dom->bwr_bit, false);
++			if (ret)
++				apple_pmc_interface_update(pmc, hw->boost_enable, dom->boost_bit,
++							   dom->consumer_boost);
++		}
++		if (!ret)
++			dom->consumer_off = true;
++	}
++	raw_spin_unlock_irqrestore(&pmc->lock, flags);
++
++	return ret;
++}
++
++static struct platform_driver apple_pmc_driver;
++
++/* The consumer-switched interface named by @consumer's apple,pmc-interface. */
++static struct apple_pmc_domain *apple_pmc_consumer_interface(struct device *consumer)
++{
++	struct device_node *np = of_parse_phandle(consumer->of_node, "apple,pmc-interface", 0);
++	struct apple_pmc_domain *dom, *found = NULL;
++	struct platform_device *pdev;
++	struct apple_pmc *pmc = NULL;
++
++	if (!np)
++		return NULL;
++	pdev = of_find_device_by_node(np->parent);
++	if (pdev && pdev->dev.driver == &apple_pmc_driver.driver)
++		pmc = platform_get_drvdata(pdev);
++	if (pmc)
++		list_for_each_entry(dom, &pmc->domains, list)
++			if (dom->np == np && dom->consumer_switched)
++				found = dom;
++	if (pdev)
++		put_device(&pdev->dev);
++	of_node_put(np);
++	return found;
++}
++
++/* Whether apple_pmc_interface_consumer_off() can run for @consumer now, changing nothing. */
++int apple_pmc_interface_consumer_check(struct device *consumer)
++{
++	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer);
++	unsigned long flags;
++	int ret;
++
++	if (!dom)
++		return -ENODEV;
++	raw_spin_lock_irqsave(&dom->pmc->lock, flags);
++	ret = dom->consumer_off ? -EALREADY : 0;
++	raw_spin_unlock_irqrestore(&dom->pmc->lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_pmc_interface_consumer_check);
++
++int apple_pmc_interface_consumer_off(struct device *consumer)
++{
++	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer);
++
++	return dom ? apple_pmc_interface_consumer_set(dom, false) : -ENODEV;
++}
++EXPORT_SYMBOL_GPL(apple_pmc_interface_consumer_off);
++
++int apple_pmc_interface_consumer_on(struct device *consumer)
++{
++	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer);
++
++	return dom ? apple_pmc_interface_consumer_set(dom, true) : -ENODEV;
++}
++EXPORT_SYMBOL_GPL(apple_pmc_interface_consumer_on);
++
+ static int apple_pmc_domain_power_on(struct generic_pm_domain *genpd)
+ {
+ 	struct apple_pmc_domain *dom = genpd_to_apple_pmc_domain(genpd);
+@@ -794,6 +903,8 @@ static int apple_pmc_domain_power_off(struct generic_pm_domain *genpd)
+ 
+ static void apple_pmc_domain_free(struct apple_pmc_domain *dom)
+ {
++	if (dom->consumer_switched)
++		goto free;
+ 	if (dom->provider)
+ 		of_genpd_del_provider(dom->np);
+ 	if (pm_genpd_remove(&dom->genpd)) {
+@@ -802,6 +913,7 @@ static void apple_pmc_domain_free(struct apple_pmc_domain *dom)
+ 			 dom->genpd.name);
+ 		return;
+ 	}
++free:
+ 	of_node_put(dom->np);
+ 	kfree(dom->genpd.name);
+ 	kfree(dom);
+@@ -1011,6 +1123,15 @@ static int apple_pmc_interface_add(struct apple_pmc *pmc, struct device_node *np
+ 		return -ENOMEM;
+ 	}
+ 
++	/* Its consumer clears and restores its bits: no genpd domain. */
++	dom->consumer_switched = of_property_read_bool(np, "apple,consumer-switched");
++	if (dom->consumer_switched) {
++		list_add_tail(&dom->list, &pmc->domains);
++		pmc->bwr_bits |= BIT(bwr);
++		pmc->boost_bits |= BIT(boost);
++		return 0;
++	}
++
+ 	ret = apple_pmc_interface_init(pmc, dom);
+ 	if (ret) {
+ 		of_node_put(dom->np);
+@@ -1280,7 +1401,9 @@ static int apple_pmc_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	for_each_available_child_of_node(np, child) {
+-		if (!of_property_present(child, "#power-domain-cells"))
++		/* A consumer-switched interface is no power domain, but still ours. */
++		if (!of_property_present(child, "#power-domain-cells") &&
++		    !of_property_read_bool(child, "apple,consumer-switched"))
+ 			continue;
+ 		if (of_property_present(child, "apple,rail"))
+ 			ret = apple_pmc_floor_add(pmc, child);
+diff --git a/include/linux/soc/apple/pmc.h b/include/linux/soc/apple/pmc.h
+index be391b83d9..da0635015f 100644
+--- a/include/linux/soc/apple/pmc.h
++++ b/include/linux/soc/apple/pmc.h
+@@ -26,7 +26,30 @@ bool apple_pmc_voter_enabled(struct device *pmc, unsigned int agent,
+ u32 apple_pmc_floor_read(struct device *pmc, unsigned int agent);
+ int apple_pmc_floor_update(struct device *pmc, unsigned int agent, u32 mask,
+ 			   u32 value);
++/*
++ * Clear, and later restore, the display pipe interface enables named by
++ * @consumer's apple,pmc-interface (an apple,consumer-switched interface).
++ * The check says, changing nothing, whether they can be cleared now.
++ */
++int apple_pmc_interface_consumer_check(struct device *consumer);
++int apple_pmc_interface_consumer_off(struct device *consumer);
++int apple_pmc_interface_consumer_on(struct device *consumer);
+ #else
++static inline int apple_pmc_interface_consumer_check(struct device *consumer)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int apple_pmc_interface_consumer_off(struct device *consumer)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int apple_pmc_interface_consumer_on(struct device *consumer)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline unsigned int apple_pmc_rail_count(struct device *pmc)
+ {
+ 	return 0;

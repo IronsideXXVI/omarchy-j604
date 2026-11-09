@@ -1,0 +1,559 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 19:24:29 +0000
+Subject: [PATCH] drm/apple: m4: add an XDR guard for panel levels
+ above the user maximum
+
+An XDR panel takes levels above its user maximum: EDR highlights and,
+in bright surroundings, a raised SDR ceiling up to the aurora maximum
+(1000 nits on the J604, what macOS sustains). Whether the 26.6.2
+firmware takes such a level in a swap is not known, and a swap it
+refuses fails the session: the panel stays black until a reboot.
+
+Add the guard as pure functions: a level above the user maximum is
+asked for only as far as the firmware has been seen to take one, up a
+ladder of 200 nit rungs. 48 taken swaps in a row at a rung (A407
+answered, D590 within 250 ms and, once a D590 has said so for an
+ordinary swap, displayed) take the highest level they asked for and
+open the next rung; three in a row that stall or are not displayed,
+or one that fails, refuse it: every level goes back at once to the
+last one taken and stays there. Thermal mitigation caps every level,
+one 100 nit step per cooling state, never below the ADT thermal
+minimum cap.
+
+A KUnit suite covers the ladder, each way back, that ordinary swaps
+never move it, the thermal cap and starting over.
+
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+(cherry picked from commit 24e928e675a52912c37fda9118d4dc34b8a136f4)
+(cherry picked from commit 7dba4077b30503f503309c6ecf7f36ead8470780)
+---
+ drivers/gpu/drm/apple/Makefile          |   1 +
+ drivers/gpu/drm/apple/dcp-m4-xdr-test.c | 279 ++++++++++++++++++++++++
+ drivers/gpu/drm/apple/dcp-m4-xdr.h      | 218 ++++++++++++++++++
+ 3 files changed, 498 insertions(+)
+ create mode 100644 drivers/gpu/drm/apple/dcp-m4-xdr-test.c
+ create mode 100644 drivers/gpu/drm/apple/dcp-m4-xdr.h
+
+diff --git a/drivers/gpu/drm/apple/Makefile b/drivers/gpu/drm/apple/Makefile
+index 9fa470fcb5..e13932edbc 100644
+--- a/drivers/gpu/drm/apple/Makefile
++++ b/drivers/gpu/drm/apple/Makefile
+@@ -33,6 +33,7 @@ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-panel-edid-test.o
+ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-panel-adt-test.o
+ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-m4-edr-test.o
+ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-m4-frame-test.o
++appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-m4-xdr-test.o
+ appledrm-y += iomfb_v26_6.o iomfb_v26_6_link.o j613_dcp_activate.o
+ appledrm-y += epic/dpavservep.o
+ appledrm-y += plane.o
+diff --git a/drivers/gpu/drm/apple/dcp-m4-xdr-test.c b/drivers/gpu/drm/apple/dcp-m4-xdr-test.c
+new file mode 100644
+index 0000000000..fcbe3d0705
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-m4-xdr-test.c
+@@ -0,0 +1,279 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++/*
++ * The XDR guard (dcp-m4-xdr.h) with the J604's ADT values: a 600 nit user
++ * maximum, the 1000 nit aurora maximum and a 300 nit thermal minimum cap.
++ * The ladder, what a stalled, hidden or failed swap does, that ordinary
++ * swaps never move it, the thermal cap and starting over.
++ */
++
++#include <kunit/test.h>
++
++#include "dcp-m4-xdr.h"
++
++#define USER	600U
++#define TOP	1000U
++#define MINCAP	300U
++#define FAST	8000U	/* us: one 120 Hz frame */
++#define SLOW	(DCP_M4_XDR_STALL_US + 1)
++
++static void j604(struct dcp_m4_xdr *x)
++{
++	dcp_m4_xdr_init(x, USER, TOP, MINCAP, true);
++}
++
++/* @n taken swaps at @level; returns how many changed the cap. */
++static unsigned int taken(struct dcp_m4_xdr *x, u32 level, unsigned int n)
++{
++	unsigned int changed = 0;
++
++	while (n--)
++		changed += dcp_m4_xdr_swap(x, level, true, true, FAST);
++	return changed;
++}
++
++static void xdr_off(struct kunit *test)
++{
++	struct dcp_m4_xdr x;
++
++	dcp_m4_xdr_init(&x, USER, TOP, MINCAP, false);
++	KUNIT_EXPECT_EQ(test, x.state, DCP_M4_XDR_OFF);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), USER);
++	/* Asking for more changes nothing: the cap never let it out. */
++	KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, 800, true, true, FAST));
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), USER);
++	/* No aurora maximum (or one not above the user maximum): off too. */
++	dcp_m4_xdr_init(&x, USER, 0, MINCAP, true);
++	KUNIT_EXPECT_EQ(test, x.state, DCP_M4_XDR_OFF);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), USER);
++	dcp_m4_xdr_init(&x, USER, USER, MINCAP, true);
++	KUNIT_EXPECT_EQ(test, x.state, DCP_M4_XDR_OFF);
++}
++
++static void xdr_climbs_the_ladder(struct kunit *test)
++{
++	struct dcp_m4_xdr x;
++
++	j604(&x);
++	KUNIT_EXPECT_EQ(test, x.state, DCP_M4_XDR_RAMP);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), 800U);
++	KUNIT_EXPECT_EQ(test, taken(&x, 800, DCP_M4_XDR_GOOD_SWAPS - 1), 0U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), 800U);
++	KUNIT_EXPECT_EQ(test, taken(&x, 800, 1), 1U);
++	KUNIT_EXPECT_EQ(test, x.taken, 800U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), TOP);
++	KUNIT_EXPECT_EQ(test, taken(&x, TOP, DCP_M4_XDR_GOOD_SWAPS), 1U);
++	KUNIT_EXPECT_EQ(test, x.state, DCP_M4_XDR_TRUSTED);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), TOP);
++	/* Trusted: nothing moves it any more, a stall included. */
++	KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, TOP, true, false, SLOW));
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), TOP);
++	KUNIT_EXPECT_EQ(test, x.reverts, 0U);
++}
++
++/* What the swaps asked for is taken, not the rung: 700 taken, 900 tried. */
++static void xdr_takes_the_level_asked_for(struct kunit *test)
++{
++	struct dcp_m4_xdr x;
++
++	j604(&x);
++	taken(&x, 650, DCP_M4_XDR_GOOD_SWAPS / 2);
++	taken(&x, 700, DCP_M4_XDR_GOOD_SWAPS / 2);
++	KUNIT_EXPECT_EQ(test, x.taken, 700U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), 900U);
++	KUNIT_EXPECT_EQ(test, x.state, DCP_M4_XDR_RAMP);
++}
++
++static void xdr_stalls_refuse_after_three(struct kunit *test)
++{
++	struct dcp_m4_xdr x;
++
++	j604(&x);
++	KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, 800, true, true, SLOW));
++	KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, 800, true, true, SLOW));
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), 800U);
++	KUNIT_EXPECT_TRUE(test, dcp_m4_xdr_swap(&x, 800, true, true, SLOW));
++	KUNIT_EXPECT_EQ(test, x.state, DCP_M4_XDR_REFUSED);
++	KUNIT_EXPECT_EQ(test, x.reason, DCP_M4_XDR_STALLED);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), USER);
++	KUNIT_EXPECT_EQ(test, x.reverts, 1U);
++	/* Refused stays refused: the swaps it allows never climb again. */
++	KUNIT_EXPECT_EQ(test, taken(&x, USER, 3 * DCP_M4_XDR_GOOD_SWAPS), 0U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), USER);
++	/* At the threshold exactly a swap has not stalled. */
++	j604(&x);
++	KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, 800, true, true, DCP_M4_XDR_STALL_US));
++	KUNIT_EXPECT_EQ(test, x.bad, 0U);
++}
++
++/* Not in a row: a taken swap in between starts the count again. */
++static void xdr_stalls_must_be_in_a_row(struct kunit *test)
++{
++	struct dcp_m4_xdr x;
++
++	j604(&x);
++	for (unsigned int i = 0; i < 10; i++) {
++		KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, 800, true, true, SLOW));
++		KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, 800, true, true, SLOW));
++		KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, 800, true, true, FAST));
++	}
++	KUNIT_EXPECT_EQ(test, x.state, DCP_M4_XDR_RAMP);
++	/* ... and a stall starts the taken count again. */
++	KUNIT_EXPECT_EQ(test, x.good, 1U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), 800U);
++}
++
++/*
++ * The D590's displayed byte counts only once a D590 has said "displayed"
++ * for an ordinary swap: a firmware that never sets it does not refuse.
++ */
++static void xdr_hidden_counts_once_the_byte_is_known(struct kunit *test)
++{
++	struct dcp_m4_xdr x;
++
++	j604(&x);
++	for (unsigned int i = 0; i < DCP_M4_XDR_GOOD_SWAPS; i++)
++		dcp_m4_xdr_swap(&x, 800, true, false, FAST);
++	KUNIT_EXPECT_EQ(test, x.taken, 800U);
++	KUNIT_EXPECT_FALSE(test, x.shown_seen);
++
++	j604(&x);
++	KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, USER, true, true, FAST));
++	KUNIT_EXPECT_TRUE(test, x.shown_seen);
++	KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, 800, true, false, FAST));
++	KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, 800, true, false, FAST));
++	KUNIT_EXPECT_TRUE(test, dcp_m4_xdr_swap(&x, 800, true, false, FAST));
++	KUNIT_EXPECT_EQ(test, x.reason, DCP_M4_XDR_NOT_SHOWN);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), USER);
++}
++
++static void xdr_failed_swap_refuses_at_once(struct kunit *test)
++{
++	struct dcp_m4_xdr x;
++
++	j604(&x);
++	KUNIT_EXPECT_TRUE(test, dcp_m4_xdr_swap(&x, 700, false, false, FAST));
++	KUNIT_EXPECT_EQ(test, x.state, DCP_M4_XDR_REFUSED);
++	KUNIT_EXPECT_EQ(test, x.reason, DCP_M4_XDR_FAILED);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), USER);
++}
++
++/* A rung refused after one taken: back to that one, not to the user maximum. */
++static void xdr_refused_keeps_the_rung_taken(struct kunit *test)
++{
++	struct dcp_m4_xdr x;
++
++	j604(&x);
++	taken(&x, 800, DCP_M4_XDR_GOOD_SWAPS);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), TOP);
++	taken(&x, 900, 5);
++	dcp_m4_xdr_swap(&x, 950, true, true, SLOW);
++	dcp_m4_xdr_swap(&x, 950, true, true, SLOW);
++	KUNIT_EXPECT_TRUE(test, dcp_m4_xdr_swap(&x, 950, true, true, SLOW));
++	KUNIT_EXPECT_EQ(test, x.state, DCP_M4_XDR_REFUSED);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), 800U);
++	/* Levels up to the one taken are ordinary swaps again. */
++	KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, 800, true, false, SLOW));
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), 800U);
++}
++
++/* Swaps at or below the level taken never move the guard, whatever they do. */
++static void xdr_ordinary_swaps(struct kunit *test)
++{
++	struct dcp_m4_xdr x;
++
++	j604(&x);
++	for (unsigned int i = 0; i < 100; i++) {
++		KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, 0, true, true, SLOW));
++		KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, USER, true, false, SLOW));
++		KUNIT_EXPECT_FALSE(test, dcp_m4_xdr_swap(&x, 400, false, false, FAST));
++	}
++	KUNIT_EXPECT_EQ(test, x.state, DCP_M4_XDR_RAMP);
++	KUNIT_EXPECT_EQ(test, x.good, 0U);
++	KUNIT_EXPECT_EQ(test, x.bad, 0U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), 800U);
++}
++
++static void xdr_thermal_cap(struct kunit *test)
++{
++	struct dcp_m4_xdr x;
++
++	j604(&x);
++	/* 1000 down to 300 in 100 nit steps: 7 states. */
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_max_state(&x), 7U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_thermal_cap(&x, 0), 0U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_thermal_cap(&x, 1), 900U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_thermal_cap(&x, 4), USER);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_thermal_cap(&x, 6), 400U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_thermal_cap(&x, 7), MINCAP);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_thermal_cap(&x, 1000), MINCAP);
++	/* The limit: the lower of the guard's cap and the thermal one. */
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_limit(&x, 0), 800U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_limit(&x, 1), 800U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_limit(&x, 3), 700U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_limit(&x, 5), 500U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_limit(&x, 7), MINCAP);
++	/* With the guard off the thermal cap still holds, on SDR too. */
++	dcp_m4_xdr_init(&x, USER, TOP, MINCAP, false);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_limit(&x, 0), USER);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_limit(&x, 6), 400U);
++	/* No minimum cap in the ADT: no thermal cap. */
++	dcp_m4_xdr_init(&x, USER, TOP, 0, true);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_max_state(&x), 0U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_thermal_cap(&x, 3), 0U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_limit(&x, 3), 800U);
++	/* No aurora maximum: down from the user maximum, 3 states. */
++	dcp_m4_xdr_init(&x, USER, 0, MINCAP, true);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_max_state(&x), 3U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_limit(&x, 1), 500U);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_limit(&x, 3), MINCAP);
++}
++
++static void xdr_rearm(struct kunit *test)
++{
++	struct dcp_m4_xdr x;
++
++	j604(&x);
++	dcp_m4_xdr_swap(&x, USER, true, true, FAST);
++	dcp_m4_xdr_swap(&x, 800, false, false, FAST);
++	KUNIT_EXPECT_EQ(test, x.state, DCP_M4_XDR_REFUSED);
++	dcp_m4_xdr_rearm(&x, true);
++	KUNIT_EXPECT_EQ(test, x.state, DCP_M4_XDR_RAMP);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), 800U);
++	KUNIT_EXPECT_TRUE(test, x.shown_seen);
++	KUNIT_EXPECT_EQ(test, x.reverts, 1U);
++	dcp_m4_xdr_rearm(&x, false);
++	KUNIT_EXPECT_EQ(test, x.state, DCP_M4_XDR_OFF);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_cap(&x), USER);
++}
++
++static void xdr_names(struct kunit *test)
++{
++	KUNIT_EXPECT_STREQ(test, dcp_m4_xdr_state_name(DCP_M4_XDR_RAMP), "ramp");
++	KUNIT_EXPECT_STREQ(test, dcp_m4_xdr_state_name(DCP_M4_XDR_REFUSED), "refused");
++	KUNIT_EXPECT_STREQ(test, dcp_m4_xdr_reason_name(DCP_M4_XDR_STALLED), "swap stalled");
++	KUNIT_EXPECT_STREQ(test, dcp_m4_xdr_reason_name(DCP_M4_XDR_NONE), "none");
++}
++
++static struct kunit_case m4_xdr_cases[] = {
++	KUNIT_CASE(xdr_off),
++	KUNIT_CASE(xdr_climbs_the_ladder),
++	KUNIT_CASE(xdr_takes_the_level_asked_for),
++	KUNIT_CASE(xdr_stalls_refuse_after_three),
++	KUNIT_CASE(xdr_stalls_must_be_in_a_row),
++	KUNIT_CASE(xdr_hidden_counts_once_the_byte_is_known),
++	KUNIT_CASE(xdr_failed_swap_refuses_at_once),
++	KUNIT_CASE(xdr_refused_keeps_the_rung_taken),
++	KUNIT_CASE(xdr_ordinary_swaps),
++	KUNIT_CASE(xdr_thermal_cap),
++	KUNIT_CASE(xdr_rearm),
++	KUNIT_CASE(xdr_names),
++	{}
++};
++
++static struct kunit_suite m4_xdr_suite = {
++	.name = "apple-dcp-m4-xdr",
++	.test_cases = m4_xdr_cases,
++};
++
++kunit_test_suite(m4_xdr_suite);
+diff --git a/drivers/gpu/drm/apple/dcp-m4-xdr.h b/drivers/gpu/drm/apple/dcp-m4-xdr.h
+new file mode 100644
+index 0000000000..4348cb63a6
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-m4-xdr.h
+@@ -0,0 +1,218 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/*
++ * The XDR guard of the T8132 internal panel (firmware 26.6.2).
++ *
++ * The panel takes levels above the user maximum (600 nits on the J604):
++ * EDR highlights and a raised SDR ceiling in bright surroundings, up to the
++ * ADT aurora maximum (1000 nits, what macOS sustains).  Whether the 26.6.2
++ * firmware takes such a level in a swap has not been measured; a swap it
++ * refuses fails the session (black panel until a reboot).  So a level above
++ * the user maximum is asked for only as far as the firmware has been seen to
++ * take one, up a ladder of rungs of DCP_M4_XDR_STEP_NITS:
++ *
++ *  - a swap that asks for a level above the last one taken counts as taken
++ *    when its A407 is answered, its D590 comes within DCP_M4_XDR_STALL_US
++ *    and, once a D590 has said so for an ordinary swap, it was displayed;
++ *  - DCP_M4_XDR_GOOD_SWAPS taken in a row: the highest of their levels is
++ *    taken, and the next rung is tried (the top: trusted);
++ *  - DCP_M4_XDR_BAD_SWAPS in a row that stalled or were not displayed, or
++ *    one that failed: refused, every level goes back at once to the last one
++ *    taken and stays there (until panel_xdr is written again).
++ *
++ * Thermal mitigation caps every level, SDR ones included, one
++ * DCP_M4_XDR_THERMAL_STEP per cooling state and never below the ADT
++ * thermal-mitigation-min-cap (300 nits on the J604), as macOS does.
++ *
++ * Pure functions, for the KUnit suite.
++ */
++#ifndef APPLE_DCP_M4_XDR_H
++#define APPLE_DCP_M4_XDR_H
++
++#include <linux/math.h>
++#include <linux/minmax.h>
++#include <linux/types.h>
++
++#define DCP_M4_XDR_STEP_NITS	200U	/* one rung of the ladder */
++#define DCP_M4_XDR_GOOD_SWAPS	48U	/* taken swaps at a rung: 2 s of 24 fps video */
++#define DCP_M4_XDR_BAD_SWAPS	3U	/* stalled or hidden swaps in a row: refused */
++#define DCP_M4_XDR_STALL_US	250000U	/* A407 to D590; a 120 Hz swap takes ~8 ms */
++#define DCP_M4_XDR_THERMAL_STEP	100U	/* nits per cooling state */
++
++enum dcp_m4_xdr_state {
++	DCP_M4_XDR_OFF,		/* off, or no level above the user maximum */
++	DCP_M4_XDR_RAMP,	/* up to the rung being tried */
++	DCP_M4_XDR_TRUSTED,	/* up to the top */
++	DCP_M4_XDR_REFUSED,	/* up to the last level taken */
++};
++
++enum dcp_m4_xdr_reason {
++	DCP_M4_XDR_NONE,
++	DCP_M4_XDR_NOT_SHOWN,
++	DCP_M4_XDR_STALLED,
++	DCP_M4_XDR_FAILED,
++};
++
++struct dcp_m4_xdr {
++	u32 user_max;	/* the user maximum: always allowed */
++	u32 top;	/* the ADT aurora maximum (0: none) */
++	u32 min_cap;	/* the ADT thermal minimum cap (0: no thermal cap) */
++	u32 taken;	/* the highest level taken, the user maximum at first */
++	u32 trying;	/* the rung being tried, above taken (0: none) */
++	u32 best;	/* the highest level taken at this rung so far */
++	u32 good, bad;	/* taken / stalled-or-hidden swaps in a row at this rung */
++	u32 reverts;
++	enum dcp_m4_xdr_state state;
++	enum dcp_m4_xdr_reason reason;
++	bool shown_seen; /* a D590 said "displayed" for an ordinary swap */
++};
++
++static inline const char *dcp_m4_xdr_state_name(enum dcp_m4_xdr_state state)
++{
++	switch (state) {
++	case DCP_M4_XDR_RAMP:
++		return "ramp";
++	case DCP_M4_XDR_TRUSTED:
++		return "trusted";
++	case DCP_M4_XDR_REFUSED:
++		return "refused";
++	default:
++		return "off";
++	}
++}
++
++static inline const char *dcp_m4_xdr_reason_name(enum dcp_m4_xdr_reason reason)
++{
++	switch (reason) {
++	case DCP_M4_XDR_NOT_SHOWN:
++		return "not displayed";
++	case DCP_M4_XDR_STALLED:
++		return "swap stalled";
++	case DCP_M4_XDR_FAILED:
++		return "swap failed";
++	default:
++		return "none";
++	}
++}
++
++/* A fresh guard; @on false, or no top above the user maximum: off. */
++static inline void dcp_m4_xdr_init(struct dcp_m4_xdr *x, u32 user_max, u32 top,
++				   u32 min_cap, bool on)
++{
++	*x = (struct dcp_m4_xdr){ .user_max = user_max, .top = top,
++				  .min_cap = min_cap, .taken = user_max };
++	if (!on || top <= user_max)
++		return;
++	x->state = DCP_M4_XDR_RAMP;
++	x->trying = min(top, user_max + DCP_M4_XDR_STEP_NITS);
++}
++
++/* Start over (panel_xdr written): what the D590 says stays known. */
++static inline void dcp_m4_xdr_rearm(struct dcp_m4_xdr *x, bool on)
++{
++	bool shown_seen = x->shown_seen;
++	u32 reverts = x->reverts;
++
++	dcp_m4_xdr_init(x, x->user_max, x->top, x->min_cap, on);
++	x->shown_seen = shown_seen;
++	x->reverts = reverts;
++}
++
++/* The highest panel level a swap may ask for, before thermal mitigation. */
++static inline u32 dcp_m4_xdr_cap(const struct dcp_m4_xdr *x)
++{
++	switch (x->state) {
++	case DCP_M4_XDR_RAMP:
++		return x->trying;
++	case DCP_M4_XDR_TRUSTED:
++		return x->top;
++	default:
++		return x->taken;
++	}
++}
++
++/* The deepest cooling state, one DCP_M4_XDR_THERMAL_STEP each down to the minimum cap. */
++static inline u32 dcp_m4_xdr_max_state(const struct dcp_m4_xdr *x)
++{
++	u32 top = max(x->top, x->user_max);
++
++	if (!x->min_cap || x->min_cap >= top)
++		return 0;
++	return DIV_ROUND_UP(top - x->min_cap, DCP_M4_XDR_THERMAL_STEP);
++}
++
++/* The thermal cap of cooling state @state, in nits; 0: none. */
++static inline u32 dcp_m4_xdr_thermal_cap(const struct dcp_m4_xdr *x, u32 state)
++{
++	u32 top = max(x->top, x->user_max), deepest = dcp_m4_xdr_max_state(x);
++
++	if (!state || !deepest)
++		return 0;
++	state = min(state, deepest);
++	if (state * DCP_M4_XDR_THERMAL_STEP >= top - x->min_cap)
++		return x->min_cap;
++	return top - state * DCP_M4_XDR_THERMAL_STEP;
++}
++
++/* The highest level a swap may ask for: the guard's, under the thermal cap. */
++static inline u32 dcp_m4_xdr_limit(const struct dcp_m4_xdr *x, u32 thermal_state)
++{
++	u32 cap = dcp_m4_xdr_cap(x), t = dcp_m4_xdr_thermal_cap(x, thermal_state);
++
++	return t ? min(cap, t) : cap;
++}
++
++/*
++ * After a swap that asked for panel level @level (0: none).  @ok: the swap
++ * was taken (A407 answered, its D590 in); @shown: its D590 said displayed;
++ * @us: A407 to D590.  Returns true when the cap changed.
++ */
++static inline bool dcp_m4_xdr_swap(struct dcp_m4_xdr *x, u32 level, bool ok,
++				   bool shown, u32 us)
++{
++	if (level <= x->taken) {
++		if (ok && shown)
++			x->shown_seen = true;
++		return false;
++	}
++	/* Only a ramp lets a swap ask for more than the level taken. */
++	if (x->state != DCP_M4_XDR_RAMP)
++		return false;
++	if (!ok) {
++		x->reason = DCP_M4_XDR_FAILED;
++		goto refused;
++	}
++	if (us > DCP_M4_XDR_STALL_US || (x->shown_seen && !shown)) {
++		x->good = 0;
++		if (++x->bad < DCP_M4_XDR_BAD_SWAPS)
++			return false;
++		x->reason = us > DCP_M4_XDR_STALL_US ? DCP_M4_XDR_STALLED :
++						       DCP_M4_XDR_NOT_SHOWN;
++		goto refused;
++	}
++	x->bad = 0;
++	x->best = max(x->best, level);
++	if (++x->good < DCP_M4_XDR_GOOD_SWAPS)
++		return false;
++	x->taken = x->best;
++	x->good = 0;
++	x->best = 0;
++	if (x->taken >= x->top) {
++		x->taken = x->top;
++		x->trying = 0;
++		x->state = DCP_M4_XDR_TRUSTED;
++	} else {
++		x->trying = min(x->top, x->taken + DCP_M4_XDR_STEP_NITS);
++	}
++	return true;
++
++refused:
++	x->state = DCP_M4_XDR_REFUSED;
++	x->trying = 0;
++	x->good = 0;
++	x->bad = 0;
++	x->best = 0;
++	x->reverts++;
++	return true;
++}
++
++#endif

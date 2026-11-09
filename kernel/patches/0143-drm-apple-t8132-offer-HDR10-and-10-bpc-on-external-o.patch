@@ -1,0 +1,436 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 20:36:41 +0000
+Subject: [PATCH] drm/apple: t8132: offer HDR10 and 10 bpc on external
+ outputs
+
+The T8132 HDMI and DisplayPort connectors offer no Colorspace, no
+HDR_OUTPUT_METADATA and no max bpc, so a compositor cannot ask an HDR
+sink for HDR10, and every link runs 8 bpc SDR.
+
+Attach Colorspace (Default, BT2020_RGB), HDR_OUTPUT_METADATA and max
+bpc (8 to 10, 10 by default; a connector reset keeps it, and runs
+once before the attach, which writes the current state). A commit
+asking for PQ in BT.2020 RGB, or a new max bpc, is a mode set, set in
+the connector's atomic check before the core decides which CRTCs need
+one; the CRTC check takes the colour element for it, PQ refused where
+the timing has none. The enable sets that colour with A364 and logs
+the link's depth and transfer; frames on a PQ link are tagged BT.2020
+PQ, as the internal panel's EDR frames are.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+(cherry picked from commit 877a94c9b49e0eebd59589c01fa95895d4ebd103)
+(cherry picked from commit 86236e2852accea0b53ded6291c202407fa74ebd)
+---
+ drivers/gpu/drm/apple/iomfb_m4.c      |  65 +++++++++++++---
+ drivers/gpu/drm/apple/iomfb_m4.h      |  12 ++-
+ drivers/gpu/drm/apple/t8132_ext_drm.c | 106 +++++++++++++++++++++++++-
+ 3 files changed, 167 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index edd8f4c574..3521230211 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -66,6 +66,7 @@
+ #include "dcp-m4-property.h"
+ #include "dcp-m4-frame.h"
+ #include "dcp-m4-xdr.h"
++#include "dcp-m4-ext-colour.h"
+ #include "parser.h"
+ #include "t8132_ext_drm.h"
+ 
+@@ -137,6 +138,8 @@ struct iomfb_m4_ext_mode {
+ 	s64 score;
+ 	/* Its colour element is one the timing lists as needing DSC */
+ 	bool dsc;
++	/* The timing's 10 bpc SDR and HDR10 elements, if it lists them */
++	struct dcp_m4_ext_colours deep;
+ };
+ 
+ /* A scratch-only realtime bandwidth mailbox (D003) is this long */
+@@ -1121,6 +1124,9 @@ struct dcp_m4_runtime {
+ 	 */
+ 	bool ext_powered;
+ 	u32 ext_cur_timing, ext_cur_color;
++	/* The link's depth and whether it runs PQ, as the last enable set them */
++	u32 ext_depth;
++	bool ext_pq;
+ 	void *ext_buf_cpu[2];
+ 	struct dcp_m4_frame ext_buf[2];
+ 	bool ext_buf_stale[2];
+@@ -3660,13 +3666,19 @@ static bool dcp_m4_ext_fits(const struct iomfb_m4_ext_mode *e, u64 capacity)
+ 
+ /*
+  * The firmware's IDs of a mode iomfb_m4_ext_get_modes()
+- * offered: -ENOENT for any other mode, -ENOSPC for one over the link.
++ * offered, with the colour element @want takes (dcp-m4-ext-colour.h; NULL:
++ * 8 bpc SDR): -ENOENT for any other mode, -ENOSPC for one over the link,
++ * -EINVAL for PQ on a timing without an HDR10 element that fits.
+  */
+ int iomfb_m4_ext_mode_ids(struct apple_dcp *owner, const struct drm_display_mode *mode,
+-			  struct iomfb_m4_ext_ids *ids)
++			  const struct iomfb_m4_ext_want *want, struct iomfb_m4_ext_ids *ids)
+ {
+ 	struct iomfb_m4 *dcp = owner->v26_6;
+ 	u64 capacity = dcp_m4_ext_capacity(owner);
++	struct dcp_m4_ext_want w = {
++		.pq = want && want->pq, .max_bpc = want ? want->max_bpc : 8,
++	};
++	struct dcp_m4_ext_choice choice;
+ 	int ret = -ENOENT;
+ 
+ 	if (!dcp || !dcp->external)
+@@ -3682,12 +3694,20 @@ int iomfb_m4_ext_mode_ids(struct apple_dcp *owner, const struct drm_display_mode
+ 			ret = -ENOSPC;
+ 			continue;
+ 		}
++		if (dcp_m4_ext_colour_choose(&w, e->color, e->dsc, &e->deep, e->mode.clock,
++					     capacity, &choice)) {
++			ret = -EINVAL;
++			break;
++		}
+ 		ids->timing = e->timing;
+-		ids->color = e->color;
++		ids->color = choice.color;
+ 		ids->bootstrap = e->bootstrap;
+-		dev_dbg(dcp->dev, "mode %ux%u@%d: timing %u, colour %u%s\n",
++		ids->depth = choice.depth;
++		ids->pq = choice.pq;
++		dev_dbg(dcp->dev, "mode %ux%u@%d: timing %u, colour %u (%u bpc%s)%s\n",
+ 			e->mode.hdisplay, e->mode.vdisplay, drm_mode_vrefresh(&e->mode),
+-			e->timing, e->color, e->dsc ? " (DSC)" : "");
++			e->timing, choice.color, choice.depth, choice.pq ? ", PQ BT.2020" : "",
++			e->dsc ? " (DSC)" : "");
+ 		ret = 0;
+ 		break;
+ 	}
+@@ -4616,6 +4636,8 @@ static_assert(sizeof(struct dcp_m4_mode_info_req) == 0x7c);
+ struct dcp_m4_ext_pick {
+ 	struct dcp_color_element best;
+ 	bool found;
++	/* The 10 bpc SDR and HDR10 elements (dcp-m4-ext-colour.h) */
++	struct dcp_m4_ext_colours deep;
+ };
+ 
+ static unsigned int dcp_m4_ext_color_rank(const struct dcp_color_element *e)
+@@ -4630,6 +4652,7 @@ static void dcp_m4_ext_pick_color(void *data, const struct dcp_color_element *e)
+ 	struct dcp_m4_ext_pick *p = data;
+ 	unsigned int rank, best_rank;
+ 
++	dcp_m4_ext_colour_take(&p->deep, e);
+ 	if (e->is_virtual || e->unsafe || e->id < 0 || e->id > U32_MAX || e->score < 0 ||
+ 	    e->depth <= 0 || e->encoding != DCP_COLOR_FORMAT_RGB ||
+ 	    e->eotf != DCP_EOTF_SDR_GAMMA || (e->dsc_required && e->depth != 8))
+@@ -4648,7 +4671,7 @@ static void dcp_m4_ext_pick_color(void *data, const struct dcp_color_element *e)
+ }
+ 
+ static bool dcp_m4_ext_timing_color(const void *blob, u32 size, u32 timing,
+-				    struct dcp_color_element *out)
++				    struct dcp_color_element *out, struct dcp_m4_ext_colours *deep)
+ {
+ 	struct dcp_m4_ext_pick p = {};
+ 	bool interlaced = false;
+@@ -4657,8 +4680,10 @@ static bool dcp_m4_ext_timing_color(const void *blob, u32 size, u32 timing,
+ 
+ 	if (!ret && interlaced)
+ 		return false;
+-	if (!ret && p.found)
++	if (!ret && p.found) {
+ 		*out = p.best;
++		*deep = p.deep;
++	}
+ 	return !ret && p.found;
+ }
+ 
+@@ -4694,10 +4719,11 @@ static bool dcp_m4_ext_cache_modes(struct iomfb_m4 *dcp, const void *blob, u32 s
+ 	}
+ 	for (unsigned int i = 0; !ret && i < count; i++) {
+ 		const struct dcp_display_mode *m = &modes[i];
++		struct dcp_m4_ext_colours deep = {};
+ 		struct dcp_color_element color;
+ 
+ 		if ((m->mode.flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLCLK)) ||
+-		    !dcp_m4_ext_timing_color(blob, size, m->timing_mode_id, &color) ||
++		    !dcp_m4_ext_timing_color(blob, size, m->timing_mode_id, &color, &deep) ||
+ 		    color.depth != 8)
+ 			continue;
+ 		drm_mode_copy(&list[kept].mode, &m->mode);
+@@ -4709,6 +4735,13 @@ static bool dcp_m4_ext_cache_modes(struct iomfb_m4 *dcp, const void *blob, u32 s
+ 		list[kept].fw_preferred = m->firmware_preferred;
+ 		list[kept].score = m->score;
+ 		list[kept].dsc = color.dsc_required;
++		list[kept].deep = deep;
++		if (deep.has_sdr10 || deep.has_pq)
++			dev_dbg(dcp->dev, "timing %u %ux%u@%d: 10 bpc colour %d, HDR10 colour %d\n",
++				m->timing_mode_id, m->mode.hdisplay, m->mode.vdisplay,
++				drm_mode_vrefresh(&m->mode),
++				deep.has_sdr10 ? (int)deep.sdr10.id : -1,
++				deep.has_pq ? (int)deep.pq.id : -1);
+ 		if (color.dsc_required)
+ 			dev_dbg(dcp->dev, "timing %u %ux%u@%d: DSC colour %u\n",
+ 				m->timing_mode_id, m->mode.hdisplay, m->mode.vdisplay,
+@@ -4979,6 +5012,7 @@ static int dcp_m4_ext_drm_buffers(struct dcp_m4_runtime *r)
+ 		f->height = height;
+ 		f->stride = stride;
+ 		f->format = DCP_M4_XRGB8888;
++		f->pq = r->ext_pq;
+ 		ret = dcp_m4_frame_check_ext(f) ?:
+ 			dcp_m4_direct_extent(f->dva, f->backing_size, (u64)stride * height);
+ 		if (ret)
+@@ -5014,9 +5048,12 @@ static bool dcp_m4_ext_ids_current(struct iomfb_m4 *dcp, const struct iomfb_m4_e
+ 	for (unsigned int i = 0; !found && dcp->ext_catalog_open && i < dcp->ext_mode_count; i++) {
+ 		const struct iomfb_m4_ext_mode *e = &dcp->ext_modes[i];
+ 
+-		found = e->timing == ids->timing && e->color == ids->color &&
++		found = e->timing == ids->timing &&
++			dcp_m4_ext_colour_known(ids->color, e->color, &e->deep) &&
+ 			e->bootstrap == ids->bootstrap && e->mode.hdisplay == width &&
+-			e->mode.vdisplay == height && dcp_m4_ext_fits(e, capacity);
++			e->mode.vdisplay == height && dcp_m4_ext_fits(e, capacity) &&
++			(ids->depth <= 8 ||
++			 dcp_m4_ext_fits_bpp(e->mode.clock, 3 * ids->depth, capacity));
+ 	}
+ 	mutex_unlock(&dcp->ext_modes_lock);
+ 	return found;
+@@ -5132,6 +5169,12 @@ int iomfb_m4_ext_enable(struct apple_dcp *owner, const struct iomfb_m4_ext_ids *
+ 		r->ext_cur_color = ids->color;
+ 		WRITE_ONCE(r->ext_cur_timing, ids->timing);
+ 	}
++	/* Frames on a PQ link are BT.2020 PQ code values (the compositor's HDR). */
++	if (r->ext_depth != ids->depth || r->ext_pq != ids->pq)
++		dev_info(dcp->dev, "external link colour %u: %u bpc RGB, %s\n", ids->color,
++			 ids->depth ?: 8, ids->pq ? "HDR10 (ST 2084, BT.2020)" : "SDR");
++	r->ext_depth = ids->depth;
++	r->ext_pq = ids->pq;
+ 	r->ext_width = width;
+ 	r->ext_height = height;
+ 	/* After a swap given up on a live link, one swap may try (a probe). */
+@@ -5809,7 +5852,7 @@ int iomfb_m4_ext_present_direct(struct apple_dcp *owner, const struct iomfb_m4_e
+ 	f = (struct dcp_m4_frame) {
+ 		.dva = r->ext_win[w].dva, .backing_size = (u64)r->ext_win[w].count * SZ_16K,
+ 		.width = fb->width, .height = fb->height, .stride = fb->pitch,
+-		.format = DCP_M4_XRGB8888,
++		.format = DCP_M4_XRGB8888, .pq = r->ext_pq,
+ 	};
+ 	r->ext_hold_probe = false;
+ 	r->ext_swap_surface = -1;
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.h b/drivers/gpu/drm/apple/iomfb_m4.h
+index 921ca2f62f..d2194b1a3e 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.h
++++ b/drivers/gpu/drm/apple/iomfb_m4.h
+@@ -21,6 +21,15 @@ struct iomfb_m4;
+ /* The firmware's IDs of an external mode (bootstrap 0: none). */
+ struct iomfb_m4_ext_ids {
+ 	u32 timing, color, bootstrap;
++	/* The link's bits per component, and whether it runs PQ (HDR10) */
++	u32 depth;
++	bool pq;
++};
++
++/* What a commit asks of an external link: PQ in BT.2020 RGB, its max bpc. */
++struct iomfb_m4_ext_want {
++	bool pq;
++	u32 max_bpc;
+ };
+ 
+ /*
+@@ -66,7 +75,7 @@ int iomfb_m4_ext_detect(struct apple_dcp *dcp);
+ int iomfb_m4_ext_get_modes(struct apple_dcp *dcp, struct drm_connector *connector);
+ /* DRM drives the external output: modeset, copied frames, disable. */
+ int iomfb_m4_ext_mode_ids(struct apple_dcp *dcp, const struct drm_display_mode *mode,
+-			  struct iomfb_m4_ext_ids *ids);
++			  const struct iomfb_m4_ext_want *want, struct iomfb_m4_ext_ids *ids);
+ int iomfb_m4_ext_enable(struct apple_dcp *dcp, const struct iomfb_m4_ext_ids *ids,
+ 			u32 width, u32 height);
+ int iomfb_m4_ext_present(struct apple_dcp *dcp, const struct iosys_map *src, u32 pitch,
+@@ -135,6 +144,7 @@ static inline int iomfb_m4_ext_get_modes(struct apple_dcp *dcp, struct drm_conne
+ 
+ static inline int iomfb_m4_ext_mode_ids(struct apple_dcp *dcp,
+ 					const struct drm_display_mode *mode,
++					const struct iomfb_m4_ext_want *want,
+ 					struct iomfb_m4_ext_ids *ids)
+ {
+ 	return -ENODEV;
+diff --git a/drivers/gpu/drm/apple/t8132_ext_drm.c b/drivers/gpu/drm/apple/t8132_ext_drm.c
+index d190e23eef..e4cebe1e92 100644
+--- a/drivers/gpu/drm/apple/t8132_ext_drm.c
++++ b/drivers/gpu/drm/apple/t8132_ext_drm.c
+@@ -14,6 +14,7 @@
+ #include <linux/device.h>
+ #include <linux/dma-buf.h>
+ #include <linux/dma-mapping.h>
++#include <linux/hdmi.h>
+ #include <linux/iosys-map.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+@@ -31,6 +32,7 @@
+ #include <drm/drm_modeset_lock.h>
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_blend.h>
++#include <drm/drm_connector.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_crtc_helper.h>
+ #include <drm/drm_damage_helper.h>
+@@ -59,6 +61,8 @@ MODULE_IMPORT_NS("DMA_BUF");
+ struct t8132_ext_crtc_state {
+ 	struct drm_crtc_state base;
+ 	struct iomfb_m4_ext_ids ids;
++	/* What its connector asked of the link when the IDs were chosen */
++	struct iomfb_m4_ext_want want;
+ };
+ 
+ static struct t8132_ext_crtc_state *to_t8132_ext_crtc_state(struct drm_crtc_state *state)
+@@ -534,19 +538,72 @@ static void t8132_ext_crtc_flush(struct drm_crtc *crtc, struct drm_atomic_commit
+ 	}
+ }
+ 
+-/* A modeset only to a mode the sink offered, within the link. */
++/*
++ * What a connector state asks of the link: PQ while HDR_OUTPUT_METADATA
++ * says ST 2084 and Colorspace is BT2020_RGB (both, as the internal panel
++ * takes them), and its max bpc.
++ */
++static struct iomfb_m4_ext_want t8132_ext_want(const struct drm_connector_state *s)
++{
++	const struct hdr_output_metadata *hdr = NULL;
++
++	if (!s)
++		return (struct iomfb_m4_ext_want){ .max_bpc = 8 };
++	if (s->hdr_output_metadata &&
++	    s->hdr_output_metadata->length == sizeof(struct hdr_output_metadata))
++		hdr = s->hdr_output_metadata->data;
++	return (struct iomfb_m4_ext_want){
++		.pq = hdr && hdr->hdmi_metadata_type1.eotf == HDMI_EOTF_SMPTE_ST2084 &&
++		      s->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB,
++		.max_bpc = s->max_requested_bpc,
++	};
++}
++
++/*
++ * A new HDR state or max bpc is a new colour element on the link: a mode
++ * set (A364 with that colour), decided here, before the core decides which
++ * CRTCs need one.
++ */
++static int t8132_ext_connector_check(struct drm_connector *connector,
++				     struct drm_atomic_commit *state)
++{
++	struct drm_connector_state *old = drm_atomic_get_old_connector_state(state, connector);
++	struct drm_connector_state *new = drm_atomic_get_new_connector_state(state, connector);
++	struct iomfb_m4_ext_want a, b;
++	struct drm_crtc_state *cs;
++
++	if (!new || !new->crtc || !old)
++		return 0;
++	a = t8132_ext_want(old);
++	b = t8132_ext_want(new);
++	if (a.pq == b.pq && a.max_bpc == b.max_bpc)
++		return 0;
++	cs = drm_atomic_get_crtc_state(state, new->crtc);
++	if (IS_ERR(cs))
++		return PTR_ERR(cs);
++	cs->mode_changed = true;
++	return 0;
++}
++
++/*
++ * A modeset only to a mode the sink offered, within the link, with the
++ * colour element its connector's HDR state and max bpc take.
++ */
+ static int t8132_ext_crtc_check(struct drm_crtc *crtc, struct drm_atomic_commit *state)
+ {
+ 	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
+ 	struct t8132_ext_out *out = container_of(crtc, struct t8132_ext_out, crtc);
++	struct t8132_ext_crtc_state *ts = to_t8132_ext_crtc_state(cs);
++	const struct drm_connector_state *conn;
+ 	struct apple_dcp *owner;
+ 	int ret = drm_crtc_helper_atomic_check(crtc, state);
+ 
+ 	if (ret || !cs->enable || !drm_atomic_crtc_needs_modeset(cs))
+ 		return ret;
++	conn = drm_atomic_get_new_connector_state(state, &out->connector) ?: out->connector.state;
++	ts->want = t8132_ext_want(conn);
+ 	owner = t8132_ext_owner(out);
+-	ret = owner ? iomfb_m4_ext_mode_ids(owner, &cs->mode,
+-					    &to_t8132_ext_crtc_state(cs)->ids) : -ENODEV;
++	ret = owner ? iomfb_m4_ext_mode_ids(owner, &cs->mode, &ts->want, &ts->ids) : -ENODEV;
+ 	if (ret)
+ 		drm_dbg_kms(crtc->dev, "%s: mode " DRM_MODE_FMT " refused: %d\n", crtc->name,
+ 			    DRM_MODE_ARG(&cs->mode), ret);
+@@ -598,6 +655,7 @@ static struct drm_crtc_state *t8132_ext_crtc_duplicate(struct drm_crtc *crtc)
+ 		return NULL;
+ 	__drm_atomic_helper_crtc_duplicate_state(crtc, &state->base);
+ 	state->ids = to_t8132_ext_crtc_state(crtc->state)->ids;
++	state->want = to_t8132_ext_crtc_state(crtc->state)->want;
+ 	return &state->base;
+ }
+ 
+@@ -673,11 +731,22 @@ static void t8132_ext_early_unregister(struct drm_connector *connector)
+ 	cancel_work_sync(&out->hotplug_work);
+ }
+ 
++/* The deepest link depth the connector offers (dcp-m4-ext-colour.h). */
++#define T8132_EXT_MAX_BPC	10
++
++/* A fresh connector state asks the deepest link: max bpc at its maximum. */
++static void t8132_ext_connector_reset(struct drm_connector *connector)
++{
++	drm_atomic_helper_connector_reset(connector);
++	if (connector->state)
++		connector->state->max_requested_bpc = T8132_EXT_MAX_BPC;
++}
++
+ static const struct drm_connector_funcs t8132_ext_connector_funcs = {
+ 	.detect = t8132_ext_detect,
+ 	.fill_modes = drm_helper_probe_single_connector_modes,
+ 	.destroy = drm_connector_cleanup,
+-	.reset = drm_atomic_helper_connector_reset,
++	.reset = t8132_ext_connector_reset,
+ 	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
+ 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
+ 	.late_register = t8132_ext_late_register,
+@@ -686,8 +755,35 @@ static const struct drm_connector_funcs t8132_ext_connector_funcs = {
+ 
+ static const struct drm_connector_helper_funcs t8132_ext_connector_helpers = {
+ 	.get_modes = t8132_ext_get_modes,
++	.atomic_check = t8132_ext_connector_check,
+ };
+ 
++/*
++ * HDR10 and deep colour, where the sink's timing lists them: Colorspace
++ * (Default, BT2020_RGB), HDR_OUTPUT_METADATA and max bpc 8..10. The state
++ * is created first: attaching max bpc sets it in the current state.
++ */
++static int t8132_ext_connector_colour(struct drm_connector *connector)
++{
++	const u32 colorspaces = BIT(DRM_MODE_COLORIMETRY_BT2020_RGB);
++	int ret;
++
++	if (connector->connector_type == DRM_MODE_CONNECTOR_HDMIA)
++		ret = drm_mode_create_hdmi_colorspace_property(connector, colorspaces);
++	else
++		ret = drm_mode_create_dp_colorspace_property(connector, colorspaces);
++	if (!ret)
++		ret = drm_connector_attach_colorspace_property(connector);
++	if (ret)
++		return ret;
++	drm_connector_attach_hdr_output_metadata_property(connector);
++	if (!connector->state)
++		t8132_ext_connector_reset(connector);
++	if (!connector->state)
++		return -ENOMEM;
++	return drm_connector_attach_max_bpc_property(connector, 8, T8132_EXT_MAX_BPC);
++}
++
+ bool t8132_ext_crtc(const struct drm_crtc *crtc)
+ {
+ 	return crtc && crtc->funcs == &t8132_ext_crtc_funcs;
+@@ -1064,6 +1160,8 @@ static int t8132_ext_out_init(struct drm_device *drm, struct platform_device *pd
+ 	drm_connector_helper_add(&out->connector, &t8132_ext_connector_helpers);
+ 	out->connector.polled = DRM_CONNECTOR_POLL_HPD;
+ 	ret = drm_connector_attach_encoder(&out->connector, &out->encoder);
++	if (!ret)
++		ret = t8132_ext_connector_colour(&out->connector);
+ 	if (ret)
+ 		goto err_connector;
+ 	/* Its system sleep, through the layer's PM notifier (its DRM device's). */
