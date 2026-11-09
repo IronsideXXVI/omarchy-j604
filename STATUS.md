@@ -24,7 +24,7 @@ MEASURED 2026-11-09 (`pacman -Q` and `uname -r` on the machine):
 | Desktop | `omarchy-dev` 4.0.0.r7637.g29f3bb6, local pkgrel `1.1` (stock edge + the keyboard-backlight series, 4 patches); `omarchy-settings-dev` same version, local `1.1` (the same 4 patches + the built-in panel defaults, 1 patch); Hyprland 0.57.1, stock | official recipes + 4 / 5 patches |
 | Mac add-on | `omarchy-mac` 0.2.3, local `2.12`: keyboard-backlight idle default, Apple F-row key names, Touch ID eligibility, the 14-inch MacBook Pro panel line (10-bit, Display P3) | official recipe + 4 patches |
 | Kernel | `linux-aurora` 7.3.0.aurora1, local `1.703` (163 patches on aurora-silicon/linux `integration/aurora` `6ff31cbfa2`), running `7.3.0-1-1.703-ARCH` since 2026-11-09 | official recipe (source moved to the 7.3 base) + J604 series |
-| Boot chain | `m1n1-aurora` 1.6.1.aurora22 (local `1.608`), `uboot-aurora` 2026.07.aurora6 (local `1.604`), `omarchy-mac-boot` 20261104 (local `1.614`), `plymouth` 26.134.222 (local `3.604`), `asahi-scripts` 20261023 (local `1.1`); boot image (`boot.bin`): m1n1 + the 1.703 J604 device tree + U-Boot, 4,700,171 bytes | official recipes + J604 patches |
+| Boot chain | `m1n1-aurora` 1.6.1.aurora22 (local `1.608`), `uboot-aurora` 2026.07.aurora6 (local `1.604`), `omarchy-mac-boot` 20261104 (local `1.616`), `plymouth` 26.134.222 (local `3.604`), `asahi-scripts` 20261023 (local `1.1`); boot image (`boot.bin`): m1n1 + the 1.703 J604 device tree + U-Boot, 4,700,171 bytes | official recipes + J604 patches |
 | Graphics | `mesa-aurora` / `vulkan-aurora` with the T8132 GPU admitted and the 7.3 kernel's "aurora" driver name accepted (local `1.8133`) | official recipe + 2 patches |
 | Audio | `alsa-ucm-conf-aurora` (local `1.605`), `aurora-audio` (local `3.607`), `speakersafetyd` (local `1.605`) with J604 profiles | official recipes + J604 files |
 | Firmware | `asahi-fwextract` 0.9.2 (local `1.608`): extra camera tuning files | official recipe + 1 patch |
@@ -47,7 +47,7 @@ CODE unless a line says otherwise.
 - **0162**: the external display controller dcpext0 uses the J604's ATC2 PHY (MEASURED 2026-11-09: it starts, with no probe timeout).
 - **0163**: a mailbox send that waits can be killed again, but not interrupted (as in 1.617).
 - Two 7.3 base changes need userland updates, both installed: the GPU's DRM driver is now called "aurora" (Mesa 1.8133), and the Secure Enclave biometric interface is version 5 (`libfprint-git` 5.604).
-- **Boot image.** Since 2026-11-09 `boot.bin` holds only the J604 device tree from the 1.703 package (4,700,171 bytes); it booted and was confirmed (MEASURED 2026-11-09). The default `update-m1n1` takes all 137 device trees of the 7.3 package (13.58 MB), which m1n1 stage 1 refuses (MEASURED 2026-11-09; see `UPSTREAM.md` note (b)). Until the boot package selects the J604 device tree (`omarchy-mac-boot` 1.615, in progress), the official boot check reports that `boot.bin` does not match the kernel's device trees; running `update-m1n1` by hand would rebuild the image that does not boot (INFERENCE 2026-11-09).
+- **Boot image.** Since 2026-11-09 `boot.bin` holds only the J604 device tree from the 1.703 package (4,700,171 bytes); it booted and was confirmed (MEASURED 2026-11-09). The default `update-m1n1` takes all 137 device trees of the 7.3 package (13.58 MB), which m1n1 stage 1 refuses (MEASURED 2026-11-09; see `UPSTREAM.md` note (b)). Since `omarchy-mac-boot` 1.616 (installed 2026-11-09) `update-m1n1` builds that J604-only image itself: its config picks the one device tree of the newest kernel whose first compatible is the running Mac's. The image it wrote was byte-identical to the confirmed one every time (three runs, at the 1.615 and the 1.616 install), and the official boot check passes (MEASURED 2026-11-09).
 
 The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on stable aurora14 and edge aurora15). The stock `linux-aurora` ships a J604 device tree that describes only the CPUs, interrupt controller, power states, pin control and serial port: no storage controller, display, keyboard or trackpad, USB, Wi-Fi or GPU. Stock m1n1 and U-Boot accept only the J713 (MacBook Air M4) on their M4 hand-off paths (INFERENCE 2026-11-09, from reading their source).
 
@@ -82,7 +82,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | Headphone jack | Working | MEASURED 2026-11-06 |
 | Microphones | In progress | TO-VERIFY 2026-11-09 |
 | Camera | In progress: `apple-isp` bound on the 7.3 kernel (no -EBUSY); no picture taken yet | MEASURED 2026-11-09 (bound); TO-VERIFY 2026-11-09 (capture) |
-| Hardware video decode (H.264) | Working | MEASURED 2026-11-08 |
+| Hardware video decode (H.264) | Worked on 1.617; on the 7.3 kernel VA-API does not load as installed, so playback falls back to software; fix in progress | MEASURED 2026-11-08 (1.617); MEASURED 2026-11-09 (7.3) |
 | Video encode (AVE), JPEG, scaler, ProRes | In progress (ProRes driver in the kernel since 1.617, nodes disabled, not loaded) | TO-VERIFY 2026-11-09 |
 | Neural Engine (ANE) | Driver bound, not powered up; no `/dev/accel` | MEASURED 2026-11-09 |
 | Ambient light sensor | Sensor reads; nothing uses it by default | MEASURED 2026-11-08 |
@@ -153,7 +153,8 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 - Carried by: kernel ISP series, m1n1 camera firmware hand-off, `asahi-fwextract` (extra sensor tuning files).
 
 ### Media engines
-- H.264 hardware decode: **Working** (MEASURED 2026-11-08, 4K through VA-API). With stock settings, mpv's system default does not use it (omacom/omarchy#18229).
+- H.264 hardware decode: worked on 1.617 (MEASURED 2026-11-08, 4K through VA-API). With stock settings, mpv's system default does not use it (omacom/omarchy#18229).
+  - On the 7.3 kernel: **In progress.** The GPU's DRM driver is now called "aurora", so libva looks for `aurora_drv_video.so`; the installed `libva-v4l2_request-avd` ships only the `asahi` name, so VA-API does not load and mpv decodes in software (MEASURED 2026-11-09). Upstream aurora-silicon/alarm-aurora aedcf240ca91 (2026-11-06) adds the `aurora` alias (SOURCE); a build with it is in progress.
 - Video encode (AVE), JPEG, scaler, ProRes: **In progress** (TO-VERIFY 2026-11-09). The kernel carries the ProRes encoder driver from Aurora (since 1.617); its device-tree nodes are disabled and the module does not load (MEASURED 2026-11-09 on 1.617).
 
 ### Neural Engine (ANE)
@@ -182,8 +183,9 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 
 ### Boot chain
 - **Working.** MEASURED 2026-11-09 (first boot of 1.703 with the 7.3 J604 device tree): m1n1 → U-Boot → Limine → kernel; no failed units; no kernel warnings or oopses. Passphrase prompt with the keyboard working (MEASURED 2026-11-09 on 1.617).
-- `boot.bin` holds m1n1 1.608, the J604 device tree of the 1.703 package and U-Boot (4,700,171 bytes, MEASURED 2026-11-09). The all-device-tree image the default `update-m1n1` builds for the 7.3 package is refused by m1n1 stage 1 (MEASURED 2026-11-09). `omarchy-mac-boot` 1.615, which selects the J604 device tree, is in progress.
-- `omarchy-mac-boot` 1.614 drops the earlier first-boot drop-in for `omarchy-plymouth-quit.service`, a unit stock does not ship.
+- `boot.bin` holds m1n1 1.608, the J604 device tree of the 1.703 package and U-Boot (4,700,171 bytes, MEASURED 2026-11-09). The all-device-tree image the stock `update-m1n1` default builds for the 7.3 package is refused by m1n1 stage 1 (MEASURED 2026-11-09).
+- `omarchy-mac-boot` 1.616 makes `update-m1n1` build that J604-only image itself (MEASURED 2026-11-09: byte-identical to the confirmed image in all three runs, at the 1.615 and the 1.616 install; the official boot check passes). Its config, `/etc/default/update-m1n1`, sets `DTBS` to the one device tree of the newest kernel whose first compatible is the running Mac's, and keeps the stock default in every other case (an explicit `DTBS`, `OMARCHY_DTB_MACHINE=0`, no `fdtget`, a chroot, zero or several matches, or an overlay that names that device tree) (CODE). The boot check reads the same file and expects the same image. The package depends on `dtc` for `fdtget`: without it the config falls back to the all-device-tree image (CODE).
+- `omarchy-mac-boot` (since 1.614) drops the earlier first-boot drop-in for `omarchy-plymouth-quit.service`, a unit stock does not ship.
 
 ## Known differences from stock Omarchy on this Mac
 

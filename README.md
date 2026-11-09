@@ -30,7 +30,7 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | Glassy bar | Stock holds about 59 fps on this 120 Hz panel. 119 fps needs the change in [omacom/omarchy#18176](https://github.com/omacom/omarchy/pull/18176), which is not carried here |
 | Wi-Fi and Bluetooth | Working |
 | Audio | Speakers (with speaker protection) and headphone jack working; microphones in progress |
-| Media | H.264 hardware decode working; video encode in progress |
+| Media | H.264 hardware decode worked on the 7.2 kernel; on 7.3 it needs a VA-API driver alias for the renamed GPU driver (in progress); video encode in progress |
 | Touch ID | Working for sudo, polkit and the lock screen |
 | Keyboard backlight | Working with the local `omarchy-dev` / `omarchy-settings-dev` builds |
 | Neural Engine | Driver bound; not powered up on the T8132 yet (the driver stops before power-up by design), no `/dev/accel` |
@@ -66,14 +66,14 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 | `asahi-scripts` | 20261023, asahi-alarm/asahi-scripts | `1.1` |
 | `plymouth` | 26.134.222, Plymouth (Arch Linux recipe) | `3.604` |
 | `libfprint-git` | 1:1.94.100.r10.g6f9479c, libfprint (`6f9479c3d5`), omacom recipe | `5.604` (accepts Secure Enclave interface v4 and v5) |
-| `omarchy-mac-boot` | 20261104, omacom/omarchy-mac-pkgs (`7e50e937b5`) | `1.614` |
+| `omarchy-mac-boot` | 20261104, omacom/omarchy-mac-pkgs (`7e50e937b5`) | `1.616` |
 | `omarchy-mac` | 0.2.3, omacom/omarchy-mac-pkgs (`ea0097a523`) | `2.12` (adds the panel line) |
 | `omarchy-dev` | 4.0.0.r7637.g29f3bb6 (edge), omacom/omarchy `quattro` (`29f3bb655f`) | `1.1` (keyboard-backlight patches only) |
 | `omarchy-settings-dev` | 4.0.0.r7637.g29f3bb6 (edge), omacom/omarchy `quattro` (`29f3bb655f`) | `1.1` (keyboard-backlight patches + built-in panel defaults) |
 
 Also installed, unchanged from the official repositories: Hyprland 0.57.1 and the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
-Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree (see `STATUS.md`, which lists what 1.703 changed over 1.617). Coming next (not installed): `omarchy-mac-boot` 1.615, which makes the boot package select the J604 device tree on its own.
+Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 changed over 1.617).
 
 ## Layout
 
@@ -90,7 +90,7 @@ Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only
 | `libfprint-git/` | Touch ID on the 7.3 kernel: the Apple Secure Enclave driver accepts biometric interface v4 and v5 (two upstream Aurora patches as one) | libfprint (omacom recipe) | LGPL-2.1-or-later |
 | `asahi-scripts/` | adds the `apple_nvmem_spmi` module to the initramfs | asahi-alarm/asahi-scripts | MIT |
 | `plymouth/` | SimpleDRM recognized by driver name, so the disk unlock prompt opens on the panel | Plymouth | GPL-2.0 |
-| `omarchy-mac-boot/` | boot package fixes for the J604 | omacom/omarchy-mac-pkgs | MIT |
+| `omarchy-mac-boot/` | boot package fixes for the J604, and `update-m1n1` builds `boot.bin` with only the running Mac's own device tree | omacom/omarchy-mac-pkgs | MIT |
 | `omarchy-mac/` | keyboard backlight idle timeout, Apple F-row key names, Touch ID on the J604, the 14-inch MacBook Pro panel line (10-bit, Display P3) | omacom/omarchy-mac-pkgs | MIT |
 | `omarchy-dev/`, `omarchy-settings-dev/` | the keyboard-backlight series on the edge recipes (the same four patches in both); `omarchy-settings-dev` also carries the built-in panel defaults (`disp-0201`) | omacom/omarchy | MIT |
 | `not-installed/` | earlier userland changes that are not installed, and where they are | | |

@@ -1,0 +1,348 @@
+From 0b07b5c4800ba58dbcf2f40388bd76967736167b Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 9 Nov 2026 21:30:00 +0000
+Subject: [PATCH] omarchy-mac-boot: build m1n1 stage 2 with the Mac's own
+ device tree
+
+update-m1n1's default DTBS is every device tree of the newest kernel.
+Linux 7.3 (Aurora) ships 137 of them, 13.5 MB, and m1n1 stage 1 on a
+T8132 Mac refuses to chainload a boot.bin that large ("image span
+overlaps the live heap", then "No valid payload found" and the proxy);
+the 7.2 set (115, 10.5 MB) still fit.
+
+/etc/default/update-m1n1 now sets DTBS to the one device tree of the
+newest kernel whose first compatible is the running machine's, when
+exactly one has it. It leaves update-m1n1's default in every other
+case: DTBS already set, OMARCHY_DTB_MACHINE=0, no fdtget, a chroot
+(PID 1 has another root), no or several device trees with that
+compatible (t8122-j613 and t8122-j613-25g83 both say apple,j613), and
+a package-owned overlay that names the Mac's device tree, which
+dtb-overlays.sh then applies as before.
+
+The boot check reads the same file and expects the same image. It now
+passes its root to the file, so its fixtures never see the host's
+device tree, and it warns that a configured DTBS leaves the overlays
+out only when an overlay names one of those device trees. The
+saved-modules hook reads the file with OMARCHY_DTB_MACHINE=0: the
+Mac's own device tree comes from the newest -ARCH directory, as the
+default does, so a downgrade still retires the running kernel's saved
+modules.
+
+Tests: update-m1n1-machine-dtb-test.sh covers each case under sh -e,
+as update-m1n1 sources the file; the boot check rebuilds the Mac's own
+device tree, draws no warning for an overlay of another device tree,
+and an overlay for the Mac's own one brings back the default; the
+locale test keeps the host's device tree out.
+
+[J604 local build: omarchy-mac-boot 20261104-1.615.]
+
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ .../bin/omarchy-apple-silicon-boot-check      |  17 ++-
+ .../files/etc/default/update-m1n1             |  33 +++++-
+ .../scripts/omarchy-mac-retire-saved-modules  |   6 +-
+ .../test/apple-silicon-boot-check-test.sh     |  29 +++++
+ .../test/update-m1n1-locale-test.sh           |  12 +-
+ .../test/update-m1n1-machine-dtb-test.sh      | 111 ++++++++++++++++++
+ 6 files changed, 198 insertions(+), 10 deletions(-)
+ create mode 100644 omarchy-mac-boot/test/update-m1n1-machine-dtb-test.sh
+
+diff --git a/omarchy-mac-boot/bin/omarchy-apple-silicon-boot-check b/omarchy-mac-boot/bin/omarchy-apple-silicon-boot-check
+index cd62f2f..8833d8b 100755
+--- a/omarchy-mac-boot/bin/omarchy-apple-silicon-boot-check
++++ b/omarchy-mac-boot/bin/omarchy-apple-silicon-boot-check
+@@ -603,7 +603,7 @@ done
+ SOURCE="" M1N1="" U_BOOT="" CONFIG="" DTBS="" disabled=""
+ config_file=$(path /etc/default/update-m1n1)
+ if [[ -e $config_file ]]; then
+-  env -i PATH=/usr/bin:/bin OMARCHY_DTB_OVERLAYS=0 bash --noprofile --norc -c '
++  env -i PATH=/usr/bin:/bin OMARCHY_DTB_OVERLAYS=0 OMARCHY_DTB_OVERLAYS_ROOT="$root" bash --noprofile --norc -c '
+     unset DTBS SOURCE M1N1 U_BOOT CONFIG M1N1_UPDATE_DISABLED
+     . "$1" >/dev/null 2>&1 || exit 1
+     for name in DTBS SOURCE M1N1 U_BOOT CONFIG M1N1_UPDATE_DISABLED; do
+@@ -727,7 +727,20 @@ if (( ${#overlays[@]} )); then
+   if (( ! overlays_called )); then
+     echo "Apple Silicon boot check: warning: /etc/default/update-m1n1 does not apply the device tree overlays, so update-m1n1 leaves them out; merge its .pacnew if there is one" >&2
+   elif [[ -n $config_dtbs ]]; then
+-    echo "Apple Silicon boot check: warning: DTBS is set in /etc/default/update-m1n1, so update-m1n1 leaves the device tree overlays out" >&2
++    # Only when an overlay names one of those device trees: the Mac's own one,
++    # which /etc/default/update-m1n1 picks, never is.
++    overlays_left_out=0
++    for overlay in "${overlays[@]}"; do
++      prefix=${overlay%/*}
++      prefix=${prefix##*/}
++      for dtb in "${dtbs[@]}"; do
++        case ${dtb##*/} in
++          "$prefix.dtb" | "$prefix"-*) overlays_left_out=1 ;;
++        esac
++      done
++    done
++    (( ! overlays_left_out )) ||
++      echo "Apple Silicon boot check: warning: DTBS is set in /etc/default/update-m1n1, so update-m1n1 leaves the device tree overlays out" >&2
+   elif ! dtb_overlays_supported "$script"; then
+     echo "Apple Silicon boot check: warning: /usr/bin/update-m1n1 has a DTBS default the device tree overlays do not follow, so it leaves them out" >&2
+   elif ! dtb_overlays_tools; then
+diff --git a/omarchy-mac-boot/files/etc/default/update-m1n1 b/omarchy-mac-boot/files/etc/default/update-m1n1
+index edcba29..4496372 100644
+--- a/omarchy-mac-boot/files/etc/default/update-m1n1
++++ b/omarchy-mac-boot/files/etc/default/update-m1n1
+@@ -6,8 +6,39 @@
+ # is rebuilt, which the boot check can then reproduce byte for byte.
+ export LC_ALL=C
+ 
++# Only this Mac's own device tree: the one of the newest kernel's whose first
++# compatible is the running machine's, when exactly one has it. With every
++# device tree, boot.bin can outgrow what m1n1 stage 1 chainloads (Linux 7.3
++# ships 137, 13.5 MB, and a T8132 Mac's stage 1 refuses that). DTBS keeps
++# update-m1n1's default when it is already set, with OMARCHY_DTB_MACHINE=0,
++# without fdtget (dtc), in a chroot (PID 1 has another root), when no device
++# tree or more than one has that compatible, and when an overlay below names
++# that device tree, so dtb-overlays.sh applies it as before.
++# OMARCHY_DTB_OVERLAYS_ROOT prefixes every path read (tests, and the boot
++# check's root); DTBS names the device tree inside that root.
++omarchy_root=${OMARCHY_DTB_OVERLAYS_ROOT:-}
++if [ -z "${DTBS:-}" ] && [ "${OMARCHY_DTB_MACHINE:-1}" != 0 ] &&
++  command -v fdtget >/dev/null 2>&1 && [ -r "$omarchy_root/proc/device-tree/compatible" ] &&
++  { ! ls -d "$omarchy_root/proc/1/root/" >/dev/null 2>&1 || [ "$omarchy_root/" -ef "$omarchy_root/proc/1/root" ]; }; then
++  omarchy_board=$(tr '\0' '\n' <"$omarchy_root/proc/device-tree/compatible" | head -n 1)
++  omarchy_dtb="" omarchy_n=0
++  for omarchy_path in $(/bin/ls -d "$omarchy_root"/lib/modules/*-ARCH 2>/dev/null | sort -rV | head -n 1)/dtbs/*.dtb; do
++    [ -n "$omarchy_board" ] && [ -f "$omarchy_path" ] &&
++      [ "$(fdtget -t s "$omarchy_path" / compatible 2>/dev/null | cut -d ' ' -f 1)" = "$omarchy_board" ] || continue
++    omarchy_dtb=$omarchy_path omarchy_n=$((omarchy_n + 1))
++  done
++  for omarchy_path in "$omarchy_root"/usr/lib/omarchy-mac-boot/dtb-overlays/*/*.dtbo; do
++    omarchy_path=${omarchy_path%/*}
++    case ${omarchy_dtb##*/} in "${omarchy_path##*/}.dtb" | "${omarchy_path##*/}"-*) omarchy_n=0 ;; esac
++  done
++  [ "$omarchy_n" != 1 ] || DTBS=${omarchy_dtb#"$omarchy_root"}
++  unset omarchy_board omarchy_dtb omarchy_n omarchy_path
++fi
++unset omarchy_root
++
+ # Package-owned device tree overlays under /usr/lib/omarchy-mac-boot/dtb-overlays
+-# (dtb-overlays.sh). With none installed, DTBS keeps update-m1n1's default.
++# (dtb-overlays.sh). With none installed, DTBS keeps update-m1n1's default, or
++# the Mac's own device tree above.
+ if [ -r /usr/lib/omarchy-mac/boot/dtb-overlays.sh ]; then
+   . /usr/lib/omarchy-mac/boot/dtb-overlays.sh
+   dtb_overlays_update_m1n1 || :
+diff --git a/omarchy-mac-boot/files/usr/share/libalpm/scripts/omarchy-mac-retire-saved-modules b/omarchy-mac-boot/files/usr/share/libalpm/scripts/omarchy-mac-retire-saved-modules
+index 3c2ebf5..0d40fa2 100755
+--- a/omarchy-mac-boot/files/usr/share/libalpm/scripts/omarchy-mac-retire-saved-modules
++++ b/omarchy-mac-boot/files/usr/share/libalpm/scripts/omarchy-mac-retire-saved-modules
+@@ -36,12 +36,14 @@ saved=$modules/$running
+ [[ -d $root$saved && ! -L $root$saved ]] || exit 0
+ pacman "${pacman_args[@]}" -Qq kernel-modules-hook >/dev/null 2>&1 || exit 0
+ 
+-# Only when update-m1n1 takes its device trees from the -ARCH default.
++# Only when update-m1n1 takes its device trees from the -ARCH default. The
++# Mac's own device tree, which /etc/default/update-m1n1 picks from the same
++# newest -ARCH directory, counts as the default (OMARCHY_DTB_MACHINE=0).
+ script=$root/usr/bin/update-m1n1
+ [[ -r $script ]] && grep -Eq '^[[:space:]]*:[[:space:]]+\$\{DTBS:=.*/modules/\*-ARCH' "$script" || exit 0
+ config=$root/etc/default/update-m1n1
+ if [[ -e $config ]]; then
+-  configured=$(env -i PATH=/usr/bin:/bin bash --noprofile --norc -c '
++  configured=$(env -i PATH=/usr/bin:/bin OMARCHY_DTB_MACHINE=0 bash --noprofile --norc -c '
+     unset DTBS M1N1_UPDATE_DISABLED
+     . "$1" >/dev/null 2>&1 || exit 1
+     printf "%s" "${DTBS-}${M1N1_UPDATE_DISABLED-}"
+diff --git a/omarchy-mac-boot/test/apple-silicon-boot-check-test.sh b/omarchy-mac-boot/test/apple-silicon-boot-check-test.sh
+index 1cd9ce1..5dc82c8 100644
+--- a/omarchy-mac-boot/test/apple-silicon-boot-check-test.sh
++++ b/omarchy-mac-boot/test/apple-silicon-boot-check-test.sh
+@@ -7,6 +7,7 @@ source "$(dirname "$0")/base-test.sh"
+ require_command gzip
+ require_command realpath
+ require_command locale
++require_command dtc
+ 
+ check="$ROOT/bin/omarchy-apple-silicon-boot-check"
+ grep -Fq '# omarchy:hidden=true' "$check" || fail "the boot check is hidden from command listings"
+@@ -615,6 +616,34 @@ run_check --boot-chain
+ expect_fail "an overlay no package owns" "device tree overlay /usr/lib/omarchy-mac-boot/dtb-overlays/t8103/omarchy-ane.dtbo is not owned by a package"
+ pass "package-owned device tree overlays are rebuilt into m1n1 stage 2 where the configuration applies them, and an unowned one fails"
+ 
++# The Mac's own device tree: /etc/default/update-m1n1 gives update-m1n1 only
++# the one with the running Mac's first compatible, and the rebuild reads the
++# same configuration, so it expects the same image.
++system linux-aurora
++cp "$ROOT/files/etc/default/update-m1n1" "$root/etc/default/update-m1n1"
++mkdir -p "$root/proc/device-tree"
++printf 'apple,j274\0apple,t8103\0apple,arm-platform\0' >"$root/proc/device-tree/compatible"
++printf '/dts-v1/;\n/ { compatible = "apple,j274", "apple,t8103", "apple,arm-platform"; };\n' |
++  dtc -q -I dts -O dtb -o "$root${dtbs[2]}" - || fail "dtc builds the Mac's device tree"
++run_check --boot-chain
++expect_fail "an m1n1 image with every device tree, where the configuration picks the Mac's own" "m1n1/boot.bin on the system ESP (/boot/efi) is not m1n1"
++write_boot_bin "${dtbs[2]}"
++run_check --boot-chain
++expect_pass "an m1n1 image update-m1n1 built with the Mac's own device tree"
++mkdir -p "$root/usr/lib/omarchy-mac-boot/dtb-overlays/t6000"
++printf 'overlay\n' >"$root/usr/lib/omarchy-mac-boot/dtb-overlays/t6000/omarchy-ane.dtbo"
++printf '/usr/lib/omarchy-mac-boot/dtb-overlays/t6000/omarchy-ane.dtbo omarchy-ane\n' >"$test_tmp/files/owners"
++run_check --boot-chain
++expect_pass "the Mac's own device tree beside an overlay for another one"
++! grep -Fq "leaves the device tree overlays out" "$test_tmp/err" ||
++  fail "an overlay for another device tree draws no warning" "$(cat "$test_tmp/err")"
++mkdir -p "$root/usr/lib/omarchy-mac-boot/dtb-overlays/t8103"
++printf 'overlay\n' >"$root/usr/lib/omarchy-mac-boot/dtb-overlays/t8103/omarchy-ane.dtbo"
++printf '/usr/lib/omarchy-mac-boot/dtb-overlays/t8103/omarchy-ane.dtbo omarchy-ane\n' >>"$test_tmp/files/owners"
++run_check --boot-chain
++expect_fail "an overlay for the Mac's own device tree, which brings back the default" "m1n1/boot.bin on the system ESP (/boot/efi) is not m1n1"
++pass "the Mac's own device tree is rebuilt as update-m1n1 builds it, and an overlay for it brings back the default"
++
+ # update-m1n1's defaults: := fills unset and empty settings alike.
+ for config in '' 'DTBS=\nSOURCE=""\n' 'CONFIG=\nM1N1=\nU_BOOT=\n' 'M1N1_UPDATE_DISABLED=\n'; do
+   system linux-aurora
+diff --git a/omarchy-mac-boot/test/update-m1n1-locale-test.sh b/omarchy-mac-boot/test/update-m1n1-locale-test.sh
+index 020abdc..2c66056 100644
+--- a/omarchy-mac-boot/test/update-m1n1-locale-test.sh
++++ b/omarchy-mac-boot/test/update-m1n1-locale-test.sh
+@@ -38,7 +38,7 @@ utf8_order=$(printf '%s\n' "${names[@]}" | LC_ALL=$utf8_locale sort)
+ update_m1n1_order() {
+   local defaults=$1
+   shift
+-  env "$@" OMARCHY_DTB_OVERLAYS=0 sh -c '
++  env "$@" OMARCHY_DTB_OVERLAYS=0 OMARCHY_DTB_MACHINE=0 sh -c '
+     [ -z "$1" ] || . "$1"
+     : ${DTBS:="$2/*.dtb"}
+     cat $DTBS
+@@ -53,10 +53,12 @@ update_m1n1_order() {
+   fail "with the defaults file, a $utf8_locale LC_ALL still concatenates in C order"
+ pass "update-m1n1 concatenates device trees in C order under any caller locale"
+ 
+-# The file only sets the locale: every input update-m1n1 and the boot check
+-# read from it keeps its default. OMARCHY_DTB_OVERLAYS=0, as the boot check
+-# reads it, keeps the host's own overlays out of this test.
+-set_by_config=$(env -i PATH=/usr/bin:/bin OMARCHY_DTB_OVERLAYS=0 bash --noprofile --norc -c '
++# Besides the Mac's own device tree (update-m1n1-machine-dtb-test.sh), the
++# file only sets the locale: every input update-m1n1 and the boot check read
++# from it keeps its default. OMARCHY_DTB_OVERLAYS=0, as the boot check reads
++# it, keeps the host's own overlays out of this test, and
++# OMARCHY_DTB_MACHINE=0 the host's own device tree.
++set_by_config=$(env -i PATH=/usr/bin:/bin OMARCHY_DTB_OVERLAYS=0 OMARCHY_DTB_MACHINE=0 bash --noprofile --norc -c '
+   unset DTBS SOURCE M1N1 U_BOOT CONFIG TARGET M1N1_UPDATE_DISABLED
+   . "$1" >/dev/null 2>&1 || exit 1
+   for name in DTBS SOURCE M1N1 U_BOOT CONFIG TARGET M1N1_UPDATE_DISABLED; do
+diff --git a/omarchy-mac-boot/test/update-m1n1-machine-dtb-test.sh b/omarchy-mac-boot/test/update-m1n1-machine-dtb-test.sh
+new file mode 100644
+index 0000000..47eab64
+--- /dev/null
++++ b/omarchy-mac-boot/test/update-m1n1-machine-dtb-test.sh
+@@ -0,0 +1,111 @@
++#!/bin/bash
++
++set -euo pipefail
++source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
++
++require_command dtc
++require_command fdtget
++
++# /etc/default/update-m1n1 gives update-m1n1 only the running Mac's own device
++# tree of the newest kernel, when exactly one has the Mac's first compatible,
++# and otherwise leaves DTBS to update-m1n1's default.
++config=$ROOT/files/etc/default/update-m1n1
++[[ -f $config ]] || fail "the package ships /etc/default/update-m1n1"
++
++tmp=$(mktemp -d)
++trap 'rm -rf "$tmp"' EXIT
++
++# A device tree whose root has COMPATIBLE (space-separated).
++dtb() {
++  local out=$1 list="" word
++  shift
++  for word; do
++    list="$list${list:+, }\"$word\""
++  done
++  mkdir -p "${out%/*}"
++  printf '/dts-v1/;\n/ { compatible = %s; #address-cells = <2>; #size-cells = <2>; };\n' "$list" |
++    dtc -q -I dts -O dtb -o "$out" - || fail "dtc builds the fixture $out"
++}
++
++# A fake root: the running Mac's compatible and the newest kernel's trees.
++make_root() {
++  local root=$1
++  shift
++  rm -rf "$root"
++  mkdir -p "$root/proc/device-tree" "$root/usr/lib/omarchy-mac-boot/dtb-overlays"
++  ln -s usr/lib "$root/lib"
++  printf 'apple,j604\0apple,t8132\0apple,arm-platform\0' >"$root/proc/device-tree/compatible"
++  dtb "$root/lib/modules/7.2.11-1-1.617-ARCH/dtbs/t8132-j604.dtb" apple,j604 apple,t8132 apple,arm-platform
++  dtb "$root/lib/modules/7.3.0-1-1.703-ARCH/dtbs/t8132-j604.dtb" apple,j604 apple,t8132 apple,arm-platform
++  dtb "$root/lib/modules/7.3.0-1-1.703-ARCH/dtbs/t8132-j623.dtb" apple,j623 apple,t8132 apple,arm-platform
++  dtb "$root/lib/modules/7.3.0-1-1.703-ARCH/dtbs/t8122-j613.dtb" apple,j613 apple,t8122 apple,arm-platform
++  dtb "$root/lib/modules/7.3.0-1-1.703-ARCH/dtbs/t8122-j613-25g83.dtb" apple,j613 apple,t8122 apple,arm-platform
++}
++
++# DTBS after update-m1n1's own `. /etc/default/update-m1n1` under sh -e, or
++# "unset". OMARCHY_DTB_OVERLAYS=0 keeps the host's own overlays out.
++configured() {
++  local root=$1
++  shift
++  env -i PATH="${TEST_PATH:-/usr/bin:/bin}" OMARCHY_DTB_OVERLAYS=0 OMARCHY_DTB_OVERLAYS_ROOT="$root" "$@" sh -ec '
++    . "$1"
++    printf "%s" "${DTBS:-unset}"
++  ' _ "$config" || fail "update-m1n1 sources the defaults file under sh -e (status $?)"
++}
++
++root=$tmp/root
++newest=/lib/modules/7.3.0-1-1.703-ARCH/dtbs
++
++make_root "$root"
++[[ $(configured "$root") == "$newest/t8132-j604.dtb" ]] ||
++  fail "a Mac gets its own device tree of the newest kernel ($(configured "$root"))"
++pass "a Mac gets its own device tree of the newest kernel"
++
++[[ $(configured "$root" DTBS=/x/y.dtb) == /x/y.dtb ]] || fail "a DTBS from the environment wins"
++[[ $(configured "$root" OMARCHY_DTB_MACHINE=0) == unset ]] || fail "OMARCHY_DTB_MACHINE=0 keeps the default"
++pass "a DTBS from the environment wins, and OMARCHY_DTB_MACHINE=0 keeps the default"
++
++printf 'apple,j613\0apple,t8122\0apple,arm-platform\0' >"$root/proc/device-tree/compatible"
++[[ $(configured "$root") == unset ]] || fail "two device trees with the Mac's compatible keep the default"
++printf 'apple,j999\0apple,t8199\0apple,arm-platform\0' >"$root/proc/device-tree/compatible"
++[[ $(configured "$root") == unset ]] || fail "a Mac the kernel has no device tree for keeps the default"
++printf 'linux,dummy-virt\0' >"$root/proc/device-tree/compatible"
++[[ $(configured "$root") == unset ]] || fail "another machine keeps the default"
++rm -f "$root/proc/device-tree/compatible"
++[[ $(configured "$root") == unset ]] || fail "a machine without a device tree keeps the default"
++pass "no device tree, another machine, or none or two matching device trees keep the default"
++
++make_root "$root"
++mkdir -p "$tmp/nofdt"
++for tool in sh tr head sort cut ls env; do
++  ln -s "$(command -v "$tool")" "$tmp/nofdt/$tool"
++done
++[[ $(TEST_PATH=$tmp/nofdt configured "$root") == unset ]] || fail "without fdtget the default stays"
++pass "without fdtget the default stays"
++
++mkdir -p "$root/proc/1" && ln -s "$tmp/nofdt" "$root/proc/1/root"
++[[ $(configured "$root") == unset ]] || fail "in a chroot (PID 1 has another root) the default stays"
++rm -rf "$root/proc/1" && mkdir -p "$root/proc/1" && ln -s "$root" "$root/proc/1/root"
++[[ $(configured "$root") == "$newest/t8132-j604.dtb" ]] || fail "PID 1 in the same root selects"
++pass "in a chroot the default stays"
++
++mkdir -p "$root/usr/lib/omarchy-mac-boot/dtb-overlays/t6000"
++: >"$root/usr/lib/omarchy-mac-boot/dtb-overlays/t6000/ane.dtbo"
++[[ $(configured "$root") == "$newest/t8132-j604.dtb" ]] || fail "an overlay for another device tree changes nothing"
++mkdir -p "$root/usr/lib/omarchy-mac-boot/dtb-overlays/t8132"
++: >"$root/usr/lib/omarchy-mac-boot/dtb-overlays/t8132/ane.dtbo"
++[[ $(configured "$root") == unset ]] || fail "an overlay for the Mac's device tree leaves DTBS to dtb-overlays.sh"
++pass "an overlay for the Mac's own device tree leaves DTBS to dtb-overlays.sh"
++
++# The saved-modules hook counts the Mac's own device tree as the -ARCH default.
++grep -Fq 'env -i PATH=/usr/bin:/bin OMARCHY_DTB_MACHINE=0 bash' "$ROOT/files/usr/share/libalpm/scripts/omarchy-mac-retire-saved-modules" ||
++  fail "the saved-modules hook reads the defaults file with OMARCHY_DTB_MACHINE=0"
++pass "the saved-modules hook reads the defaults file with OMARCHY_DTB_MACHINE=0"
++
++# The variables the file uses for this are gone after it.
++leftover=$(env -i PATH=/usr/bin:/bin OMARCHY_DTB_OVERLAYS=0 OMARCHY_DTB_OVERLAYS_ROOT="$root" sh -ec '
++  . "$1"
++  set | grep -E "^omarchy_" || :
++' _ "$config")
++[[ -z $leftover ]] || fail "the defaults file leaves no omarchy_ variables ($leftover)"
++pass "the defaults file leaves no variables of its own"
+-- 
+2.43.0
+
