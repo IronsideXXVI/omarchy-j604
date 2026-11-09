@@ -30,3 +30,5 @@ the history of `kernel/` keeps (kernel 1.617 was added in commit 4407a2a).
 Also credited in a patch message: the built-in panel defaults (`omarchy-settings-dev/patches/disp-0201`) follow omacom/omarchy#10549 by j-c-m, which set `cm = "dp3"` for the Dell XPS OLED panel.
 
 `libfprint-git/patches/aurora-touchid-v5.patch` carries patches 0004 and 0005 from aurora-silicon/aurora-sep-userspace (shipped in aurora-silicon/alarm-aurora `libfprint-aurora`), renamed to the omacom driver's names. The patch has no single `From:` author, so it is not counted in the table.
+
+`libva-v4l2_request-avd/patches/recipe-aurora-alias.patch` is a recipe diff that carries Ryan Murray's alias change (aurora-silicon/alarm-aurora aedcf240ca91, also proposed for omacom as omacom/omarchy-pkgs#2375 by edimoldovan). It has no `From:` line, so it is not counted in the table.

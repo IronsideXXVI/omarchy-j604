@@ -6,7 +6,7 @@ This repository is the working set for running [Omarchy](https://github.com/omac
 
 The J604 runs the official Omarchy **edge** channel (switched with the official `omarchy-channel-set edge` on 2026-11-09): `omarchy-dev` and `omarchy-settings-dev` built from the `quattro` branch, plus the official `omarchy-mac`. This repository carries only what the stock packages lack for this Mac:
 
-- the hardware enablement (kernel, boot chain, Mesa admission, audio profiles, firmware extraction, initramfs and unlock-prompt fixes, Touch ID eligibility, and the Touch ID library update the 7.3 kernel's Secure Enclave interface needs);
+- the hardware enablement (kernel, boot chain, Mesa admission, audio profiles, firmware extraction, initramfs and unlock-prompt fixes, Touch ID eligibility, the Touch ID library update the 7.3 kernel's Secure Enclave interface needs, and the VA-API driver alias the 7.3 kernel's renamed GPU driver needs);
 - two userland additions:
   - the keyboard-backlight series in `omarchy-dev` / `omarchy-settings-dev` (the backlight comes on with activity, goes off after 10 s idle, Ctrl+F1/F2 change it, and Super+K leaves out keys a MacBook doesn't have);
   - built-in panel defaults: `omarchy-settings-dev` reads a `panel` line from the platform package, and `omarchy-mac` names this Mac's panel there (10-bit, Display P3). A setting in the user's `monitors.lua` still wins.
@@ -30,7 +30,7 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | Glassy bar | Stock holds about 59 fps on this 120 Hz panel. 119 fps needs the change in [omacom/omarchy#18176](https://github.com/omacom/omarchy/pull/18176), which is not carried here |
 | Wi-Fi and Bluetooth | Working |
 | Audio | Speakers (with speaker protection) and headphone jack working; microphones in progress |
-| Media | H.264 hardware decode worked on the 7.2 kernel. On 7.3 VA-API does not load with the stock driver package, so players decode in software; the GPU fault that held back a driver alias for the renamed GPU driver is fixed in kernel 1.704, and the alias waits for its zero-copy test (in progress, see `STATUS.md`); video encode in progress |
+| Media | Hardware decode (H.264, HEVC, VP9) working in stock mpv through VA-API, with kernel 1.704 and the VA-API driver alias (checked at 1080p, and 4K for H.264; AV1 and 10-bit not yet); video encode in progress |
 | Touch ID | Working for sudo, polkit and the lock screen |
 | Keyboard backlight | Working with the local `omarchy-dev` / `omarchy-settings-dev` builds |
 | Neural Engine | Driver bound; not powered up on the T8132 yet (the driver stops before power-up by design), no `/dev/accel` |
@@ -66,6 +66,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 | `asahi-scripts` | 20261023, asahi-alarm/asahi-scripts | `1.1` |
 | `plymouth` | 26.134.222, Plymouth (Arch Linux recipe) | `3.604` |
 | `libfprint-git` | 1:1.94.100.r10.g6f9479c, libfprint (`6f9479c3d5`), omacom recipe | `5.604` (accepts Secure Enclave interface v4 and v5) |
+| `libva-v4l2_request-avd` | 1.3.r11.r169.gc653eaa, omacom/libva-v4l2_request (`c653eaa623`), omacom recipe | `1.604` (adds the `aurora_drv_video.so` alias; the same change is open as [omacom/omarchy-pkgs#2375](https://github.com/omacom/omarchy-pkgs/pull/2375), and its official `-2` will replace this build) |
 | `omarchy-mac-boot` | 20261104, omacom/omarchy-mac-pkgs (`7e50e937b5`) | `1.616` |
 | `omarchy-mac` | 0.2.3, omacom/omarchy-mac-pkgs (`ea0097a523`) | `2.12` (adds the panel line) |
 | `omarchy-dev` | 4.0.0.r7637.g29f3bb6 (edge), omacom/omarchy `quattro` (`29f3bb655f`) | `1.1` (keyboard-backlight patches only) |
@@ -88,6 +89,7 @@ Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only
 | `speakersafetyd/` | J604 speaker protection profile | AsahiLinux/speakersafetyd | MIT |
 | `asahi-fwextract/` | camera tuning firmware extraction for the J604 | asahi-alarm/asahi-alarm-installer | MIT |
 | `libfprint-git/` | Touch ID on the 7.3 kernel: the Apple Secure Enclave driver accepts biometric interface v4 and v5 (two upstream Aurora patches as one) | libfprint (omacom recipe) | LGPL-2.1-or-later |
+| `libva-v4l2_request-avd/` | VA-API on the 7.3 kernel: the recipe adds the `aurora_drv_video.so` alias (upstream aurora-silicon/alarm-aurora aedcf240ca91). The change is in the recipe only, so `patches/` holds the recipe diff | omacom/omarchy-pkgs recipe (omacom/libva-v4l2_request source unchanged) | GPL-3.0-or-later |
 | `asahi-scripts/` | adds the `apple_nvmem_spmi` module to the initramfs | asahi-alarm/asahi-scripts | MIT |
 | `plymouth/` | SimpleDRM recognized by driver name, so the disk unlock prompt opens on the panel | Plymouth | GPL-2.0 |
 | `omarchy-mac-boot/` | boot package fixes for the J604, and `update-m1n1` builds `boot.bin` with only the running Mac's own device tree | omacom/omarchy-mac-pkgs | MIT |
