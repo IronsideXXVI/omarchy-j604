@@ -58,7 +58,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 | `linux-aurora`, `linux-aurora-headers` | 7.2.11.aurora15, omacom/linux-aurora `integration/aurora` (`b798f2b0c7`), 766 patches | `1.617` |
 | `m1n1-aurora` | 1.6.1.aurora22, omacom/m1n1 (`bc79acc434`), 37 patches | `1.608` |
 | `uboot-aurora` | 2026.07.aurora6, aurora-silicon/u-boot (`d30213eadc`) | `1.604` |
-| `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261031, omacom/mesa (`a196911147`) | `1.8132` |
+| `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261031, omacom/mesa (`a196911147`) | `1.8133` |
 | `alsa-ucm-conf-aurora` | 10.aurora3, aurora-silicon/alsa-ucm-conf-asahi (`b9b2d0c82c`) | `1.605` |
 | `aurora-audio` | 4.1.aurora3, aurora-silicon/asahi-audio (`06aec67a8a`) | `3.607` |
 | `speakersafetyd` | 2.0.1, AsahiLinux/speakersafetyd | `1.605` |
@@ -82,7 +82,7 @@ Coming next (not installed): a rebase of the J604 series onto aurora-silicon/lin
 | `kernel/` | `git format-patch` series (apply in `series` order); `BASE` names the commit it applies to and the official recipe | omacom/linux-aurora | GPL-2.0 (see `kernel/COPYING`) |
 | `m1n1/` | patches and the `m1n1-aurora` recipe | omacom/m1n1 | MIT |
 | `uboot-aurora/` | J604 board patch and the `uboot-aurora` recipe | aurora-silicon/u-boot | GPL-2.0+ |
-| `mesa/` | T8132 patch and the `mesa-aurora` recipe (builds `mesa-aurora` and `vulkan-aurora`) | omacom/mesa | MIT (main code) |
+| `mesa/` | T8132 patch, the "aurora" driver-name patch and the `mesa-aurora` recipe (builds `mesa-aurora` and `vulkan-aurora`) | omacom/mesa | MIT (main code) |
 | `alsa-ucm-conf-aurora/` | J604 headphone jack, microphone and speaker UCM | aurora-silicon/alsa-ucm-conf-asahi | BSD-3-Clause |
 | `aurora-audio/` | J604 speaker graph and microphone, plus upstream audio fixes | aurora-silicon/asahi-audio | MIT |
 | `speakersafetyd/` | J604 speaker protection profile | AsahiLinux/speakersafetyd | MIT |

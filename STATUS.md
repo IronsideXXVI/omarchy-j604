@@ -25,7 +25,7 @@ MEASURED 2026-11-09 (`pacman -Q` and `uname -r` on the machine):
 | Mac add-on | `omarchy-mac` 0.2.3, local `2.12`: keyboard-backlight idle default, Apple F-row key names, Touch ID eligibility, the 14-inch MacBook Pro panel line (10-bit, Display P3) | official recipe + 4 patches |
 | Kernel | `linux-aurora` 7.2.11.aurora15, local `1.617` (766 patches), running `7.2.11-15-1.617-ARCH` since 2026-11-09 | official recipe + J604 series |
 | Boot chain | `m1n1-aurora` 1.6.1.aurora22 (local `1.608`), `uboot-aurora` 2026.07.aurora6 (local `1.604`), `omarchy-mac-boot` 20261104 (local `1.614`), `plymouth` 26.134.222 (local `3.604`), `asahi-scripts` 20261023 (local `1.1`) | official recipes + J604 patches |
-| Graphics | `mesa-aurora` / `vulkan-aurora` with the T8132 GPU admitted (local `1.8132`) | official recipe + 1 patch |
+| Graphics | `mesa-aurora` / `vulkan-aurora` with the T8132 GPU admitted and the 7.3 kernel's "aurora" driver name accepted (local `1.8133`) | official recipe + 2 patches |
 | Audio | `alsa-ucm-conf-aurora` (local `1.605`), `aurora-audio` (local `3.607`), `speakersafetyd` (local `1.605`) with J604 profiles | official recipes + J604 files |
 | Firmware | `asahi-fwextract` 0.9.2 (local `1.608`): extra camera tuning files | official recipe + 1 patch |
 | Touch ID library | `libfprint-git` 1:1.94.100.r10.g6f9479c, local `5.604`: accepts Secure Enclave biometric interface v4 and v5 | official recipe + 1 patch |
@@ -106,7 +106,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 ### GPU
 - **Working.** MEASURED 2026-11-09: the `asahi` driver drives the 10-core G16 GPU; OpenGL 4.6 and Vulkan 1.4.
 - GPU idle power: in progress (TO-VERIFY 2026-11-09). The idle power-off is in the kernel; its power across boots is still being measured.
-- Carried by: kernel series and `mesa-aurora`/`vulkan-aurora` with one patch that admits the T8132 GPU. Stock Mesa refuses this GPU on purpose (omacom/mesa#25).
+- Carried by: kernel series and `mesa-aurora`/`vulkan-aurora` with two patches: one admits the T8132 GPU (stock Mesa refuses this GPU on purpose, omacom/mesa#25); the other is upstream aurora-silicon/mesa 6edf62bcfd0, which accepts the "aurora" DRM driver name of the 7.3 kernel as well as "asahi" (SOURCE 2026-11-09). Both names are in the built libraries, and with 1.8133 installed OpenGL and Vulkan report the Apple M4 GPU (G16G B0) on the 7.3 kernel, not llvmpipe (MEASURED 2026-11-09).
 
 ### Internal display
 - **Working.** MEASURED 2026-11-09: 3024x1964 at 120 Hz, scale 2.
