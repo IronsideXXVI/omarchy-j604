@@ -32,7 +32,7 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | Camera | Working, tuned: 1080p and 720p capture with the sensor tuning file loaded, seen by stock apps and Chromium; colour not yet judged by eye |
 | Wi-Fi and Bluetooth | Working |
 | Audio | Speakers (with speaker protection), headphone jack and the three-microphone array working |
-| Media | Hardware decode (H.264, HEVC, VP9) working in stock mpv through VA-API, with kernel 1.704 and the VA-API driver alias (checked at 1080p, and 4K for H.264; 10-bit HEVC decodes through VA-API as real 10-bit in short checks; AV1 not yet); JPEG hardware encode working; H.264 and HEVC hardware encode working through stock FFmpeg since 1.722, and the stock screen recorder records in hardware since 1.726 (10-bit HEVC works through V4L2 directly; stock FFmpeg cannot send 10-bit frames to V4L2 encoders) |
+| Media | Hardware decode (H.264, HEVC, VP9) working in stock mpv through VA-API, with kernel 1.704 and the VA-API driver alias (checked at 1080p, and 4K for H.264; 10-bit HEVC decodes through VA-API as real 10-bit in short checks; AV1 not yet); JPEG hardware encode and decode working (decode since 1.728); H.264 and HEVC hardware encode working through stock FFmpeg since 1.722, and the stock screen recorder records in hardware since 1.726 (10-bit HEVC works through V4L2 directly; stock FFmpeg cannot send 10-bit frames to V4L2 encoders) |
 | Touch ID | Working for sudo, polkit and the lock screen |
 | Keyboard backlight | Working with the local `omarchy-dev` / `omarchy-settings-dev` builds |
 | Neural Engine | Working: on by default (`/dev/accel/accel0`), runs programs bit-exact and powers off when idle (measured on 1.711) |
@@ -57,7 +57,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`6ff31cbfa2`), 225 patches | `1.727` |
+| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`6ff31cbfa2`), 228 patches | `1.728` |
 | `m1n1-aurora` | 1.6.1.aurora22, omacom/m1n1 (`bc79acc434`), 38 patches | `1.610` |
 | `uboot-aurora` | 2026.07.aurora6, aurora-silicon/u-boot (`d30213eadc`) | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261031, omacom/mesa (`a196911147`) | `1.8133` |
@@ -77,7 +77,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 Also installed, unchanged from the official repositories: Hyprland 0.57.1 and the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
-Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.727 changed over 1.617).
+Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.728 changed over 1.617).
 
 ## Layout
 
