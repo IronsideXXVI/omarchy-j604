@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 20:44:35 +0000
+Subject: [PATCH] soc: apple: s2r: breadcrumb the abort, the resume
+ entry and the end of a sleep
+
+The suspend-to-RAM breadcrumb (apple_s2r.breadcrumb, default off) wrote
+no step when ->enter returned without sleeping, none when the syscore
+resume started (the first thing it does is put the watchdog back), and
+its last step was ->finish, after which the byte got its old value back
+in ->end. So a stop between an abort and the syscore resume, at the very
+start of the resume, or in the resume of devices after ->finish and in
+the thaw left the same trail as the step before it.
+
+Write three more steps: 0x3b when ->enter returns without sleeping,
+0x3c as the syscore resume begins, and 0x3d in ->end, after every
+device has resumed and completed. Read the byte back and give it its
+old value only from a PM_POST_SUSPEND notifier, once user space is
+thawed, so that a stop up to there leaves 0x3d or an earlier step.
+
+After a forced power-off the boot firmware may not record the stage as
+a failed-boot stage. Have macsmc-reboot also print the boot stage byte
+as it finds it at boot, before it writes its own value, so the next boot
+shows what the byte held, or that the firmware rewrote it.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/power/reset/macsmc-reboot.c | 12 ++++++++++++
+ drivers/soc/apple/apple-s2r.c       | 20 +++++++++++++++++---
+ 2 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/power/reset/macsmc-reboot.c b/drivers/power/reset/macsmc-reboot.c
+index 9e913b1e69..43baf1ea19 100644
+--- a/drivers/power/reset/macsmc-reboot.c
++++ b/drivers/power/reset/macsmc-reboot.c
+@@ -219,6 +219,18 @@ static void macsmc_reboot_print_last_end(struct macsmc_reboot *reboot)
+ 
+ 	if (!IS_ERR_OR_NULL(stage) && stage_len >= 1)
+ 		dev_info(reboot->dev, "previous boot: failed-boot stage %#x\n", stage[0]);
++	/*
++	 * The boot stage byte itself, as the boot firmware handed it over: after
++	 * a forced power-off it may still hold the last step a sleep wrote there
++	 * (apple_s2r.breadcrumb), unless the firmware rewrote it.
++	 */
++	if (reboot->nvm.boot_stage) {
++		int handover = nvmem_cell_get_u8(reboot->nvm.boot_stage);
++
++		if (handover >= 0)
++			dev_info(reboot->dev, "previous boot: boot stage at handover %#x\n",
++				 handover);
++	}
+ 	if (!IS_ERR_OR_NULL(fault) && fault_len)
+ 		dev_info(reboot->dev, "previous boot: PMU fault shadow %*ph\n",
+ 			 (int)min_t(size_t, fault_len, 32), fault);
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index 24504f71fd..839317d5d2 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -584,7 +584,7 @@ MODULE_PARM_DESC(wdt_from_enter, "For bring-up: arm the wdt_timeout watchdog alr
+ 
+ static bool breadcrumb;
+ module_param(breadcrumb, bool, 0644);
+-MODULE_PARM_DESC(breadcrumb, "For bring-up: during a suspend-to-RAM, write the number of each late step (0x31-0x3a) to the PMU boot stage byte, so that a sleep that never returns leaves its last step for the next boot; the original value is put back at the end of the cycle (default: off)");
++MODULE_PARM_DESC(breadcrumb, "For bring-up: during a suspend-to-RAM, write the number of each late step (0x31-0x3d) to the PMU boot stage byte, so that a sleep that never returns leaves its last step for the next boot; the original value is put back once user space is thawed (default: off)");
+ 
+ static char breadcrumb_trail[128];
+ module_param_string(breadcrumb_trail, breadcrumb_trail, sizeof(breadcrumb_trail), 0444);
+@@ -724,6 +724,9 @@ enum apple_s2r_crumb {
+ 	S2R_CRUMB_POWER_DOWN,		/* next: CPU and SoC clusters off, SoC sleeps */
+ 	S2R_CRUMB_SYSCORE,		/* syscore resume done */
+ 	S2R_CRUMB_FINISH,		/* ->finish: noirq and early resume done */
++	S2R_CRUMB_ABORT,		/* 0x3b ->enter returns without sleeping */
++	S2R_CRUMB_SYSCORE_IN,		/* 0x3c syscore resume entered */
++	S2R_CRUMB_END,			/* 0x3d ->end: every device resumed and completed */
+ };
+ 
+ /*
+@@ -800,7 +803,7 @@ static void apple_s2r_crumb_begin(struct apple_s2r *s2r)
+ 	s2r->crumb_on = true;
+ }
+ 
+-/* ->end: read the byte back, put the old value back, report */
++/* After thaw (PM_POST_SUSPEND): read the byte back, put the old value back, report */
+ static void apple_s2r_crumb_end(struct apple_s2r *s2r)
+ {
+ 	u8 last = 0, now = 0;
+@@ -1157,6 +1160,7 @@ static int apple_s2r_enter(suspend_state_t state)
+ 
+ fail:
+ 	s2r->failed_ret = ret;
++	apple_s2r_crumb(s2r, S2R_CRUMB_ABORT);
+ 	return ret;
+ }
+ 
+@@ -1165,6 +1169,8 @@ static void apple_s2r_syscore_resume(void *data)
+ 	struct apple_s2r *s2r = data;
+ 	unsigned long done = s2r->done;
+ 
++	apple_s2r_crumb(s2r, S2R_CRUMB_SYSCORE_IN);
++
+ 	/*
+ 	 * First, before anything that could hang until the reset. Armed from
+ 	 * ->enter, the watchdog stays armed through the rest of resume, with a
+@@ -1220,6 +1226,14 @@ static int apple_s2r_pm_notify(struct notifier_block *nb, unsigned long action,
+ {
+ 	struct apple_s2r *s2r = container_of(nb, struct apple_s2r, pm_nb);
+ 
++	/*
++	 * The last step of a sleep, after user space is thawed: only now is the
++	 * breadcrumb read back and the boot stage byte given its old value, so a
++	 * stop anywhere before still leaves 0x3d or an earlier step.
++	 */
++	if (action == PM_POST_SUSPEND)
++		apple_s2r_crumb_end(s2r);
++
+ 	if (action != PM_POST_SUSPEND || !s2r->wdt_armed || !s2r->wdt_hold)
+ 		return NOTIFY_DONE;
+ 
+@@ -1311,7 +1325,7 @@ static void apple_s2r_resume_finish(void)
+ static void apple_s2r_resume_end(void)
+ {
+ 	if (apple_s2r)
+-		apple_s2r_crumb_end(apple_s2r);
++		apple_s2r_crumb(apple_s2r, S2R_CRUMB_END);
+ }
+ 
+ static const struct platform_suspend_ops apple_s2r_ops = {

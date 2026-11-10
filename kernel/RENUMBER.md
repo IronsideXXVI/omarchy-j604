@@ -16,6 +16,8 @@ New in 1.807: 0237 (`soc: apple: s2r: optionally arm the bring-up watchdog when 
 
 New in 1.808: 0238 (`soc: apple: s2r: leave a breadcrumb in the PMU for each late sleep step`), 0239 (`soc: apple: sleep: optionally log the AP wake masks when they are undone`), 0240 (`cpufreq: apple-soc: optionally wait for a transition before an idle drop`).
 
+New in 1.809: 0241 (`soc: apple: s2r: send the enclave no sleep request in a run set to abort`), 0242 (`soc: apple: s2r: keep the bring-up watchdog armed through resume`), 0243 (`soc: apple: s2r: refuse an abort_before that no step reaches`), 0244 (`soc: apple: s2r: breadcrumb the abort, the resume entry and the end of a sleep`), 0245 (`cpufreq: apple-soc: wait for a transition before an idle drop by default`).
+
 | 1.736 | 1.800 | Subject |
 |---|---|---|
 | 0001 | 0001 | dt-bindings: pci: apple,pcie: Describe the three T8132 root ports |
