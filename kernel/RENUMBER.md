@@ -14,6 +14,8 @@ New in 1.805: 0234 (`arm64: dts: apple: t8132-j604: report the always-zero SMC t
 
 New in 1.807: 0237 (`soc: apple: s2r: optionally arm the bring-up watchdog when ->enter starts`).
 
+New in 1.808: 0238 (`soc: apple: s2r: leave a breadcrumb in the PMU for each late sleep step`), 0239 (`soc: apple: sleep: optionally log the AP wake masks when they are undone`), 0240 (`cpufreq: apple-soc: optionally wait for a transition before an idle drop`).
+
 | 1.736 | 1.800 | Subject |
 |---|---|---|
 | 0001 | 0001 | dt-bindings: pci: apple,pcie: Describe the three T8132 root ports |

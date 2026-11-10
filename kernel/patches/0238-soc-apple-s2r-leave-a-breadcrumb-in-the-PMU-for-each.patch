@@ -1,0 +1,402 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 20:00:42 +0000
+Subject: [PATCH] soc: apple: s2r: leave a breadcrumb in the PMU for
+ each late sleep step
+
+A suspend-to-RAM that never returns leaves nothing behind: the journal
+is frozen with user space, and a forced power-off clears memory. The
+J604's first real trial ended that way, so nothing told where it
+stopped.
+
+Add a bring-up parameter, breadcrumb (default off). With it set, each
+late step writes its number (0x31-0x3a) to the PMU's boot stage byte:
+after the noirq suspend of every device, at the start of ->enter, after
+the coprocessors' last refusals, after their first and last stops, after
+the parked CPUs went down, after AFR off, right before the CPU and SoC
+clusters go off, at the end of the syscore resume and in ->finish. The
+byte keeps its value without the SoC, and after a reset the boot
+firmware records a non-zero stage as the failed-boot stage, which
+macsmc-reboot prints on the next boot. Nothing is written once the SoC
+clusters start going off, since the SPMI controller's power there is
+not proven. At the end of the cycle the byte is read back, its old value
+is put back, and the result is kept in the read-only parameter
+breadcrumb_trail.
+
+The nvmem cell API cannot do the writes: most steps run with IRQs off,
+and both the nvmem provider's regmap and the SPMI controller take
+mutexes. The byte is located through the PMU's nvmem layout (its
+boot-stage cell) and written through the SPMI device instead, and the
+Apple SPMI controller now accepts a command with IRQs off when it is
+parked for a firmware-driven sleep: it takes the FIFO only if it is
+free and polls for the reply without sleeping. With IRQs on nothing
+changes.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/soc/apple/apple-s2r.c        | 187 ++++++++++++++++++++++++++-
+ drivers/spmi/spmi-apple-controller.c |  40 +++++-
+ 2 files changed, 220 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index fe59f1ec59..46dbf3005a 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -58,6 +58,12 @@
+  * With wdt_from_enter it is armed already when ->enter starts, so that
+  * the coprocessor stops and the SoC steps are covered as well.
+  *
++ * For bring-up, the breadcrumb parameter makes each late step write its
++ * number to the PMU's boot stage byte, which keeps its value through a
++ * forced power-off and which the boot firmware records as the failed-boot
++ * stage after a reset (macsmc-reboot prints that on the next boot). See
++ * apple_s2r_crumb().
++ *
+  * CPM gating, AFR, the non-CPU SoC clusters and SIO are shared with s2idle
+  * and live in apple-sleep.
+  */
+@@ -82,6 +88,7 @@
+ #include <linux/regmap.h>
+ #include <linux/seq_file.h>
+ #include <linux/soc/apple/sleep.h>
++#include <linux/spmi.h>
+ #include <linux/suspend.h>
+ #include <linux/syscore_ops.h>
+ 
+@@ -248,6 +255,15 @@ struct apple_s2r {
+ 	u32 wdt_saved_ctl;
+ 	u32 wdt_saved_alarm;
+ 
++	/* Breadcrumb: PMU boot stage byte, and this cycle's writes */
++	struct spmi_device *crumb_dev;
++	u16 crumb_addr;
++	bool crumb_on;
++	u8 crumb_orig;
++	u8 crumb_trail[16];
++	unsigned int crumb_n;
++	unsigned int crumb_err;
++
+ 	struct syscore syscore;
+ 
+ 	/* The AP pins, which a deep sleep resets (apple,pinctrl) */
+@@ -558,6 +574,14 @@ static bool wdt_from_enter;
+ module_param(wdt_from_enter, bool, 0644);
+ MODULE_PARM_DESC(wdt_from_enter, "For bring-up: arm the wdt_timeout watchdog already when ->enter starts, so that a stop in the coprocessor stops or the SoC steps also ends in a reset; the finisher arms it again with a fresh count; needs wdt_timeout (default: off)");
+ 
++static bool breadcrumb;
++module_param(breadcrumb, bool, 0644);
++MODULE_PARM_DESC(breadcrumb, "For bring-up: during a suspend-to-RAM, write the number of each late step (0x31-0x3a) to the PMU boot stage byte, so that a sleep that never returns leaves its last step for the next boot; the original value is put back at the end of the cycle (default: off)");
++
++static char breadcrumb_trail[128];
++module_param_string(breadcrumb_trail, breadcrumb_trail, sizeof(breadcrumb_trail), 0444);
++MODULE_PARM_DESC(breadcrumb_trail, "Breadcrumb result of the last suspend-to-RAM cycle: steps written, write errors, value read back at the end, value put back");
++
+ static bool bringup_no_fw;
+ module_param(bringup_no_fw, bool, 0444);
+ MODULE_PARM_DESC(bringup_no_fw, "For bring-up without firmware warm boot support: register anyway, but only run suspend-to-RAM with abort_before set to a step before the clock generators (1-8), so the SoC never goes to sleep (default: off)");
+@@ -676,6 +700,123 @@ static void apple_s2r_sep_on(struct apple_s2r *s2r)
+ 	regmap_update_bits(s2r->sep, s2r->sep_reg, PS_MIN, 0);
+ }
+ 
++/*
++ * Breadcrumb steps, written to the PMU boot stage byte. Linux writes 0x30
++ * there at boot (macsmc-reboot) and 0 at a clean shutdown; the boot firmware
++ * uses values up to 0x2f for its own stages, so these follow 0x30.
++ */
++enum apple_s2r_crumb {
++	S2R_CRUMB_NOIRQ = 0x31,		/* ->prepare_late: devices noirq-suspended */
++	S2R_CRUMB_ENTER,		/* ->enter started */
++	S2R_CRUMB_COPROCS_OK,		/* last refusals of the coprocessors passed */
++	S2R_CRUMB_COPROCS_FIRST,	/* first coprocessor stops done */
++	S2R_CRUMB_COPROCS_LAST,		/* last coprocessor stops done */
++	S2R_CRUMB_PARKED,		/* parked CPUs powered down */
++	S2R_CRUMB_AFR,			/* CPU complex saved, CPM gated, AFR off */
++	S2R_CRUMB_POWER_DOWN,		/* next: CPU and SoC clusters off, SoC sleeps */
++	S2R_CRUMB_SYSCORE,		/* syscore resume done */
++	S2R_CRUMB_FINISH,		/* ->finish: noirq and early resume done */
++};
++
++/*
++ * Find the PMU boot stage byte: the boot-stage cell of the PMU's nvmem
++ * layout. The cell API cannot be used for the writes: its regmap and the
++ * SPMI controller take mutexes, and most steps run with IRQs off. The
++ * writes go to the same byte through the SPMI device, which the Apple
++ * controller accepts with IRQs off once it is parked for the sleep.
++ */
++static int apple_s2r_crumb_find(struct apple_s2r *s2r)
++{
++	struct device_node *pmic, *layout = NULL, *cell = NULL;
++	struct spmi_device *sdev = NULL;
++	u32 reg[2];
++	int ret = -ENODEV;
++
++	if (!IS_REACHABLE(CONFIG_SPMI))
++		return -EOPNOTSUPP;
++	if (s2r->crumb_dev)
++		return 0;
++
++	for_each_compatible_node(pmic, NULL, "apple,spmi-nvmem")
++		if (of_device_is_available(pmic))
++			break;
++	if (pmic)
++		layout = of_get_child_by_name(pmic, "nvmem-layout");
++	if (layout)
++		cell = of_get_child_by_name(layout, "boot-stage");
++	if (cell && !of_property_read_u32_array(cell, "reg", reg, 2) &&
++	    reg[0] <= U16_MAX && reg[1] == 1) {
++		sdev = spmi_find_device_by_of_node(pmic);
++		ret = sdev ? 0 : -EPROBE_DEFER;
++	}
++	if (!ret) {
++		/* The reference is kept: the PMU is never removed */
++		s2r->crumb_dev = sdev;
++		s2r->crumb_addr = reg[0];
++	}
++	of_node_put(cell);
++	of_node_put(layout);
++	of_node_put(pmic);
++	return ret;
++}
++
++/* Record @step; never sleeps, never prints */
++static void apple_s2r_crumb(struct apple_s2r *s2r, u8 step)
++{
++	if (!s2r->crumb_on)
++		return;
++	if (spmi_ext_register_writel(s2r->crumb_dev, s2r->crumb_addr, &step, 1))
++		s2r->crumb_err++;
++	else if (s2r->crumb_n < ARRAY_SIZE(s2r->crumb_trail))
++		s2r->crumb_trail[s2r->crumb_n++] = step;
++}
++
++/* ->begin: arm the breadcrumb for this cycle, keeping the byte's value */
++static void apple_s2r_crumb_begin(struct apple_s2r *s2r)
++{
++	int ret;
++
++	s2r->crumb_on = false;
++	s2r->crumb_n = 0;
++	s2r->crumb_err = 0;
++	if (!READ_ONCE(breadcrumb))
++		return;
++	ret = apple_s2r_crumb_find(s2r);
++	if (!ret)
++		ret = spmi_ext_register_readl(s2r->crumb_dev, s2r->crumb_addr,
++					      &s2r->crumb_orig, 1);
++	if (ret) {
++		dev_warn(s2r->dev, "breadcrumb: PMU boot stage byte not usable: %d\n", ret);
++		return;
++	}
++	s2r->crumb_on = true;
++}
++
++/* ->end: read the byte back, put the old value back, report */
++static void apple_s2r_crumb_end(struct apple_s2r *s2r)
++{
++	u8 last = 0, now = 0;
++	int len = 0, rd, wr, rb;
++	unsigned int i;
++
++	if (!s2r->crumb_on)
++		return;
++	s2r->crumb_on = false;
++	rd = spmi_ext_register_readl(s2r->crumb_dev, s2r->crumb_addr, &last, 1);
++	wr = spmi_ext_register_writel(s2r->crumb_dev, s2r->crumb_addr,
++				      &s2r->crumb_orig, 1);
++	rb = spmi_ext_register_readl(s2r->crumb_dev, s2r->crumb_addr, &now, 1);
++
++	len += scnprintf(breadcrumb_trail + len, sizeof(breadcrumb_trail) - len, "steps");
++	for (i = 0; i < s2r->crumb_n; i++)
++		len += scnprintf(breadcrumb_trail + len, sizeof(breadcrumb_trail) - len,
++				 " %02x", s2r->crumb_trail[i]);
++	scnprintf(breadcrumb_trail + len, sizeof(breadcrumb_trail) - len,
++		  " errors %u last %02x%s restored %02x%s", s2r->crumb_err, last,
++		  rd ? "(read failed)" : "", now, (wr || rb) ? "(failed)" : "");
++	dev_info(s2r->dev, "breadcrumb: %s\n", breadcrumb_trail);
++}
++
+ /* Make the watchdog reset the system if the resume path does not come back */
+ static void apple_s2r_wdt_arm(struct apple_s2r *s2r)
+ {
+@@ -872,6 +1013,7 @@ static int apple_s2r_enter(suspend_state_t state)
+ 		apple_s2r_wdt_take(s2r);
+ 		apple_s2r_wdt_arm(s2r);
+ 	}
++	apple_s2r_crumb(s2r, S2R_CRUMB_ENTER);
+ 
+ 	/* The coprocessors' last refusals, before anything that can't be undone */
+ 	ret = apple_s2r_coprocs_check(s2r);
+@@ -879,9 +1021,12 @@ static int apple_s2r_enter(suspend_state_t state)
+ 		s2r->failed_step = S2R_STEP_COPROCS;
+ 		goto fail;
+ 	}
++	apple_s2r_crumb(s2r, S2R_CRUMB_COPROCS_OK);
+ 	if (!READ_ONCE(abort_before)) {
+ 		apple_s2r_coprocs_stop(true);
++		apple_s2r_crumb(s2r, S2R_CRUMB_COPROCS_FIRST);
+ 		apple_s2r_coprocs_stop(false);
++		apple_s2r_crumb(s2r, S2R_CRUMB_COPROCS_LAST);
+ 	}
+ 
+ 	/* No printk from here on: the console may lose its clock */
+@@ -889,6 +1034,7 @@ static int apple_s2r_enter(suspend_state_t state)
+ 			     apple_cpu_park_power_down_all);
+ 	if (ret)
+ 		goto fail;
++	apple_s2r_crumb(s2r, S2R_CRUMB_PARKED);
+ 	ret = apple_s2r_step(s2r, S2R_STEP_ACC, S2R_DONE_ACC, apple_cpu_acc_save);
+ 	if (ret)
+ 		goto fail;
+@@ -898,6 +1044,14 @@ static int apple_s2r_enter(suspend_state_t state)
+ 	ret = apple_s2r_step(s2r, S2R_STEP_AFR, S2R_DONE_AFR, apple_sleep_afr_off);
+ 	if (ret)
+ 		goto fail;
++	apple_s2r_crumb(s2r, S2R_CRUMB_AFR);
++
++	/*
++	 * The last breadcrumb before the SoC power-down: past this point the
++	 * SPMI controller's own power is not proven, so nothing more is written
++	 * until the resume.
++	 */
++	apple_s2r_crumb(s2r, S2R_CRUMB_POWER_DOWN);
+ 
+ 	if (s2r->cluster_ps && !(skip & S2R_DONE_CPU_CLUSTERS)) {
+ 		s2r->done |= S2R_DONE_CPU_CLUSTERS;
+@@ -965,8 +1119,10 @@ static void apple_s2r_syscore_resume(void *data)
+ 		s2r->wdt_armed = false;
+ 	}
+ 
+-	if (!done)
++	if (!done) {
++		apple_s2r_crumb(s2r, S2R_CRUMB_SYSCORE);
+ 		return;
++	}
+ 
+ 	if (s2r->resumed)
+ 		apple_sleep_pmgr_wake();
+@@ -989,6 +1145,7 @@ static void apple_s2r_syscore_resume(void *data)
+ 		apple_sleep_afr_restore();
+ 	if (done & S2R_DONE_WAKE)
+ 		apple_sleep_ap_wake_restore();
++	apple_s2r_crumb(s2r, S2R_CRUMB_SYSCORE);
+ }
+ 
+ static const struct syscore_ops apple_s2r_syscore_ops = {
+@@ -1044,17 +1201,43 @@ static int apple_s2r_begin(suspend_state_t state)
+ 		return 0;
+ 	if (READ_ONCE(debug_begin_as_idle))
+ 		return 0;
+-	if (apple_s2r)
++	if (apple_s2r) {
+ 		apple_s2r_pins_save(apple_s2r);
++		apple_s2r_crumb_begin(apple_s2r);
++	}
+ 	pm_set_suspend_via_firmware();
+ 	return 0;
+ }
+ 
++/* After every device's noirq suspend */
++static int apple_s2r_prepare_late(void)
++{
++	if (apple_s2r)
++		apple_s2r_crumb(apple_s2r, S2R_CRUMB_NOIRQ);
++	return 0;
++}
++
++/* After the noirq and early resume of every device */
++static void apple_s2r_resume_finish(void)
++{
++	if (apple_s2r)
++		apple_s2r_crumb(apple_s2r, S2R_CRUMB_FINISH);
++}
++
++static void apple_s2r_resume_end(void)
++{
++	if (apple_s2r)
++		apple_s2r_crumb_end(apple_s2r);
++}
++
+ static const struct platform_suspend_ops apple_s2r_ops = {
+ 	.valid = suspend_valid_only_mem,
+ 	.begin = apple_s2r_begin,
++	.prepare_late = apple_s2r_prepare_late,
+ 	.enter = apple_s2r_enter,
+ 	.wake = apple_s2r_wake,
++	.finish = apple_s2r_resume_finish,
++	.end = apple_s2r_resume_end,
+ };
+ 
+ static void __iomem *apple_s2r_optional_reg(struct platform_device *pdev,
+diff --git a/drivers/spmi/spmi-apple-controller.c b/drivers/spmi/spmi-apple-controller.c
+index e655fad881..28a5b56170 100644
+--- a/drivers/spmi/spmi-apple-controller.c
++++ b/drivers/spmi/spmi-apple-controller.c
+@@ -168,7 +168,12 @@ static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
+ 	int ret;
+ 	u32 status;
+ 
+-	if (spmi->notify_irq) {
++	if (irqs_disabled()) {
++		/* Parked controller only, see spmi_raw_cmd() */
++		ret = readl_poll_timeout_atomic(spmi->regs + spmi->hw->status, status,
++						!(status & spmi->hw->rx_empty), 1,
++						REG_POLL_TIMEOUT_US);
++	} else if (spmi->notify_irq) {
+ 		ret = wait_for_completion_timeout(&spmi->fifo_rx,
+ 			usecs_to_jiffies(REG_POLL_TIMEOUT_US));
+ 		if (!ret)
+@@ -193,8 +198,8 @@ static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
+ 	return 0;
+ }
+ 
+-static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
+-			const u8 *buf_wr, size_t len_wr, u8 *buf_rd, size_t len_rd)
++static int __spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
++			  const u8 *buf_wr, size_t len_wr, u8 *buf_rd, size_t len_rd)
+ {
+ 	struct apple_spmi *spmi = spmi_controller_get_drvdata(ctrl);
+ 	u32 spmi_cmd = apple_spmi_pack_cmd(opc, sid, param);
+@@ -202,8 +207,6 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
+ 	size_t i = 0, j;
+ 	int ret;
+ 
+-	guard(mutex)(&spmi->fifo_lock);
+-
+ 	if (spmi->prev_fail) {
+ 		/* Do not consume a late reply as the reply to a new command. */
+ 		if (!spmi->hw->legacy_irqs)
+@@ -267,6 +270,33 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
+ 	return 0;
+ }
+ 
++/*
++ * With IRQs off (the last steps of a suspend-to-RAM, its syscore resume) a
++ * command must not sleep. It is then sent only if the FIFO is free and the
++ * controller is parked (no reply interrupt, see apple_spmi_suspend_noirq()),
++ * and its reply is polled for without sleeping. Otherwise -EBUSY.
++ */
++static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
++			const u8 *buf_wr, size_t len_wr, u8 *buf_rd, size_t len_rd)
++{
++	struct apple_spmi *spmi = spmi_controller_get_drvdata(ctrl);
++	int ret;
++
++	if (irqs_disabled()) {
++		if (!mutex_trylock(&spmi->fifo_lock))
++			return -EBUSY;
++		if (spmi->notify_irq) {
++			mutex_unlock(&spmi->fifo_lock);
++			return -EBUSY;
++		}
++	} else {
++		mutex_lock(&spmi->fifo_lock);
++	}
++	ret = __spmi_raw_cmd(ctrl, opc, sid, param, buf_wr, len_wr, buf_rd, len_rd);
++	mutex_unlock(&spmi->fifo_lock);
++	return ret;
++}
++
+ /* Send a raw command with 1..16 input data frames */
+ static int spmi_raw_cmd_input(struct spmi_controller *ctrl, u8 opc, u8 sid,
+ 			 u16 param, u8 *buf, size_t len)
