@@ -18,6 +18,8 @@ New in 1.808: 0238 (`soc: apple: s2r: leave a breadcrumb in the PMU for each lat
 
 New in 1.809: 0241 (`soc: apple: s2r: send the enclave no sleep request in a run set to abort`), 0242 (`soc: apple: s2r: keep the bring-up watchdog armed through resume`), 0243 (`soc: apple: s2r: refuse an abort_before that no step reaches`), 0244 (`soc: apple: s2r: breadcrumb the abort, the resume entry and the end of a sleep`), 0245 (`cpufreq: apple-soc: wait for a transition before an idle drop by default`).
 
+New in 1.810: 0246 (`soc: apple: s2r: let one bring-up abort still tell the enclave`).
+
 | 1.736 | 1.800 | Subject |
 |---|---|---|
 | 0001 | 0001 | dt-bindings: pci: apple,pcie: Describe the three T8132 root ports |
