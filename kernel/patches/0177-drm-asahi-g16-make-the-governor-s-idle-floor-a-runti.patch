@@ -1,0 +1,261 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 9 Nov 2026 23:40:34 +0000
+Subject: [PATCH] drm/asahi: g16: make the governor's idle floor a
+ runtime parameter
+
+The firmware runs at the published performance state, busy or not, so
+the governor's lowest state is where an idle GPU sits. It is S3, from
+J713 measurements; on the J604 the idle GPU rail stays at about 0.32 W
+whatever idle core power-off and the AGX vote are set to, and how much
+of that the floor state costs has not been measured.
+
+Add asahi.g16_idle_floor (1-9, default 3, writable by root at run
+time), so one boot can compare the idle rail and the desktop's frame
+pacing per floor state. The governor takes a new value at its next
+window; an idle engine above the floor is polled down to it as before.
+The default is unchanged.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/params.rs       | 101 ++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/power.rs        |   1 +
+ drivers/gpu/drm/asahi/g16/power/policy.rs |  44 +++++++++-
+ 3 files changed, 142 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index ca7bd0710a..a71a611b72 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -13,6 +13,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
+ 
+ use kernel::{prelude::*, uapi};
+ 
++use super::power::policy::{FLOOR, PSTATE_MAX};
+ use super::{hw, Gpu, GPU_GENERATION};
+ use crate::module_parameters;
+ 
+@@ -192,6 +193,106 @@ static IDLE_POWER_OFF_PARMTYPE: [u8; BUILTIN_PARMTYPE.len()] = modinfo(BUILTIN_P
+ #[used(compiler)]
+ static IDLE_POWER_OFF_PARM: [u8; BUILTIN_PARM.len()] = modinfo(BUILTIN_PARM);
+ 
++/// Storage of `asahi.g16_idle_floor`, always in 1..=[`PSTATE_MAX`].
++static IDLE_FLOOR: AtomicU32 = AtomicU32::new(FLOOR);
++
++/// Lowest performance state the utilization governor publishes, idle or lightly loaded.
++///
++/// The firmware runs at the published state, busy or not, so this is the state an idle GPU
++/// sits in. The default, [`FLOOR`] (S3), comes from J713 measurements; on the J604 the idle
++/// GPU rail has not been measured per state yet. Writable by root at run time; the governor
++/// takes a new value at its next window, and an idle engine is polled down to it.
++pub(crate) fn idle_floor() -> u32 {
++    IDLE_FLOOR.load(Ordering::Relaxed).clamp(1, PSTATE_MAX)
++}
++
++/// `set` of `asahi.g16_idle_floor`: a decimal state, clamped to 1..=[`PSTATE_MAX`].
++///
++/// # Safety
++///
++/// Called by the module-parameter core with `val` NULL or a NUL-terminated string.
++unsafe extern "C" fn idle_floor_set(
++    val: *const c_char,
++    _kp: *const kernel::bindings::kernel_param,
++) -> c_int {
++    if val.is_null() {
++        return EINVAL.to_errno();
++    }
++    // SAFETY: `val` is a NUL-terminated string per the function contract.
++    let Ok(text) = unsafe { core::ffi::CStr::from_ptr(val) }.to_str() else {
++        return EINVAL.to_errno();
++    };
++    let Ok(state) = text.trim().parse::<u32>() else {
++        return EINVAL.to_errno();
++    };
++    IDLE_FLOOR.store(state.clamp(1, PSTATE_MAX), Ordering::Relaxed);
++    0
++}
++
++/// `get` of `asahi.g16_idle_floor`.
++///
++/// # Safety
++///
++/// `buffer` is the module-parameter core's PAGE_SIZE output buffer.
++unsafe extern "C" fn idle_floor_get(
++    buffer: *mut c_char,
++    _kp: *const kernel::bindings::kernel_param,
++) -> c_int {
++    let state = idle_floor() as u8;
++    // SAFETY: the buffer holds PAGE_SIZE bytes; two are written. The core appends the newline.
++    unsafe {
++        *buffer.cast::<u8>() = b'0' + state;
++        *buffer.cast::<u8>().add(1) = 0;
++    }
++    1
++}
++
++static IDLE_FLOOR_OPS: kernel::bindings::kernel_param_ops = kernel::bindings::kernel_param_ops {
++    flags: 0,
++    set: Some(idle_floor_set),
++    get: Some(idle_floor_get),
++    free: None,
++};
++
++#[link_section = "__param"]
++#[used(compiler)]
++static IDLE_FLOOR_PARAM: kernel::module_param::KernelParam =
++    kernel::module_param::KernelParam::new(kernel::bindings::kernel_param {
++        name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
++            kernel::c_str!("g16_idle_floor")
++        } else {
++            kernel::c_str!("asahi.g16_idle_floor")
++        }),
++        // As for `g16_idle_power_off`: the address of `__this_module`, without a reference.
++        #[cfg(MODULE)]
++        mod_: (&raw const kernel::bindings::__this_module).cast_mut(),
++        #[cfg(not(MODULE))]
++        mod_: core::ptr::null_mut(),
++        ops: core::ptr::from_ref(&IDLE_FLOOR_OPS),
++        perm: 0o644,
++        level: -1,
++        flags: 0,
++        __bindgen_anon_1: kernel::bindings::kernel_param__bindgen_ty_1 {
++            arg: core::ptr::from_ref(&IDLE_FLOOR).cast_mut().cast(),
++        },
++    });
++
++#[cfg(MODULE)]
++const FLOOR_PARMTYPE: &[u8] = b"parmtype=g16_idle_floor:u32\0";
++#[cfg(MODULE)]
++const FLOOR_PARM: &[u8] = b"parm=g16_idle_floor:G16: lowest governed performance state, 1-9 (default 3; runtime 0644)\0";
++#[cfg(not(MODULE))]
++const FLOOR_PARMTYPE: &[u8] = b"asahi.parmtype=g16_idle_floor:u32\0";
++#[cfg(not(MODULE))]
++const FLOOR_PARM: &[u8] = b"asahi.parm=g16_idle_floor:G16: lowest governed performance state, 1-9 (default 3; runtime 0644)\0";
++
++#[link_section = ".modinfo"]
++#[used(compiler)]
++static IDLE_FLOOR_PARMTYPE: [u8; FLOOR_PARMTYPE.len()] = modinfo(FLOOR_PARMTYPE);
++#[link_section = ".modinfo"]
++#[used(compiler)]
++static IDLE_FLOOR_PARM: [u8; FLOOR_PARM.len()] = modinfo(FLOOR_PARM);
++
+ /// Fragment-only dependency publication has not been qualified on this backend.
+ pub(crate) fn early_tiling() -> bool {
+     false
+diff --git a/drivers/gpu/drm/asahi/g16/power.rs b/drivers/gpu/drm/asahi/g16/power.rs
+index f761ab6fdb..e40692ccf0 100644
+--- a/drivers/gpu/drm/asahi/g16/power.rs
++++ b/drivers/gpu/drm/asahi/g16/power.rs
+@@ -275,6 +275,7 @@ impl Firmware {
+         self.service_idle_power_off()?;
+         let now = now_ns();
+         let (limit, decision) = self.power.ceiling(now);
++        self.power.utilization.set_floor(params::idle_floor());
+         let target = self
+             .power
+             .utilization
+diff --git a/drivers/gpu/drm/asahi/g16/power/policy.rs b/drivers/gpu/drm/asahi/g16/power/policy.rs
+index 0d127b8a5f..d7f18479d3 100644
+--- a/drivers/gpu/drm/asahi/g16/power/policy.rs
++++ b/drivers/gpu/drm/asahi/g16/power/policy.rs
+@@ -53,19 +53,26 @@ pub(crate) fn smooth(average: u32, util: u32, window: u64) -> u32 {
+ /// The state to request from the `current` published one: up on the last
+ /// window's utilization `util`, to the top state under heavy load, and down
+ /// on the smoothed `average`, to the floor when idle.
++#[cfg(test)]
+ pub(crate) fn demand(current: u32, util: u32, average: u32) -> u32 {
++    demand_floor(current, util, average, FLOOR)
++}
++
++/// [`demand`] with the lowest state `floor` (1..=[`PSTATE_MAX`]) in place of [`FLOOR`].
++pub(crate) fn demand_floor(current: u32, util: u32, average: u32, floor: u32) -> u32 {
++    let floor = floor.clamp(1, PSTATE_MAX);
+     let next = if util >= 70 {
+         PSTATE_MAX
+     } else if util >= 40 {
+         current.saturating_add(1)
+     } else if average < 10 {
+-        FLOOR
++        floor
+     } else if average < 25 {
+         current.saturating_sub(1)
+     } else {
+         current
+     };
+-    next.clamp(FLOOR, PSTATE_MAX)
++    next.clamp(floor, PSTATE_MAX)
+ }
+ 
+ /// Busy-time accounting over the governor's windows. The engine reports each
+@@ -77,6 +84,8 @@ pub(crate) struct Governor {
+     window_ns: u64,
+     busy_since: Option<u64>,
+     busy_ns: u64,
++    /// The lowest state to request (`asahi.g16_idle_floor`).
++    floor: u32,
+ }
+ 
+ impl Governor {
+@@ -87,9 +96,15 @@ impl Governor {
+             window_ns: 0,
+             busy_since: None,
+             busy_ns: 0,
++            floor: FLOOR,
+         }
+     }
+ 
++    /// Sets the lowest state to request, clamped to 1..=[`PSTATE_MAX`].
++    pub(crate) fn set_floor(&mut self, floor: u32) {
++        self.floor = floor.clamp(1, PSTATE_MAX);
++    }
++
+     /// The engine published work; it stays busy until [`Governor::idle`].
+     pub(crate) fn busy(&mut self, now: u64) {
+         self.busy_since.get_or_insert(now);
+@@ -105,7 +120,7 @@ impl Governor {
+     /// Whether an idle engine still has a state above the floor to give back.
+     /// Its poll comes back once a window while this holds.
+     pub(crate) fn decaying(&self) -> bool {
+-        self.busy_since.is_none() && self.demand > FLOOR
++        self.busy_since.is_none() && self.demand > self.floor
+     }
+ 
+     /// Closes the window once it is due and returns the state to publish
+@@ -123,7 +138,7 @@ impl Governor {
+             }
+             let util = utilization(self.busy_ns, window);
+             self.average = smooth(self.average, util, window);
+-            self.demand = demand(self.demand.min(limit), util, self.average);
++            self.demand = demand_floor(self.demand.min(limit), util, self.average, self.floor);
+             self.window_ns = now;
+             self.busy_ns = 0;
+         }
+@@ -135,6 +150,27 @@ impl Governor {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn a_lower_idle_floor_is_reached_and_kept_in_range() {
++        assert_eq!(demand_floor(PSTATE_MAX, 0, 5, 1), 1);
++        assert_eq!(demand_floor(2, 20, 20, 1), 1);
++        assert_eq!(demand_floor(1, 100, 0, 1), PSTATE_MAX);
++        assert_eq!(demand_floor(5, 0, 0, 0), 1);
++        assert_eq!(demand_floor(5, 0, 0, 42), PSTATE_MAX);
++        let mut g = Governor::new();
++        g.set_floor(1);
++        let w = WINDOW_NS;
++        let mut now = 1_000_000_000;
++        for _ in 0..8 {
++            now += w;
++            g.govern(now, PSTATE_MAX, false);
++        }
++        assert_eq!(g.govern(now + w, PSTATE_MAX, false), 1);
++        assert!(!g.decaying());
++        g.set_floor(3);
++        assert_eq!(g.govern(now + 2 * w, PSTATE_MAX, false), 3);
++    }
++
+     #[test]
+     fn provider_sampling_is_independent_of_completion_polling() {
+         assert!(read_due(None, 0));

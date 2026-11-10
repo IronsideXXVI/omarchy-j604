@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 9 Nov 2026 23:55:19 +0000
+Subject: [PATCH] phy: apple: atc: add a test switch for DP Alt Mode
+ pin assignment D on T8132
+
+USB-C monitors and docks with a USB hub usually take pin assignment D:
+two DP lanes beside USB3. On T8132 the PHY already runs that mode. For
+USB3 it sets up the lane mode and crossbar words of the mode table,
+with the DP pair, applies the AUX calibration and starts the common
+block. But the DP PHY refuses DCP's activate and link rate calls in
+that mode, and the display fabric does not route the display, so such
+a monitor gets USB and no picture.
+
+Add t8132_dp_alt_d, off by default. When it is set, the DP PHY takes
+activate and deactivate in USB3+DP mode as it does in DP mode. It sets
+the link rate and drive levels through the T8122 sequence, which
+already works per lane pair from the mode table. It reports that it
+runs two lanes beside USB3 (apple_atc_dp_alt_lanes() returns 2), and
+the fabric then routes pin assignment D. The switch is read when the
+display side asks, so a test can set it and replug. With it off,
+nothing changes.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/gpu/drm/apple/dcp-fabric-core.c |  5 ++--
+ drivers/gpu/drm/apple/dcp-fabric-test.c |  3 +++
+ drivers/gpu/drm/apple/dcp-fabric.c      |  2 +-
+ drivers/phy/apple/atc.c                 | 32 +++++++++++++++++++++++--
+ 4 files changed, 37 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-fabric-core.c b/drivers/gpu/drm/apple/dcp-fabric-core.c
+index 154d74e8ac..4d49f98cea 100644
+--- a/drivers/gpu/drm/apple/dcp-fabric-core.c
++++ b/drivers/gpu/drm/apple/dcp-fabric-core.c
+@@ -560,8 +560,9 @@ enum dcp_fabric_t8132_dp_alt dcp_fabric_t8132_dp_alt(int phy_lanes, bool four_la
+ {
+ 	if (phy_lanes <= 0)
+ 		return DCP_FABRIC_T8132_DP_ALT_NO_PHY;
+-	return four_lanes ? DCP_FABRIC_T8132_DP_ALT_ROUTE :
+-			    DCP_FABRIC_T8132_DP_ALT_TWO_LANES;
++	/* @phy_lanes 2: the PHY also runs two lanes beside USB3 (pin assignment D). */
++	return four_lanes || phy_lanes >= 2 ? DCP_FABRIC_T8132_DP_ALT_ROUTE :
++					      DCP_FABRIC_T8132_DP_ALT_TWO_LANES;
+ }
+ EXPORT_SYMBOL_GPL(dcp_fabric_t8132_dp_alt);
+ 
+diff --git a/drivers/gpu/drm/apple/dcp-fabric-test.c b/drivers/gpu/drm/apple/dcp-fabric-test.c
+index 9fc1a8fad0..e9ea420d4d 100644
+--- a/drivers/gpu/drm/apple/dcp-fabric-test.c
++++ b/drivers/gpu/drm/apple/dcp-fabric-test.c
+@@ -499,6 +499,9 @@ static void fabric_scenario_test(struct kunit *test)
+ 		/* Pin assignment D with a calibrated PHY: two lanes, not run. */
+ 		KUNIT_EXPECT_EQ(test, dcp_fabric_t8132_dp_alt(1, false),
+ 				DCP_FABRIC_T8132_DP_ALT_TWO_LANES);
++		/* Pin assignment D on a PHY that runs two lanes beside USB3: routed. */
++		KUNIT_EXPECT_EQ(test, dcp_fabric_t8132_dp_alt(2, false),
++				DCP_FABRIC_T8132_DP_ALT_ROUTE);
+ 		/* No calibration, no PHY module, not an ATC DP PHY: not routed. */
+ 		KUNIT_EXPECT_EQ(test, dcp_fabric_t8132_dp_alt(0, true),
+ 				DCP_FABRIC_T8132_DP_ALT_NO_PHY);
+diff --git a/drivers/gpu/drm/apple/dcp-fabric.c b/drivers/gpu/drm/apple/dcp-fabric.c
+index 2f57372187..82e67cfaa4 100644
+--- a/drivers/gpu/drm/apple/dcp-fabric.c
++++ b/drivers/gpu/drm/apple/dcp-fabric.c
+@@ -1957,7 +1957,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
+ 		break;
+ 	case DCP_FABRIC_T8132_DP_ALT_TWO_LANES:
+ 		dev_info_once(route->dcp->dev,
+-			      "DP alt mode display not routed: pin assignment D (two lanes beside USB3) is not run on T8132\n");
++			      "DP alt mode display not routed: pin assignment D (two lanes beside USB3) is not run on T8132 (phy_apple_atc.t8132_dp_alt_d=1 tries it)\n");
+ 		port->applied_valid = true;
+ 		return 0;
+ 	case DCP_FABRIC_T8132_DP_ALT_NO_PHY:
+diff --git a/drivers/phy/apple/atc.c b/drivers/phy/apple/atc.c
+index 6c484131db..9a3d6195ca 100644
+--- a/drivers/phy/apple/atc.c
++++ b/drivers/phy/apple/atc.c
+@@ -1445,6 +1445,26 @@ module_param(t8132_usb4_pipe, bool, 0644);
+ MODULE_PARM_DESC(t8132_usb4_pipe,
+ 		 "T8132: route the PIPE to the USB4 side in CIO mode for tunnelled USB3 (default: N; experimental)");
+ 
++/*
++ * Test switch for DP Alt Mode pin assignment D on T8132: two DP lanes beside
++ * USB3. The PHY already runs that mode for USB3 with the DP pair and AUX set
++ * up (atcphy_configure_t8132()); the switch lets the DP PHY carry the link on
++ * that pair, through the T8122 rate and drive sequence that works per lane
++ * pair. Read when the display side asks, so it applies from the next
++ * connection. Off by default.
++ */
++static bool t8132_dp_alt_d;
++module_param(t8132_dp_alt_d, bool, 0644);
++MODULE_PARM_DESC(t8132_dp_alt_d,
++		 "T8132: run DP Alt Mode pin assignment D (two DP lanes beside USB3) (default: N; experimental)");
++
++/* Does this T8132 Type-C PHY take pin assignment D, by the test switch? */
++static bool atcphy_t8132_dp_alt_d(const struct apple_atcphy *atcphy)
++{
++	return READ_ONCE(t8132_dp_alt_d) && !atcphy->dp_only &&
++	       atcphy->hw->gen == ATCPHY_GENERATION_T8132;
++}
++
+ /*
+  * The PIPE backend a mode needs. T8132 carries no USB3 over USB4 yet, so its
+  * PIPE stays on the dummy backend in CIO, as in a mode without USB3. Routed to
+@@ -4729,6 +4749,10 @@ static int atcphy_dpphy_set_mode_t8132(struct apple_atcphy *atcphy, enum phy_mod
+ 	    (atcphy->mode == APPLE_ATCPHY_MODE_USB4 || atcphy->mode == APPLE_ATCPHY_MODE_TBT ||
+ 	     atcphy->mode == APPLE_ATCPHY_MODE_DP))
+ 		return 0;
++	/* Pin assignment D: the DP pair was set up with USB3 by the mux. */
++	if ((mode == PHY_MODE_DP || mode == PHY_MODE_INVALID) &&
++	    atcphy->mode == APPLE_ATCPHY_MODE_USB3_DP && atcphy_t8132_dp_alt_d(atcphy))
++		return 0;
+ 	return -EOPNOTSUPP;
+ }
+ 
+@@ -4779,7 +4803,8 @@ static int atcphy_dpphy_configure_t8122(struct apple_atcphy *atcphy,
+ 
+ 	/* A T8132 Type-C port in a tunnel sets its rate through its own call. */
+ 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && !atcphy->dp_only &&
+-	    atcphy->mode != APPLE_ATCPHY_MODE_DP)
++	    atcphy->mode != APPLE_ATCPHY_MODE_DP &&
++	    !(atcphy->mode == APPLE_ATCPHY_MODE_USB3_DP && atcphy_t8132_dp_alt_d(atcphy)))
+ 		return -EOPNOTSUPP;
+ 	if (opts->set_lanes)
+ 		return -EINVAL;
+@@ -5053,7 +5078,10 @@ int apple_atc_dp_alt_lanes(struct phy *phy)
+ 	atcphy = phy_get_drvdata(phy);
+ 	if (atcphy->hw->gen != ATCPHY_GENERATION_T8132)
+ 		return 1;
+-	return atcphy_t8132_dp_lanes(atcphy);
++	if (!atcphy_t8132_dp_lanes(atcphy))
++		return 0;
++	/* 2: two lanes beside USB3 as well (pin assignment D), by the test switch */
++	return atcphy_t8132_dp_alt_d(atcphy) ? 2 : 1;
+ }
+ EXPORT_SYMBOL_GPL(apple_atc_dp_alt_lanes);
+ 

@@ -21,21 +21,23 @@ Changes go to the official repositories as reviewed pull requests, one topic at 
 
 Only what's measured on the machine is listed as working. The full per-block status, with labels and dates, is in [`STATUS.md`](STATUS.md).
 
-| Area | Status (2026-11-09) |
+| Area | Status (2026-11-10) |
 | --- | --- |
 | Boot chain (m1n1, U-Boot, Limine, disk unlock), storage, keyboard and trackpad, USB, battery, lid | Working |
 | CPU | Working: 10 cores at full clocks (performance 4.46 GHz, efficiency 2.89 GHz), cpufreq and cpuidle |
-| GPU | Accelerated (OpenGL 4.6 / Vulkan 1.4). GPU idle power in progress |
+| GPU | Accelerated (OpenGL 4.6 / Vulkan 1.4); idle GPU power 0.041 W on 1.710 |
 | Internal display | 3024x1964 at 120 Hz, scale 2, 10-bit (XRGB2101010) and Display P3 as package defaults, with no user setting. The panel link is most likely 8 bits per channel with dithering (not yet verified). VRR stays off, as in upstream Omarchy |
 | Glassy bar | Stock holds about 59 fps on this 120 Hz panel. 119 fps needs the change in [omacom/omarchy#18176](https://github.com/omacom/omarchy/pull/18176), which is not carried here |
+| Smoothness at 120 Hz | Not fixed yet: full-window animations run at about 90 fps and video judders in Chromium; ordinary scrolling holds 120 fps (see `STATUS.md`) |
+| Camera | Working, untuned: 1080p and 720p capture, seen by stock apps and Chromium; sensor tuning not installed yet |
 | Wi-Fi and Bluetooth | Working |
 | Audio | Speakers (with speaker protection) and headphone jack working; microphones in progress |
 | Media | Hardware decode (H.264, HEVC, VP9) working in stock mpv through VA-API, with kernel 1.704 and the VA-API driver alias (checked at 1080p, and 4K for H.264; AV1 and 10-bit not yet); video encode in progress |
 | Touch ID | Working for sudo, polkit and the lock screen |
 | Keyboard backlight | Working with the local `omarchy-dev` / `omarchy-settings-dev` builds |
-| Neural Engine | Driver bound; not powered up on the T8132 yet (the driver stops before power-up by design), no `/dev/accel` |
-| Power | Suspend (s2idle) on lid close working. Idle on AC is about 10.5 W with the stock edge `performance` power profile (see `STATUS.md`). Deep sleep in progress |
-| In progress | GPU idle power, deep sleep, camera, microphones, Thunderbolt/USB4, external displays and HDMI |
+| Neural Engine | Powers up (`/dev/accel/accel0`) and runs programs from the official compiler bit-exact, measured with a driver option on 1.704 and 1.708; 1.710 powers it up by default (not yet checked on 1.710) |
+| Power | Suspend (s2idle) working again since 1.710 (it was refused on 1.705-1.708). Idle on AC is about 10.5 W with the stock edge `performance` power profile (see `STATUS.md`). Deep sleep in progress |
+| In progress | Deep sleep, 120 Hz smoothness, camera tuning, Neural Engine, microphones, Thunderbolt/USB4, external displays and HDMI |
 
 ## Install
 
@@ -55,15 +57,15 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`6ff31cbfa2`), 176 patches | `1.706` |
+| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`6ff31cbfa2`), 194 patches | `1.711` |
 | `m1n1-aurora` | 1.6.1.aurora22, omacom/m1n1 (`bc79acc434`), 37 patches | `1.608` |
 | `uboot-aurora` | 2026.07.aurora6, aurora-silicon/u-boot (`d30213eadc`) | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261031, omacom/mesa (`a196911147`) | `1.8133` |
 | `alsa-ucm-conf-aurora` | 10.aurora3, aurora-silicon/alsa-ucm-conf-asahi (`b9b2d0c82c`) | `1.605` |
 | `aurora-audio` | 4.1.aurora3, aurora-silicon/asahi-audio (`06aec67a8a`) | `3.607` |
 | `speakersafetyd` | 2.0.1, AsahiLinux/speakersafetyd | `1.605` |
-| `asahi-fwextract` | 0.9.2, asahi-alarm/asahi-alarm-installer | `1.608` |
-| `asahi-scripts` | 20261023, asahi-alarm/asahi-scripts | `1.1` |
+| `asahi-fwextract` | 0.9.2, asahi-alarm/asahi-alarm-installer | `1.609` |
+| `asahi-scripts` | 20261023, asahi-alarm/asahi-scripts | `1.2` |
 | `plymouth` | 26.134.222, Plymouth (Arch Linux recipe) | `3.604` |
 | `libfprint-git` | 1:1.94.100.r10.g6f9479c, libfprint (`6f9479c3d5`), omacom recipe | `5.604` (accepts Secure Enclave interface v4 and v5) |
 | `libva-v4l2_request-avd` | 1.3.r11.r169.gc653eaa, omacom/libva-v4l2_request (`c653eaa623`), omacom recipe | `1.604` (adds the `aurora_drv_video.so` alias; the same change is open as [omacom/omarchy-pkgs#2375](https://github.com/omacom/omarchy-pkgs/pull/2375), and its official `-2` will replace this build) |
@@ -74,7 +76,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 Also installed, unchanged from the official repositories: Hyprland 0.57.1 and the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
-Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.706 changed over 1.617).
+Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.711 changed over 1.617).
 
 ## Layout
 
@@ -87,10 +89,10 @@ Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only
 | `alsa-ucm-conf-aurora/` | J604 headphone jack, microphone and speaker UCM | aurora-silicon/alsa-ucm-conf-asahi | BSD-3-Clause |
 | `aurora-audio/` | J604 speaker graph and microphone, plus upstream audio fixes | aurora-silicon/asahi-audio | MIT |
 | `speakersafetyd/` | J604 speaker protection profile | AsahiLinux/speakersafetyd | MIT |
-| `asahi-fwextract/` | camera tuning firmware extraction for the J604 | asahi-alarm/asahi-alarm-installer | MIT |
+| `asahi-fwextract/` | camera tuning firmware extraction for the J604; keeps the BCM4388 rev C2 Wi-Fi firmware | asahi-alarm/asahi-alarm-installer | MIT |
 | `libfprint-git/` | Touch ID on the 7.3 kernel: the Apple Secure Enclave driver accepts biometric interface v4 and v5 (two upstream Aurora patches as one) | libfprint (omacom recipe) | LGPL-2.1-or-later |
 | `libva-v4l2_request-avd/` | VA-API on the 7.3 kernel: the recipe adds the `aurora_drv_video.so` alias (upstream aurora-silicon/alarm-aurora aedcf240ca91). The change is in the recipe only, so `patches/` holds the recipe diff | omacom/omarchy-pkgs recipe (omacom/libva-v4l2_request source unchanged) | GPL-3.0-or-later |
-| `asahi-scripts/` | adds the `apple_nvmem_spmi` module to the initramfs | asahi-alarm/asahi-scripts | MIT |
+| `asahi-scripts/` | adds the `apple_nvmem_spmi` and `dwc3-apple` modules to the initramfs | asahi-alarm/asahi-scripts | MIT |
 | `plymouth/` | SimpleDRM recognized by driver name, so the disk unlock prompt opens on the panel | Plymouth | GPL-2.0 |
 | `omarchy-mac-boot/` | boot package fixes for the J604, and `update-m1n1` builds `boot.bin` with only the running Mac's own device tree | omacom/omarchy-mac-pkgs | MIT |
 | `omarchy-mac/` | keyboard backlight idle timeout, Apple F-row key names, Touch ID on the J604, the 14-inch MacBook Pro panel line (10-bit, Display P3) | omacom/omarchy-mac-pkgs | MIT |

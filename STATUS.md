@@ -23,11 +23,11 @@ MEASURED 2026-11-09 (`pacman -Q` and `uname -r` on the machine):
 | Channel | Omarchy **edge** since 2026-11-09 (official `omarchy-channel-set edge`) | official |
 | Desktop | `omarchy-dev` 4.0.0.r7641.gf97d3e7, local pkgrel `1.1` (stock edge + the keyboard-backlight series, 4 patches); `omarchy-settings-dev` same version, local `1.1` (the same 4 patches + the built-in panel defaults, 1 patch); Hyprland 0.57.1, stock | official recipes + 4 / 5 patches |
 | Mac add-on | `omarchy-mac` 0.2.3, local `2.12`: keyboard-backlight idle default, Apple F-row key names, Touch ID eligibility, the 14-inch MacBook Pro panel line (10-bit, Display P3) | official recipe + 4 patches |
-| Kernel | `linux-aurora` 7.3.0.aurora1, local `1.706` (176 patches on aurora-silicon/linux `integration/aurora` `6ff31cbfa2`: 1.705 plus 0176), running `7.3.0-1-1.706-ARCH` since 2026-11-10 | official recipe (source moved to the 7.3 base) + J604 series |
-| Boot chain | `m1n1-aurora` 1.6.1.aurora22 (local `1.608`), `uboot-aurora` 2026.07.aurora6 (local `1.604`), `omarchy-mac-boot` 20261104 (local `1.616`), `plymouth` 26.134.222 (local `3.604`), `asahi-scripts` 20261023 (local `1.1`); boot image (`boot.bin`): m1n1 + the J604 device tree (the same in 1.703 and 1.704) + U-Boot, 4,700,171 bytes | official recipes + J604 patches |
+| Kernel | `linux-aurora` 7.3.0.aurora1, local `1.711` (194 patches on aurora-silicon/linux `integration/aurora` `6ff31cbfa2`: 1.706 plus 0177-0194), running `7.3.0-1-1.711-ARCH` since 2026-11-10 | official recipe (source moved to the 7.3 base) + J604 series |
+| Boot chain | `m1n1-aurora` 1.6.1.aurora22 (local `1.608`), `uboot-aurora` 2026.07.aurora6 (local `1.604`), `omarchy-mac-boot` 20261104 (local `1.616`), `plymouth` 26.134.222 (local `3.604`), `asahi-scripts` 20261023 (local `1.2`); boot image (`boot.bin`): m1n1 + the 1.711 J604 device tree + U-Boot, 4,700,195 bytes | official recipes + J604 patches |
 | Graphics | `mesa-aurora` / `vulkan-aurora` with the T8132 GPU admitted and the 7.3 kernel's "aurora" driver name accepted (local `1.8133`) | official recipe + 2 patches |
 | Audio | `alsa-ucm-conf-aurora` (local `1.605`), `aurora-audio` (local `3.607`), `speakersafetyd` (local `1.605`) with J604 profiles | official recipes + J604 files |
-| Firmware | `asahi-fwextract` 0.9.2 (local `1.608`): extra camera tuning files | official recipe + 1 patch |
+| Firmware | `asahi-fwextract` 0.9.2 (local `1.609`): extra camera tuning files, and keeps the M4 (BCM4388 rev C2) Wi-Fi firmware when firmware is re-extracted | official recipe + 2 patches |
 | Touch ID library | `libfprint-git` 1:1.94.100.r10.g6f9479c, local `5.604`: accepts Secure Enclave biometric interface v4 and v5 | official recipe + 1 patch |
 | Video decode driver | `libva-v4l2_request-avd` 1.3.r11.r169.gc653eaa, local `1.604`: adds the `aurora_drv_video.so` alias, so VA-API finds the decoder on the 7.3 kernel (until omacom/omarchy-pkgs#2375 ships) | official recipe + 1 recipe line |
 | Neural Engine userland | `omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`: official edge builds, not carried by us | official |
@@ -36,7 +36,7 @@ Kernel 7.3 gate (MEASURED 2026-11-09, first boot of 1.703 with its J604 device t
 
 Kernel 1.704 gate (MEASURED 2026-11-09, first boot of 1.704, one reboot): Hyprland running; no failed units; no driver probe failures; no firmware load failures; PCIe links up with no failures. The install left `boot.bin` unchanged (same J604 device tree as 1.703).
 
-## What changed with kernel 7.3 (1.703 to 1.706, over 1.617)
+## What changed with kernel 7.3 (1.703 to 1.711, over 1.617)
 
 CODE unless a line says otherwise.
 
@@ -53,8 +53,16 @@ CODE unless a line says otherwise.
 - **0165-0167** (1.705): the suspend-to-RAM driver is now offered whenever the boot firmware publishes its mailbox and reset vector and every core's reset vector is locked to it; suspend-to-idle stays the default (a new `suspend_set_ops_keep_s2idle()` helper). On 1.705 `/sys/power/mem_sleep` reads `[s2idle] deep` (MEASURED 2026-11-09). A real deep sleep is not possible yet: the GPU driver refuses any sleep that powers the SoC down once its firmware has run, because the M4 GPU has no firmware stop and warm restart yet (CODE).
 - **0168-0175** (1.705): eight USB4/Thunderbolt and USB-C PD fixes from aurora-silicon/linux `integration/aurora` that landed after our base and apply to the M4 (NHI started only with its DART, XDomain teardown and DMA-path checks, DROM entries for missing ports, the TI PD controller's LDCM startup and removal, a port restart when the peer link is lost, the USB4 router taken again after a rebind). Kept with their upstream authors. They act only when a USB4/Thunderbolt partner is plugged in; nothing plugged in behaves as on 1.704 (MEASURED 2026-11-09, gate).
 - **0176** (1.706): a module parameter of the USB-C PHY driver (`t8132_usb4_pipe`, off by default) that lets USB3 run over a USB4 link for testing; with the default the driver makes the same decision as before (CODE). Nothing plugged in behaves as on 1.705 (MEASURED 2026-11-10, gate).
+- **0177** (1.707): the GPU governor's idle floor becomes a runtime parameter; the default is unchanged (CODE).
+- **0178-0180** (1.708): GPU command submission experiments for the browser animation stutter, all with defaults that behave as 1.707: an order switch for the two render records, an adjustable completion re-poll interval, and start/retire latency counters in debugfs. They do not fix the stutter (MEASURED 2026-11-10: 90.5 fps in the same animation test as on 1.707); the stutter stays open.
+- **0181-0185** (1.710): power. 0181 adds an off-by-default switch to try a GPU firmware stop and warm restart across suspend-to-RAM; 0182 lets an idle J604 GPU drop to its lowest power state after 100 ms without work (a default change, J604 only); 0183-0184 report and, behind a write-only runtime switch, set the CPU cluster power-gate words. **0185 fixes a regression**: from 1.705 to 1.708 the suspend-to-RAM driver also ran for suspend-to-idle, and the GPU driver then refused the sleep, so suspend (and suspend on lid close) did not happen (MEASURED 2026-11-10 on 1.708: "refusing a sleep that powers the SoC down", "Some devices failed to suspend"). On 1.710 a suspend-to-idle cycle enters and resumes again (MEASURED 2026-11-10, one `rtcwake -m freeze` cycle).
+- **0186** (1.710): a debugfs histogram of the GPU firmware start delay, to choose the next stutter fix (no behaviour change).
+- **0187-0188** (1.710): the Neural Engine driver powers the engine up at boot on the J604 and powers it off while idle (CODE; the check on 1.710 is TO-VERIFY 2026-11-10).
+- **0189-0193** (1.711), all off by default, so with the defaults the GPU and display behave as on 1.710 (CODE): 0189 lets the GPU publish a render command behind a running one (`aurora.g16_flights`, default 1), 0190 gives J604 panel swaps a presentation target (`appledrm.swap_target`, default 0), 0191 splits the firmware start-delay histogram by address-space switches (debugfs only), 0192 is a test switch for DP Alt Mode pin assignment D, and 0193 lets an idle HDMI output release its PHY and crossbar.
+- **0194** (1.711): a device-tree change that enables the J604's SIO coprocessor and the HDMI port's audio. On 1.711 the SIO firmware starts (protocol v10), the HDMI audio device binds, and nothing is deferred (MEASURED 2026-11-10). Sound to an HDMI display is not tested (TO-VERIFY). With the new device tree, `boot.bin` is 4,700,195 bytes: the stock `update-m1n1` wrote it from the 1.711 package, and a trial boot confirmed it (MEASURED 2026-11-10).
+- 1.709 was a trial of a device-tree change for the SIO and the HDMI port's audio; it failed its boot gate (an SIO register window overlapped its mailbox, and a parent power domain was disabled) and was rolled back before it shipped (MEASURED 2026-11-10). The corrected change is 0194 in 1.711.
 - Two 7.3 base changes need userland updates, both installed: the GPU's DRM driver is now called "aurora" (Mesa 1.8133), and the Secure Enclave biometric interface is version 5 (`libfprint-git` 5.604). The renamed GPU driver also needs a VA-API driver alias: `libva-v4l2_request-avd` 1.604, installed again with kernel 1.704 on 2026-11-09 (the first install was rolled back because of the GPU fault that 0164 fixes; see Media engines).
-- **Boot image.** Since 2026-11-09 `boot.bin` holds only the J604 device tree from the 1.703 package (4,700,171 bytes); it booted and was confirmed (MEASURED 2026-11-09). The default `update-m1n1` takes all 137 device trees of the 7.3 package (13.58 MB), which m1n1 stage 1 refuses (MEASURED 2026-11-09; see `UPSTREAM.md` note (b)). Since `omarchy-mac-boot` 1.616 (installed 2026-11-09) `update-m1n1` builds that J604-only image itself: its config picks the one device tree of the newest kernel whose first compatible is the running Mac's. The image it wrote was byte-identical to the confirmed one every time (three runs, at the 1.615 and the 1.616 install), and the official boot check passes (MEASURED 2026-11-09).
+- **Boot image.** Since 2026-11-09 `boot.bin` holds only the J604 device tree of the kernel package (4,700,171 bytes from 1.703 to 1.710); it booted and was confirmed (MEASURED 2026-11-09). With the 1.711 device tree it is 4,700,195 bytes, written by `update-m1n1` and confirmed by a trial boot (MEASURED 2026-11-10). The default `update-m1n1` takes all 137 device trees of the 7.3 package (13.58 MB), which m1n1 stage 1 refuses (MEASURED 2026-11-09; see `UPSTREAM.md` note (b)). Since `omarchy-mac-boot` 1.616 (installed 2026-11-09) `update-m1n1` builds that J604-only image itself: its config picks the one device tree of the newest kernel whose first compatible is the running Mac's. The image it wrote was byte-identical to the confirmed one every time (three runs, at the 1.615 and the 1.616 install), and the official boot check passes (MEASURED 2026-11-09).
 
 The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on stable aurora14 and edge aurora15). The stock `linux-aurora` ships a J604 device tree that describes only the CPUs, interrupt controller, power states, pin control and serial port: no storage controller, display, keyboard or trackpad, USB, Wi-Fi or GPU. Stock m1n1 and U-Boot accept only the J713 (MacBook Air M4) on their M4 hand-off paths (INFERENCE 2026-11-09, from reading their source).
 
@@ -65,7 +73,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | CPU frequency scaling and idle (10 cores, full clocks) | Working | MEASURED 2026-11-09 |
 | CPU performance counters | Working: cycles and instructions count correctly on both core types (test-only DT setting) | MEASURED 2026-11-09 (1.704) |
 | GPU (OpenGL 4.6 / Vulkan 1.4) | Working | MEASURED 2026-11-09 |
-| GPU idle power | In progress | TO-VERIFY 2026-11-09 |
+| GPU idle power | 0.041 W at idle on 1.710 (0.32-0.34 W on 1.704-1.707) | MEASURED 2026-11-10 |
 | RAM (16 GB) | Working | MEASURED 2026-11-09 |
 | Internal display (3024x1964 at 120 Hz, scale 2) | Working | MEASURED 2026-11-09 |
 | 10-bit | Package default: compositor scans out XRGB2101010 with no user setting; panel link most likely 8 bpc with dithering | MEASURED 2026-11-09 (scanout); INFERENCE 2026-11-09 (link depth) |
@@ -73,11 +81,12 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | VRR | Off, fixed 120 Hz: the upstream Omarchy default (since 58443c82c), kept by the owner's decision | MEASURED 2026-11-09 |
 | EDR / HDR | Panel and connector advertise HDR; the desktop runs SDR; no EDR headroom path yet | MEASURED 2026-11-09 (properties); TO-VERIFY 2026-11-09 (HDR output) |
 | Glassy bar frame rate | Stock: about 59 fps at 120 Hz; 119 fps only with omacom/omarchy#18176 | MEASURED 2026-11-09 |
+| Smoothness at 120 Hz (animation, video) | Not fixed: a full-window animation runs at about 90 fps; 1080p60 video in Chromium judders; ordinary page scrolling holds 120 fps. Cause being investigated in the GPU driver | MEASURED 2026-11-09/10 (1.704-1.710) |
 | Brightness | Working (panel backlight) | MEASURED 2026-11-09 |
 | Automatic brightness | Not shipped | MEASURED 2026-11-09 (not in the installed packages) |
-| External display (USB-C / Thunderbolt), HDMI | In progress | TO-VERIFY 2026-11-09 |
+| External display (USB-C / Thunderbolt), HDMI | In progress: both external display controllers start, the HDMI port and the USB-C display routes are registered, and on 1.711 the HDMI port's audio device binds; no monitor tested | MEASURED 2026-11-09/10 (nothing plugged in); TO-VERIFY (picture) |
 | USB-C data | Working (USB devices) | MEASURED 2026-11-09 |
-| Thunderbolt / USB4 | In progress (no USB4 domains found) | MEASURED 2026-11-09 |
+| Thunderbolt / USB4 | In progress: the three USB4 host routers bind with no errors; with nothing plugged in there is no USB4 domain, by design; no device tested | MEASURED 2026-11-09/10 (1.704-1.707); TO-VERIFY (devices) |
 | External display 10-bit / HDR10 / EDID / DP audio, idle power-down | In the kernel since 1.617 (kept in 1.703), not tested | TO-VERIFY 2026-11-09 |
 | SD card reader | In progress (controller bound on 1.704, no card tested) | MEASURED 2026-11-09 (controller); TO-VERIFY 2026-11-09 (card) |
 | Storage (NVMe) | Working | MEASURED 2026-11-09 |
@@ -88,18 +97,18 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 | Speakers (with speaker protection) | Working | MEASURED 2026-11-06 (playback); 2026-11-09 (owner's playback check on the 7.3 kernel; `speakersafetyd` active on 1.703) |
 | Headphone jack | Working | MEASURED 2026-11-06 |
 | Microphones | Working: three-mic array captures room sound; the default source is the processed mono microphone | MEASURED 2026-11-09 (1.704) |
-| Camera | In progress: `apple-isp` bound on the 7.3 kernel (no -EBUSY); no picture taken yet | MEASURED 2026-11-09 (bound); TO-VERIFY 2026-11-09 (capture) |
+| Camera | Working, untuned: 1080p30 and 720p30 (NV12) capture with no dropped frames; seen by PipeWire, the Omarchy webcam tools and Chromium with no user settings. Sensor tuning not installed yet (picture dark, magenta cast); camera-in-use indicator not verified | MEASURED 2026-11-09/10 (1.704, 1.705; capture), TO-VERIFY (indicator) |
 | Hardware video decode (H.264, HEVC, VP9) | Working in stock mpv (`hwdec=auto-safe`, no user settings): VA-API zero-copy with kernel 1.704 and the VA-API driver alias (`libva-v4l2_request-avd` 1.604); picture identical to software decoding at 1080p (H.264, HEVC, VP9) and 4K (H.264), no GPU submit errors. Not checked: AV1, 10-bit and HDR, 4K HEVC/VP9, other players and browsers, battery effect | MEASURED 2026-11-09 (1.704 + 1.604); TO-VERIFY 2026-11-09 (not checked) |
 | Video encode (AVE), JPEG, scaler, ProRes | In progress (ProRes driver in the kernel since 1.617, nodes disabled, not loaded) | TO-VERIFY 2026-11-09 |
-| Neural Engine (ANE) | Driver bound, not powered up; no `/dev/accel` | MEASURED 2026-11-09 |
+| Neural Engine (ANE) | In progress: powers up and runs programs with correct results when the driver is loaded with an option (1.704, 1.708); 1.710 powers it up by default | MEASURED 2026-11-10 (option); TO-VERIFY 2026-11-10 (1.710 default) |
 | Ambient light sensor | Sensor reads; nothing uses it by default | MEASURED 2026-11-08 |
 | Accelerometer, gyroscope, lid angle | Working at rest (plausible readings); lid-angle tracking while moving not checked | MEASURED 2026-11-09 (1.704, at rest); TO-VERIFY 2026-11-09 (moving lid) |
-| Lid switch, suspend on lid close | Working | MEASURED 2026-11-09 |
+| Lid switch, suspend on lid close | Lid switch working; the suspend itself was refused on 1.705-1.708 and works again on 1.710 (see Suspend) | MEASURED 2026-11-09 (switch), 2026-11-10 (suspend); TO-VERIFY 2026-11-10 (a lid close on 1.710) |
 | SMC sensors, fan, thermal readouts | Working (readouts) | MEASURED 2026-11-09 |
 | Battery and charger | Working | MEASURED 2026-11-09 |
-| Suspend (s2idle) | Working | MEASURED 2026-11-09 |
+| Suspend (s2idle) | Working on 1.710 and 1.711; refused on 1.705-1.708 (regression, fixed by 0185) | MEASURED 2026-11-10 |
 | Idle power on AC | About 10.5 W with the stock edge `performance` power profile (7.5-7.7 W before 2026-11-09 04:56Z) | MEASURED 2026-11-09 |
-| Deep sleep (suspend to RAM) | In progress: deep is offered on 1.705, suspend-to-idle stays the default; the GPU still blocks a real deep sleep | MEASURED 2026-11-09 (offered); TO-VERIFY 2026-11-09 (a full sleep) |
+| Deep sleep (suspend to RAM) | In progress: offered since 1.705 (suspend-to-idle stays the default); the first full trial, on 1.710, FAILED: the machine reset on wake | MEASURED 2026-11-09 (offered), 2026-11-10 (trial) |
 | Battery life vs macOS | Not measured yet | TO-VERIFY 2026-11-09 |
 | Touch ID (sudo, polkit, lock screen) | Working (sudo also on the 7.3 kernel, owner's check) | MEASURED 2026-11-09 |
 | Boot chain (m1n1, U-Boot, Limine, disk unlock) | Working, no failed units on 1.703 and 1.704 with the 7.3 J604 device tree | MEASURED 2026-11-09 |
@@ -114,7 +123,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 
 ### GPU
 - **Working.** MEASURED 2026-11-09: the 10-core G16 GPU runs OpenGL 4.6 and Vulkan 1.4; on the 7.3 kernel its DRM driver is called `aurora` (on 7.2 it was `asahi`).
-- GPU idle power: in progress (TO-VERIFY 2026-11-09). The idle power-off is in the kernel; its power across boots is still being measured.
+- GPU idle power: on 1.710 the GPU rail reads 0.041 W over 8 s at idle, down from 0.32-0.34 W on 1.704-1.707 (MEASURED 2026-11-10). Since 0182 an idle J604 GPU drops to its lowest power state after 100 ms without work; animation frame pacing and stock-mpv hardware video were the same with it (MEASURED 2026-11-10).
 - Carried by: kernel series and `mesa-aurora`/`vulkan-aurora` with two patches: one admits the T8132 GPU (stock Mesa refuses this GPU on purpose, omacom/mesa#25); the other is upstream aurora-silicon/mesa 6edf62bcfd0, which accepts the "aurora" DRM driver name of the 7.3 kernel as well as "asahi" (SOURCE 2026-11-09). Both names are in the built libraries, and with 1.8133 installed OpenGL and Vulkan report the Apple M4 GPU (G16G B0) on the 7.3 kernel, not llvmpipe (MEASURED 2026-11-09).
 
 ### Internal display
@@ -125,14 +134,21 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 - VRR: off (MEASURED 2026-11-09). That is the upstream Omarchy default: Omarchy turned VRR on and took it out again in 58443c82c because it adds a small lag (SOURCE). The panel supports 24-120 Hz. It stays off: a fixed 120 Hz, by the owner's decision (2026-11-09).
 - EDR / HDR (MEASURED 2026-11-09 on 1.704, properties only): the panel's EDID carries an HDR static metadata block (SDR and PQ transfer functions), and the internal connector exposes HDR output metadata and colorspace properties. The desktop runs SDR (10-bit, Display P3, 80-nit SDR reference) with the backlight in its normal range; no path that hands EDR headroom above that range to the panel is exposed yet. 1.617 adds groundwork that takes the EDR headroom from the content (CODE); HDR output TO-VERIFY 2026-11-09.
 - Glassy bar: stock holds about 59 fps on this 120 Hz panel; 119 fps needs the xray change in omacom/omarchy#18176 (MEASURED 2026-11-09). That change is not in our packages; the owner's own user toggle restores it locally.
+- Smoothness at 120 Hz: **not fixed.**
+  - A full-window CSS animation in Chromium runs at about 90 fps instead of 120 (90.5 fps on 1.704, 1.708 and 1.710; MEASURED 2026-11-09/10). The 1.708 changes (0178-0180) did not change it. 1.711 adds two experiments behind switches that are off by default (0189 two render commands in flight, 0190 a presentation target for panel swaps); with the defaults it behaves as 1.710 (CODE).
+  - 1080p60 video in Chromium (software decode, the stock browser setting) dropped about 1 frame per second on 1.704 and 1.708 (6-10 of about 720 frames in 12 s). On 1.710 a run dropped 0 of 602 frames, but 28 % of the frames were shown off the 16.7 ms cadence, at 12.5 or 20.9 ms (MEASURED 2026-11-09/10). That is the visible judder.
+  - Ordinary page scrolling holds 120 fps (MEASURED 2026-11-10 on 1.710: 0 frames over 12 ms).
+  - The compositor settings are not the main cause: blur off gave the same 90 fps (MEASURED 2026-11-09). Under investigation in the GPU driver: the M4 GPU backend runs one render command at a time, and every command pays a fixed firmware start cost of about 0.7 ms before it runs (MEASURED 2026-11-10 on 1.710; CODE). For video, the panel shows each frame at the next 4.17 ms step, so a frame that arrives late is shown 4.17 ms late (MEASURED 2026-11-10).
 - Brightness: the panel backlight works (MEASURED 2026-11-09). There is no automatic brightness in the installed packages.
 
 ### External displays, HDMI
 - **In progress.** The kernel has the external display controllers, crossbar, DP PHY and HDMI bridge. 1.617 adds 10-bit scanout, HDR10, the sink's EDID and primaries, DP audio for an external controller, and power-down of an idle external controller (CODE). On 1.703 the external display controller dcpext0 starts with the J604's PHY (MEASURED 2026-11-09). No external monitor has been tested on the current build (TO-VERIFY 2026-11-09).
+- HDMI audio: on 1.711 the SIO coprocessor runs (firmware protocol v10) and the HDMI port's audio device binds, with nothing deferred (MEASURED 2026-11-10). Sound to an HDMI display is not tested (TO-VERIFY).
 
 ### USB-C, Thunderbolt / USB4, SD card
 - USB-C data: **Working** for USB devices (MEASURED 2026-11-09).
-- Thunderbolt / USB4: **In progress.** No USB4 domains are found on the current build (MEASURED 2026-11-09).
+- Thunderbolt / USB4: **In progress.** The three USB4 host routers bind and register their USB-C switches, with no Thunderbolt or USB4 error lines (MEASURED 2026-11-09/10 on 1.704-1.707). With nothing plugged in there is no USB4 domain: the host router powers up only when the USB-C controller reports a USB4 or Thunderbolt partner (CODE), as on 1.6xx. No USB4 or Thunderbolt device has been tested yet (TO-VERIFY).
+- USB-C before the disk unlock: since `asahi-scripts` 1.2 the initramfs carries the `dwc3-apple` module, so the USB-C controllers bind before the unlock prompt (MEASURED 2026-11-10 on 1.708: no "waiting for the USB role switch" at boot). Typing the passphrase on a USB-C keyboard is TO-VERIFY.
 - SD reader: the controller (`sdhci-pci`, ADMA 64-bit) is bound on 1.704 with no error lines (MEASURED 2026-11-09); no card tested (TO-VERIFY 2026-11-09).
 
 ### Storage
@@ -154,10 +170,11 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 - Carried by: J604 files in `alsa-ucm-conf-aurora`, `aurora-audio` and `speakersafetyd`, and the speaker amp configuration m1n1 passes on. Without `speakersafetyd` the kernel keeps the speakers muted.
 
 ### Camera
-- **In progress.** MEASURED 2026-11-09: on the 7.3 kernel (1.701, 1.702 and 1.703) the `apple-isp` driver is bound, with no -EBUSY. No picture has been taken yet (TO-VERIFY 2026-11-09).
+- **Working, untuned.** MEASURED 2026-11-09 and 2026-11-10 on kernels 1.704 and 1.705: the FaceTime HD camera (`apple-isp`, /dev/video4) captures 1920x1080 and 1280x720 at 30 fps (NV12) with contiguous frame numbers, no driver errors, and powers down between streams. PipeWire lists it as a video source, the Omarchy webcam picker selects it, and Chromium opens it (1280x720, 30 fps) with stock settings. The sensor tuning file (`isp_2224_01XX.dat`) is not installed yet: the picture is dark with a magenta cast. Installing it needs `asahi-fwextract` 0.9.2-1.609 (installed 2026-11-10), because the stock extractor drops the M4 Wi-Fi firmware when it re-extracts (MEASURED 2026-11-10, rolled back before any reboot). Not verified: the camera-in-use indicator under Linux.
+  - Earlier: on 1.701-1.703 the driver bound with no -EBUSY but no picture was taken.
   - On 1.617 its probe failed with -EBUSY (error -16): the ISP's DART (`apple-dart`) mapped its address-filter (`dapf`) register window, and the ISP driver then asked for the same window exclusively (MEASURED 2026-11-09 on 1.617). 1.703 carries the fix (one driver owns the window).
   - On 1.614 the probe also failed, earlier, with -19: the ISP's DART had no filter ranges and did not probe (MEASURED 2026-11-09 on 1.614).
-- Carried by: kernel ISP series, m1n1 camera firmware hand-off, `asahi-fwextract` (extra sensor tuning files).
+- Carried by: kernel ISP series, m1n1 camera firmware hand-off, `asahi-fwextract` (extra sensor tuning files; since 1.609 it also keeps the BCM4388 rev C2 Wi-Fi firmware).
 
 ### Media engines
 - H.264 hardware decode: worked on 1.617 (MEASURED 2026-11-08, 4K through VA-API). With stock settings on 1.617, mpv's system default did not use it (omacom/omarchy#18229).
@@ -170,7 +187,11 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 - Video encode (AVE), JPEG, scaler, ProRes: **In progress** (TO-VERIFY 2026-11-09). The kernel carries the ProRes encoder driver from Aurora (since 1.617); its device-tree nodes are disabled and the module does not load (MEASURED 2026-11-09 on 1.617).
 
 ### Neural Engine (ANE)
-- **In progress.** MEASURED 2026-11-09: the ANE is detected and the `ane_t6021` driver is bound; on the T8132 the driver stops before power-up, by design for now. There is no `/dev/accel`.
+- **In progress.** MEASURED 2026-11-09/10 (kernels 1.704 and 1.708): loaded with `ane_t6021.h16_power_unqualified=1`, the M4 Neural Engine powers up, its firmware starts (H16 26.6.2, build 25G83), and `/dev/accel/accel0` appears.
+  - Programs compiled by the official `mil-hwx-compiler` (a 128x128 matrix multiply, compiled on the laptop itself) and the kernel's add-128 test program give bit-exact results against a CPU reference, in about 0.2-0.4 ms per run. A softmax program stays within 9 ULP (bound 32).
+  - The engine powers off and boots again across a suspend cycle, and gives the same results afterwards.
+  - Without the option, 1.704-1.708 stop after identifying the firmware (no `/dev/accel`). 1.710 (0187-0188) powers it up by default and off while idle (CODE; TO-VERIFY 2026-11-10).
+  - The official `omarchy-ane` tools do not support the M4 yet (`omarchy-ane-smoke`: "t8132: no omarchy-ane driver for this chip").
 - m1n1 1.608 hands the preloaded ANE firmware over (m1n1 patch 0028). 1.617 lets the ANE's DARTs suspend once the device is bound (CODE). The ANE userland (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`) is the official edge build; our earlier rebuilds are withdrawn. `omarchy-ane-dkms` skips its build on our kernels by design, because they ship the ANE driver in the kernel (MEASURED 2026-11-09: the same skip on 1.614, 1.617, 1.701 and 1.702).
 
 ### Sensors
@@ -181,8 +202,8 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 - Battery and charger: **Working** (MEASURED 2026-11-09).
 
 ### Power
-- Suspend (s2idle): **Working** (MEASURED 2026-11-09; the kernel offers only `s2idle`).
-- Deep sleep (suspend to RAM): **In progress.** Since 1.705 the kernel offers it (`[s2idle] deep`, MEASURED 2026-11-09); the boot firmware already publishes what it needs (no m1n1 change). Suspend-to-idle stays the default, so closing the lid behaves as before. A full deep sleep needs a GPU firmware stop and warm restart first (CODE; TO-VERIFY 2026-11-09).
+- Suspend (s2idle): **Working on 1.710 and 1.711** (MEASURED 2026-11-10, on each: `rtcwake -m freeze -s 8` returns, the journal shows suspend entry and exit, nothing refused, the desktop is alive). **Refused on 1.705-1.708** (MEASURED 2026-11-10 on 1.708): the suspend-to-RAM driver added in 1.705 also ran for suspend-to-idle and the GPU driver refused the sleep; 0185 (1.710) fixes it.
+- Deep sleep (suspend to RAM): **In progress.** Since 1.705 the kernel offers it (`[s2idle] deep`, MEASURED 2026-11-09); the boot firmware already publishes what it needs (no m1n1 change). Suspend-to-idle stays the default, so closing the lid behaves as before. 1.710 adds the GPU firmware stop and warm restart a full deep sleep needs, behind a switch that is off by default (0181). The first full suspend-to-RAM trial, on 1.710 with that switch on, FAILED: the machine went down and came back with a cold boot about 10 s after the wake alarm, so the wake did not reach the kernel; no hang, no power cycle needed (MEASURED 2026-11-10). No log of the attempt survived, so where it stopped is not known yet (TO-VERIFY).
 - Idle power on AC: about 10.5 W (SMC system power, 120 s idle, screen on; MEASURED 2026-11-09 on 1.617), against 7.5-7.7 W in the same check on 1.614 before 2026-11-09 04:56Z.
   - The cause is userland, not the kernel: since that time the J604 runs the edge `omarchy-power-profiles-daemon` 0.30-7, which adds Apple Silicon CPU profiles (SOURCE: its package description). With the stock profile on AC, `performance`, both CPU policies use the `performance` governor, so the cores idle at their top clock (MEASURED 2026-11-09). The earlier 0.30-3 had no Apple Silicon profile, and the kernel default `schedutil` applied.
   - This is the stock edge default, left as it is. A comparison with the `balanced` profile is TO-VERIFY.
@@ -195,7 +216,7 @@ The stock official packages cannot boot this Mac yet (MEASURED 2026-11-09 on sta
 
 ### Boot chain
 - **Working.** MEASURED 2026-11-09 (first boot of 1.703 with the 7.3 J604 device tree): m1n1 → U-Boot → Limine → kernel; no failed units; no kernel warnings or oopses. Passphrase prompt with the keyboard working (MEASURED 2026-11-09 on 1.617).
-- `boot.bin` holds m1n1 1.608, the J604 device tree of the 1.703 package and U-Boot (4,700,171 bytes, MEASURED 2026-11-09). The all-device-tree image the stock `update-m1n1` default builds for the 7.3 package is refused by m1n1 stage 1 (MEASURED 2026-11-09).
+- `boot.bin` holds m1n1 1.608, the J604 device tree of the 1.711 package and U-Boot (4,700,195 bytes, MEASURED 2026-11-10). The all-device-tree image the stock `update-m1n1` default builds for the 7.3 package is refused by m1n1 stage 1 (MEASURED 2026-11-09).
 - `omarchy-mac-boot` 1.616 makes `update-m1n1` build that J604-only image itself (MEASURED 2026-11-09: byte-identical to the confirmed image in all three runs, at the 1.615 and the 1.616 install; the official boot check passes). Its config, `/etc/default/update-m1n1`, sets `DTBS` to the one device tree of the newest kernel whose first compatible is the running Mac's, and keeps the stock default in every other case (an explicit `DTBS`, `OMARCHY_DTB_MACHINE=0`, no `fdtget`, a chroot, zero or several matches, or an overlay that names that device tree) (CODE). The boot check reads the same file and expects the same image. The package depends on `dtc` for `fdtget`: without it the config falls back to the all-device-tree image (CODE).
 - `omarchy-mac-boot` (since 1.614) drops the earlier first-boot drop-in for `omarchy-plymouth-quit.service`, a unit stock does not ship.
 
