@@ -24,7 +24,7 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | Area | Status (2026-11-10) |
 | --- | --- |
 | Boot chain (m1n1, U-Boot, Limine, disk unlock), storage, keyboard and trackpad, USB, battery, lid | Working |
-| CPU | Working: 10 cores, cpufreq and cpuidle (performance cores up to 4.46 GHz requested, efficiency 2.89 GHz); under load a performance core reaches about 3.94-3.98 GHz, not the turbo states (open); since 1.723 the reported frequency is the reached one |
+| CPU | Working: 10 cores, cpufreq and cpuidle (performance cores up to 4.46 GHz requested, efficiency 2.89 GHz); one busy performance core runs at about 4.36 GHz and two to four at about 3.9 GHz, as under macOS with all cores loaded; since 1.723 the reported frequency is the reached one |
 | GPU | Accelerated (OpenGL 4.6 / Vulkan 1.4); idle GPU power 0.041 W on 1.710, 0.076 W on 1.711 |
 | Internal display | 3024x1964 at 120 Hz, scale 2, 10-bit (XRGB2101010) and Display P3 as package defaults, with no user setting. The panel link is most likely 8 bits per channel with dithering (not yet verified). VRR stays off, as in upstream Omarchy |
 | Glassy bar | Stock holds about 59 fps on this 120 Hz panel. 119 fps needs the change in [omacom/omarchy#18176](https://github.com/omacom/omarchy/pull/18176), which is not carried here |
@@ -32,7 +32,7 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | Camera | Working, tuned: 1080p and 720p capture with the sensor tuning file loaded, seen by stock apps and Chromium; colour not yet judged by eye |
 | Wi-Fi and Bluetooth | Working |
 | Audio | Speakers (with speaker protection), headphone jack and the three-microphone array working |
-| Media | Hardware decode (H.264, HEVC, VP9) working in stock mpv through VA-API, with kernel 1.704 and the VA-API driver alias (checked at 1080p, and 4K for H.264; 10-bit HEVC decodes through VA-API in a first check; AV1 not yet); JPEG hardware encode working; H.264 and HEVC hardware encode working through stock FFmpeg since 1.722 (10-bit HEVC works through V4L2 directly; stock FFmpeg cannot send 10-bit frames to V4L2 encoders) |
+| Media | Hardware decode (H.264, HEVC, VP9) working in stock mpv through VA-API, with kernel 1.704 and the VA-API driver alias (checked at 1080p, and 4K for H.264; 10-bit HEVC decodes through VA-API as real 10-bit in short checks; AV1 not yet); JPEG hardware encode working; H.264 and HEVC hardware encode working through stock FFmpeg since 1.722 (10-bit HEVC works through V4L2 directly; stock FFmpeg cannot send 10-bit frames to V4L2 encoders) |
 | Touch ID | Working for sudo, polkit and the lock screen |
 | Keyboard backlight | Working with the local `omarchy-dev` / `omarchy-settings-dev` builds |
 | Neural Engine | Working: on by default (`/dev/accel/accel0`), runs programs bit-exact and powers off when idle (measured on 1.711) |
