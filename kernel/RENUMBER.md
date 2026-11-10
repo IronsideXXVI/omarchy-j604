@@ -12,6 +12,8 @@ New in 1.804: 0232 (`drm/apple: m4: do not let one interval after idle open the 
 
 New in 1.805: 0234 (`arm64: dts: apple: t8132-j604: report the always-zero SMC temperatures as no data`), 0235 (`arm64: dts: apple: t8132-j604: Describe the DP audio of the second external display processor`), 0236 (`drm: apple: dcp: let the T8132 HDMI output's idle release engage`).
 
+New in 1.807: 0237 (`soc: apple: s2r: optionally arm the bring-up watchdog when ->enter starts`).
+
 | 1.736 | 1.800 | Subject |
 |---|---|---|
 | 0001 | 0001 | dt-bindings: pci: apple,pcie: Describe the three T8132 root ports |

@@ -29,15 +29,15 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | Internal display | 3024x1964 at 120 Hz, scale 2, 10-bit (XRGB2101010) and Display P3 as package defaults, with no user setting. The panel link is most likely 8 bits per channel with dithering (not yet verified). VRR stays off, as in upstream Omarchy |
 | Glassy bar | Stock holds about 59 fps on this 120 Hz panel (re-measured on 1.731). 119 fps needs the change in [omacom/omarchy#18176](https://github.com/omacom/omarchy/pull/18176), which is not carried here |
 | Smoothness at 120 Hz | Both fixes on by default since 1.718: a full-window animation runs at 120 fps (about 90 before), scrolling at 120 fps, and 24, 30 and 60 fps video in Chromium stays on its cadence in our tests. YouTube fullscreen 1080p60 since 1.730: 1.8-3.4 % of frames off cadence, 0 dropped (1.6-7.2 % before, 23 % before pacing). 4K60 in Chromium is held back by its software decoding; stock mpv plays the same 4K60 clip with 0 of 600 frames off (see `STATUS.md`). After idle, a terminal open/close animation sometimes ran below about 68 fps (cause: the frame pacing's start value after idle); 1.804 carries the fix, and its first 8-burst check held no frame |
-| Camera | Working, tuned: 1080p and 720p capture with the sensor tuning file loaded, seen by stock apps and Chromium; colour not yet judged by eye |
+| Camera | Working, tuned: 1080p and 720p capture with the sensor tuning file loaded, seen by stock apps and Chromium; colour close to neutral in a bright scene, not yet judged by eye |
 | Wi-Fi and Bluetooth | Working |
 | Audio | Speakers (with speaker protection), headphone jack and the three-microphone array working |
 | Media | Hardware decode (H.264, HEVC, VP9) working in stock mpv through VA-API, with kernel 1.704 and the VA-API driver alias (checked at 1080p, and 4K for H.264; 10-bit HEVC decodes through VA-API as real 10-bit in short checks; AV1 bit-exact through VA-API in ffmpeg); Chromium decodes VP9, AV1 and H.264 on the hardware decoder as shipped since kernel 1.804 with `omarchy-mac` 2.13 (stock omarchy-mac turns that off on Apple Silicon; video encode in Chromium is software only); JPEG hardware encode and decode working (decode since 1.728); H.264 and HEVC hardware encode working through stock FFmpeg since 1.722, and the stock screen recorder records in hardware since 1.726 (10-bit HEVC works through V4L2 directly; stock FFmpeg cannot send 10-bit frames to V4L2 encoders) |
 | Touch ID | Working for sudo, polkit and the lock screen |
 | Keyboard backlight | Working with the local `omarchy-dev` / `omarchy-settings-dev` builds |
 | Neural Engine | Working: on by default (`/dev/accel/accel0`), runs programs bit-exact and powers off when idle (measured on 1.711) |
-| Power | Suspend (s2idle) working again since 1.710 (it was refused on 1.705-1.708). Idle on AC is about 10.5 W with the stock edge `performance` power profile (see `STATUS.md`); since 1.802 the idle performance cores drop to their slowest clock (rail 994 mW against 2360 mW; the wall figure is not measured yet). Deep sleep in progress: the reset during a test sleep is fixed since 1.736; changes for the two GPU items that block real suspend-to-RAM are in 1.803 (off by default); real suspend-to-RAM is not working yet |
-| In progress | Deep sleep, camera colour, a picture check of H.264 hardware decode in Chromium, Thunderbolt/USB4, external displays and HDMI |
+| Power | Suspend (s2idle) working again since 1.710 (it was refused on 1.705-1.708). Idle on AC is about 10.5 W with the stock edge `performance` power profile (see `STATUS.md`); since 1.802 the idle performance cores drop to their slowest clock (rail 994 mW against 2360 mW; the wall figure is not measured yet). Deep sleep in progress: the reset during a test sleep is fixed since 1.736; changes for the two GPU items that block real suspend-to-RAM are in 1.803 (off by default); the first real suspend-to-RAM trial (1.804) hung, so deep sleep stays off and suspend-to-idle is the shipped sleep |
+| In progress | Deep sleep, camera colour, Thunderbolt/USB4, external displays and HDMI |
 
 ## Install
 
@@ -57,7 +57,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`a82a1ebda940`), 236 patches | `1.805` |
+| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`a82a1ebda940`), 237 patches | `1.807` |
 | `m1n1-aurora` | 1.6.1.aurora22, omacom/m1n1 (`bc79acc434`), 38 patches | `1.610` |
 | `uboot-aurora` | 2026.07.aurora6, aurora-silicon/u-boot (`d30213eadc`) | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261031, omacom/mesa (`a196911147`) | `1.8133` |
@@ -77,7 +77,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 Also installed, unchanged from the official repositories: Hyprland 0.57.1 and the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
-Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.805 changed over 1.617).
+Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.807 changed over 1.617).
 
 ## Layout
 
