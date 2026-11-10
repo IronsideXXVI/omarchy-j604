@@ -31,13 +31,13 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | Smoothness at 120 Hz | Both fixes on by default since 1.718: a full-window animation runs at 120 fps (about 90 before), scrolling at 120 fps, and 24, 30 and 60 fps video in Chromium stays on its cadence in our tests. YouTube fullscreen is not fully even yet (1080p60: 1.6-7.2 % of frames off cadence, 23 % before; see `STATUS.md`) |
 | Camera | Working, tuned: 1080p and 720p capture with the sensor tuning file loaded, seen by stock apps and Chromium; colour not yet judged by eye |
 | Wi-Fi and Bluetooth | Working |
-| Audio | Speakers (with speaker protection), headphone jack and the three-microphone array working |
+| Audio | Speakers (with speaker protection) and headphone jack working; the default microphone source returns noise on 1.725 and 1.726 although the raw three-microphone array reads clean (a regression since 1.704, being traced) |
 | Media | Hardware decode (H.264, HEVC, VP9) working in stock mpv through VA-API, with kernel 1.704 and the VA-API driver alias (checked at 1080p, and 4K for H.264; 10-bit HEVC decodes through VA-API as real 10-bit in short checks; AV1 not yet); JPEG hardware encode working; H.264 and HEVC hardware encode working through stock FFmpeg since 1.722, and the stock screen recorder records in hardware since 1.726 (10-bit HEVC works through V4L2 directly; stock FFmpeg cannot send 10-bit frames to V4L2 encoders) |
 | Touch ID | Working for sudo, polkit and the lock screen |
 | Keyboard backlight | Working with the local `omarchy-dev` / `omarchy-settings-dev` builds |
 | Neural Engine | Working: on by default (`/dev/accel/accel0`), runs programs bit-exact and powers off when idle (measured on 1.711) |
 | Power | Suspend (s2idle) working again since 1.710 (it was refused on 1.705-1.708). Idle on AC is about 10.5 W with the stock edge `performance` power profile (see `STATUS.md`). Deep sleep in progress |
-| In progress | Deep sleep, camera colour, fullscreen video cadence, Thunderbolt/USB4, external displays and HDMI |
+| In progress | Microphone regression, deep sleep, camera colour, fullscreen video cadence, Thunderbolt/USB4, external displays and HDMI |
 
 ## Install
 
