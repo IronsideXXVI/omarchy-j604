@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 01:33:56 +0000
+Subject: [PATCH] drm/apple: m4: add knobs for the J604 panel's
+ adaptive-sync request
+
+On the J604 a 60 fps video in Chromium is shown with about 40 % of its
+frames 12.5 or 20.9 ms apart: the panel shows each swap at its next
+4.17 ms tick, on either phase of the 120 Hz refresh. With the compositor's
+VRR on, which sends an adaptive-sync minimum of 24 Hz, the firmware held
+swaps on one phase and 91 % of the frames came 16.7 ms apart. The request
+also has a media target rate, which the firmware reports and which the
+driver always sends as zero.
+
+Add panel_adaptive (0644, default off), which sends the panel_vrr_min_hz
+minimum while the compositor has VRR off too, and panel_media_hz (0644,
+default 0), the media target rate in the same 16.16 Hz form as the
+minimum. Both apply from the next commit and change nothing at their
+defaults. They are for measuring on the machine which part of the request
+paces video.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/gpu/drm/apple/iomfb_m4.c | 37 +++++++++++++++++++++++---------
+ 1 file changed, 27 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 0c590d9f7a..6a11de0673 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -199,6 +199,16 @@ module_param(swap_pace_lead_us, uint, 0644);
+ MODULE_PARM_DESC(swap_pace_lead_us,
+ 		 "J604: with swap_pace, the time from starting a swap to the first panel tick it can make, us (default 0 = the shortest start-to-completion time of recent swaps)");
+ 
++static bool panel_adaptive;
++module_param(panel_adaptive, bool, 0644);
++MODULE_PARM_DESC(panel_adaptive,
++		 "J604: send the internal panel's adaptive-sync minimum (panel_vrr_min_hz) also while the compositor has VRR off (experimental; default: off; applies from the next commit)");
++
++static unsigned int panel_media_hz;
++module_param(panel_media_hz, uint, 0644);
++MODULE_PARM_DESC(panel_media_hz,
++		 "J604: mediaTargetRate of the internal panel's adaptive-sync request, Hz (experimental; default 0 = none; at most 120; applies from the next commit)");
++
+ static bool panel_edr;
+ /* Given on the command line or written: the machine default stays out. */
+ static bool panel_edr_given;
+@@ -391,6 +401,7 @@ struct iomfb_m4 {
+ 	 * (16.16 Hz, 0: never sent) and the A442 status words seen.
+ 	 */
+ 	u32 vrr_min_sent;
++	u32 vrr_media_sent;
+ 	u32 vrr_status;
+ 	u64 vrr_calls;
+ 	/* The minimum when the panel EDID was first published, 0: no VRR offered. */
+@@ -3769,11 +3780,12 @@ static_assert(sizeof(struct dcp_m4_set_parameter) == 0x28);
+ #define DCP_M4_PARAM_ADAPTIVE_SYNC	14
+ #define DCP_M4_VRR_FIXED_HZ		120
+ 
+-static int dcp_m4_set_adaptive_sync(struct iomfb_m4 *dcp, u32 min_rr)
++static int dcp_m4_set_adaptive_sync(struct iomfb_m4 *dcp, u32 min_rr, u32 media)
+ {
++	/* minRR and mediaTargetRate, 16.16 Hz, then the fractional rate */
+ 	const struct dcp_m4_set_parameter param = {
+ 		.param = cpu_to_le32(DCP_M4_PARAM_ADAPTIVE_SYNC),
+-		.value = { cpu_to_le32(min_rr) },
++		.value = { cpu_to_le32(min_rr), cpu_to_le32(media) },
+ 		.count = cpu_to_le32(3),
+ 	};
+ 	__le32 status = 0;
+@@ -3787,8 +3799,8 @@ static int dcp_m4_set_adaptive_sync(struct iomfb_m4 *dcp, u32 min_rr)
+ 				  &param, sizeof(param), &status, sizeof(status));
+ 	dcp->vrr_calls++;
+ 	dcp->vrr_status = le32_to_cpu(status);
+-	dev_info(dcp->dev, "adaptive sync minimum %u.%03u Hz: ret %d status %#x (panel_vrr_min_hz)\n",
+-		 min_rr >> 16, (u32)(((u64)(min_rr & 0xffff) * 1000) >> 16), ret,
++	dev_info(dcp->dev, "adaptive sync minimum %u.%03u Hz media %u Hz: ret %d status %#x (panel_vrr_min_hz)\n",
++		 min_rr >> 16, (u32)(((u64)(min_rr & 0xffff) * 1000) >> 16), media >> 16, ret,
+ 		 dcp->vrr_status);
+ 	return ret;
+ }
+@@ -3814,17 +3826,22 @@ void iomfb_m4_atomic_vrr(struct apple_dcp *owner, bool vrr_enabled)
+ {
+ 	struct iomfb_m4 *dcp = owner->v26_6;
+ 	unsigned int hz = READ_ONCE(panel_vrr_min_hz);
++	bool adaptive = vrr_enabled || READ_ONCE(panel_adaptive);
++	u32 media = min_t(u32, READ_ONCE(panel_media_hz), DCP_M4_VRR_FIXED_HZ) << 16;
+ 	u32 min;
+ 
+ 	if (!dcp || dcp->external || !READ_ONCE(dcp->vrr_offered_hz))
+ 		return;
+ 	mutex_lock(&dcp->lock);
+ 	/* panel_vrr_min_hz written 0 at run time holds the panel at 120 Hz. */
+-	min = (vrr_enabled && hz ? hz : DCP_M4_VRR_FIXED_HZ) << 16;
+-	if ((dcp->vrr_min_sent || (vrr_enabled && hz)) && min != dcp->vrr_min_sent &&
++	min = (adaptive && hz ? hz : DCP_M4_VRR_FIXED_HZ) << 16;
++	if ((dcp->vrr_min_sent || (adaptive && hz) || media) &&
++	    (min != dcp->vrr_min_sent || media != dcp->vrr_media_sent) &&
+ 	    dcp->runtime && !dcp->powered_off &&
+-	    !dcp_m4_set_adaptive_sync(dcp, min))
++	    !dcp_m4_set_adaptive_sync(dcp, min, media)) {
+ 		dcp->vrr_min_sent = min;
++		dcp->vrr_media_sent = media;
++	}
+ 	mutex_unlock(&dcp->lock);
+ }
+ 
+@@ -7342,9 +7359,9 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
+ 			   dcp->runtime ? dcp->runtime->int_lost.given_up : 0,
+ 			   dcp->runtime ? dcp->runtime->int_lost.late : 0, !!dcp->lost_fb);
+ 	if (READ_ONCE(panel_vrr_min_hz))
+-		seq_printf(s, "vrr min_hz=%u min_sent=%#x calls=%llu status=%#x\n",
+-			   READ_ONCE(panel_vrr_min_hz), dcp->vrr_min_sent, dcp->vrr_calls,
+-			   dcp->vrr_status);
++		seq_printf(s, "vrr min_hz=%u min_sent=%#x media_sent=%#x calls=%llu status=%#x\n",
++			   READ_ONCE(panel_vrr_min_hz), dcp->vrr_min_sent, dcp->vrr_media_sent,
++			   dcp->vrr_calls, dcp->vrr_status);
+ 	if (READ_ONCE(panel_edr))
+ 		seq_printf(s, "edr capable=%u output=%u peak=%u ceiling=%u hm=%u sdr=%u sent=%u swaps=%llu cll=%u\n",
+ 			   dcp->edr_capable, dcp->output_edr, dcp->panel_peak, dcp->edr_ceiling,

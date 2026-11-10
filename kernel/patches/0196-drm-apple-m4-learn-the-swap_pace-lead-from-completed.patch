@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 01:28:09 +0000
+Subject: [PATCH] drm/apple: m4: learn the swap_pace lead from
+ completed swaps
+
+swap_pace holds a J604 panel swap whose first reachable 4.17 ms tick
+would fall between two 120 Hz refreshes. Which tick a swap can still make
+depends on the firmware's floor from the swap's start to that tick, seen
+from the counter value taken when the swap completes. swap_pace_lead_us
+guessed it at 1.5 ms, while the shortest start-to-completion time measured
+on the J604 is about 2 ms. With the guess too short, a swap started in the
+gap is predicted onto a grid tick and lands on the tick between.
+
+Record the counter at the start of each internal-panel swap and take the
+shortest start-to-completion time of the latest 64 swaps, which start at
+every phase of the tick. Use it when swap_pace_lead_us is 0, the new
+default; a nonzero value still overrides it. Nothing changes while
+swap_pace is off.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/gpu/drm/apple/iomfb_m4.c | 49 ++++++++++++++++++++++++++++++--
+ 1 file changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index e5526e3d5a..0c590d9f7a 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -194,10 +194,10 @@ module_param(swap_pace, bool, 0644);
+ MODULE_PARM_DESC(swap_pace,
+ 		 "J604: before an internal-panel swap, wait when the frame would otherwise be shown on the panel tick between two 120 Hz refreshes (4.17 ms after one), so it is shown on the 120 Hz grid of the last completion (experimental; default: off)");
+ 
+-static unsigned int swap_pace_lead_us = 1500;
++static unsigned int swap_pace_lead_us;
+ module_param(swap_pace_lead_us, uint, 0644);
+ MODULE_PARM_DESC(swap_pace_lead_us,
+-		 "J604: with swap_pace, the time from starting a swap to the first panel tick it can make, us (default 1500)");
++		 "J604: with swap_pace, the time from starting a swap to the first panel tick it can make, us (default 0 = the shortest start-to-completion time of recent swaps)");
+ 
+ static bool panel_edr;
+ /* Given on the command line or written: the machine default stays out. */
+@@ -1094,6 +1094,15 @@ struct dcp_m4_runtime {
+ 	struct iomfb_m4 *dcp;
+ 	/* Architectural counter at the internal panel's last swap completion (swap_target) */
+ 	u64 int_done_cnt;
++	/*
++	 * swap_pace: counter at the start of the internal panel's swap in
++	 * flight, and the shortest start-to-completion time seen (the latest
++	 * full window of DCP_M4_PACE_WINDOW swaps, and the current window).
++	 */
++	u64 int_start_cnt;
++	u64 int_lat_min;
++	u64 int_lat_win;
++	u32 int_lat_n;
+ 	struct dcp_m4_properties *properties;
+ 	struct dcp_m4_timing timing;
+ 	struct dcp_m4_swap_state swap;
+@@ -1710,6 +1719,33 @@ static bool dcp_m4_int_late_d590(struct dcp_m4_runtime *r, u32 id)
+ 	return true;
+ }
+ 
++/*
++ * swap_pace: a swap started at least the firmware's floor before a panel tick
++ * makes that tick; it completes on it, so the shortest start-to-completion
++ * time over many swaps (which start at every phase of the tick) is that floor
++ * as seen from the completion's counter value. Kept per window so that it can
++ * also grow.
++ */
++#define DCP_M4_PACE_WINDOW	64
++
++static void dcp_m4_pace_learn(struct dcp_m4_runtime *r)
++{
++	u64 start = READ_ONCE(r->int_start_cnt), done = READ_ONCE(r->int_done_cnt), lat;
++
++	if (!start || done <= start)
++		return;
++	WRITE_ONCE(r->int_start_cnt, 0);
++	lat = done - start;
++	if (!r->int_lat_n || lat < r->int_lat_win)
++		r->int_lat_win = lat;
++	if (!READ_ONCE(r->int_lat_min) || lat < READ_ONCE(r->int_lat_min))
++		WRITE_ONCE(r->int_lat_min, lat);
++	if (++r->int_lat_n >= DCP_M4_PACE_WINDOW) {
++		WRITE_ONCE(r->int_lat_min, r->int_lat_win);
++		r->int_lat_n = 0;
++	}
++}
++
+ static int dcp_m4_runtime_swap_done(void *cookie, u32 id)
+ {
+ 	struct dcp_m4_runtime *r = cookie;
+@@ -1721,6 +1757,7 @@ static int dcp_m4_runtime_swap_done(void *cookie, u32 id)
+ 		if (dcp_m4_int_late_d590(r, id))
+ 			return 0;
+ 		WRITE_ONCE(r->int_done_cnt, __arch_counter_get_cntpct());
++		dcp_m4_pace_learn(r);
+ 		return dcp_m4_swap_record_done(&r->swap, id);
+ 	}
+ 	r->ext_done.valid = false;
+@@ -2589,6 +2626,7 @@ static bool dcp_m4_ext_swap_give_up(struct dcp_m4_runtime *r, struct dcp_m4_swap
+ static unsigned long dcp_m4_swap_pace_us(struct dcp_m4_runtime *r)
+ {
+ 	u64 freq, half, base, now, t, k;
++	unsigned int lead;
+ 
+ 	if (!READ_ONCE(swap_pace))
+ 		return 0;
+@@ -2598,7 +2636,11 @@ static unsigned long dcp_m4_swap_pace_us(struct dcp_m4_runtime *r)
+ 	now = __arch_counter_get_cntpct();
+ 	if (!half || !base || base > now)
+ 		return 0;
+-	t = now + div_u64(freq * READ_ONCE(swap_pace_lead_us), USEC_PER_SEC);
++	lead = READ_ONCE(swap_pace_lead_us);
++	if (lead)
++		t = now + div_u64(freq * lead, USEC_PER_SEC);
++	else
++		t = now + (READ_ONCE(r->int_lat_min) ?: div_u64(freq, 500));
+ 	k = div64_u64(t - base + half - 1, half);
+ 	if (!(k & 1))
+ 		return 0;
+@@ -2686,6 +2728,7 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
+ 
+ 		if (pace)
+ 			usleep_range(pace, pace + 50);
++		WRITE_ONCE(r->int_start_cnt, __arch_counter_get_cntpct());
+ 	}
+ 	r->deadline = jiffies + msecs_to_jiffies(5000);
+ 	ret = dcp_m4_runtime_call(r, 406, false, start, sizeof(start), started, sizeof(started));
