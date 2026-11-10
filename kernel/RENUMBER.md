@@ -20,6 +20,8 @@ New in 1.809: 0241 (`soc: apple: s2r: send the enclave no sleep request in a run
 
 New in 1.810: 0246 (`soc: apple: s2r: let one bring-up abort still tell the enclave`).
 
+New in 1.811: 0247 (`iommu: apple-dart: optionally save a DART without a sleep list`).
+
 | 1.736 | 1.800 | Subject |
 |---|---|---|
 | 0001 | 0001 | dt-bindings: pci: apple,pcie: Describe the three T8132 root ports |
