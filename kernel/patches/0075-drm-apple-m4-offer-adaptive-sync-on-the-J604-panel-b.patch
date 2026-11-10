@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 11:44:45 +0000
+Subject: [PATCH] drm/apple: m4: offer adaptive sync on the J604 panel
+ by default
+
+The J604's ProMotion panel offered VRR only with appledrm.panel_vrr_min_hz
+set at boot (default 0). Ship it on, as the port rule asks, with a
+run-time path back:
+
+- The machine profile carries the default minimum: J604 48 Hz, the lowest
+  fixed rate Apple lists for this panel (MacBook Pro technical
+  specifications: ProMotion "adaptive refresh rates up to 120Hz", fixed
+  47.95/48/50/59.94/60 Hz). J713 and J715 keep 0 (off), as before. A
+  value given on the command line wins over the profile.
+- VRR is offered at the panel EDID's first publication: vrr_capable, and
+  the range (minimum up to the mode's 120 Hz) in the EDID, so
+  monitor_range reads it back.
+- The parameter is now writable at run time. A write moves the live
+  minimum from the next commit; 0 holds the panel at 120 Hz while
+  VRR_ENABLED stays valid, so a compositor that asked for VRR is not
+  refused. The offer itself only changes at boot.
+- Nothing is sent to the firmware until a commit first asks for VRR
+  (unchanged): Omarchy sets no vrr, so the desktop is as before until a
+  compositor rule enables it.
+
+A442 as set_parameter_dcp on firmware 26.6.2 is still INFERENCE (the
+desktop 26.6 table); the 1.612 plan runs the A/B before this stays on.
+
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp-m4-profile.h | 11 +++++
+ drivers/gpu/drm/apple/iomfb_m4.c       | 59 +++++++++++++++++++++-----
+ 2 files changed, 59 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-m4-profile.h b/drivers/gpu/drm/apple/dcp-m4-profile.h
+index ee9c5a8531..8a3127c8b2 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-profile.h
++++ b/drivers/gpu/drm/apple/dcp-m4-profile.h
+@@ -30,6 +30,11 @@ struct dcp_m4_profile {
+ 	 * (iomfb_m4_panel_edid()).
+ 	 */
+ 	u16 model_year;
++	/*
++	 * Adaptive sync offered on the panel by default: the minimum rate in Hz,
++	 * 0 for none (appledrm.panel_vrr_min_hz given at boot overrides it).
++	 */
++	u16 vrr_min_hz;
+ 	/*
+ 	 * The qualified preferred timing (ID 2), horizontal then vertical:
+ 	 * Active, Total, FrontPorch, SyncWidth, BackPorch, PreciseSyncRate,
+@@ -114,6 +119,12 @@ static const struct dcp_m4_profile dcp_m4_profile_j604 = {
+ 	.width_mm = 0, .height_mm = 0,
+ 	/* MacBook Pro (14-inch, M4, 2024): the panel EDID's model year. */
+ 	.model_year = 2024,
++	/*
++	 * ProMotion "adaptive refresh rates up to 120Hz"; 48 Hz is the lowest
++	 * fixed rate Apple lists for this panel (47.95 and 48 Hz, MacBook Pro
++	 * technical specifications). J713 and J715 keep VRR off.
++	 */
++	.vrr_min_hz = 48,
+ 	.timing = dcp_m4_timing_j604, .timing_elements = 6,
+ 	.alloc_page_align = true,
+ };
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index fce572ea7a..c85334f6d0 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -167,10 +167,16 @@ MODULE_PARM_DESC(panel_edr,
+ 		 "J604: offer HDR to the compositor and show BT.2020 PQ content as EDR on the internal panel, up to its ADT peak (testing; default: off; boot time)");
+ 
+ static unsigned int panel_vrr_min_hz;
++/* Given on the command line or written: the machine default stays out. */
++static bool panel_vrr_min_hz_given;
+ 
+ static int panel_vrr_min_hz_set(const char *val, const struct kernel_param *kp)
+ {
+-	return param_set_uint_minmax(val, kp, 0, 119);
++	int ret = param_set_uint_minmax(val, kp, 0, 119);
++
++	if (!ret)
++		WRITE_ONCE(panel_vrr_min_hz_given, true);
++	return ret;
+ }
+ 
+ static const struct kernel_param_ops panel_vrr_min_hz_ops = {
+@@ -178,9 +184,9 @@ static const struct kernel_param_ops panel_vrr_min_hz_ops = {
+ 	.get = param_get_uint,
+ };
+ 
+-module_param_cb(panel_vrr_min_hz, &panel_vrr_min_hz_ops, &panel_vrr_min_hz, 0444);
++module_param_cb(panel_vrr_min_hz, &panel_vrr_min_hz_ops, &panel_vrr_min_hz, 0644);
+ MODULE_PARM_DESC(panel_vrr_min_hz,
+-		 "J604 experiment: offer VRR on the internal panel; VRR_ENABLED sets the DCP adaptive-sync minimum to this rate (A442 IOMFBParameter 14, as desktop 26.6 ProMotion panels; 0: off, default; at most 119; boot time)");
++		 "J604: adaptive sync on the internal panel; VRR_ENABLED sets the DCP adaptive-sync minimum to this rate (A442 IOMFBParameter 14, as desktop 26.6 ProMotion panels; default: the machine's, J604 48, J713/J715 0 = off; at most 119). Set at boot it offers VRR (vrr_capable, the EDID range); a later write moves the minimum from the next commit, and 0 holds the panel at 120 Hz");
+ 
+ static unsigned int panel_boost_nits;
+ 
+@@ -274,6 +280,9 @@ struct iomfb_m4 {
+ 	u32 vrr_min_sent;
+ 	u32 vrr_status;
+ 	u64 vrr_calls;
++	/* The minimum when the panel EDID was first published, 0: no VRR offered. */
++	u32 vrr_offered_hz;
++	bool vrr_latched;
+ 	/*
+ 	 * Bright surroundings (panel_boost_nits): the ADT ceiling (supports-aurora,
+ 	 * aurora-maximum-nits; 0: none) and the one the last carried level used.
+@@ -2814,6 +2823,16 @@ static u64 dcp_m4_bw_mailbox(struct device *dev)
+ 	return slot;
+ }
+ 
++/*
++ * The defaults the machine profile ships on (port rule: a feature ships
++ * enabled), unless the parameter was given on the command line.
++ */
++static void iomfb_m4_machine_defaults(const struct dcp_m4_profile *pf)
++{
++	if (!READ_ONCE(panel_vrr_min_hz_given))
++		WRITE_ONCE(panel_vrr_min_hz, pf->vrr_min_hz);
++}
++
+ int iomfb_m4_init(struct apple_dcp *owner)
+ {
+ 	struct platform_device *pdev = to_platform_device(owner->dev);
+@@ -2839,6 +2858,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
+ 	if (!external && !pf->timing)
+ 		return dev_err_probe(dev, -ENODEV, "no qualified %s panel timing\n", pf->name);
+ 	dcp_m4_pf = pf;
++	iomfb_m4_machine_defaults(pf);
+ 	ret = dcp_m4_dart_check(dev);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "inherited SID23 domain not qualified\n");
+@@ -3157,8 +3177,16 @@ int iomfb_m4_panel_edid(struct apple_dcp *owner, struct drm_connector *connector
+ 	/* The internal panel only: an external T8132 output has a sink EDID. */
+ 	if (!dcp || dcp->external)
+ 		return 0;
+-	/* panel_vrr_min_hz: the compositor may ask for VRR (testing). */
+-	if (READ_ONCE(panel_vrr_min_hz))
++	/*
++	 * VRR is offered at the first publication with panel_vrr_min_hz set
++	 * (the J604 default): vrr_capable and the range in the EDID. A later
++	 * write moves the live minimum (iomfb_m4_atomic_vrr()), not the offer.
++	 */
++	if (!dcp->vrr_latched) {
++		dcp->vrr_latched = true;
++		WRITE_ONCE(dcp->vrr_offered_hz, READ_ONCE(panel_vrr_min_hz));
++	}
++	if (dcp->vrr_offered_hz)
+ 		drm_connector_set_vrr_capable_property(connector, true);
+ 	if (!dcp_m4_pf->model_year)
+ 		return 0;
+@@ -3200,6 +3228,11 @@ int iomfb_m4_panel_edid(struct apple_dcp *owner, struct drm_connector *connector
+ 	ret = iomfb_m4_get_mode(owner, &mode);
+ 	if (ret)
+ 		return ret;
++	/* The VRR range: the offered minimum up to the mode's fixed rate. */
++	if (dcp->vrr_offered_hz && dcp->vrr_offered_hz < drm_mode_vrefresh(&mode)) {
++		id.vrr_min_hz = dcp->vrr_offered_hz;
++		id.vrr_max_hz = drm_mode_vrefresh(&mode);
++	}
+ 	strscpy(id.vendor, "APP", sizeof(id.vendor));
+ 	strscpy(id.name, dcp_m4_pf->name, sizeof(id.name));
+ 	id.model_year = dcp_m4_pf->model_year;
+@@ -3256,7 +3289,7 @@ static int dcp_m4_set_adaptive_sync(struct iomfb_m4 *dcp, u32 min_rr)
+ 				  &param, sizeof(param), &status, sizeof(status));
+ 	dcp->vrr_calls++;
+ 	dcp->vrr_status = le32_to_cpu(status);
+-	dev_info(dcp->dev, "adaptive sync minimum %u.%03u Hz: ret %d status %#x (panel_vrr_min_hz, testing)\n",
++	dev_info(dcp->dev, "adaptive sync minimum %u.%03u Hz: ret %d status %#x (panel_vrr_min_hz)\n",
+ 		 min_rr >> 16, (u32)(((u64)(min_rr & 0xffff) * 1000) >> 16), ret,
+ 		 dcp->vrr_status);
+ 	return ret;
+@@ -3266,8 +3299,11 @@ bool iomfb_m4_panel_vrr_requested(struct apple_dcp *owner)
+ {
+ 	struct iomfb_m4 *dcp = iomfb_is_m4(owner) ? owner->v26_6 : NULL;
+ 
+-	/* The internal panel only: an external T8132 output takes no VRR here. */
+-	return dcp && !dcp->external && READ_ONCE(panel_vrr_min_hz);
++	/*
++	 * The internal panel only, when it offered VRR: an external T8132
++	 * output takes no VRR here. A run-time 0 keeps VRR_ENABLED valid.
++	 */
++	return dcp && !dcp->external && READ_ONCE(dcp->vrr_offered_hz);
+ }
+ 
+ /*
+@@ -3282,11 +3318,12 @@ void iomfb_m4_atomic_vrr(struct apple_dcp *owner, bool vrr_enabled)
+ 	unsigned int hz = READ_ONCE(panel_vrr_min_hz);
+ 	u32 min;
+ 
+-	if (!dcp || dcp->external || !hz)
++	if (!dcp || dcp->external || !READ_ONCE(dcp->vrr_offered_hz))
+ 		return;
+ 	mutex_lock(&dcp->lock);
+-	min = (vrr_enabled ? hz : DCP_M4_VRR_FIXED_HZ) << 16;
+-	if ((dcp->vrr_min_sent || vrr_enabled) && min != dcp->vrr_min_sent &&
++	/* panel_vrr_min_hz written 0 at run time holds the panel at 120 Hz. */
++	min = (vrr_enabled && hz ? hz : DCP_M4_VRR_FIXED_HZ) << 16;
++	if ((dcp->vrr_min_sent || (vrr_enabled && hz)) && min != dcp->vrr_min_sent &&
+ 	    dcp->runtime && !dcp->powered_off &&
+ 	    !dcp_m4_set_adaptive_sync(dcp, min))
+ 		dcp->vrr_min_sent = min;

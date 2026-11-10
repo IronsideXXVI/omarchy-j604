@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 15:56:24 +0000
+Subject: [PATCH] drm/apple: m4: test when the display lets a SoC
+ power-down sleep go ahead
+
+KUnit suite apple-dcp-m4-sleep for dcp-m4-sleep.h: a blanked live
+session on a board with the display power-down, enabled, may sleep; each
+missing condition refuses with its own reason (no session, failed
+session, no power-down on the board, power_gate_ms = 0, still scanning
+out, not blanked); a display powered down already may sleep even if
+power_gate_ms went to 0 since, but never with a failed or missing
+session; and a board without the power-down refuses whatever else holds,
+with the old "no display firmware stop" reason.
+
+Standalone like DRM_APPLE_FABRIC_KUNIT_TEST: it tests only the pure
+header, so it needs neither DRM_APPLE nor Apple display hardware.
+
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/Makefile                  |   1 +
+ drivers/gpu/drm/apple/Kconfig.tests       |  11 +++
+ drivers/gpu/drm/apple/dcp-m4-sleep-test.c | 110 ++++++++++++++++++++++
+ 3 files changed, 122 insertions(+)
+ create mode 100644 drivers/gpu/drm/apple/dcp-m4-sleep-test.c
+
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+index cd966b1b5b..f95f71db78 100644
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -229,6 +229,7 @@ obj-$(CONFIG_DRM_PANTHOR) += panthor/
+ obj-$(CONFIG_DRM_TYR) += tyr/
+ obj-$(CONFIG_DRM_APPLE_FABRIC_CORE) += apple/dcp-fabric-core.o
+ obj-$(CONFIG_DRM_APPLE_FABRIC_KUNIT_TEST) += apple/dcp-fabric-test.o
++obj-$(CONFIG_DRM_APPLE_M4_SLEEP_KUNIT_TEST) += apple/dcp-m4-sleep-test.o
+ obj-$(CONFIG_DRM_APPLE) += apple/
+ obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple/iomfb-state-test.o
+ obj-$(CONFIG_DRM_ASPEED_GFX) += aspeed/
+diff --git a/drivers/gpu/drm/apple/Kconfig.tests b/drivers/gpu/drm/apple/Kconfig.tests
+index 818ffa6b7d..e375cbd022 100644
+--- a/drivers/gpu/drm/apple/Kconfig.tests
++++ b/drivers/gpu/drm/apple/Kconfig.tests
+@@ -13,3 +13,14 @@ config DRM_APPLE_FABRIC_KUNIT_TEST
+ 	  output priority without DRM devices or Apple display hardware.
+ 	  The suite covers direct DisplayPort and USB4 tunnel combinations,
+ 	  immutable tunnel ownership and external display service readiness.
++
++config DRM_APPLE_M4_SLEEP_KUNIT_TEST
++	tristate "KUnit tests for the T8132 display in a SoC power-down sleep" if !KUNIT_ALL_TESTS
++	depends on KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  Test when the T8132 display lets a system sleep that powers the
++	  SoC down go ahead: only for a running, unfailed display session on
++	  a board with the display power-down, enabled, with nothing scanned
++	  out and the display blanked, or with the display powered down
++	  already. No DRM device or Apple display hardware is needed.
+diff --git a/drivers/gpu/drm/apple/dcp-m4-sleep-test.c b/drivers/gpu/drm/apple/dcp-m4-sleep-test.c
+new file mode 100644
+index 0000000000..5ce1863917
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-m4-sleep-test.c
+@@ -0,0 +1,110 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/*
++ * KUnit tests for the T8132 display's part in a sleep that powers the SoC
++ * down (dcp-m4-sleep.h). No hardware.
++ */
++#include <kunit/test.h>
++#include <linux/module.h>
++#include <linux/string.h>
++
++#include "dcp-m4-sleep.h"
++
++/* A J604 with a running, blanked session and power_gate_ms set: may sleep. */
++static struct dcp_m4_fw_sleep_state ready(void)
++{
++	return (struct dcp_m4_fw_sleep_state) {
++		.runtime = true,
++		.gate_capable = true,
++		.gate_enabled = true,
++		.display_off = true,
++	};
++}
++
++static void dcp_m4_sleep_blanked_ok(struct kunit *test)
++{
++	struct dcp_m4_fw_sleep_state s = ready();
++
++	KUNIT_EXPECT_EQ(test, dcp_m4_fw_sleep_check(&s), DCP_M4_FW_SLEEP_OK);
++}
++
++/* Each missing condition refuses on its own, with its own reason. */
++static void dcp_m4_sleep_each_refusal(struct kunit *test)
++{
++	struct dcp_m4_fw_sleep_state s;
++
++	s = ready();
++	s.runtime = false;
++	KUNIT_EXPECT_EQ(test, dcp_m4_fw_sleep_check(&s), DCP_M4_FW_SLEEP_NO_SESSION);
++	s = ready();
++	s.failed = true;
++	KUNIT_EXPECT_EQ(test, dcp_m4_fw_sleep_check(&s), DCP_M4_FW_SLEEP_FAILED);
++	s = ready();
++	s.gate_capable = false;
++	KUNIT_EXPECT_EQ(test, dcp_m4_fw_sleep_check(&s), DCP_M4_FW_SLEEP_NO_GATE);
++	s = ready();
++	s.gate_enabled = false;
++	KUNIT_EXPECT_EQ(test, dcp_m4_fw_sleep_check(&s), DCP_M4_FW_SLEEP_GATE_OFF);
++	s = ready();
++	s.scanning = true;
++	KUNIT_EXPECT_EQ(test, dcp_m4_fw_sleep_check(&s), DCP_M4_FW_SLEEP_SCANNING);
++	s = ready();
++	s.display_off = false;
++	KUNIT_EXPECT_EQ(test, dcp_m4_fw_sleep_check(&s), DCP_M4_FW_SLEEP_NOT_BLANKED);
++}
++
++/* Down already (a blank longer than power_gate_ms): OK even if the knob went to 0 since. */
++static void dcp_m4_sleep_gated_ok(struct kunit *test)
++{
++	struct dcp_m4_fw_sleep_state s = ready();
++
++	s.gated = true;
++	s.gate_enabled = false;
++	KUNIT_EXPECT_EQ(test, dcp_m4_fw_sleep_check(&s), DCP_M4_FW_SLEEP_OK);
++	/* But never for a failed or missing session. */
++	s.failed = true;
++	KUNIT_EXPECT_EQ(test, dcp_m4_fw_sleep_check(&s), DCP_M4_FW_SLEEP_FAILED);
++	s.runtime = false;
++	KUNIT_EXPECT_EQ(test, dcp_m4_fw_sleep_check(&s), DCP_M4_FW_SLEEP_NO_SESSION);
++}
++
++/* No power-down on the board (no apple,pmc-interface): refused whatever else holds, as before. */
++static void dcp_m4_sleep_no_gate_board(struct kunit *test)
++{
++	struct dcp_m4_fw_sleep_state s = ready();
++
++	s.gate_capable = false;
++	s.scanning = true;
++	s.display_off = false;
++	KUNIT_EXPECT_EQ(test, dcp_m4_fw_sleep_check(&s), DCP_M4_FW_SLEEP_NO_GATE);
++	KUNIT_EXPECT_NOT_NULL(test, strstr(dcp_m4_fw_sleep_reason(DCP_M4_FW_SLEEP_NO_GATE),
++					   "no display firmware stop"));
++}
++
++static void dcp_m4_sleep_reasons(struct kunit *test)
++{
++	enum dcp_m4_fw_sleep_verdict v;
++
++	for (v = DCP_M4_FW_SLEEP_OK; v <= DCP_M4_FW_SLEEP_PMP_REFUSED; v++)
++		KUNIT_EXPECT_STRNEQ(test, dcp_m4_fw_sleep_reason(v), "unknown");
++	KUNIT_EXPECT_NOT_NULL(test, strstr(dcp_m4_fw_sleep_reason(DCP_M4_FW_SLEEP_GATE_OFF),
++					   "power_gate_ms=0"));
++}
++
++static struct kunit_case dcp_m4_sleep_cases[] = {
++	KUNIT_CASE(dcp_m4_sleep_blanked_ok),
++	KUNIT_CASE(dcp_m4_sleep_each_refusal),
++	KUNIT_CASE(dcp_m4_sleep_gated_ok),
++	KUNIT_CASE(dcp_m4_sleep_no_gate_board),
++	KUNIT_CASE(dcp_m4_sleep_reasons),
++	{}
++};
++
++static struct kunit_suite dcp_m4_sleep_suite = {
++	.name = "apple-dcp-m4-sleep",
++	.test_cases = dcp_m4_sleep_cases,
++};
++
++kunit_test_suite(dcp_m4_sleep_suite);
++
++MODULE_DESCRIPTION("Apple T8132 display system sleep decision tests");
++MODULE_LICENSE("Dual MIT/GPL");

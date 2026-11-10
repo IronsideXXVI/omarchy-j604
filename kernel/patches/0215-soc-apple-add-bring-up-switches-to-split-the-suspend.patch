@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 07:40:21 +0000
+Subject: [PATCH] soc: apple: add bring-up switches to split the
+ suspend-to-RAM devices stage
+
+A suspend-to-RAM on the J604 resets the machine about 30 s after the
+devices stage resumes (pm_test "devices" with mem; the same stage with
+suspend-to-idle survives). Leaving out the SMC sleep warning or the DCP
+firmware power-down does not change that. Add runtime switches, all
+default off, to narrow down the rest:
+
+  apple_s2r.debug_begin_as_idle: ->begin does not declare the sleep
+    firmware-driven, so every driver suspends as for suspend-to-idle;
+    ->enter refuses such a sleep.
+  rtc_apple_pmu.debug_allow_mem, apple_rtkit_helper.debug_allow_mem:
+    do not refuse that sleep (both refuse a mem sleep that is not
+    firmware-driven).
+  nvme_apple.debug_skip_sleep_stop: no ANS sleep stop; the controller
+    is disabled as for suspend-to-idle.
+  apple_sep.debug_skip_sleep_request: no sleep request to the enclave.
+
+With every switch off nothing changes.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/nvme/host/apple.c        | 11 ++++++++++-
+ drivers/rtc/rtc-apple-pmu.c      |  8 +++++++-
+ drivers/soc/apple/apple-s2r.c    | 18 ++++++++++++++++++
+ drivers/soc/apple/pm_shim.c      | 11 ++++++++++-
+ drivers/soc/apple/rtkit-helper.c | 11 ++++++++++-
+ 5 files changed, 55 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/nvme/host/apple.c b/drivers/nvme/host/apple.c
+index 66c9fbacda..a866bb35d4 100644
+--- a/drivers/nvme/host/apple.c
++++ b/drivers/nvme/host/apple.c
+@@ -2999,9 +2999,18 @@ static int apple_nvme_sleep_flush(struct apple_nvme *anv)
+ 	return ret;
+ }
+ 
++/*
++ * Bring-up: suspend ANS for a suspend-to-RAM as for suspend-to-idle (controller
++ * disabled, RTKit kept running), to locate sleep faults. Such a sleep cannot
++ * complete. Default off.
++ */
++static bool debug_skip_sleep_stop;
++module_param(debug_skip_sleep_stop, bool, 0644);
++MODULE_PARM_DESC(debug_skip_sleep_stop, "Bring-up: no ANS sleep stop in a suspend-to-RAM, as for suspend-to-idle (default: off)");
++
+ static bool apple_nvme_sleep_wanted(struct apple_nvme *anv)
+ {
+-	return anv->sleep_registered &&
++	return anv->sleep_registered && !READ_ONCE(debug_skip_sleep_stop) &&
+ 	       pm_suspend_target_state == PM_SUSPEND_MEM && pm_suspend_via_firmware() &&
+ 	       nvme_ctrl_state(&anv->ctrl) == NVME_CTRL_LIVE && anv->owns_rtkit &&
+ 	       apple_rtkit_is_running(anv->rtk);
+diff --git a/drivers/rtc/rtc-apple-pmu.c b/drivers/rtc/rtc-apple-pmu.c
+index 709c85948f..8e878763b5 100644
+--- a/drivers/rtc/rtc-apple-pmu.c
++++ b/drivers/rtc/rtc-apple-pmu.c
+@@ -382,6 +382,11 @@ static const struct rtc_class_ops apple_pmu_rtc_ops = {
+ 	.alarm_irq_enable = apple_pmu_rtc_alarm_enable,
+ };
+ 
++/* Bring-up: with apple_s2r.debug_begin_as_idle, let a non-firmware-driven mem sleep through. */
++static bool debug_allow_mem;
++module_param(debug_allow_mem, bool, 0644);
++MODULE_PARM_DESC(debug_allow_mem, "Bring-up: do not refuse a suspend-to-RAM that is not firmware-driven (default: off)");
++
+ static int apple_pmu_rtc_prepare(struct device *dev)
+ {
+ 	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
+@@ -393,7 +398,8 @@ static int apple_pmu_rtc_prepare(struct device *dev)
+ 	 * alarm stays armed in the PMU, which stays powered. Only a sleep state
+ 	 * without either has no way to bring the alarm back.
+ 	 */
+-	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE && !pm_suspend_via_firmware())
++	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE && !pm_suspend_via_firmware() &&
++	    !READ_ONCE(debug_allow_mem))
+ 		return -EBUSY;
+ 	return 0;
+ }
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index 18cc96715f..9c85cb086c 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -560,6 +560,16 @@ static bool default_deep;
+ module_param(default_deep, bool, 0444);
+ MODULE_PARM_DESC(default_deep, "Make \"deep\" the default mem sleep; off, suspend-to-idle stays the default and \"deep\" is only offered, as long as a device (the M4 GPU) refuses it once running (default: off)");
+ 
++/*
++ * Bring-up: a suspend-to-RAM that the PM core runs as usual but that is not
++ * declared firmware-driven, so every driver suspends as for suspend-to-idle.
++ * Only for pm_test runs that locate a sleep fault: ->enter refuses it.
++ * Default off: nothing changes.
++ */
++static bool debug_begin_as_idle;
++module_param(debug_begin_as_idle, bool, 0644);
++MODULE_PARM_DESC(debug_begin_as_idle, "Bring-up: do not declare a suspend-to-RAM firmware-driven, so devices suspend as for suspend-to-idle; ->enter then refuses it (default: off)");
++
+ static bool spin_instead_of_sleep;
+ module_param(spin_instead_of_sleep, bool, 0644);
+ MODULE_PARM_DESC(spin_instead_of_sleep, "For bring-up: run every step, arm the watchdog, then spin with interrupts off instead of the final power-down, so only the watchdog can end it; needs wdt_timeout (default: off)");
+@@ -807,6 +817,12 @@ static int apple_s2r_enter(suspend_state_t state)
+ 	struct apple_s2r *s2r = apple_s2r;
+ 	int ret;
+ 
++	/* Nothing was prepared for a firmware-driven sleep (debug_begin_as_idle). */
++	if (!pm_suspend_via_firmware()) {
++		pr_warn("apple-s2r: sleep not declared firmware-driven (debug_begin_as_idle): refused\n");
++		return -EBUSY;
++	}
++
+ 	s2r->done = 0;
+ 	s2r->resumed = false;
+ 	s2r->failed_step = S2R_STEP_NONE;
+@@ -1006,6 +1022,8 @@ static int apple_s2r_begin(suspend_state_t state)
+ 	 */
+ 	if (state != PM_SUSPEND_MEM)
+ 		return 0;
++	if (READ_ONCE(debug_begin_as_idle))
++		return 0;
+ 	if (apple_s2r)
+ 		apple_s2r_pins_save(apple_s2r);
+ 	pm_set_suspend_via_firmware();
+diff --git a/drivers/soc/apple/pm_shim.c b/drivers/soc/apple/pm_shim.c
+index 4d7f52aeaa..55425f0d32 100644
+--- a/drivers/soc/apple/pm_shim.c
++++ b/drivers/soc/apple/pm_shim.c
+@@ -14,6 +14,7 @@
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ #include <linux/mfd/syscon.h>
++#include <linux/moduleparam.h>
+ #include <linux/notifier.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+@@ -356,6 +357,14 @@ int sep_pm_commit_finish(void *ptr)
+ 	return c->sent;
+ }
+ 
++/*
++ * Bring-up: send the enclave no sleep request in a suspend-to-RAM, to locate
++ * sleep faults. Such a sleep cannot complete. Default off.
++ */
++static bool debug_skip_sleep_request;
++module_param(debug_skip_sleep_request, bool, 0644);
++MODULE_PARM_DESC(debug_skip_sleep_request, "Bring-up: send the enclave no sleep request in a suspend-to-RAM (default: off)");
++
+ /*
+  * Only a firmware-driven suspend tells the enclave anything, so every other sleep
+  * stays as it was. Refusing is safe: the PM core runs the resume callback of a
+@@ -367,7 +376,7 @@ static int __maybe_unused sep_pm_suspend(struct device *dev)
+ 	int (*sleep)(void) = READ_ONCE(sep_pm_sleep);
+ 	int ret;
+ 
+-	if (!pm_suspend_via_firmware() || !sleep)
++	if (!pm_suspend_via_firmware() || !sleep || READ_ONCE(debug_skip_sleep_request))
+ 		return 0;
+ 
+ 	WRITE_ONCE(sep_pm_suspending, true);
+diff --git a/drivers/soc/apple/rtkit-helper.c b/drivers/soc/apple/rtkit-helper.c
+index feeaa6f758..c6a8cef717 100644
+--- a/drivers/soc/apple/rtkit-helper.c
++++ b/drivers/soc/apple/rtkit-helper.c
+@@ -404,6 +404,14 @@ static int apple_rtkit_helper_ap_power(struct apple_rtkit_helper *helper, bool o
+  * Bring-up: do not tell the coprocessor the AP goes idle for a sleep (nor, so,
+  * that it is on again). Only for locating a sleep fault. Default off.
+  */
++/*
++ * Bring-up: with apple_s2r.debug_begin_as_idle, keep the adopted session through
++ * a test mem sleep.
++ */
++static bool debug_allow_mem;
++module_param(debug_allow_mem, bool, 0644);
++MODULE_PARM_DESC(debug_allow_mem, "Bring-up: do not refuse a suspend-to-RAM that is not firmware-driven (default: off)");
++
+ static bool debug_skip_ap_notice;
+ module_param(debug_skip_ap_notice, bool, 0644);
+ MODULE_PARM_DESC(debug_skip_ap_notice,
+@@ -473,7 +481,8 @@ static int __maybe_unused apple_rtkit_helper_suspend(struct device *dev)
+ 		return apple_rtkit_helper_ap_idle(helper);
+ 
+ 	/* Only suspend-to-idle has a verified live-session retention contract. */
+-	if (helper->adopted && pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
++	if (helper->adopted && pm_suspend_target_state != PM_SUSPEND_TO_IDLE &&
++	    !READ_ONCE(debug_allow_mem))
+ 		return -EBUSY;
+ 	return 0;
+ }

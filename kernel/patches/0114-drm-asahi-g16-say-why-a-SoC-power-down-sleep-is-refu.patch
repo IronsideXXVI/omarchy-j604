@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 17:53:29 +0000
+Subject: [PATCH] drm/asahi: g16: say why a SoC power-down sleep is
+ refused
+
+G16 refuses a sleep that powers the SoC down (pm_suspend_via_firmware())
+in .prepare, as Aurora does for G15 and G16: it has no firmware stop and
+warm restart, and the firmware would not come back. The refusal was
+silent: the journal only had the PM core's "not prepared for power
+transition: code -16" against the GPU device, with nothing saying what
+is missing, and it applied even where no firmware session exists.
+
+Move G16's sleep callback into g16/sleep.rs with a pure decision
+(g16/sleep/policy.rs):
+ - suspend-to-idle goes ahead, as before (the firmware runs through it
+   with its own idle power management; nothing changes for idle power);
+ - a SoC power-down with the firmware touched (boot::glue::retained(),
+   set when the module is pinned for the firmware session, before RTKit
+   and RUN) is refused, now with "G16: refusing a sleep that powers the
+   SoC down: the GPU firmware has no stop and warm restart yet ...";
+ - a SoC power-down before the firmware was touched goes ahead with an
+   info line: there is nothing to lose. If the AGX vote was already
+   taken, the PMP still refuses (pmp-display-sleep: "the AGX vote is
+   held and has no release").
+
+The shared sleep_refuse in driver.rs had G16 as its only user in this
+tree and goes.
+
+What a G16 firmware stop and warm restart needs, and which parts of it
+have no source yet, is a separate write-up.
+
+Tests: KUnit suite asahi_g16_sleep (3 cases; host-tested with rustc).
+
+TO-VERIFY on the J604 (dev loop, kernel with this commit): with the GPU
+in use, `echo mem > /sys/power/state` is refused with the line above in
+the journal and the system carries on (120 Hz rendering still matches); s2idle
+unchanged (smoke test); idle power unchanged (no idle path touched).
+
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/mod.rs          |  7 +++
+ drivers/gpu/drm/asahi/g16/sleep.rs        | 58 +++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/sleep/policy.rs | 51 ++++++++++++++++++++
+ 3 files changed, 116 insertions(+)
+ create mode 100644 drivers/gpu/drm/asahi/g16/sleep.rs
+ create mode 100644 drivers/gpu/drm/asahi/g16/sleep/policy.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index c5d705a177..05775340ee 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -67,6 +67,7 @@ mod queue;
+ mod recovery;
+ mod regs;
+ mod resources;
++mod sleep;
+ mod slots;
+ mod timestamp;
+ mod uat;
+@@ -150,6 +151,12 @@ impl platform::Driver for Driver {
+         true
+     }
+ 
++    /// Nor restarted after a sleep that powers the SoC down: such a sleep is refused once the
++    /// firmware has been touched, see [`sleep`].
++    fn pm_ops() -> Option<&'static kernel::bindings::dev_pm_ops> {
++        sleep::ops()
++    }
++
+     fn probe<'bound>(
+         pdev: &'bound platform::Device<Core<'_>>,
+         info: Option<&'bound Self::IdInfo>,
+diff --git a/drivers/gpu/drm/asahi/g16/sleep.rs b/drivers/gpu/drm/asahi/g16/sleep.rs
+new file mode 100644
+index 0000000000..5d4086666f
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/sleep.rs
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! System sleep.
++//!
++//! Suspend-to-idle keeps the SoC powered, and the GPU firmware runs through it with its own idle
++//! power management (`asahi.g16_idle_power_off`). A sleep that powers the SoC down
++//! (`pm_suspend_via_firmware()`) takes the GPU's ASC, its power domain and the state iBoot set up
++//! for the cold start with it. G16 has no firmware stop (RTKit idle, then the ASC stopped) and no
++//! warm restart (the ASC started again with the firmware's state kept in DRAM, the RTKit handshake
++//! and no initialization, as macOS does on T8140), so such a sleep is refused once the firmware
++//! has been touched. A G16 that never got that far has nothing to lose; the PMP still refuses the
++//! sleep if the AGX vote was taken.
++
++use kernel::{bindings, device, prelude::*};
++
++mod policy;
++
++use policy::Verdict;
++
++/// `.prepare`, before any device suspends, so that the refusal comes before anything stopped.
++unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_int {
++    // SAFETY: Reads a global flag word.
++    let via_firmware = unsafe { bindings::pm_suspend_via_firmware() };
++    let verdict = policy::verdict(via_firmware, super::boot::glue::retained());
++    if verdict == Verdict::Go {
++        return 0;
++    }
++    // SAFETY: The PM core passes the bound device and holds a reference to it for the callback.
++    let d = unsafe { device::Device::<device::Normal>::from_raw(dev) };
++    if verdict == Verdict::Untouched {
++        dev_info!(
++            d,
++            "G16: firmware never started: a sleep that powers the SoC down loses nothing here\n"
++        );
++        return 0;
++    }
++    dev_warn!(
++        d,
++        "G16: refusing a sleep that powers the SoC down: the GPU firmware has no stop and warm restart yet and would not come back (suspend-to-idle is not affected)\n"
++    );
++    EBUSY.to_errno()
++}
++
++struct SleepOps(bindings::dev_pm_ops);
++
++// SAFETY: Immutable: the callbacks are plain functions.
++unsafe impl Sync for SleepOps {}
++
++static OPS: SleepOps = SleepOps(bindings::dev_pm_ops {
++    prepare: Some(sleep_prepare),
++    // SAFETY: All-zero is the absence of every other callback.
++    ..unsafe { core::mem::zeroed() }
++});
++
++/// G16's system sleep callbacks.
++pub(super) fn ops() -> Option<&'static bindings::dev_pm_ops> {
++    Some(&OPS.0)
++}
+diff --git a/drivers/gpu/drm/asahi/g16/sleep/policy.rs b/drivers/gpu/drm/asahi/g16/sleep/policy.rs
+new file mode 100644
+index 0000000000..d515b2bd66
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/sleep/policy.rs
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! The G16 sleep decision, apart from the hardware so that it can be tested.
++
++/// What `.prepare` does with a sleep.
++#[derive(Copy, Clone, Debug, PartialEq, Eq)]
++pub(crate) enum Verdict {
++    /// The SoC stays powered (suspend-to-idle): the firmware runs through the sleep.
++    Go,
++    /// The SoC powers down, but the firmware was never touched: there is nothing to lose.
++    Untouched,
++    /// The SoC powers down under a firmware session: it would be lost.
++    Refuse,
++}
++
++/// The verdict for a sleep.
++///
++/// `via_firmware`: the sleep powers the SoC down (`pm_suspend_via_firmware()`).
++/// `retained`: the firmware has been touched and its session is kept until reboot
++/// (`boot::glue::retained()`).
++pub(crate) fn verdict(via_firmware: bool, retained: bool) -> Verdict {
++    match (via_firmware, retained) {
++        (false, _) => Verdict::Go,
++        (true, false) => Verdict::Untouched,
++        (true, true) => Verdict::Refuse,
++    }
++}
++
++#[cfg_attr(not(test), kernel::macros::kunit_tests(asahi_g16_sleep))]
++mod tests {
++    use super::*;
++
++    /// Suspend-to-idle goes ahead whatever the firmware does.
++    #[test]
++    fn suspend_to_idle_goes() {
++        assert_eq!(verdict(false, true), Verdict::Go);
++        assert_eq!(verdict(false, false), Verdict::Go);
++    }
++
++    /// A SoC power-down with the firmware session up is refused.
++    #[test]
++    fn power_down_with_firmware_refused() {
++        assert_eq!(verdict(true, true), Verdict::Refuse);
++    }
++
++    /// A SoC power-down before the firmware was touched loses nothing.
++    #[test]
++    fn power_down_before_firmware_goes() {
++        assert_eq!(verdict(true, false), Verdict::Untouched);
++    }
++}

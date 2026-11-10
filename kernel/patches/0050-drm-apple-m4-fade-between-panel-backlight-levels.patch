@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 7 Nov 2026 04:20:00 +0000
+Subject: [PATCH] drm/apple: m4: fade between panel backlight levels
+
+The T8132 backend sends the panel level in the swap, and firmware 26.6.2
+shows each level at once. Its policy jumps to every new level, so any
+change is a visible step. On a MacBook Pro (14-inch, M4) with an encrypted
+root this shows on every boot: the first present carries the board
+record's 140 nits, the passphrase prompt shows at that level, and after
+unlock systemd-backlight restores the saved level (48 nits here) while
+the boot splash is still up. The DCP log shows brightness_changed 140.0
+and then 48.0 nits (16.16), a hard step on a dark screen 0.7 s before
+the splash quits.
+
+Fade there as on H17P. The first present still carries the requested
+level at once, as the panel does not show it yet. After that a new level
+fades from the level presented last over DCP_BL_FADE_MS, one
+brightness-only present per DCP_BL_FADE_STEP_MS at most; steps that
+come faster than presents complete merge into the next one, and steps
+also ride on the compositor's flips. Blanking, unblanking, suspend and a
+level the panel may not show yet still jump. A fade only moves between
+two accepted levels, so it never exceeds the requested level nor the
+board maximum.
+
+Brightness-only presents on this firmware are the existing backlight
+work path; this only makes it run once per step instead of once per
+change.
+
+Add a KUnit case for the T8132 setup: the first present carries the
+default, the restored level fades down monotonically and ends exactly
+at its target, a fade up stops at its target, and a level requested
+before the first present completes is presented directly.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+[j604: k610 drm sync: dcp_backlight_test.c conflict only (both sides add tests/cases: upstream EDR cases, this T8132 fade case). Upstream 50d5865ea6 still makes the T8132 panel jump (dcp_backlight_configure()); Aurora 2924f21d75 fades the DAC-firmware panels only, so this fade is still needed and its dcp_backlight.c hunk applied unchanged.]
+---
+ drivers/gpu/drm/apple/dcp_backlight.c      |  9 ++-
+ drivers/gpu/drm/apple/dcp_backlight_test.c | 68 ++++++++++++++++++++++
+ 2 files changed, 75 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp_backlight.c b/drivers/gpu/drm/apple/dcp_backlight.c
+index 4eb26803bb..c5e0c6c277 100644
+--- a/drivers/gpu/drm/apple/dcp_backlight.c
++++ b/drivers/gpu/drm/apple/dcp_backlight.c
+@@ -294,10 +294,15 @@ int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
+ 				  default_valid, default_nits);
+ 		if (!ret && iomfb_is_m4(dcp)) {
+ 			/*
+-			 * The J713 panel jumps to new levels, and its first
+-			 * present carries the requested level.
++			 * The first present carries the requested level, as
++			 * the panel does not show it yet.  The firmware shows
++			 * each present's level at once, so later levels fade
++			 * from the one presented last, as on H17P: otherwise
++			 * the level restored after boot is a visible step on
++			 * the boot splash.
+ 			 */
+ 			dcp_bl_jump(&dcp->backlight.state);
++			dcp->backlight.state.fade = true;
+ 			dcp->backlight.kick = kick;
+ 		} else if (!ret) {
+ 			dcp->backlight.state.fade = !iomfb_v14_7_panel_nits(dcp);
+diff --git a/drivers/gpu/drm/apple/dcp_backlight_test.c b/drivers/gpu/drm/apple/dcp_backlight_test.c
+index 2a40415fb6..572df90f00 100644
+--- a/drivers/gpu/drm/apple/dcp_backlight_test.c
++++ b/drivers/gpu/drm/apple/dcp_backlight_test.c
+@@ -760,6 +760,73 @@ static void edr_start_ramp_test(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, dcp_edr_next(hm, DCP_EDR_UNITY, 6, 6), DCP_EDR_UNITY);
+ }
+ 
++/*
++ * The T8132 policy as dcp_backlight_configure() sets it up: a registration
++ * default the panel does not show yet, presented by the first present, and
++ * fades between lit levels after that.
++ */
++static void backlight_m4_unlock_fade_test(struct kunit *test)
++{
++	struct dcp_backlight_state state;
++	struct dcp_backlight_present present;
++	u32 last = 140, elapsed;
++
++	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 600, false, 0, true, 140), 0);
++	dcp_bl_jump(&state);
++	state.fade = true;
++	KUNIT_EXPECT_FALSE(test, state.level_known);
++
++	/* The first present carries the default, at once. */
++	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
++	KUNIT_EXPECT_EQ(test, present.nits, 140U);
++	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
++	KUNIT_EXPECT_TRUE(test, state.level_known);
++
++	/* The level restored after unlock fades down from the one shown. */
++	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 48, false, false), 0);
++	KUNIT_EXPECT_TRUE(test, state.fading);
++	KUNIT_EXPECT_FALSE(test, state.dirty);
++	KUNIT_EXPECT_EQ(test, dcp_bl_effective(&state), 140U);
++	for (elapsed = 16; elapsed < 250; elapsed += 16) {
++		KUNIT_EXPECT_TRUE(test, dcp_bl_fade_step(&state, elapsed, 250));
++		KUNIT_EXPECT_LE(test, state.level, last);
++		KUNIT_EXPECT_GE(test, state.level, 48U);
++		last = state.level;
++		if (state.dirty) {
++			KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
++			KUNIT_EXPECT_EQ(test, present.nits, last);
++			KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
++		}
++	}
++	KUNIT_EXPECT_FALSE(test, dcp_bl_fade_step(&state, 250, 250));
++	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
++	KUNIT_EXPECT_EQ(test, present.nits, 48U);
++	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
++	KUNIT_EXPECT_EQ(test, state.actual, 48U);
++
++	/* A fade up never passes its target, nor the panel maximum. */
++	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 140, false, false), 0);
++	last = 48;
++	for (elapsed = 0; elapsed <= 300; elapsed += 7) {
++		dcp_bl_fade_step(&state, elapsed, 250);
++		KUNIT_EXPECT_GE(test, state.level, last);
++		KUNIT_EXPECT_LE(test, state.level, 140U);
++		last = state.level;
++	}
++	KUNIT_EXPECT_EQ(test, state.level, 140U);
++	KUNIT_EXPECT_EQ(test, dcp_bl_request(&state, 601, false, false), -ERANGE);
++	KUNIT_EXPECT_EQ(test, state.target, 140U);
++
++	/* A request before the first present completes is presented directly. */
++	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 600, false, 0, true, 140), 0);
++	dcp_bl_jump(&state);
++	state.fade = true;
++	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 48, false, false), 0);
++	KUNIT_EXPECT_FALSE(test, state.fading);
++	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
++	KUNIT_EXPECT_EQ(test, present.nits, 48U);
++}
++
+ static struct kunit_case backlight_cases[] = {
+ 	KUNIT_CASE(backlight_reports_keep_target_test),
+ 	KUNIT_CASE(backlight_millinits_takeover_test),
+@@ -786,6 +853,7 @@ static struct kunit_case backlight_cases[] = {
+ 	KUNIT_CASE(edr_low_end_steady_test),
+ 	KUNIT_CASE(edr_fade_monotonic_test),
+ 	KUNIT_CASE(edr_start_ramp_test),
++	KUNIT_CASE(backlight_m4_unlock_fade_test),
+ 	{}
+ };
+ 

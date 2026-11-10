@@ -1,0 +1,216 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 11:09:52 +0000
+Subject: [PATCH] accel/ane: take the H16 DAPF record count from the
+ platform
+
+The H16 boot programs and checks exactly four DAPF records, sizes the
+range table for four, reads eight apple,dapf-ranges cells at probe and
+maps four identity MMIO pages. That is the T6041 bank. The T8132 ADT
+dapf-instance-0 has five records (J604 runtime ADT, MEASURED), and its
+DT node already lists five pairs, which the preflight accepts through
+dapf_range_count.
+
+Size the table for five, and use the platform count (four when unset)
+everywhere the stages walk the records: the compare and program pass,
+the probe read and its checks, the aperture check and the identity
+mappings. A count above the table size is refused.
+
+KUnit: a five-record platform programs and reads back all five records,
+the fifth included, writes nothing on a second pass, never touches a
+sixth, and an oversized count is refused.
+
+No change for the T6041: its platform leaves the count at four.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/accel/ane/ane_h16_backend.c   | 11 +++++----
+ drivers/accel/ane/ane_h16_boot.h      | 28 +++++++++++++++-------
+ drivers/accel/ane/ane_h16_boot_test.c | 34 +++++++++++++++++++++++++--
+ 3 files changed, 58 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/accel/ane/ane_h16_backend.c b/drivers/accel/ane/ane_h16_backend.c
+index 19aa484bc8..a0c28f098c 100644
+--- a/drivers/accel/ane/ane_h16_backend.c
++++ b/drivers/accel/ane/ane_h16_backend.c
+@@ -861,7 +861,7 @@ static int ane_h16_map(void *ctx)
+ 	    !(h->domain->pgsize_bitmap & SZ_16K))
+ 		return -EOPNOTSUPP;
+ 	/* Never widen a finalized DART aperture by assigning geometry fields. */
+-	for (i = 0; i < 4; i++) {
++	for (i = 0; i < ane_h16_dapf_count(b->soc); i++) {
+ 		u64 page = round_down(b->ranges[i][0], SZ_16K);
+ 
+ 		if (!ane_fw_contains(h->domain->geometry.aperture_start,
+@@ -890,7 +890,7 @@ static int ane_h16_map(void *ctx)
+ 	ret = ane_h16_map_heap_tail(h);
+ 	if (ret)
+ 		return ret;
+-	for (i = 0; i < 4; i++) {
++	for (i = 0; i < ane_h16_dapf_count(b->soc); i++) {
+ 		u64 page = round_down(b->ranges[i][0], SZ_16K);
+ 
+ 		ret = ane_h16_map_range(h, page, page, SZ_16K,
+@@ -1805,11 +1805,14 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
+ 	h->boot.ctx = h;
+ 	h->boot.ops = &ane_h16_ops;
+ 	h->boot.transport_ops = &ane_h16_transport_ops;
++	ret = -EINVAL;
++	if (ane_h16_dapf_count(soc) > ANE_H16_DAPF_MAX)
++		goto free;
+ 	ret = of_property_read_u64_array(h->dev->of_node, "apple,dapf-ranges",
+-					 &h->boot.ranges[0][0], 8);
++					 &h->boot.ranges[0][0], 2 * ane_h16_dapf_count(soc));
+ 	if (ret)
+ 		goto free;
+-	for (i = 0; i < 4; i++) {
++	for (i = 0; i < ane_h16_dapf_count(soc); i++) {
+ 		u64 start = h->boot.ranges[i][0], end = h->boot.ranges[i][1];
+ 
+ 		ret = -EINVAL;
+diff --git a/drivers/accel/ane/ane_h16_boot.h b/drivers/accel/ane/ane_h16_boot.h
+index f12a8fb3d8..301e122c6d 100644
+--- a/drivers/accel/ane/ane_h16_boot.h
++++ b/drivers/accel/ane/ane_h16_boot.h
+@@ -6,6 +6,9 @@
+ 
+ #include "ane_fw_transport.h"
+ 
++/* apple,dapf-ranges pairs: four on the T6041, five on the T8132. */
++#define ANE_H16_DAPF_MAX 5
++
+ enum ane_h16_stage {
+ 	ANE_H16_REFUSE,
+ 	ANE_H16_PREFLIGHT,
+@@ -156,7 +159,7 @@ struct ane_h16_boot {
+ 	struct ane_fw_surface pool;
+ 	struct ane_fw_surface ipc;
+ 	struct ane_fw_surface heap;
+-	u64 ranges[4][2];
++	u64 ranges[ANE_H16_DAPF_MAX][2];
+ 	u32 requests[5];
+ 	u32 tick;
+ 	/* The PMU aperture base for SET_SNE_PMU_BASE2 at startup; 0: not sent. */
+@@ -331,32 +334,39 @@ static inline bool ane_h16_dapf_record(struct ane_h16_boot *b, unsigned int reco
+ }
+ 
+ /*
+- * Compare the four records with apple,dapf-ranges. Preflight only reports.
++ * Compare the records (four, or the platform's count) with apple,dapf-ranges. Preflight only reports.
+  * The bank loses its records whenever its power domain does, so map writes
+  * every record that differs, in the order the t8110 bank takes them, and
+  * reads it back. A bank whose lock word has bit 2 set and that differs is
+  * refused before any write.
+  */
++static inline unsigned int ane_h16_dapf_count(const struct ane_fw_platform *soc)
++{
++	return soc->dapf_range_count ?: 4;
++}
++
+ static inline int ane_h16_dapf(struct ane_h16_boot *b, bool program)
+ {
+ 	const struct ane_h16_mmio *m = b->mmio;
+ 	enum ane_h16_window owner = ANE_H16_DART0 + b->soc->dapf_dart;
+ 	u32 protect = b->ops->read32(b->ctx, owner, m->dart_protect);
+ 	u32 lock = b->ops->read32(b->ctx, owner, m->dart_lock);
+-	unsigned int record, matched = 0;
+-	bool match[4];
++	unsigned int record, matched = 0, n = ane_h16_dapf_count(b->soc);
++	bool match[ANE_H16_DAPF_MAX];
+ 
+ 	b->ops->log(b->ctx, "DAPF protect/lock", protect, lock);
+-	for (record = 0; record < 4; record++) {
++	if (n > ANE_H16_DAPF_MAX)
++		return -EINVAL;
++	for (record = 0; record < n; record++) {
+ 		match[record] = ane_h16_dapf_record(b, record);
+ 		matched += match[record];
+ 	}
+-	b->ops->log(b->ctx, "DAPF records matching", matched, 4);
+-	if (!program || matched == 4)
++	b->ops->log(b->ctx, "DAPF records matching", matched, n);
++	if (!program || matched == n)
+ 		return 0;
+ 	if (lock & BIT(2))
+ 		return -EPERM;
+-	for (record = 0; record < 4; record++) {
++	for (record = 0; record < n; record++) {
+ 		u32 off = m->dapf_records + record * m->dapf_stride;
+ 
+ 		if (match[record])
+@@ -369,7 +379,7 @@ static inline int ane_h16_dapf(struct ane_h16_boot *b, bool program)
+ 		if (!ane_h16_dapf_record(b, record))
+ 			return -EIO;
+ 	}
+-	b->ops->log(b->ctx, "DAPF records written/read back", 4 - matched, 4);
++	b->ops->log(b->ctx, "DAPF records written/read back", n - matched, n);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/accel/ane/ane_h16_boot_test.c b/drivers/accel/ane/ane_h16_boot_test.c
+index 58bf09123d..c0a16e33b4 100644
+--- a/drivers/accel/ane/ane_h16_boot_test.c
++++ b/drivers/accel/ane/ane_h16_boot_test.c
+@@ -94,7 +94,8 @@ static void sim_check_dapf(struct ane_h16_sim *s, u32 off, u32 width)
+ 
+ 	KUNIT_ASSERT_NOT_NULL(s->test, m);
+ 	KUNIT_EXPECT_GE(s->test, off, m->dapf_records);
+-	KUNIT_EXPECT_LE(s->test, off + width, m->dapf_records + 4 * m->dapf_stride);
++	KUNIT_EXPECT_LE(s->test, off + width,
++			m->dapf_records + ane_h16_dapf_count(&s->soc) * m->dapf_stride);
+ 	KUNIT_EXPECT_LE(s->test, off + width, s->soc.dapf_size);
+ }
+ 
+@@ -585,7 +586,7 @@ static int sim_init(struct kunit *test)
+ 	s->boot.ops = &sim_ops;
+ 	s->boot.transport_ops = &sim_transport_ops;
+ 	s->boot.ctx = s;
+-	for (i = 0; i < 4; i++) {
++	for (i = 0; i < ANE_H16_DAPF_MAX; i++) {
+ 		s->boot.ranges[i][0] = 0x500000000ULL + i * SZ_16K;
+ 		s->boot.ranges[i][1] = s->boot.ranges[i][0] + 3;
+ 	}
+@@ -601,6 +602,34 @@ static int sim_init(struct kunit *test)
+ 	return 0;
+ }
+ 
++/*
++ * T8132: five apple,dapf-ranges pairs. An unprogrammed bank gets all five
++ * records, the fifth one included, and reads them back; a sixth is never
++ * touched (sim_check_dapf bounds every access by the platform count).
++ */
++static void ane_h16_dapf_five_test(struct kunit *test)
++{
++	struct ane_h16_sim *s = test->priv;
++	const struct ane_h16_mmio *m;
++	u32 *p;
++
++	s->soc.dapf_range_count = 5;
++	s->boot.mmio = &s->mmio;
++	m = s->boot.mmio;
++	KUNIT_ASSERT_EQ(test, ane_h16_dapf(&s->boot, true), 0);
++	p = &s->dapf[(m->dapf_records + 4 * m->dapf_stride) / 4];
++	KUNIT_EXPECT_EQ(test, p[0] & 0xff, (u32)m->dapf_r0);
++	KUNIT_EXPECT_EQ(test, p[2], lower_32_bits(s->boot.ranges[4][0]));
++	KUNIT_EXPECT_EQ(test, p[3], upper_32_bits(s->boot.ranges[4][0]));
++	KUNIT_EXPECT_EQ(test, p[8] & 0xffff, (u32)m->dapf_r20);
++	/* Already programmed: a second pass writes nothing. */
++	s->dapf_writes = 0;
++	KUNIT_ASSERT_EQ(test, ane_h16_dapf(&s->boot, true), 0);
++	KUNIT_EXPECT_EQ(test, s->dapf_writes, 0U);
++	s->soc.dapf_range_count = ANE_H16_DAPF_MAX + 1;
++	KUNIT_EXPECT_EQ(test, ane_h16_dapf(&s->boot, true), -EINVAL);
++}
++
+ static void ane_h16_happy_test(struct kunit *test)
+ {
+ 	struct ane_h16_sim *s = test->priv;
+@@ -1229,6 +1258,7 @@ static struct kunit_case ane_h16_boot_cases[] = {
+ 	KUNIT_CASE(ane_h16_happy_test),
+ 	KUNIT_CASE(ane_h16_locked_matching_test),
+ 	KUNIT_CASE(ane_h16_dapf_program_test),
++	KUNIT_CASE(ane_h16_dapf_five_test),
+ 	KUNIT_CASE(ane_h16_dapf_partial_test),
+ 	KUNIT_CASE(ane_h16_dapf_readback_test),
+ 	KUNIT_CASE(ane_h16_unknown_revision_test),

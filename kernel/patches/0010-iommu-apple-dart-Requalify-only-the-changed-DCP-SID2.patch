@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 6 Nov 2026 01:23:51 +0000
+Subject: [PATCH] iommu/apple-dart: Requalify only the changed DCP
+ SID23 leaves
+
+Until the IOMFB session is qualified, every message the host sends the
+DCP first runs the full health check, and for SID23 that check walks
+every leaf of the inherited tables: each nonzero leaf outside the DCP's
+own reservations goes through region_intersects(), under the table lock
+with interrupts off. On the J604 the loader leaves five foreign 32-MiB
+slots, up to 10240 leaves, and the DCP's startup makes 317 callbacks,
+each acknowledged by one such send while the firmware waits. IOMFB
+startup takes 4.8-4.9 s at boot there, and the firmware log advances in
+steps of about 12 ms, one per round trip; the internal panel's real KMS
+device then arrives some 5 s after the boot splash and the disk password
+prompt are already up on simpledrm.
+
+apple_dart_dcp_leaf_safe() depends only on the leaf value and on inputs
+fixed at admission (the consumer and reserved-memory snapshots, the
+linear map and System RAM). Remember the value each foreign leaf had
+when it last passed, and run the qualification again only for a leaf
+whose value changed. Every leaf is still read on every call and any
+unsafe leaf still fails the domain, as before; an unchanged leaf keeps
+its earlier verdict. The inherited SID0 and SID16 tables already keep
+their expected values this way.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/iommu/apple-dart-dcp.h | 11 +++++++++++
+ drivers/iommu/apple-dart.c     | 11 +++++++++--
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/iommu/apple-dart-dcp.h b/drivers/iommu/apple-dart-dcp.h
+index 49ed48c2f3..95c703277b 100644
+--- a/drivers/iommu/apple-dart-dcp.h
++++ b/drivers/iommu/apple-dart-dcp.h
+@@ -22,6 +22,11 @@ struct apple_dart_dcp {
+ 	u64 *root;
+ 	u64 *table[DCP_DART_ENTRIES];
+ 	u64 *expected[DCP_DART_ENTRIES];
++	/* SID23 foreign leaves: the value each leaf had when it last passed
++	 * apple_dart_dcp_leaf_safe(). Firmware may rewrite them; only a
++	 * changed leaf needs the (fixed-input) qualification again.
++	 */
++	u64 *qualified[DCP_DART_ENTRIES];
+ 	u64 entry[DCP_DART_ENTRIES];
+ 	struct resource leaf_regions[64];
+ 	unsigned int nr_leaf_regions;
+@@ -596,6 +601,10 @@ static int apple_dart_dcp_import(struct apple_dart *dart, unsigned int sid,
+ 			dcp->expected[i] = apple_dart_retained_alloc(dart, DCP_DART_PAGE);
+ 			if (!dcp->expected[i])
+ 				return -ENOMEM;
++		} else {
++			dcp->qualified[i] = apple_dart_retained_alloc(dart, DCP_DART_PAGE);
++			if (!dcp->qualified[i])
++				return -ENOMEM;
+ 		}
+ 		for (unsigned int j = 0; j < DCP_DART_ENTRIES; j++) {
+ 			u64 leaf = READ_ONCE(dcp->table[i][j]);
+@@ -610,6 +619,8 @@ static int apple_dart_dcp_import(struct apple_dart *dart, unsigned int sid,
+ 					sid, i, j, leaf);
+ 			if (sid != 23)
+ 				dcp->expected[i][j] = leaf;
++			else
++				dcp->qualified[i][j] = leaf;
+ 		}
+ 	}
+ 	/* Refuse an unstable root instead of trying to repair it. */
+diff --git a/drivers/iommu/apple-dart.c b/drivers/iommu/apple-dart.c
+index e9929282d0..908f39d238 100644
+--- a/drivers/iommu/apple-dart.c
++++ b/drivers/iommu/apple-dart.c
+@@ -3270,11 +3270,18 @@ static int __apple_dart_dcp_check(struct device *dev)
+ 		 * their physical ownership too, not just known firmware segments.
+ 		 */
+ 		if (dcp->sid == 23 && test_bit(i, dcp->foreign) && dcp->table[i])
+-			for (unsigned int j = 0; j < DCP_DART_ENTRIES; j++)
+-				if (!apple_dart_dcp_leaf_safe(dcp, READ_ONCE(dcp->table[i][j]))) {
++			for (unsigned int j = 0; j < DCP_DART_ENTRIES; j++) {
++				u64 leaf = READ_ONCE(dcp->table[i][j]);
++
++				/* Same verdict as last time: the inputs are fixed at admission. */
++				if (leaf == dcp->qualified[i][j])
++					continue;
++				if (!apple_dart_dcp_leaf_safe(dcp, leaf)) {
+ 					drift = true;
+ 					break;
+ 				}
++				dcp->qualified[i][j] = leaf;
++			}
+ 		if (drift)
+ 			break;
+ 	}

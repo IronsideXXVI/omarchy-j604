@@ -1,0 +1,272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 7 Nov 2026 07:31:18 +0000
+Subject: [PATCH] drm/asahi: g16: add a testing knob for idle core
+ power-off
+
+The G16 (T8132) backend writes eleven Globals policy words that sit at the
+same offsets, with the same values, as the G17 region C fields (+0x24 3000,
++0x998..+0x9cc, including idle_power_off_delay 40 at +0x9bc and
+compute_watchdog 50 at +0x9cc). It leaves +0x30 zero. The G17 backend
+documents +0x30 as idle_power_off ("non-zero lets the firmware power the GPU
+cores off when idle") and sets it to 1. On the J604 the GPU rail stays at
+about 278 mW at desktop idle, against 0 mW on macOS.
+
+Add g16_idle_power_off (default 0, read once at probe):
+  0: the qualified encoding, unchanged;
+  1: also write Globals +0x30 = 1;
+  2: as 1, and clear the G17 gating-disable bits (SGX +0xd06030, bits 1-2)
+     before the initdata doorbell, as Regs::enable_g17_gating does.
+
+The Globals policy words move into globals::POLICY and
+encode_globals_policy() so that a test can check that the default encoding is
+byte-identical and that the knob adds only +0x30. Tests in the
+asahi_g16_idle_power_off suite (plain #[test] on the host).
+
+Not qualified on T8132/25G83: whether the firmware honours +0x30, whether
+SGX +0xd06030 has the G17 meaning, and whether the host MMIO the backend
+does at runtime (SGX +0xd60000 generation, +0xc000 status window) stays
+accessible while the cores are gated. The default keeps today's behaviour.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: Claude:claude-opus-5.5
+---
+ drivers/gpu/drm/asahi/asahi_core.rs      |   4 +
+ drivers/gpu/drm/asahi/g16/boot.rs        |  16 ++++
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs | 103 +++++++++++++++++++----
+ drivers/gpu/drm/asahi/g16/initdata.rs    |   9 ++
+ drivers/gpu/drm/asahi/g16/params.rs      |  12 +++
+ drivers/gpu/drm/asahi/g16/power.rs       |   3 +-
+ 6 files changed, 131 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index 076d9ab7e7..d48aa2fa5b 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -240,5 +240,9 @@ module! {
+             default: 1,
+             description: "G16: accept render/compute sampler heaps (0 refuses them)",
+         },
++        g16_idle_power_off: u32 {
++            default: 0,
++            description: "G16 (testing): idle core power-off. 0: qualified 25G83 initdata (cores stay powered); 1: Globals +0x30 = 1 (G17 region C idle_power_off); 2: 1 and clear the SGX +0xd06030 gating-disable bits before init (G17 pattern)",
++        },
+     },
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index ea2c1a9175..5c61bca3a2 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -642,6 +642,22 @@ fn run(
+             .try_write32(u32::from_le_bytes(word.try_into().unwrap()), i * 4)?;
+     }
+     regs::wmb();
++    if super::params::idle_power_off() >= 2 {
++        // G17 clears these gating-disable bits before the firmware is initialized
++        // (Regs::enable_g17_gating). Not qualified on T8132 (testing knob only).
++        const GATING_CONTROL: usize = 0xd06030;
++        const GATING_DISABLE: u32 = 0x6;
++        let res = &session.regs.res;
++        let before = res.sgx_read32_at(GATING_CONTROL)?;
++        res.sgx_write32_at(GATING_CONTROL, before & !GATING_DISABLE)?;
++        let after = res.sgx_read32_at(GATING_CONTROL)?;
++        dev_info!(
++            dev,
++            "M4: SGX gating control {:#x} -> {:#x} (g16_idle_power_off=2, testing)\n",
++            before,
++            after
++        );
++    }
+     let root = init.root_va()?;
+     session.send(
+         hw::ep::FIRMWARE,
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index 9acbb4ac76..b575d59560 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -81,6 +81,38 @@ pub(crate) mod control {
+ pub(crate) mod globals {
+     pub(crate) const SIZE: usize = super::OBJECT_SIZE[super::id::GLOBALS];
+     pub(crate) const PSTATE_SELECTORS: [usize; 3] = [0x88, 0x8c, 0x98];
++    /// The word the G17 backend documents as region C `idle_power_off` ("non-zero lets the
++    /// firmware power the GPU cores off when idle"), at the same offset. The qualified G16
++    /// Globals leaves it zero; the G17 region C values around it (+0x24, +0x998..+0x9cc,
++    /// including the power-off delay at +0x9bc) are written by [`super::encode`] on both.
++    pub(crate) const IDLE_POWER_OFF: usize = 0x30;
++    /// The qualified Globals policy words (offset, value): the subset of G17 region C that
++    /// the working M4 encoder writes.
++    pub(crate) const POLICY: [(usize, u32); 11] = [
++        (0x78, 1),
++        (0xe28, 3),
++        (0x24, 3000),
++        (0x998, 40),
++        (0x99c, 10),
++        (0x9a0, 250),
++        (0x9b8, 2),
++        (0x9bc, 40),
++        (0x9c0, 5),
++        (0x9c8, 40),
++        (0x9cc, 50),
++    ];
++    const _: () = assert!(IDLE_POWER_OFF + 4 <= SIZE);
++}
++
++/// Writes the Globals policy words; `idle_power_off` adds only [`globals::IDLE_POWER_OFF`].
++pub(crate) fn encode_globals_policy(g: &mut [u8], idle_power_off: bool) -> Result<(), ()> {
++    for (at, value) in globals::POLICY {
++        put32(g, at, value)?;
++    }
++    if idle_power_off {
++        put32(g, globals::IDLE_POWER_OFF, 1)?;
++    }
++    Ok(())
+ }
+ pub(crate) mod hwdata {
+     pub(crate) const SIZE: usize = super::OBJECT_SIZE[super::id::MAIN];
+@@ -371,6 +403,8 @@ pub(crate) struct Input {
+     pub(crate) ktrace_mask: u32,
+     pub(crate) progress_recovery: u32,
+     pub(crate) performance: Performance,
++    /// Set [`globals::IDLE_POWER_OFF`] (testing knob, off in the qualified encoding).
++    pub(crate) idle_power_off: bool,
+ }
+ 
+ pub(crate) fn object_va(va: u64, size: usize) -> bool {
+@@ -514,21 +548,7 @@ pub(crate) fn encode(
+     put32(objects[id::ACTIVITY_FRAGMENT], 0xc18, 0xffffffff)?;
+     put32(objects[id::ACTIVITY_FRAGMENT], 0xc30, 0xffffffff)?;
+     let g = &mut objects[id::GLOBALS];
+-    for (at, value) in [
+-        (0x78, 1),
+-        (0xe28, 3),
+-        (0x24, 3000),
+-        (0x998, 40),
+-        (0x99c, 10),
+-        (0x9a0, 250),
+-        (0x9b8, 2),
+-        (0x9bc, 40),
+-        (0x9c0, 5),
+-        (0x9c8, 40),
+-        (0x9cc, 50),
+-    ] {
+-        put32(g, at, value)?;
+-    }
++    encode_globals_policy(g, input.idle_power_off)?;
+     for at in globals::PSTATE_SELECTORS {
+         put32(g, at, 100 * ceiling)?;
+     }
+@@ -601,3 +621,56 @@ pub(crate) fn encode(
+     }
+     Ok(())
+ }
++
++#[cfg_attr(not(test), kernel::macros::kunit_tests(asahi_g16_idle_power_off))]
++mod tests {
++    use super::*;
++
++    fn globals(idle_power_off: bool) -> [u8; globals::SIZE] {
++        let mut g = [0u8; globals::SIZE];
++        assert!(encode_globals_policy(&mut g, idle_power_off).is_ok());
++        g
++    }
++
++    fn word(g: &[u8], at: usize) -> u32 {
++        u32::from_le_bytes([g[at], g[at + 1], g[at + 2], g[at + 3]])
++    }
++
++    /// Number of non-zero aligned words; one Globals image per test keeps the stack small.
++    fn nonzero(g: &[u8]) -> usize {
++        (0..globals::SIZE).step_by(4).filter(|at| word(g, *at) != 0).count()
++    }
++
++    #[test]
++    fn the_default_keeps_the_qualified_globals() {
++        let g = globals(false);
++        assert_eq!(word(&g, globals::IDLE_POWER_OFF), 0);
++        for (at, value) in globals::POLICY {
++            assert_eq!(word(&g, at), value);
++        }
++        assert_eq!(nonzero(&g), globals::POLICY.len());
++    }
++
++    #[test]
++    fn the_knob_sets_only_idle_power_off() {
++        let g = globals(true);
++        assert_eq!(word(&g, globals::IDLE_POWER_OFF), 1);
++        for (at, value) in globals::POLICY {
++            assert_eq!(word(&g, at), value);
++        }
++        assert_eq!(nonzero(&g), globals::POLICY.len() + 1);
++    }
++
++    #[test]
++    fn the_word_matches_g17_region_c_and_misses_the_policy_words() {
++        // G17 region C: idle_power_off at 0x30, idle_power_off_delay at 0x9bc (40),
++        // compute_watchdog at 0x9cc (50).
++        assert_eq!(globals::IDLE_POWER_OFF, 0x30);
++        for (at, _) in globals::POLICY {
++            assert!(at + 4 <= globals::IDLE_POWER_OFF || at >= globals::IDLE_POWER_OFF + 4);
++            assert!(!globals::PSTATE_SELECTORS.contains(&at));
++        }
++        assert!(globals::POLICY.contains(&(0x9bc, 40)));
++        assert!(globals::POLICY.contains(&(0x9cc, 50)));
++    }
++}
+diff --git a/drivers/gpu/drm/asahi/g16/initdata.rs b/drivers/gpu/drm/asahi/g16/initdata.rs
+index 3a404222c8..ad615ee5d2 100644
+--- a/drivers/gpu/drm/asahi/g16/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/initdata.rs
+@@ -147,7 +147,16 @@ pub(crate) fn build(
+         lower_parameter: wire::BOOTSTRAP_START + 0x8000,
+         ktrace_mask: 0,
+         progress_recovery: 1,
++        idle_power_off: super::params::idle_power_off() != 0,
+     };
++    if input.idle_power_off {
++        dev_info!(
++            dev,
++            "M4 initdata: idle core power-off requested (g16_idle_power_off={}, testing): Globals +{:#x} = 1\n",
++            super::params::idle_power_off(),
++            globals::IDLE_POWER_OFF
++        );
++    }
+     for i in 0..wire::OBJECT_COUNT {
+         input.va[i] = graph[i].va;
+     }
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 2f2953585f..8aed7531c5 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -53,6 +53,18 @@ pub(crate) fn sampler_heap() -> bool {
+     *module_parameters::g16_sampler_heap.value() != 0
+ }
+ 
++/// Idle core power-off level (testing; read once at probe).
++///
++/// 0 keeps the qualified 25G83 initdata, under which the firmware keeps the GPU cores powered
++/// while idle. 1 sets the Globals word that the G17 backend documents as region C
++/// `idle_power_off` (same offset, +0x30; the qualified G16 Globals already carries the G17
++/// region C values around it, including the power-off delay at +0x9bc). 2 also clears the
++/// G17 gating-disable bits in SGX +0xd06030 before the firmware is initialized. Values above 2
++/// are treated as 2.
++pub(crate) fn idle_power_off() -> u32 {
++    (*module_parameters::g16_idle_power_off.value()).min(2)
++}
++
+ /// Fragment-only dependency publication has not been qualified on this backend.
+ pub(crate) fn early_tiling() -> bool {
+     false
+diff --git a/drivers/gpu/drm/asahi/g16/power.rs b/drivers/gpu/drm/asahi/g16/power.rs
+index 9c23f8688e..87dcf2ab8a 100644
+--- a/drivers/gpu/drm/asahi/g16/power.rs
++++ b/drivers/gpu/drm/asahi/g16/power.rs
+@@ -11,7 +11,8 @@
+ //! The firmware runs at the published state, busy or not, so the host requests
+ //! one from the GPU's busy share of each window, bounded by the ceiling.
+ //!
+-//! The firmware keeps GFX powered while the GPU idles, so the host reports
++//! Under the qualified initdata (`g16_idle_power_off=0`, see `params::idle_power_off`)
++//! the firmware keeps GFX powered while the GPU idles, so the host reports
+ //! when it has work in flight to the DT-selected CLPC, which holds the memory
+ //! and fabric floor for that work.
+ 
