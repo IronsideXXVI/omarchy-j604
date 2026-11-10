@@ -36,7 +36,7 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | Touch ID | Working for sudo, polkit and the lock screen |
 | Keyboard backlight | Working with the local `omarchy-dev` / `omarchy-settings-dev` builds |
 | Neural Engine | Working: on by default (`/dev/accel/accel0`), runs programs bit-exact and powers off when idle (measured on 1.711) |
-| Power | Suspend (s2idle) working again since 1.710 (it was refused on 1.705-1.708). Idle on AC is about 10.5 W with the stock edge `performance` power profile (see `STATUS.md`). Deep sleep in progress |
+| Power | Suspend (s2idle) working again since 1.710 (it was refused on 1.705-1.708). Idle on AC is about 10.5 W with the stock edge `performance` power profile (see `STATUS.md`). Deep sleep in progress: the reset during a test sleep is fixed since 1.736; real suspend-to-RAM still waits for two GPU items |
 | In progress | Deep sleep, camera colour, browser hardware video decode (off by default; H.264 in software), Thunderbolt/USB4, external displays and HDMI |
 
 ## Install
@@ -57,7 +57,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`6ff31cbfa2`), 239 patches | `1.734` |
+| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`6ff31cbfa2`), 245 patches | `1.736` |
 | `m1n1-aurora` | 1.6.1.aurora22, omacom/m1n1 (`bc79acc434`), 38 patches | `1.610` |
 | `uboot-aurora` | 2026.07.aurora6, aurora-silicon/u-boot (`d30213eadc`) | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261031, omacom/mesa (`a196911147`) | `1.8133` |
@@ -77,7 +77,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 Also installed, unchanged from the official repositories: Hyprland 0.57.1 and the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
-Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.734 changed over 1.617).
+Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.736 changed over 1.617).
 
 ## Layout
 
@@ -124,7 +124,8 @@ What goes to which upstream, in what order, and what's already open is in [`UPST
 - [omacom/omarchy#18228](https://github.com/omacom/omarchy/pull/18228): retry the kyber scheduler write while a sibling NVMe namespace switches
 - [omacom/omarchy#18229](https://github.com/omacom/omarchy/issues/18229) (issue): `omarchy-mac`'s mpv default never installs because `omarchy-settings` owns `/etc/mpv/mpv.conf`; linked from [omacom/omarchy-mac-pkgs#66](https://github.com/omacom/omarchy-mac-pkgs/issues/66). An M1 user's measurements there showed that the stock default (`hwdec=auto-safe`) is the right one on the M1; our reply (2026-11-09) agrees and adds M4 numbers
 - [omacom/linux-aurora#432](https://github.com/omacom/linux-aurora/issues/432) (issue): J604 test results
-- Closed without merging: [omacom/omarchy#18177](https://github.com/omacom/omarchy/pull/18177) (keybindings menu leaves out absent keys)
+- [omacom/omarchy#18177](https://github.com/omacom/omarchy/pull/18177): keybindings menu leaves out absent keys; reopened on 2026-11-10, unchanged (the same change is our kbd-0104)
+- [omacom/omarchy-mac-installer#212](https://github.com/omacom/omarchy-mac-installer/pull/212) (draft): collect the M4-family Wi-Fi firmware (BCM4388 rev C2) from the installed macOS, a port of aurora-silicon/aurora-installer 34f90a5 with its author Ryan Murray as co-author
 
 The Aurora kernel has merged DjDeveloperr's J604 / M4 device trees (aurora-silicon/linux #1142 and follow-ups). We rebase onto them and send only what goes beyond them.
 

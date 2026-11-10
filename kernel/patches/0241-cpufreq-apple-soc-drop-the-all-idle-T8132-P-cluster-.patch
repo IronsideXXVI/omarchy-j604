@@ -1,0 +1,273 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 08:03:02 +0000
+Subject: [PATCH] cpufreq: apple-soc: drop the all-idle T8132 P cluster
+ to its slowest state
+
+With the performance governor the J604's P cluster sits at its top
+P-state (4464 MHz requested) while its cores are 99.7 % idle, because an
+idle M4 core waits in WFI at the cluster's state and nothing lowers it.
+Capping the cluster at its slowest state with the desktop idle takes
+the P-CPU rail from 2.36 W to 0.064 W and the whole machine from
+11.46 W to 8.49 W, about 3 W, a quarter of idle power; macOS idles the
+P cluster at 912 MHz.
+
+Using cpuidle-apple's cluster hooks, move the P cluster to its slowest
+P-state when every online CPU of it waits in the long-idle state, and
+ask for the governor's state again when the first one wakes. The woken
+CPU does not wait: with a busy core the cluster is at 2868 MHz or more
+within 75 us. Requests while the cluster is down only update the state
+to restore, so the governor, its limits and the thermal caps keep
+their meaning. Nothing changes while a CPU of the cluster is busy, and
+system sleep is unchanged. The E cluster, about 20 mW at its top state,
+is left alone.
+
+apple_soc_cpufreq.idle_drop (default on, writable at runtime) turns
+it off; dvfs_registers also shows the number of drops and the state to
+restore.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/cpufreq/apple-soc-cpufreq.c | 156 ++++++++++++++++++++++++++++
+ 1 file changed, 156 insertions(+)
+
+diff --git a/drivers/cpufreq/apple-soc-cpufreq.c b/drivers/cpufreq/apple-soc-cpufreq.c
+index e6de0f032a..288d18edd1 100644
+--- a/drivers/cpufreq/apple-soc-cpufreq.c
++++ b/drivers/cpufreq/apple-soc-cpufreq.c
+@@ -26,8 +26,10 @@
+ #include <linux/of_address.h>
+ #include <linux/pm_opp.h>
+ #include <linux/pm_qos.h>
++#include <linux/sched/topology.h>
+ #include <linux/slab.h>
+ #include <linux/suspend.h>
++#include <linux/soc/apple/cluster-idle.h>
+ #include <linux/soc/apple/cpufreq-thermal.h>
+ #include <linux/soc/apple/pmp-report.h>
+ #include <linux/spinlock.h>
+@@ -207,6 +209,8 @@ struct apple_soc_cpufreq_info {
+ 	/* Fail closed when the DT describes no fast die-temperature limit. */
+ 	bool needs_thermal_policy;
+ 	bool needs_thermal_owner;
++	/* Drop an all-idle cluster to its slowest state, see "Cluster idle drop". */
++	bool idle_drop;
+ 	u32 transition_timeout_us;
+ 	/* Highest P-state allowed without a thermal policy; 0 if not capped. */
+ 	u32 max_unmanaged_pstate;
+@@ -254,6 +258,19 @@ struct apple_cpu_priv {
+ 	/* A failure the verify timer has yet to report, and its command. */
+ 	bool failure_unreported;
+ 	u64 failure_command;
++	/*
++	 * Cluster idle drop: the CPUs of the policy waiting in cpuidle's
++	 * cluster state (atomic bit operations), the policy's online CPUs, the
++	 * P-state the governor last asked for, the slowest P-state, whether the
++	 * cluster was moved to it and how often. The last four are protected
++	 * by @lock.
++	 */
++	struct cpumask idle_cpus;
++	const struct cpumask *cpus;
++	unsigned int run_pstate;
++	unsigned int idle_pstate;
++	bool idle_dropped;
++	unsigned long idle_drops;
+ };
+ 
+ static struct cpufreq_driver apple_soc_cpufreq_driver;
+@@ -337,6 +354,7 @@ static const struct apple_soc_cpufreq_info soc_t8152_info = {
+  */
+ static const struct apple_soc_cpufreq_info soc_t8132_info = {
+ 	.needs_thermal_owner = true,
++	.idle_drop = true,
+ 	.cur_pstate_mask = APPLE_DVFS_STATUS_CUR_PS_T8112,
+ 	.cur_pstate_shift = APPLE_DVFS_STATUS_CUR_PS_SHIFT_T8112,
+ 	.max_unmanaged_pstate = 4,
+@@ -499,6 +517,118 @@ static int apple_soc_cpufreq_set_pstate(struct apple_cpu_priv *priv,
+ 	return 0;
+ }
+ 
++/*
++ * Cluster idle drop (idle_drop SoCs)
++ *
++ * A core waiting in WFI stays at its cluster's P-state, so an idle cluster
++ * keeps the state the governor last chose; with the performance governor
++ * that is the top one, which on the J604 costs about 3 W at the wall over
++ * the slowest state with every core idle. When cpuidle-apple's cluster state
++ * finds every online CPU of the cluster waiting in it, the cluster is moved
++ * to its slowest state, and the first CPU to wake asks for the governor's
++ * state again; that CPU runs at once, and the cluster is at 2868 MHz or more
++ * within 75 us and usually at its loaded top state within 60 us. A request while the cluster is down only updates the state
++ * to restore. Nothing changes while a CPU of the cluster is busy, nor in
++ * system sleep, where the core already holds the clusters at their suspend
++ * frequency. A CPU brought online into a dropped cluster runs slow until the
++ * cluster's next wake, a few milliseconds at most.
++ *
++ * Only the clusters of the fastest cores take part: the J604's E cluster
++ * costs about 20 mW at its top state, not worth slower wakes for the
++ * background work it runs.
++ */
++static bool idle_drop = true;
++module_param(idle_drop, bool, 0644);
++MODULE_PARM_DESC(idle_drop, "T8132: while every CPU of the performance cluster waits in a long idle, run the cluster at its slowest P-state and restore the governor's state on the first wake (default: on)");
++
++static DEFINE_PER_CPU(struct apple_cpu_priv *, apple_idle_priv);
++
++/* The policy of @cpu if its cluster takes part in the idle drop, or NULL. */
++static struct apple_cpu_priv *apple_soc_cpufreq_idle_priv(unsigned int cpu)
++{
++	if (arch_scale_cpu_capacity(cpu) < SCHED_CAPACITY_SCALE)
++		return NULL;
++	return per_cpu(apple_idle_priv, cpu);
++}
++
++/* Asks for the governor's state again. Called with priv->lock held. */
++static void apple_soc_cpufreq_idle_restore(struct apple_cpu_priv *priv)
++{
++	u64 reg;
++
++	/* The drop itself may still be in flight after a very short idle. */
++	if (readq_poll_timeout_atomic(priv->reg_base + APPLE_DVFS_CMD, reg,
++				      !(reg & APPLE_DVFS_CMD_BUSY), 1,
++				      apple_soc_cpufreq_timeout(priv->info)))
++		return;	/* Still down: the next wake or request retries. */
++	apple_soc_cpufreq_write(priv, reg, priv->run_pstate);
++	priv->idle_dropped = false;
++}
++
++static void apple_soc_cpufreq_idle_enter(unsigned int cpu)
++{
++	struct apple_cpu_priv *priv = apple_soc_cpufreq_idle_priv(cpu);
++	u64 reg;
++
++	if (!priv)
++		return;
++	cpumask_set_cpu(cpu, &priv->idle_cpus);
++	if (!READ_ONCE(idle_drop) || !cpumask_subset(priv->cpus, &priv->idle_cpus))
++		return;
++
++	raw_spin_lock(&priv->lock);
++	if (!priv->idle_dropped && priv->run_pstate > priv->idle_pstate &&
++	    cpumask_subset(priv->cpus, &priv->idle_cpus)) {
++		reg = readq_relaxed(priv->reg_base + APPLE_DVFS_CMD);
++		/* A transition in flight means a CPU just asked: leave it. */
++		if (!(reg & APPLE_DVFS_CMD_BUSY)) {
++			apple_soc_cpufreq_write(priv, reg, priv->idle_pstate);
++			priv->idle_dropped = true;
++			priv->idle_drops++;
++		}
++	}
++	raw_spin_unlock(&priv->lock);
++}
++
++static void apple_soc_cpufreq_idle_exit(unsigned int cpu)
++{
++	struct apple_cpu_priv *priv = apple_soc_cpufreq_idle_priv(cpu);
++
++	if (!priv)
++		return;
++	cpumask_clear_cpu(cpu, &priv->idle_cpus);
++	/*
++	 * Under the lock even when no drop is seen: a CPU entering idle may be
++	 * dropping the cluster right now, having seen this CPU's bit still set.
++	 */
++	raw_spin_lock(&priv->lock);
++	if (priv->idle_dropped)
++		apple_soc_cpufreq_idle_restore(priv);
++	raw_spin_unlock(&priv->lock);
++}
++
++static const struct apple_cluster_idle_ops apple_soc_cpufreq_idle_ops = {
++	.enter	= apple_soc_cpufreq_idle_enter,
++	.exit	= apple_soc_cpufreq_idle_exit,
++};
++
++/* A request on an idle_drop SoC, see "Cluster idle drop". */
++static int apple_soc_cpufreq_idle_request(struct apple_cpu_priv *priv,
++					  unsigned int pstate)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	raw_spin_lock_irqsave(&priv->lock, flags);
++	priv->run_pstate = pstate;
++	if (!priv->idle_dropped)
++		ret = apple_soc_cpufreq_set_pstate(priv, pstate);
++	else if (!cpumask_subset(priv->cpus, &priv->idle_cpus))
++		apple_soc_cpufreq_idle_restore(priv);
++	raw_spin_unlock_irqrestore(&priv->lock, flags);
++	return ret;
++}
++
+ /* Requests the frequency table entry @index, see apple_soc_cpufreq_set_pstate(). */
+ static int apple_soc_cpufreq_request(struct cpufreq_policy *policy,
+ 				     unsigned int index)
+@@ -510,6 +640,8 @@ static int apple_soc_cpufreq_request(struct cpufreq_policy *policy,
+ 	if (pstate < priv->info->min_pstate || pstate > priv->info->max_pstate)
+ 		return -EINVAL;
+ 
++	if (priv->info->idle_drop)
++		return apple_soc_cpufreq_idle_request(priv, pstate);
+ 	return apple_soc_cpufreq_set_pstate(priv, pstate);
+ }
+ 
+@@ -1475,6 +1607,14 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
+ 	priv->pending_pstate = -1;
+ 	priv->cap_pstate = info->max_pstate;
+ 	priv->waited = true;
++	if (info->idle_drop) {
++		priv->cpus = policy->cpus;
++		priv->idle_pstate = freq_table[0].driver_data;
++		priv->run_pstate = FIELD_GET(APPLE_DVFS_CMD_PS1,
++					     readq_relaxed(reg_base + APPLE_DVFS_CMD));
++		for_each_cpu(i, policy->related_cpus)
++			per_cpu(apple_idle_priv, i) = priv;
++	}
+ 	policy->driver_data = priv;
+ 	policy->freq_table = freq_table;
+ 
+@@ -1511,6 +1651,9 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
+ 	return 0;
+ 
+ out_clear_policy:
++	if (info->idle_drop)
++		for_each_cpu(i, policy->related_cpus)
++			per_cpu(apple_idle_priv, i) = NULL;
+ 	if (freq_qos_request_active(&priv->unmanaged_cap))
+ 		freq_qos_remove_request(&priv->unmanaged_cap);
+ 	policy->driver_data = NULL;
+@@ -1530,6 +1673,12 @@ out_free_priv:
+ static void apple_soc_cpufreq_exit(struct cpufreq_policy *policy)
+ {
+ 	struct apple_cpu_priv *priv = policy->driver_data;
++	unsigned int cpu;
++
++	/* Every CPU of the policy is offline: none is in an idle hook. */
++	if (priv->info->idle_drop)
++		for_each_cpu(cpu, policy->related_cpus)
++			per_cpu(apple_idle_priv, cpu) = NULL;
+ 
+ 	/*
+ 	 * The governor has stopped and the policy goes away: stop the verify
+@@ -1587,6 +1736,11 @@ static ssize_t show_dvfs_registers(struct cpufreq_policy *policy, char *buf)
+ 		return -ENODEV;
+ 	cmd = readq_relaxed(priv->reg_base + APPLE_DVFS_CMD);
+ 	status = readl_relaxed(priv->reg_base + APPLE_DVFS_STATUS);
++	if (priv->info->idle_drop)
++		return sysfs_emit(buf, "cmd %#018llx requested %llu status %#010x idle_drops %lu run %u\n",
++				  cmd, (cmd & priv->info->ps1_mask) >> priv->info->ps1_shift,
++				  status, READ_ONCE(priv->idle_drops),
++				  READ_ONCE(priv->run_pstate));
+ 	return sysfs_emit(buf, "cmd %#018llx requested %llu status %#010x\n",
+ 			  cmd, (cmd & priv->info->ps1_mask) >> priv->info->ps1_shift,
+ 			  status);
+@@ -1626,6 +1780,8 @@ static int __init apple_soc_cpufreq_module_init(void)
+ 	if (of_machine_is_compatible("apple,t8132")) {
+ 		apple_soc_cpufreq_driver.online = apple_soc_cpufreq_online;
+ 		apple_soc_cpufreq_driver.offline = apple_soc_cpufreq_offline;
++		/* Registered for good; the hooks skip CPUs without a policy. */
++		apple_cpuidle_set_cluster_ops(&apple_soc_cpufreq_idle_ops);
+ 	}
+ 
+ 	/*
