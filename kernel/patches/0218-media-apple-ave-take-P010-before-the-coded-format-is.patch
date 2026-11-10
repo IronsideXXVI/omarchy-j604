@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 04:19:46 +0000
+Subject: [PATCH] media: apple: ave: take P010 before the coded format
+ is set
+
+FFmpeg's hevc_v4l2m2m sets the raw (OUTPUT) format before the coded
+(CAPTURE) one. The driver accepted P010 only when the coded format was
+already HEVC, so while CAPTURE still had its H.264 default it changed the
+request to NV12, and FFmpeg gave up ("Encoder requires nv12 pixel
+format"); HEVC Main 10 could not be encoded with stock FFmpeg on the M4.
+FFmpeg also never sets the HEVC profile control, so a P010 session would
+then have been refused as Main with 16-bit input.
+
+Take P010 on OUTPUT whatever the coded format is, turn it back into NV12
+when the coded format is set to H.264, and let P010 input select Main 10
+for HEVC. An explicit Main 10 request with NV12 input is still refused.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/ave/ave-sess.c |  9 ++++++---
+ drivers/media/platform/apple/ave/ave-v4l2.c | 12 ++++++++++--
+ 2 files changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/platform/apple/ave/ave-sess.c b/drivers/media/platform/apple/ave/ave-sess.c
+index e47337b611..74c02a4645 100644
+--- a/drivers/media/platform/apple/ave/ave-sess.c
++++ b/drivers/media/platform/apple/ave/ave-sess.c
+@@ -174,11 +174,14 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
+ 	/*
+ 	 * HEVC Main 10 encodes P010 input; Main encodes NV12. The firmware
+ 	 * takes 16-bit samples for Main 10 (macOS converts 8-bit input to that
+-	 * first), so other pairings are refused rather than converted.
++	 * first), so other pairings are refused rather than converted. P010
++	 * input selects Main 10 by itself: the profile control defaults to
++	 * Main, and clients that never set it (FFmpeg's hevc_v4l2m2m) would
++	 * otherwise be refused.
+ 	 */
+ 	if ((p->codec == AVE_CODEC_HEVC &&
+-	     ctx->hevc_profile == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10) !=
+-	    (p->sample_bytes == 2))
++	     (ctx->hevc_profile == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10 ||
++	      p->sample_bytes == 2)) != (p->sample_bytes == 2))
+ 		return -EINVAL;
+ 	if (p->sample_bytes == 2) {
+ 		/* Only the 9003 layout's Main 10 fields are mapped. */
+diff --git a/drivers/media/platform/apple/ave/ave-v4l2.c b/drivers/media/platform/apple/ave/ave-v4l2.c
+index d46a810e24..ced9d9bbd6 100644
+--- a/drivers/media/platform/apple/ave/ave-v4l2.c
++++ b/drivers/media/platform/apple/ave/ave-v4l2.c
+@@ -92,13 +92,15 @@ static void ave_clamp_size(u32 coded, u32 *w, u32 *h)
+  * Raw NV12 or P010, one buffer: Y plane, then interleaved CbCr at half
+  * height. P010 holds 10-bit samples in the high bits of 16-bit words; it
+  * is the input for HEVC Main 10. @coded is the context's coded format,
+- * which limits the size.
++ * which limits the size. P010 is taken whatever the coded format is at
++ * this point, since clients such as FFmpeg set the raw side first; a later
++ * switch of the coded side to H.264 turns it back into NV12.
+  */
+ static void ave_fill_raw(struct v4l2_pix_format_mplane *f, u32 coded)
+ {
+ 	u32 stride, height, bytes;
+ 
+-	if (f->pixelformat != V4L2_PIX_FMT_P010 || coded != V4L2_PIX_FMT_HEVC)
++	if (f->pixelformat != V4L2_PIX_FMT_P010)
+ 		f->pixelformat = V4L2_PIX_FMT_NV12;
+ 	bytes = f->pixelformat == V4L2_PIX_FMT_P010 ? 2 : 1;
+ 	ave_clamp_size(coded, &f->width, &f->height);
+@@ -245,6 +247,12 @@ static int ave_s_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
+ 	pix->ycbcr_enc = ctx->src_fmt.ycbcr_enc;
+ 	pix->quantization = ctx->src_fmt.quantization;
+ 	ctx->dst_fmt = *pix;
++	/* H.264 takes 8-bit input only. */
++	if (pix->pixelformat != V4L2_PIX_FMT_HEVC &&
++	    ctx->src_fmt.pixelformat == V4L2_PIX_FMT_P010) {
++		ctx->src_fmt.pixelformat = V4L2_PIX_FMT_NV12;
++		ave_fill_raw(&ctx->src_fmt, pix->pixelformat);
++	}
+ 	return 0;
+ }
+ 

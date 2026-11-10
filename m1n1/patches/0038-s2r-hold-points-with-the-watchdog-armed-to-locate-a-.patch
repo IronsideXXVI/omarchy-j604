@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 03:57:30 +0000
+Subject: [PATCH] s2r: hold points with the watchdog armed, to locate a failed
+ wake (T8132)
+
+The first suspend-to-RAM attempt on a J604 ended in a cold boot about ten
+seconds after the wake alarm, with no console and no log from the warm
+path: nothing tells whether the wake reached this path at all, the
+branch to the kernel, or only the kernel's resume.
+
+Add three bring-up requests the kernel can set in the mailbox flags,
+none of which needs a console:
+
+ - bit 5, HOLD_AT_ENTRY: right after the mailbox is disarmed, arm the
+   watchdog for 30 s and wait;
+ - bit 6, HOLD_AT_BRANCH: after the per-core setup, arm it for 60 s and
+   wait instead of branching to the kernel;
+ - bit 7, WDT_THROUGH: branch to the kernel with the watchdog armed for
+   90 s instead of stopped; the kernel stops it once it has resumed.
+
+The time of the reset that follows, against the wake alarm, then tells
+how far the wake got. wdt_arm_cached() arms the primary watchdog at the
+base found at boot, as wdt_disable_cached() stops it. Without these bits
+nothing changes.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ src/s2r.c | 15 +++++++++++++++
+ src/s2r.h | 13 +++++++++++++
+ src/wdt.c | 16 ++++++++++++++++
+ src/wdt.h |  1 +
+ 4 files changed, 45 insertions(+)
+
+diff --git a/src/s2r.c b/src/s2r.c
+index f4244503..4fb02fb7 100644
+--- a/src/s2r.c
++++ b/src/s2r.c
+@@ -43,6 +43,15 @@ extern u8 _vectors_start[0];
+ 
+ bool s2r_warm_quiet = false;
+ 
++/* Hold here until the watchdog resets the system after the given time */
++static void __attribute__((noreturn)) s2r_hold(unsigned seconds)
++{
++    wdt_arm_cached(seconds);
++    sysop("dsb sy");
++    while (1)
++        sysop("wfe");
++}
++
+ /* Reset through the watchdog this m1n1 found at boot; spin if that fails */
+ static void __attribute__((noreturn)) s2r_reboot(void)
+ {
+@@ -110,6 +119,8 @@ void s2r_warm_resume(void)
+ 
+     if (flags & S2R_FLAG_REBOOT_AT_ENTRY)
+         s2r_reboot();
++    if (flags & S2R_FLAG_HOLD_AT_ENTRY)
++        s2r_hold(S2R_HOLD_ENTRY_SECS);
+ 
+     /* A watchdog apple-s2r armed for bring-up would reset us otherwise. */
+     wdt_disable_cached();
+@@ -119,6 +130,10 @@ void s2r_warm_resume(void)
+ 
+     if ((flags & S2R_FLAG_REBOOT_AT_BRANCH) || !entry)
+         s2r_reboot();
++    if (flags & S2R_FLAG_HOLD_AT_BRANCH)
++        s2r_hold(S2R_HOLD_BRANCH_SECS);
++    if (flags & S2R_FLAG_WDT_THROUGH)
++        wdt_arm_cached(S2R_WDT_THROUGH_SECS);
+ 
+     s2r_jump_el2(entry, arg);
+ }
+diff --git a/src/s2r.h b/src/s2r.h
+index 45a629df..e51bfbf2 100644
+--- a/src/s2r.h
++++ b/src/s2r.h
+@@ -25,6 +25,19 @@ struct s2r_mailbox {
+ #define S2R_FLAG_MCC_INIT         BIT(2)
+ #define S2R_FLAG_REBOOT_AT_ENTRY  BIT(3)
+ #define S2R_FLAG_REBOOT_AT_BRANCH BIT(4)
++/*
++ * Bring-up stage markers that need no console: hold at a point with the
++ * watchdog armed for a known time, so the time of the reset that follows
++ * tells how far the warm path got. WDT_THROUGH branches to the kernel with
++ * the watchdog armed instead of stopped; the kernel stops it once it resumed.
++ */
++#define S2R_FLAG_HOLD_AT_ENTRY    BIT(5)
++#define S2R_FLAG_HOLD_AT_BRANCH   BIT(6)
++#define S2R_FLAG_WDT_THROUGH      BIT(7)
++
++#define S2R_HOLD_ENTRY_SECS       30
++#define S2R_HOLD_BRANCH_SECS      60
++#define S2R_WDT_THROUGH_SECS      90
+ #define S2R_FLAG_RESUMED          BIT(63)
+ 
+ /* start.S checks the magic as these four halfwords (movz/movk, low first) */
+diff --git a/src/wdt.c b/src/wdt.c
+index f054a3a3..231ea8a5 100644
+--- a/src/wdt.c
++++ b/src/wdt.c
+@@ -58,6 +58,22 @@ void wdt_disable_cached(void)
+         write32(wdt_base + WDT_CTL, 0);
+ }
+ 
++/*
++ * Arm the primary watchdog at the base found at boot to reset the system
++ * after the given time (at most 178 s at 24 MHz), for the same paths.
++ */
++void wdt_arm_cached(unsigned seconds)
++{
++    if (!wdt_base)
++        return;
++    if (seconds > 178)
++        seconds = 178;
++    write32(wdt_base + WDT_CTL, 0);
++    write32(wdt_base + WDT_COUNT, 0);
++    write32(wdt_base + WDT_ALARM, seconds * 24000000u);
++    write32(wdt_base + WDT_CTL, 4);
++}
++
+ void wdt_reboot(void)
+ {
+     if (!wdt_base)
+diff --git a/src/wdt.h b/src/wdt.h
+index 48938bd2..9b990d0d 100644
+--- a/src/wdt.h
++++ b/src/wdt.h
+@@ -6,6 +6,7 @@
+ void wdt_disable(void);
+ void wdt_reboot(void);
+ void wdt_disable_cached(void);
++void wdt_arm_cached(unsigned seconds);
+ int wdt_arm_seconds(unsigned seconds);
+ 
+ #endif
+-- 
+2.43.0
+
