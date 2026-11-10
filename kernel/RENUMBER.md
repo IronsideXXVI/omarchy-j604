@@ -10,6 +10,8 @@ New in 1.803: 0229 (`drm/asahi: g16: stop the firmware at the sleep's commit wit
 
 New in 1.804: 0232 (`drm/apple: m4: do not let one interval after idle open the swap_pace gate`), 0233 (`media: apple: avd: decode H.264 in frame-based mode`).
 
+New in 1.805: 0234 (`arm64: dts: apple: t8132-j604: report the always-zero SMC temperatures as no data`), 0235 (`arm64: dts: apple: t8132-j604: Describe the DP audio of the second external display processor`), 0236 (`drm: apple: dcp: let the T8132 HDMI output's idle release engage`).
+
 | 1.736 | 1.800 | Subject |
 |---|---|---|
 | 0001 | 0001 | dt-bindings: pci: apple,pcie: Describe the three T8132 root ports |
