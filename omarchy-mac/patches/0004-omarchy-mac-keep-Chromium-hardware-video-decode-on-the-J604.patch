@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 18:42:30 +0000
+Subject: [PATCH] omarchy-mac: keep Chromium's hardware video decode on the
+ 14-inch MacBook Pro M4
+
+User setup turns AcceleratedVideoDecoder off in every Chromium-family
+browser's flags on Apple Silicon, because VA-API builds such as Brave
+rendered green frames on some streams. On the J604 the green frames came
+from the kernel: the Apple Video Decoder refused the request controls
+Chromium sends first and then decoded with stale ones. Its kernel now
+applies them, and Arch Linux ARM's Chromium, built without VA-API, reaches
+the decoder through V4L2 only with the feature turned on, which such
+builds leave off.
+
+So on the J604 (device tree compatible apple,j604, through the runtime's
+omarchy-hw-match-device-tree) Chromium's flags take the feature out of
+--disable-features, which takes precedence over --enable-features, and
+add it to --enable-features. VP9 and AV1 then decode on the Apple Video
+Decoder; H.264 stays in software until the kernel takes frame-based
+H.264. Its other browsers and every other Mac keep the workaround.
+---
+ omarchy-mac/bin/omarchy-mac-setup-user | 25 +++++++++++++++++-
+ omarchy-mac/test/desktop-setup-test.sh | 36 ++++++++++++++++++++++++++
+ 2 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/omarchy-mac/bin/omarchy-mac-setup-user b/omarchy-mac/bin/omarchy-mac-setup-user
+index 8099e89..b6365f2 100755
+--- a/omarchy-mac/bin/omarchy-mac-setup-user
++++ b/omarchy-mac/bin/omarchy-mac-setup-user
+@@ -16,12 +16,35 @@ config=${XDG_CONFIG_HOME:-$HOME/.config}
+ # existing list. Runs again after a browser install writes a fresh flags file.
+ # Browser installs write the flags in ~/.config; Chromium reads them from
+ # XDG_CONFIG_HOME, which may be another directory.
++#
++# The 14-inch MacBook Pro with M4 (J604) is the exception for Chromium itself:
++# its kernel applies the decode requests Chromium sends first (refusing them is
++# what turned frames green), and Arch Linux ARM's Chromium, built without
++# VA-API, reaches the decoder through V4L2 only with AcceleratedVideoDecoder
++# turned on, which such builds leave off. There Chromium's flags take the
++# feature out of --disable-features, which wins over --enable-features, and add
++# it to --enable-features. Its other browsers and every other Mac keep the
++# workaround until the decoder is known to work for them.
++chromium_decodes() {
++  [[ ${1##*/} == chromium-flags.conf ]] && omarchy-hw-match-device-tree apple,j604 2>/dev/null
++}
++enable_decoder() {
++  sed -i -E '/^--disable-features=/{s/([=,])AcceleratedVideoDecoder([,[:space:]]|$)/\1\2/;s/,,/,/;s/=,/=/;s/,([[:space:]]|$)/\1/;/^--disable-features=[[:space:]]*$/d}' "$1"
++  if grep -q -- '^--enable-features=' "$1"; then
++    sed -i -E '/^--enable-features=/{/[=,]AcceleratedVideoDecoder([,[:space:]]|$)/!s/^(--enable-features=[^[:space:]]*)/\1,AcceleratedVideoDecoder/;s/^--enable-features=,/--enable-features=/}' "$1"
++  else
++    [[ -z $(tail -c1 "$1") ]] || echo >>"$1"
++    echo '--enable-features=AcceleratedVideoDecoder' >>"$1"
++  fi
++}
+ flag_dirs=("$config")
+ [[ $config == "$HOME/.config" ]] || flag_dirs+=("$HOME/.config")
+ for flags_dir in "${flag_dirs[@]}"; do
+   for flags in "$flags_dir"/{chromium,chrome,microsoft-edge-stable,brave,brave-origin}-flags.conf; do
+     [[ -f $flags ]] || continue
+-    if grep -q -- '^--disable-features=' "$flags"; then
++    if chromium_decodes "$flags"; then
++      enable_decoder "$flags"
++    elif grep -q -- '^--disable-features=' "$flags"; then
+       sed -i -E '/^--disable-features=/{/[=,]AcceleratedVideoDecoder([,[:space:]]|$)/!s/^(--disable-features=[^[:space:]]*)/\1,AcceleratedVideoDecoder/;s/^--disable-features=,/--disable-features=/}' "$flags"
+     else
+       [[ -z $(tail -c1 "$flags") ]] || echo >>"$flags"
+diff --git a/omarchy-mac/test/desktop-setup-test.sh b/omarchy-mac/test/desktop-setup-test.sh
+index e0a93bd..84e6790 100644
+--- a/omarchy-mac/test/desktop-setup-test.sh
++++ b/omarchy-mac/test/desktop-setup-test.sh
+@@ -183,6 +183,42 @@ for browser in chromium chrome microsoft-edge-stable brave-origin; do
+ done
+ pass 'Chromium-family browsers decode in software on Apple Silicon, once, joining existing lists'
+ 
++# The J604 keeps Chromium's hardware decode; its other browsers and other Macs
++# keep the workaround.
++cat >"$work/bin/omarchy-hw-match-device-tree" <<'STUB'
++#!/bin/bash
++for wanted in "$@"; do
++  for entry in ${TEST_COMPATIBLE:-}; do
++    [[ ${entry,,} == "${wanted,,}" ]] && exit 0
++  done
++done
++exit 1
++STUB
++chmod +x "$work/bin/omarchy-hw-match-device-tree"
++flags="$HOME/.config/chromium-flags.conf"
++stock=$'--ozone-platform=wayland\n--enable-features=TouchpadOverscrollHistoryNavigation,OverlayScrollbar\n--no-default-browser-check\n--disable-features=AcceleratedVideoDecoder'
++printf '%s\n' "$stock" >"$flags"
++TEST_COMPATIBLE='apple,j614 apple,t8132 apple,arm-platform' "$setup_user" "$stage"
++[[ $(<"$flags") == "$stock" ]] || fail 'another M4 Mac keeps the workaround in Chromium' "$(cat "$flags")"
++TEST_COMPATIBLE='apple,j604 apple,t8132 apple,arm-platform' "$setup_user" "$stage"
++TEST_COMPATIBLE='apple,j604 apple,t8132 apple,arm-platform' "$setup_user" "$stage"
++[[ $(<"$flags") == $'--ozone-platform=wayland\n--enable-features=TouchpadOverscrollHistoryNavigation,OverlayScrollbar,AcceleratedVideoDecoder\n--no-default-browser-check' ]] ||
++  fail 'the J604 turns Chromium hardware decode on, once, and drops a list left empty' "$(cat "$flags")"
++printf '%s\n' '--disable-features=SomeOtherThing,AcceleratedVideoDecoder,Another' '--ozone-platform=wayland' >"$flags"
++TEST_COMPATIBLE='apple,j604' "$setup_user" "$stage"
++[[ $(<"$flags") == $'--disable-features=SomeOtherThing,Another\n--ozone-platform=wayland\n--enable-features=AcceleratedVideoDecoder' ]] ||
++  fail 'the J604 keeps the other disabled features and starts a feature list' "$(cat "$flags")"
++printf '%s' '--disable-features=AcceleratedVideoDecoder' >"$flags"
++TEST_COMPATIBLE='apple,j604' "$setup_user" "$stage"
++[[ $(<"$flags") == '--enable-features=AcceleratedVideoDecoder' ]] ||
++  fail 'the J604 replaces a lone workaround line without a final newline' "$(cat "$flags")"
++printf '%s\n' '--ozone-platform=wayland' >"$HOME/.config/brave-flags.conf"
++TEST_COMPATIBLE='apple,j604' "$setup_user" "$stage"
++grep -Fxq -- '--disable-features=AcceleratedVideoDecoder' "$HOME/.config/brave-flags.conf" ||
++  fail "the J604's other browsers keep the workaround"
++pass 'the J604 keeps Chromium hardware decode on; other Macs and browsers keep the workaround'
++rm -f "$work/bin/omarchy-hw-match-device-tree"
++
+ : >"$CALLS"
+ OMARCHY_MAC_ROOT=$stage "$stage/usr/lib/omarchy/mac/setup-user" || fail 'the setup-user entrypoint runs user setup'
+ [[ -L $HOME/.config/systemd/user/graphical-session.target.wants/omarchy-asahi-mic.service ]] || fail 'the setup-user entrypoint sets up the microphone'
+-- 
+2.43.0
+

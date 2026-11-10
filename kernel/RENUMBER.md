@@ -6,6 +6,10 @@ New in 1.800: 0221 (`arm64: dts: apple: t8132-j604: keep the MTP handoff of this
 
 New in 1.802: 0228 (`cpufreq: apple-soc: point the idle drop at the cluster's CPUs at init`), the fix that makes 0240-0241 (1.800: 0223-0224) run.
 
+New in 1.803: 0229 (`drm/asahi: g16: stop the firmware at the sleep's commit with g16_deep_sleep`), 0230 (`soc: apple: pmp: release the GPU's AGX vote at the sleep's commit`), 0231 (`drm/asahi: g16: end the runtime parameters' sysfs values with a newline`).
+
+New in 1.804: 0232 (`drm/apple: m4: do not let one interval after idle open the swap_pace gate`), 0233 (`media: apple: avd: decode H.264 in frame-based mode`).
+
 | 1.736 | 1.800 | Subject |
 |---|---|---|
 | 0001 | 0001 | dt-bindings: pci: apple,pcie: Describe the three T8132 root ports |
