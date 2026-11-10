@@ -22,6 +22,8 @@ New in 1.810: 0246 (`soc: apple: s2r: let one bring-up abort still tell the encl
 
 New in 1.811: 0247 (`iommu: apple-dart: optionally save a DART without a sleep list`).
 
+New in 1.813: 0248 (`soc: apple: s2r: check what suspend-to-RAM needs before offering it`), 0249 (`arm64: apple: describe the T8132 CPU complexes, used only on request`).
+
 | 1.736 | 1.800 | Subject |
 |---|---|---|
 | 0001 | 0001 | dt-bindings: pci: apple,pcie: Describe the three T8132 root ports |
