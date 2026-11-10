@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 22:55:26 +0000
+Subject: [PATCH] soc: apple: cluster-pwrgate: optionally log the T8132
+ sleep words
+
+A suspend-to-RAM on T8132 writes the CPU cluster control words, the CPU
+complexes' power gates and the clusters' DVFM control, in blocks that
+the ADT lists as /arm-io/pmgr reg[36], reg[34], reg[9] and reg[20]. Where
+each word sits and what it holds with both clusters up is known only
+from another board.
+
+Add the dump_sleep_words parameter. With it set on the command line the
+words are read and logged once at boot; written with 1 at runtime they
+are read and logged then. Nothing is written to the hardware. The table
+is used on T8132 only.
+
+The parameter is off by default; then nothing changes.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/apple-cluster-pwrgate.c | 85 +++++++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+
+diff --git a/drivers/soc/apple/apple-cluster-pwrgate.c b/drivers/soc/apple/apple-cluster-pwrgate.c
+index fe834613cb..8f2b805fc1 100644
+--- a/drivers/soc/apple/apple-cluster-pwrgate.c
++++ b/drivers/soc/apple/apple-cluster-pwrgate.c
+@@ -15,6 +15,8 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/printk.h>
++#include <linux/sysfs.h>
++#include <linux/types.h>
+ 
+ #define CLUSTER_PWRGATE_EN	BIT(31)
+ 
+@@ -23,11 +25,94 @@ static const struct of_device_id apple_cluster_pwrgate_of_match[] = {
+ 	{ }
+ };
+ 
++/*
++ * Bring-up: the T8132 words a suspend-to-RAM writes, read once and logged, so
++ * that a boot shows where they are and what they hold with both clusters up.
++ * Reads only. The blocks are /arm-io/pmgr reg[36] (CPU cluster control),
++ * reg[34] (power gates) and reg[9] / reg[20] (the two clusters' DVFM) of the
++ * J604 ADT. The offsets are those of Aurora's T8132 sleep driver.
++ */
++struct apple_cluster_pwrgate_word {
++	phys_addr_t addr;
++	bool wide;
++	const char *name;
++};
++
++static const struct apple_cluster_pwrgate_word t8132_sleep_words[] = {
++	{ 0x380780000, false, "cluster E" },
++	{ 0x380780004, false, "cluster P" },
++	{ 0x380780008, false, "cluster AVE" },
++	{ 0x380724000, false, "pwrgate +0x00" },
++	{ 0x380724040, false, "pwrgate +0x40" },
++	{ 0x380724060, false, "pwrgate +0x60" },
++	{ 0x3807240a0, false, "pwrgate +0xa0" },
++	{ 0x3807240a8, false, "pwrgate +0xa8" },
++	{ 0x210e70178, true, "DVFM E ctl" },
++	{ 0x211e70178, true, "DVFM P ctl" },
++};
++
++static bool dump_sleep_words_req;
++
++static void apple_cluster_pwrgate_dump(void)
++{
++	unsigned int i;
++
++	if (!of_machine_is_compatible("apple,t8132")) {
++		pr_info("sleep words: no table for this SoC\n");
++		return;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(t8132_sleep_words); i++) {
++		const struct apple_cluster_pwrgate_word *w = &t8132_sleep_words[i];
++		void __iomem *reg = ioremap_np(w->addr, w->wide ? 8 : 4);
++
++		if (!reg) {
++			pr_info("sleep words: %s at %pa: not mapped\n", w->name, &w->addr);
++			continue;
++		}
++		if (w->wide)
++			pr_info("sleep words: %s at %pa = %#llx\n", w->name, &w->addr, readq(reg));
++		else
++			pr_info("sleep words: %s at %pa = %#x\n", w->name, &w->addr, readl(reg));
++		iounmap(reg);
++	}
++}
++
++static int apple_cluster_pwrgate_dump_set(const char *val, const struct kernel_param *kp)
++{
++	bool dump;
++	int ret;
++
++	ret = kstrtobool(val, &dump);
++	if (ret)
++		return ret;
++	dump_sleep_words_req = dump;
++	/* On the command line this runs before ioremap works: the initcall dumps then. */
++	if (dump && system_state == SYSTEM_RUNNING)
++		apple_cluster_pwrgate_dump();
++	return 0;
++}
++
++static int apple_cluster_pwrgate_dump_get(char *buf, const struct kernel_param *kp)
++{
++	return sysfs_emit(buf, "%c\n", dump_sleep_words_req ? 'Y' : 'N');
++}
++
++static const struct kernel_param_ops apple_cluster_pwrgate_dump_ops = {
++	.set = apple_cluster_pwrgate_dump_set,
++	.get = apple_cluster_pwrgate_dump_get,
++};
++module_param_cb(dump_sleep_words, &apple_cluster_pwrgate_dump_ops, NULL, 0600);
++MODULE_PARM_DESC(dump_sleep_words, "Bring-up: log the T8132 CPU cluster, power gate and DVFM words a suspend-to-RAM uses, read only; at boot, or now when 1 is written (default: off)");
++
+ /* Before the secondaries start. A core picks the word up at its next WFI. */
+ static int __init apple_cluster_pwrgate_init(void)
+ {
+ 	struct device_node *np;
+ 
++	if (dump_sleep_words_req)
++		apple_cluster_pwrgate_dump();
++
+ 	for_each_matching_node(np, apple_cluster_pwrgate_of_match) {
+ 		void __iomem *gate;
+ 		int i;

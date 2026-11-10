@@ -24,6 +24,8 @@ New in 1.811: 0247 (`iommu: apple-dart: optionally save a DART without a sleep l
 
 New in 1.813: 0248 (`soc: apple: s2r: check what suspend-to-RAM needs before offering it`), 0249 (`arm64: apple: describe the T8132 CPU complexes, used only on request`).
 
+New in 1.816: 0250 (`arm64: apple: let a core powered down alone be tried again, for bring-up`), 0251 (`soc: apple: cluster-pwrgate: optionally log the T8132 sleep words`), 0252 (`arm64: dts: apple: t8132-j604: wake only from the sources macOS uses`).
+
 | 1.736 | 1.800 | Subject |
 |---|---|---|
 | 0001 | 0001 | dt-bindings: pci: apple,pcie: Describe the three T8132 root ports |

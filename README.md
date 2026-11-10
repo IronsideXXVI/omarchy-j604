@@ -57,7 +57,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`a82a1ebda940`), 249 patches | `1.813` |
+| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`a82a1ebda940`), 252 patches | `1.816` |
 | `m1n1-aurora` | 1.6.1.aurora22, omacom/m1n1 (`bc79acc434`), 38 patches | `1.610` |
 | `uboot-aurora` | 2026.07.aurora6, aurora-silicon/u-boot (`d30213eadc`) | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261031, omacom/mesa (`a196911147`) | `1.8133` |
@@ -77,7 +77,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 Also installed, unchanged from the official repositories: Hyprland 0.57.1 and the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
-Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.813 changed over 1.617).
+Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.816 changed over 1.617).
 
 ## Layout
 
