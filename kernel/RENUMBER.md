@@ -4,6 +4,8 @@ Kernel 1.800 rebases the J604 series from aurora-silicon/linux `integration/auro
 
 New in 1.800: 0221 (`arm64: dts: apple: t8132-j604: keep the MTP handoff of this boot chain`) and 0222 (`soc: apple: t8132: keep the J604's own PMGR domain policy for now`).
 
+New in 1.802: 0228 (`cpufreq: apple-soc: point the idle drop at the cluster's CPUs at init`), the fix that makes 0240-0241 (1.800: 0223-0224) run.
+
 | 1.736 | 1.800 | Subject |
 |---|---|---|
 | 0001 | 0001 | dt-bindings: pci: apple,pcie: Describe the three T8132 root ports |
