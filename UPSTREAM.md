@@ -1,6 +1,6 @@
 # Upstream plan for the J604 work
 
-Last updated 2026-11-09. This page lists what we plan to send to the official projects, in what order, how ready each piece is, and what is already open. **Nothing has merged yet.**
+Last updated 2026-11-10. This page lists what we plan to send to the official projects, in what order, how ready each piece is, and what is already open. **One has merged:** aurora-silicon/linux#1392 (2026-11-10).
 
 Labels:
 - **MEASURED**: run on the J604, or measured in our build and test runs.
@@ -9,16 +9,18 @@ Labels:
 - **INFERENCE**: our reasoning.
 - **TO-VERIFY**: open question.
 
-## Open upstream now (SOURCE, checked 2026-11-09)
+## Open upstream now (SOURCE, checked 2026-11-10)
 
 | Link | What | State |
 | --- | --- | --- |
-| [omacom/linux-aurora#432](https://github.com/omacom/linux-aurora/issues/432) | J604 test results (issue); points here for the status (`STATUS.md`) and this plan | open |
-| [omacom/omarchy#18176](https://github.com/omacom/omarchy/pull/18176) | Blur the Glassy bar from the cached wallpaper blur (59 to 119 fps on this 120 Hz panel, measured before 1.716; to be re-measured) | open, reopened. The same change as [#18191](https://github.com/omacom/omarchy/pull/18191) by raffsmagic; whichever the maintainers prefer, we test it |
+| [omacom/linux-aurora#432](https://github.com/omacom/linux-aurora/issues/432) | J604 test results (issue); points here for the status (`STATUS.md`) and this plan | open; results updated for 1.731 in a [comment on 2026-11-10](https://github.com/omacom/linux-aurora/issues/432#issuecomment-6761353411) |
+| [omacom/omarchy#18176](https://github.com/omacom/omarchy/pull/18176) | Blur the Glassy bar from the cached wallpaper blur (59 to 119 fps on this 120 Hz panel, re-measured on 1.731) | open, reopened. On 2026-11-10 a second commit (c60a87abef: the migration uses one conditional, as the automated review asked) and a [re-measure comment](https://github.com/omacom/omarchy/pull/18176#issuecomment-6761630560) were posted. The same change as [#18191](https://github.com/omacom/omarchy/pull/18191) by raffsmagic; whichever the maintainers prefer, we test it |
 | [omacom/omarchy#18228](https://github.com/omacom/omarchy/pull/18228) | Retry the kyber scheduler write while a sibling NVMe namespace switches (Linux 7.2 returns EBUSY) | open |
 | [omacom/omarchy#18229](https://github.com/omacom/omarchy/issues/18229) | Issue: `omarchy-mac`'s mpv default never installs because `omarchy-settings` owns `/etc/mpv/mpv.conf`. Linked from the related [omacom/omarchy-mac-pkgs#66](https://github.com/omacom/omarchy-mac-pkgs/issues/66). An M1 user's measurements showed that the stock default (`hwdec=auto-safe`) is the right one on the M1; our reply (2026-11-09) agrees and adds M4 numbers | open |
-| [aurora-silicon/linux#1392](https://github.com/aurora-silicon/linux/pull/1392) | GPU: lock a shared reservation once in the GPUVM exec lock (our kernel patch 0164; Wave 2 #22, note (g)), against `integration/aurora` | open |
+| [aurora-silicon/linux#1392](https://github.com/aurora-silicon/linux/pull/1392) | GPU: lock a shared reservation once in the GPUVM exec lock (our kernel patch 0164; Wave 2 #22, note (g)), against `integration/aurora` | **merged** 2026-11-10 07:25Z by RyanTheTide (merge commit d555cbe2acaa). Carried into omacom's kernel as [omacom/linux-aurora#438](https://github.com/omacom/linux-aurora/pull/438) (open, opened by edimoldovan with Dylan's authorship kept; he reports it tested on a J714c). It pairs with [omacom/omarchy-pkgs#2375](https://github.com/omacom/omarchy-pkgs/pull/2375) (the VA-API `aurora` alias, open), whose author replied that the two land together |
 | [omacom/omarchy#18177](https://github.com/omacom/omarchy/pull/18177) | Keybindings menu leaves out keys a keyboard lacks | closed, not merged. The same change is now kbd-0104 in our edge build (see below) |
+
+Posted on 2026-11-10, each on Dylan's yes: an update of the J604 results on [omacom/linux-aurora#432](https://github.com/omacom/linux-aurora/issues/432#issuecomment-6761353411); a second commit and a [re-measure comment](https://github.com/omacom/omarchy/pull/18176#issuecomment-6761630560) on omacom/omarchy#18176; an "Update, Nov 10" and a short follow-up on the Omarchy M team's J604 thread in Basecamp (members only, no public link).
 
 Drafted, **not opened yet** (each waits for Dylan's yes):
 - omacom/omarchy `quattro` <- `panel-display-defaults` (commit f480a050, our `disp-0201`): a built-in panel gets the monitor settings its platform package names in `displays.conf`. Credits #10549 (j-c-m), which set `cm = "dp3"` for the Dell XPS OLED.
@@ -27,7 +29,7 @@ Drafted, **not opened yet** (each waits for Dylan's yes):
 ## Direction we follow (SOURCE: Omarchy M team decisions and chat, Sep–Nov 2026)
 
 - Integrate into the main omacom repositories wherever practical: omacom/omarchy, omacom/omarchy-pkgs, omacom/omarchy-mac-pkgs, omacom/linux-aurora, omacom/m1n1.
-- **The kernel work for M4, M5 and M6 is merged together with Linux 7.3.** Our kernel series now applies to aurora-silicon/linux `integration/aurora` 7.3.0 (local 1.731, installed 2026-11-10) for that merge, rather than being sent as a separate J604 tree.
+- **The kernel work for M4, M5 and M6 is merged together with Linux 7.3.** Our kernel series now applies to aurora-silicon/linux `integration/aurora` 7.3.0 (local 1.733, installed 2026-11-10) for that merge, rather than being sent as a separate J604 tree.
 - Results are reported through [omarchy-m-testing.org](https://omarchy-m-testing.org), one result per check. "Not tested" is the default; an implementation alone is not a pass.
 
 ## How we work
@@ -57,7 +59,7 @@ Each needs Dylan's sign-off.
 | --- | --- | --- | --- | --- |
 | 1 | kyber retry | omacom/omarchy | **Open: #18228** | MEASURED 2026-11-09: two namespaces stay on `mq-deadline` with stock |
 | 2 | mpv.conf ownership | omacom/omarchy issue, cc omarchy-mac-pkgs | **Open: issue #18229**, linked from omarchy-mac-pkgs#66; the fix follows the maintainers' choice | MEASURED 2026-11-09 |
-| 3 | Glassy bar xray (59 to 119 fps) | omacom/omarchy | **Open: #18176** (reopened), same change as #18191 | MEASURED 2026-11-09 (before 1.716): stock 59 fps on this panel; TO-VERIFY on newer kernels |
+| 3 | Glassy bar xray (59 to 119 fps) | omacom/omarchy | **Open: #18176** (reopened), same change as #18191 | MEASURED 2026-11-09, re-measured 2026-11-10 on 1.731: stock 59 fps on this panel, 119 with xray |
 | 4 | Keyboard backlight: idle timeout (#12558 by Daniel Fernau, existing PR), a platform default for the timeout (`idle.json`), the restore level kept across a reboot, and the menu leaving out absent keys (the #18177 change) | omacom/omarchy (`quattro`); the platform default data in omacom/omarchy-mac-pkgs | Drafts ready; #12558 is someone else's open PR, which we test and support rather than resend | MEASURED 2026-11-09 on the J604 with the 1.3 builds |
 | 5 | Touch ID eligibility for the J604 (`apple,t8132` + `apple,j604`) + test | omacom/omarchy-mac-pkgs | Waits for the kernel side (#20) | MEASURED 2026-11-09: sudo, polkit, lock screen |
 | 6 | Plymouth: recognise SimpleDRM by driver name | freedesktop plymouth (GitLab merge request) | Ready (check for a duplicate first) | CODE + observed on the J604 before the fix |
@@ -84,7 +86,7 @@ Ordered by dependency. Kernel items assume Aurora's J604 tree and the 7.3 rebase
 | 19 | Audio: J604 UCM, speaker DSP graph, microphone config, `speakersafetyd` safety profile | AsahiLinux asahi-audio / alsa-ucm-conf-asahi / speakersafetyd, then the omarchy-pkgs recipes | Speaker safety review with the audio maintainers first |
 | 20 | Touch ID kernel side (Secure Enclave sensor node for T8132) | aurora-silicon/linux, with the Touch ID owners | Coordinate, don't duplicate; unblocks #5 |
 | 21 | CPU PMU node for the J604 (test-only today: enabled in the J604 delta file of patch 0157, as patch 0616 did in 1.617) | aurora-silicon/linux | Needs the counter measurement first |
-| 22 | GPU: lock a shared reservation once in the GPUVM exec lock (kernel patch 0164, "rust: drm: gpuvm: lock a shared reservation once in exec_lock"; note (g)) | aurora-silicon/linux | **Open: [aurora-silicon/linux#1392](https://github.com/aurora-silicon/linux/pull/1392)** (sent 2026-11-09 against `integration/aurora`, 1 commit, +8/-5; not merged). Upstream `integration/aurora` `d7303c39e215` still takes the full exec lock without `DRM_EXEC_IGNORE_DUPLICATES` (SOURCE, 2026-11-09). With it, stock mpv's zero-copy video on the J604 shows the correct picture with no submit errors (MEASURED 2026-11-09) |
+| 22 | GPU: lock a shared reservation once in the GPUVM exec lock (kernel patch 0164, "rust: drm: gpuvm: lock a shared reservation once in exec_lock"; note (g)) | aurora-silicon/linux | **Merged: [aurora-silicon/linux#1392](https://github.com/aurora-silicon/linux/pull/1392)** (sent 2026-11-09 against `integration/aurora`, 1 commit, +8/-5; merged 2026-11-10 as d555cbe2acaa; carried in omacom/linux-aurora#438). Before it, upstream `integration/aurora` took the full exec lock without `DRM_EXEC_IGNORE_DUPLICATES` (SOURCE, 2026-11-09). With it, stock mpv's zero-copy video on the J604 shows the correct picture with no submit errors (MEASURED 2026-11-09) |
 
 Not ready to propose (still being brought up, see `STATUS.md`): camera, microphones, ANE power-up, video encoder, external displays and HDMI, Thunderbolt/USB4, deep sleep.
 
@@ -102,5 +104,5 @@ Findings from moving the J604 to the Aurora 7.3 kernel base. Each is a note to r
 
 ## Kernel: what's next
 
-- Installed: `linux-aurora` 7.3.0.aurora1, local `1.731`: the series in `kernel/` (231 patches: 1.704's 164 plus 0165-0231) on aurora-silicon/linux `integration/aurora` `6ff31cbfa2`, booted with the 7.3 J604 device tree (1.703 since 2026-11-09, 1.704 since 22:16 UTC, 1.705 since 23:48 UTC, 1.706 since 2026-11-10 00:02 UTC, 1.707 since 00:11, 1.708 since 00:26, 1.710 since 01:01 UTC, 1.711 since 01:16 UTC, 1.712 since 01:35 UTC, 1.713 since 01:49 UTC, 1.714 since 02:06 UTC, 1.715 since 02:20 UTC, 1.716 since 02:35 UTC, 1.717 since 02:51 UTC, 1.718 since 03:09 UTC, 1.719 since 03:26 UTC, 1.720 since 04:05 UTC, 1.721 since 04:20 UTC, 1.722 since 04:38 UTC, 1.723 since 04:48 UTC, 1.724 since 04:55 UTC, 1.725 since 05:07 UTC, 1.726 since 05:54 UTC, 1.727 since 06:10 UTC, 1.728 since 06:26 UTC, 1.729 since 06:45 UTC, 1.730 since 06:58 UTC, 1.731 since 07:07 UTC; 1.709 was a trial, rolled back). Patches 0168-0175 are upstream `integration/aurora` commits taken unchanged. The official `linux-aurora` recipe still pins 7.2.11 (`b798f2b0c7`); our build keeps that recipe and moves its source to the 7.3 base.
-- Next: split the series into upstream topics for aurora-silicon/linux (Wave 2 above), starting with the small J604 device-tree and driver-match fixes (0158-0162); the GPU fix 0164 is open as aurora-silicon/linux#1392 (#22). The boot package selection of note (b) is installed (`omarchy-mac-boot` 1.616); it goes to omacom/omarchy-mac-pkgs as a note first, with Dylan's sign-off.
+- Installed: `linux-aurora` 7.3.0.aurora1, local `1.733`: the series in `kernel/` (236 patches: 1.704's 164 plus 0165-0236) on aurora-silicon/linux `integration/aurora` `6ff31cbfa2`, booted with the 7.3 J604 device tree (1.703 since 2026-11-09, 1.704 since 22:16 UTC, 1.705 since 23:48 UTC, 1.706 since 2026-11-10 00:02 UTC, 1.707 since 00:11, 1.708 since 00:26, 1.710 since 01:01 UTC, 1.711 since 01:16 UTC, 1.712 since 01:35 UTC, 1.713 since 01:49 UTC, 1.714 since 02:06 UTC, 1.715 since 02:20 UTC, 1.716 since 02:35 UTC, 1.717 since 02:51 UTC, 1.718 since 03:09 UTC, 1.719 since 03:26 UTC, 1.720 since 04:05 UTC, 1.721 since 04:20 UTC, 1.722 since 04:38 UTC, 1.723 since 04:48 UTC, 1.724 since 04:55 UTC, 1.725 since 05:07 UTC, 1.726 since 05:54 UTC, 1.727 since 06:10 UTC, 1.728 since 06:26 UTC, 1.729 since 06:45 UTC, 1.730 since 06:58 UTC, 1.731 since 07:07 UTC, 1.732 since 07:28 UTC, 1.733 since 07:56 UTC; 1.709 was a trial, rolled back). Patches 0168-0175 are upstream `integration/aurora` commits taken unchanged. The official `linux-aurora` recipe still pins 7.2.11 (`b798f2b0c7`); our build keeps that recipe and moves its source to the 7.3 base.
+- Next: split the series into upstream topics for aurora-silicon/linux (Wave 2 above), starting with the small J604 device-tree and driver-match fixes (0158-0162); the GPU fix 0164 merged as aurora-silicon/linux#1392 (#22) and leaves our series at the next rebase. Aurora's `integration/aurora` is now about 600 commits past our base `6ff31cbfa2` (604 on 2026-11-10, SOURCE), including aurora-silicon/linux#1329, another contributor's change that lets the GPU driver accept the J604's performance layout; a rebase onto it is planned. The boot package selection of note (b) is installed (`omarchy-mac-boot` 1.616); it goes to omacom/omarchy-mac-pkgs as a note first, with Dylan's sign-off.
