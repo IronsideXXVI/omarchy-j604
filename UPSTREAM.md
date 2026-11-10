@@ -27,7 +27,7 @@ Drafted, **not opened yet** (each waits for Dylan's yes):
 ## Direction we follow (SOURCE: Omarchy M team decisions and chat, Sep–Nov 2026)
 
 - Integrate into the main omacom repositories wherever practical: omacom/omarchy, omacom/omarchy-pkgs, omacom/omarchy-mac-pkgs, omacom/linux-aurora, omacom/m1n1.
-- **The kernel work for M4, M5 and M6 is merged together with Linux 7.3.** Our kernel series now applies to aurora-silicon/linux `integration/aurora` 7.3.0 (local 1.714, installed 2026-11-10) for that merge, rather than being sent as a separate J604 tree.
+- **The kernel work for M4, M5 and M6 is merged together with Linux 7.3.** Our kernel series now applies to aurora-silicon/linux `integration/aurora` 7.3.0 (local 1.715, installed 2026-11-10) for that merge, rather than being sent as a separate J604 tree.
 - Results are reported through [omarchy-m-testing.org](https://omarchy-m-testing.org), one result per check. "Not tested" is the default; an implementation alone is not a pass.
 
 ## How we work
@@ -102,5 +102,5 @@ Findings from moving the J604 to the Aurora 7.3 kernel base. Each is a note to r
 
 ## Kernel: what's next
 
-- Installed: `linux-aurora` 7.3.0.aurora1, local `1.714`: the series in `kernel/` (199 patches: 1.704's 164 plus 0165-0199) on aurora-silicon/linux `integration/aurora` `6ff31cbfa2`, booted with the 7.3 J604 device tree (1.703 since 2026-11-09, 1.704 since 22:16 UTC, 1.705 since 23:48 UTC, 1.706 since 2026-11-10 00:02 UTC, 1.707 since 00:11, 1.708 since 00:26, 1.710 since 01:01 UTC, 1.711 since 01:16 UTC, 1.712 since 01:35 UTC, 1.713 since 01:49 UTC, 1.714 since 02:06 UTC; 1.709 was a trial, rolled back). Patches 0168-0175 are upstream `integration/aurora` commits taken unchanged. The official `linux-aurora` recipe still pins 7.2.11 (`b798f2b0c7`); our build keeps that recipe and moves its source to the 7.3 base.
+- Installed: `linux-aurora` 7.3.0.aurora1, local `1.715`: the series in `kernel/` (200 patches: 1.704's 164 plus 0165-0200) on aurora-silicon/linux `integration/aurora` `6ff31cbfa2`, booted with the 7.3 J604 device tree (1.703 since 2026-11-09, 1.704 since 22:16 UTC, 1.705 since 23:48 UTC, 1.706 since 2026-11-10 00:02 UTC, 1.707 since 00:11, 1.708 since 00:26, 1.710 since 01:01 UTC, 1.711 since 01:16 UTC, 1.712 since 01:35 UTC, 1.713 since 01:49 UTC, 1.714 since 02:06 UTC, 1.715 since 02:20 UTC; 1.709 was a trial, rolled back). Patches 0168-0175 are upstream `integration/aurora` commits taken unchanged. The official `linux-aurora` recipe still pins 7.2.11 (`b798f2b0c7`); our build keeps that recipe and moves its source to the 7.3 base.
 - Next: split the series into upstream topics for aurora-silicon/linux (Wave 2 above), starting with the small J604 device-tree and driver-match fixes (0158-0162); the GPU fix 0164 is open as aurora-silicon/linux#1392 (#22). The boot package selection of note (b) is installed (`omarchy-mac-boot` 1.616); it goes to omacom/omarchy-mac-pkgs as a note first, with Dylan's sign-off.
