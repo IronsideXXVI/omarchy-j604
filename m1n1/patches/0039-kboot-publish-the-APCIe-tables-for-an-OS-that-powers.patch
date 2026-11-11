@@ -1,0 +1,284 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Diljit Singh <hey@djdev.me>
+Date: Sun, 8 Nov 2026 05:15:29 -0500
+Subject: [PATCH] kboot: publish the APCIe tables for an OS that powers
+ ANS's PCIe block back
+
+On every post-M4 Mac ANS runs on an APCIe block whose power an OS cycles
+in a deep sleep. Linux's deep sleep brings that block back by itself,
+and the ten tables it needs are only in the ADT. Copy them from the APCIe
+controller ANS is on (/arm-io/apcie, else /arm-io/apcie0) and its
+pci-bridge0 to the DT, each as <offset mask value> records relative to
+its window:
+
+- apcie-axi2af-tunables to apple,tunable-axi2af (reg[4], "axi2af")
+- apcie-phy-tunables to apple,tunable-phy (reg[2], "phy-block")
+- apcie-phy-ip-pll-tunables and apcie-phy-ip-auspma-tunables to
+  apple,tunable-phy-ip-pll and -phy-ip-auspma (reg[3], "phy-ip")
+- apcie-cio3pllcore-tunables to apple,tunable-cio3pll (reg[5], "cio3pll")
+- apcie-pcieclkgen-tunables to apple,tunable-clkgen (reg[6], "clkgen")
+- the bridge's apcie-config-tunables to apple,tunable-port (reg[7],
+  "port0")
+- the bridge's pcie-rc-tunables, pcie-rc-gen3-shadow-tunables and
+  pcie-rc-gen4-shadow-tunables to apple,tunable-rc, -rc-gen3 and -rc-gen4
+  (reg[0], "config")
+
+The host's go on the DT PCIe host whose "rc" window is the controller's
+reg[1], and the bridge's on its pci@0,0. These are the names Linux's
+T8140 deep sleep reads. The J700, J713, J773g, J773s and J616c ADTs all
+carry the ten under these names. The J604 dump on macOS 27.0 has none, and
+gets none published.
+
+Every record must be 32 bits wide, aligned and inside its window, or no
+table is published. Each table goes in with one fdt_setprop(), and if one
+fails the ones already added are removed, so it is all ten or none.
+Adding to the host moves its port, so the port is looked up again for each
+table and for the rollback. A failure only logs. On a Mac whose ANS isn't
+the post-M4 kind (no nvme-secure-bar) nothing is published.
+
+On the Neo's live ADT (J700, September dumps) all ten pass: 274 records,
+3.2 KiB of DT.
+
+Two host-model tests compile pcie_fdt.c and kboot_boot() with their own
+stubs, so they get stubs for the new code.
+
+Signed-off-by: Diljit Singh <hey@djdev.me>
+(cherry picked from commit 3729d8b1a929c4bef08cd858f7487be927b7cab2)
+[Dylan: our tree has no T6050 handoff, so only the publishing hook goes into kboot_boot(); the host tests take our stubs plus the new ones; our pcie-power test already models adt and adt_path_offset, so it gets only a NULL adt_get_property and the three new stubs.]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ src/kboot.c                            |   3 +
+ src/pcie.h                             |   2 +
+ src/pcie_fdt.c                         | 140 +++++++++++++++++++++++++
+ tests/python/test_m4_pcie_power_fdt.py |  11 +-
+ tests/python/test_smp_handoff_gate.py  |   1 +
+ 5 files changed, 156 insertions(+), 1 deletion(-)
+
+diff --git a/src/kboot.c b/src/kboot.c
+index 901f7689..69d533ab 100644
+--- a/src/kboot.c
++++ b/src/kboot.c
+@@ -8004,6 +8004,9 @@ int kboot_boot(void *kernel)
+                 return -1;
+         }
+     }
++    /* Linux's deep sleep needs them to bring ANS's APCIe block back. */
++    if (!ret && pcie_apcie_tables_fdt(dt) < 0)
++        printf("kboot: APCIe tables not published; deep sleep stays refused\n");
+     if (chip_id == T8140) {
+         if (ret < 0) {
+             printf("kboot: refusing T8140 handoff after partial PCIe setup\n");
+diff --git a/src/pcie.h b/src/pcie.h
+index 123466f6..4e86d090 100644
+--- a/src/pcie.h
++++ b/src/pcie.h
+@@ -10,5 +10,7 @@ int pcie_shutdown(void);
+ 
+ /* Disable optional J713 PCIe admission after rail/controller/DART failure. */
+ int pcie_disable_j713_fdt(void *dt);
++/* Post-M4: copy the APCIe tables from the ADT to the DT's PCIe host and its port. */
++int pcie_apcie_tables_fdt(void *dt);
+ 
+ #endif
+diff --git a/src/pcie_fdt.c b/src/pcie_fdt.c
+index 522ec7b7..45566d0e 100644
+--- a/src/pcie_fdt.c
++++ b/src/pcie_fdt.c
+@@ -3,6 +3,7 @@
+ #include "pcie.h"
+ #include "adt.h"
+ #include "dart.h"
++#include "malloc.h"
+ #include "smc.h"
+ #include "utils.h"
+ #include "t8132_board.h"
+@@ -403,6 +404,145 @@ int pcie_handoff_fdt(void *dt)
+  * No native PCIe device driver may adopt a partially prepared rail/link/DART.
+  * ANS storage is independent. Never change another board's topology here.
+  */
++/* The ADT's local tunable format. */
++struct pcie_adt_tunable {
++    u32 offset;
++    u32 size;
++    u64 mask;
++    u64 value;
++} PACKED;
++
++/*
++ * Post-M4: what an OS needs to bring the APCIe block ANS runs on back by itself after its power
++ * was cycled, as Linux's deep sleep does, which only the ADT has. Each
++ * table is <offset mask value> records relative to its /arm-io/apcie window, named as in the DT
++ * PCIe node: reg[0] "config", reg[2] "phy-block", reg[3] "phy-ip", reg[4] "axi2af", reg[5]
++ * "cio3pll", reg[6] "clkgen" and reg[7] "port0". The port's own come from pci-bridge0, and go on
++ * the DT's pci@0,0.
++ */
++static const struct {
++    const char *adt;
++    const char *fdt;
++    int reg;
++    bool port;
++} pcie_apcie_tables[] = {
++    {"apcie-axi2af-tunables", "apple,tunable-axi2af", 4, false},
++    {"apcie-phy-tunables", "apple,tunable-phy", 2, false},
++    {"apcie-phy-ip-pll-tunables", "apple,tunable-phy-ip-pll", 3, false},
++    {"apcie-phy-ip-auspma-tunables", "apple,tunable-phy-ip-auspma", 3, false},
++    {"apcie-cio3pllcore-tunables", "apple,tunable-cio3pll", 5, false},
++    {"apcie-pcieclkgen-tunables", "apple,tunable-clkgen", 6, false},
++    {"apcie-config-tunables", "apple,tunable-port", 7, true},
++    {"pcie-rc-tunables", "apple,tunable-rc", 0, true},
++    {"pcie-rc-gen3-shadow-tunables", "apple,tunable-rc-gen3", 0, true},
++    {"pcie-rc-gen4-shadow-tunables", "apple,tunable-rc-gen4", 0, true},
++};
++
++/* Adding to the host moves its port, so the port is looked up each time. */
++static int pcie_apcie_table_node(void *dt, int host, size_t i)
++{
++    return pcie_apcie_tables[i].port ? fdt_subnode_offset(dt, host, "pci@0,0") : host;
++}
++
++/* One table, whole or not at all. */
++static int pcie_apcie_table_fdt(void *dt, int host, int adt_node, int *path, size_t i)
++{
++    const struct pcie_adt_tunable *t;
++    int node = pcie_apcie_table_node(dt, host, i);
++    u64 base, size;
++    u32 len;
++
++    t = adt_getprop(adt, adt_node, pcie_apcie_tables[i].adt, &len);
++    if (!t || !len || len % sizeof(*t) ||
++        adt_get_reg(adt, path, "reg", pcie_apcie_tables[i].reg, &base, &size) < 0 || size < 4) {
++        printf("FDT: %s missing or malformed\n", pcie_apcie_tables[i].adt);
++        return -1;
++    }
++
++    u32 n = len / sizeof(*t);
++    fdt32_t *cells = malloc(n * 3 * sizeof(*cells));
++    if (!cells)
++        return -1;
++    for (u32 j = 0; j < n; j++) {
++        if (t[j].size != 4 || t[j].offset % 4 || t[j].offset > size - 4 || t[j].mask >> 32 ||
++            t[j].value >> 32) {
++            printf("FDT: %s record %u unsupported\n", pcie_apcie_tables[i].adt, j);
++            free(cells);
++            return -1;
++        }
++        cells[3 * j] = cpu_to_fdt32(t[j].offset);
++        cells[3 * j + 1] = cpu_to_fdt32(t[j].mask);
++        cells[3 * j + 2] = cpu_to_fdt32(t[j].value);
++    }
++
++    int ret = fdt_setprop(dt, node, pcie_apcie_tables[i].fdt, cells, n * 3 * sizeof(*cells));
++    free(cells);
++    if (ret < 0) {
++        printf("FDT: couldn't add %s: %s\n", pcie_apcie_tables[i].fdt, fdt_strerror(ret));
++        return -1;
++    }
++    return n;
++}
++
++/* The DT PCIe host whose "rc" window is the ADT controller's reg[1]. */
++static int pcie_apcie_host(void *dt, int *path)
++{
++    u64 rc;
++
++    if (adt_get_reg(adt, path, "reg", 1, &rc, NULL) < 0)
++        return -1;
++    for (int node = fdt_next_node(dt, -1, NULL); node >= 0; node = fdt_next_node(dt, node, NULL)) {
++        int idx = fdt_stringlist_search(dt, node, "reg-names", "rc"), len;
++        const fdt32_t *reg = fdt_getprop(dt, node, "reg", &len);
++        int parent = fdt_parent_offset(dt, node);
++
++        if (idx < 0 || !reg || fdt_address_cells(dt, parent) != 2 ||
++            fdt_size_cells(dt, parent) != 2 || len < (idx + 1) * 16)
++            continue;
++        if (((u64)fdt32_to_cpu(reg[4 * idx]) << 32 | fdt32_to_cpu(reg[4 * idx + 1])) == rc)
++            return node;
++    }
++    return -1;
++}
++
++/* 0 on a Mac whose ANS doesn't run on the APCIe block: nothing to publish. */
++int pcie_apcie_tables_fdt(void *dt)
++{
++    int ans = adt_path_offset(adt, "/arm-io/ans");
++    if (ans < 0 || !adt_get_property(adt, ans, "nvme-secure-bar"))
++        return 0;
++
++    const char *apcie =
++        adt_path_offset(adt, "/arm-io/apcie") >= 0 ? "/arm-io/apcie" : "/arm-io/apcie0";
++    char bridge[32];
++    int path[8], bridge_path[8];
++    snprintf(bridge, sizeof(bridge), "%s/pci-bridge0", apcie);
++    int adt_node = adt_path_offset_trace(adt, apcie, path);
++    int adt_bridge = adt_path_offset_trace(adt, bridge, bridge_path);
++    int host = adt_node < 0 ? -1 : pcie_apcie_host(dt, path);
++    int records = 0;
++
++    if (adt_bridge < 0 || host < 0 || fdt_subnode_offset(dt, host, "pci@0,0") < 0) {
++        printf("FDT: no PCIe host or port in the DT for %s's tables\n", apcie);
++        return -1;
++    }
++
++    /* Properties added to the host or its port leave the host's offset as it is. */
++    for (size_t i = 0; i < ARRAY_SIZE(pcie_apcie_tables); i++) {
++        int from = pcie_apcie_tables[i].port ? adt_bridge : adt_node;
++        int n = pcie_apcie_table_fdt(dt, host, from, path, i);
++        if (n < 0) {
++            for (size_t j = 0; j < i; j++)
++                fdt_delprop(dt, pcie_apcie_table_node(dt, host, j), pcie_apcie_tables[j].fdt);
++            return -1;
++        }
++        records += n;
++    }
++
++    printf("FDT: %s tables published, %d records\n", apcie, records);
++    return records;
++}
++
+ int pcie_disable_j713_fdt(void *dt)
+ {
+     int host = -1;
+diff --git a/tests/python/test_m4_pcie_power_fdt.py b/tests/python/test_m4_pcie_power_fdt.py
+index 020f56ba..857b6302 100644
+--- a/tests/python/test_m4_pcie_power_fdt.py
++++ b/tests/python/test_m4_pcie_power_fdt.py
+@@ -120,14 +120,23 @@ def test_j713_pcie_power_contract(tmp_path):
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include "libfdt.h"
+ typedef uint8_t u8;
+ typedef uint32_t u32;
+ typedef uint64_t u64;
+-#define PACKED __attribute__((packed))
+ typedef int smc_dev_t;
+ #define BIT(n) (1U << (n))
++#define PACKED __attribute__((packed))
++#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
++/* The T8140 APCIe tables aren't under test; the J604 ADT model below has adt. */
++struct adt_property;
++const struct adt_property *adt_get_property(const void *a, int node, const char *name) { return NULL; }
++static int adt_path_offset_trace(const void *a, const char *path, int *offsets) { return -1; }
++static const void *adt_getprop(const void *a, int node, const char *name, u32 *len) { return NULL; }
++static int adt_get_reg(const void *a, int *path, const char *prop, int idx, u64 *addr, u64 *size)
++{ return -1; }
+ static int writes, bypasses;
+ static int smc_result;
+ static u32 last_value, last_key;
+diff --git a/tests/python/test_smp_handoff_gate.py b/tests/python/test_smp_handoff_gate.py
+index d9da7256..1e1545b2 100644
+--- a/tests/python/test_smp_handoff_gate.py
++++ b/tests/python/test_smp_handoff_gate.py
+@@ -50,6 +50,7 @@ static void usb_init(void) {}
+ static int pcie_init(void) { return 0; }
+ static int pcie_prepare_fdt(void *p) { return 0; }
+ static int pcie_handoff_fdt(void *p) { return 0; }
++static int pcie_apcie_tables_fdt(void *p) { return 0; }
+ static int fdt_node_check_compatible(const void *p, int node, const char *compatible) { return 1; }
+ static int dt_disable_j713_pcie(void) { return 0; }
+ static int dt_disable_t8140_pcie(void) { return 0; }
+-- 
+2.43.0
+

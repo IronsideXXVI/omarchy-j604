@@ -30,6 +30,8 @@ New in 1.820: 0253 (`phy: apple: atc: keep a T8132 CIO link when its USB host st
 
 New in 1.821: 0265 (`arm64: apple: stop parked cores for a T8132 sleep commit, as macOS does`), 0266 (`soc: apple: s2r: add the T8132 sleep sequence macOS uses, for bring-up`), 0267 (`dt-bindings: power: apple,pmgr-s2r: describe the T8132 sequence`), 0268 (`arm64: dts: apple: t8132-j604: describe the T8132 sleep sequence's windows`), 0269 (`soc: apple: s2r: report the CPU stop word around a T8132 sleep`), 0270 (`drm/asahi: g17: restart the GPU firmware across a firmware-driven suspend`), 0271 (`drm/asahi: G16: ride out dark sensors while the GPU is idle`), 0272 (`drm/asahi: G16: stop the firmware for a deep sleep and restart it warm`), 0273 (`Revert "soc: apple: pmp: release the GPU's AGX vote at the sleep's commit"`), 0274 (`arm64: dts: apple: t8132: map the whole PMP SRAM`), 0275 (`soc: apple: pmp: keep T8132's __DATA across a deep sleep`), 0276 (`soc: apple: pmp: keep the GPU's AGX vote through a deep sleep`).
 
+New in 1.823: 0277 (`arm64: dts: apple: t8132-j604: point the P cluster's power gate at +0x60`), 0278 (`mmc: sdhci-pci-gli: optionally runtime suspend an idle GL9755`), 0279 (`drm/apple: m4: power the internal DCP down for any deep sleep`).
+
 | 1.736 | 1.800 | Subject |
 |---|---|---|
 | 0001 | 0001 | dt-bindings: pci: apple,pcie: Describe the three T8132 root ports |
