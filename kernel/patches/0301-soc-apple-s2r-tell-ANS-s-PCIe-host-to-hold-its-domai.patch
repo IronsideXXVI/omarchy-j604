@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 04:03:55 +0000
+Subject: [PATCH] soc: apple: s2r: tell ANS's PCIe host to hold its
+ domains through a T8132 sleep
+
+In every suspend-to-RAM genpd powers a domain off at noirq once all its
+devices are suspended. For ANS's APCIe block that is before ->enter,
+while ANS still runs on the link; and since the domains then sit "off"
+on genpd's books, the power-state resync after a sleep that set
+pm_resume_via_firmware gates the block the T8132 sequence has just
+raised, so ANS restarts on a link that is not set up.
+
+The sequence owns that block's power: it lowers it after stopping ANS
+and raises it before ANS runs again, as macOS does. From ->begin to
+->end of a T8132 sleep, apple_sleep_apcie_hold() answers true for ANS's
+host (the apple,apcie node), so that the host can keep genpd off its
+domains for the sleep, as it already does for suspend-to-idle.
+
+Only a sleep with t8132_sequence set is affected.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/apple-s2r.c   | 27 +++++++++++++++++++++++++++
+ include/linux/soc/apple/sleep.h |  3 +++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index dbf1ac2afe..c672e08582 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -440,6 +440,9 @@ struct apple_s2r_t8132 {
+ 	u32 stop_word[3];
+ 	unsigned int stop_read;
+ 	bool wd2_armed;
++	/* ANS's APCIe host, and whether its domains are held on for this sleep */
++	struct device_node *apcie_np;
++	bool hold_apcie;
+ 
+ 	/* The wake words as read back right after arming the masks */
+ 	u32 wake_rb[T8132_WAKE_RB_WORDS];
+@@ -2257,6 +2260,24 @@ int apple_sleep_apcie_port_down(unsigned int port)
+ }
+ EXPORT_SYMBOL_GPL(apple_sleep_apcie_port_down);
+ 
++/**
++ * apple_sleep_apcie_hold() - whether a T8132 sleep holds this PCIe host's domains on
++ * @np: the host's node
++ *
++ * For the PCIe host, in its noirq suspend. From ->begin of a T8132 sleep to its ->end the
++ * sequence owns the power of ANS's APCIe block: it lowers and raises it itself inside
++ * ->enter, after ANS is stopped, as macOS does. genpd must neither gate the block at noirq
++ * under a still running ANS, nor leave its books off, for the resume's power-state resync
++ * would then gate the block the sequence raised. True only for that host, during that
++ * sleep.
++ */
++bool apple_sleep_apcie_hold(struct device_node *np)
++{
++	return apple_s2r && np && READ_ONCE(apple_s2r->t8132.hold_apcie) &&
++	       np == apple_s2r->t8132.apcie_np;
++}
++EXPORT_SYMBOL_GPL(apple_sleep_apcie_hold);
++
+ static void __iomem *apple_s2r_t8132_apcie_block(struct apple_s2r *s2r, struct device_node *np,
+ 						 const char *name, const char *prop,
+ 						 struct apple_tunable **tun)
+@@ -2356,6 +2377,8 @@ static void apple_s2r_t8132_map_apcie(struct apple_s2r *s2r)
+ 	dev_info(s2r->dev, "T8132 sequence: ANS's APCIe block %s\n",
+ 		 t->apcie_ok ? "can be lowered and raised (tables from the boot loader)" :
+ 		 "has no complete tables: a real sleep with ANS stopped is refused");
++	/* Kept: apple_sleep_apcie_hold() tells this host from the others. */
++	t->apcie_np = of_node_get(np);
+ out:
+ 	of_node_put(pins);
+ 	of_node_put(np);
+@@ -2963,6 +2986,8 @@ static void apple_s2r_t8132_begin(struct apple_s2r *s2r)
+ 		apple_s2r_t8132_set_wd2(s2r, T8132_WD2_BEGIN_SECS);
+ 		t->wd2_armed = true;
+ 	}
++	/* The sequence lowers and raises ANS's block itself: genpd keeps off it. */
++	WRITE_ONCE(t->hold_apcie, t->mapped && t->apcie_np);
+ }
+ 
+ /* The T8132 register windows; mapped without claiming them, as other drivers own most. */
+@@ -3430,6 +3455,8 @@ static void apple_s2r_resume_finish(void)
+ 
+ static void apple_s2r_resume_end(void)
+ {
++	if (apple_s2r)
++		WRITE_ONCE(apple_s2r->t8132.hold_apcie, false);
+ 	if (apple_s2r)
+ 		apple_s2r_crumb(apple_s2r, S2R_CRUMB_END);
+ 	if (apple_s2r && apple_s2r->t8132.wd2_armed) {
+diff --git a/include/linux/soc/apple/sleep.h b/include/linux/soc/apple/sleep.h
+index 5c8690ed6b..93fc816021 100644
+--- a/include/linux/soc/apple/sleep.h
++++ b/include/linux/soc/apple/sleep.h
+@@ -101,6 +101,8 @@ void apple_sleep_apcie_port_up(unsigned int port);
+ void apple_sleep_radio_port_up(void);
+ /* Whether a T8132 sleep left that root port down: 1 down, 0 not, -EIO if the block stayed off. */
+ int apple_sleep_apcie_port_down(unsigned int port);
++/* Whether a T8132 sleep holds this PCIe host's power domains on (its own lowering owns them). */
++bool apple_sleep_apcie_hold(struct device_node *np);
+ #else
+ static inline int apple_sleep_coproc_register(struct device *dev, void __iomem *asc,
+ 					      bool pcie_ans, int (*last_stop)(void *data),
+@@ -120,6 +122,7 @@ static inline void apple_sleep_restore_pins(void) { }
+ static inline void apple_sleep_apcie_port_up(unsigned int port) { }
+ static inline void apple_sleep_radio_port_up(void) { }
+ static inline int apple_sleep_apcie_port_down(unsigned int port) { return 0; }
++static inline bool apple_sleep_apcie_hold(struct device_node *np) { return false; }
+ #endif
+ 
+ /*

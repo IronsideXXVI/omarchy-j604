@@ -1,0 +1,412 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 03:55:41 +0000
+Subject: [PATCH] soc: apple: s2r: refuse a T8132 sleep whose IO
+ lowering fails, split the split step, time each step
+
+The split step (abort_before 16) on a J604 never came back and the
+watchdog reset the machine about 120 s after the match. With the
+breadcrumb on, the steps before the IO lowering came back intact
+(abort_before 15), and the boot firmware records none of the PMU stage
+values the steps past the match write, so nothing told where it stopped.
+
+Three bring-up aids for the steps between the match and the commit:
+
+- The lowering keeps the result of each of its handshakes: a root
+  port's PHY clock, the APCIe PHY clocks, the clock generator, the
+  fabric enables' domain, and ANS reading off. The first one that fails
+  is named, the lowering is undone as the return from a sleep undoes
+  it, and the sleep returns -EIO instead of going on to the commit with
+  a block that did not go down. An L2 entry that a driverless endpoint
+  never answers is counted, not refused. A root port's PHY window is
+  touched only with the system domain on too, as the block's PHY is.
+
+- split_depth: with abort_before 16, how much of the lowering runs
+  before the raise: ANS stopped only, then ATC0, the root ports, the
+  PHY, the clock and system domains, the fabric enables, and ANS's
+  domain. Each depth undoes what it lowered: ports stopped alone are
+  left down for their host, a block whose domains went down is raised
+  whole.
+
+- t8132_time_trail: each step past the match arms the watchdog with its
+  own time, 20 s apart (120 s stays the syscore resume's), so that the
+  time of a reset names the step without the PMU or memory.
+
+All of it acts only with t8132_sequence set; the depth and the time
+trail are off by default, and the refusal only changes a sleep that
+would otherwise hang.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/apple-s2r.c | 191 +++++++++++++++++++++++++++-------
+ 1 file changed, 156 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index 936917180c..db6e019836 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -445,6 +445,14 @@ struct apple_s2r_t8132 {
+ 	int pcie_ans_on_ret;
+ 	/* abort_before at the raise: the IO lowering was undone without a commit */
+ 	bool raised;
++	/* What the finisher lowered, and the first lowering step that failed */
++	bool io_lowered;
++	bool apcie_lowered;
++	bool apcie_domains_lowered;
++	u8 lower_step;
++	int lower_err;
++	unsigned int l2_timeouts;
++	int atc0_ret;
+ 
+ 	/* PMU boot stage byte: macOS's sleep value is written at the match */
+ 	bool pmu_written;
+@@ -1018,6 +1026,14 @@ static bool debug_begin_as_idle;
+ module_param(debug_begin_as_idle, bool, 0644);
+ MODULE_PARM_DESC(debug_begin_as_idle, "Bring-up: do not declare a suspend-to-RAM firmware-driven, so devices suspend as for suspend-to-idle; ->enter then refuses it (default: off)");
+ 
++static uint split_depth;
++module_param(split_depth, uint, 0644);
++MODULE_PARM_DESC(split_depth, "For bring-up, with t8132_sequence and abort_before=16 (the split step): how much of the IO lowering runs before it is raised again: 1 ANS stopped only, 2 + ATC0, 3 + APCIe root ports stopped, 4 + APCIe PHY, 5 + APCIe clock and system domains, 6 + AXI enables and GP, 7 + the ANS domain; 0 is all of it (default: 0)");
++
++static bool t8132_time_trail;
++module_param(t8132_time_trail, bool, 0644);
++MODULE_PARM_DESC(t8132_time_trail, "For bring-up, with t8132_sequence and wdt_from_enter: at each step past the match, arm the watchdog again with that step's own time (20 s apart), so that the time of a reset names the step a hang came from (default: off)");
++
+ static bool t8132_sequence;
+ module_param(t8132_sequence, bool, 0444);
+ MODULE_PARM_DESC(t8132_sequence, "Bring-up, T8132 only: run suspend-to-RAM with the sequence macOS uses on that SoC (as Aurora measured and ported it) instead of the CPU complex one, which T8132 lacks; needs its register windows and apple,wake-enable in the device tree. A real sleep is still refused while a display CPU or ANS's PCIe block is on, so only bring-up runs with abort_before go ahead (default: off, deep is not offered on T8132)");
+@@ -1285,6 +1301,30 @@ static void apple_s2r_wdt_arm(struct apple_s2r *s2r)
+ 	apple_s2r_wdt_arm_secs(s2r, wdt_timeout);
+ }
+ 
++/*
++ * t8132_time_trail: each step past the match arms the watchdog with its own
++ * time, so that a reset names the step without the PMU byte (whose 0x4X
++ * values the boot firmware does not record) and without memory. 120 s stays
++ * the syscore resume's, for a stop after the split step came back.
++ */
++#define T8132_TT_STOPPED	20
++#define T8132_TT_RAM		40
++#define T8132_TT_IO		60
++#define T8132_TT_PORTS		80
++#define T8132_TT_PHY		100
++#define T8132_TT_DOMAINS	140
++#define T8132_TT_ANS		160
++#define T8132_TT_RAISE		175
++#define T8132_TT_WD2		178
++
++/* A step past the match: its crumb, and with the time trail its own watchdog time */
++static void apple_s2r_t8132_step(struct apple_s2r *s2r, u8 crumb, u32 secs)
++{
++	apple_s2r_crumb(s2r, crumb);
++	if (READ_ONCE(t8132_time_trail) && s2r->wdt_armed && secs)
++		apple_s2r_wdt_arm_secs(s2r, secs);
++}
++
+ /* Keep what the watchdog driver had programmed, then arm the safety timer */
+ static void apple_s2r_wdt_take(struct apple_s2r *s2r)
+ {
+@@ -1872,12 +1912,22 @@ static int apple_s2r_t8132_ps_raise_full(void __iomem *reg)
+ 	return ret;
+ }
+ 
+-static void apple_s2r_t8132_port_stop(struct apple_s2r *s2r, int i)
++/* The first lowering step that failed, kept for the refusal */
++static void apple_s2r_t8132_lower_fail(struct apple_s2r_t8132 *t, u8 step, int ret)
++{
++	if (ret && !t->lower_err) {
++		t->lower_err = ret;
++		t->lower_step = step;
++	}
++}
++
++static int apple_s2r_t8132_port_stop(struct apple_s2r *s2r, int i)
+ {
+ 	struct apple_s2r_t8132 *t = &s2r->t8132;
+ 	void __iomem *port = t->apcie_ports[i].port;
+ 	void __iomem *phy = t->apcie_ports[i].phy;
+ 	u32 val;
++	int ret;
+ 
+ 	writel(readl(port + APCIE_PORT_INTMSK) | APCIE_PORT_INT_LINK, port + APCIE_PORT_INTMSK);
+ 	writel(APCIE_PORT_INT_LINK, port + APCIE_PORT_INTSTAT);
+@@ -1886,8 +1936,10 @@ static void apple_s2r_t8132_port_stop(struct apple_s2r *s2r, int i)
+ 	/* A loader can leave the port ready with the link never trained. */
+ 	if (readl(port + APCIE_PORT_LINKSTS) & APCIE_PORT_LINKSTS_UP) {
+ 		writel(APCIE_PORT_L2_ENTER, port + APCIE_PORT_L2);
+-		readl_poll_timeout_atomic(port + APCIE_PORT_L2, val, !(val & APCIE_PORT_L2_BUSY),
+-					  10, APCIE_PORT_STOP_US);
++		/* An endpoint with no driver (removed before the sleep) may never answer. */
++		if (readl_poll_timeout_atomic(port + APCIE_PORT_L2, val,
++					      !(val & APCIE_PORT_L2_BUSY), 10, APCIE_PORT_STOP_US))
++			t->l2_timeouts++;
+ 	}
+ 	/* The endpoint keeps its power and firmware, in reset until its host releases it. */
+ 	if (s2r->pins && t->apcie_ports[i].perst >= 0 &&
+@@ -1910,11 +1962,14 @@ static void apple_s2r_t8132_port_stop(struct apple_s2r *s2r, int i)
+ 	writel(readl(phy) & ~APCIE_PORT_PHY_EN0, phy);
+ 	writel(readl(phy) | APCIE_PHY_CTRL_RESET, phy);
+ 	writel(readl(phy) & ~APCIE_PHY_CTRL_CLK0REQ, phy);
+-	readl_poll_timeout_atomic(phy, val, !(val & APCIE_PHY_CTRL_CLK0ACK), 1, APCIE_POLL_US);
++	ret = readl_poll_timeout_atomic(phy, val, !(val & APCIE_PHY_CTRL_CLK0ACK), 1,
++					APCIE_POLL_US);
+ 	writel(readl(phy) & ~APCIE_PHY_CTRL_CLK1REQ, phy);
+ 
+ 	writel(readl(port + APCIE_PORT_APPCLK) & ~APCIE_PORT_APPCLK_EN, port + APCIE_PORT_APPCLK);
+ 	writel(readl(port + APCIE_PORT_INTSTAT), port + APCIE_PORT_INTSTAT);
++
++	return ret;
+ }
+ 
+ /* Only a port set up, by the loader or by its host after a wake: else its registers abort. */
+@@ -1923,70 +1978,91 @@ static void apple_s2r_t8132_ports_stop(struct apple_s2r *s2r)
+ 	struct apple_s2r_t8132 *t = &s2r->t8132;
+ 	int i;
+ 
++	/* Each port's PHY window, like the block's, needs PHY_SW and SYS_ST on. */
+ 	if (!apple_s2r_t8132_ps_on(s2r, T8132_PS_APCIE_GP) ||
+-	    !apple_s2r_t8132_ps_on(s2r, T8132_PS_APCIE_PHY_SW))
++	    !apple_s2r_t8132_ps_on(s2r, T8132_PS_APCIE_PHY_SW) ||
++	    !apple_s2r_t8132_ps_on(s2r, T8132_PS_APCIE_SYS_ST))
+ 		return;
+ 	for (i = 0; i < APCIE_MAX_PORTS; i++) {
+ 		if (!t->apcie_ports[i].port || !t->apcie_ports[i].phy ||
+ 		    t->apcie_ports[i].stopped || t->apcie_ports[i].down)
+ 			continue;
+ 		t->apcie_ports[i].stopped = true;
+-		apple_s2r_t8132_port_stop(s2r, i);
++		apple_s2r_t8132_lower_fail(t, S2R_CRUMB_T8132_PORTS,
++					   apple_s2r_t8132_port_stop(s2r, i));
+ 	}
+ }
+ 
+ /* A poll here only paces the steps: the power goes next whatever it reads. */
+-static void apple_s2r_t8132_apcie_phy_off(struct apple_s2r_t8132 *t)
++static int apple_s2r_t8132_apcie_phy_off(struct apple_s2r_t8132 *t)
+ {
+ 	void __iomem *ctrl = t->apcie_phy + APCIE_PHY_CTRL;
+ 	void __iomem *run = t->apcie_phy + APCIE_PHY_RUN;
+ 	u32 val;
++	int ret;
+ 
+ 	writel(readl(ctrl) | APCIE_PHY_CTRL_RESET, ctrl);
+ 	writel(readl(ctrl) & ~APCIE_PHY_CTRL_CLK1REQ, ctrl);
+-	readl_poll_timeout_atomic(ctrl, val, !(val & APCIE_PHY_CTRL_CLK1ACK), 1, APCIE_POLL_US);
++	ret = readl_poll_timeout_atomic(ctrl, val, !(val & APCIE_PHY_CTRL_CLK1ACK), 1,
++					APCIE_POLL_US);
+ 	writel(readl(ctrl) & ~APCIE_PHY_CTRL_CLK0REQ, ctrl);
+-	readl_poll_timeout_atomic(ctrl, val, !(val & APCIE_PHY_CTRL_CLK0ACK), 1, APCIE_POLL_US);
++	ret |= readl_poll_timeout_atomic(ctrl, val, !(val & APCIE_PHY_CTRL_CLK0ACK), 1,
++					 APCIE_POLL_US);
+ 	writel(readl(ctrl) & ~APCIE_PHY_CTRL_UP, ctrl);
+ 	writel(readl(run) & ~APCIE_PHY_RUN_EN2, run);
+ 	writel(readl(run) & ~APCIE_PHY_RUN_EN, run);
++
++	return ret ? -ETIMEDOUT : 0;
+ }
+ 
+-static void apple_s2r_t8132_apcie_clk_off(struct apple_s2r_t8132 *t)
++static int apple_s2r_t8132_apcie_clk_off(struct apple_s2r_t8132 *t)
+ {
+ 	void __iomem *clk = t->apcie_clkgen + APCIE_CLK_CTRL;
+ 	u32 val;
++	int ret;
+ 
+ 	writel(readl(clk) & ~APCIE_CLK_RUN, clk);
+ 	writel(readl(clk) | APCIE_CLK_OFF, clk);
+-	readl_poll_timeout_atomic(clk, val, !(val & APCIE_CLK_BUSY), 1, APCIE_POLL_US);
++	ret = readl_poll_timeout_atomic(clk, val, !(val & APCIE_CLK_BUSY), 1, APCIE_POLL_US);
+ 	writel(readl(clk) | APCIE_CLK_OFF2, clk);
++
++	return ret;
+ }
+ 
+ /*
+  * ANS's own link runs on this block, and macOS takes it down with the domains,
+  * in this order. A block's registers fault with its domain off.
+  */
+-static void apple_s2r_t8132_lower_apcie(struct apple_s2r *s2r)
++static void apple_s2r_t8132_lower_apcie(struct apple_s2r *s2r, unsigned int depth)
+ {
+ 	struct apple_s2r_t8132 *t = &s2r->t8132;
+ 	void __iomem *gp = t->ps + T8132_PS_APCIE_SYS_GP;
+ 	u32 val;
+ 
++	t->apcie_lowered = true;
+ 	apple_s2r_t8132_ports_stop(s2r);
+-	apple_s2r_crumb(s2r, S2R_CRUMB_T8132_PORTS);
++	apple_s2r_t8132_step(s2r, S2R_CRUMB_T8132_PORTS, T8132_TT_PORTS);
++	if (depth < 4)
++		return;
++	t->apcie_domains_lowered = true;
+ 	/* The PHY's registers need both domains on. */
+ 	if (apple_s2r_t8132_ps_on(s2r, T8132_PS_APCIE_PHY_SW) &&
+ 	    apple_s2r_t8132_ps_on(s2r, T8132_PS_APCIE_SYS_ST))
+-		apple_s2r_t8132_apcie_phy_off(t);
++		apple_s2r_t8132_lower_fail(t, S2R_CRUMB_T8132_PHY,
++					   apple_s2r_t8132_apcie_phy_off(t));
+ 	apple_s2r_t8132_ps_lower(t->ps + T8132_PS_APCIE_PHY_SW);
+-	apple_s2r_crumb(s2r, S2R_CRUMB_T8132_PHY);
++	apple_s2r_t8132_step(s2r, S2R_CRUMB_T8132_PHY, T8132_TT_PHY);
++	if (depth < 5)
++		return;
+ 
+ 	if (apple_s2r_t8132_ps_on(s2r, T8132_PS_APCIE_SYS_ST))
+-		apple_s2r_t8132_apcie_clk_off(t);
++		apple_s2r_t8132_lower_fail(t, S2R_CRUMB_T8132_SYS,
++					   apple_s2r_t8132_apcie_clk_off(t));
+ 	apple_s2r_t8132_ps_lower(t->ps + T8132_PS_APCIE_SYS_ST);
+ 	apple_s2r_t8132_ps_lower(t->ps + T8132_PS_APCIE_ST);
+-	apple_s2r_crumb(s2r, S2R_CRUMB_T8132_SYS);
++	apple_s2r_t8132_step(s2r, S2R_CRUMB_T8132_SYS, T8132_TT_DOMAINS);
++	if (depth < 6)
++		return;
+ 
+ 	/*
+ 	 * The AXI enables are the block's link into the fabric. macOS reads the
+@@ -1997,13 +2073,18 @@ static void apple_s2r_t8132_lower_apcie(struct apple_s2r *s2r)
+ 	if (apple_s2r_t8132_ps_wait_on(gp, val)) {
+ 		writel(readl(t->apcie_axi + APCIE_AXI_EN0) & ~BIT(0), t->apcie_axi + APCIE_AXI_EN0);
+ 		writel(readl(t->apcie_axi + APCIE_AXI_EN1) & ~BIT(0), t->apcie_axi + APCIE_AXI_EN1);
++	} else if (FIELD_GET(T8132_PS_TARGET, val)) {
++		/* Asked on and never on: the AXI enables stay, and the link error would latch. */
++		apple_s2r_t8132_lower_fail(t, S2R_CRUMB_T8132_GP, -ETIMEDOUT);
+ 	}
+ 	apple_s2r_t8132_ps_lower_finish(gp, val);
+ 
+ 	apple_s2r_t8132_ps_lower(t->ps + T8132_PS_APCIE_GP);
+-	apple_s2r_crumb(s2r, S2R_CRUMB_T8132_GP);
++	apple_s2r_t8132_step(s2r, S2R_CRUMB_T8132_GP, T8132_TT_DOMAINS);
++	if (depth < 7)
++		return;
+ 	apple_s2r_t8132_ps_lower(t->ps + T8132_PS_ANS);
+-	apple_s2r_crumb(s2r, S2R_CRUMB_T8132_ANS);
++	apple_s2r_t8132_step(s2r, S2R_CRUMB_T8132_ANS, T8132_TT_ANS);
+ }
+ 
+ /* Read-modify-write in table order, with no write where nothing changes. */
+@@ -2353,17 +2434,25 @@ static void apple_s2r_t8132_raise_after_lower(struct apple_s2r *s2r)
+ 	struct apple_s2r_t8132 *t = &s2r->t8132;
+ 	int i;
+ 
+-	apple_s2r_crumb(s2r, S2R_CRUMB_T8132_RAISE);
+-	apple_s2r_t8132_ps_restore(t->ps + T8132_PS_ATC0_COMMON, t->atc0_saved[2]);
+-	apple_s2r_t8132_ps_restore(t->ps_aon + T8132_PS_AON_ATC0_USB_AON, t->atc0_saved[1]);
+-	apple_s2r_t8132_ps_restore(t->ps_aon + T8132_PS_AON_ATC0_USB, t->atc0_saved[0]);
++	apple_s2r_t8132_step(s2r, S2R_CRUMB_T8132_RAISE, T8132_TT_RAISE);
++	if (t->io_lowered) {
++		int r;
++
++		r = apple_s2r_t8132_ps_restore(t->ps + T8132_PS_ATC0_COMMON, t->atc0_saved[2]);
++		r |= apple_s2r_t8132_ps_restore(t->ps_aon + T8132_PS_AON_ATC0_USB_AON,
++						t->atc0_saved[1]);
++		r |= apple_s2r_t8132_ps_restore(t->ps_aon + T8132_PS_AON_ATC0_USB,
++						t->atc0_saved[0]);
++		t->atc0_ret = r ? -ETIMEDOUT : 0;
++	}
+ 	apple_s2r_crumb(s2r, S2R_CRUMB_T8132_RAISE_IO);
+-	if (t->pcie_ans_stopped) {
++	/* Ports stopped alone stay down for their host; a lowered block comes back whole. */
++	if (t->apcie_domains_lowered)
+ 		t->pcie_ans_on_ret = apple_s2r_t8132_raise_apcie(s2r);
++	if (t->apcie_lowered)
+ 		for (i = 0; i < APCIE_MAX_PORTS; i++)
+ 			if (t->apcie_ports[i].stopped)
+ 				t->apcie_ports[i].down = true;
+-	}
+ 	apple_s2r_crumb(s2r, S2R_CRUMB_T8132_RAISE_APCIE);
+ 	t->raised = true;
+ }
+@@ -2396,6 +2485,7 @@ static int apple_s2r_t8132_finish(unsigned long arg)
+ 	struct apple_s2r_t8132 *t = &s2r->t8132;
+ 	struct apple_s2r_mailbox *mb = s2r->mailbox;
+ 	u64 flags = S2R_FLAG_QUIET | (warm_flags & S2R_FLAGS_OS);
++	unsigned int depth;
+ 	int i, ret;
+ 
+ 	t->siq_cfg = read_sysreg_s(SYS_APL_SIQ_CFG_EL1);
+@@ -2411,7 +2501,10 @@ static int apple_s2r_t8132_finish(unsigned long arg)
+ 		apple_cpu_t8132_release_stopped(false);
+ 		return ret;
+ 	}
+-	apple_s2r_crumb(s2r, S2R_CRUMB_T8132_STOPPED);
++	apple_s2r_t8132_step(s2r, S2R_CRUMB_T8132_STOPPED, T8132_TT_STOPPED);
++	/* WD2 from ->begin (170 s) would run out inside the trail's bins: past them. */
++	if (READ_ONCE(t8132_time_trail) && s2r->wdt_armed)
++		apple_s2r_t8132_set_wd2(s2r, T8132_TT_WD2);
+ 	ret = apple_s2r_check(s2r, S2R_STEP_T8132_LOWER);
+ 	if (ret) {
+ 		apple_cpu_t8132_release_stopped(false);
+@@ -2419,18 +2512,35 @@ static int apple_s2r_t8132_finish(unsigned long arg)
+ 	}
+ 
+ 	/* From here the SoC powers down. */
++	/* The split step's depth: 0 or 7 and up is the whole lowering. */
++	depth = READ_ONCE(abort_before) == S2R_STEP_T8132_RAISE ? READ_ONCE(split_depth) : 0;
++	if (!depth || depth > 7)
++		depth = 7;
++
+ 	pm_set_resume_via_firmware();
+ 	apple_s2r_t8132_clean_ram();
+-	apple_s2r_crumb(s2r, S2R_CRUMB_T8132_RAM);
+-	apple_s2r_t8132_lower_io(s2r);
+-	apple_s2r_crumb(s2r, S2R_CRUMB_T8132_IO);
+-	if (t->pcie_ans_stopped) {
+-		apple_s2r_t8132_lower_apcie(s2r);
+-		t->ans_off_ret = apple_s2r_t8132_ps_wait_off(t->ps + T8132_PS_ANS);
+-		apple_s2r_crumb(s2r, S2R_CRUMB_T8132_ANS_OFF);
++	apple_s2r_t8132_step(s2r, S2R_CRUMB_T8132_RAM, T8132_TT_RAM);
++	if (depth >= 2) {
++		apple_s2r_t8132_lower_io(s2r);
++		t->io_lowered = true;
++		apple_s2r_t8132_step(s2r, S2R_CRUMB_T8132_IO, T8132_TT_IO);
++	}
++	if (t->pcie_ans_stopped && depth >= 3) {
++		apple_s2r_t8132_lower_apcie(s2r, depth);
++		if (depth >= 7) {
++			t->ans_off_ret = apple_s2r_t8132_ps_wait_off(t->ps + T8132_PS_ANS);
++			apple_s2r_t8132_lower_fail(t, S2R_CRUMB_T8132_ANS_OFF, t->ans_off_ret);
++			apple_s2r_t8132_step(s2r, S2R_CRUMB_T8132_ANS_OFF, T8132_TT_ANS);
++		}
+ 	}
+ 
++	/*
++	 * A block that did not go down is not slept on: raised again, the sleep
++	 * refused and named, instead of a commit the engine may never finish.
++	 */
+ 	ret = apple_s2r_check(s2r, S2R_STEP_T8132_RAISE);
++	if (!ret && t->lower_err)
++		ret = -EIO;
+ 	if (ret) {
+ 		apple_s2r_t8132_raise_after_lower(s2r);
+ 		apple_cpu_t8132_release_stopped(false);
+@@ -2675,6 +2785,13 @@ static int apple_s2r_t8132_enter(struct apple_s2r *s2r)
+ 	t->ans_off_ret = 0;
+ 	t->pcie_ans_on_ret = 0;
+ 	t->raised = false;
++	t->io_lowered = false;
++	t->apcie_lowered = false;
++	t->apcie_domains_lowered = false;
++	t->lower_step = 0;
++	t->lower_err = 0;
++	t->l2_timeouts = 0;
++	t->atc0_ret = 0;
+ 	if (!READ_ONCE(abort_before) || READ_ONCE(abort_before) == S2R_STEP_T8132_RAISE)
+ 		for (i = 0; i < S2R_COPROCS; i++)
+ 			if (apple_s2r_coprocs[i].dev && apple_s2r_coprocs[i].pcie_ans &&
+@@ -2744,8 +2861,12 @@ static void apple_s2r_t8132_report(struct apple_s2r *s2r)
+ 		for (i = 0; i < APCIE_MAX_PORTS; i++)
+ 			if (t->apcie_ports[i].stopped)
+ 				ports |= BIT(i);
+-		dev_info(s2r->dev, "T8132: split step: IO lowered and raised without the commit: ANS off %d, ANS's APCIe block raised %d; root ports %#x stopped, left down for their host\n",
+-			 t->ans_off_ret, t->pcie_ans_on_ret, ports);
++		dev_info(s2r->dev, "T8132: split step (depth %u): IO lowered and raised without the commit: ANS off %d, ANS's APCIe block raised %d; root ports %#x stopped, left down for their host; L2 timeouts %u, ATC0 back %d\n",
++			 READ_ONCE(split_depth), t->ans_off_ret, t->pcie_ans_on_ret, ports,
++			 t->l2_timeouts, t->atc0_ret);
++		if (t->lower_err)
++			dev_err(s2r->dev, "T8132: IO lowering failed at step %#x: %d; raised again, sleep refused\n",
++				t->lower_step, t->lower_err);
+ 		if (t->ans_off_ret)
+ 			dev_err(s2r->dev, "T8132: ANS did not read off after the lowering: %d\n",
+ 				t->ans_off_ret);

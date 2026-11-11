@@ -36,7 +36,7 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | Touch ID | Working for sudo, polkit and the lock screen |
 | Keyboard backlight | Working with the local `omarchy-dev` / `omarchy-settings-dev` builds |
 | Neural Engine | Working: on by default (`/dev/accel/accel0`), runs programs bit-exact and powers off when idle (measured on 1.711) |
-| Power | Suspend (s2idle) working again since 1.710 (it was refused on 1.705-1.708). Idle on AC is about 10.5 W with the stock edge `performance` power profile (see `STATUS.md`); since 1.802 the idle performance cores drop to their slowest clock (rail 994 mW against 2360 mW), and since 1.809 the drop waits for a clock change in flight (rail 383 mW; SMC system total 9.82 W to 9.07 W in an A/B; the wall figure is not measured yet). Deep sleep in progress: the reset during a test sleep is fixed since 1.736; changes for the two GPU items that block real suspend-to-RAM are in 1.803 (off by default); the first real suspend-to-RAM trial (1.804) and a test told to stop before the power-down (1.807) both hung and needed the power button; staged tests on 1.810 and 1.811 found the stop in resume, and a guard for it is in 1.811 (off by default), but no real power-down has been completed, so deep sleep is still not working; since 1.813 `deep` is not offered on this Mac, the T8132 sleep sequence ported from Aurora is carried since 1.821, switched off by default; the first real sleep with it (1.829) did not come back and the machine reset itself; the cause is being isolated, deep sleep is not working, and suspend-to-idle is the only sleep state |
+| Power | Suspend (s2idle) working again since 1.710 (it was refused on 1.705-1.708). Idle on AC is about 10.5 W with the stock edge `performance` power profile (see `STATUS.md`); since 1.802 the idle performance cores drop to their slowest clock (rail 994 mW against 2360 mW), and since 1.809 the drop waits for a clock change in flight (rail 383 mW; SMC system total 9.82 W to 9.07 W in an A/B; the wall figure is not measured yet). Deep sleep in progress: the reset during a test sleep is fixed since 1.736; changes for the two GPU items that block real suspend-to-RAM are in 1.803 (off by default); the first real suspend-to-RAM trial (1.804) and a test told to stop before the power-down (1.807) both hung and needed the power button; staged tests on 1.810 and 1.811 found the stop in resume, and a guard for it is in 1.811 (off by default), but no real power-down has been completed, so deep sleep is still not working; since 1.813 `deep` is not offered on this Mac, the T8132 sleep sequence ported from Aurora is carried since 1.821, switched off by default; the first real sleep with it (1.829) did not come back and the machine reset itself; on 1.833 the kernel was measured powering part of the SSD controller's PCIe block off under the running SSD controller, and 1.836 carries a change for that which has not been run yet; deep sleep is not working, and suspend-to-idle is the only sleep state |
 | In progress | Deep sleep, camera colour, Thunderbolt/USB4, external displays and HDMI |
 
 ## Install
@@ -57,8 +57,8 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`a82a1ebda940`), 297 patches | `1.833` |
-| `m1n1-aurora` | 1.6.1.aurora22, omacom/m1n1 (`bc79acc434`), 40 patches | `1.611` |
+| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`a82a1ebda940`), 303 patches | `1.836` |
+| `m1n1-aurora` | 1.6.1.aurora22, omacom/m1n1 (`bc79acc434`), 41 patches | `1.612` |
 | `uboot-aurora` | 2026.07.aurora6, aurora-silicon/u-boot (`d30213eadc`) | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261107, omacom/mesa (`b7b03c5b3b`) | `1.8134` |
 | `alsa-ucm-conf-aurora` | 10.aurora3, aurora-silicon/alsa-ucm-conf-asahi (`b9b2d0c82c`) | `1.605` |
@@ -77,7 +77,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 Also installed, unchanged from the official repositories: Hyprland 0.57.1 and the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
-Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.833 changed over 1.617).
+Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.836 changed over 1.617).
 
 ## Layout
 
