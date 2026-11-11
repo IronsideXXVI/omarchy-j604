@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 23:59:06 +0000
+Subject: [PATCH] soc: apple: s2r: report the CPU stop word around a
+ T8132 sleep
+
+What clears a core's bit in the PMGR CPU start block's stop word, and
+whether a bit left set keeps the core from being started, is not known.
+Aurora's T8132 sleep sets each core's bit at the commit and, after the
+wake, starts the cores with the alive and cluster start words alone, never
+writing the stop word. m1n1 likewise only ever sets a core's own bit. A
+J604 core powered down alone, its cluster up, did not start again with its
+bit still set.
+
+Report the word, without writing it, in the T8132 sequence: at ->enter,
+after the parked CPUs stopped, and back from cpu_suspend (before any core
+is started after a wake, or after an abort). One line per sleep, only with
+apple_s2r.t8132_sequence, so a bring-up cycle shows whether the bits stay
+set without a power cycle and whether a real sleep clears them.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ arch/arm64/include/asm/apple_cpu.h |  6 ++++++
+ arch/arm64/kernel/apple_cpu.c      | 18 ++++++++++++++++++
+ drivers/soc/apple/apple-s2r.c      | 22 +++++++++++++++++++++-
+ 3 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/include/asm/apple_cpu.h b/arch/arm64/include/asm/apple_cpu.h
+index 05936d7db4..3b0dd97d6f 100644
+--- a/arch/arm64/include/asm/apple_cpu.h
++++ b/arch/arm64/include/asm/apple_cpu.h
+@@ -25,6 +25,7 @@ void apple_cpu_power_cycled(void);
+ int apple_cpu_t8132_stop_parked(void);
+ void apple_cpu_t8132_release_stopped(bool committed);
+ void __noreturn apple_cpu_t8132_deep_sleep(void);
++u32 apple_cpu_stop_word(void);
+ 
+ /* The park loop of an offline CPU, internal to the CPU hotplug code */
+ u64 apple_cpu_park_wfi(u64 *cmd, u64 cyc, u64 ways, u64 sets, u64 way_shift,
+@@ -62,6 +63,11 @@ static inline int apple_cpu_t8132_stop_parked(void)
+ static inline void apple_cpu_t8132_release_stopped(bool committed)
+ {
+ }
++
++static inline u32 apple_cpu_stop_word(void)
++{
++	return 0;
++}
+ #endif
+ 
+ #endif /* __ASM_APPLE_CPU_H */
+diff --git a/arch/arm64/kernel/apple_cpu.c b/arch/arm64/kernel/apple_cpu.c
+index 3c4da0e33b..89d2140a04 100644
+--- a/arch/arm64/kernel/apple_cpu.c
++++ b/arch/arm64/kernel/apple_cpu.c
+@@ -1621,6 +1621,24 @@ void apple_cpu_t8132_release_stopped(bool committed)
+ }
+ EXPORT_SYMBOL_GPL(apple_cpu_t8132_release_stopped);
+ 
++/**
++ * apple_cpu_stop_word() - the PMGR CPU start block's stop word, for a report
++ *
++ * Only reads it. What clears a core's bit there, and whether a set bit keeps
++ * the core from starting, is not known: no driver or boot loader writes
++ * anything but a core's own bit to it.
++ *
++ * Return: the word of the first CPU control block, 0 if there is none.
++ */
++u32 apple_cpu_stop_word(void)
++{
++	if (!apple_nr_cpu_ctrls || !apple_cpu_ctrls[0].start)
++		return 0;
++
++	return readl(apple_cpu_ctrls[0].start + CPU_START_STOP);
++}
++EXPORT_SYMBOL_GPL(apple_cpu_stop_word);
++
+ /**
+  * apple_cpu_power_cycled() - every CPU complex lost power
+  *
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index d113fa7bfc..602f186a9d 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -327,6 +327,9 @@ struct apple_s2r_t8132 {
+ 	int cpus_stop_ret;
+ 	int cluster_e_ret;
+ 	bool returned;
++	/* The CPU start block's stop word at ->enter, after the stop, and back */
++	u32 stop_word[3];
++	unsigned int stop_read;
+ 	bool wd2_armed;
+ 
+ 	/* PMU boot stage byte: macOS's sleep value is written at the match */
+@@ -1737,6 +1740,8 @@ static int apple_s2r_t8132_finish(unsigned long arg)
+ 	if (ret)
+ 		return ret;
+ 	ret = apple_cpu_t8132_stop_parked();
++	t->stop_word[1] = apple_cpu_stop_word();
++	t->stop_read |= BIT(1);
+ 	if (ret) {
+ 		/* Ours, not Aurora's: a core left awake would hold the engine. */
+ 		apple_cpu_t8132_release_stopped(false);
+@@ -1832,6 +1837,10 @@ static void apple_s2r_t8132_return(struct apple_s2r *s2r)
+ 	isb();
+ 	write_sysreg_s(t->siq_cfg, SYS_APL_SIQ_CFG_EL1);
+ 
++	/* Before anything starts a core: what the wake left there */
++	t->stop_word[2] = apple_cpu_stop_word();
++	t->stop_read |= BIT(2);
++
+ 	writel(T8132_CLUSTER_ON, t->cluster + T8132_CLUSTER_E);
+ 	t->cluster_e_ret = readl_poll_timeout_atomic(t->cluster + T8132_CLUSTER_E, val,
+ 						     val & T8132_CLUSTER_E_READY, 1,
+@@ -1918,6 +1927,8 @@ static int apple_s2r_t8132_enter(struct apple_s2r *s2r)
+ 	t->returned = false;
+ 	t->cpus_stop_ret = 0;
+ 	t->cluster_e_ret = 0;
++	t->stop_word[0] = apple_cpu_stop_word();
++	t->stop_read = BIT(0);
+ 
+ 	ret = apple_s2r_check(s2r, S2R_STEP_T8132_WAKE);
+ 	if (ret)
+@@ -1934,8 +1945,12 @@ static int apple_s2r_t8132_enter(struct apple_s2r *s2r)
+ 		if (s2r->wdt && wdt_timeout && !s2r->wdt_armed)
+ 			apple_s2r_wdt_take(s2r);
+ 		ret = cpu_suspend((unsigned long)s2r, apple_s2r_t8132_finish);
+-		if (!ret)
++		if (!ret) {
+ 			apple_s2r_t8132_return(s2r);
++		} else if (t->stop_read & BIT(1)) {
++			t->stop_word[2] = apple_cpu_stop_word();
++			t->stop_read |= BIT(2);
++		}
+ 	}
+ 
+ 	apple_s2r_t8132_match_undo(s2r);
+@@ -1953,6 +1968,11 @@ static void apple_s2r_t8132_report(struct apple_s2r *s2r)
+ 	if (t->pmu_err)
+ 		dev_warn(s2r->dev, "T8132: PMU boot stage write failed %u time(s)\n", t->pmu_err);
+ 	t->pmu_err = 0;
++	if (t->stop_read & BIT(1))
++		dev_info(s2r->dev, "T8132: CPU stop word %#x at ->enter, %#x after the stop, %#x %s\n",
++			 t->stop_word[0], t->stop_word[1], t->stop_word[2],
++			 t->returned ? "back from the sleep" : "after the abort");
++	t->stop_read = 0;
+ 	if (!t->returned)
+ 		return;
+ 	t->returned = false;

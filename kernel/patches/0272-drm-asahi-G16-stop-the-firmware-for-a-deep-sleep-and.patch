@@ -1,0 +1,1192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bartosz Nitka <niteria@gmail.com>
+Date: Mon, 9 Nov 2026 16:22:06 +0100
+Subject: [PATCH] drm/asahi: G16: stop the firmware for a deep sleep
+ and restart it warm
+
+The M4's GPU driver refused every sleep that powers the SoC down, so deep
+sleep needed the driver blacklisted. Add the sleep path, following G17:
+
+- .prepare drains the GPU, closes publication and leaves the stop to the
+  sleep's commit, with every refusal behind it.
+- The commit idles the firmware, stops it and lowers the GFX domain, on
+  G17's C path, which now also takes a firmware whose control registers
+  are the ASC's own.
+- .complete raises the domain and restarts the firmware warm: the RTKit
+  handshake, no initialization. iBoot's last wake program has reprogrammed
+  the GPU's tables by then.
+
+A refused sleep finds the firmware never stopped. Stopping it any earlier
+doesn't work: after a stop in .prepare and an alarmtimer refusal, RTKit
+discovery timed out and the GPU was lost until reboot. That matches G17's
+"only a real wake restarts the firmware".
+
+Differences from G17, all measured on a J713:
+- The sleep clears the GFX TVM gate (0x0 after a real wake, 0x1 after a
+  refusal) and genpd doesn't know, so it's enabled before the domain is
+  raised.
+- The PMP vote stays through the sleep. A release before the stop also
+  worked, in 4 sleeps, but the commit has no polled path for one.
+- There's no bridge and no power-on-done message, as on the M4 Pro.
+
+The M4 publication host test gets the flag, and a case for a publish
+during a sleep.
+
+[Dylan: resolved onto the J604 tree, where this replaces our own G16
+ sleep path (g16_deep_sleep: a stop at the apple-s2r commit, and the AGX
+ release in the PMP last stop), which never ran through a real sleep:
+ g16/sleep.rs is this commit's, our sleep/policy.rs and the
+ asahi_g16_commit_* glue go, and so does the g16_deep_sleep parameter,
+ which only that path read. boot.rs keeps our changes and takes these
+ RTKit helpers in place of our raw(). The drivers/soc/apple/sleep.c
+ comment is left to the sleep driver port.]
+
+Assisted-by: LLM
+Signed-off-by: Bartosz Nitka <niteria@gmail.com>
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/driver.rs               |   2 +-
+ drivers/gpu/drm/asahi/g16/boot.rs             |  36 +-
+ drivers/gpu/drm/asahi/g16/engine.rs           |   4 +
+ drivers/gpu/drm/asahi/g16/glue.c              |  87 ++-
+ drivers/gpu/drm/asahi/g16/mod.rs              |  22 +-
+ drivers/gpu/drm/asahi/g16/params.rs           |  18 -
+ drivers/gpu/drm/asahi/g16/poll.rs             |   4 +
+ drivers/gpu/drm/asahi/g16/regs.rs             |   6 -
+ drivers/gpu/drm/asahi/g16/sleep.rs            | 544 ++++++++++--------
+ drivers/gpu/drm/asahi/g16/sleep/policy.rs     |  51 --
+ drivers/gpu/drm/asahi/g17/sleep.c             |  52 +-
+ drivers/gpu/drm/asahi/g17/sleep.h             |   1 +
+ .../drivers/gpu/asahi-m4/test-publication.py  |  12 +-
+ 13 files changed, 454 insertions(+), 385 deletions(-)
+ delete mode 100644 drivers/gpu/drm/asahi/g16/sleep/policy.rs
+
+diff --git a/drivers/gpu/drm/asahi/driver.rs b/drivers/gpu/drm/asahi/driver.rs
+index 458d29a188..ba45b0f1ea 100644
+--- a/drivers/gpu/drm/asahi/driver.rs
++++ b/drivers/gpu/drm/asahi/driver.rs
+@@ -237,7 +237,7 @@ asahi_of_device_table!(
+ #[cfg(CONFIG_DRM_ASAHI_G15)]
+ asahi_of_device_table!();
+ 
+-struct SleepOps(bindings::dev_pm_ops);
++pub(crate) struct SleepOps(pub(crate) bindings::dev_pm_ops);
+ 
+ // SAFETY: Immutable: the callbacks are plain functions.
+ unsafe impl Sync for SleepOps {}
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 9432dc573e..8cc52944d2 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -213,7 +213,10 @@ unsafe extern "C" fn rtkit_recv(cookie: *mut c_void, endpoint: u8, message: u64)
+         endpoint,
+         message
+     );
+-    shared.fail_stop(eproto());
++    // What a firmware says while it comes back from a sleep isn't known yet.
++    if !shared.sleeping.load(Ordering::Acquire) {
++        shared.fail_stop(eproto());
++    }
+ }
+ 
+ /// EP 0x20 ring-service request, in the mailbox interrupt: wake only. The drain and the
+@@ -349,16 +352,40 @@ impl Rtkit {
+         }
+     }
+ 
+-    fn wake(&mut self) -> Result {
++    pub(crate) fn wake(&mut self) -> Result {
+         // SAFETY: `rtk` is live by the type invariant.
+         to_result(unsafe { bindings::apple_rtkit_wake(self.rtk) })
+     }
+ 
+-    /// The C handle, for the system sleep path. Live until reboot (never freed).
+-    pub(crate) fn raw(&self) -> *mut bindings::apple_rtkit {
++    /// The C handle, for the stop at a sleep's commit.
++    pub(crate) fn as_raw(&self) -> *mut bindings::apple_rtkit {
+         self.rtk
+     }
+ 
++    /// RTKit AP and IOP idle, each acknowledged.
++    pub(crate) fn idle(&mut self) -> Result {
++        // SAFETY: `rtk` is live by the type invariant.
++        to_result(unsafe { bindings::apple_rtkit_idle(self.rtk) })
++    }
++
++    /// Mailbox receive off, for firmware that acknowledged idle.
++    pub(crate) fn mailbox_off(&mut self) {
++        // SAFETY: `rtk` is live by the type invariant.
++        unsafe { bindings::apple_rtkit_mailbox_off(self.rtk) };
++    }
++
++    /// Prepares for HELLO from firmware restarting warm, which keeps its buffers and rings.
++    pub(crate) fn warm_restart(&mut self) -> Result {
++        // SAFETY: `rtk` is live by the type invariant.
++        to_result(unsafe { bindings::apple_rtkit_warm_restart(self.rtk) })
++    }
++
++    /// Waits for the firmware to report in, and sets the AP on.
++    pub(crate) fn boot(&mut self) -> Result {
++        // SAFETY: `rtk` is live by the type invariant.
++        to_result(unsafe { bindings::apple_rtkit_boot(self.rtk) })
++    }
++
+     fn running(&self) -> bool {
+         // SAFETY: `rtk` is retained and valid for the session lifetime.
+         unsafe {
+@@ -854,7 +881,6 @@ pub(crate) fn start(
+         return Err(e);
+     }
+     let (init, channels, max_frequency_khz) = built.ok_or(EINVAL)?;
+-    super::sleep::publish(session.rtkit.raw(), session.regs.asc_control_ptr());
+     Ok(Booted {
+         session,
+         init,
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index b42196eecd..f15c201c5b 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -773,6 +773,10 @@ impl Firmware {
+     /// and latches the device failed. Dependency errors and exhausted resource classes are handled
+     /// separately before preparation, without failing an otherwise healthy engine class.
+     pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
++        // What arrives during a system sleep waits for its end.
++        if self.session.shared.sleeping.load(core::sync::atomic::Ordering::Acquire) {
++            return Ok(());
++        }
+         self.session.check()?;
+         self.objects.health()?;
+         self.service_power()?;
+diff --git a/drivers/gpu/drm/asahi/g16/glue.c b/drivers/gpu/drm/asahi/g16/glue.c
+index 9bcc967d1f..b53922733b 100644
+--- a/drivers/gpu/drm/asahi/g16/glue.c
++++ b/drivers/gpu/drm/asahi/g16/glue.c
+@@ -7,6 +7,7 @@
+ #include <linux/atomic.h>
+ #include <linux/dma-map-ops.h>
+ #include <linux/io.h>
++#include <linux/iopoll.h>
+ #include <linux/ioport.h>
+ #include <linux/mm.h>
+ #include <linux/mfd/syscon.h>
+@@ -168,6 +169,40 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool id
+ 	return ret;
+ }
+ 
++/*
++ * genpd never turned the GFX domain's TVM gate off, so a sleep that lost it goes
++ * unnoticed: the domain then doesn't come on. Enabled here if it's found clear.
++ */
++int asahi_g16_tvm_enable(struct device *dev);
++int asahi_g16_tvm_enable(struct device *dev)
++{
++	struct device_node *gfx, *tvm;
++	void __iomem *reg;
++	u32 val;
++	int ret = 0;
++
++	gfx = of_parse_phandle(dev->of_node, "power-domains", 0);
++	if (!gfx)
++		return -EINVAL;
++	tvm = of_parse_phandle(gfx, "power-domains", 0);
++	of_node_put(gfx);
++	if (!tvm)
++		return -EINVAL;
++	reg = of_iomap(tvm, 0);
++	of_node_put(tvm);
++	if (!reg)
++		return -ENOMEM;
++	val = readl(reg);
++	dev_dbg(dev, "GFX TVM gate after the sleep: %#x\n", val);
++	if (!(val & BIT(0))) {
++		writel(val | BIT(0), reg);
++		ret = readl_poll_timeout(reg, val, val & BIT(0), 1, 1000);
++	}
++	iounmap(reg);
++
++	return ret;
++}
++
+ /* Whether this is a qualified J713/T8132 board. */
+ bool asahi_g16_board(void)
+ {
+@@ -366,55 +401,3 @@ void asahi_g16_clpc_gpu_put(struct apple_clpc_gpu *gpu)
+ 	apple_clpc_gpu_put(gpu);
+ }
+ 
+-/*
+- * g16_deep_sleep: the firmware's idle and the ASC stop at the sleep's commit (apple-s2r), past
+- * every refusal, as for the PMP. An idled firmware doesn't come back with its power kept, so a
+- * sleep refused before the commit must find it still running. Registered first: the GPU stops
+- * before the PMP, which carries its power vote. Only a retained session registers, and it pins
+- * this module until reboot.
+- */
+-#define ASAHI_G16_ASC_RUN	BIT(4)
+-
+-static struct {
+-	struct apple_rtkit *rtk;
+-	void __iomem *control;
+-	unsigned int us;
+-	int ret;
+-} asahi_g16_commit;
+-
+-/* Interrupts off, one CPU: apple_rtkit_sleep_stop(), polled. It can't refuse the sleep. */
+-static int asahi_g16_commit_stop(void *unused)
+-{
+-	void __iomem *control = asahi_g16_commit.control;
+-
+-	asahi_g16_commit.ret = apple_rtkit_sleep_idle_polled(asahi_g16_commit.rtk, control,
+-							     &asahi_g16_commit.us);
+-	apple_rtkit_mailbox_recv_off(asahi_g16_commit.rtk);
+-	/* Twice, each time from what it reads back. */
+-	writel(readl(control) & ~ASAHI_G16_ASC_RUN, control);
+-	writel(readl(control) & ~ASAHI_G16_ASC_RUN, control);
+-	return 0;
+-}
+-
+-int asahi_g16_commit_register(struct device *dev, struct apple_rtkit *rtk, void __iomem *control);
+-int asahi_g16_commit_register(struct device *dev, struct apple_rtkit *rtk, void __iomem *control)
+-{
+-	asahi_g16_commit.rtk = rtk;
+-	asahi_g16_commit.control = control;
+-	return apple_sleep_coproc_register_first(dev, asahi_g16_commit_stop, NULL);
+-}
+-
+-void asahi_g16_commit_ready(struct device *dev, bool ready);
+-void asahi_g16_commit_ready(struct device *dev, bool ready)
+-{
+-	apple_sleep_coproc_set_ready(dev, ready);
+-}
+-
+-/* Whether the commit stopped the firmware; if so, how its idle went (@us: about how long). */
+-bool asahi_g16_commit_stopped(struct device *dev, int *idle, unsigned int *us);
+-bool asahi_g16_commit_stopped(struct device *dev, int *idle, unsigned int *us)
+-{
+-	*idle = asahi_g16_commit.ret;
+-	*us = asahi_g16_commit.us;
+-	return apple_sleep_coproc_stopped(dev);
+-}
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 7f1bf3f188..5d71f2a75d 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -75,7 +75,7 @@ mod vm;
+ 
+ use core::any::Any;
+ use core::ops::Range;
+-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
++use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+ 
+ use kernel::{
+     c_str,
+@@ -147,20 +147,14 @@ impl platform::Driver for Driver {
+     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+ 
+     fn pm_ops() -> Option<&'static kernel::bindings::dev_pm_ops> {
+-        crate::driver::sleep_refuse_ops()
++        Some(sleep::ops())
+     }
+ 
+-    /// The firmware session cannot be stopped once started.
++    /// The firmware session cannot be stopped by an unbind.
+     fn suppress_bind_attrs() -> bool {
+         true
+     }
+ 
+-    /// Nor restarted after a sleep that powers the SoC down: such a sleep is refused once the
+-    /// firmware has been touched, see [`sleep`].
+-    fn pm_ops() -> Option<&'static kernel::bindings::dev_pm_ops> {
+-        sleep::ops()
+-    }
+-
+     fn probe<'bound>(
+         pdev: &'bound platform::Device<Core<'_>>,
+         info: Option<&'bound Self::IdInfo>,
+@@ -219,6 +213,13 @@ pub(crate) struct Shared {
+     pub(crate) rtkit_buffer: AtomicU64,
+     /// A firmware session whose start or backend start failed: retained, rings still drained.
+     pub(crate) orphaned: AtomicBool,
++    /// From a system sleep's `.prepare` until the firmware restarted: nothing reads its
++    /// registers and nothing is published.
++    pub(crate) sleeping: AtomicBool,
++    /// The GFX power state word from before a system sleep.
++    sleep_ps: AtomicU32,
++    /// The stop left to a system sleep's commit, until `.complete` finishes it.
++    sleep_commit: AtomicPtr<core::ffi::c_void>,
+     #[pin]
+     pub(crate) orphan: Mutex<Option<KBox<boot::Orphan>>>,
+     #[pin]
+@@ -400,6 +401,9 @@ impl Gpu {
+                 data,
+                 rtkit_buffer: AtomicU64::new(0),
+                 orphaned: AtomicBool::new(false),
++                sleeping: AtomicBool::new(false),
++                sleep_ps: AtomicU32::new(0),
++                sleep_commit: AtomicPtr::new(core::ptr::null_mut()),
+                 orphan <- new_mutex!(None, "g16::Shared::orphan"),
+                 poll <- new_delayed_work!("g16::Shared::poll"),
+                 resnap <- HrTimer::new(),
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 1678dea9df..efc268fa8c 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -474,24 +474,6 @@ live_u32_param!(
+     "G16: runtime completion repoll interval, us (default 0 = g16_resnap_us; 10..1000; runtime 0644)"
+ );
+ 
+-/// Storage of `g16_deep_sleep` (runtime 0644, testing; any nonzero value means on).
+-static DEEP_SLEEP: AtomicU32 = AtomicU32::new(0);
+-
+-/// Whether a sleep that powers the SoC down stops the firmware and warm-restarts it on resume
+-/// (testing, default off), instead of being refused. See `sleep.rs`.
+-pub(crate) fn deep_sleep() -> bool {
+-    DEEP_SLEEP.load(Ordering::Relaxed) != 0
+-}
+-
+-live_u32_param!(
+-    DEEP_SLEEP_PARAM,
+-    DEEP_SLEEP_PARMTYPE,
+-    DEEP_SLEEP_PARM,
+-    DEEP_SLEEP,
+-    "g16_deep_sleep",
+-    "G16: stop and warm-restart the firmware across suspend-to-RAM (testing; default 0; runtime 0644)"
+-);
+-
+ /// Storage of `g16_flights` (runtime 0644): 1 publishes one command at a time (the qualified
+ /// protocol, default); 2 lets one render command be published behind a running one.
+ static FLIGHTS: AtomicU32 = AtomicU32::new(1);
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 7f503e8086..8742b6cda7 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -68,6 +68,10 @@ fn stats_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ impl Shared {
+     /// One poll pass (the poll work item).
+     pub(crate) fn run_poll(self: Arc<Self>) {
++        // The domain may be off. The sleep's end queues a pass.
++        if self.sleeping.load(Ordering::Acquire) {
++            return;
++        }
+         let signalling = kernel::dma_fence::SignallingGuard::new();
+         let mut done = Completions::new();
+         {
+diff --git a/drivers/gpu/drm/asahi/g16/regs.rs b/drivers/gpu/drm/asahi/g16/regs.rs
+index 15a17e61f5..e264e319c2 100644
+--- a/drivers/gpu/drm/asahi/g16/regs.rs
++++ b/drivers/gpu/drm/asahi/g16/regs.rs
+@@ -246,12 +246,6 @@ impl Regs {
+         self.asc.io().try_write32(value, ASC_CONTROL)
+     }
+ 
+-    /// The ASC control word as the C RTKit sleep helpers take it (`cpu_control`). Valid as
+-    /// long as this `Regs` lives; the session keeps it until reboot.
+-    pub(crate) fn asc_control_ptr(&self) -> *mut core::ffi::c_void {
+-        (self.asc.raw.addr() + ASC_CONTROL) as *mut core::ffi::c_void
+-    }
+-
+     /// Engine receipts, under the device lock: busy is bit 0 of `C020 | C120`; the fault status
+     /// is `D8C0` under fault-bank selectors 0 and 1 (`D800`), with the saved selector restored.
+     /// 64-bit accesses.
+diff --git a/drivers/gpu/drm/asahi/g16/sleep.rs b/drivers/gpu/drm/asahi/g16/sleep.rs
+index 61ec921d0d..94c65491df 100644
+--- a/drivers/gpu/drm/asahi/g16/sleep.rs
++++ b/drivers/gpu/drm/asahi/g16/sleep.rs
+@@ -1,297 +1,361 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ 
+-//! System sleep.
++//! System sleep: the firmware goes idle, its domain goes off, and it restarts warm.
+ //!
+-//! Suspend-to-idle keeps the SoC powered, and the GPU firmware runs through it with its own idle
+-//! power management (`asahi.g16_idle_power_off`). A sleep that powers the SoC down
+-//! (`pm_suspend_via_firmware()`) takes the GPU's ASC, its power domain and the state iBoot set up
+-//! for the cold start with it. G16 has no qualified firmware stop (RTKit idle, then the ASC
+-//! stopped) and warm restart (the ASC started again with the firmware's state kept in DRAM, the
+-//! RTKit handshake and no initialization, as macOS does on T8140), so such a sleep is refused
+-//! once the firmware has been touched. A G16 that never got that far has nothing to lose; the PMP
+-//! still refuses the sleep if the AGX vote was taken.
++//! The firmware isn't initialized again. It keeps its rings and state in DRAM, so a restart is
++//! the RTKit handshake. That only works after a real wake: iBoot's last wake program reprograms
++//! the GPU's tables with the domain on and leaves it off, and after a stop with no sleep the
++//! firmware doesn't answer the handshake.
+ //!
+-//! For bring-up, `asahi.g16_deep_sleep=1` takes such a sleep instead: the firmware is idled and
+-//! its ASC stopped, and restarted warm early in the resume (`.resume_early`, after the power
+-//! domain is back). Whether the G16 firmware comes back from that on the J604 is what the
+-//! parameter is for; a firmware that does not come back leaves the GPU failed until reboot, the
+-//! rest of the system resumes.
++//! So `.prepare` only drains and closes publication, and the stop is left to the sleep's commit,
++//! which runs it with interrupts off and every refusal behind it. A sleep refused before then
++//! finds the firmware never stopped. The order is G17's, which macOS's power words on T8132
++//! agree with. The PMP vote stays through the sleep.
+ //!
+-//! An idled firmware doesn't come back with its power kept: only a sleep that reaches the
+-//! hardware restarts it. So where the sleep driver can take it (apple-s2r), the idle and the stop
+-//! are left for the sleep's commit, past every refusal, with interrupts off (`g16/glue.c`), as
+-//! for the PMP: a sleep refused before then finds the firmware still running and costs the GPU
+-//! nothing. Without the sleep driver they run in `.suspend_late` (interrupts still on), and a
+-//! sleep refused after that leaves the firmware stopped until one that reaches the hardware.
++//! Only a real wake restarts the firmware. A sleep refused after a stop leaves it stopped and
++//! publication closed until the next real sleep, with the domain on.
+ 
+-use core::ffi::c_void;
+-use core::ptr::null_mut;
+-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
++use core::sync::atomic::Ordering;
+ 
+-use kernel::{bindings, device, error::to_result, prelude::*};
++use kernel::{
++    bindings,
++    prelude::*,
++    sync::Arc,
++    time::{delay::fsleep, Delta},
++    workqueue::{DelayedWork, Work},
++};
+ 
+-mod policy;
++use super::recovery::now_ns;
++use super::regs::{self, ASC_RUN};
++use super::{Firmware, Gpu, Shared};
++use crate::driver::{AsahiPlatformDriverData, SleepOps};
+ 
+-use policy::Verdict;
+-
+-/// The firmware's RTKit handle and ASC control word, published once the firmware runs.
+-static RTK: AtomicPtr<bindings::apple_rtkit> = AtomicPtr::new(null_mut());
+-static ASC_CONTROL: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+-/// This sleep stops the firmware (set in `.prepare`, cleared in `.complete`).
+-static STOP_WANTED: AtomicBool = AtomicBool::new(false);
+-/// The firmware was stopped and must be restarted by a sleep that reaches the hardware.
+-static STOPPED: AtomicBool = AtomicBool::new(false);
+-/// The sleep driver takes the stop at its commit (registered once, until reboot).
+-static COMMIT_REGISTERED: AtomicBool = AtomicBool::new(false);
+-/// This sleep's stop was left for the commit (set in `.suspend_late`, read in `.resume_early`).
+-static AT_COMMIT: AtomicBool = AtomicBool::new(false);
+-/// This sleep's AGX release is armed at the PMP (set in `.suspend_late`, ended in `.resume_early`).
+-static AGX_ARMED: AtomicBool = AtomicBool::new(false);
++/// Time work in flight gets to finish before the sleep is refused.
++const DRAIN_NS: u64 = 3_000_000_000;
++const DRAIN_TICK_MS: i64 = 2;
+ 
+ extern "C" {
+-    fn asahi_g16_commit_register(
+-        dev: *mut c_void,
++    fn asahi_g16_tvm_enable(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
++    fn asahi_g16_commit_prepare(
++        dev: *mut core::ffi::c_void,
+         rtk: *mut bindings::apple_rtkit,
+-        control: *mut c_void,
+-    ) -> core::ffi::c_int;
+-    fn asahi_g16_commit_ready(dev: *mut c_void, ready: bool);
+-    fn asahi_g16_commit_stopped(
+-        dev: *mut c_void,
+-        idle: *mut core::ffi::c_int,
+-        us: *mut core::ffi::c_uint,
+-    ) -> bool;
++    ) -> *mut core::ffi::c_void;
++    fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
++    fn asahi_g17_power_auto_off(dev: *mut core::ffi::c_void, saved: *mut u32) -> core::ffi::c_int;
++    fn asahi_g17_power_lower(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
++    fn asahi_g17_power_raise(dev: *mut core::ffi::c_void, saved: u32) -> core::ffi::c_int;
++    fn asahi_g17_power_auto_on(dev: *mut core::ffi::c_void, saved: u32) -> core::ffi::c_int;
+ }
+ 
+-/// Called once the firmware has started: both pointers stay valid until reboot.
+-pub(crate) fn publish(rtk: *mut bindings::apple_rtkit, asc_control: *mut c_void) {
+-    ASC_CONTROL.store(asc_control, Ordering::Release);
+-    RTK.store(rtk, Ordering::Release);
+-}
++impl Firmware {
++    /// Nothing published, nothing waiting and no recovery under way.
++    fn sleep_quiet(&mut self) -> Result<bool> {
++        self.drain_rings()?;
++        Ok(self.engine.flights.is_empty()
++            && self.engine.pending.is_empty()
++            && !self.engine.frozen
++            && self.recovery_idle()?)
++    }
+ 
+-fn firmware() -> Option<(*mut bindings::apple_rtkit, *mut c_void)> {
+-    let rtk = RTK.load(Ordering::Acquire);
+-    let control = ASC_CONTROL.load(Ordering::Acquire);
+-    if rtk.is_null() || control.is_null() {
+-        None
+-    } else {
+-        Some((rtk, control))
++    /// RTKit idle, the mailbox off, then the run bit, where the commit can't do it. An error
++    /// leaves it running.
++    fn sleep_stop(&mut self) -> Result {
++        if let Err(error) = self.session.rtkit.idle() {
++            // EINVAL: it never left the on state.
++            if let Err(wake) = self.session.rtkit.wake() {
++                if wake != EINVAL {
++                    self.session.shared.fail_stop(wake);
++                }
++            }
++            return Err(error);
++        }
++        self.session.rtkit.mailbox_off();
++        let control = self.session.regs.asc_control()?;
++        self.session.regs.set_asc_control(control & !ASC_RUN)?;
++        regs::mb();
++        Ok(())
+     }
+-}
+ 
+-/// `.prepare`, before any device suspends, so that the refusal comes before anything stopped.
+-unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_int {
+-    STOP_WANTED.store(false, Ordering::Relaxed);
+-    // SAFETY: Reads a global flag word.
+-    let via_firmware = unsafe { bindings::pm_suspend_via_firmware() };
+-    let verdict = policy::verdict(via_firmware, super::boot::glue::retained());
+-    if verdict == Verdict::Go {
+-        return 0;
++    /// The run bit and the RTKit handshake, with the firmware's state as it was left.
++    fn sleep_restart(&mut self) -> Result {
++        self.session.rtkit.warm_restart()?;
++        let control = self.session.regs.asc_control()?;
++        self.session.regs.set_asc_control(control | ASC_RUN)?;
++        regs::mb();
++        self.session.rtkit.boot()
+     }
+-    // SAFETY: The PM core passes the bound device and holds a reference to it for the callback.
+-    let d = unsafe { device::Device::<device::Normal>::from_raw(dev) };
+-    if verdict == Verdict::Untouched {
+-        dev_info!(
+-            d,
+-            "G16: firmware never started: a sleep that powers the SoC down loses nothing here\n"
+-        );
+-        return 0;
++}
++
++impl Shared {
++    fn lower_domain(&self) {
++        let mut saved = 0;
++        // SAFETY: `dev` is the live GPU device and `saved` is writable.
++        let ret = unsafe { asahi_g17_power_auto_off(self.dev.as_raw().cast(), &mut saved) };
++        if ret != 0 {
++            dev_warn!(self.dev.as_ref(), "GPU domain, automatic off: {}\n", ret);
++        }
++        self.sleep_ps.store(saved, Ordering::Relaxed);
++        // SAFETY: `dev` is the live GPU device.
++        let ret = unsafe { asahi_g17_power_lower(self.dev.as_raw().cast()) };
++        if ret != 0 {
++            dev_warn!(self.dev.as_ref(), "GPU domain slow to go off: {}\n", ret);
++        }
+     }
+-    if super::params::deep_sleep() && firmware().is_some() {
+-        dev_warn!(
+-            d,
+-            "G16: testing (g16_deep_sleep=1): stopping the firmware for a sleep that powers the SoC down, warm restart on resume\n"
+-        );
+-        STOP_WANTED.store(true, Ordering::Relaxed);
+-        return 0;
++
++    fn raise_domain(&self) -> Result {
++        let saved = self.sleep_ps.load(Ordering::Relaxed);
++        // SAFETY: `dev` is the live GPU device.
++        kernel::error::to_result(unsafe { asahi_g16_tvm_enable(self.dev.as_raw().cast()) })?;
++        // SAFETY: `dev` is the live GPU device.
++        kernel::error::to_result(unsafe {
++            asahi_g17_power_raise(self.dev.as_raw().cast(), saved)
++        })?;
++        // SAFETY: `dev` is the live GPU device.
++        kernel::error::to_result(unsafe {
++            asahi_g17_power_auto_on(self.dev.as_raw().cast(), saved)
++        })
+     }
+-    dev_warn!(
+-        d,
+-        "G16: refusing a sleep that powers the SoC down: the GPU firmware has no stop and warm restart yet and would not come back (suspend-to-idle is not affected)\n"
+-    );
+-    EBUSY.to_errno()
+-}
+ 
+-/// Registers the stop at the sleep's commit, once. False: the sleep driver can't take it.
+-fn commit_available(
+-    d: &device::Device,
+-    dev: *mut bindings::device,
+-    rtk: *mut bindings::apple_rtkit,
+-    control: *mut c_void,
+-) -> bool {
+-    if COMMIT_REGISTERED.load(Ordering::Relaxed) {
+-        return true;
++    /// With the sleeping flag set, joins whatever may be reading the firmware's registers.
++    fn join_workers(self: &Arc<Self>) {
++        // Dropping the handle cancels an expiry that's still pending.
++        drop(self.resnap_handle.lock().take());
++        // SAFETY: An initialized, pinned delayed work of this Shared. A pending callback owned
++        // one Arc that it can no longer reclaim. Later enqueues run into the sleeping check.
++        let cancelled = unsafe {
++            let work = Work::raw_get(DelayedWork::raw_as_work(&self.poll));
++            let delayed = kernel::container_of!(work, bindings::delayed_work, work);
++            bindings::cancel_delayed_work_sync(delayed)
++        };
++        if cancelled {
++            // SAFETY: See above.
++            drop(unsafe { Arc::from_raw(Arc::as_ptr(self)) });
++        }
+     }
+-    // SAFETY: `dev` is the bound GPU; both pointers were published by the retained session and
+-    // live until reboot, as does this module, which the session pins.
+-    match to_result(unsafe { asahi_g16_commit_register(dev.cast(), rtk, control) }) {
+-        Ok(()) => {
+-            COMMIT_REGISTERED.store(true, Ordering::Relaxed);
+-            true
++
++    /// Waits for what's been published to retire. The poll work keeps running meanwhile.
++    fn wait_quiet(self: &Arc<Self>, deadline: u64) -> Result {
++        loop {
++            self.check()?;
++            let now = now_ns();
++            {
++                let mut state = self.state.lock();
++                let firmware = state.as_deref_mut().ok_or(ENODEV)?;
++                if firmware.sleep_quiet()? {
++                    return Ok(());
++                }
++            }
++            if now >= deadline {
++                return Err(EBUSY);
++            }
++            self.poll_now();
++            fsleep(Delta::from_millis(DRAIN_TICK_MS));
+         }
+-        Err(e) => {
+-            dev_warn!(
+-                d,
+-                "G16: the sleep driver can't stop the firmware at its commit ({:?}): stopping it now\n",
+-                e
+-            );
+-            false
++    }
++
++    /// Leaves the stop to the sleep's commit. False, with the reason logged, if it can't be.
++    fn leave_for_commit(&self, firmware: &mut Firmware) -> bool {
++        // SAFETY: `dev` is the live GPU device. The RTKit handle lasts until reboot, and
++        // `.complete` frees the result.
++        let commit = unsafe {
++            asahi_g16_commit_prepare(self.dev.as_raw().cast(), firmware.session.rtkit.as_raw())
++        };
++        match kernel::error::from_err_ptr(commit) {
++            Ok(commit) => {
++                self.sleep_commit.store(commit, Ordering::Release);
++                true
++            }
++            Err(error) => {
++                dev_warn!(
++                    self.dev.as_ref(),
++                    "no GPU stop at the commit ({:?}): stopping it now\n",
++                    error
++                );
++                false
++            }
+         }
+     }
+-}
+ 
+-/// Arms the AGX vote's release at the sleep's commit, which the PMP's last stop sends after the
+-/// firmware's stop. Without it the PMP refuses the sleep, its vote held.
+-fn arm_agx(d: &device::Device, dev: *mut bindings::device) {
+-    // SAFETY: `dev` is the bound GPU, the AGX consumer.
+-    match to_result(unsafe { bindings::apple_pmp_j713_gpu_sleep_enable(dev) }) {
+-        Ok(()) => AGX_ARMED.store(true, Ordering::Relaxed),
+-        Err(e) => dev_warn!(
+-            d,
+-            "G16: AGX release not armed ({:?}): the PMP will refuse the sleep\n",
+-            e
+-        ),
++    /// Whether the commit stopped the firmware, if the stop was left to it.
++    fn sleep_commit_finish(&self) -> Option<bool> {
++        let commit = self.sleep_commit.swap(core::ptr::null_mut(), Ordering::AcqRel);
++        if commit.is_null() {
++            return None;
++        }
++        let mut saved = self.sleep_ps.load(Ordering::Relaxed);
++        // SAFETY: `commit` came from `asahi_g16_commit_prepare` and is finished only once.
++        let stopped = unsafe { asahi_g17_commit_finish(commit, &mut saved) };
++        self.sleep_ps.store(saved, Ordering::Relaxed);
++        Some(stopped)
+     }
+-}
+ 
+-/// `.suspend_late`: leaves the firmware's idle and stop for the sleep's commit, or does them
+-/// here, interrupts still on.
+-unsafe extern "C" fn sleep_suspend_late(dev: *mut bindings::device) -> core::ffi::c_int {
+-    if !STOP_WANTED.load(Ordering::Relaxed) {
+-        return 0;
++    /// Waits for quiet, closes publication and leaves the stop to the commit, or stops the
++    /// firmware if it can't be. A refusal changes nothing.
++    fn sleep_down(self: &Arc<Self>) -> Result {
++        if self.sleeping.load(Ordering::Acquire) {
++            // After a sleep refused past the stop, only the domain is left to lower.
++            self.lower_domain();
++            return Ok(());
++        }
++        if self.crashed.load(Ordering::Acquire) {
++            // Nothing to save: the domain only has to be off for the sleep.
++            self.sleeping.store(true, Ordering::Release);
++            self.join_workers();
++            self.lower_domain();
++            return Ok(());
++        }
++        self.wait_quiet(now_ns().saturating_add(DRAIN_NS))?;
++        self.sleeping.store(true, Ordering::Release);
++        self.join_workers();
++        let left = {
++            let mut state = self.state.lock();
++            match state.as_deref_mut() {
++                Some(firmware) => firmware
++                    .sleep_quiet()
++                    .and_then(|quiet| if quiet { Ok(()) } else { Err(EBUSY) })
++                    .and_then(|_| {
++                        if self.leave_for_commit(firmware) {
++                            Ok(true)
++                        } else {
++                            firmware.sleep_stop().map(|_| false)
++                        }
++                    }),
++                None => Err(ENODEV),
++            }
++        };
++        match left {
++            Ok(true) => Ok(()),
++            Ok(false) => {
++                self.lower_domain();
++                Ok(())
++            }
++            Err(error) => {
++                self.sleeping.store(false, Ordering::Release);
++                self.poll_now();
++                Err(error)
++            }
++        }
+     }
+-    let Some((rtk, control)) = firmware() else {
+-        return 0;
+-    };
+-    // SAFETY: The PM core passes the bound device and holds a reference to it for the callback.
+-    let d = unsafe { device::Device::<device::Normal>::from_raw(dev) };
+-    if STOPPED.load(Ordering::Relaxed) {
+-        dev_info!(
+-            d,
+-            "G16: firmware still stopped from a sleep that did not reach the hardware: this one restarts it\n"
++
++    /// Keeps the firmware stopped after a sleep that never reached the hardware. False if
++    /// there's no domain to keep it in.
++    fn sleep_hold(self: &Arc<Self>) -> bool {
++        if self.crashed.load(Ordering::Acquire) || self.raise_domain().is_err() {
++            return false;
++        }
++        dev_warn!(
++            self.dev.as_ref(),
++            "sleep refused: GPU firmware stays stopped until a real sleep\n"
+         );
+-        return 0;
+-    }
+-    if commit_available(d, dev, rtk, control) {
+-        // SAFETY: Registered above for this device.
+-        unsafe { asahi_g16_commit_ready(dev.cast(), true) };
+-        AT_COMMIT.store(true, Ordering::Relaxed);
+-        dev_info!(d, "G16: firmware idle and ASC stop left for the sleep's commit\n");
+-        arm_agx(d, dev);
+-        return 0;
++        true
+     }
+-    // SAFETY: Both pointers were published by the running session and live until reboot.
+-    match to_result(unsafe { bindings::apple_rtkit_sleep_stop(rtk, control) }) {
+-        Ok(()) => {
+-            STOPPED.store(true, Ordering::Relaxed);
+-            dev_info!(d, "G16: firmware idled and ASC stopped for the sleep\n");
+-            arm_agx(d, dev);
+-            0
+-        }
+-        Err(e) => {
+-            dev_err!(d, "G16: firmware stop failed: {:?}; refusing the sleep\n", e);
+-            // SAFETY: As above. Without a real sleep this only checks that it still runs.
+-            let back = to_result(unsafe { bindings::apple_rtkit_sleep_return(rtk, control) });
+-            if let Err(e2) = back {
+-                dev_err!(d, "G16: firmware not running after the failed stop: {:?}\n", e2);
++
++    /// Raises the domain and restarts the firmware. A failure loses the device.
++    fn sleep_up(self: &Arc<Self>) -> Result {
++        let started = now_ns();
++        let result = {
++            let mut state = self.state.lock();
++            match state.as_deref_mut() {
++                Some(firmware) if !self.crashed.load(Ordering::Acquire) => {
++                    self.raise_domain().and_then(|_| firmware.sleep_restart())
++                }
++                _ => self.raise_domain(),
++            }
++        };
++        self.sleeping.store(false, Ordering::Release);
++        match result {
++            Ok(()) => {
++                dev_info!(
++                    self.dev.as_ref(),
++                    "GPU firmware back in {} us\n",
++                    now_ns().saturating_sub(started) / 1000
++                );
++                self.poll_now();
++                Ok(())
++            }
++            Err(error) => {
++                dev_err!(self.dev.as_ref(), "GPU firmware did not come back: {:?}\n", error);
++                self.fail_stop(error);
++                Err(error)
+             }
+-            e.to_errno()
+         }
+     }
+ }
+ 
+-/// `.resume_early`: restarts the stopped firmware warm, once its power domain is back.
+-unsafe extern "C" fn sleep_resume_early(dev: *mut bindings::device) -> core::ffi::c_int {
+-    // SAFETY: The PM core passes the bound device and holds a reference to it for the callback.
+-    let d = unsafe { device::Device::<device::Normal>::from_raw(dev) };
+-    if AGX_ARMED.swap(false, Ordering::Relaxed) {
+-        // SAFETY: `dev` is the bound GPU, the AGX consumer.
+-        unsafe { bindings::apple_pmp_j713_gpu_sleep_disable(dev) };
++impl Gpu {
++    /// Called before any device suspends. Only a sleep that powers the SoC down gets here.
++    fn sleep_prepare(&self) -> Result {
++        let result = self.shared.sleep_down();
++        if let Err(error) = result {
++            dev_warn!(self.shared.dev.as_ref(), "GPU refused sleep: {:?}\n", error);
++        }
++        result
+     }
+-    if AT_COMMIT.swap(false, Ordering::Relaxed) {
+-        let mut idle: core::ffi::c_int = 0;
+-        let mut us: core::ffi::c_uint = 0;
+-        // SAFETY: Registered for this device in `.suspend_late`; the out pointers are locals.
+-        let stopped = unsafe { asahi_g16_commit_stopped(dev.cast(), &mut idle, &mut us) };
+-        // SAFETY: As above.
+-        unsafe { asahi_g16_commit_ready(dev.cast(), false) };
+-        if !stopped {
++
++    /// Called after every device resumed, whether or not the sleep reached the hardware.
++    fn sleep_complete(&self) {
++        if !self.shared.sleeping.load(Ordering::Acquire) {
++            return;
++        }
++        // SAFETY: Reads a global flag word.
++        let real = unsafe { bindings::pm_resume_via_firmware() };
++        if self.shared.sleep_commit_finish() == Some(false) && !real {
+             dev_info!(
+-                d,
+-                "G16: sleep refused before the commit: the firmware never stopped and still runs\n"
++                self.shared.dev.as_ref(),
++                "sleep refused before the commit: GPU firmware never stopped\n"
+             );
+-            return 0;
++            self.shared.sleeping.store(false, Ordering::Release);
++            self.shared.poll_now();
++            return;
+         }
+-        if idle != 0 {
+-            dev_warn!(
+-                d,
+-                "G16: firmware idle at the commit failed ({}, {} us): ASC stopped anyway\n",
+-                idle,
+-                us
+-            );
+-        } else {
+-            dev_info!(d, "G16: firmware idled ({} us) and ASC stopped at the commit\n", us);
++        if !real && self.shared.sleep_hold() {
++            return;
+         }
+-        STOPPED.store(true, Ordering::Relaxed);
++        let _ = self.shared.sleep_up();
+     }
+-    if !STOPPED.load(Ordering::Relaxed) {
+-        return 0;
+-    }
+-    // SAFETY: Reads a global flag word.
+-    if !unsafe { bindings::pm_resume_via_firmware() } {
+-        dev_warn!(
+-            d,
+-            "G16: the sleep did not reach the hardware: the firmware stays stopped until one that does\n"
+-        );
+-        return 0;
+-    }
+-    STOPPED.store(false, Ordering::Relaxed);
+-    let Some((rtk, control)) = firmware() else {
+-        return 0;
++}
++
++/// # Safety
++///
++/// `dev` must be a device this driver is bound to, as for a PM core callback.
++unsafe fn sleep_gpu<'a>(dev: *mut bindings::device) -> Option<&'a Arc<Gpu>> {
++    // SAFETY: Probe stored a `Pin<KBox<Option<AsahiPlatformDriverData>>>` here, and the PM core
++    // keeps the device bound for the duration of a callback.
++    let data = unsafe {
++        &*bindings::dev_get_drvdata(dev).cast::<Option<AsahiPlatformDriverData<'a>>>()
+     };
+-    // The AGX vote again before the ASC runs, as at the cold start; the PMP resumed first. A vote
+-    // still held (its release never went) sends nothing.
+-    // SAFETY: `dev` is the bound GPU, the AGX consumer.
+-    if let Err(e) = to_result(unsafe { bindings::apple_pmp_j713_gpu_get(dev) }) {
+-        dev_err!(
+-            d,
+-            "G16: AGX vote not taken again after the sleep: {:?}; the GPU stays failed until reboot\n",
+-            e
+-        );
++    data.as_ref()?.g16.as_ref()
++}
++
++/// Runs before any device suspends, so the GPU goes first and work still in flight can finish.
++unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_int {
++    // SAFETY: Reads a global flag word.
++    if !unsafe { bindings::pm_suspend_via_firmware() } {
+         return 0;
+     }
+-    // SAFETY: Both pointers were published by the running session and live until reboot.
+-    match to_result(unsafe { bindings::apple_rtkit_sleep_return(rtk, control) }) {
+-        Ok(()) => dev_info!(d, "G16: firmware warm-restarted after the sleep\n"),
+-        Err(e) => dev_err!(
+-            d,
+-            "G16: firmware did not come back after the sleep: {:?}; the GPU stays failed until reboot\n",
+-            e
+-        ),
++    // SAFETY: Called by the PM core.
++    match unsafe { sleep_gpu(dev) } {
++        Some(gpu) => kernel::error::from_result(|| gpu.sleep_prepare().map(|_| 0)),
++        None => EBUSY.to_errno(),
+     }
+-    // A failed GPU must not stop the rest of the system from resuming.
+-    0
+ }
+ 
+-/// `.complete`: the sleep is over, whatever happened.
+-unsafe extern "C" fn sleep_complete(_dev: *mut bindings::device) {
+-    STOP_WANTED.store(false, Ordering::Relaxed);
++/// Runs after every device resumed. Does nothing unless [`sleep_prepare`] closed publication.
++unsafe extern "C" fn sleep_complete(dev: *mut bindings::device) {
++    // SAFETY: Called by the PM core.
++    if let Some(gpu) = unsafe { sleep_gpu(dev) } {
++        gpu.sleep_complete();
++    }
+ }
+ 
+-struct SleepOps(bindings::dev_pm_ops);
+-
+-// SAFETY: Immutable: the callbacks are plain functions.
+-unsafe impl Sync for SleepOps {}
+-
+-static OPS: SleepOps = SleepOps(bindings::dev_pm_ops {
++static SLEEP_OPS: SleepOps = SleepOps(bindings::dev_pm_ops {
+     prepare: Some(sleep_prepare),
+     complete: Some(sleep_complete),
+-    suspend_late: Some(sleep_suspend_late),
+-    resume_early: Some(sleep_resume_early),
+     // SAFETY: All-zero is the absence of every other callback.
+     ..unsafe { core::mem::zeroed() }
+ });
+ 
+-/// G16's system sleep callbacks.
+-pub(super) fn ops() -> Option<&'static bindings::dev_pm_ops> {
+-    Some(&OPS.0)
++/// The G16 driver's sleep callbacks.
++pub(super) fn ops() -> &'static bindings::dev_pm_ops {
++    &SLEEP_OPS.0
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/sleep/policy.rs b/drivers/gpu/drm/asahi/g16/sleep/policy.rs
+deleted file mode 100644
+index d515b2bd66..0000000000
+--- a/drivers/gpu/drm/asahi/g16/sleep/policy.rs
++++ /dev/null
+@@ -1,51 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+-
+-//! The G16 sleep decision, apart from the hardware so that it can be tested.
+-
+-/// What `.prepare` does with a sleep.
+-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+-pub(crate) enum Verdict {
+-    /// The SoC stays powered (suspend-to-idle): the firmware runs through the sleep.
+-    Go,
+-    /// The SoC powers down, but the firmware was never touched: there is nothing to lose.
+-    Untouched,
+-    /// The SoC powers down under a firmware session: it would be lost.
+-    Refuse,
+-}
+-
+-/// The verdict for a sleep.
+-///
+-/// `via_firmware`: the sleep powers the SoC down (`pm_suspend_via_firmware()`).
+-/// `retained`: the firmware has been touched and its session is kept until reboot
+-/// (`boot::glue::retained()`).
+-pub(crate) fn verdict(via_firmware: bool, retained: bool) -> Verdict {
+-    match (via_firmware, retained) {
+-        (false, _) => Verdict::Go,
+-        (true, false) => Verdict::Untouched,
+-        (true, true) => Verdict::Refuse,
+-    }
+-}
+-
+-#[cfg_attr(not(test), kernel::macros::kunit_tests(asahi_g16_sleep))]
+-mod tests {
+-    use super::*;
+-
+-    /// Suspend-to-idle goes ahead whatever the firmware does.
+-    #[test]
+-    fn suspend_to_idle_goes() {
+-        assert_eq!(verdict(false, true), Verdict::Go);
+-        assert_eq!(verdict(false, false), Verdict::Go);
+-    }
+-
+-    /// A SoC power-down with the firmware session up is refused.
+-    #[test]
+-    fn power_down_with_firmware_refused() {
+-        assert_eq!(verdict(true, true), Verdict::Refuse);
+-    }
+-
+-    /// A SoC power-down before the firmware was touched loses nothing.
+-    #[test]
+-    fn power_down_before_firmware_goes() {
+-        assert_eq!(verdict(true, false), Verdict::Untouched);
+-    }
+-}
+diff --git a/drivers/gpu/drm/asahi/g17/sleep.c b/drivers/gpu/drm/asahi/g17/sleep.c
+index 57af9cc3df..85dfae403d 100644
+--- a/drivers/gpu/drm/asahi/g17/sleep.c
++++ b/drivers/gpu/drm/asahi/g17/sleep.c
+@@ -40,6 +40,9 @@
+ #define SGX_BRIDGE_ENABLE	BIT(0)
+ 
+ #define ASC_CPU_STATUS		0x4
++/* Where the ASC's own registers hold the CPU's control: G16. */
++#define ASC_CPU_CONTROL		0x44
++#define ASC_CPU_CONTROL_RUN	BIT(4)
+ 
+ /* The PMP's request for the GPU, where the device tree names one. */
+ int asahi_g17_pmp_request(struct device *dev, bool enable)
+@@ -206,7 +209,10 @@ static int asahi_g17_commit_stop(void *data)
+ 	for (i = 0; i < c->count; i++) {
+ 		c->status[i] = readl(c->cpu[i] + ASC_CPU_STATUS);
+ 		apple_rtkit_mailbox_recv_off(c->rtk[i]);
+-		apple_mbox_ascwrap_v6_stop_cpu_atomic(c->mbox[i]);
++		if (c->mbox[i])
++			apple_mbox_ascwrap_v6_stop_cpu_atomic(c->mbox[i]);
++		else
++			writel(readl(c->cpu[i]) & ~ASC_CPU_CONTROL_RUN, c->cpu[i]);
+ 		if (!i && c->bridge)
+ 			writel(readl(c->gating) | SGX_GATING_HOLD, c->gating);
+ 	}
+@@ -251,6 +257,9 @@ static void asahi_g17_commit_free(struct asahi_g17_commit *c)
+ 		apple_pmp_report_entry_commit_owned(c->request, false);
+ 		of_node_put(c->request);
+ 	}
++	/* The mapping is only this structure's on G16: G17's belongs to its mailbox. */
++	if (!c->mbox[0] && c->cpu[0])
++		iounmap(c->cpu[0]);
+ 	if (c->ps)
+ 		iounmap(c->ps);
+ 	if (c->bridge)
+@@ -325,6 +334,47 @@ err:
+ 	return ERR_PTR(ret);
+ }
+ 
++/*
++ * The same stop for G16: one firmware instance, whose control registers are the ASC's own, no
++ * bridge and no PMP request to withdraw, as its vote stays through the sleep.
++ */
++struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk)
++{
++	struct asahi_g17_commit *c;
++	struct device_node *np;
++	u32 offset;
++	int ret;
++
++	c = kzalloc_obj(*c);
++	if (!c)
++		return ERR_PTR(-ENOMEM);
++	c->dev = dev;
++	c->rtk[0] = rtk;
++	c->count = 1;
++
++	ret = -ENODEV;
++	c->cpu[0] = asahi_g17_map(dev->of_node, "asc", 0, ASC_CPU_CONTROL, 8);
++	np = of_parse_phandle(dev->of_node, "power-domains", 0);
++	if (!np)
++		goto err;
++	if (!of_property_read_u32(np, "reg", &offset) && np->parent)
++		c->ps = asahi_g17_map(np->parent, NULL, 0, offset, 4);
++	of_node_put(np);
++	if (!c->cpu[0] || !c->ps)
++		goto err;
++
++	ret = apple_sleep_coproc_register_first(dev, asahi_g17_commit_stop, c);
++	if (ret)
++		goto err;
++	apple_sleep_coproc_set_ready(dev, true);
++
++	return c;
++
++err:
++	asahi_g17_commit_free(c);
++	return ERR_PTR(ret);
++}
++
+ /*
+  * After the sleep, refused or not: whether the commit stopped the GPU, and in @saved the
+  * domain's word from before, if it did. Frees @c.
+diff --git a/drivers/gpu/drm/asahi/g17/sleep.h b/drivers/gpu/drm/asahi/g17/sleep.h
+index 21b91dfca0..c9d35415fb 100644
+--- a/drivers/gpu/drm/asahi/g17/sleep.h
++++ b/drivers/gpu/drm/asahi/g17/sleep.h
+@@ -14,6 +14,7 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
+ 						  struct apple_mbox *primary_mbox,
+ 						  struct apple_rtkit *secondary_rtk,
+ 						  struct apple_mbox *secondary_mbox, bool bridge);
++struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk);
+ bool asahi_g17_commit_finish(struct asahi_g17_commit *c, u32 *saved);
+ int asahi_g17_power_auto_off(struct device *dev, u32 *saved);
+ int asahi_g17_power_lower(struct device *dev);
+diff --git a/tools/testing/selftests/drivers/gpu/asahi-m4/test-publication.py b/tools/testing/selftests/drivers/gpu/asahi-m4/test-publication.py
+index 4033debb94..6f388b4693 100644
+--- a/tools/testing/selftests/drivers/gpu/asahi-m4/test-publication.py
++++ b/tools/testing/selftests/drivers/gpu/asahi-m4/test-publication.py
+@@ -57,6 +57,8 @@ impl Engine {
+     __UNPEND__
+ }
+ struct Checks;impl Checks{fn check(&self)->Result{Ok(())}fn health(&self)->Result{Ok(())}}
++struct Shared{sleeping:AtomicBool}
++struct Session{shared:Shared}impl Session{fn check(&self)->Result{Ok(())}}
+ struct Recovery{error:Option<Error>,publication_wait_deadline:Option<u64>}impl Recovery{fn failed(&self)->Option<Error>{self.error}}
+ struct Slots{compute_exhausted:bool,render_exhausted:bool,releases:u32,quarantines:u32}
+ impl Slots{
+@@ -107,7 +109,7 @@ struct Stage{result:Result,visible:bool}
+ #[derive(Default)]struct Power{work:Vec<bool>}
+ impl Power{fn report_work(&mut self,in_flight:bool){self.work.push(in_flight);}}
+ struct Firmware{
+-    session:Checks,objects:Checks,recovery:Recovery,engine:Engine,slots:Slots,power:Power,
++    session:Session,objects:Checks,recovery:Recovery,engine:Engine,slots:Slots,power:Power,
+     unavailable:Vec<(usize,Error)>,stages:VecDeque<Stage>,retained:Vec<u32>,attempted:Vec<u32>,fail_stops:u32,
+ }
+ impl Firmware {
+@@ -145,7 +147,7 @@ fn job(id:u32,render:bool,sent:u32,dependency:Result)->Arc<Job>{
+         commands:vec![if render{Command::Render(())}else{Command::Compute(())};sent as usize+1],dependency,terminal_marked:AtomicBool::new(false)})
+ }
+ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
+-    Firmware{session:Checks,objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
++    Firmware{session:Session{shared:Shared{sleeping:AtomicBool::new(false)}},objects:Checks,recovery:Recovery{error:None,publication_wait_deadline:None},
+         engine:Engine{ordinal:0,draw:0,pending:jobs,flights:vec![],frozen:false,turn:0,stats:Stats::default(),chan_wait:false},
+         slots:Slots{compute_exhausted:false,render_exhausted:false,releases:0,quarantines:0},power:Power::default(),
+         unavailable:vec![],stages:stages.into_iter().map(|(result,visible)|Stage{result,visible}).collect(),
+@@ -221,6 +223,12 @@ fn firmware(jobs:Vec<Arc<Job>>,stages:Vec<(Result,bool)>)->Firmware{
+         assert_eq!(f.publish(&mut done),Err(ETIMEDOUT));
+         assert_eq!(f.recovery.publication_wait_deadline,Some(deadline));
+     }
++    #[test]fn nothing_is_published_during_a_system_sleep(){
++        let mut f=firmware(vec![job(1,false,0,Ok(()))],vec![(Ok(()),true)]);f.session.shared.sleeping.store(true,Ordering::Relaxed);
++        let mut done=vec![];assert_eq!(f.publish(&mut done),Ok(()));
++        assert!(done.is_empty());assert!(f.attempted.is_empty());assert_eq!(f.engine.pending.len(),1);assert!(f.power.work.is_empty());
++        f.session.shared.sleeping.store(false,Ordering::Relaxed);assert_eq!(f.publish(&mut done),Ok(()));assert_eq!(f.attempted,[1]);
++    }
+ 
+ }
+ '''

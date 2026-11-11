@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bartosz Nitka <niteria@gmail.com>
+Date: Mon, 9 Nov 2026 16:22:06 +0100
+Subject: [PATCH] drm/asahi: G16: ride out dark sensors while the GPU
+ is idle
+
+The boot core's power-gate bit, which deep sleep requires, lets the P
+cluster power down in WFI, and the PMP then marks its die sensors
+invalid. The GPU's cooling backstop took each of those -ENODATA readings
+for a failed sensor and went to its top level, so on a kernel that can
+sleep the GPU sat at S1 while idle and took almost 2 s to climb back for
+each burst of work.
+
+Go on from the last cool reading, as apple-pmp-thermal does: for 2 s
+with work in flight, and for as long as the sensors stay dark while the
+GPU is idle, when it makes no heat and samples only about twice a
+second. The two constants move to pmp-cooling.h, shared by both.
+
+Measured on a J713 at idle, before: 66 of 137 samples -ENODATA, backstop
+8, limit S1. After: no errors past the first valid reading, backstop 0,
+limit S9.
+
+[Dylan: resolved g16/power.rs onto the J604 tree: this commit's
+ idle-aware ceiling, then the governor floor our g16_idle_floor
+ parameter sets.]
+
+Assisted-by: LLM
+Signed-off-by: Bartosz Nitka <niteria@gmail.com>
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/glue.c      | 18 ++++++++++++++++--
+ drivers/gpu/drm/asahi/g16/power.rs    | 11 +++++++----
+ include/linux/soc/apple/pmp-cooling.h |  7 +++++++
+ 3 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/glue.c b/drivers/gpu/drm/asahi/g16/glue.c
+index f4c51484c5..9bcc967d1f 100644
+--- a/drivers/gpu/drm/asahi/g16/glue.c
++++ b/drivers/gpu/drm/asahi/g16/glue.c
+@@ -47,11 +47,14 @@ struct asahi_g16_cooling {
+ 	struct device_node *pmp_node;
+ 	struct apple_pmp_cooling policy;
+ 	struct thermal_cooling_device *cdev;
++	/* The last reading from a sensor that was valid, and when. */
++	u64 valid_ns;
++	long valid_mc;
+ };
+ 
+ struct asahi_g16_cooling *asahi_g16_cooling_register(struct device *dev);
+ void asahi_g16_cooling_unregister(struct asahi_g16_cooling *cooling);
+-int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
++int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool idle,
+ 			    long *temperature, u32 *governor, u32 *power,
+ 			    u32 *backstop);
+ int asahi_g16_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out);
+@@ -137,8 +140,10 @@ void asahi_g16_cooling_unregister(struct asahi_g16_cooling *cooling)
+ 
+ /* Serialized by the GPU owner. Provider lifetime and MMIO access stay with
+  * PMP: this consumer owns no SRAM mapping and cannot restart its firmware.
++ * An idle GPU samples about twice a second and makes no heat, so with nothing
++ * in flight the last cool reading stands for as long as the sensors stay dark.
+  */
+-int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
++int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now, bool idle,
+ 			    long *temperature, u32 *governor, u32 *power,
+ 			    u32 *backstop)
+ {
+@@ -146,6 +151,15 @@ int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
+ 
+ 	*temperature = 0;
+ 	ret = apple_pmp_telemetry_get_hotspot(cooling->pmp_node, temperature);
++	if (!ret) {
++		cooling->valid_ns = now;
++		cooling->valid_mc = *temperature;
++	} else if (ret == -ENODATA && cooling->valid_ns &&
++		   (idle || now - cooling->valid_ns < APPLE_PMP_GATED_HOLD_NS) &&
++		   cooling->valid_mc < APPLE_PMP_GATED_HOLD_MC) {
++		*temperature = cooling->valid_mc;
++		ret = 0;
++	}
+ 	apple_pmp_cooling_sample(&cooling->policy, now, *temperature, ret);
+ 	*governor = atomic_read(&cooling->state);
+ 	*power = apple_pmp_gpu_power_state(cooling->pmp);
+diff --git a/drivers/gpu/drm/asahi/g16/power.rs b/drivers/gpu/drm/asahi/g16/power.rs
+index fa9eeb7062..0476553599 100644
+--- a/drivers/gpu/drm/asahi/g16/power.rs
++++ b/drivers/gpu/drm/asahi/g16/power.rs
+@@ -43,6 +43,7 @@ extern "C" {
+     fn asahi_g16_cooling_sample(
+         cooling: *mut c_void,
+         now: u64,
++        idle: bool,
+         temperature: *mut core::ffi::c_long,
+         governor: *mut u32,
+         power: *mut u32,
+@@ -76,7 +77,7 @@ impl Cooling {
+         })
+     }
+ 
+-    fn sample(&mut self, now: u64, power: &mut Sample) -> Result {
++    fn sample(&mut self, now: u64, idle: bool, power: &mut Sample) -> Result {
+         let mut mc: core::ffi::c_long = 0;
+         // SAFETY: The C allocation and PMP phandle outlive this call, all output
+         // pointers are valid, and the caller holds the GPU device mutex.
+@@ -84,6 +85,7 @@ impl Cooling {
+             asahi_g16_cooling_sample(
+                 self.inner.as_ptr(),
+                 now,
++                idle,
+                 &mut mc,
+                 &mut power.governor,
+                 &mut power.budget,
+@@ -235,10 +237,10 @@ impl Power {
+         }
+     }
+ 
+-    fn ceiling(&mut self, now: u64) -> (u32, bool) {
++    fn ceiling(&mut self, now: u64, idle: bool) -> (u32, bool) {
+         if policy::read_due(self.last_sample_ns, now) {
+             self.last_sample_ns = Some(now);
+-            self.sensor_error = self.cooling.sample(now, &mut self.sample).err();
++            self.sensor_error = self.cooling.sample(now, idle, &mut self.sample).err();
+             if self.sensor_error.is_some() {
+                 self.sensor_errors += 1;
+             }
+@@ -277,7 +279,8 @@ impl Firmware {
+         }
+         self.service_idle_power_off()?;
+         let now = now_ns();
+-        let (limit, decision) = self.power.ceiling(now);
++        let idle = self.engine.flights.is_empty();
++        let (limit, decision) = self.power.ceiling(now, idle);
+         self.power.utilization.set_floor(params::idle_floor());
+         let target = self
+             .power
+diff --git a/include/linux/soc/apple/pmp-cooling.h b/include/linux/soc/apple/pmp-cooling.h
+index 915686472c..29ff8bc74b 100644
+--- a/include/linux/soc/apple/pmp-cooling.h
++++ b/include/linux/soc/apple/pmp-cooling.h
+@@ -20,6 +20,13 @@
+ #define APPLE_PMP_BACKSTOP_MC 108000
+ #define APPLE_PMP_FULL_COOLING_MC 115000
+ #define APPLE_PMP_RELEASE_MC 106000
++/*
++ * The firmware publishes a die sensor only while its cluster has power, so an idle
++ * machine can have none valid for a moment (0.46 s the longest measured). Go on from the
++ * last reading for this long, if it was this cool. Longer or hotter is a failed sensor.
++ */
++#define APPLE_PMP_GATED_HOLD_NS 2000000000ULL
++#define APPLE_PMP_GATED_HOLD_MC 90000
+ 
+ struct apple_pmp_cooling {
+ 	unsigned long long last_ns, good_ns, anchor_ns, release_ns;
