@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 17:22:14 +0000
+Subject: [PATCH] soc: apple: s2r: hand the watchdog back as its driver
+ had it before the sleep
+
+With wdt_from_enter, ->enter keeps the watchdog's control and alarm and
+arms its own timer; once the whole resume has finished they go back to
+the watchdog driver. By ->enter, though, the driver's own suspend has
+already stopped its watchdog, so what was kept is a stopped control
+word. The driver's resume starts the watchdog again, and the hand-back
+after it then writes the stopped word over that: the watchdog stays off
+for the rest of the boot while its user goes on pinging it, and a later
+hang never resets the machine.
+
+Take the driver's control and alarm as ->begin finds them, before any
+device suspends, and hand those back.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/apple-s2r.c | 28 +++++++++++++++++++++++++---
+ 1 file changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index 6b835965dc..9d5ead17a5 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -670,6 +670,10 @@ struct apple_s2r {
+ 	struct notifier_block pm_nb;
+ 	u32 wdt_saved_ctl;
+ 	u32 wdt_saved_alarm;
++	/* The watchdog driver's own state at ->begin, before its suspend stopped it */
++	bool wdt_begin_ok;
++	u32 wdt_begin_ctl;
++	u32 wdt_begin_alarm;
+ 
+ 	/* Breadcrumb: PMU boot stage byte, and this cycle's writes */
+ 	struct spmi_device *crumb_dev;
+@@ -1361,11 +1365,22 @@ static void apple_s2r_t8132_step(struct apple_s2r *s2r, u8 crumb, u32 secs)
+ 		apple_s2r_wdt_arm_secs(s2r, secs);
+ }
+ 
+-/* Keep what the watchdog driver had programmed, then arm the safety timer */
++/*
++ * Keep what the watchdog driver had programmed, then arm the safety timer.
++ * By ->enter the driver's own suspend has stopped its watchdog, so take its
++ * state as ->begin found it: handing back the stopped one after the resume
++ * (whose driver resume started it again) would leave the watchdog off for
++ * the rest of the boot, with its user still pinging it.
++ */
+ static void apple_s2r_wdt_take(struct apple_s2r *s2r)
+ {
+-	s2r->wdt_saved_ctl = readl_relaxed(s2r->wdt + WDT_CTL);
+-	s2r->wdt_saved_alarm = readl_relaxed(s2r->wdt + WDT_ALARM);
++	if (s2r->wdt_begin_ok) {
++		s2r->wdt_saved_ctl = s2r->wdt_begin_ctl;
++		s2r->wdt_saved_alarm = s2r->wdt_begin_alarm;
++	} else {
++		s2r->wdt_saved_ctl = readl_relaxed(s2r->wdt + WDT_CTL);
++		s2r->wdt_saved_alarm = readl_relaxed(s2r->wdt + WDT_ALARM);
++	}
+ 	s2r->wdt_armed = true;
+ }
+ 
+@@ -3457,6 +3472,11 @@ static int apple_s2r_begin(suspend_state_t state)
+ 	if (READ_ONCE(debug_begin_as_idle))
+ 		return 0;
+ 	if (apple_s2r) {
++		if (apple_s2r->wdt) {
++			apple_s2r->wdt_begin_ctl = readl_relaxed(apple_s2r->wdt + WDT_CTL);
++			apple_s2r->wdt_begin_alarm = readl_relaxed(apple_s2r->wdt + WDT_ALARM);
++			apple_s2r->wdt_begin_ok = true;
++		}
+ 		apple_s2r_pins_save(apple_s2r);
+ 		apple_s2r_crumb_begin(apple_s2r);
+ 		if (t8132_sequence)
+@@ -3483,6 +3503,8 @@ static void apple_s2r_resume_finish(void)
+ 
+ static void apple_s2r_resume_end(void)
+ {
++	if (apple_s2r)
++		apple_s2r->wdt_begin_ok = false;
+ 	if (apple_s2r)
+ 		WRITE_ONCE(apple_s2r->t8132.hold_apcie, false);
+ 	if (apple_s2r)

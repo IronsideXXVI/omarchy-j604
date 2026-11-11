@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 17:26:44 +0000
+Subject: [PATCH] soc: apple: s2r: arm the bring-up watchdog from
+ ->begin with wdt_from_enter
+
+wdt_from_enter arms the watchdog when ->enter starts. Before that, the
+watchdog driver's own suspend has already stopped the timer its user
+had running, so a stop anywhere in the rest of device suspend, the late
+and noirq phases, the CPU offline or the syscore suspend ends in no
+reset at all.
+
+With wdt_from_enter, arm it at ->begin already, and once more at
+->prepare, after every device's suspend and so after the watchdog
+driver's. If ->enter never takes it over (a refusal, or a device that
+would not suspend), ->end hands the driver's own state back.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/apple-s2r.c | 35 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index 9d5ead17a5..6acd5b4062 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -674,6 +674,8 @@ struct apple_s2r {
+ 	bool wdt_begin_ok;
+ 	u32 wdt_begin_ctl;
+ 	u32 wdt_begin_alarm;
++	/* wdt_from_enter: armed from ->begin already, until ->enter takes over */
++	bool wdt_early;
+ 
+ 	/* Breadcrumb: PMU boot stage byte, and this cycle's writes */
+ 	struct spmi_device *crumb_dev;
+@@ -3476,6 +3478,15 @@ static int apple_s2r_begin(suspend_state_t state)
+ 			apple_s2r->wdt_begin_ctl = readl_relaxed(apple_s2r->wdt + WDT_CTL);
+ 			apple_s2r->wdt_begin_alarm = readl_relaxed(apple_s2r->wdt + WDT_ALARM);
+ 			apple_s2r->wdt_begin_ok = true;
++			/*
++			 * Bring-up: from here, not only from ->enter. The watchdog
++			 * driver's suspend stops it again (unless its keep_in_sleep
++			 * is set), so ->prepare arms it once more after that.
++			 */
++			if (wdt_timeout && READ_ONCE(wdt_from_enter)) {
++				apple_s2r_wdt_arm(apple_s2r);
++				apple_s2r->wdt_early = true;
++			}
+ 		}
+ 		apple_s2r_pins_save(apple_s2r);
+ 		apple_s2r_crumb_begin(apple_s2r);
+@@ -3486,6 +3497,14 @@ static int apple_s2r_begin(suspend_state_t state)
+ 	return 0;
+ }
+ 
++/* After every device's suspend: what the watchdog driver's suspend stopped, armed again */
++static int apple_s2r_prepare(void)
++{
++	if (apple_s2r && apple_s2r->wdt_early)
++		apple_s2r_wdt_arm(apple_s2r);
++	return 0;
++}
++
+ /* After every device's noirq suspend */
+ static int apple_s2r_prepare_late(void)
+ {
+@@ -3503,8 +3522,21 @@ static void apple_s2r_resume_finish(void)
+ 
+ static void apple_s2r_resume_end(void)
+ {
+-	if (apple_s2r)
++	/*
++	 * Armed from ->begin, and ->enter never took it over (a refusal, or a
++	 * device that would not suspend): back to the driver's own state now.
++	 * ->enter's hold goes back after the thaw instead (apple_s2r_pm_notify()).
++	 */
++	if (apple_s2r && apple_s2r->wdt_early && !apple_s2r->wdt_hold) {
++		writel_relaxed(0, apple_s2r->wdt + WDT_CTL);
++		writel_relaxed(apple_s2r->wdt_begin_alarm, apple_s2r->wdt + WDT_ALARM);
++		writel_relaxed(0, apple_s2r->wdt + WDT_COUNT);
++		writel(apple_s2r->wdt_begin_ctl, apple_s2r->wdt + WDT_CTL);
++	}
++	if (apple_s2r) {
++		apple_s2r->wdt_early = false;
+ 		apple_s2r->wdt_begin_ok = false;
++	}
+ 	if (apple_s2r)
+ 		WRITE_ONCE(apple_s2r->t8132.hold_apcie, false);
+ 	if (apple_s2r)
+@@ -3518,6 +3550,7 @@ static void apple_s2r_resume_end(void)
+ static const struct platform_suspend_ops apple_s2r_ops = {
+ 	.valid = apple_s2r_valid,
+ 	.begin = apple_s2r_begin,
++	.prepare = apple_s2r_prepare,
+ 	.prepare_late = apple_s2r_prepare_late,
+ 	.enter = apple_s2r_enter,
+ 	.wake = apple_s2r_wake,
