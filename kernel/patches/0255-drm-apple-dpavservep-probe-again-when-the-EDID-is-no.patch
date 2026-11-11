@@ -1,0 +1,215 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Wed, 11 Nov 2026 03:10:32 +1100
+Subject: [PATCH] drm/apple: dpavservep: probe again when the EDID is
+ not read yet
+
+After system resume the external DCP publishes a new AV service
+instance and reports the sink as still connected before its link to
+the sink is back. A mode probe in that window reads the EDID through
+the new instance, and the firmware answers the call with no EDID bytes
+(used size 0). The reply failed validation as -EIO and get_modes
+logged "copy_edid failed: -EIO" on every systemd suspend/resume of the
+Neo with a DP monitor attached. About 50 ms later the firmware drops
+the link, plugs the sink again and the next read succeeds.
+
+Return -ENODATA for a reply without EDID bytes and, for that case,
+probe the connector again (up to 5 times, 500 ms apart) as long as the
+same instance is current, instead of warning. A new instance or sink
+gets its own hotplug; any other failure is still reported.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(cherry picked from commit 5b8fe9c5545cecc479318ed61d84965bafb2c5a0)
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp.c                   |  3 +
+ drivers/gpu/drm/apple/epic/dpavserv-edid.h    |  7 +++
+ drivers/gpu/drm/apple/epic/dpavservep.c       | 60 +++++++++++++++++++
+ drivers/gpu/drm/apple/epic/dpavservep.h       | 11 ++++
+ drivers/gpu/drm/apple/iomfb.c                 | 10 ++++
+ .../apple-afkv2/host-include/linux/errno.h    |  1 +
+ .../drivers/gpu/apple-afkv2/inline-edid.c     |  6 ++
+ 7 files changed, 98 insertions(+)
+
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index f09ff22118..b8348287f7 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -6588,6 +6588,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
+ 	spin_lock_init(&dcp->metadata.lock);
+ 	mutex_init(&dcp->dcpavserv.lock);
+ 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
++	ret = dcpavserv_edid_retry_init(dcp);
++	if (ret)
++		return ret;
+ 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+ 	/* The display such a processor finds at boot is its first sink. */
+ 	if (dcp_sink_metadata(dcp))
+diff --git a/drivers/gpu/drm/apple/epic/dpavserv-edid.h b/drivers/gpu/drm/apple/epic/dpavserv-edid.h
+index 31baaaea70..742a752d58 100644
+--- a/drivers/gpu/drm/apple/epic/dpavserv-edid.h
++++ b/drivers/gpu/drm/apple/epic/dpavserv-edid.h
+@@ -24,6 +24,13 @@ static inline int dpavserv_edid_size(const void *response, size_t received,
+ 	if (afkv2_get64(p) != EDID_BUF_SIZE)
+ 		return -EIO;
+ 	used = afkv2_get64(p + 32);
++	/*
++	 * No EDID bytes: the firmware has not read the sink for this instance
++	 * yet. It publishes a new instance on resume before its link is back,
++	 * and reads the sink again once the link is up.
++	 */
++	if (!used)
++		return -ENODATA;
+ 	if (used < EDID_LEADING_DATA_SIZE + EDID_BLOCK_SIZE || used > EDID_BUF_SIZE ||
+ 	    used > received - DPAV_EDID_HEADER_SIZE)
+ 		return -EIO;
+diff --git a/drivers/gpu/drm/apple/epic/dpavservep.c b/drivers/gpu/drm/apple/epic/dpavservep.c
+index a92af3295f..206bae1077 100644
+--- a/drivers/gpu/drm/apple/epic/dpavservep.c
++++ b/drivers/gpu/drm/apple/epic/dpavservep.c
+@@ -594,6 +594,66 @@ bool dcpavserv_edid_service_current(struct apple_dcp *dcp, u64 epoch)
+ 		 !READ_ONCE(dcp->external_physically_absent));
+ }
+ 
++#define DCPAVSERV_EDID_RETRIES 5
++#define DCPAVSERV_EDID_RETRY_MS 500
++
++static void dcpavserv_edid_retry_work(struct work_struct *work)
++{
++	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
++					     dcpavserv.edid_retry_wq);
++	struct apple_connector *con;
++	bool current_instance;
++
++	guard(mutex)(&dcp->hpd_mutex);
++	scoped_guard(mutex, &dcp->dcpavserv.lock)
++		current_instance = dcpavserv_edid_service_current(dcp,
++							  dcp->dcpavserv.edid_retry_epoch);
++	con = dcp->connector;
++	/* A new instance or a new sink is probed by its own hotplug. */
++	if (current_instance && !READ_ONCE(dcp->quiescing) && con &&
++	    READ_ONCE(con->dcp) == to_platform_device(dcp->dev))
++		schedule_work(&con->hotplug_wq);
++}
++
++static void dcpavserv_edid_retry_cancel(void *data)
++{
++	struct apple_dcp *dcp = data;
++
++	cancel_delayed_work_sync(&dcp->dcpavserv.edid_retry_wq);
++}
++
++int dcpavserv_edid_retry_init(struct apple_dcp *dcp)
++{
++	INIT_DELAYED_WORK(&dcp->dcpavserv.edid_retry_wq, dcpavserv_edid_retry_work);
++	return devm_add_action_or_reset(dcp->dev, dcpavserv_edid_retry_cancel, dcp);
++}
++
++/*
++ * The EDID read through instance @epoch came back without data: probe again
++ * shortly, as the firmware fills in the EDID once it has the sink's link up.
++ * Returns false when this instance has used up its retries.
++ */
++bool dcpavserv_edid_retry(struct apple_dcp *dcp, u64 epoch)
++{
++	lockdep_assert_held(&dcp->dcpavserv.lock);
++	if (dcp->dcpavserv.edid_retry_epoch != epoch) {
++		dcp->dcpavserv.edid_retry_epoch = epoch;
++		dcp->dcpavserv.edid_retries = 0;
++	}
++	if (dcp->dcpavserv.edid_retries >= DCPAVSERV_EDID_RETRIES)
++		return false;
++	dcp->dcpavserv.edid_retries++;
++	mod_delayed_work(system_freezable_wq, &dcp->dcpavserv.edid_retry_wq,
++			 msecs_to_jiffies(DCPAVSERV_EDID_RETRY_MS));
++	return true;
++}
++
++void dcpavserv_edid_retry_reset(struct apple_dcp *dcp)
++{
++	lockdep_assert_held(&dcp->dcpavserv.lock);
++	dcp->dcpavserv.edid_retries = 0;
++}
++
+ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation,
+ 					u64 *epoch)
+ {
+diff --git a/drivers/gpu/drm/apple/epic/dpavservep.h b/drivers/gpu/drm/apple/epic/dpavservep.h
+index bf1762963c..8f248bfea8 100644
+--- a/drivers/gpu/drm/apple/epic/dpavservep.h
++++ b/drivers/gpu/drm/apple/epic/dpavservep.h
+@@ -44,6 +44,13 @@ struct dcpavserv {
+ 	u64 terminated_epoch;
+ 	u64 close_epoch;
+ 	struct work_struct close_wq;
++	/*
++	 * An EDID read the firmware answered without data: probe again for
++	 * the instance edid_retry_epoch, a few times (dcpavserv_edid_retry()).
++	 */
++	struct delayed_work edid_retry_wq;
++	u64 edid_retry_epoch;
++	unsigned int edid_retries;
+ };
+ 
+ /* The 14.7 external role: close the AV client before the sink is released. */
+@@ -56,5 +63,9 @@ bool dcpavserv_edid_service_current(struct apple_dcp *dcp, u64 epoch);
+ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation,
+ 					u64 *epoch);
+ void dpavservep_detach(struct apple_dcp *dcp);
++/* Set up once with the DCP (dcp_platform_probe_pipe()). */
++int dcpavserv_edid_retry_init(struct apple_dcp *dcp);
++bool dcpavserv_edid_retry(struct apple_dcp *dcp, u64 epoch);
++void dcpavserv_edid_retry_reset(struct apple_dcp *dcp);
+ 
+ #endif /* _DRM_APPLE_EPIC_DPAVSERV_H */
+diff --git a/drivers/gpu/drm/apple/iomfb.c b/drivers/gpu/drm/apple/iomfb.c
+index 9216dee7be..f323eef050 100644
+--- a/drivers/gpu/drm/apple/iomfb.c
++++ b/drivers/gpu/drm/apple/iomfb.c
+@@ -2173,9 +2173,19 @@ int dcp_get_modes(struct drm_connector *connector)
+ 			 */
+ 			if (PTR_ERR(edid) == -ENODEV)
+ 				dev_dbg(dcp->dev, "no EDID source\n");
++			/*
++			 * After resume the firmware publishes the AV service
++			 * before its link to the sink is back, and answers a
++			 * read then without data; probe again once it has read
++			 * the sink.
++			 */
++			else if (PTR_ERR(edid) == -ENODATA &&
++				 dcpavserv_edid_retry(dcp, service_epoch))
++				dev_dbg(dcp->dev, "sink EDID not read yet, probing again\n");
+ 			else
+ 				dev_warn(dcp->dev, "copy_edid failed: %pe\n", edid);
+ 		} else {
++			dcpavserv_edid_retry_reset(dcp);
+ 			drm_edid_free(apple_connector->drm_edid);
+ 			apple_connector->drm_edid = edid;
+ 			apple_connector->drm_edid_generation = edid_generation;
+diff --git a/tools/testing/selftests/drivers/gpu/apple-afkv2/host-include/linux/errno.h b/tools/testing/selftests/drivers/gpu/apple-afkv2/host-include/linux/errno.h
+index e7a1050305..62af398feb 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-afkv2/host-include/linux/errno.h
++++ b/tools/testing/selftests/drivers/gpu/apple-afkv2/host-include/linux/errno.h
+@@ -10,3 +10,4 @@
+ #define ENOMEM 12
+ #define EOVERFLOW 75
+ #define EOPNOTSUPP 95
++#define ENODATA 61
+diff --git a/tools/testing/selftests/drivers/gpu/apple-afkv2/inline-edid.c b/tools/testing/selftests/drivers/gpu/apple-afkv2/inline-edid.c
+index b711adf804..beb059b315 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-afkv2/inline-edid.c
++++ b/tools/testing/selftests/drivers/gpu/apple-afkv2/inline-edid.c
+@@ -116,6 +116,12 @@ int main(void)
+ 	afkv2_put64(edid + 32, 8 + 128);
+ 	afkv2_put64(edid, EDID_BUF_SIZE - 1);
+ 	CHECK(dpavserv_edid_size(edid, sizeof(edid), &length));
++	/* A reply without EDID bytes: not read from the sink yet. */
++	afkv2_put64(edid, EDID_BUF_SIZE);
++	afkv2_put64(edid + 32, 0);
++	CHECK(dpavserv_edid_size(edid, sizeof(edid), &length) == -ENODATA);
++	afkv2_put64(edid + 32, 8);
++	CHECK(dpavserv_edid_size(edid, sizeof(edid), &length) == -EIO);
+ 	printf("PASS: inline AFKV2 and EDID validation (%u checks)\n", assertions);
+ 	return 0;
+ }

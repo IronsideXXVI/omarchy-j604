@@ -26,6 +26,8 @@ New in 1.813: 0248 (`soc: apple: s2r: check what suspend-to-RAM needs before off
 
 New in 1.816: 0250 (`arm64: apple: let a core powered down alone be tried again, for bring-up`), 0251 (`soc: apple: cluster-pwrgate: optionally log the T8132 sleep words`), 0252 (`arm64: dts: apple: t8132-j604: wake only from the sources macOS uses`).
 
+New in 1.820: 0253 (`phy: apple: atc: keep a T8132 CIO link when its USB host stops`), 0254 (`phy: apple: atc: enable the dummy PHY on T8132 SuperSpeed ports`), 0255 (`drm/apple: dpavservep: probe again when the EDID is not read yet`), 0256 (`selftests: apple-dcp: stub the EDID re-probe in the rate harness`), 0257 (`drm/apple: afk: one initializer for an endpoint's locks and queues`), 0258 (`arm64: cpufeature: hide WFxT on Apple M4+ without a forced override`), 0259 (`soc: apple: sep: publish the chardevs without holding their slot locks`), 0260 (`power: supply: macsmc: hold the charge with CHLS where CHTE and CH0C are absent`), 0261 (`arm64: dts: apple: t8132: describe the AOP's sensor services`), 0262 (`HID: dockchannel-hid: write each frame to the FIFO under one lock`), 0263 (`Input: macsmc-input - confirm a lid-open report during system sleep`), 0264 (`arm64: dts: apple: t8132-j604: take the AOP sensor nodes from t8132.dtsi`).
+
 | 1.736 | 1.800 | Subject |
 |---|---|---|
 | 0001 | 0001 | dt-bindings: pci: apple,pcie: Describe the three T8132 root ports |
