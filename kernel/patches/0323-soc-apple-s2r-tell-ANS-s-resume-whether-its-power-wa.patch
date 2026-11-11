@@ -1,0 +1,251 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 19:38:51 +0000
+Subject: [PATCH] soc: apple: s2r: tell ANS's resume whether its power
+ was really cut
+
+The T8132 last mile declares the resume firmware-driven before it
+lowers anything, so a split step that aborts before any block loses
+power still has every driver take its state-lost resume. ANS's driver
+then restarts an ANS that was idled with its power kept, which never
+comes back, and holds every request for good.
+
+Declare it from the first block a driver owns that loses power (ATC0,
+split depth 2 and up), and keep, per stopped coprocessor, whether its
+power was cut since: a real wake, the split step's ANS domain going
+down (depth 7), or split_ans=2's cycle. nvme-apple asks for that
+instead of the global flag: it restarts ANS only after a cut, and
+otherwise says at once that it cannot. Without the T8132 sequence the
+answer is the firmware-driven resume, as before.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/nvme/host/apple.c       | 13 +++++++++-
+ drivers/soc/apple/apple-s2r.c   | 43 ++++++++++++++++++++++++++++++++-
+ drivers/soc/apple/rtkit.c       | 17 ++++++++-----
+ include/linux/soc/apple/rtkit.h |  6 +++++
+ include/linux/soc/apple/sleep.h |  5 ++++
+ 5 files changed, 76 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/nvme/host/apple.c b/drivers/nvme/host/apple.c
+index 5801fc8a83..f05a3cb323 100644
+--- a/drivers/nvme/host/apple.c
++++ b/drivers/nvme/host/apple.c
+@@ -2867,6 +2867,17 @@ static int apple_nvme_resume_early(struct device *dev)
+ 	if (!anv->hw->needs_ioq_registers || !anv->suspended || !anv->sleep_idled)
+ 		return 0;
+ 	anv->sleep_idled = false;
++	/*
++	 * Idled, ANS comes back only from a power cut (apple_rtkit_sleep_return()):
++	 * a sleep refused or aborted before one leaves it down. Say so at once.
++	 */
++	if (!apple_sleep_coproc_power_cycled(dev)) {
++		if (anv->sleep_stop)
++			apple_sleep_coproc_set_ready(dev, false);
++		dev_crit(dev, "ANS was idled and its power never cut, it cannot restart: holding all I/O, reboot to recover\n");
++		anv->sleep_failed = true;
++		return 0;
++	}
+ 	if (anv->sleep_stop)
+ 		apple_sleep_coproc_set_ready(dev, false);
+ 	/* Its link doesn't come up with the pins as the sleep left them. */
+@@ -2877,7 +2888,7 @@ static int apple_nvme_resume_early(struct device *dev)
+ 
+ 	dev_dbg(dev, "ANS: restarting after the sleep, CPU control %#x\n", readl(control));
+ 	anv->sleep_run_time = ktime_get();
+-	ret = apple_rtkit_sleep_return_start(anv->rtk, control);
++	ret = apple_rtkit_cycled_return_start(anv->rtk, control);
+ 	if (ret) {
+ 		dev_crit(dev, "ANS restart after sleep failed: %d\n", ret);
+ 		anv->sleep_failed = true;
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index f93dab5ae4..df47a0e3c3 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -827,6 +827,8 @@ static struct apple_s2r_coproc {
+ 	void *data;
+ 	bool ready;
+ 	bool stopped;
++	/* Its power cut and back since that stop: a real sleep, or a T8132 split */
++	bool cycled;
+ 	/* Stopped before the others; its last stop clears its own run bits */
+ 	bool first;
+ 	/* ANS: its link runs on the APCIe block the T8132 sequence lowers and raises */
+@@ -974,6 +976,18 @@ bool apple_sleep_coproc_stopped(struct device *dev)
+ }
+ EXPORT_SYMBOL_GPL(apple_sleep_coproc_stopped);
+ 
++bool apple_sleep_coproc_power_cycled(struct device *dev)
++{
++	struct apple_s2r_coproc *c;
++
++	if (!READ_ONCE(t8132_sequence))
++		return pm_resume_via_firmware();
++	guard(mutex)(&apple_s2r_coprocs_lock);
++	c = apple_s2r_coproc_find(dev);
++	return c && c->cycled;
++}
++EXPORT_SYMBOL_GPL(apple_sleep_coproc_power_cycled);
++
+ /*
+  * The last refusals: interrupts are off and no other CPU is up, so the
+  * registry is read without its lock, which no one can hold now.
+@@ -1018,6 +1032,7 @@ static int apple_s2r_coprocs_check(struct apple_s2r *s2r, bool tell_enclave)
+  */
+ static void apple_s2r_coproc_stop_one(struct apple_s2r_coproc *c)
+ {
++	c->cycled = false;
+ 	if (c->last_stop)
+ 		c->last_stop(c->data);
+ 	if (c->asc) {
+@@ -1044,6 +1059,22 @@ static void apple_s2r_coprocs_stop(bool first)
+ 	dsb(sy);
+ }
+ 
++/*
++ * Interrupts off, one CPU up: the registry is read without its lock. The
++ * stopped coprocessors (or ANS alone) had their power cut and restored.
++ */
++static void apple_s2r_coprocs_mark_cycled(bool ans_only)
++{
++	int i;
++
++	for (i = 0; i < S2R_COPROCS; i++) {
++		struct apple_s2r_coproc *c = &apple_s2r_coprocs[i];
++
++		if (c->dev && c->stopped && (!ans_only || c->pcie_ans))
++			c->cycled = true;
++	}
++}
++
+ /*
+  * The T8132 split step stops ANS alone: its power domain goes down and comes
+  * back with its APCIe block, as after a real sleep, while every other
+@@ -2602,6 +2633,8 @@ static void apple_s2r_t8132_ans_cycle(struct apple_s2r *s2r)
+ 	t->ans_cycle_off = apple_s2r_t8132_ps_wait_off(ans);
+ 	t->ans_cycle_on = apple_s2r_t8132_ps_raise_full(ans);
+ 	t->ans_cycled = true;
++	if (!t->ans_cycle_off)
++		apple_s2r_coprocs_mark_cycled(true);
+ }
+ 
+ static void apple_s2r_t8132_raise_after_lower(struct apple_s2r *s2r)
+@@ -2714,10 +2747,15 @@ static int apple_s2r_t8132_finish(unsigned long arg)
+ 	if (!depth || depth > 7)
+ 		depth = 7;
+ 
+-	pm_set_resume_via_firmware();
+ 	apple_s2r_t8132_clean_ram();
+ 	apple_s2r_t8132_step(s2r, S2R_CRUMB_T8132_RAM, T8132_TT_RAM);
+ 	if (depth >= 2) {
++		/*
++		 * From the first block a driver owns that loses its power: before
++		 * it nothing did, and a split that stops short of it returns to
++		 * drivers whose state is all still there.
++		 */
++		pm_set_resume_via_firmware();
+ 		apple_s2r_t8132_lower_io(s2r);
+ 		t->io_lowered = true;
+ 		apple_s2r_t8132_step(s2r, S2R_CRUMB_T8132_IO, T8132_TT_IO);
+@@ -2727,6 +2765,8 @@ static int apple_s2r_t8132_finish(unsigned long arg)
+ 		if (depth >= 7) {
+ 			t->ans_off_ret = apple_s2r_t8132_ps_wait_off(t->ps + T8132_PS_ANS);
+ 			apple_s2r_t8132_lower_fail(t, S2R_CRUMB_T8132_ANS_OFF, t->ans_off_ret);
++			if (!t->ans_off_ret)
++				apple_s2r_coprocs_mark_cycled(true);
+ 			apple_s2r_t8132_step(s2r, S2R_CRUMB_T8132_ANS_OFF, T8132_TT_ANS);
+ 		}
+ 	}
+@@ -2875,6 +2915,7 @@ static void apple_s2r_t8132_return(struct apple_s2r *s2r)
+ 	apple_s2r_crumb(s2r, S2R_CRUMB_T8132_BACK_APCIE);
+ 
+ 	apple_cpu_power_cycled();
++	apple_s2r_coprocs_mark_cycled(false);
+ 	s2r->pins_lost = s2r->pins_saved_valid;
+ 
+ 	for (i = 0; i < T8132_WAKE_WORDS; i++)
+diff --git a/drivers/soc/apple/rtkit.c b/drivers/soc/apple/rtkit.c
+index bec2107a27..a02ed59ebc 100644
+--- a/drivers/soc/apple/rtkit.c
++++ b/drivers/soc/apple/rtkit.c
+@@ -2602,14 +2602,10 @@ void apple_rtkit_set_oslog_echo(struct apple_rtkit *rtk, bool echo)
+ }
+ EXPORT_SYMBOL_GPL(apple_rtkit_set_oslog_echo);
+ 
+-int apple_rtkit_sleep_return_start(struct apple_rtkit *rtk, void __iomem *cpu_control)
++int apple_rtkit_cycled_return_start(struct apple_rtkit *rtk, void __iomem *cpu_control)
+ {
+-	int ret;
+-
+-	if (!pm_resume_via_firmware())
+-		return -EOPNOTSUPP;
++	int ret = apple_rtkit_warm_restart(rtk);
+ 
+-	ret = apple_rtkit_warm_restart(rtk);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2617,6 +2613,15 @@ int apple_rtkit_sleep_return_start(struct apple_rtkit *rtk, void __iomem *cpu_co
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(apple_rtkit_cycled_return_start);
++
++int apple_rtkit_sleep_return_start(struct apple_rtkit *rtk, void __iomem *cpu_control)
++{
++	if (!pm_resume_via_firmware())
++		return -EOPNOTSUPP;
++
++	return apple_rtkit_cycled_return_start(rtk, cpu_control);
++}
+ EXPORT_SYMBOL_GPL(apple_rtkit_sleep_return_start);
+ 
+ void apple_rtkit_free(struct apple_rtkit *rtk)
+diff --git a/include/linux/soc/apple/rtkit.h b/include/linux/soc/apple/rtkit.h
+index c59e67cc8b..14f716638e 100644
+--- a/include/linux/soc/apple/rtkit.h
++++ b/include/linux/soc/apple/rtkit.h
+@@ -352,6 +352,12 @@ int apple_rtkit_power_cycled_return(struct apple_rtkit *rtk, void __iomem *cpu_c
+  */
+ int apple_rtkit_sleep_return_start(struct apple_rtkit *rtk, void __iomem *cpu_control);
+ 
++/*
++ * apple_rtkit_sleep_return_start() for a co-processor its caller knows lost its power,
++ * whatever pm_resume_via_firmware() says (a sleep step that powered it alone down).
++ */
++int apple_rtkit_cycled_return_start(struct apple_rtkit *rtk, void __iomem *cpu_control);
++
+ /*
+  * Echo each OSLOG channel-0 counter the firmware sends, as macOS does. On by default on
+  * T8140, where a firmware with one outstanding takes no AP power notice.
+diff --git a/include/linux/soc/apple/sleep.h b/include/linux/soc/apple/sleep.h
+index 93fc816021..0409dd9916 100644
+--- a/include/linux/soc/apple/sleep.h
++++ b/include/linux/soc/apple/sleep.h
+@@ -81,6 +81,9 @@ static inline void apple_sleep_lid_closed_wake(void) { }
+  * @last_stop. @last_stop can't refuse; the sleep goes on.
+  * apple_sleep_coproc_stopped() tells a resume path whether that happened: after
+  * a refused or aborted sleep, false means the coprocessor still runs.
++ * apple_sleep_coproc_power_cycled() tells it whether the stopped coprocessor's
++ * power was cut and restored since (a real sleep, or a T8132 split step that
++ * took its domain down): one idled with its power kept does not come back.
+  * T8132 has no PCIe ANS block: @pcie_ans must be false.
+  */
+ #if IS_ENABLED(CONFIG_APPLE_S2R)
+@@ -94,6 +97,7 @@ int apple_sleep_enclave_register(struct device *dev, int (*tell)(void *data), vo
+ void apple_sleep_enclave_unregister(struct device *dev);
+ void apple_sleep_coproc_set_ready(struct device *dev, bool ready);
+ bool apple_sleep_coproc_stopped(struct device *dev);
++bool apple_sleep_coproc_power_cycled(struct device *dev);
+ /* After a deep sleep, put back the pins it reset. ANS's driver calls it before the run bit. */
+ void apple_sleep_restore_pins(void);
+ /* The PCIe host retrained a root port (or the radio's, port 0) after a T8132 sleep. */
+@@ -118,6 +122,7 @@ static inline int apple_sleep_enclave_register(struct device *dev, int (*tell)(v
+ static inline void apple_sleep_enclave_unregister(struct device *dev) { }
+ static inline void apple_sleep_coproc_set_ready(struct device *dev, bool ready) { }
+ static inline bool apple_sleep_coproc_stopped(struct device *dev) { return false; }
++static inline bool apple_sleep_coproc_power_cycled(struct device *dev) { return false; }
+ static inline void apple_sleep_restore_pins(void) { }
+ static inline void apple_sleep_apcie_port_up(unsigned int port) { }
+ static inline void apple_sleep_radio_port_up(void) { }

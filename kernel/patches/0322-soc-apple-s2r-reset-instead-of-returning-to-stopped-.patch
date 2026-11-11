@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 19:37:53 +0000
+Subject: [PATCH] soc: apple: s2r: reset instead of returning to
+ stopped coprocessors
+
+In the real T8132 sequence every coprocessor is stopped before the last
+mile, and only the power cycle of a real sleep brings them back. Two
+refusals can still come after that: a parked CPU that does not take its
+stop, and a lowering step that fails. Each returns to a machine without
+its disk, display or GPU, which then waits on its disk with no way out.
+
+In the real sequence, write a stage the boot firmware records with the
+reset instead (0x3e, for either), whatever the breadcrumb says, and
+reset at once through the watchdog. The next boot names it. Bring-up
+aborts still return as before.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/apple-s2r.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index 0306ee0450..f93dab5ae4 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -1252,6 +1252,12 @@ enum apple_s2r_crumb {
+ 	S2R_CRUMB_ABORT,		/* 0x3b ->enter returns without sleeping */
+ 	S2R_CRUMB_SYSCORE_IN,		/* 0x3c syscore resume entered */
+ 	S2R_CRUMB_END,			/* 0x3d ->end: every device resumed and completed */
++	/*
++	 * 0x3e T8132, the real sequence: refused after every coprocessor stopped
++	 * (a parked CPU missed its stop, or a lowering step failed), reset. 0x3f is
++	 * left to user space: the bring-up sentinel's "alive after the call" mark.
++	 */
++	S2R_CRUMB_T8132_FATAL,
+ 	/*
+ 	 * T8132 sequence, past the match. The byte holds macOS's 0x50 from the
+ 	 * match; these replace it until it is written back right before the
+@@ -2648,6 +2654,26 @@ static void apple_s2r_t8132_stage_sleep(struct apple_s2r *s2r)
+  * the stopped CPUs then power down and stay down until a reboot. At the
+  * raise, it undoes the IO lowering instead and returns, before WD2's 5 s.
+  */
++/*
++ * The real sequence has stopped every coprocessor by now, and only the power
++ * cycle of a real sleep brings them back (apple_s2r_coprocs_stop()): returning
++ * would leave the machine without its disk, display or GPU. Write the stage the
++ * boot firmware records with the reset (0x3X values are, MEASURED), whatever
++ * the breadcrumb says, and reset now. Bring-up aborts return as before.
++ */
++static void __noreturn apple_s2r_t8132_fatal(struct apple_s2r *s2r, u8 stage)
++{
++	struct apple_s2r_t8132 *t = &s2r->t8132;
++
++	if (s2r->crumb_dev)
++		spmi_ext_register_writel(s2r->crumb_dev, s2r->crumb_addr, &stage, 1);
++	pr_emerg("apple-s2r: T8132: refused after every coprocessor stopped (stage %#x, lowering step %#x: %d): resetting\n",
++		 stage, t->lower_step, t->lower_err);
++	apple_s2r_wdt_arm_secs(s2r, 1);
++	for (;;)
++		cpu_relax();
++}
++
+ static int apple_s2r_t8132_finish(unsigned long arg)
+ {
+ 	struct apple_s2r *s2r = (struct apple_s2r *)arg;
+@@ -2666,6 +2692,8 @@ static int apple_s2r_t8132_finish(unsigned long arg)
+ 	t->stop_word[1] = apple_cpu_stop_word();
+ 	t->stop_read |= BIT(1);
+ 	if (ret) {
++		if (!READ_ONCE(abort_before))
++			apple_s2r_t8132_fatal(s2r, S2R_CRUMB_T8132_FATAL);
+ 		/* Ours, not Aurora's: a core left awake would hold the engine. */
+ 		apple_cpu_t8132_release_stopped(false);
+ 		return ret;
+@@ -2710,6 +2738,8 @@ static int apple_s2r_t8132_finish(unsigned long arg)
+ 	ret = apple_s2r_check(s2r, S2R_STEP_T8132_RAISE);
+ 	if (!ret && t->lower_err)
+ 		ret = -EIO;
++	if (ret && !READ_ONCE(abort_before))
++		apple_s2r_t8132_fatal(s2r, S2R_CRUMB_T8132_FATAL);
+ 	if (ret) {
+ 		apple_s2r_t8132_raise_after_lower(s2r);
+ 		if (t->split_ans == S2R_SPLIT_ANS_CYCLE && t->pcie_ans_stopped)
