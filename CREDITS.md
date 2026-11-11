@@ -13,7 +13,7 @@ their authors' names.
 
 | Author | Patches |
 | --- | --- |
-| Dylan Ironside | 305 |
+| Dylan Ironside | 307 |
 | Ryan Murray | 23 |
 | Diljit Singh | 23 |
 | RJ Skerry-Ryan | 8 |
