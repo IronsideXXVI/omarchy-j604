@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 05:21:13 +0000
+Subject: [PATCH] media: apple: avd: do not stop a stream for a frame
+ the codec refused
+
+A stream is stopped at its first frame that fails in hardware, with an
+error-level message. A frame whose prepare() or run() fails never reached
+the hardware (both only build the instruction program), yet it counted
+the same, so one picture the codec could not describe ended the stream
+and every later frame of it failed until streaming restarted.
+
+Mark a refused whole picture refused: it still completes in error, but
+it no longer counts as a hardware failure, stops the stream or prints.
+A frame-based HEVC picture from Chromium ended the whole stream this
+way. A refused part of a held picture (HOLD_CAPTURE) still stops the
+stream, as before: that picture's CAPTURE buffer would otherwise come
+back without those slices.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ .../platform/apple/avd/avd-queue-internal.h   |  1 +
+ drivers/media/platform/apple/avd/avd-queue.c  | 19 +++++++++++++++++--
+ drivers/media/platform/apple/avd/avd-queue.h  |  2 ++
+ 3 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/apple/avd/avd-queue-internal.h b/drivers/media/platform/apple/avd/avd-queue-internal.h
+index c5b9c06836..19d0241e5f 100644
+--- a/drivers/media/platform/apple/avd/avd-queue-internal.h
++++ b/drivers/media/platform/apple/avd/avd-queue-internal.h
+@@ -22,6 +22,7 @@ static inline int avd_slot_reserve(struct avd_frame *f, struct avd_ctx *ctx,
+ 	f->state = AVD_FRAME_RESERVED;
+ 	f->dep = AVD_DEP_NONE;
+ 	f->status = 0;
++	f->refused = false;
+ 	f->vp_done = false;
+ 	f->vp_retired = false;
+ 	f->prog_words = 0;
+diff --git a/drivers/media/platform/apple/avd/avd-queue.c b/drivers/media/platform/apple/avd/avd-queue.c
+index 22e40b631a..f62daee59f 100644
+--- a/drivers/media/platform/apple/avd/avd-queue.c
++++ b/drivers/media/platform/apple/avd/avd-queue.c
+@@ -10,7 +10,11 @@
+ #include "avd-queue-internal.h"
+ 
+ #define AVD_FRAME_TIMEOUT msecs_to_jiffies(2000)
+-/* A stream is stopped at its first frame that fails in hardware. */
++/*
++ * A stream is stopped at its first frame that fails in hardware. A whole
++ * picture the codec refused never reached it: it completes in error and the
++ * stream goes on.
++ */
+ #define AVD_CTX_MAX_HW_ERRORS 1
+ /* Never reset the decoder more often than this. */
+ #define AVD_RECOVER_GAP_MS 20
+@@ -78,6 +82,8 @@ static void avd_retire(struct avd_dev *avd)
+ 			state = f->status ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE;
+ 			if (!f->status) {
+ 				ctx->hw_errors = 0;
++			} else if (f->refused) {
++				/* nothing reached the hardware */
+ 			} else if (++ctx->hw_errors >= AVD_CTX_MAX_HW_ERRORS && !ctx->broken) {
+ 				ctx->broken = true;
+ 				dev_err(avd->dev, "stream stopped after %u failed frames; restart streaming to retry\n",
+@@ -476,8 +482,17 @@ static void avd_queue_submit_work(struct work_struct *work)
+ 		ret = ctx->coded_fmt_desc->ops->run(ctx);
+ 		avd->building = NULL;
+ 	}
+-	if (ret)
++	if (ret) {
++		/*
++		 * prepare() and run() only build the program, so a refused whole
++		 * picture never reached the hardware. A refused part of a held
++		 * picture still stops the stream: its CAPTURE buffer would come
++		 * back without those slices.
++		 */
++		f->refused = !(f->src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF) &&
++			     !f->dst->is_held;
+ 		goto fail;
++	}
+ 	ctx->next_dep = ops ? f->dep : AVD_DEP_PREV_DONE;
+ 	if ((ops && (f->src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF)) ||
+ 	    (!ops && avd->compat_held)) {
+diff --git a/drivers/media/platform/apple/avd/avd-queue.h b/drivers/media/platform/apple/avd/avd-queue.h
+index 038c4f9113..f83e452df2 100644
+--- a/drivers/media/platform/apple/avd/avd-queue.h
++++ b/drivers/media/platform/apple/avd/avd-queue.h
+@@ -33,6 +33,8 @@ struct avd_frame {
+ 	enum avd_frame_state state;
+ 	enum avd_frame_dep dep;
+ 	int status;			/* 0 or -EIO/-ETIMEDOUT from the backend */
++	/* The codec refused the frame before any of it reached the hardware. */
++	bool refused;
+ 
+ 	struct avd_ctx *ctx;
+ 	struct vb2_v4l2_buffer *src;	/* OUTPUT, held until retire */
