@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 02:56:26 +0000
+Subject: [PATCH] soc: apple: s2r: give every T8132 watchdog its own
+ time
+
+On the T8132 path two watchdogs run with the same 120 s from ->begin
+and ->enter, and WD1 is armed again with the same time before the
+commit, so a reset 120 s in names no stretch, and the WD2 one, which may
+not leave the boot stage byte to the PMU's failed-boot record, can come
+first.
+
+Bring-up times, each its own: WD2 170 s from ->begin, so that WD1's
+wdt_timeout from ->enter runs out first in the steps before the commit;
+WD1 100 s (or wdt_timeout if shorter) from just before the commit; WD2
+140 s from the return. With macOS's 5 s past the IO lowering and the
+resume stub's 60 s, the time of a reset alone then names the stretch it
+came from, even when nothing of the kernel's log survives.
+
+Only the T8132 sequence uses these; it is off by default.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/apple-s2r.c | 28 +++++++++++++++++++++-------
+ 1 file changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index f5b10cc94a..936917180c 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -203,7 +203,17 @@
+ #define T8132_WD2_ALARM			0x28
+ #define T8132_WD2_CTL			0x2c
+ #define T8132_WD2_SLEEP_SECS		5
+-#define T8132_WD2_SUSPEND_SECS		120
++/*
++ * Bring-up: every watchdog on the path runs out at its own time, so that the
++ * time of a reset names the stretch it came from even when nothing of the
++ * kernel's log survives: WD2 170 s from ->begin (after WD1, whose reset the
++ * PMU records with the boot stage byte), WD1 wdt_timeout from ->enter, WD1
++ * 100 s from just before the commit, WD2 5 s past the IO lowering (macOS's),
++ * WD2 60 s from the resume stub, WD2 140 s from the return.
++ */
++#define T8132_WD2_BEGIN_SECS		170
++#define T8132_WD2_RETURN_SECS		140
++#define T8132_WD1_COMMIT_SECS		100
+ #define T8132_AON_AP_DEADLINE		0x08
+ #define T8132_POST_COMMIT_MS		3
+ 
+@@ -1261,16 +1271,20 @@ static void apple_s2r_crumb_end(struct apple_s2r *s2r)
+ }
+ 
+ /* Make the watchdog reset the system if the resume path does not come back */
+-static void apple_s2r_wdt_arm(struct apple_s2r *s2r)
++static void apple_s2r_wdt_arm_secs(struct apple_s2r *s2r, u32 secs)
+ {
+-	u32 secs = min(wdt_timeout, WDT_MAX_TIMEOUT);
+-
++	secs = min(secs, WDT_MAX_TIMEOUT);
+ 	s2r->wdt_alarm = secs * WDT_CLK_HZ;
+ 	writel_relaxed(s2r->wdt_alarm, s2r->wdt + WDT_ALARM);
+ 	writel_relaxed(0, s2r->wdt + WDT_COUNT);
+ 	writel(WDT_CTL_RESET_EN, s2r->wdt + WDT_CTL);
+ }
+ 
++static void apple_s2r_wdt_arm(struct apple_s2r *s2r)
++{
++	apple_s2r_wdt_arm_secs(s2r, wdt_timeout);
++}
++
+ /* Keep what the watchdog driver had programmed, then arm the safety timer */
+ static void apple_s2r_wdt_take(struct apple_s2r *s2r)
+ {
+@@ -2476,7 +2490,7 @@ static int apple_s2r_t8132_finish(unsigned long arg)
+ 	WRITE_ONCE(mb->magic, cpu_to_le64(S2R_MAGIC));
+ 	dcache_clean_poc((unsigned long)mb, (unsigned long)(mb + 1));
+ 	if (s2r->wdt_armed)
+-		apple_s2r_wdt_arm(s2r);
++		apple_s2r_wdt_arm_secs(s2r, min_t(u32, wdt_timeout, T8132_WD1_COMMIT_SECS));
+ 
+ 	/* What this path has dirtied since the sweep. */
+ 	dcache_clean_poc((unsigned long)task_stack_page(current),
+@@ -2536,7 +2550,7 @@ static void apple_s2r_t8132_return(struct apple_s2r *s2r)
+ 	writel(T8132_PWRGATE_ON, t->pwrgate + T8132_PWRGATE_CPM_1);
+ 
+ 	/* macOS stops it here. Keep a longer one over device resume, until ->end. */
+-	apple_s2r_t8132_set_wd2(s2r, T8132_WD2_SUSPEND_SECS);
++	apple_s2r_t8132_set_wd2(s2r, T8132_WD2_RETURN_SECS);
+ 	apple_s2r_crumb(s2r, S2R_CRUMB_T8132_BACK_WD2);
+ 
+ 	/* What the commit lowered for a driver comes back before anything uses it. */
+@@ -2792,7 +2806,7 @@ static void apple_s2r_t8132_begin(struct apple_s2r *s2r)
+ 	t->pmu_orig_ok = !apple_s2r_crumb_find(s2r) &&
+ 			 !spmi_ext_register_readl(s2r->crumb_dev, s2r->crumb_addr, &t->pmu_orig, 1);
+ 	if (t->mapped && s2r->wdt) {
+-		apple_s2r_t8132_set_wd2(s2r, T8132_WD2_SUSPEND_SECS);
++		apple_s2r_t8132_set_wd2(s2r, T8132_WD2_BEGIN_SECS);
+ 		t->wd2_armed = true;
+ 	}
+ }

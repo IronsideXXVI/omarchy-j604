@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erik Bourget <erik@ebourget.net>
+Date: Mon, 9 Nov 2026 14:45:03 -0500
+Subject: [PATCH] Bluetooth: bcm4377: restore private PCI windows
+ before J713 resume
+
+Shared radio PERST resets private BAR windows that generic PCI saved
+state does not cover. Restore the windows and subsystem control in
+resume_noirq, before interrupts or UNQUIESCE access the retained device.
+Without this, Wi-Fi returns after sleep but Bluetooth HCI commands time
+out. Restoring the windows permits Read Local Version to complete.
+
+Coordinate QUIESCE and recovery work with the managed host transaction,
+leaving other controllers on their existing path. Cover config failures
+and retained-path skips with a fault-injection fixture.
+
+Signed-off-by: Erik Bourget <erik@ebourget.net>
+[niteria: bcm4377-resume-tests' mocks now have the radio sleep hooks]
+Assisted-by: LLM
+Signed-off-by: Bartosz Nitka <niteria@gmail.com>
+[dylan: hand-ported from aurora-silicon/linux d810b1f6874d (PR #1384) to
+ the J604's unmanaged radio port: only the resume_noirq window restore is
+ taken, gated on pm_resume_via_firmware() alone; the managed radio-sleep
+ coordination (apple_radio_sleep_*), the J713-only gating, the fixture
+ and the panic on a failed restore (an error return here) are left out;
+ see the upstream commit for the full change]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/bluetooth/hci_bcm4377.c | 40 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/bluetooth/hci_bcm4377.c b/drivers/bluetooth/hci_bcm4377.c
+index 46f0f933bf..25967e3e96 100644
+--- a/drivers/bluetooth/hci_bcm4377.c
++++ b/drivers/bluetooth/hci_bcm4377.c
+@@ -21,6 +21,7 @@
+ #include <linux/pci.h>
+ #include <linux/printk.h>
+ #include <linux/property.h>
++#include <linux/suspend.h>
+ #include <linux/workqueue.h>
+ 
+ #include <linux/unaligned.h>
+@@ -3195,7 +3196,44 @@ static int bcm4377_resume(struct device *dev)
+ 	return ret;
+ }
+ 
+-static DEFINE_SIMPLE_DEV_PM_OPS(bcm4377_ops, bcm4377_suspend, bcm4377_resume);
++/*
++ * A sleep that powered the radio off (on the J604 the APCIe block goes down
++ * with ANS for a T8132 deep sleep) resets the private BAR windows, which
++ * PCI's saved config state does not cover. Restore them before the IRQ
++ * handler or UNQUIESCE reaches the controller through them. Suspend-to-idle
++ * keeps power and does not resume via firmware, so it skips this.
++ */
++static int bcm4377_resume_noirq(struct device *dev)
++{
++	struct bcm4377_data *bcm4377 = pci_get_drvdata(to_pci_dev(dev));
++	u32 before = 0, after = 0;
++	int ret;
++
++	if (!pm_resume_via_firmware())
++		return 0;
++
++	ret = pci_read_config_dword(bcm4377->pdev, BCM4377_PCIECFG_BAR0_WINDOW1, &before);
++	if (!ret)
++		ret = bcm4377_init_cfg(bcm4377);
++	if (!ret)
++		ret = pci_read_config_dword(bcm4377->pdev, BCM4377_PCIECFG_BAR0_WINDOW1, &after);
++	if (ret > 0)
++		ret = pcibios_err_to_errno(ret);
++	if (!ret && after != bcm4377->hw->bar0_window1)
++		ret = -EIO;
++	if (ret) {
++		dev_err(dev, "private PCI windows not restored after a power loss: %d\n", ret);
++		return ret;
++	}
++	dev_info(dev, "private PCI windows restored after a power loss (%#x -> %#x)\n",
++		 before, after);
++	return 0;
++}
++
++static const struct dev_pm_ops bcm4377_ops = {
++	SYSTEM_SLEEP_PM_OPS(bcm4377_suspend, bcm4377_resume)
++	.resume_noirq = bcm4377_resume_noirq,
++};
+ 
+ static const struct dmi_system_id bcm4377_dmi_board_table[] = {
+ 	{

@@ -1,0 +1,154 @@
+From e51fcca2e440f07bcd1c8e6c247f19e19f409753 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 02:21:28 +0000
+Subject: [PATCH] surface: size exported 10-bit backings for AV1 and VP9 too
+
+A surface exported before its first decode gets a standalone backing
+from a throwaway decoder instance. Because the codec is not known yet,
+the probe reserves the largest CAPTURE size over every coded format of
+the decoder, and the bound context later checks that the backing is at
+least as large as its own CAPTURE format.
+
+Two things made that reservation too small for 10-bit AV1 above 4096
+pixels on the Apple video decoder:
+
+- The probe only told H.264 and HEVC about the 10-bit depth. AV1 and
+  VP9 were sized as 8-bit, but the decoder's compression metadata after
+  the image is twice as large at 10 bits, so their tail was
+  under-reserved.
+- Each S_FMT on the OUTPUT queue writes back the size the driver
+  clamped to. H.264 and VP9 stop at 4096 on that decoder, and the
+  following codecs inherited the clamped size instead of the one asked
+  for.
+
+Up to 4096 pixels the H.264 10-bit reservation happened to cover AV1.
+Above it, H.264 drops out of the probe, the backing came out smaller
+than the AV1 10-bit CAPTURE format, and the decode was refused with
+"cannot decode into the already-exported surface layout" (4608x2592
+and 7680x4320 failed, 4096x2176 worked).
+
+Probe VP9 (profile 2) and AV1 (Main) at 10 bits like H.264 and HEVC,
+start every candidate from the requested size, and say which part of the
+layout differs when a backing does not fit its CAPTURE format.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ src/context.c | 11 ++++++++++-
+ src/surface.c | 50 +++++++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 55 insertions(+), 6 deletions(-)
+
+diff --git a/src/context.c b/src/context.c
+index 286de51..ad60ea4 100644
+--- a/src/context.c
++++ b/src/context.c
+@@ -658,8 +658,17 @@ static bool backing_matches_capture(const struct v4l2r_context *ctx,
+ 	if (backing->pixelformat != v4l2r_format_pixelformat(fmt) ||
+ 	    backing->width != v4l2r_format_width(fmt) ||
+ 	    backing->height != v4l2r_format_height(fmt) ||
+-	    backing->pitch != v4l2r_format_bytesperline(fmt))
++	    backing->pitch != v4l2r_format_bytesperline(fmt)) {
++		v4l2r_diag(ctx, V4L2R_DIAG_LEVEL_WARNING, V4L2R_DIAG_CLIENT,
++			   "backing-match", 0,
++			   "backing %.4s %ux%u pitch %u, the CAPTURE format %.4s %ux%u pitch %u",
++			   (const char *)&backing->pixelformat,
++			   backing->width, backing->height, backing->pitch,
++			   (const char *)&(uint32_t){v4l2r_format_pixelformat(fmt)},
++			   v4l2r_format_width(fmt), v4l2r_format_height(fmt),
++			   v4l2r_format_bytesperline(fmt));
+ 		return false;
++	}
+ 
+ 	/* Say which check failed: the callers only print the layout above. */
+ 	if (backing->nb_planes != nb_planes) {
+diff --git a/src/surface.c b/src/surface.c
+index 3dff5de..b3fe0de 100644
+--- a/src/surface.c
++++ b/src/surface.c
+@@ -379,6 +379,12 @@ static void probe_set_bit_depth(int fd, uint32_t coded, uint32_t pixelformat,
+ #endif
+ #if HAVE_V4L2_CTRL_HEVC
+ 	struct v4l2_ctrl_hevc_sps hevc = {0};
++#endif
++#if HAVE_V4L2_CTRL_VP9
++	struct v4l2_ctrl_vp9_frame vp9 = {0};
++#endif
++#if HAVE_V4L2_CTRL_AV1
++	struct v4l2_ctrl_av1_sequence av1 = {0};
+ #endif
+ 	struct v4l2_ext_control control = {0};
+ 	struct v4l2_ext_controls controls = {
+@@ -416,6 +422,28 @@ static void probe_set_bit_depth(int fd, uint32_t coded, uint32_t pixelformat,
+ 		control.ptr = &hevc;
+ 		control.size = sizeof(hevc);
+ 		break;
++#endif
++#if HAVE_V4L2_CTRL_VP9
++	case V4L2_PIX_FMT_VP9_FRAME:
++		vp9.profile = 2;
++		vp9.bit_depth = 10;
++		vp9.flags = V4L2_VP9_FRAME_FLAG_X_SUBSAMPLING |
++			    V4L2_VP9_FRAME_FLAG_Y_SUBSAMPLING;
++		control.id = V4L2_CID_STATELESS_VP9_FRAME;
++		control.ptr = &vp9;
++		control.size = sizeof(vp9);
++		break;
++#endif
++#if HAVE_V4L2_CTRL_AV1
++	case V4L2_PIX_FMT_AV1_FRAME:
++		av1.seq_profile = 0;			/* Main: 4:2:0, 8 or 10 bit */
++		av1.bit_depth = 10;
++		av1.flags = V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
++			    V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
++		control.id = V4L2_CID_STATELESS_AV1_SEQUENCE;
++		control.ptr = &av1;
++		control.size = sizeof(av1);
++		break;
+ #endif
+ 	default:
+ 		return;
+@@ -549,14 +577,21 @@ static VAStatus backing_alloc(struct v4l2r_driver *drv,
+ 
+ 		/* Export may precede context creation, so the codec is unknown.
+ 		 * Reserve enough tail storage for every codec with this layout;
+-		 * AVD keeps codec-specific reference data after the visible image. */
++		 * AVD keeps codec-specific reference data after the visible image.
++		 * The tail depends on the bit depth the decoder is told about, so
++		 * each codec is probed at the depth of the requested layout. */
+ 		struct v4l2_format allocation = format;
+ 		for (unsigned int c = 1; c < drv->decoders[n].nb_pixelformats; c++) {
+ 			struct v4l2_format candidate = format;
+-			if (mplane)
++			if (mplane) {
++				out.fmt.pix_mp.width = width;
++				out.fmt.pix_mp.height = height;
+ 				out.fmt.pix_mp.pixelformat = drv->decoders[n].pixelformats[c];
+-			else
++			} else {
++				out.fmt.pix.width = width;
++				out.fmt.pix.height = height;
+ 				out.fmt.pix.pixelformat = drv->decoders[n].pixelformats[c];
++			}
+ 			if (ioctl(fd, VIDIOC_S_FMT, &out) < 0)
+ 				continue;
+ 			probe_set_bit_depth(fd, drv->decoders[n].pixelformats[c],
+@@ -580,10 +615,15 @@ static VAStatus backing_alloc(struct v4l2r_driver *drv,
+ 				allocation.fmt.pix.sizeimage = candidate.fmt.pix.sizeimage;
+ 			}
+ 		}
+-		if (mplane)
++		if (mplane) {
++			out.fmt.pix_mp.width = width;
++			out.fmt.pix_mp.height = height;
+ 			out.fmt.pix_mp.pixelformat = coded;
+-		else
++		} else {
++			out.fmt.pix.width = width;
++			out.fmt.pix.height = height;
+ 			out.fmt.pix.pixelformat = coded;
++		}
+ 		if (ioctl(fd, VIDIOC_S_FMT, &out) < 0)
+ 			goto next;
+ 		probe_set_bit_depth(fd, coded, pixelformat, width, height);
+-- 
+2.43.0
+
