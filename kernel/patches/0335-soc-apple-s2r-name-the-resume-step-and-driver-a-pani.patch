@@ -1,0 +1,529 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 22:36:23 +0000
+Subject: [PATCH] soc: apple: s2r: name the resume step and driver a
+ panic came from
+
+A deep sleep split at depth 7 on T8132 resets with the PMU boot stage
+byte still at 0x39 (syscore resume done): the stop lies between syscore
+resume and ->finish (0x3a), in the interrupt enable, the wake report or
+the noirq and early device resume. With kernel.panic 5 the reset came
+1..6 s after the call, with kernel.panic 0 at the syscore resume's own
+120 s watchdog: a panic. Nothing on the next boot says which step or
+which driver, since the memory and the log are gone with the reset.
+
+Add resume_trail, a bring-up parameter (default off) that only acts
+with the breadcrumb on. From syscore resume on:
+
+ - 0x36 is written at ->wake, 0x37 at the first noirq and 0x38 at the
+   first early device resume callback. The boot firmware counts these
+   0x3X values with a reset, and the T8132 sequence never writes them
+   before 0x39. The driver core's device_pm_callback_start tracepoint
+   gives the callbacks; its probe is registered at ->begin and removed
+   at ->end, so nothing runs outside a traced sleep.
+ - A panic or an oops from there to ->end arms the watchdog, which this
+   driver holds through the resume, again with a time that names the
+   driver of the last device callback: 12 s none yet, then 8 s apart
+   for DART, PMGR power state, PCIe, NVMe, ATC PHY, pinctrl and any
+   other. The panic is kept from restarting before that time.
+
+The phase byte and the reset time together name the step. A host test
+checks the phase selection, the class of each driver name (and that
+each name is that driver's own), and the time table.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ MAINTAINERS                           |   1 +
+ drivers/soc/apple/apple-s2r.c         | 189 +++++++++++++++++++++++++-
+ tools/asahi/run-host-tests.py         |   4 +
+ tools/asahi/s2r-resume-trail-tests.py | 151 ++++++++++++++++++++
+ 4 files changed, 343 insertions(+), 2 deletions(-)
+ create mode 100755 tools/asahi/s2r-resume-trail-tests.py
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 89f7665934..8cd7895af7 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2794,6 +2794,7 @@ F:	tools/asahi/apple-pwm-pm-tests.py
+ F:	drivers/reset/reset-apple-cio.c
+ F:	drivers/rtc/rtc-macsmc.c
+ F:	drivers/soc/apple/*
++F:	tools/asahi/s2r-resume-trail-tests.py
+ F:	tools/asahi/s2r-split-ans-tests.py
+ F:	tools/asahi/m3-uapi-*
+ F:	drivers/soc/apple/clpc.kunitconfig
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index 7253231b30..a564c18f57 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -66,7 +66,9 @@
+  * number to the PMU's boot stage byte, which keeps its value through a
+  * forced power-off and which the boot firmware records as the failed-boot
+  * stage after a reset (macsmc-reboot prints that on the next boot). See
+- * apple_s2r_crumb().
++ * apple_s2r_crumb(). With resume_trail as well, the resume after syscore
++ * resume gets crumbs of its own, and a panic or an oops there arms the
++ * watchdog with a time that names the driver of the last device callback.
+  *
+  * CPM gating, AFR, the non-CPU SoC clusters and SIO are shared with s2idle
+  * and live in apple-sleep.
+@@ -93,11 +95,14 @@
+ #include <linux/delay.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
++#include <linux/kdebug.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
++#include <linux/panic.h>
++#include <linux/panic_notifier.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ #include <linux/sched/task_stack.h>
+@@ -105,11 +110,14 @@
+ #include <linux/soc/apple/sleep.h>
+ #include <linux/soc/apple/tunable.h>
+ #include <linux/spmi.h>
++#include <linux/string.h>
+ #include <linux/suspend.h>
+ #include <linux/syscore_ops.h>
+ 
+ #include <dt-bindings/gpio/gpio.h>
+ 
++#include <trace/events/power.h>
++
+ #include <asm/apple_cpu.h>
+ #include <asm/memory.h>
+ #include <asm/sections.h>
+@@ -779,6 +787,15 @@ struct apple_s2r {
+ 	unsigned int crumb_n;
+ 	unsigned int crumb_err;
+ 
++	/* resume_trail: from syscore resume to ->end */
++	bool rt_on;
++	bool rt_live;
++	u8 rt_phase;
++	unsigned int rt_class;
++	unsigned int rt_fired;
++	struct notifier_block rt_panic_nb;
++	struct notifier_block rt_die_nb;
++
+ 	struct syscore syscore;
+ 
+ 	/* The AP pins, which a deep sleep resets (apple,pinctrl) */
+@@ -1259,6 +1276,10 @@ static bool t8132_time_trail;
+ module_param(t8132_time_trail, bool, 0644);
+ MODULE_PARM_DESC(t8132_time_trail, "For bring-up, with t8132_sequence and wdt_from_enter: at each step past the match, arm the watchdog again with that step's own time (20 s apart), so that the time of a reset names the step a hang came from (default: off)");
+ 
++static bool resume_trail;
++module_param(resume_trail, bool, 0644);
++MODULE_PARM_DESC(resume_trail, "For bring-up, with breadcrumb: after syscore resume (0x39), write 0x36 at ->wake, 0x37 at the first noirq and 0x38 at the first early device resume callback; with the watchdog armed from ->enter (wdt_from_enter, wdt_timeout), a panic or an oops from syscore resume to ->end arms it again with a time that names the driver of the last device callback (12 s none yet, 20 DART, 28 PMGR power state, 36 PCIe, 44 NVMe, 52 ATC PHY, 60 pinctrl, 68 any other) and keeps the panic from restarting before it (default: off)");
++
+ static bool t8132_sequence;
+ module_param(t8132_sequence, bool, 0444);
+ MODULE_PARM_DESC(t8132_sequence, "Bring-up, T8132 only: run suspend-to-RAM with the sequence macOS uses on that SoC (as Aurora measured and ported it) instead of the CPU complex one, which T8132 lacks; needs its register windows and apple,wake-enable in the device tree. A real sleep is still refused while a display CPU or ANS's PCIe block is on, so only bring-up runs with abort_before go ahead (default: off, deep is not offered on T8132)");
+@@ -1388,6 +1409,14 @@ enum apple_s2r_crumb {
+ 	 * left to user space: the bring-up sentinel's "alive after the call" mark.
+ 	 */
+ 	S2R_CRUMB_T8132_FATAL,
++	/*
++	 * resume_trail, after syscore resume. The T8132 sequence never writes
++	 * these before it; on the other SoCs they name CPU complex steps of
++	 * ->enter, which come before 0x39 in the trail.
++	 */
++	S2R_CRUMB_RT_WAKE = 0x36,	/* ->wake: interrupts on, CPUs tried */
++	S2R_CRUMB_RT_NOIRQ,		/* 0x37 first noirq device resume callback */
++	S2R_CRUMB_RT_EARLY,		/* 0x38 first early device resume callback */
+ 	/*
+ 	 * T8132 sequence, past the match. The byte holds macOS's 0x50 from the
+ 	 * match; these replace it until it is written back right before the
+@@ -1418,6 +1447,71 @@ enum apple_s2r_crumb {
+ 	S2R_CRUMB_T8132_BACK_DONE,	/* 0x66 the return done */
+ };
+ 
++/*
++ * resume_trail: the driver of the last device resume callback, as a class
++ * whose watchdog time (apple_s2r_rt_secs()) names it after a panic or an
++ * oops. The classes are the drivers whose resume reads or restarts a block
++ * that a deep sleep powered down.
++ */
++enum apple_s2r_rt_class {
++	S2R_RT_NONE,		/* no device callback since syscore resume */
++	S2R_RT_DART,
++	S2R_RT_PMGR,
++	S2R_RT_PCIE,
++	S2R_RT_NVME,
++	S2R_RT_ATC,
++	S2R_RT_PINCTRL,
++	S2R_RT_OTHER,
++	S2R_RT_CLASSES,
++};
++
++static const char *const apple_s2r_rt_drivers[S2R_RT_OTHER] = {
++	[S2R_RT_DART] = "apple-dart",
++	[S2R_RT_PMGR] = "apple-pmgr-pwrstate",
++	[S2R_RT_PCIE] = "pcie-apple",
++	[S2R_RT_NVME] = "nvme-apple",
++	[S2R_RT_ATC] = "phy-apple-atc",
++	[S2R_RT_PINCTRL] = "apple-gpio-pinctrl",
++};
++
++static unsigned int apple_s2r_rt_class(const char *driver)
++{
++	unsigned int i;
++
++	if (!driver)
++		return S2R_RT_OTHER;
++	for (i = S2R_RT_DART; i < S2R_RT_OTHER; i++)
++		if (!strcmp(driver, apple_s2r_rt_drivers[i]))
++			return i;
++	return S2R_RT_OTHER;
++}
++
++/*
++ * 8 s apart from 12 s: every slot wider than the spread of the next boot's
++ * clock set, the last one well before the syscore resume's own 120 s.
++ */
++#define S2R_RT_BASE_SECS	12
++#define S2R_RT_STEP_SECS	8
++
++static unsigned int apple_s2r_rt_secs(unsigned int class)
++{
++	if (class >= S2R_RT_CLASSES)
++		class = S2R_RT_OTHER;
++	return S2R_RT_BASE_SECS + S2R_RT_STEP_SECS * class;
++}
++
++/* The crumb of a device callback's phase: 0 outside the noirq and early resume */
++static u8 apple_s2r_rt_phase(const char *pm_ops, int event)
++{
++	if (event != PM_EVENT_RESUME || !pm_ops)
++		return 0;
++	if (!strncmp(pm_ops, "noirq", 5))
++		return S2R_CRUMB_RT_NOIRQ;
++	if (!strncmp(pm_ops, "early", 5))
++		return S2R_CRUMB_RT_EARLY;
++	return 0;
++}
++
+ /*
+  * Find the PMU boot stage byte: the boot-stage cell of the PMU's nvmem
+  * layout. The cell API cannot be used for the writes: its regmap and the
+@@ -1532,6 +1626,81 @@ static void apple_s2r_wdt_arm(struct apple_s2r *s2r)
+ 	apple_s2r_wdt_arm_secs(s2r, wdt_timeout);
+ }
+ 
++/* resume_trail: every device callback from syscore resume to ->end */
++static void apple_s2r_rt_callback(void *data, struct device *dev, const char *pm_ops,
++				  int event)
++{
++	struct apple_s2r *s2r = data;
++	u8 phase;
++
++	if (!READ_ONCE(s2r->rt_live) || event != PM_EVENT_RESUME)
++		return;
++	WRITE_ONCE(s2r->rt_class, apple_s2r_rt_class(dev_driver_string(dev)));
++	phase = apple_s2r_rt_phase(pm_ops, event);
++	if (phase && xchg(&s2r->rt_phase, phase) != phase)
++		apple_s2r_crumb(s2r, phase);
++}
++
++/* ->begin: track this cycle's resume callbacks, with the breadcrumb on */
++static void apple_s2r_rt_begin(struct apple_s2r *s2r)
++{
++	WRITE_ONCE(s2r->rt_live, false);
++	s2r->rt_phase = 0;
++	s2r->rt_class = S2R_RT_NONE;
++	s2r->rt_fired = 0;
++	if (!READ_ONCE(resume_trail) || !s2r->crumb_on || s2r->rt_on)
++		return;
++	if (register_trace_device_pm_callback_start(apple_s2r_rt_callback, s2r)) {
++		dev_warn(s2r->dev, "resume_trail: device callbacks cannot be traced\n");
++		return;
++	}
++	s2r->rt_on = true;
++}
++
++/* ->end: every device resumed */
++static void apple_s2r_rt_end(struct apple_s2r *s2r)
++{
++	WRITE_ONCE(s2r->rt_live, false);
++	if (!s2r->rt_on)
++		return;
++	unregister_trace_device_pm_callback_start(apple_s2r_rt_callback, s2r);
++	tracepoint_synchronize_unregister();
++	s2r->rt_on = false;
++}
++
++/*
++ * A panic or an oops inside the window: the watchdog, armed by this driver
++ * through the resume, gets the last driver's time. The first one counts.
++ * Never sleeps, takes no lock: register writes only.
++ */
++static bool apple_s2r_rt_fire(struct apple_s2r *s2r)
++{
++	if (!READ_ONCE(s2r->rt_live) || !s2r->wdt_armed)
++		return false;
++	if (!s2r->rt_fired++)
++		apple_s2r_wdt_arm_secs(s2r, apple_s2r_rt_secs(READ_ONCE(s2r->rt_class)));
++	return true;
++}
++
++static int apple_s2r_rt_panic(struct notifier_block *nb, unsigned long event, void *data)
++{
++	struct apple_s2r *s2r = container_of(nb, struct apple_s2r, rt_panic_nb);
++
++	/* The watchdog's time is the record: no restart before it */
++	if (apple_s2r_rt_fire(s2r))
++		WRITE_ONCE(panic_timeout, 0);
++	return NOTIFY_DONE;
++}
++
++static int apple_s2r_rt_die(struct notifier_block *nb, unsigned long event, void *data)
++{
++	struct apple_s2r *s2r = container_of(nb, struct apple_s2r, rt_die_nb);
++
++	if (event == DIE_OOPS)
++		apple_s2r_rt_fire(s2r);
++	return NOTIFY_DONE;
++}
++
+ /*
+  * t8132_time_trail: each step past the match arms the watchdog with its own
+  * time, so that a reset names the step without the PMU byte (whose 0x4X
+@@ -3639,6 +3808,8 @@ static void apple_s2r_syscore_resume(void *data)
+ 
+ 	if (!done) {
+ 		apple_s2r_crumb(s2r, S2R_CRUMB_SYSCORE);
++		if (s2r->rt_on)
++			WRITE_ONCE(s2r->rt_live, true);
+ 		return;
+ 	}
+ 
+@@ -3664,6 +3835,8 @@ static void apple_s2r_syscore_resume(void *data)
+ 	if (done & S2R_DONE_WAKE)
+ 		apple_sleep_ap_wake_restore();
+ 	apple_s2r_crumb(s2r, S2R_CRUMB_SYSCORE);
++	if (s2r->rt_on)
++		WRITE_ONCE(s2r->rt_live, true);
+ }
+ 
+ static const struct syscore_ops apple_s2r_syscore_ops = {
+@@ -3716,6 +3889,9 @@ static void apple_s2r_wake(void)
+ 	struct apple_s2r_mailbox *mb = s2r->mailbox;
+ 	u64 flags;
+ 
++	if (READ_ONCE(s2r->rt_live))
++		apple_s2r_crumb(s2r, S2R_CRUMB_RT_WAKE);
++
+ 	flags = 0;
+ 	if (mb) {
+ 		/* The firmware updated the mailbox with the caches off */
+@@ -3780,6 +3956,7 @@ static int apple_s2r_begin(suspend_state_t state)
+ 		}
+ 		apple_s2r_pins_save(apple_s2r);
+ 		apple_s2r_crumb_begin(apple_s2r);
++		apple_s2r_rt_begin(apple_s2r);
+ 		if (t8132_sequence)
+ 			apple_s2r_t8132_begin(apple_s2r);
+ 	}
+@@ -3829,8 +4006,10 @@ static void apple_s2r_resume_end(void)
+ 	}
+ 	if (apple_s2r)
+ 		WRITE_ONCE(apple_s2r->t8132.hold_apcie, false);
+-	if (apple_s2r)
++	if (apple_s2r) {
+ 		apple_s2r_crumb(apple_s2r, S2R_CRUMB_END);
++		apple_s2r_rt_end(apple_s2r);
++	}
+ 	if (apple_s2r && apple_s2r->t8132.wd2_armed) {
+ 		writel(0, apple_s2r->wdt + T8132_WD2_CTL);
+ 		apple_s2r->t8132.wd2_armed = false;
+@@ -4094,6 +4273,12 @@ static int apple_s2r_probe(struct platform_device *pdev)
+ 	s2r->pm_nb.notifier_call = apple_s2r_pm_notify;
+ 	register_pm_notifier(&s2r->pm_nb);
+ 
++	/* resume_trail; they do nothing outside its window */
++	s2r->rt_panic_nb.notifier_call = apple_s2r_rt_panic;
++	atomic_notifier_chain_register(&panic_notifier_list, &s2r->rt_panic_nb);
++	s2r->rt_die_nb.notifier_call = apple_s2r_rt_die;
++	register_die_notifier(&s2r->rt_die_nb);
++
+ 	/*
+ 	 * The M4 GPU firmware has no stop and warm restart yet, so its driver
+ 	 * refuses a sleep that powers the SoC down once the firmware ran: with
+diff --git a/tools/asahi/run-host-tests.py b/tools/asahi/run-host-tests.py
+index d447a5a022..dc7b134999 100755
+--- a/tools/asahi/run-host-tests.py
++++ b/tools/asahi/run-host-tests.py
+@@ -172,6 +172,10 @@ ASAHI_TESTS = {
+                                    'maverick-event', 'stowe-offset'), out()),
+     'perf-mmap-alias-lifecycle-tests.py': [([], PASS)],
+     'qspi-nvram-tests.py': [(out('--output'), PASS)],
++    's2r-resume-trail-tests.py': [(out(), PASS)]
++        + mutations('--mutation', ('secs-step', 'secs-base', 'secs-clamp', 'phase-event',
++                                   'phase-early', 'class-loop', 'class-name',
++                                   'crumb-value'), out()),
+     's2r-split-ans-tests.py': [(out(), PASS)]
+         + mutations('--mutation', ('notice-depth', 'depth-seven', 'depth-zero',
+                                    'not-split', 'mode-unknown', 'lowers-real',
+diff --git a/tools/asahi/s2r-resume-trail-tests.py b/tools/asahi/s2r-resume-trail-tests.py
+new file mode 100755
+index 0000000000..9cfd522c6c
+--- /dev/null
++++ b/tools/asahi/s2r-resume-trail-tests.py
+@@ -0,0 +1,151 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Execute apple-s2r's resume_trail selection on the host.
++
++The breadcrumb enum, the class enum and table, and apple_s2r_rt_class(),
++apple_s2r_rt_secs() and apple_s2r_rt_phase() are extracted from the driver
++and compiled on the host. This checks which crumb each device callback phase
++gets, which class each driver name maps to, and that the watchdog times of
++the classes stay apart and below the syscore resume's 120 s. It also checks
++that every driver name in the table is the .name of that driver's source.
++"""
++import argparse
++import os
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[2]
++DRIVERS = {
++    'apple-dart': 'drivers/iommu/apple-dart.c',
++    'apple-pmgr-pwrstate': 'drivers/pmdomain/apple/pmgr-pwrstate.c',
++    'pcie-apple': 'drivers/pci/controller/pcie-apple.c',
++    'nvme-apple': 'drivers/nvme/host/apple.c',
++    'phy-apple-atc': 'drivers/phy/apple/atc.c',
++    'apple-gpio-pinctrl': 'drivers/pinctrl/pinctrl-apple-gpio.c',
++}
++MUTATIONS = {
++    'secs-step': ('#define S2R_RT_STEP_SECS\t8', '#define S2R_RT_STEP_SECS\t4'),
++    'secs-base': ('#define S2R_RT_BASE_SECS\t12', '#define S2R_RT_BASE_SECS\t0'),
++    'secs-clamp': ('if (class >= S2R_RT_CLASSES)', 'if (class > S2R_RT_CLASSES)'),
++    'phase-event': ('if (event != PM_EVENT_RESUME || !pm_ops)', 'if ((event && 0) || !pm_ops)'),
++    'phase-early': ('"early", 5', '"late", 4'),
++    'class-loop': ('i < S2R_RT_OTHER; i++', 'i < S2R_RT_PINCTRL; i++'),
++    'class-name': ('[S2R_RT_PCIE] = "pcie-apple"', '[S2R_RT_PCIE] = "apple-pcie"'),
++    'crumb-value': ('S2R_CRUMB_RT_WAKE = 0x36', 'S2R_CRUMB_RT_WAKE = 0x46'),
++}
++
++PRELUDE = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++typedef uint8_t u8;
++#define PM_EVENT_SUSPEND 0x0002
++#define PM_EVENT_RESUME 0x0010
++'''
++
++CASES = r'''
++int main(void) {
++    unsigned int c, d;
++    /* the crumbs: counted 0x3X values, between syscore done and ->finish in meaning */
++    assert(S2R_CRUMB_RT_WAKE == 0x36 && S2R_CRUMB_RT_NOIRQ == 0x37 && S2R_CRUMB_RT_EARLY == 0x38);
++    assert(S2R_CRUMB_SYSCORE == 0x39 && S2R_CRUMB_FINISH == 0x3a && S2R_CRUMB_END == 0x3d);
++    /* phases: resume only, noirq and early only, every info prefix */
++    assert(apple_s2r_rt_phase("noirq power domain ", PM_EVENT_RESUME) == 0x37);
++    assert(apple_s2r_rt_phase("noirq type ", PM_EVENT_RESUME) == 0x37);
++    assert(apple_s2r_rt_phase("noirq class ", PM_EVENT_RESUME) == 0x37);
++    assert(apple_s2r_rt_phase("noirq bus ", PM_EVENT_RESUME) == 0x37);
++    assert(apple_s2r_rt_phase("noirq driver ", PM_EVENT_RESUME) == 0x37);
++    assert(apple_s2r_rt_phase("early power domain ", PM_EVENT_RESUME) == 0x38);
++    assert(apple_s2r_rt_phase("early driver ", PM_EVENT_RESUME) == 0x38);
++    assert(apple_s2r_rt_phase("driver ", PM_EVENT_RESUME) == 0);
++    assert(apple_s2r_rt_phase("power domain ", PM_EVENT_RESUME) == 0);
++    assert(apple_s2r_rt_phase("", PM_EVENT_RESUME) == 0);
++    assert(apple_s2r_rt_phase(NULL, PM_EVENT_RESUME) == 0);
++    assert(apple_s2r_rt_phase("noirq driver ", PM_EVENT_SUSPEND) == 0);
++    assert(apple_s2r_rt_phase("early driver ", PM_EVENT_SUSPEND) == 0);
++    /* classes */
++    assert(apple_s2r_rt_class("apple-dart") == S2R_RT_DART);
++    assert(apple_s2r_rt_class("apple-pmgr-pwrstate") == S2R_RT_PMGR);
++    assert(apple_s2r_rt_class("pcie-apple") == S2R_RT_PCIE);
++    assert(apple_s2r_rt_class("nvme-apple") == S2R_RT_NVME);
++    assert(apple_s2r_rt_class("phy-apple-atc") == S2R_RT_ATC);
++    assert(apple_s2r_rt_class("apple-gpio-pinctrl") == S2R_RT_PINCTRL);
++    assert(apple_s2r_rt_class("apple-admac") == S2R_RT_OTHER);
++    assert(apple_s2r_rt_class("apple-dart-x") == S2R_RT_OTHER);
++    assert(apple_s2r_rt_class("platform") == S2R_RT_OTHER);
++    assert(apple_s2r_rt_class("") == S2R_RT_OTHER);
++    assert(apple_s2r_rt_class(NULL) == S2R_RT_OTHER);
++    /* times: the published table, 8 s apart, all well below 120 s */
++    {
++        static const unsigned int want[S2R_RT_CLASSES] = { 12, 20, 28, 36, 44, 52, 60, 68 };
++        for (c = 0; c < S2R_RT_CLASSES; c++) {
++            assert(apple_s2r_rt_secs(c) == want[c]);
++            assert(apple_s2r_rt_secs(c) + 8 + 19 < 120);
++            for (d = 0; d < c; d++)
++                assert(apple_s2r_rt_secs(c) - apple_s2r_rt_secs(d) >= 8);
++        }
++        assert(apple_s2r_rt_secs(S2R_RT_CLASSES) == 68);
++        assert(apple_s2r_rt_secs(0xffffffffu) == 68);
++    }
++    puts("apple-s2r resume_trail: every phase, driver and class selects as documented");
++    return 0;
++}
++'''
++
++
++def extract(source):
++    crumb = re.search(r'enum apple_s2r_crumb \{.*?\n\};\n', source, re.S).group(0)
++    cls = re.search(r'enum apple_s2r_rt_class \{.*?\n\};\n', source, re.S).group(0)
++    table = re.search(r'static const char \*const apple_s2r_rt_drivers\[.*?\n\};\n', source, re.S).group(0)
++    defines = ''.join(l + '\n' for l in source.splitlines() if re.match(r'#define S2R_RT_', l))
++    code = crumb + cls + table + defines
++    for fn in ('static unsigned int apple_s2r_rt_class(', 'static unsigned int apple_s2r_rt_secs(',
++               'static u8 apple_s2r_rt_phase('):
++        start = source.index(fn)
++        code += source[start:source.index('\n}\n', start) + 3]
++    return code
++
++
++def check_names(code):
++    names = re.findall(r'\[S2R_RT_\w+\] = "([^"]+)"', code)
++    assert sorted(names) == sorted(DRIVERS), f'table names {names}'
++    for name, path in DRIVERS.items():
++        text = (ROOT / path).read_text()
++        assert re.search(r'\.name\s*=\s*"%s"' % re.escape(name), text), \
++            f'{name}: not the .name of {path}'
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--out', type=Path)
++    parser.add_argument('--mutation', choices=MUTATIONS)
++    args = parser.parse_args()
++    code = extract((ROOT / 'drivers/soc/apple/apple-s2r.c').read_text())
++    if args.mutation:
++        old, new = MUTATIONS[args.mutation]
++        assert old in code, f'missing mutation site: {old}'
++        code = code.replace(old, new, 1)
++    try:
++        check_names(code)
++    except AssertionError as e:
++        print(f'Assertion failed: driver names: {e}')
++        raise SystemExit(1)
++    with tempfile.TemporaryDirectory(prefix='s2r-resume-trail-') as tmp:
++        out = args.out or Path(tmp)
++        out.mkdir(parents=True, exist_ok=True)
++        unit = out / 's2r-resume-trail.c'
++        binary = out / 's2r-resume-trail'
++        unit.write_text(PRELUDE + code + CASES)
++        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra',
++                        '-Werror', '-Wno-unused-function', str(unit), '-o', str(binary)],
++                       check=True)
++        result = subprocess.run([str(binary)])
++        raise SystemExit(1 if result.returncode else 0)
++
++
++if __name__ == '__main__':
++    main()
