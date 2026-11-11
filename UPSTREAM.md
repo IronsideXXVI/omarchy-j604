@@ -32,6 +32,7 @@ Drafted, **not opened yet** (each waits for Dylan's yes):
 - omacom/omarchy `quattro` <- `panel-display-defaults` (commit f480a050, our `disp-0201`): a built-in panel gets the monitor settings its platform package names in `displays.conf`. Credits #10549 (j-c-m), which set `cm = "dp3"` for the Dell XPS OLED.
 - omacom/omarchy-mac-pkgs `main` <- `omarchy-mac-panel-display` (our `omarchy-mac` 0003): the 14-inch MacBook Pro panel line. It needs a fork of omacom/omarchy-mac-pkgs first, and goes after the omarchy pull request.
 - omacom/omarchy-mac-pkgs `main`: keep Chromium's hardware video decode on the 14-inch MacBook Pro M4 (J604 only, in `chromium-flags.conf`). It needs the video decoder fix (our kernel 0237 in 1.734, 0218 since the 1.800 renumbering) upstream or linked first; that fix is merged in aurora-silicon/linux `integration/aurora` as [#1511](https://github.com/aurora-silicon/linux/pull/1511) (2026-11-11). Carried on the J604 as our `omarchy-mac` 0004 (2.13).
+- omacom/omarchy-mac-pkgs `main`: the Touch ID start-up race (fprintd can start alongside the activation, which reports ready while the node is still held). Carried on the J604 as our `omarchy-mac` 0006 (2.17); to be proposed once it has passed a boot on the J604, with Dylan's yes.
 
 ## Others' upstream work we carry (since kernel 1.820; SOURCE, checked 2026-11-11)
 
