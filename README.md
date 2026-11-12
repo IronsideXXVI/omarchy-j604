@@ -60,7 +60,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 | `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`a82a1ebda940`), 337 patches | `1.848` |
 | `m1n1-aurora` | 1.6.1.aurora22, omacom/m1n1 (`bc79acc434`), 41 patches | `1.612` |
 | `uboot-aurora` | 2026.07.aurora6, aurora-silicon/u-boot (`d30213eadc`) | `1.604` |
-| `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261107, omacom/mesa (`b7b03c5b3b`) | `1.8134` |
+| `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261107, omacom/mesa (`b7b03c5b3b`) | `1.8139` (the `1.8134` content) |
 | `alsa-ucm-conf-aurora` | 10.aurora3, aurora-silicon/alsa-ucm-conf-asahi (`b9b2d0c82c`) | `1.605` |
 | `aurora-audio` | 4.1.aurora3, aurora-silicon/asahi-audio (`06aec67a8a`) | `3.607` |
 | `speakersafetyd` | 2.0.1, AsahiLinux/speakersafetyd | `1.605` |
@@ -73,7 +73,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 | `gpu-screen-recorder` | 6.1.7, gpu-screen-recorder (Arch Linux recipe, built for aarch64) | `1.604` (captures monitors on the Apple display controller) |
 | `omarchy-mac-boot` | 20261104, omacom/omarchy-mac-pkgs (`7e50e937b5`) | `1.616` |
 | `omarchy-mac` | 0.2.3, omacom/omarchy-mac-pkgs (`ea0097a523`) | `2.17` (adds the panel line, Chromium hardware video decode on the J604 for H.264 and VP9 profile 0, and a Touch ID start-up race fix) |
-| `omarchy-dev` | 4.0.0.r7641.gf97d3e7 (edge), omacom/omarchy `quattro` (`f97d3e7dc8`), omacom recipe (`5c7fdeaecf`) | `1.1` (keyboard-backlight patches only) |
+| `omarchy-dev` | 4.0.0.r7641.gf97d3e7 (edge), omacom/omarchy `quattro` (`f97d3e7dc8`), omacom recipe (`5c7fdeaecf`) | `1.3` (keyboard-backlight patches only; the `1.1` content) |
 | `omarchy-settings-dev` | 4.0.0.r7641.gf97d3e7 (edge), omacom/omarchy `quattro` (`f97d3e7dc8`) | `1.1` (keyboard-backlight patches + built-in panel defaults) |
 
 Also installed, unchanged from the official repositories: Hyprland 0.57.1 and the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
