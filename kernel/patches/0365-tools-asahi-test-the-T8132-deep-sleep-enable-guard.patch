@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 17:37:16 +0000
+Subject: [PATCH 365/368] tools/asahi: test the T8132 deep sleep enable guard
+
+Check that S3_5_C15_C6_2 is written in one place only, inside the
+dse_allowed() guard; that the guard follows apple_cpu.t8132_dse (0 auto,
+1 never, 2 always, nothing above 2, a log line at 2) and otherwise the
+boot flag, which only aura's mailbox branch sets, from its execute
+window property; that the stub without CPU hotplug says no; and that
+apple-s2r refuses a real T8132 sleep with -EOPNOTSUPP and one line,
+after the read-only checks and before any watchdog, crumb, coprocessor
+stop or core stop. Runs that abort before the commit are not refused.
+
+For the EFI stub, check that the window property must be two u64s,
+that the check runs only after the Image is placed and never changes
+the status, and run its containment test with u64 arithmetic, wrap
+cases included. Each check has a mutation that must fail it.
+
+Assisted-by: LLM
+---
+ MAINTAINERS                    |   1 +
+ tools/asahi/run-host-tests.py  |   7 ++
+ tools/asahi/t8132-dse-tests.py | 171 +++++++++++++++++++++++++++++++++
+ 3 files changed, 179 insertions(+)
+ create mode 100755 tools/asahi/t8132-dse-tests.py
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 360849fec4..959f3a64c8 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2778,6 +2778,7 @@ F:	drivers/iommu/apple-dart.c
+ F:	drivers/iommu/io-pgtable-dart.c
+ F:	drivers/irqchip/irq-apple-aic.c
+ F:	include/linux/irqchip/apple-aic.h
++F:	tools/asahi/t8132-dse-tests.py
+ F:	tools/asahi/t8132-last-wfi-tests.py
+ F:	tools/asahi/t8132-pwrgate-adt-tests.py
+ F:	drivers/mfd/macsmc*.c
+diff --git a/tools/asahi/run-host-tests.py b/tools/asahi/run-host-tests.py
+index f4c676d379..94ba7c268d 100755
+--- a/tools/asahi/run-host-tests.py
++++ b/tools/asahi/run-host-tests.py
+@@ -218,6 +218,13 @@ ASAHI_TESTS = {
+                                    'no-hold-report', 'nostick-saved', 'strict-on',
+                                    'refuse-unconditional', 'no-strict-refuse', 'pga-always',
+                                    'pga-from-probe'), out()),
++    't8132-dse-tests.py': [(out(), PASS)]
++        + mutations('--mutation', ('dse-forced-true', 'param-default-always', 'no-range',
++                                   'override-silent', 'never-means-always', 'unguarded-write',
++                                   'boot-from-mailbox', 'boot-any-loader', 'stub-allows',
++                                   'no-refuse', 'refuse-aborts', 'refuse-quiet-ok',
++                                   'refuse-after-stop', 'refuse-after-wdt', 'stub-unsafe-sum',
++                                   'stub-no-len', 'stub-fails-boot', 'stub-before-place'), out()),
+     't8132-apcie-dart-resume-tests.py': [(out() + ['--dtc', '{dtc}'], PASS)]
+         + mutations('--mutation', ('gate-power-lost', 'gate-off', 'host-down', 'host-skip',
+                                    'host-no-ungate'), out()),
+diff --git a/tools/asahi/t8132-dse-tests.py b/tools/asahi/t8132-dse-tests.py
+new file mode 100755
+index 0000000000..20662a3523
+--- /dev/null
++++ b/tools/asahi/t8132-dse-tests.py
+@@ -0,0 +1,171 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Check the T8132 per-core deep sleep enable guard and the EFI stub's window report.
++
++On a T8132 that m1n1 starts directly, any write to S3_5_C15_C6_2 stops the
++machine. The last WFI may write it only on a boot through aura's boot object
++(aura's aurora,s2r-mailbox and /chosen/aurora,ctxr-exec-window), unless the
++named override apple_cpu.t8132_dse says otherwise; the override defaults to
++auto, takes only 0-2 and logs when set to 2. apple-s2r refuses a real T8132
++sleep on any other boot with -EOPNOTSUPP, after the read-only checks and
++before anything is armed, told, stopped or parked; runs that abort before the
++commit are not refused. The arm64 EFI stub reports, and only reports, an Image
++outside the window; its containment test is run here with u64 arithmetic.
++"""
++import argparse
++from pathlib import Path
++import re
++
++ROOT = Path(__file__).resolve().parents[2]
++CPU = 'arch/arm64/kernel/apple_cpu.c'
++HDR = 'arch/arm64/include/asm/apple_cpu.h'
++S2R = 'drivers/soc/apple/apple-s2r.c'
++STUB = 'drivers/firmware/efi/libstub/arm64-stub.c'
++GUARD = 'if (!READ_ONCE(abort_before) && !apple_cpu_t8132_dse_allowed()) {'
++MUTATIONS = {
++    'dse-forced-true': (CPU, '\tdefault:\n\t\treturn apple_cpu_t8132_dse_boot;', '\tdefault:\n\t\treturn true;'),
++    'param-default-always': (CPU, 'static uint t8132_dse;\n', 'static uint t8132_dse = 2;\n'),
++    'no-range': (CPU, '\tif (v > 2)\n\t\treturn -EINVAL;\n', ''),
++    'override-silent': (CPU, '\tif (v == 2)\n\t\tpr_warn(', '\tif (0)\n\t\tpr_warn('),
++    'never-means-always': (CPU, '\tcase 1:\n\t\treturn false;', '\tcase 1:\n\t\treturn true;'),
++    'unguarded-write': (CPU, 'if (deep_sleep && apple_cpu_t8132_dse_allowed()) {', 'if (deep_sleep) {'),
++    'boot-from-mailbox': (CPU, 'apple_cpu_t8132_dse_boot = of_property_present(of_chosen,\n\t\t\t\t\t\t\t       "aurora,ctxr-exec-window");',
++                          'apple_cpu_t8132_dse_boot = true;'),
++    'boot-any-loader': (CPU, '\t} else if (apple_m1n1_v161_probe(&why)) {', '\t} else if (apple_m1n1_v161_probe(&why)) {\n\t\tapple_cpu_t8132_dse_boot = true;'),
++    'stub-allows': (HDR, 'static inline bool apple_cpu_t8132_dse_allowed(void)\n{\n\treturn false;', 'static inline bool apple_cpu_t8132_dse_allowed(void)\n{\n\treturn true;'),
++    'no-refuse': (S2R, GUARD, 'if (0) {'),
++    'refuse-aborts': (S2R, GUARD, 'if (!apple_cpu_t8132_dse_allowed()) {'),
++    'refuse-quiet-ok': (S2R, '\t\treturn -EOPNOTSUPP;\n\t}\n\n\t/*\n\t * A real sleep.', '\t\treturn 0;\n\t}\n\n\t/*\n\t * A real sleep.'),
++    'refuse-after-stop': (S2R, '\t\tret = apple_s2r_t8132_refuse(s2r);', '\t\tapple_s2r_coprocs_stop(true);\n\t\tret = apple_s2r_t8132_refuse(s2r);'),
++    'refuse-after-wdt': (S2R, '\t\tret = apple_s2r_t8132_refuse(s2r);', '\t\tapple_s2r_wdt_arm(s2r);\n\t\tret = apple_s2r_t8132_refuse(s2r);'),
++    'stub-unsafe-sum': (STUB, 'image_addr - base > size - image_memsize', 'image_addr + image_memsize > base + size'),
++    'stub-no-len': (STUB, '\tif (!prop || len != 2 * sizeof(*prop))\n', '\tif (!prop)\n'),
++    'stub-fails-boot': (STUB, '\tif (status == EFI_SUCCESS)\n\t\tefi_check_ctxr_window(*image_addr, kernel_memsize);\n\treturn status;',
++                        '\tif (status == EFI_SUCCESS)\n\t\tefi_check_ctxr_window(*image_addr, kernel_memsize);\n\treturn EFI_LOAD_ERROR;'),
++    'stub-before-place': (STUB, '\tstatus = efi_kaslr_relocate_kernel(', '\tefi_check_ctxr_window(*image_addr, kernel_memsize);\n\tstatus = efi_kaslr_relocate_kernel('),
++}
++
++
++def fn_body(src, head):
++    at = src.index(head)
++    return src[at:src.index('\n}\n', at)]
++
++
++class U64:
++    M = (1 << 64) - 1
++
++    def __init__(self, v):
++        self.v = v & self.M
++
++    def __add__(self, o):
++        return U64(self.v + o.v)
++
++    def __sub__(self, o):
++        return U64(self.v - o.v)
++
++    def __lt__(self, o):
++        return self.v < o.v
++
++    def __gt__(self, o):
++        return self.v > o.v
++
++
++def stub_outside(cond, a, m, b, s):
++    expr = cond.replace('||', ' or ').replace('\n', ' ')
++    return bool(eval(expr, {}, {'image_addr': U64(a), 'image_memsize': U64(m), 'base': U64(b), 'size': U64(s)}))
++
++
++def check(cpu, hdr, s2r, stub):
++    # the override: default auto, 0..2 only, logs at 2
++    assert re.search(r'^static uint t8132_dse;$', cpu, re.M), 'Assertion failed: t8132_dse must default to 0 (auto)'
++    st = fn_body(cpu, 'static int t8132_dse_set(const char *val, const struct kernel_param *kp)')
++    assert '\tif (v > 2)\n\t\treturn -EINVAL;\n' in st, 'Assertion failed: t8132_dse must refuse values above 2'
++    assert re.search(r'\tif \(v == 2\)\n\t\tpr_warn\(', st), 'Assertion failed: setting t8132_dse=2 must log'
++    assert 'module_param_cb(t8132_dse, &t8132_dse_ops, &t8132_dse, 0644);' in cpu
++    al = fn_body(cpu, 'bool apple_cpu_t8132_dse_allowed(void)')
++    assert '\tcase 1:\n\t\treturn false;' in al and '\tcase 2:\n\t\treturn true;' in al and \
++        '\tdefault:\n\t\treturn apple_cpu_t8132_dse_boot;' in al, \
++        'Assertion failed: dse_allowed must be: 1 never, 2 always, else the boot flag'
++    # the boot flag: only on aura's mailbox branch, from the execute window property
++    ri = fn_body(cpu, 'static int __init apple_cpu_reentry_init(void)')
++    sets = [m.start() for m in re.finditer(r'apple_cpu_t8132_dse_boot = ', cpu)]
++    assert len(sets) == 1, f'Assertion failed: the boot flag must be set in one place ({len(sets)})'
++    a = ri.find('apple_reentry.mode = APPLE_REENTRY_AURA;')
++    f = ri.find('apple_cpu_t8132_dse_boot = of_property_present(of_chosen,\n\t\t\t\t\t\t\t       "aurora,ctxr-exec-window");')
++    v = ri.find('} else if (apple_m1n1_v161_probe(&why)) {')
++    m = ri.find('of_property_read_u64(of_chosen, "asahi,s2r-mailbox"')
++    assert 0 <= m < a < f < v, 'Assertion failed: the boot flag must come from aura\'s branch and its execute window only'
++    assert re.search(r'^static bool apple_cpu_t8132_dse_boot;$', cpu, re.M), 'Assertion failed: the boot flag must start false'
++    # the only write of the register, behind the guard
++    writes = re.findall(r'write_sysreg_s\([^;]*SYS_APL_T8132_DEEP_SLEEP\)', cpu)
++    assert len(writes) == 1, f'Assertion failed: S3_5_C15_C6_2 must be written in one place ({len(writes)})'
++    lw = fn_body(cpu, 'static void __noreturn apple_cpu_t8132_last_wfi(bool deep_sleep)')
++    g = lw.find('if (deep_sleep && apple_cpu_t8132_dse_allowed()) {')
++    w = lw.find('write_sysreg_s(deep, SYS_APL_T8132_DEEP_SLEEP);')
++    assert 0 <= g < w < lw.find('\t}', g), 'Assertion failed: the register write must sit inside the dse_allowed guard'
++    stb = hdr[hdr.index('#else'):]
++    assert 'static inline bool apple_cpu_t8132_dse_allowed(void)\n{\n\treturn false;' in stb, \
++        'Assertion failed: without CPU hotplug the guard must say no'
++    # apple-s2r: refused cleanly for a real sleep, only after read-only checks, before anything else
++    rf = fn_body(s2r, 'static int apple_s2r_t8132_refuse(struct apple_s2r *s2r)')
++    e = rf.find('if (READ_ONCE(abort_before) && READ_ONCE(abort_before) != S2R_STEP_T8132_RAISE)\n\t\treturn 0;')
++    q = rf.find(GUARD)
++    assert 0 <= e < q, 'Assertion failed: the refusal must be for a real sleep only (abort_before 0)'
++    blk = rf[q:rf.index('\n\t}\n', q)]
++    assert 'pr_warn(' in blk and blk.count('pr_warn(') == 1 and 'return -EOPNOTSUPP;' in blk, \
++        'Assertion failed: the refusal must be -EOPNOTSUPP with one line'
++    en = fn_body(s2r, 'static int apple_s2r_enter(suspend_state_t state)')
++    r = en.find('ret = apple_s2r_t8132_refuse(s2r);')
++    assert r >= 0, 'Assertion failed: ->enter must call the T8132 refusal'
++    before = set(re.findall(r'\b(apple_[a-z0-9_]+|cpu_suspend)\(', en[en.index('{'):r]))
++    allowed = {'apple_s2r_preflight', 'apple_s2r_abort_reachable', 'apple_s2r_check_rvbar', 'apple_s2r_t8132_refuse'}
++    assert before <= allowed, f'Assertion failed: ->enter acts before the refusal: {sorted(before - allowed)}'
++    for act in ('apple_s2r_wdt_take(', 'apple_s2r_wdt_arm(', 'apple_s2r_crumb(', 'apple_s2r_coprocs_stop(',
++                'apple_s2r_t8132_enter(', 'cpu_suspend('):
++        assert en.find(act) > r, f'Assertion failed: {act} must come after the refusal'
++    # EFI stub: report only, after the Image is placed, property of the right size, u64-safe containment
++    ck = fn_body(stub, 'static void efi_check_ctxr_window(unsigned long image_addr,')
++    assert 'fdt_getprop(fdt, node, "aurora,ctxr-exec-window", &len);' in ck and \
++        '\tif (!prop || len != 2 * sizeof(*prop))\n' in ck, 'Assertion failed: the window must be two u64s'
++    assert not re.search(r'efi_(allocate|free|relocate)|AllocateAddress|return EFI', ck), \
++        'Assertion failed: the window check must only report'
++    hk = fn_body(stub, 'efi_status_t handle_kernel_image(unsigned long *image_addr,')
++    p, c = hk.find('status = efi_kaslr_relocate_kernel('), hk.find('efi_check_ctxr_window(*image_addr, kernel_memsize);')
++    assert 0 <= p < c and '\tif (status == EFI_SUCCESS)\n\t\tefi_check_ctxr_window' in hk and \
++        hk.rstrip().endswith('return status;'), 'Assertion failed: the check must run after the placement and never change the status'
++    cond = re.search(r'\tif \((image_addr < base.*?)\)\n\t\tefi_warn', ck, re.S).group(1)
++    cases = [((0x1000000, 0x100000, 0x1000000, 0x8000000), False), ((0x8f00000, 0x100000, 0x1000000, 0x8000000), False),
++             ((0x8f00001, 0x100000, 0x1000000, 0x8000000), True), ((0x0ffffff, 0x100000, 0x1000000, 0x8000000), True),
++             ((0x2000000, 0x9000000, 0x1000000, 0x8000000), True), ((0x1000000, 0x8000000, 0x1000000, 0x8000000), False),
++             ((0xfffffffffff00000, 0x200000, 0xfffffffffff00000, 0x100000), True),
++             ((0xfffffffffff00000, 0x200000, 0xffffffff00000000, 0x10000000), True)]
++    for args, want in cases:
++        got = stub_outside(cond, *args)
++        assert got == want, f'Assertion failed: window test {[hex(x) for x in args]} gave {got}, want {want}'
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--out', type=Path)
++    parser.add_argument('--mutation', choices=MUTATIONS)
++    args = parser.parse_args()
++    src = {f: (ROOT / f).read_text() for f in (CPU, HDR, S2R, STUB)}
++    if args.mutation:
++        f, old, new = MUTATIONS[args.mutation]
++        assert old in src[f], f'missing mutation site: {old}'
++        src[f] = src[f].replace(old, new, 1)
++    try:
++        check(src[CPU], src[HDR], src[S2R], src[STUB])
++    except (AssertionError, ValueError, AttributeError) as e:
++        print(e if str(e).startswith('Assertion') else f'Assertion failed: {e}')
++        raise SystemExit(1)
++    line = ('t8132 deep sleep enable: written only on a boot through aura (execute window + mailbox) or with '
++            't8132_dse=2, which logs; a real sleep elsewhere refused with -EOPNOTSUPP before anything acts; '
++            'the EFI stub only reports an Image outside the window')
++    if args.out:
++        args.out.write_text(line + '\n')
++    print(line)
++
++
++if __name__ == '__main__':
++    main()
+-- 
+2.43.0
+

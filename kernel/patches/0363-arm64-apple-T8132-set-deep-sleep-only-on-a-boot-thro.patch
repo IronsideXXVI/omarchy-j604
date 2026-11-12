@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 17:28:30 +0000
+Subject: [PATCH 363/368] arm64: apple: T8132: set deep sleep only on a boot
+ through aura
+
+On a T8132 (M4) that m1n1 starts directly, any write to the per-core
+deep sleep enable S3_5_C15_C6_2 stops the machine, even a write of the
+value the register already holds. Reading it is harmless. Measured on a
+J604 at EL2: 0x0 read on all ten cores; one write of 0x0 on one
+secondary, interrupts masked and no WFI, took the machine down within
+two seconds.
+
+The T8132 last WFI writes bits 0 and 63 of that register on every core
+after the commit, so on such a boot a real sleep ends at that write.
+aura publishes /chosen/aurora,ctxr-exec-window and aurora,s2r-mailbox
+only for an OS it started from its boot object, where the write is
+expected to work.
+
+Write the enable only on that boot. Elsewhere apple-s2r refuses a real
+T8132 sleep at ->enter with -EOPNOTSUPP and one line, before any core is
+parked or any coprocessor is told. Runs that abort before the commit
+never write the register and are unchanged. apple_cpu.t8132_dse=1
+never writes it; =2 always does, for bring-up, and says so when set.
+
+Assisted-by: LLM
+---
+ arch/arm64/include/asm/apple_cpu.h |  6 +++
+ arch/arm64/kernel/apple_cpu.c      | 61 +++++++++++++++++++++++++++++-
+ drivers/soc/apple/apple-s2r.c      |  6 +++
+ 3 files changed, 72 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/include/asm/apple_cpu.h b/arch/arm64/include/asm/apple_cpu.h
+index 3b0dd97d6f..187e094f3c 100644
+--- a/arch/arm64/include/asm/apple_cpu.h
++++ b/arch/arm64/include/asm/apple_cpu.h
+@@ -25,6 +25,7 @@ void apple_cpu_power_cycled(void);
+ int apple_cpu_t8132_stop_parked(void);
+ void apple_cpu_t8132_release_stopped(bool committed);
+ void __noreturn apple_cpu_t8132_deep_sleep(void);
++bool apple_cpu_t8132_dse_allowed(void);
+ u32 apple_cpu_stop_word(void);
+ 
+ /* The park loop of an offline CPU, internal to the CPU hotplug code */
+@@ -64,6 +65,11 @@ static inline void apple_cpu_t8132_release_stopped(bool committed)
+ {
+ }
+ 
++static inline bool apple_cpu_t8132_dse_allowed(void)
++{
++	return false;
++}
++
+ static inline u32 apple_cpu_stop_word(void)
+ {
+ 	return 0;
+diff --git a/arch/arm64/kernel/apple_cpu.c b/arch/arm64/kernel/apple_cpu.c
+index a5f958e86d..e91f9fba1a 100644
+--- a/arch/arm64/kernel/apple_cpu.c
++++ b/arch/arm64/kernel/apple_cpu.c
+@@ -799,6 +799,9 @@ out_unmap:
+ 	return false;
+ }
+ 
++/* Set at the re-entry init: this boot came through aura's boot object */
++static bool apple_cpu_t8132_dse_boot;
++
+ static int __init apple_cpu_reentry_init(void)
+ {
+ 	const char *why = NULL;
+@@ -830,6 +833,8 @@ static int __init apple_cpu_reentry_init(void)
+ 		 */
+ 		apple_reentry.mode = APPLE_REENTRY_AURA;
+ 		pr_info("aura warm boot mailbox at %#llx: its re-entry path is quiet\n", mailbox);
++		apple_cpu_t8132_dse_boot = of_property_present(of_chosen,
++							       "aurora,ctxr-exec-window");
+ 	} else if (apple_m1n1_v161_probe(&why)) {
+ 		apple_reentry.mode = APPLE_REENTRY_M1N1_V161;
+ 	}
+@@ -837,6 +842,9 @@ static int __init apple_cpu_reentry_init(void)
+ 	if (apple_reentry.mode == APPLE_REENTRY_UNKNOWN)
+ 		pr_info("boot loader re-entry path not known to be quiet (%s): CPU clusters are not power gated\n",
+ 			why);
++	pr_info("deep sleep enable at the last WFI: %s\n",
++		apple_cpu_t8132_dse_boot ? "this boot came through aura's boot object" :
++					   "not on this boot (needs aura's boot object)");
+ 
+ 	return 0;
+ }
+@@ -1233,6 +1241,57 @@ EXPORT_SYMBOL_GPL(apple_cpu_deep_sleep);
+ #define SYS_APL_T8132_DEEP_SLEEP	sys_reg(3, 5, 15, 6, 2)
+ #define T8132_DEEP_SLEEP_ENABLE		(BIT_ULL(0) | BIT_ULL(63))
+ 
++/*
++ * On a boot that did not come through aura's boot object (m1n1 started
++ * directly), any write to S3_5_C15_C6_2 stops the machine, even one that
++ * changes no bit (measured on a J604). aura publishes its execute window
++ * only for an OS it started from its boot object, so the write is made
++ * only on that boot.
++ */
++static uint t8132_dse;
++
++static int t8132_dse_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int v;
++	int ret;
++
++	ret = kstrtouint(val, 0, &v);
++	if (ret)
++		return ret;
++	if (v > 2)
++		return -EINVAL;
++	WRITE_ONCE(t8132_dse, v);
++	if (v == 2)
++		pr_warn("t8132_dse=2: the per-core deep sleep enable is written at the last WFI whatever the boot (bring-up only: a boot not through aura's boot object stops at that write)\n");
++	return 0;
++}
++
++static const struct kernel_param_ops t8132_dse_ops = {
++	.set = t8132_dse_set,
++	.get = param_get_uint,
++};
++module_param_cb(t8132_dse, &t8132_dse_ops, &t8132_dse, 0644);
++MODULE_PARM_DESC(t8132_dse,
++		 "T8132 per-core deep sleep enable at the last WFI: 0 only on a boot through aura's boot object (default), 1 never, 2 always (bring-up: other boots stop at the write)");
++
++/**
++ * apple_cpu_t8132_dse_allowed() - whether the last WFI may set deep sleep
++ *
++ * Return: true if S3_5_C15_C6_2 may be written on this boot.
++ */
++bool apple_cpu_t8132_dse_allowed(void)
++{
++	switch (READ_ONCE(t8132_dse)) {
++	case 1:
++		return false;
++	case 2:
++		return true;
++	default:
++		return apple_cpu_t8132_dse_boot;
++	}
++}
++EXPORT_SYMBOL_GPL(apple_cpu_t8132_dse_allowed);
++
+ /* Set by the boot CPU once the commit is written, or the sleep abandoned */
+ static bool apple_cpu_t8132_released;
+ /* With the release: whether the commit was written, and deep sleep allowed */
+@@ -1293,7 +1352,7 @@ static void __noreturn apple_cpu_t8132_last_wfi(bool deep_sleep)
+ 		sysreg_clear_set_s(SYS_APL_ACNTHV_CTL_EL2, BIT(0), 0);
+ 	isb();
+ 
+-	if (deep_sleep) {
++	if (deep_sleep && apple_cpu_t8132_dse_allowed()) {
+ 		deep = read_sysreg_s(SYS_APL_T8132_DEEP_SLEEP) | T8132_DEEP_SLEEP_ENABLE;
+ 		write_sysreg_s(deep, SYS_APL_T8132_DEEP_SLEEP);
+ 		isb();
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index 8c7714100b..991accd1f3 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -3522,6 +3522,12 @@ static int apple_s2r_t8132_refuse(struct apple_s2r *s2r)
+ 	if (READ_ONCE(abort_before) && READ_ONCE(abort_before) != S2R_STEP_T8132_RAISE)
+ 		return 0;
+ 
++	/* A real sleep ends in the per-core deep sleep enable write (apple_cpu.c) */
++	if (!READ_ONCE(abort_before) && !apple_cpu_t8132_dse_allowed()) {
++		pr_warn("apple-s2r: T8132 sequence: deep sleep needs a boot through aura's boot object, the per-core deep sleep enable cannot be written on this one: refused\n");
++		return -EOPNOTSUPP;
++	}
++
+ 	/*
+ 	 * A real sleep. The engine waits for the display CPUs with no timeout
+ 	 * (SOURCE): kept as a safety (all three read off at ->enter, MEASURED).
+-- 
+2.43.0
+
