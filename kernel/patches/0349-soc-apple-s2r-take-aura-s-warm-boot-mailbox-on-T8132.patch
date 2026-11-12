@@ -1,0 +1,474 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 04:27:42 +0000
+Subject: [PATCH 349/353] soc: apple: s2r: take aura's warm boot mailbox on
+ T8132
+
+On M4 and later, iBoot locks every core's reset vector to the boot
+object, so a wake restarts each core inside the boot loader, which has
+to send it back to Linux. m1n1 publishes /chosen/asahi,s2r-mailbox for
+that. aura, booted as a Mach-O boot object, publishes its own instead,
+/chosen/aurora,s2r-mailbox (aurora-silicon/aura 30896625, "kboot: let
+an OS at EL2 return from its own sleep"): 32 bytes of magic "AURAS2R1",
+the boot core's MPIDR, the resume address and a resume count. The boot
+core jumps to the resume address at EL2 with the MMU and caches off,
+or reboots if it is 0; secondaries go back to their spin table release
+address; and aura's reset paths print nothing once the mailbox is out.
+
+Take aura's mailbox when m1n1's is absent:
+
+- apple-s2r checks its magic and that it is for the boot CPU. aura
+  names no reset vector, as it publishes the mailbox only once the
+  locked RVBARs lead into its image, so the vector is the one the
+  online cores have locked, which must be the same on all of them and
+  is checked again before each sleep, as for m1n1.
+- A T8132 sleep arms the resume address with the T8132 resume stub,
+  which restarts WD2 before cpu_resume, and cleans it to the PoC. The
+  wake counts a resume when aura's count moved, and clears the
+  address. aura takes no warm boot flags.
+- aura's mailbox is refused outside the T8132 sequence.
+- apple_cpu treats aura's re-entry path as quiet, so CPU clusters can
+  be power gated under it as under m1n1.
+
+With m1n1 nothing changes: its mailbox is still looked up first.
+
+tools/asahi/s2r-aura-mailbox-tests.py checks the layout and magic
+against aura's, the lookup order, the probe checks, the arming, the
+wake and the refusal.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ MAINTAINERS                           |   1 +
+ arch/arm64/kernel/apple_cpu.c         |  12 +++
+ drivers/soc/apple/apple-s2r.c         | 125 ++++++++++++++++++++-----
+ tools/asahi/run-host-tests.py         |   4 +
+ tools/asahi/s2r-aura-mailbox-tests.py | 130 ++++++++++++++++++++++++++
+ 5 files changed, 250 insertions(+), 22 deletions(-)
+ create mode 100755 tools/asahi/s2r-aura-mailbox-tests.py
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 6701f3ff34..593b9897bf 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2796,6 +2796,7 @@ F:	tools/asahi/apple-pwm-pm-tests.py
+ F:	drivers/reset/reset-apple-cio.c
+ F:	drivers/rtc/rtc-macsmc.c
+ F:	drivers/soc/apple/*
++F:	tools/asahi/s2r-aura-mailbox-tests.py
+ F:	tools/asahi/s2r-resume-trail-tests.py
+ F:	tools/asahi/s2r-split-ans-tests.py
+ F:	tools/asahi/t8132-apcie-dart-resume-tests.py
+diff --git a/arch/arm64/kernel/apple_cpu.c b/arch/arm64/kernel/apple_cpu.c
+index f2870c6d3e..a5f958e86d 100644
+--- a/arch/arm64/kernel/apple_cpu.c
++++ b/arch/arm64/kernel/apple_cpu.c
+@@ -408,6 +408,8 @@ enum apple_reentry_mode {
+ 	APPLE_REENTRY_MAILBOX,
+ 	/* m1n1 v1.6.1: clear its console and dockchannel UART bases */
+ 	APPLE_REENTRY_M1N1_V161,
++	/* aura's warm boot mailbox: its reset paths are quiet once it is out */
++	APPLE_REENTRY_AURA,
+ };
+ 
+ /* Warm boot mailbox (magic, entry, arg, flags) and its QUIET flag */
+@@ -819,6 +821,15 @@ static int __init apple_cpu_reentry_init(void)
+ 		} else {
+ 			why = "cannot map the warm boot mailbox";
+ 		}
++	} else if (!of_property_read_u64(of_chosen, "aurora,s2r-mailbox", &mailbox)) {
++		/*
++		 * aura publishes it only for an OS at EL2 whose secondaries' RVBARs
++		 * lead back into aura, sends a reset secondary to its spin table
++		 * release address, and prints nothing on a reset path from then on
++		 * (aurora-silicon/aura 30896625).
++		 */
++		apple_reentry.mode = APPLE_REENTRY_AURA;
++		pr_info("aura warm boot mailbox at %#llx: its re-entry path is quiet\n", mailbox);
+ 	} else if (apple_m1n1_v161_probe(&why)) {
+ 		apple_reentry.mode = APPLE_REENTRY_M1N1_V161;
+ 	}
+@@ -855,6 +866,7 @@ static void apple_reentry_quiet(void)
+ 		dcache_clean_poc((unsigned long)uart, (unsigned long)(uart + 1));
+ 		dcache_clean_poc((unsigned long)dock, (unsigned long)(dock + 1));
+ 		break;
++	case APPLE_REENTRY_AURA:
+ 	case APPLE_REENTRY_UNKNOWN:
+ 		break;
+ 	}
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index 441717b770..f62da645d5 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -635,6 +635,24 @@ struct apple_s2r_mailbox {
+ 				 S2R_FLAG_WDT_THROUGH)
+ #define S2R_FLAG_RESUMED	BIT_ULL(63)
+ 
++/*
++ * aura's warm boot mailbox, /chosen/aurora,s2r-mailbox (aurora-silicon/aura
++ * 30896625, "kboot: let an OS at EL2 return from its own sleep"). aura
++ * publishes it only when a running secondary's locked RVBAR leads back into
++ * its image. On a core reset the boot core (boot_mpidr) jumps to resume_pa at
++ * EL2 with the MMU and caches off, or reboots if it is 0; aura then clears
++ * resume_pa and counts the resume. It takes no flags, and its reset paths
++ * stay off the console once the mailbox is out.
++ */
++struct apple_s2r_aura_mailbox {
++	__le64 magic;
++	__le64 boot_mpidr;
++	__le64 resume_pa;
++	__le64 resumes;
++};
++
++#define S2R_AURA_MAGIC		0x3152325341525541ULL	/* "AURAS2R1" */
++
+ /*
+  * Steps taken by ->enter() that the resume path must undo. The same bits
+  * select steps to leave out with the skip parameter.
+@@ -791,6 +809,9 @@ struct apple_s2r {
+ 	void __iomem *timer;
+ 	void __iomem *wdt;
+ 	struct apple_s2r_mailbox *mailbox;
++	/* aura's mailbox instead of m1n1's, and its resume count at the commit */
++	struct apple_s2r_aura_mailbox *aura;
++	u64 aura_resumes;
+ 	/* The vector the boot firmware verified, and every core's RVBAR */
+ 	u64 reset_vector;
+ 	void __iomem **rvbar;
+@@ -3276,11 +3297,18 @@ static int apple_s2r_t8132_finish(unsigned long arg)
+ 	/* Our boot firmware's mailbox; the wake comes back through the WD2 stub. */
+ 	if (!s2r->wdt_armed)
+ 		flags &= ~S2R_FLAG_WDT_THROUGH;
+-	WRITE_ONCE(mb->entry, cpu_to_le64(__pa_symbol(apple_s2r_t8132_resume)));
+-	WRITE_ONCE(mb->arg, 0);
+-	WRITE_ONCE(mb->flags, cpu_to_le64(flags));
+-	WRITE_ONCE(mb->magic, cpu_to_le64(S2R_MAGIC));
+-	dcache_clean_poc((unsigned long)mb, (unsigned long)(mb + 1));
++	if (s2r->aura) {
++		s2r->aura_resumes = le64_to_cpu(READ_ONCE(s2r->aura->resumes));
++		WRITE_ONCE(s2r->aura->resume_pa,
++			   cpu_to_le64(__pa_symbol(apple_s2r_t8132_resume)));
++		dcache_clean_poc((unsigned long)s2r->aura, (unsigned long)(s2r->aura + 1));
++	} else {
++		WRITE_ONCE(mb->entry, cpu_to_le64(__pa_symbol(apple_s2r_t8132_resume)));
++		WRITE_ONCE(mb->arg, 0);
++		WRITE_ONCE(mb->flags, cpu_to_le64(flags));
++		WRITE_ONCE(mb->magic, cpu_to_le64(S2R_MAGIC));
++		dcache_clean_poc((unsigned long)mb, (unsigned long)(mb + 1));
++	}
+ 	if (s2r->wdt_armed)
+ 		apple_s2r_wdt_arm_secs(s2r, min_t(u32, wdt_timeout, T8132_WD1_COMMIT_SECS));
+ 
+@@ -3778,7 +3806,10 @@ static int apple_s2r_enter(suspend_state_t state)
+ 	 * Without a warm boot mailbox nothing can resume the SoC: only the
+ 	 * bring-up runs that stop before the clock generators are allowed.
+ 	 */
+-	if (!s2r->mailbox) {
++	/* aura's mailbox is used on the T8132 sequence only */
++	if (s2r->aura && !t8132_sequence)
++		return -EOPNOTSUPP;
++	if (!s2r->mailbox && !s2r->aura) {
+ 		unsigned int ab = READ_ONCE(abort_before);
+ 
+ 		if (!ab || (!t8132_sequence && ab > S2R_STEP_CLKGEN))
+@@ -4068,6 +4099,15 @@ static void apple_s2r_wake(void)
+ 		WRITE_ONCE(mb->magic, 0);
+ 		WRITE_ONCE(mb->flags, 0);
+ 		dcache_clean_poc((unsigned long)mb, (unsigned long)(mb + 1));
++	} else if (s2r->aura) {
++		struct apple_s2r_aura_mailbox *am = s2r->aura;
++
++		/* aura counted the resume with the caches off */
++		dcache_clean_inval_poc((unsigned long)am, (unsigned long)(am + 1));
++		if (le64_to_cpu(READ_ONCE(am->resumes)) != s2r->aura_resumes)
++			flags |= S2R_FLAG_RESUMED;
++		WRITE_ONCE(am->resume_pa, 0);
++		dcache_clean_poc((unsigned long)am, (unsigned long)(am + 1));
+ 	}
+ 
+ 	if (s2r->resumed)
+@@ -4217,19 +4257,27 @@ static void apple_s2r_unmap_rvbars(void *data)
+  * the reset vector the boot firmware verified. Every online core must already
+  * be locked to it; offline cores are checked by the boot firmware only.
+  */
+-static int apple_s2r_verify_reset_vector(struct apple_s2r *s2r)
++/*
++ * m1n1 names the vector it verified. aura publishes its mailbox only once it
++ * has checked that the locked RVBARs lead into its image, and names none: the
++ * vector is then the one the online cores have locked, which must be the same
++ * on all of them.
++ */
++static int apple_s2r_verify_reset_vector(struct apple_s2r *s2r, bool aura)
+ {
+ 	struct device *dev = s2r->dev;
+ 	unsigned int cpu;
+ 	int ret;
+ 
+-	if (of_property_read_u64(of_chosen, "asahi,s2r-reset-vector",
+-				 &s2r->reset_vector))
+-		return dev_err_probe(dev, -ENODEV,
+-				     "boot firmware did not verify its warm boot reset vector\n");
+-	if (!s2r->reset_vector || (s2r->reset_vector & ~IMPL_RVBAR_ADDR))
+-		return dev_err_probe(dev, -EINVAL, "invalid reset vector %#llx\n",
+-				     s2r->reset_vector);
++	if (!aura) {
++		if (of_property_read_u64(of_chosen, "asahi,s2r-reset-vector",
++					 &s2r->reset_vector))
++			return dev_err_probe(dev, -ENODEV,
++					     "boot firmware did not verify its warm boot reset vector\n");
++		if (!s2r->reset_vector || (s2r->reset_vector & ~IMPL_RVBAR_ADDR))
++			return dev_err_probe(dev, -EINVAL, "invalid reset vector %#llx\n",
++					     s2r->reset_vector);
++	}
+ 
+ 	s2r->rvbar = devm_kcalloc(dev, nr_cpu_ids, sizeof(*s2r->rvbar),
+ 				  GFP_KERNEL);
+@@ -4259,10 +4307,18 @@ static int apple_s2r_verify_reset_vector(struct apple_s2r *s2r)
+ 	}
+ 
+ 	cpus_read_lock();
++	ret = 0;
++	if (aura) {
++		u64 val = readq(s2r->rvbar[cpumask_first(cpu_online_mask)]);
++
++		s2r->reset_vector = val & IMPL_RVBAR_ADDR;
++		if (!(val & IMPL_RVBAR_LOCK) || !s2r->reset_vector)
++			ret = -ENODEV;
++	}
+ 	for_each_online_cpu(cpu) {
+-		ret = apple_s2r_check_rvbar(s2r, cpu);
+ 		if (ret)
+ 			break;
++		ret = apple_s2r_check_rvbar(s2r, cpu);
+ 	}
+ 	cpus_read_unlock();
+ 
+@@ -4328,6 +4384,7 @@ static int apple_s2r_probe(struct platform_device *pdev)
+ 	struct device_node *sep_np;
+ 	struct of_phandle_args args;
+ 	struct apple_s2r *s2r;
++	bool aura = false;
+ 	u64 mailbox;
+ 	int ret;
+ 
+@@ -4340,10 +4397,13 @@ static int apple_s2r_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, -ENODEV, "warm boot resumes at EL2\n");
+ 
+ 	if (of_property_read_u64(of_chosen, "asahi,s2r-mailbox", &mailbox)) {
+-		if (!bringup_no_fw)
++		if (!of_property_read_u64(of_chosen, "aurora,s2r-mailbox", &mailbox))
++			aura = true;
++		else if (!bringup_no_fw)
+ 			return dev_err_probe(dev, -ENODEV,
+ 					     "boot firmware has no warm boot mailbox\n");
+-		mailbox = 0;
++		else
++			mailbox = 0;
+ 	}
+ 
+ 	s2r = devm_kzalloc(dev, sizeof(*s2r), GFP_KERNEL);
+@@ -4351,14 +4411,35 @@ static int apple_s2r_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 	s2r->dev = dev;
+ 
+-	if (mailbox) {
++	if (mailbox && aura) {
++		u64 magic, mpidr;
++
++		s2r->aura = devm_memremap(dev, mailbox, sizeof(*s2r->aura), MEMREMAP_WB);
++		if (IS_ERR(s2r->aura))
++			return dev_err_probe(dev, PTR_ERR(s2r->aura),
++					     "failed to map aura's warm boot mailbox\n");
++		magic = le64_to_cpu(READ_ONCE(s2r->aura->magic));
++		mpidr = le64_to_cpu(READ_ONCE(s2r->aura->boot_mpidr));
++		if (magic != S2R_AURA_MAGIC)
++			return dev_err_probe(dev, -EINVAL, "bad aura mailbox magic %#llx\n", magic);
++		if (mpidr != cpu_logical_map(0))
++			return dev_err_probe(dev, -EINVAL,
++					     "aura mailbox is for CPU %#llx, not the boot CPU %#llx\n",
++					     mpidr, cpu_logical_map(0));
++		if (warm_flags & S2R_FLAGS_OS)
++			dev_warn(dev, "aura takes no warm boot flags: warm_flags %#lx ignored\n",
++				 warm_flags);
++		ret = apple_s2r_verify_reset_vector(s2r, true);
++		if (ret)
++			return ret;
++	} else if (mailbox) {
+ 		s2r->mailbox = devm_memremap(dev, mailbox,
+ 					     sizeof(*s2r->mailbox), MEMREMAP_WB);
+ 		if (IS_ERR(s2r->mailbox))
+ 			return dev_err_probe(dev, PTR_ERR(s2r->mailbox),
+ 					     "failed to map the warm boot mailbox\n");
+ 
+-		ret = apple_s2r_verify_reset_vector(s2r);
++		ret = apple_s2r_verify_reset_vector(s2r, false);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -4462,9 +4543,9 @@ static int apple_s2r_probe(struct platform_device *pdev)
+ 
+ 	if (apple_s2r_preflight(false))
+ 		dev_info(dev, "suspend-to-RAM not offered: %s\n", apple_s2r_preflight(false));
+-	else if (s2r->mailbox)
+-		dev_info(dev, "suspend-to-RAM available (mailbox at %#llx, reset vector %#llx)%s\n",
+-			 mailbox, s2r->reset_vector,
++	else if (s2r->mailbox || s2r->aura)
++		dev_info(dev, "suspend-to-RAM available (%s mailbox at %#llx, reset vector %#llx)%s\n",
++			 s2r->aura ? "aura" : "m1n1", mailbox, s2r->reset_vector,
+ 			 s2r->timer ? "" : ", without clock/PLL/timer steps");
+ 	else
+ 		dev_warn(dev, "bring-up only: no warm boot mailbox, suspend-to-RAM runs only with abort_before 1-%d\n",
+diff --git a/tools/asahi/run-host-tests.py b/tools/asahi/run-host-tests.py
+index e69db37209..7480b63bbb 100755
+--- a/tools/asahi/run-host-tests.py
++++ b/tools/asahi/run-host-tests.py
+@@ -178,6 +178,10 @@ ASAHI_TESTS = {
+         + mutations('--mutation', ('secs-step', 'secs-base', 'secs-clamp', 'phase-event',
+                                    'phase-early', 'class-loop', 'class-name',
+                                    'crumb-value'), out()),
++    's2r-aura-mailbox-tests.py': [(out(), PASS)]
++        + mutations('--mutation', ('magic-wrong', 'layout-swap', 'aura-first', 'no-magic-check',
++                                   'no-mpidr-check', 'no-lock-check', 'wrong-entry', 'arm-no-clean',
++                                   'wake-no-clear', 'no-refuse', 'cpu-no-aura'), out()),
+     's2r-split-ans-tests.py': [(out(), PASS)]
+         + mutations('--mutation', ('notice-depth', 'depth-seven', 'depth-zero',
+                                    'not-split', 'mode-unknown', 'lowers-real',
+diff --git a/tools/asahi/s2r-aura-mailbox-tests.py b/tools/asahi/s2r-aura-mailbox-tests.py
+new file mode 100755
+index 0000000000..73f0788cdd
+--- /dev/null
++++ b/tools/asahi/s2r-aura-mailbox-tests.py
+@@ -0,0 +1,130 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Check apple-s2r's and apple_cpu's use of aura's warm boot mailbox.
++
++aura (aurora-silicon/aura 30896625) publishes /chosen/aurora,s2r-mailbox: a
++32-byte mailbox of magic "AURAS2R1", boot_mpidr, resume_pa and resumes. The
++boot core takes resume_pa at EL2 with the MMU off, or reboots if it is 0, and
++aura counts the resume. This checks, from the sources, that the kernel's
++struct has aura's layout and magic; that m1n1's mailbox is still preferred
++and aura's taken only without it; that the magic, the boot CPU and a locked
++RVBAR shared by the online cores are checked at probe; that a T8132 sleep arms
++resume_pa with the resume stub and touches m1n1's mailbox only without aura;
++that the wake reads the resume count and clears resume_pa; that aura is
++refused outside the T8132 sequence; and that apple_cpu treats aura's re-entry
++as quiet.
++"""
++import argparse
++from pathlib import Path
++import re
++import struct
++
++ROOT = Path(__file__).resolve().parents[2]
++AURA_FIELDS = ['magic', 'boot_mpidr', 'resume_pa', 'resumes']
++MUTATIONS = {
++    'magic-wrong': ('0x3152325341525541ULL', '0x3152325341525542ULL'),
++    'layout-swap': ('\t__le64 resume_pa;\n\t__le64 resumes;\n', '\t__le64 resumes;\n\t__le64 resume_pa;\n'),
++    'aura-first': ('\tif (of_property_read_u64(of_chosen, "asahi,s2r-mailbox", &mailbox)) {\n'
++                   '\t\tif (!of_property_read_u64(of_chosen, "aurora,s2r-mailbox", &mailbox))',
++                   '\tif (of_property_read_u64(of_chosen, "aurora,s2r-mailbox", &mailbox)) {\n'
++                   '\t\tif (!of_property_read_u64(of_chosen, "asahi,s2r-mailbox", &mailbox))'),
++    'no-magic-check': ('\t\tif (magic != S2R_AURA_MAGIC)\n', '\t\tif (0)\n'),
++    'no-mpidr-check': ('\t\tif (mpidr != cpu_logical_map(0))\n', '\t\tif (0)\n'),
++    'no-lock-check': ('\t\tif (!(val & IMPL_RVBAR_LOCK) || !s2r->reset_vector)\n',
++                      '\t\tif (!s2r->reset_vector)\n'),
++    'wrong-entry': ('cpu_to_le64(__pa_symbol(apple_s2r_t8132_resume)));\n\t\tdcache_clean_poc((unsigned long)s2r->aura',
++                    'cpu_to_le64(__pa_symbol(cpu_resume)));\n\t\tdcache_clean_poc((unsigned long)s2r->aura'),
++    'arm-no-clean': ('\t\tdcache_clean_poc((unsigned long)s2r->aura, (unsigned long)(s2r->aura + 1));\n', ''),
++    'wake-no-clear': ('\t\tWRITE_ONCE(am->resume_pa, 0);\n', ''),
++    'no-refuse': ('\tif (s2r->aura && !t8132_sequence)\n\t\treturn -EOPNOTSUPP;\n', ''),
++    'cpu-no-aura': ('\t\tapple_reentry.mode = APPLE_REENTRY_AURA;\n', ''),
++}
++
++
++def fn_body(src, head):
++    at = src.index(head)
++    return src[at:src.index('\n}\n', at)]
++
++
++def check(s2r, cpu):
++    m = re.search(r'struct apple_s2r_aura_mailbox \{(.*?)\};', s2r, re.S)
++    assert m, 'Assertion failed: no struct apple_s2r_aura_mailbox'
++    fields = re.findall(r'__le64 (\w+);', m.group(1))
++    assert fields == AURA_FIELDS, f'Assertion failed: aura mailbox layout {fields}, want {AURA_FIELDS}'
++    magic = int(re.search(r'#define S2R_AURA_MAGIC\s+(0x[0-9a-fA-F]+)ULL', s2r).group(1), 16)
++    assert struct.pack('<Q', magic) == b'AURAS2R1', f'Assertion failed: magic {magic:#x} is not "AURAS2R1"'
++
++    probe = fn_body(s2r, 'static int apple_s2r_probe(struct platform_device *pdev)')
++    i_m1n1 = probe.find('of_property_read_u64(of_chosen, "asahi,s2r-mailbox", &mailbox)')
++    i_aura = probe.find('of_property_read_u64(of_chosen, "aurora,s2r-mailbox", &mailbox)')
++    assert 0 <= i_m1n1 < i_aura, "Assertion failed: m1n1's mailbox must be looked up first"
++    for need in ('if (magic != S2R_AURA_MAGIC)', 'if (mpidr != cpu_logical_map(0))',
++                 'apple_s2r_verify_reset_vector(s2r, true)', 'apple_s2r_verify_reset_vector(s2r, false)'):
++        assert need in probe, f'Assertion failed: probe lacks {need}'
++
++    ver = fn_body(s2r, 'static int apple_s2r_verify_reset_vector(struct apple_s2r *s2r, bool aura)')
++    assert 'if (!(val & IMPL_RVBAR_LOCK) || !s2r->reset_vector)' in ver, \
++        'Assertion failed: aura needs a locked RVBAR'
++    assert ver.find('s2r->reset_vector = val & IMPL_RVBAR_ADDR;') < ver.find('ret = apple_s2r_check_rvbar(s2r, cpu);'), \
++        'Assertion failed: every online core must be checked against the vector read'
++
++    fin = fn_body(s2r, 'static int apple_s2r_t8132_finish(unsigned long arg)')
++    arm = fin[fin.index('\tif (s2r->aura) {'):fin.index('writel(S2R_TIMER_START, t->commit);')]
++    aura_part, _, m1n1_part = arm.partition('\t} else {')
++    assert 'WRITE_ONCE(s2r->aura->resume_pa,\n\t\t\t   cpu_to_le64(__pa_symbol(apple_s2r_t8132_resume)));' in aura_part, \
++        'Assertion failed: resume_pa must be the T8132 resume stub'
++    assert 'dcache_clean_poc((unsigned long)s2r->aura, (unsigned long)(s2r->aura + 1));' in aura_part, \
++        'Assertion failed: the armed mailbox must be cleaned to the PoC'
++    assert 's2r->aura_resumes = le64_to_cpu(READ_ONCE(s2r->aura->resumes));' in aura_part, \
++        'Assertion failed: the resume count must be read before the commit'
++    assert 'mb->' not in aura_part and 'mb->magic' in m1n1_part, \
++        "Assertion failed: m1n1's mailbox may only be written without aura"
++
++    wake = fn_body(s2r, 'static void apple_s2r_wake(void)')
++    aw = wake[wake.index('} else if (s2r->aura) {'):]
++    for need in ('dcache_clean_inval_poc((unsigned long)am', 'if (le64_to_cpu(READ_ONCE(am->resumes)) != s2r->aura_resumes)',
++                 'WRITE_ONCE(am->resume_pa, 0);'):
++        assert need in aw, f'Assertion failed: the wake lacks {need}'
++
++    pre = s2r[s2r.index('\t/* aura\'s mailbox is used on the T8132 sequence only */'):]
++    assert pre.startswith("\t/* aura's mailbox is used on the T8132 sequence only */\n"
++                          '\tif (s2r->aura && !t8132_sequence)\n\t\treturn -EOPNOTSUPP;\n'), \
++        'Assertion failed: aura must be refused outside the T8132 sequence'
++
++    assert 'APPLE_REENTRY_AURA,' in cpu, 'Assertion failed: no APPLE_REENTRY_AURA'
++    init = fn_body(cpu, 'static int __init apple_cpu_reentry_init(void)')
++    i_c1 = init.find('"asahi,s2r-mailbox"')
++    i_c2 = init.find('"aurora,s2r-mailbox"')
++    assert 0 <= i_c1 < i_c2 and 'apple_reentry.mode = APPLE_REENTRY_AURA;' in init, \
++        'Assertion failed: apple_cpu must take aura after m1n1 and mark it quiet'
++    quiet = fn_body(cpu, 'static void apple_reentry_quiet(void)')
++    assert 'case APPLE_REENTRY_AURA:' in quiet, 'Assertion failed: quiet() must know aura'
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--out', type=Path)
++    parser.add_argument('--mutation', choices=MUTATIONS)
++    args = parser.parse_args()
++    s2r = (ROOT / 'drivers/soc/apple/apple-s2r.c').read_text()
++    cpu = (ROOT / 'arch/arm64/kernel/apple_cpu.c').read_text()
++    if args.mutation:
++        old, new = MUTATIONS[args.mutation]
++        if old in s2r:
++            s2r = s2r.replace(old, new, 1)
++        else:
++            assert old in cpu, f'missing mutation site: {old}'
++            cpu = cpu.replace(old, new, 1)
++    try:
++        check(s2r, cpu)
++    except (AssertionError, ValueError, AttributeError) as e:
++        print(e if str(e).startswith('Assertion') else f'Assertion failed: {e}')
++        raise SystemExit(1)
++    line = "s2r aura mailbox: layout and magic as aura's, m1n1 first, armed with the T8132 stub, counted at the wake, quiet re-entry"
++    if args.out:
++        args.out.write_text(line + '\n')
++    print(line)
++
++
++if __name__ == '__main__':
++    main()
+-- 
+2.43.0
+

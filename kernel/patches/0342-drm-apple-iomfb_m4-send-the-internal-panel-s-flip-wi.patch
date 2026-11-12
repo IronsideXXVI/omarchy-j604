@@ -1,0 +1,682 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 22:25:05 +0000
+Subject: [PATCH 342/353] drm/apple: iomfb_m4: send the internal panel's flip
+ with its swap's completion
+
+The internal panel's present waited inside the atomic commit for the
+swap's own completion (D590), 3.3 ms after the firmware accepted it
+(A407) on average, most of it the wait for the panel's next tick, and
+the flip event then said refresh 0 and the time the commit returned:
+the driver never calls drm_vblank_init().
+
+The commit now returns once the firmware has accepted the swap. The
+swap waits in one slot (r->int_fl, the external path's hand-off at
+depth 1) until its D590, which puts its frame on screen and sends the
+flip event, stamped with the time the D590 arrived (taken in the
+mailbox receive path for every word) and with the panel's refresh
+count: the last one plus the refreshes since the previous flip at the
+running rate.
+
+The flip still comes no earlier than the D590. DRM hands the previous
+framebuffer back to the compositor with it, and that framebuffer is
+scanned out until the D590: it stays dcp->active_fb, referenced, until
+the D590 promotes the new frame, and only then is the event sent. A
+D590 that says the frame was not displayed keeps every frame that may
+still be on screen (lost_fb, extra_fb) until a displayed one retires
+them.
+
+At most one internal swap is open: every host call of our own (the
+next swap's A406, a blank, a power state, a mode set, an idle-cache or
+power-gate call) first waits for the open swap's D590, as the commit
+did before. A D590 that does not come within 5 s fails the session as
+it did, with the flip sent as lost. Framebuffers retired by a D590 are
+put by a work item, outside the lock. The idle worker that handles a
+D590 nobody waits for runs at high priority on the internal DCP.
+
+XDR probe swaps keep the synchronous path (their given-up rule needs
+the D590 in the commit), as do blanks and brightness-only swaps.
+swap_pace is unchanged; its base is now the D590's arrival.
+
+The m4tl present timeline gains ret_cnt (when the present returned),
+appended to each line; flip_cnt / flip_ns are when the flip was sent.
+
+int_async_flip=N restores the synchronous path from the next frame.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/gpu/drm/apple/dcp.c      |  29 +++
+ drivers/gpu/drm/apple/dcp.h      |   1 +
+ drivers/gpu/drm/apple/iomfb.c    |   5 +-
+ drivers/gpu/drm/apple/iomfb_m4.c | 372 ++++++++++++++++++++++++++++++-
+ 4 files changed, 395 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index 5e3d077741..e13e4814f7 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -633,6 +633,35 @@ static void dcp_crtc_send_page_flip_event(struct apple_crtc *crtc,
+ 	send_vblank_event(dev, e, seq, flip);
+ }
+ 
++/*
++ * The pending flip event of @crtc, with the refresh count @seq and the time
++ * @when its frame went on screen (CLOCK_MONOTONIC), for a driver without
++ * drm_vblank_init(), whose events would say 0 and the time of sending.
++ */
++void dcp_drm_crtc_vblank_at(struct apple_crtc *crtc, u64 seq, ktime_t when)
++{
++	struct drm_device *dev = crtc->base.dev;
++	struct drm_pending_vblank_event *e;
++	unsigned long flags;
++
++	spin_lock_irqsave(&dev->event_lock, flags);
++	e = crtc->event;
++	crtc->event = NULL;
++	if (e) {
++		e->pipe = drm_crtc_index(&crtc->base);
++		if (e->event.base.type == DRM_EVENT_FLIP_COMPLETE ||
++		    e->event.base.type == DRM_EVENT_VBLANK) {
++			struct timespec64 tv = ktime_to_timespec64(when);
++
++			e->event.vbl.sequence = seq;
++			e->event.vbl.tv_sec = tv.tv_sec;
++			e->event.vbl.tv_usec = tv.tv_nsec / 1000;
++		}
++		drm_send_event_timestamp_locked(dev, &e->base, when);
++	}
++	spin_unlock_irqrestore(&dev->event_lock, flags);
++}
++
+ /* HACK: moved here to avoid circular dependency between apple_drv and dcp */
+ void dcp_drm_crtc_vblank(struct apple_crtc *crtc)
+ {
+diff --git a/drivers/gpu/drm/apple/dcp.h b/drivers/gpu/drm/apple/dcp.h
+index 76dd655eb6..ed506393bb 100644
+--- a/drivers/gpu/drm/apple/dcp.h
++++ b/drivers/gpu/drm/apple/dcp.h
+@@ -90,6 +90,7 @@ void dcp_release_all_retained_framebuffers(struct apple_dcp *dcp);
+ bool dcp_is_initialized(struct platform_device *pdev);
+ void apple_crtc_vblank(struct apple_crtc *apple);
+ void dcp_drm_crtc_vblank(struct apple_crtc *crtc);
++void dcp_drm_crtc_vblank_at(struct apple_crtc *crtc, u64 seq, ktime_t when);
+ void dcp_drm_crtc_error(struct apple_crtc *crtc,
+ 			struct drm_crtc_state *state, int error);
+ void dcp_drm_crtc_flip_lost(struct apple_crtc *crtc,
+diff --git a/drivers/gpu/drm/apple/iomfb.c b/drivers/gpu/drm/apple/iomfb.c
+index 1e61730ce3..fff8ec2917 100644
+--- a/drivers/gpu/drm/apple/iomfb.c
++++ b/drivers/gpu/drm/apple/iomfb.c
+@@ -3367,9 +3367,10 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
+ 			ret = obj ? iomfb_m4_present(dcp, plane->fb, obj->dma_addr,
+ 						       obj->base.size) : -EINVAL;
+ 		}
+-		if (ret)
++		/* 1: the frame's flip goes with its D590 (iomfb_m4 int_async_flip). */
++		if (ret < 0)
+ 			dcp_drm_crtc_error(to_apple_crtc(crtc), new, -EIO);
+-		else
++		else if (!ret)
+ 			dcp_drm_crtc_vblank(to_apple_crtc(crtc));
+ 		return;
+ 	}
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 050cea42dc..101c343bea 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -181,6 +181,11 @@ module_param(swap_timestamps, bool, 0644);
+ MODULE_PARM_DESC(swap_timestamps,
+ 		 "J604: stamp presents with the swap timing words so the 120 Hz panel shows them at 120 Hz, not 60 Hz (default: on; applies from the next swap; J713: no effect)");
+ 
++static bool int_async_flip = true;
++module_param(int_async_flip, bool, 0644);
++MODULE_PARM_DESC(int_async_flip,
++		 "J604: an internal-panel commit returns once the firmware accepted its swap (A407), and its flip event goes with the swap's completion (D590), stamped with the D590's arrival and the panel's refresh count (default: on; off: the commit waits for the D590 itself, as before; from the next frame)");
++
+ static unsigned int swap_target;
+ module_param(swap_target, uint, 0644);
+ MODULE_PARM_DESC(swap_target,
+@@ -392,6 +397,18 @@ struct iomfb_m4 {
+ 	/* Exact completed successor or blank is the only framebuffer retirement. */
+ 	struct drm_framebuffer *active_fb;
+ 	struct drm_framebuffer *uncertain_fb;
++	/*
++	 * int_async_flip: a frame a D590 said was NOT displayed leaves the one
++	 * before it on screen (active_unshown: the active one was not shown);
++	 * extra_fb keeps a third that may be on screen. Framebuffers retired by
++	 * a D590 are put by retire_work, outside the lock (retire_lock).
++	 */
++	bool active_unshown;
++	struct drm_framebuffer *extra_fb;
++	spinlock_t retire_lock;	/* retire_q, retire_n */
++	struct drm_framebuffer *retire_q[8];
++	unsigned int retire_n;
++	struct work_struct retire_work;
+ 	/*
+ 	 * The frame of an XDR probe given up, the session kept: on screen or
+ 	 * not, as the one before it, until the next confirmed swap retires both.
+@@ -1155,9 +1172,11 @@ struct dcp_m4_prec {
+ 	u64 start_cnt;
+ 	u64 reply_cnt;
+ 	u64 done_cnt;
+-	/* counter and CLOCK_MONOTONIC ns when the present returned */
++	/* counter and CLOCK_MONOTONIC ns when the flip event was sent */
+ 	u64 flip_cnt;
+ 	s64 flip_ns;
++	/* counter when the present returned to the commit (int_async_flip: after A407) */
++	u64 ret_cnt;
+ };
+ 
+ #define DCP_M4_PREC_N		256
+@@ -1226,6 +1245,29 @@ struct dcp_m4_runtime {
+ 	u32 level;
+ 	/* The internal panel's last D590, and whether it said displayed. */
+ 	bool int_shown_valid, int_shown;
++	/* When the last internal D590 arrived (CLOCK_MONOTONIC) */
++	ktime_t int_done_kt;
++	/*
++	 * int_async_flip: the one internal swap accepted (A407 answered) whose
++	 * D590 has not been handled, with the frame it puts on screen; the
++	 * present asking for it (int_async_req, the framebuffer it holds), and
++	 * whether the last one went so; the refresh count of the last flip and
++	 * when it came; counts for debugfs.
++	 */
++	struct {
++		struct dcp_m4_swap_state swap;
++		struct drm_framebuffer *fb;
++		struct dcp_m4_frame frame;
++		unsigned long deadline;
++		bool open;
++	} int_fl;
++	struct delayed_work int_fl_work;
++	bool int_async_req, int_async_used;
++	struct drm_framebuffer *int_async_fb;
++	struct dcp_m4_frame int_async_frame;
++	u64 seq_last;
++	ktime_t seq_last_kt;
++	u64 int_async_flips, int_async_unshown, int_async_lost, int_async_settled;
+ 	/*
+ 	 * The next internal swap is an XDR probe (iomfb_m4_swap()), how it was
+ 	 * given up if it was (dcp_m4_int_swap_give_up()), and the probes given
+@@ -1242,6 +1284,11 @@ struct dcp_m4_runtime {
+ 	int queue_gen[32];
+ 	/* ... and the PM epoch it was received in (ext_pm_epoch) */
+ 	int queue_pm[32];
++	/* ... and the counter and CLOCK_MONOTONIC time it arrived at */
++	u64 queue_cnt[32];
++	ktime_t queue_kt[32];
++	u64 word_cnt;
++	ktime_t word_kt;
+ 	/* ... of the word last taken, and of the callback being handled */
+ 	int word_gen, cb_gen;
+ 	int word_pm, cb_pm;
+@@ -1424,6 +1471,9 @@ static void dcp_m4_runtime_receive(struct iomfb_m4 *dcp, u64 word)
+ 			atomic_read(&dcp->ext_pm_epoch);
+ 		r->queue_gen[(r->head + r->count) % ARRAY_SIZE(r->queue)] =
+ 			atomic_read(&dcp->ext_sink_gen);
++		r->queue_cnt[(r->head + r->count) % ARRAY_SIZE(r->queue)] =
++			__arch_counter_get_cntpct();
++		r->queue_kt[(r->head + r->count) % ARRAY_SIZE(r->queue)] = ktime_get();
+ 		r->queue[(r->head + r->count++) % ARRAY_SIZE(r->queue)] = word;
+ 		complete(&r->received);
+ 	}
+@@ -1464,6 +1514,8 @@ static int dcp_m4_runtime_next(struct dcp_m4_runtime *r, u64 *word, bool wait)
+ 	if (!ret) {
+ 		r->word_gen = r->queue_gen[r->head % ARRAY_SIZE(r->queue)];
+ 		r->word_pm = r->queue_pm[r->head % ARRAY_SIZE(r->queue)];
++		r->word_cnt = r->queue_cnt[r->head % ARRAY_SIZE(r->queue)];
++		r->word_kt = r->queue_kt[r->head % ARRAY_SIZE(r->queue)];
+ 		*word = r->queue[r->head++ % ARRAY_SIZE(r->queue)];
+ 		r->count--;
+ 	}
+@@ -1931,6 +1983,213 @@ static void dcp_m4_pace_learn(struct dcp_m4_runtime *r)
+ 	}
+ }
+ 
++static int dcp_m4_runtime_callback(struct dcp_m4_runtime *r, u64 word);
++static int dcp_m4_runtime_drain(struct dcp_m4_runtime *r, unsigned int budget);
++static u32 dcp_m4_live_rate(struct dcp_m4_runtime *r);
++
++/*
++ * int_async_flip. The internal panel's present returns once the firmware has
++ * accepted its swap (A407); the swap waits in r->int_fl, at most one, until
++ * its D590, which puts its frame on screen and sends the flip event. The
++ * previous frame stays dcp->active_fb, referenced, until then: it is scanned
++ * out until the D590, and DRM hands it back to the compositor with the flip
++ * event, so it is handed back only once off screen. Every other host call
++ * first waits for that D590 (dcp_m4_int_settle()), so the firmware never has
++ * two internal swaps open, as with the synchronous path.
++ */
++
++/* Framebuffers retired by a D590, put outside dcp->lock. */
++static void iomfb_m4_retire_work(struct work_struct *work)
++{
++	struct iomfb_m4 *dcp = container_of(work, struct iomfb_m4, retire_work);
++	struct drm_framebuffer *q[ARRAY_SIZE(dcp->retire_q)];
++	unsigned int n, i;
++
++	spin_lock_irq(&dcp->retire_lock);
++	n = dcp->retire_n;
++	memcpy(q, dcp->retire_q, n * sizeof(*q));
++	dcp->retire_n = 0;
++	spin_unlock_irq(&dcp->retire_lock);
++	for (i = 0; i < n; i++)
++		drm_framebuffer_put(q[i]);
++}
++
++/* False when the queue is full: the caller keeps the reference. */
++static bool iomfb_m4_retire(struct iomfb_m4 *dcp, struct drm_framebuffer *fb)
++{
++	bool queued = true;
++
++	if (!fb)
++		return true;
++	spin_lock_irq(&dcp->retire_lock);
++	if (dcp->retire_n < ARRAY_SIZE(dcp->retire_q))
++		dcp->retire_q[dcp->retire_n++] = fb;
++	else
++		queued = false;
++	spin_unlock_irq(&dcp->retire_lock);
++	if (queued)
++		schedule_work(&dcp->retire_work);
++	else
++		dev_warn_ratelimited(dcp->dev, "retire queue full: a framebuffer kept until teardown\n");
++	return queued;
++}
++
++/*
++ * The panel's refresh count at @t: the last one plus the refreshes since the
++ * last flip at the running rate, at least one more. Counted from flip to
++ * flip, so that rounding never accumulates.
++ */
++static u64 dcp_m4_int_seq(struct dcp_m4_runtime *r, ktime_t t)
++{
++	u32 rate = dcp_m4_live_rate(r);
++	u64 period = rate ? div_u64((u64)NSEC_PER_SEC << 16, rate) : 0;
++	u64 n = 1;
++
++	if (period && r->seq_last_kt && ktime_after(t, r->seq_last_kt))
++		n = max_t(u64, 1, div64_u64(ktime_to_ns(ktime_sub(t, r->seq_last_kt)) +
++					      period / 2, period));
++	r->seq_last += n;
++	r->seq_last_kt = t;
++	return r->seq_last;
++}
++
++/*
++ * The open swap's D590 is in (dcp->lock held): its frame is on screen, or the
++ * firmware kept the one before (D590 +0x4 = 0). Promote it, keep every frame
++ * that may still be on screen, retire the rest, and send the flip event.
++ */
++static void dcp_m4_int_flight_finish(struct dcp_m4_runtime *r)
++{
++	struct iomfb_m4 *dcp = r->dcp;
++	struct apple_crtc *crtc = READ_ONCE(dcp->owner->crtc);
++	bool shown = !r->int_shown_valid || r->int_shown;
++	struct drm_framebuffer *old = dcp->active_fb;
++	ktime_t t = r->int_done_kt ?: ktime_get();
++
++	r->int_fl.open = false;
++	cancel_delayed_work(&r->int_fl_work);
++	if (shown) {
++		if (!iomfb_m4_retire(dcp, old))
++			old = NULL;
++		if (iomfb_m4_retire(dcp, dcp->lost_fb))
++			dcp->lost_fb = NULL;
++		if (iomfb_m4_retire(dcp, dcp->extra_fb))
++			dcp->extra_fb = NULL;
++		dcp->active_unshown = false;
++	} else {
++		/* What is on screen: the last displayed frame, kept. */
++		r->int_async_unshown++;
++		dev_info_ratelimited(dcp->dev, "swap %u: its D590 says not displayed: the frame on screen stays\n",
++				     r->int_fl.swap.id);
++		if (dcp->active_unshown)
++			iomfb_m4_retire(dcp, old);
++		else if (!dcp->lost_fb)
++			dcp->lost_fb = old;
++		else if (!dcp->extra_fb)
++			dcp->extra_fb = old;
++		else
++			dcp->uncertain_fb = old;
++		dcp->active_unshown = true;
++	}
++	dcp->active_fb = r->int_fl.fb;
++	dcp->active_frame = r->int_fl.frame;
++	r->int_fl.fb = NULL;
++	dcp->flips++;
++	r->int_async_flips++;
++	if (r->prec_cur.reply_cnt && r->prec_cur.id == r->int_fl.swap.id) {
++		r->prec_cur.done_cnt = READ_ONCE(r->int_done_cnt);
++		r->prec_cur.flip_cnt = __arch_counter_get_cntpct();
++		r->prec_cur.flip_ns = ktime_get_ns();
++		r->prec[r->prec_count++ % DCP_M4_PREC_N] = r->prec_cur;
++		r->prec_cur.start_cnt = 0;
++		r->prec_cur.reply_cnt = 0;
++	}
++	if (crtc)
++		dcp_drm_crtc_vblank_at(crtc, dcp_m4_int_seq(r, t), t);
++}
++
++static int dcp_m4_int_flight_done(struct dcp_m4_runtime *r)
++{
++	int ret = dcp_m4_swap_record_done(&r->int_fl.swap, r->int_fl.swap.id);
++
++	if (!ret && dcp_m4_swap_take_completion(&r->int_fl.swap) != 1)
++		ret = -EPROTO;
++	if (ret)
++		return ret;
++	dcp_m4_int_flight_finish(r);
++	return 0;
++}
++
++/*
++ * The open swap's D590 never came (its deadline), or the session failed: as
++ * the synchronous path would, the session fails; both frames are kept (no
++ * release receipt for either), and the flip is sent as lost.
++ */
++static void dcp_m4_int_flight_lost(struct dcp_m4_runtime *r, int error)
++{
++	struct iomfb_m4 *dcp = r->dcp;
++	struct apple_crtc *crtc = READ_ONCE(dcp->owner->crtc);
++
++	if (!r->int_fl.open)
++		return;
++	r->int_fl.open = false;
++	r->int_async_lost++;
++	cancel_delayed_work(&r->int_fl_work);
++	if (!dcp->uncertain_fb)
++		dcp->uncertain_fb = r->int_fl.fb;
++	else if (!dcp->extra_fb)
++		dcp->extra_fb = r->int_fl.fb;
++	r->int_fl.fb = NULL;
++	dev_err(dcp->dev, "swap %u: no D590 after its A407: %d\n", r->int_fl.swap.id, error);
++	if (crtc)
++		dcp_drm_crtc_error(crtc, NULL, error);
++	dcp_m4_swap_fail(&r->int_fl.swap, error);
++	dcp_m4_transaction_fail(&dcp->transaction, error);
++	dcp_m4_failed(dcp, error);
++}
++
++/* Before any other host call: the open swap's D590, or its deadline. */
++static int dcp_m4_int_settle(struct dcp_m4_runtime *r)
++{
++	unsigned long deadline = r->deadline, limit = r->limit;
++	u64 word;
++	int ret = 0;
++
++	r->int_async_settled++;
++	r->deadline = r->int_fl.deadline;
++	r->limit = 0;
++	while (!ret && r->int_fl.open) {
++		ret = dcp_m4_runtime_next(r, &word, true);
++		if (!ret)
++			ret = dcp_m4_runtime_callback(r, word);
++	}
++	r->deadline = deadline;
++	r->limit = limit;
++	if (ret)
++		dcp_m4_int_flight_lost(r, ret);
++	return ret;
++}
++
++/* The open swap at its deadline: words already in first, then given up. */
++static void dcp_m4_int_fl_work(struct work_struct *work)
++{
++	struct dcp_m4_runtime *r = container_of(to_delayed_work(work), struct dcp_m4_runtime,
++						int_fl_work);
++	struct iomfb_m4 *dcp = r->dcp;
++	int ret;
++
++	mutex_lock(&dcp->lock);
++	if (r->int_fl.open) {
++		ret = READ_ONCE(dcp->error) ?: dcp_m4_runtime_drain(r, 32);
++		if (r->int_fl.open && (ret < 0 || time_after_eq(jiffies, r->int_fl.deadline)))
++			dcp_m4_int_flight_lost(r, ret < 0 ? ret : -ETIMEDOUT);
++		else if (r->int_fl.open)
++			queue_delayed_work(r->wq, &r->int_fl_work,
++					   max_t(long, (long)(r->int_fl.deadline - jiffies), 1));
++	}
++	mutex_unlock(&dcp->lock);
++}
++
+ static int dcp_m4_runtime_swap_done(void *cookie, u32 id)
+ {
+ 	struct dcp_m4_runtime *r = cookie;
+@@ -1941,8 +2200,12 @@ static int dcp_m4_runtime_swap_done(void *cookie, u32 id)
+ 		/* The late D590 of a probe given up is not this swap's. */
+ 		if (dcp_m4_int_late_d590(r, id))
+ 			return 0;
+-		WRITE_ONCE(r->int_done_cnt, __arch_counter_get_cntpct());
++		/* When it arrived, not when it is handled: the stamp of the flip. */
++		WRITE_ONCE(r->int_done_cnt, r->word_cnt ?: __arch_counter_get_cntpct());
++		r->int_done_kt = r->word_kt ?: ktime_get();
+ 		dcp_m4_pace_learn(r);
++		if (r->int_fl.open && id == r->int_fl.swap.id)
++			return dcp_m4_int_flight_done(r);
+ 		return dcp_m4_swap_record_done(&r->swap, id);
+ 	}
+ 	r->ext_done.valid = false;
+@@ -2656,6 +2919,15 @@ finished:
+ static int dcp_m4_runtime_call(void *cookie, unsigned int method, bool remote,
+ 			       const void *input, u32 input_size, void *output, u32 output_size)
+ {
++	struct dcp_m4_runtime *r = cookie;
++
++	/* No host call while an internal swap is open: its D590 first. */
++	if (!remote && r->int_fl.open) {
++		int ret = dcp_m4_int_settle(r);
++
++		if (ret)
++			return ret;
++	}
+ 	return dcp_m4_runtime_call_stream(cookie, method, 0, remote, input, input_size,
+ 					  output, output_size);
+ }
+@@ -3068,6 +3340,31 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
+ 		r->prec_cur.reply_cnt = __arch_counter_get_cntpct();
+ 		r->prec_cur.id = id;
+ 	}
++	/*
++	 * int_async_flip: an accepted client frame (not a blank, a probe, an
++	 * intent or an upper-only swap) does not wait for its D590 here: it
++	 * waits in r->int_fl, and its flip goes with the D590
++	 * (dcp_m4_int_flight_finish()), or at once if that came first.
++	 */
++	if (!ret && !ext && primary && frame && !upper && !intent && !r->int_probe &&
++	    r->int_async_req && !r->int_fl.open) {
++		ret = dcp_m4_swap_hand_off(&r->swap, &r->int_fl.swap);
++		if (!ret) {
++			r->deadline = 0;
++			kfree(input);
++			r->int_fl.fb = r->int_async_fb;
++			r->int_fl.frame = r->int_async_frame;
++			r->int_fl.deadline = jiffies + msecs_to_jiffies(5000);
++			r->int_fl.open = true;
++			r->int_async_used = true;
++			if (r->int_fl.swap.completed) {
++				r->int_fl.swap.completed = false;
++				return dcp_m4_int_flight_done(r);
++			}
++			queue_delayed_work(r->wq, &r->int_fl_work, msecs_to_jiffies(5000));
++			return 0;
++		}
++	}
+ 	/*
+ 	 * A direct swap does not wait for its D590: it joins the swaps in flight
+ 	 * and is tracked there (r->swap may begin the next one) until its D590,
+@@ -3243,6 +3540,7 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
+ 	/* No direct swap going out. */
+ 	r->ext_swap_win = -1;
+ 	INIT_DELAYED_WORK(&r->ext_async_work, dcp_m4_ext_async_work);
++	INIT_DELAYED_WORK(&r->int_fl_work, dcp_m4_int_fl_work);
+ 	init_completion(&r->received);
+ 	INIT_WORK(&r->idle, dcp_m4_runtime_idle);
+ 	/*
+@@ -3250,8 +3548,12 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
+ 	 * not handled across system sleep: its queue is frozen with the tasks,
+ 	 * before the DARTs suspend and until after they resume.
+ 	 */
+-	r->wq = alloc_ordered_workqueue("iomfb-v26-6",
+-					WQ_MEM_RECLAIM | (dcp->external ? WQ_FREEZABLE : 0));
++	/*
++	 * The internal panel's idle worker handles the D590 that sends a flip
++	 * (int_async_flip): at high priority, so that the event is not late.
++	 */
++	r->wq = alloc_ordered_workqueue("iomfb-v26-6", WQ_MEM_RECLAIM |
++					(dcp->external ? WQ_FREEZABLE : WQ_HIGHPRI));
+ 	if (!r->wq) {
+ 		ret = -ENOMEM;
+ 		goto failed;
+@@ -3553,6 +3855,8 @@ int iomfb_m4_init(struct apple_dcp *owner)
+ 	init_waitqueue_head(&dcp->ext_settle_wq);
+ 	INIT_DELAYED_WORK(&dcp->idle_cache, iomfb_m4_idle_cache_work);
+ 	INIT_DELAYED_WORK(&dcp->gate_work, iomfb_m4_gate_work);
++	spin_lock_init(&dcp->retire_lock);
++	INIT_WORK(&dcp->retire_work, iomfb_m4_retire_work);
+ 	if (!request_mem_region(res->start, resource_size(res), dev_name(dev))) {
+ 		ret = -EBUSY;
+ 		goto release;
+@@ -5072,8 +5376,9 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+ 		     dma_addr_t dva, size_t mapped)
+ {
+ 	struct iomfb_m4 *dcp = owner->v26_6;
+-	struct drm_framebuffer *retire = NULL, *retire_lost = NULL;
++	struct drm_framebuffer *retire = NULL, *retire_lost = NULL, *retire_extra = NULL;
+ 	enum dcp_m4_frame_format format;
++	struct dcp_m4_runtime *r;
+ 	struct dcp_m4_frame frame;
+ 	u64 now;
+ 	int ret;
+@@ -5116,7 +5421,36 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+ 		goto out;
+ 	/* Keep the source before the first work descriptor can become visible. */
+ 	drm_framebuffer_get(fb);
++	r = dcp->runtime;
++	r->int_async_req = READ_ONCE(int_async_flip) && READ_ONCE(owner->crtc);
++	r->int_async_fb = fb;
++	r->int_async_frame = frame;
++	r->int_async_used = false;
+ 	ret = iomfb_m4_swap(dcp, &frame);
++	r->int_async_req = false;
++	r->int_async_fb = NULL;
++	if (r->int_async_used) {
++		/*
++		 * The slot holds the frame; its D590 promotes it and sends the
++		 * flip (maybe already). A failure after the hand-off fails the
++		 * session; the slot's flip goes as lost then.
++		 */
++		now = ktime_get_ns();
++		if (dcp->last_flip_ns)
++			dcp->flip_interval_ns = now - dcp->last_flip_ns;
++		dcp->last_flip_ns = now;
++		if (dcp->swap_carried)
++			dcp->brightness_carried++;
++		if (r->prec_cur.reply_cnt)
++			r->prec_cur.ret_cnt = __arch_counter_get_cntpct();
++		else if (r->prec_count)
++			r->prec[(r->prec_count - 1) % DCP_M4_PREC_N].ret_cnt =
++				__arch_counter_get_cntpct();
++		if (!ret)
++			iomfb_m4_idle_cache_kick(dcp);
++		mutex_unlock(&dcp->lock);
++		return ret ?: 1;
++	}
+ 	if (ret && dcp->runtime->int_given_up) {
+ 		/*
+ 		 * An XDR probe given up, the session kept: this frame may be on
+@@ -5136,7 +5470,10 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+ 	}
+ 	retire = dcp->active_fb;
+ 	retire_lost = dcp->lost_fb;
++	retire_extra = dcp->extra_fb;
+ 	dcp->lost_fb = NULL;
++	dcp->extra_fb = NULL;
++	dcp->active_unshown = false;
+ 	dcp->active_fb = fb;
+ 	dcp->active_frame = frame;
+ 	dcp->flips++;
+@@ -5154,6 +5491,7 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+ 		if (!p->flip_cnt) {
+ 			p->flip_cnt = __arch_counter_get_cntpct();
+ 			p->flip_ns = ktime_get_ns();
++			p->ret_cnt = p->flip_cnt;
+ 		}
+ 	}
+ 	iomfb_m4_idle_cache_kick(dcp);
+@@ -5163,13 +5501,15 @@ out:
+ 		drm_framebuffer_put(retire);
+ 	if (retire_lost)
+ 		drm_framebuffer_put(retire_lost);
++	if (retire_extra)
++		drm_framebuffer_put(retire_extra);
+ 	return ret;
+ }
+ 
+ int iomfb_m4_blank(struct apple_dcp *owner)
+ {
+ 	struct iomfb_m4 *dcp = owner->v26_6;
+-	struct drm_framebuffer *retire = NULL, *retire_lost = NULL;
++	struct drm_framebuffer *retire = NULL, *retire_lost = NULL, *retire_extra = NULL;
+ 	int ret;
+ 
+ 	if (!dcp || !dcp->runtime)
+@@ -5188,8 +5528,11 @@ int iomfb_m4_blank(struct apple_dcp *owner)
+ 	} else {
+ 		retire = dcp->active_fb;
+ 		retire_lost = dcp->lost_fb;
++		retire_extra = dcp->extra_fb;
+ 		dcp->active_fb = NULL;
+ 		dcp->lost_fb = NULL;
++		dcp->extra_fb = NULL;
++		dcp->active_unshown = false;
+ 		memset(&dcp->active_frame, 0, sizeof(dcp->active_frame));
+ 		dcp->blanks++;
+ 		/*
+@@ -5218,6 +5561,8 @@ int iomfb_m4_blank(struct apple_dcp *owner)
+ 		drm_framebuffer_put(retire);
+ 	if (retire_lost)
+ 		drm_framebuffer_put(retire_lost);
++	if (retire_extra)
++		drm_framebuffer_put(retire_extra);
+ 	return ret;
+ }
+ 
+@@ -7772,8 +8117,14 @@ void iomfb_m4_quiesce(struct apple_dcp *owner)
+ 	/* Wake any RPC waiter before waiting for workers; never recycle its DMA. */
+ 	dcp_m4_failed(dcp, -ENODEV);
+ 	cancel_delayed_work_sync(&dcp->backlight_work);
+-	if (dcp->runtime)
++	if (dcp->runtime) {
++		mutex_lock(&dcp->lock);
++		dcp_m4_int_flight_lost(dcp->runtime, -ENODEV);
++		mutex_unlock(&dcp->lock);
++		cancel_delayed_work_sync(&dcp->runtime->int_fl_work);
+ 		flush_workqueue(dcp->runtime->wq);
++	}
++	flush_work(&dcp->retire_work);
+ 	/* After the flush, as drained callbacks can queue it. */
+ 	cancel_delayed_work_sync(&dcp->idle_cache);
+ 	cancel_delayed_work_sync(&dcp->gate_work);
+@@ -7929,13 +8280,14 @@ static int iomfb_m4_present_show(struct seq_file *s, void *unused)
+ 	mutex_unlock(&dcp->lock);
+ 
+ 	seq_printf(s, "frq %llu presents %llu\n", (u64)arch_timer_get_cntfrq(), count);
+-	seq_puts(s, "# id pace_us start_cnt reply_cnt done_cnt flip_cnt flip_ns\n");
++	seq_puts(s, "# id pace_us start_cnt reply_cnt done_cnt flip_cnt flip_ns ret_cnt\n");
+ 	first = count > DCP_M4_PREC_N ? count - DCP_M4_PREC_N : 0;
+ 	for (i = first; i < count; i++) {
+ 		struct dcp_m4_prec *p = &snap[i % DCP_M4_PREC_N];
+ 
+-		seq_printf(s, "%u %u %llu %llu %llu %llu %lld\n", p->id, p->pace_us, p->start_cnt,
+-			   p->reply_cnt, p->done_cnt, p->flip_cnt, p->flip_ns);
++		seq_printf(s, "%u %u %llu %llu %llu %llu %lld %llu\n", p->id, p->pace_us,
++			   p->start_cnt, p->reply_cnt, p->done_cnt, p->flip_cnt, p->flip_ns,
++			   p->ret_cnt);
+ 	}
+ 	first = d590_count > 2 ? d590_count - 2 : 0;
+ 	for (i = first; i < d590_count; i++) {
+-- 
+2.43.0
+

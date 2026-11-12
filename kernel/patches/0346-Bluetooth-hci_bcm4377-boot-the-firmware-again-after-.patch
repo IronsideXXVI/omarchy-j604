@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 02:41:20 +0000
+Subject: [PATCH 346/353] Bluetooth: hci_bcm4377: boot the firmware again after
+ a sleep cut power
+
+A T8132 deep sleep powers the J604's APCIe block down, and with it the
+BCM4388. If the controller comes back in its boot ROM, firmware gone,
+bcm4377_resume_noirq() restores the private BAR windows, but resume then
+unquiesces nothing and sends its resume commands into rings the
+controller no longer has. They time out, and the reset that follows
+refuses on this radio ("controller recovery requires a platform reboot"),
+because no DMA-stop boundary is qualified for the shared high window.
+Bluetooth stays down until a reboot.
+
+The radio may keep its power under PERST and its firmware with it (the
+J713 radio sleep measured exactly that), and then restoring the windows
+is enough. Only a controller back in its boot ROM lost its firmware.
+
+Behind hci_bcm4377.power_loss_reboot (default off): when a resume via
+firmware finds, once the windows are restored, bootstage and RTI status
+both 0 (the boot ROM state, which bcm4377_boot() requires), mark the
+controller for reset, and before the resume commands close and open the
+HCI device (hci_reset_dev_sync()). Close skips the device side of the
+ring teardown, as for any device marked for reset; open boots the
+firmware and sets up RTI through bcm4377_pci_reset(); the core then runs
+its init and post_init (calibration) as after any reset. A controller
+whose firmware still runs is left to the existing path.
+
+bcm4377_pci_reset() needs no function reset for such a controller and
+does not refuse it: it is out of a fundamental reset, no DMA runs, and
+its DART is restored before endpoints resume, so the reason for the
+refusal does not hold.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/bluetooth/hci_bcm4377.c | 67 +++++++++++++++++++++++++++------
+ 1 file changed, 56 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/bluetooth/hci_bcm4377.c b/drivers/bluetooth/hci_bcm4377.c
+index 25967e3e96..c86cfc876b 100644
+--- a/drivers/bluetooth/hci_bcm4377.c
++++ b/drivers/bluetooth/hci_bcm4377.c
+@@ -603,6 +603,8 @@ struct bcm4377_data {
+ 	const char *board_type;
+ 
+ 	bool needs_reset;
++	/* A sleep cut the controller's power: its firmware boots again on resume. */
++	bool power_lost;
+ 	/* Set while bcm4377_pci_reset() resets the function itself. */
+ 	bool own_reset;
+ 	bool cal_needed;
+@@ -1403,13 +1405,22 @@ static int bcm4377_init_cfg(struct bcm4377_data *bcm4377);
+ static int bcm4377_boot(struct bcm4377_data *bcm4377);
+ static int bcm4377_setup_rti(struct bcm4377_data *bcm4377);
+ 
++static bool power_loss_reboot;
++module_param(power_loss_reboot, bool, 0644);
++MODULE_PARM_DESC(power_loss_reboot,
++		 "Boot the firmware again when a system sleep cut the controller's power (default: off)");
++
+ static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
+ {
+ 	int ret;
+ 	int irq;
+ 
+-	/* The shared high-window radio has no qualified function-reset boundary. */
+-	if (bcm4377->dma_window_base) {
++	/*
++	 * The shared high-window radio has no qualified function-reset
++	 * boundary. A controller whose power the sleep cut needs none: it is
++	 * out of a fundamental reset, no DMA runs, and its DART is restored.
++	 */
++	if (bcm4377->dma_window_base && !bcm4377->power_lost) {
+ 		dev_err_once(&bcm4377->pdev->dev,
+ 			     "controller recovery requires a platform reboot\n");
+ 		return -EIO;
+@@ -1426,16 +1437,18 @@ static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
+ 	if (bcm4377->hw->disable_aspm)
+ 		bcm4377_disable_aspm(bcm4377);
+ 
+-	WRITE_ONCE(bcm4377->own_reset, true);
+-	ret = pci_reset_function(bcm4377->pdev);
+-	WRITE_ONCE(bcm4377->own_reset, false);
+-	if (ret) {
+-		dev_err(&bcm4377->pdev->dev,
+-			"function level reset failed: %d\n", ret);
+-		goto out_irq;
+-	}
++	if (!bcm4377->power_lost) {
++		WRITE_ONCE(bcm4377->own_reset, true);
++		ret = pci_reset_function(bcm4377->pdev);
++		WRITE_ONCE(bcm4377->own_reset, false);
++		if (ret) {
++			dev_err(&bcm4377->pdev->dev,
++				"function level reset failed: %d\n", ret);
++			goto out_irq;
++		}
+ 
+-	msleep(100);
++		msleep(100);
++	}
+ 
+ 	pci_set_master(bcm4377->pdev);
+ 
+@@ -1477,6 +1490,7 @@ static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
+ 	}
+ 
+ 	bcm4377->needs_reset = false;
++	bcm4377->power_lost = false;
+ 	dev_info(&bcm4377->pdev->dev,
+ 		 "hardware reset recovery completed successfully\n");
+ 	return 0;
+@@ -3172,6 +3186,24 @@ static int bcm4377_resume(struct device *dev)
+ 		bcm4377->wake_armed = false;
+ 	}
+ 
++	/*
++	 * Power lost (bcm4377_resume_noirq()): nothing runs on the controller
++	 * to unquiesce or to answer the resume commands. Close and open the HCI
++	 * device first: open boots the firmware again (needs_reset), and the
++	 * core runs its init and post_init (calibration) as after any reset.
++	 */
++	if (bcm4377->power_lost) {
++		bcm4377->quiesced = false;
++		if (hdev_is_powered(bcm4377->hdev)) {
++			hci_req_sync_lock(bcm4377->hdev);
++			ret = hci_reset_dev_sync(bcm4377->hdev);
++			hci_req_sync_unlock(bcm4377->hdev);
++			if (ret)
++				dev_err(dev, "firmware not booted again after a power loss: %d\n",
++					ret);
++		}
++	}
++
+ 	if (bcm4377->quiesced) {
+ 		iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
+ 			  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+@@ -3225,6 +3257,19 @@ static int bcm4377_resume_noirq(struct device *dev)
+ 		dev_err(dev, "private PCI windows not restored after a power loss: %d\n", ret);
+ 		return ret;
+ 	}
++	/*
++	 * The windows say the PCIe side went through a reset; the firmware may
++	 * still run (the radio keeps its power under PERST). Only a controller
++	 * back in its boot ROM, bootstage and RTI status both 0 (what
++	 * bcm4377_boot() requires), lost its firmware.
++	 */
++	if (power_loss_reboot &&
++	    !ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_BOOTSTAGE) &&
++	    !ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_RTI_STATUS)) {
++		bcm4377->power_lost = true;
++		bcm4377->needs_reset = true;
++		dev_info(dev, "controller lost power in the sleep: its firmware boots again\n");
++	}
+ 	dev_info(dev, "private PCI windows restored after a power loss (%#x -> %#x)\n",
+ 		 before, after);
+ 	return 0;
+-- 
+2.43.0
+

@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 06:15:50 +0000
+Subject: [PATCH 353/353] soc: apple: s2r: read T8132 ADT power gates back
+ after the write
+
+With t8132_pwrgate_adt, ->enter writes the J604 ADT's pmgr
+pwrgate-regs words, but their value after the write was only read at
+the commit, deep in the sleep path and past the point where WD2 is
+armed. Nothing said whether a word held the write, and an abort
+before the commit printed a commit value that was never read.
+
+Read each written word back right after the write and report it
+after the return or abort, with a warning for each word whose value
+bits did not hold, and say when the commit read was not reached. The
+sleep itself goes on whichever words hold.
+
+Add t8132_pwrgate_strict, default off: with it, a written word that
+did not hold refuses the sleep at the match, as an abort there, so
+the report names the word without a sleep.
+
+Nothing changes with t8132_pwrgate_adt off: no word is written, so
+none is checked.
+
+The host test now also pins when the probe read runs: only on a boot
+with t8132_sequence set, from the T8132 mapping, so a stock boot keeps
+printing no T8132 line at all.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/apple-s2r.c          | 43 +++++++++++++++++++++++---
+ tools/asahi/run-host-tests.py          |  5 ++-
+ tools/asahi/t8132-pwrgate-adt-tests.py | 41 ++++++++++++++++++++++--
+ 3 files changed, 81 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index e74bc79865..3f028b2e62 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -529,9 +529,15 @@ struct apple_s2r_t8132 {
+ 	struct apple_s2r_t8132_pga pga[T8132_PGA_MAX];
+ 	unsigned int npga;
+ 	u32 pga_saved[T8132_PGA_MAX];
++	u32 pga_after[T8132_PGA_MAX];
+ 	u32 pga_commit[T8132_PGA_MAX];
+ 	u8 pga_changed;
+ 	u8 pga_written;
++	/* written words whose value bits did not read back after the write */
++	u8 pga_nostick;
++	/* the sleep was refused for it (t8132_pwrgate_strict) */
++	bool pga_refused;
++	bool pga_commit_read;
+ 	bool pga_read;
+ 
+ 	/* ANS's APCIe block, from the apple,apcie host node and its loader-published tables */
+@@ -1376,6 +1382,10 @@ static bool t8132_pwrgate_adt;
+ module_param(t8132_pwrgate_adt, bool, 0644);
+ MODULE_PARM_DESC(t8132_pwrgate_adt, "For bring-up, with t8132_sequence and apple,pwrgate-regs: before the sequence, write the ADT's pmgr pwrgate-regs records the way m1n1 applies the ADT's {reg, offset, mask, value} tables (the mask's bits cleared, the value's set); an abort puts the old values back, a real wake keeps them. They are read at probe and at the commit either way (default: off)");
+ 
++static bool t8132_pwrgate_strict;
++module_param(t8132_pwrgate_strict, bool, 0644);
++MODULE_PARM_DESC(t8132_pwrgate_strict, "For bring-up, with t8132_pwrgate_adt: refuse the sleep at the match, as an abort, when a written ADT power gate word does not read back its value bits, so the report names it without a sleep (default: off)");
++
+ static bool t8132_lower_stray;
+ module_param(t8132_lower_stray, bool, 0644);
+ MODULE_PARM_DESC(t8132_lower_stray, "For bring-up, with t8132_sequence: on a real sleep, once every coprocessor has stopped, lower AVD_SYS, VENC_SYS, GFX and JPG if still on, as Aurora does from macOS's sequence; one that will not go off resets with stage 0x3e, as any refusal past the coprocessor stops; raised again on the wake (default: off)");
+@@ -3307,6 +3317,7 @@ static int apple_s2r_t8132_finish(unsigned long arg)
+ 
+ 	for (i = 0; i < t->npga; i++)
+ 		t->pga_commit[i] = readl(apple_s2r_t8132_pga_addr(t, i));
++	t->pga_commit_read = true;
+ 	t->quiesce_still_on = 0;
+ 	for (i = 0; i < ARRAY_SIZE(t8132_quiesce_words); i++)
+ 		if (apple_s2r_t8132_ps_on(s2r, t8132_quiesce_words[i]))
+@@ -3514,10 +3525,14 @@ static void apple_s2r_t8132_pga_enter(struct apple_s2r *s2r, bool write)
+ 	u32 val;
+ 
+ 	t->pga_changed = 0;
++	t->pga_nostick = 0;
++	t->pga_refused = false;
++	t->pga_commit_read = false;
+ 	for (i = 0; i < t->npga; i++) {
+ 		void __iomem *reg = apple_s2r_t8132_pga_addr(t, i);
+ 
+ 		t->pga_saved[i] = readl(reg);
++		t->pga_after[i] = t->pga_saved[i];
+ 		if (!write)
+ 			continue;
+ 		val = (t->pga_saved[i] & ~t->pga[i].mask) | t->pga[i].value;
+@@ -3525,6 +3540,9 @@ static void apple_s2r_t8132_pga_enter(struct apple_s2r *s2r, bool write)
+ 			continue;
+ 		writel(val, reg);
+ 		t->pga_changed |= BIT(i);
++		t->pga_after[i] = readl(reg);
++		if ((t->pga_after[i] & t->pga[i].value) != t->pga[i].value)
++			t->pga_nostick |= BIT(i);
+ 	}
+ 	t->pga_written = t->pga_changed;
+ 	t->pga_read = t->npga;
+@@ -3604,6 +3622,11 @@ static int apple_s2r_t8132_enter(struct apple_s2r *s2r)
+ 	apple_s2r_t8132_wake_arm(s2r);
+ 
+ 	ret = apple_s2r_check(s2r, S2R_STEP_T8132_MATCH);
++	/* With t8132_pwrgate_strict, a power gate word that did not hold: as an abort here */
++	if (!ret && t->pga_nostick && READ_ONCE(t8132_pwrgate_strict)) {
++		t->pga_refused = true;
++		ret = -EIO;
++	}
+ 	if (!ret) {
+ 		apple_s2r_t8132_match(s2r);
+ 		ret = apple_s2r_check(s2r, S2R_STEP_SUSPEND);
+@@ -3653,10 +3676,22 @@ static void apple_s2r_t8132_report(struct apple_s2r *s2r)
+ 			 t->returned ? "" : " (P put back after the abort)");
+ 	t->pg_read = false;
+ 	if (t->pga_read) {
+-		for (i = 0; i < t->npga; i++)
+-			dev_info(s2r->dev, "T8132: ADT power gate %u at ->enter %#x, at the commit %#x%s\n",
+-				 i, t->pga_saved[i], t->pga_commit[i],
+-				 t->pga_written & BIT(i) ? " (written)" : "");
++		for (i = 0; i < t->npga; i++) {
++			if (t->pga_commit_read)
++				dev_info(s2r->dev,
++					 "T8132: ADT power gate %u at ->enter %#x, after the write %#x, at the commit %#x%s\n",
++					 i, t->pga_saved[i], t->pga_after[i], t->pga_commit[i],
++					 t->pga_written & BIT(i) ? " (written)" : "");
++			else
++				dev_info(s2r->dev,
++					 "T8132: ADT power gate %u at ->enter %#x, after the write %#x, commit not reached%s\n",
++					 i, t->pga_saved[i], t->pga_after[i],
++					 t->pga_written & BIT(i) ? " (written)" : "");
++			if (t->pga_nostick & BIT(i))
++				dev_warn(s2r->dev,
++					 "T8132: ADT power gate %u did not hold the write%s\n", i,
++					 t->pga_refused ? ": sleep refused" : "");
++		}
+ 	}
+ 	t->pga_read = false;
+ 	if (t->wake_rb_ok)
+diff --git a/tools/asahi/run-host-tests.py b/tools/asahi/run-host-tests.py
+index 5483e266d5..dc214ad13f 100755
+--- a/tools/asahi/run-host-tests.py
++++ b/tools/asahi/run-host-tests.py
+@@ -204,7 +204,10 @@ ASAHI_TESTS = {
+     't8132-pwrgate-adt-tests.py': [(out(), PASS)]
+         + mutations('--mutation', ('param-on', 'always-write', 'wrong-apply', 'no-bounds',
+                                    'no-overlap-check', 'no-undo', 'undo-forward', 'dt-record',
+-                                   'dt-window', 'no-commit-read'), out()),
++                                   'dt-window', 'no-commit-read', 'no-after-read',
++                                   'no-hold-report', 'nostick-saved', 'strict-on',
++                                   'refuse-unconditional', 'no-strict-refuse', 'pga-always',
++                                   'pga-from-probe'), out()),
+     't8132-apcie-dart-resume-tests.py': [(out() + ['--dtc', '{dtc}'], PASS)]
+         + mutations('--mutation', ('gate-power-lost', 'gate-off', 'host-down', 'host-skip',
+                                    'host-no-ungate'), out()),
+diff --git a/tools/asahi/t8132-pwrgate-adt-tests.py b/tools/asahi/t8132-pwrgate-adt-tests.py
+index f7766848a8..c7c5d0431d 100755
+--- a/tools/asahi/t8132-pwrgate-adt-tests.py
++++ b/tools/asahi/t8132-pwrgate-adt-tests.py
+@@ -35,8 +35,18 @@ MUTATIONS = {
+                      '\tfor (i = 0; i < t->npga; i++)\n\t\tif (t->pga_changed & BIT(i))'),
+     'dt-record': ('<0 0x2704c 0x0 0x80000000>', '<0 0x2704c 0x0 0x40000000>'),
+     'dt-window': ('<0x3 0x88280000 0x0 0x1d000>', '<0x3 0x88280000 0x0 0x10000>'),
+-    'no-commit-read': ('\t\tt->pga_commit[i] = readl(apple_s2r_t8132_pga_addr(t, i));\n\tt->quiesce_still_on = 0;',
+-                       '\tt->quiesce_still_on = 0;'),
++    'no-after-read': ('\t\tt->pga_after[i] = readl(reg);\n', ''),
++    'strict-on': ('static bool t8132_pwrgate_strict;', 'static bool t8132_pwrgate_strict = true;'),
++    'refuse-unconditional': ('if (!ret && t->pga_nostick && READ_ONCE(t8132_pwrgate_strict)) {', 'if (!ret && t->pga_nostick) {'),
++    'no-strict-refuse': ('\t\tt->pga_refused = true;\n\t\tret = -EIO;\n', '\t\tt->pga_refused = true;\n'),
++    'no-hold-report': ('\t\t\tif (t->pga_nostick & BIT(i))\n', '\t\t\tif (0)\n'),
++    'nostick-saved': ('if ((t->pga_after[i] & t->pga[i].value) != t->pga[i].value)',
++                      'if ((t->pga_saved[i] & t->pga[i].value) != t->pga[i].value)'),
++    'pga-always': ('\tif (t8132_sequence && of_device_is_compatible(np, "apple,t8132-pmgr-s2r"))\n\t\tapple_s2r_t8132_map(s2r, pdev);\n',
++                   '\tapple_s2r_t8132_map(s2r, pdev);\n'),
++    'pga-from-probe': ('\tapple_s2r_map_pins(s2r);\n', '\tapple_s2r_map_pins(s2r);\n\tapple_s2r_t8132_map_pga(pdev, &s2r->t8132);\n'),
++    'no-commit-read': ('\t\tt->pga_commit[i] = readl(apple_s2r_t8132_pga_addr(t, i));\n\tt->pga_commit_read = true;',
++                       '\tt->pga_commit_read = true;'),
+ }
+ 
+ 
+@@ -71,6 +81,15 @@ def check(s2r, dt):
+ 
+     assert 'static bool t8132_pwrgate_adt;' in s2r, 'Assertion failed: t8132_pwrgate_adt must default to off'
+     assert 'module_param(t8132_pwrgate_adt, bool, 0644);' in s2r
++    # WHEN the probe read runs (lead-262): only on a t8132_sequence boot, so a stock boot stays without T8132 lines
++    calls = [i for i in range(len(s2r)) if s2r.startswith('apple_s2r_t8132_map_pga(', i)]
++    tm = fn_body(s2r, 'static int apple_s2r_t8132_map(struct apple_s2r *s2r, struct platform_device *pdev)')
++    assert len(calls) == 2 and 'apple_s2r_t8132_map_pga(pdev, t);' in tm, \
++        'Assertion failed: the probe read must be reached only from apple_s2r_t8132_map()'
++    pr = fn_body(s2r, 'static int apple_s2r_probe(struct platform_device *pdev)')
++    assert pr.count('apple_s2r_t8132_map(s2r, pdev);') == 1 and \
++        '\tif (t8132_sequence && of_device_is_compatible(np, "apple,t8132-pmgr-s2r"))\n\t\tapple_s2r_t8132_map(s2r, pdev);\n' in pr, \
++        'Assertion failed: the probe read must run only on a t8132_sequence boot (stock boots print no T8132 line)'
+     mp = fn_body(s2r, 'static int apple_s2r_t8132_map_pga(')
+     assert 'writel' not in mp, 'Assertion failed: probe must only read the words'
+     for need in ('p->reg >= T8132_PGA_REGS', 'p->offset % 4', 'p->offset > t->pmgr_reg_size[p->reg] - 4', '(p->mask & p->value)'):
+@@ -89,6 +108,22 @@ def check(s2r, dt):
+     pu = fn_body(s2r, 'static void apple_s2r_t8132_pg_undo(struct apple_s2r *s2r)')
+     assert 0 <= pu.find('apple_s2r_t8132_pga_undo(s2r);') < pu.find('if (!t->pg_changed)'), \
+         'Assertion failed: an abort must put the words back'
++    w = en.find('writel(val, reg);')
++    assert w < en.find('t->pga_after[i] = readl(reg);') and \
++        'if ((t->pga_after[i] & t->pga[i].value) != t->pga[i].value)' in en, \
++        'Assertion failed: each written word must be read back after the write and checked'
++    tr = fn_body(s2r, 'static int apple_s2r_t8132_enter(struct apple_s2r *s2r)')
++    assert 'static bool t8132_pwrgate_strict;' in s2r and 'module_param(t8132_pwrgate_strict, bool, 0644);' in s2r, \
++        'Assertion failed: t8132_pwrgate_strict must exist and default to off'
++    m = tr.find('ret = apple_s2r_check(s2r, S2R_STEP_T8132_MATCH);')
++    r = tr.find('if (!ret && t->pga_nostick && READ_ONCE(t8132_pwrgate_strict)) {\n\t\tt->pga_refused = true;\n\t\tret = -EIO;\n\t}')
++    assert 0 <= m < r < tr.find('apple_s2r_t8132_match(s2r);'), \
++        'Assertion failed: a word that does not hold refuses the sleep at the match only with t8132_pwrgate_strict (lead-260 / lead-261)'
++    assert tr.count('pga_nostick') == 1, 'Assertion failed: no other path may act on a word that does not hold'
++    rp = fn_body(s2r, 'static void apple_s2r_t8132_report(struct apple_s2r *s2r)')
++    w = rp.find('if (t->pga_nostick & BIT(i))')
++    assert 't->pga_after[i]' in rp and 0 <= w < rp.find('did not hold the write'), \
++        'Assertion failed: the report must give the value after the write and name a word that did not hold'
+     fin = fn_body(s2r, 'static int apple_s2r_t8132_finish(unsigned long arg)')
+     assert fin.find('t->pga_commit[i] = readl(apple_s2r_t8132_pga_addr(t, i));') >= 0 and \
+         fin.find('t->pga_commit[i] = readl(') < fin.find('writel(S2R_TIMER_START, t->commit);'), \
+@@ -115,7 +150,7 @@ def main():
+     except (AssertionError, ValueError, AttributeError) as e:
+         print(e if str(e).startswith('Assertion') else f'Assertion failed: {e}')
+         raise SystemExit(1)
+-    line = 't8132 pwrgate-regs: %d records as the ADT has them, in their windows; read at probe and at the commit, written only with t8132_pwrgate_adt' % len(recs)
++    line = 't8132 pwrgate-regs: %d records as the ADT has them, in their windows; read at probe and at the commit, written only with t8132_pwrgate_adt, read back after the write and reported; with t8132_pwrgate_strict a word that does not hold refuses the sleep' % len(recs)
+     if args.out:
+         args.out.write_text(line + '\n')
+     print(line)
+-- 
+2.43.0
+

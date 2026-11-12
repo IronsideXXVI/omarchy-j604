@@ -1,0 +1,335 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 01:54:45 +0000
+Subject: [PATCH 339/353] media: apple: isp: offer the wider sensor config of
+ the T8132 camera per stream
+
+The T8132 device tree presets serve 1920x1080 and 1280x720 from the
+IMX958's config 5, a two-exposure readout whose 1920x1080 window takes
+the array at the native pixel pitch: 48% of its 4032-pixel width.
+Config 6 is the same kind of readout over a 3040x2880 window. Its
+centred 16:9 crop, 3040x1710, shows 1.6 times the field from 1.58 times
+the pixels per side.
+
+Measured on the J604: the firmware selects config 6, applies the crop,
+scales it to 1920x1080 or to 2560x1440 and delivers 30 frames per
+second, every frame, with steadier pacing than config 5.
+
+The T8132 firmware boots afresh for every stream and takes its sensor
+config then. So choose the view at stream start: with the new
+apple_isp.wide_view parameter (writable at runtime, off by default) a
+stream whose preset crops config 5's window starts from config 6
+instead, with the same output size and the largest centred crop of that
+aspect. A 2560x1440 preset from config 6 is listed while the wide view
+is on, after the device tree presets, so the default format stays the
+same. The view can change between two streams without a reboot, and a
+running stream is never changed. One line is logged when the view of a
+stream differs from the previous one.
+
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/isp/isp-cam.c  | 139 ++++++++++++++++++--
+ drivers/media/platform/apple/isp/isp-cam.h  |   5 +
+ drivers/media/platform/apple/isp/isp-drv.c  |   4 +
+ drivers/media/platform/apple/isp/isp-drv.h  |  12 ++
+ drivers/media/platform/apple/isp/isp-v4l2.c |   6 +
+ 5 files changed, 155 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 21b5966885..ff39ed2924 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -467,6 +467,8 @@ static unsigned int isp_append_size(struct isp_preset *presets, unsigned int num
+ 
+ 	/* Never use a generated size as evidence for another generated size. */
+ 	for (unsigned int i = 0; i < sources; i++) {
++		if (presets[i].wide_only)
++			continue;
+ 		if (!isp_size_from_crop(&presets[i], size, &candidate))
+ 			continue;
+ 		area = candidate.crop_size.x * candidate.crop_size.y;
+@@ -498,8 +500,12 @@ static int isp_add_call_sizes(struct apple_isp *isp)
+ 
+ 	/* A smaller sensor can still offer a square without enlarging pixels. */
+ 	for (unsigned int i = 0; i < sources; i++) {
+-		u32 side = round_down(min(presets[i].crop_size.x,
+-					  presets[i].crop_size.y), 2);
++		u32 side;
++
++		if (presets[i].wide_only)
++			continue;
++		side = round_down(min(presets[i].crop_size.x,
++				      presets[i].crop_size.y), 2);
+ 
+ 		if (isp_size_from_crop(&presets[i], (struct coord){ side, side }, &candidate))
+ 			square = max(square, side);
+@@ -533,6 +539,114 @@ int apple_isp_add_early_call_sizes(struct apple_isp *isp)
+ 	return err;
+ }
+ 
++/*
++ * The IMX958's sensor config 5 is a 1920x2160 two-exposure readout whose
++ * 1920x1080 window covers 48% of the 4032-pixel-wide array at the native
++ * pitch. Config 6 is the same kind of readout over a 3040x2880 window: its
++ * centred 16:9 crop, 3040x1710, shows 1.6 times the field from 1.58 times
++ * the pixels per side. Measured on the J604 (T8132): the firmware selects
++ * config 6, applies that crop, scales it to the requested output and
++ * delivers every frame at 30 per second, 2560x1440 included.
++ *
++ * The T8132 firmware boots afresh for every stream and is told its sensor
++ * config then, so the view is chosen at stream start: the formats stay the
++ * same, and the view can change between two streams without a reboot.
++ */
++static const struct isp_preset isp_wide_source = {
++	.index = 6,
++	.input_dim = { 3040, 5760 },
++	.crop_offset = { 0, 584 },
++	.crop_size = { 3040, 1710 },
++	.output_dim = { 1920, 1080 },
++};
++
++static bool wide_view;
++module_param(wide_view, bool, 0644);
++MODULE_PARM_DESC(wide_view,
++		 "T8132: start the next streams from the wider sensor config and offer 2560x1440 (default: off)");
++
++bool apple_isp_wide_view(struct apple_isp *isp)
++{
++	return isp->hw->imx958_wide_cfg6 && READ_ONCE(wide_view);
++}
++
++bool apple_isp_preset_offered(struct apple_isp *isp,
++			      const struct isp_preset *preset)
++{
++	return !preset->wide_only || apple_isp_wide_view(isp);
++}
++
++/* A preset that crops config 5's 1920x1080 window. */
++static bool isp_preset_narrow(const struct isp_preset *preset)
++{
++	return preset->index == 5 && preset->input_dim.x == 1920 &&
++	       preset->input_dim.y == 2160 &&
++	       preset->crop_offset.x <= 1920 &&
++	       preset->crop_size.x <= 1920 - preset->crop_offset.x &&
++	       preset->crop_offset.y <= 1080 &&
++	       preset->crop_size.y <= 1080 - preset->crop_offset.y;
++}
++
++/*
++ * Add 2560x1440 from config 6, offered only with the wide view, after the
++ * device tree presets so that the default format does not change.
++ */
++int apple_isp_add_wide_presets(struct apple_isp *isp)
++{
++	struct isp_preset *presets;
++	unsigned int num = isp->num_presets;
++	bool narrow = false;
++
++	if (!isp->hw->imx958_wide_cfg6)
++		return 0;
++
++	for (unsigned int i = 0; i < num; i++) {
++		if (isp->presets[i].output_dim.x == 2560 &&
++		    isp->presets[i].output_dim.y == 1440)
++			return 0;
++		narrow |= isp_preset_narrow(&isp->presets[i]);
++	}
++	if (!narrow)
++		return 0;
++
++	presets = devm_kcalloc(isp->dev, num + 1, sizeof(*presets), GFP_KERNEL);
++	if (!presets)
++		return -ENOMEM;
++	memcpy(presets, isp->presets, num * sizeof(*presets));
++	presets[num] = isp_wide_source;
++	presets[num].output_dim = (struct coord){ 2560, 1440 };
++	presets[num].wide_only = true;
++	isp->presets = presets;
++	isp->num_presets = num + 1;
++	return 0;
++}
++
++/* The preset a stream starts with; with the wide view, from config 6. */
++static void isp_resolve_stream_preset(struct apple_isp *isp,
++				      const struct isp_preset *preset)
++{
++	struct isp_preset wide;
++	bool use_wide = preset->wide_only;
++
++	isp->stream_preset = *preset;
++	if (apple_isp_wide_view(isp) && isp_preset_narrow(preset) &&
++	    isp_size_from_crop(&isp_wide_source, preset->output_dim, &wide)) {
++		isp->stream_preset = wide;
++		use_wide = true;
++	}
++
++	if (use_wide != isp->streamed_wide)
++		dev_info(isp->dev,
++			 "wide view %s: %ux%u from sensor config %u, crop %ux%u\n",
++			 use_wide ? "on" : "off",
++			 isp->stream_preset.output_dim.x,
++			 isp->stream_preset.output_dim.y,
++			 isp->stream_preset.index,
++			 isp->stream_preset.crop_size.x,
++			 isp->stream_preset.crop_size.y);
++	isp->streamed_wide = use_wide;
++}
++
+ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
+ {
+ 	struct isp_format *fmt = isp_get_format(isp, ch);
+@@ -938,7 +1052,7 @@ select_config:
+ 	if (err)
+ 		return err;
+ 
+-	err = isp_cmd_ch_camera_config_select(isp, ch, fmt->preset->index);
++	err = isp_cmd_ch_camera_config_select(isp, ch, isp->stream_preset.index);
+ 	if (err)
+ 		return err;
+ 
+@@ -951,15 +1065,16 @@ select_config:
+ 	if (err)
+ 		return err;
+ 
+-	err = isp_cmd_ch_crop_set(isp, ch, fmt->preset->crop_offset.x,
+-				  fmt->preset->crop_offset.y,
+-				  fmt->preset->crop_size.x,
+-				  fmt->preset->crop_size.y);
++	err = isp_cmd_ch_crop_set(isp, ch, isp->stream_preset.crop_offset.x,
++				  isp->stream_preset.crop_offset.y,
++				  isp->stream_preset.crop_size.x,
++				  isp->stream_preset.crop_size.y);
+ 	if (err)
+ 		return err;
+ 
+-	err = isp_cmd_ch_output_config_set(isp, ch, fmt->preset->output_dim.x,
+-					   fmt->preset->output_dim.y,
++	err = isp_cmd_ch_output_config_set(isp, ch,
++					   isp->stream_preset.output_dim.x,
++					   isp->stream_preset.output_dim.y,
+ 					   fmt->strides, CISP_COLORSPACE_REC709,
+ 					   isp_is_p010(isp) ? CISP_OUTPUT_FORMAT_P010 :
+ 							      CISP_OUTPUT_FORMAT_YUV_2PLANE);
+@@ -1069,9 +1184,11 @@ int apple_isp_start_camera(struct apple_isp *isp)
+ 		return err;
+ 	}
+ 
+-	if (isp->num_fw_presets && fmt->preset->index >= isp->num_fw_presets) {
++	isp_resolve_stream_preset(isp, fmt->preset);
++	if (isp->num_fw_presets &&
++	    isp->stream_preset.index >= isp->num_fw_presets) {
+ 		dev_err(isp->dev, "preset config %u: firmware has %u\n",
+-			fmt->preset->index, isp->num_fw_presets);
++			isp->stream_preset.index, isp->num_fw_presets);
+ 		apple_isp_firmware_shutdown(isp);
+ 		return -EINVAL;
+ 	}
+diff --git a/drivers/media/platform/apple/isp/isp-cam.h b/drivers/media/platform/apple/isp/isp-cam.h
+index 557a1aaa7c..6f53f7c170 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.h
++++ b/drivers/media/platform/apple/isp/isp-cam.h
+@@ -16,6 +16,11 @@
+ int apple_isp_detect_camera(struct apple_isp *isp);
+ int apple_isp_add_early_call_sizes(struct apple_isp *isp);
+ 
++bool apple_isp_wide_view(struct apple_isp *isp);
++bool apple_isp_preset_offered(struct apple_isp *isp,
++			      const struct isp_preset *preset);
++int apple_isp_add_wide_presets(struct apple_isp *isp);
++
+ int apple_isp_start_camera(struct apple_isp *isp);
+ void apple_isp_stop_camera(struct apple_isp *isp);
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index c55becb460..0ed31b1d56 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -534,6 +534,9 @@ static int apple_isp_init_presets(struct apple_isp *isp)
+ 		preset++;
+ 	}
+ 
++	err = apple_isp_add_wide_presets(isp);
++	if (err)
++		return err;
+ 	apple_isp_lab_preset(isp);
+ 	return 0;
+ }
+@@ -1194,6 +1197,7 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
+ 	.fw_restore = true,
+ 	.deferred_start = true,
+ 	.meta_exposure = true,
++	.imx958_wide_cfg6 = true,
+ };
+ 
+ /*
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 937079b3a5..3f5c37598f 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -155,6 +155,8 @@ struct isp_preset {
+ 	struct coord crop_size;
+ 	/* Processed P010 geometry established by preview or a config reply. */
+ 	bool p010;
++	/* Offered only while the wide view is selected. */
++	bool wide_only;
+ };
+ 
+ struct apple_isp_hw {
+@@ -272,6 +274,12 @@ struct apple_isp_hw {
+ 	 */
+ 	bool deferred_start;
+ 
++	/*
++	 * The IMX958's sensor config 6 can serve config 5's 1920x1080 window
++	 * wider, chosen at stream start (T8132).
++	 */
++	bool imx958_wide_cfg6;
++
+ 	/* The xx24 setfiles' lens shading strides need zeroing (T8142). */
+ 	bool setfile_stride_fixup;
+ };
+@@ -422,6 +430,10 @@ struct apple_isp {
+ 	bool camera_detected;
+ 	/* the crop-derived call sizes are in the presets already */
+ 	bool call_sizes_added;
++	/* the preset the current stream started with, after the view choice */
++	struct isp_preset stream_preset;
++	/* the previous stream ran from the wide sensor config */
++	bool streamed_wide;
+ 	/* configurations the firmware has, once a deferred start detected them */
+ 	u32 num_fw_presets;
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index 3e8be0d540..74cbc0ddeb 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -776,6 +776,8 @@ static struct isp_preset *isp_select_preset(struct apple_isp *isp, u32 width,
+ 		preset = &isp->presets[i];
+ 		if (p010 && !preset->p010)
+ 			continue;
++		if (!apple_isp_preset_offered(isp, preset))
++			continue;
+ 		score = abs((int)preset->output_dim.x - (int)width) +
+ 		abs((int)preset->output_dim.y - (int)height);
+ 		if (score < best_score) {
+@@ -831,6 +833,8 @@ static int isp_vidioc_enum_framesizes(struct file *file, void *fh,
+ 	for (int i = 0; i < isp->num_presets; i++) {
+ 		if (f->pixel_format == V4L2_PIX_FMT_P010 && !isp->presets[i].p010)
+ 			continue;
++		if (!apple_isp_preset_offered(isp, &isp->presets[i]))
++			continue;
+ 		if (index++ == f->index) {
+ 			preset = &isp->presets[i];
+ 			break;
+@@ -861,6 +865,8 @@ static int isp_vidioc_enum_frameintervals(struct file *file, void *fh,
+ 	for (i = 0; i < isp->num_presets; i++) {
+ 		if (interval->pixel_format == V4L2_PIX_FMT_P010 && !isp->presets[i].p010)
+ 			continue;
++		if (!apple_isp_preset_offered(isp, &isp->presets[i]))
++			continue;
+ 		if (isp->presets[i].output_dim.x == interval->width &&
+ 		    isp->presets[i].output_dim.y == interval->height)
+ 			break;
+-- 
+2.43.0
+
