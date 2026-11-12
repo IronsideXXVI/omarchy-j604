@@ -1,0 +1,487 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 08:11:50 +0000
+Subject: [PATCH 358/358] mfd: macsmc: optionally send the sleep notice from
+ the T8132 finisher
+
+Add the bring-up parameter notice_late (default off). With it, the
+noirq suspend leaves slpa and the AP idle notice to apple-s2r's T8132
+finisher, which calls back right before the commit, and sends nothing
+itself; without a T8132 finisher to take it, the notice goes at noirq
+as before.
+
+The finisher runs with interrupts off, one CPU and timekeeping
+suspended, so the late path takes no lock and uses no clock: one SMC
+command at a time, its reply polled for counted 10 us steps (200 ms),
+and RTKit's counted AP power notice. It keeps apple_smc_sleep_commit()'s
+order and gaps: CLKU for smc-stamp, slpa, 6 ms, the AP idle notice and
+30 ms; an idle notice not answered is taken back. The resume reports
+whether the notice was sent and how it went; a sleep that stopped before
+the finisher's end never sent it, and .complete takes the warning back
+as for any refusal.
+
+tools/asahi/smc-notice-late-tests.py checks the parameter, the noirq,
+the late path's order and that it is lock- and clock-free, RTKit's
+polled notice and the finisher's order from the sources, builds the
+counted command against a fake RTKit (reply, timeout after exactly the
+counted steps, wrong sequence number, error result), and kills fifteen
+mutations.
+
+Assisted-by: LLM
+---
+ drivers/mfd/macsmc.c                 | 131 ++++++++++++++
+ include/linux/mfd/macsmc.h           |   4 +
+ tools/asahi/run-host-tests.py        |   5 +
+ tools/asahi/smc-notice-late-tests.py | 253 +++++++++++++++++++++++++++
+ 4 files changed, 393 insertions(+)
+ create mode 100755 tools/asahi/smc-notice-late-tests.py
+
+diff --git a/drivers/mfd/macsmc.c b/drivers/mfd/macsmc.c
+index d876028773..8b146ae63e 100644
+--- a/drivers/mfd/macsmc.c
++++ b/drivers/mfd/macsmc.c
+@@ -1117,6 +1117,132 @@ static void apple_smc_clock_mark(struct apple_smc *smc)
+ 	apple_sleep_smc_clock_mark(smc_us, before, after);
+ }
+ 
++/*
++ * smc-notice-late (bring-up, default off): send slpa and the AP idle notice
++ * from the sleep's finisher, right before the commit, instead of here. On
++ * macOS the SMC stamps the sleep (CLSP) within 1 ms of the last AP step;
++ * ours tells it at this noirq, before the whole sleep sequence. Only with
++ * the T8132 sequence; a sleep that stops before the finisher's end never
++ * sends it, and .complete takes the warning back as for any refusal.
++ */
++static bool notice_late;
++module_param(notice_late, bool, 0644);
++MODULE_PARM_DESC(notice_late,
++		 "Bring-up: send the SMC's sleep notice from the T8132 sleep's finisher, right before the commit (default: off)");
++
++/* The finisher has interrupts off and timekeeping suspended: counted 10 us steps, 200 ms. */
++#define SMC_COUNTED_STEP_US	10
++#define SMC_COUNTED_STEPS	20000
++
++/*
++ * One command from the finisher: no lock (no other CPU and no interrupt
++ * runs there) and no clock, the reply polled for a counted time.
++ */
++static int apple_smc_cmd_counted(struct apple_smc *smc, u64 cmd, smc_key key, u64 size)
++{
++	unsigned int i;
++	u64 msg;
++
++	if (smc->boot_stage != APPLE_SMC_INITIALIZED || smc->atomic_mode || smc->ap_notified)
++		return -EIO;
++
++	reinit_completion(&smc->cmd_done);
++	smc->msg_id = (smc->msg_id + 1) & 0xf;
++	msg = (FIELD_PREP(SMC_MSG, cmd) |
++	       FIELD_PREP(SMC_SIZE, size) |
++	       FIELD_PREP(SMC_ID, smc->msg_id) |
++	       FIELD_PREP(SMC_DATA, key));
++	if (apple_rtkit_send_message(smc->rtk, SMC_ENDPOINT, msg, NULL, true))
++		return -EIO;
++
++	for (i = 0; ; i++) {
++		apple_rtkit_poll(smc->rtk);
++		if (completion_done(&smc->cmd_done))
++			break;
++		if (i == SMC_COUNTED_STEPS)
++			return -ETIMEDOUT;
++		udelay(SMC_COUNTED_STEP_US);
++	}
++
++	if (FIELD_GET(SMC_ID, smc->cmd_ret) != smc->msg_id)
++		return -EIO;
++	if (FIELD_GET(SMC_RESULT, smc->cmd_ret))
++		return -EIO;
++
++	return FIELD_GET(SMC_SIZE, smc->cmd_ret);
++}
++
++/*
++ * The late notice, from apple-s2r's T8132 finisher: the SMC's clock (for
++ * smc-stamp), slpa, the arm gap, the AP idle notice and the idle gap, the
++ * order of apple_smc_sleep_commit(). 0 once the SMC took the notice; an
++ * idle notice not answered is taken back, as at noirq.
++ */
++static int apple_smc_notice_late(void *data)
++{
++	struct apple_smc *smc = data;
++	u32 slpa = SMC_KEY(slpa);
++	u64 smc_us, before, after;
++	unsigned int us = 0;
++	int ret;
++
++	before = get_cycles();
++	ret = apple_smc_cmd_counted(smc, SMC_MSG_READ_KEY, SMC_KEY(CLKU), sizeof(smc_us));
++	after = get_cycles();
++	if (ret == sizeof(smc_us)) {
++		apple_smc_read_sram(smc, &smc_us, sizeof(smc_us));
++		apple_sleep_smc_clock_mark(smc_us, before, after);
++	}
++
++	memcpy_toio(smc->shmem.iomem, &slpa, sizeof(slpa));
++	ret = apple_smc_cmd_counted(smc, SMC_MSG_WRITE_KEY, SMC_KEY(MBSE), sizeof(slpa));
++	if (ret >= 0) {
++		mdelay(SMC_SLEEP_ARM_MS);
++		smc->ap_notified = true;
++		ret = apple_rtkit_ap_power_polled(smc->rtk, false, &us);
++		if (ret) {
++			unsigned int back;
++
++			apple_rtkit_ap_power_polled(smc->rtk, true, &back);
++			smc->ap_notified = false;
++		} else {
++			mdelay(SMC_SLEEP_IDLE_MS);
++		}
++	}
++
++	smc->late_ret = ret < 0 ? ret : 0;
++	smc->late_us = us;
++	return smc->late_ret;
++}
++
++/* At noirq: leave the notice to the finisher, when asked and when it can take it. */
++static bool apple_smc_notice_late_arm(struct apple_smc *smc)
++{
++	if (!READ_ONCE(notice_late))
++		return false;
++	if (apple_sleep_smc_late_register(apple_smc_notice_late, smc, sizeof(*smc))) {
++		dev_warn(smc->dev, "smc-notice-late: no T8132 finisher to send it, sent now\n");
++		return false;
++	}
++	smc->late_ret = -ENODATA;
++	smc->late_us = 0;
++	smc->notice_late = true;
++	return true;
++}
++
++static void apple_smc_notice_late_end(struct apple_smc *smc)
++{
++	if (!smc->notice_late)
++		return;
++	apple_sleep_smc_late_unregister(smc);
++	smc->notice_late = false;
++	if (smc->late_ret == -ENODATA)
++		dev_info(smc->dev, "smc-notice-late: not sent, the sleep stopped before the finisher's end\n");
++	else
++		dev_info(smc->dev, "smc-notice-late: sent from the finisher: %d, idle answered in %u us\n",
++			 smc->late_ret, smc->late_us);
++}
++
+ static int apple_smc_suspend_noirq(struct device *dev)
+ {
+ 	struct apple_smc *smc = dev_get_drvdata(dev);
+@@ -1128,6 +1254,10 @@ static int apple_smc_suspend_noirq(struct device *dev)
+ 	apple_smc_set_polled(smc, true);
+ 	if (apple_sleep_debug_link_cut())
+ 		apple_smc_outbox_settle(smc);
++	if (apple_smc_notice_late_arm(smc)) {
++		apple_smc_set_polled(smc, false);
++		return 0;
++	}
+ 	apple_smc_clock_mark(smc);
+ 	ret = apple_smc_sleep_commit(smc);
+ 	apple_smc_set_polled(smc, false);
+@@ -1139,6 +1269,7 @@ static int apple_smc_resume_noirq(struct device *dev)
+ {
+ 	struct apple_smc *smc = dev_get_drvdata(dev);
+ 
++	apple_smc_notice_late_end(smc);
+ 	if (smc->ap_notified) {
+ 		apple_smc_set_polled(smc, true);
+ 		apple_smc_sleep_wake(smc);
+diff --git a/include/linux/mfd/macsmc.h b/include/linux/mfd/macsmc.h
+index 0f9cd33b46..521b4312ef 100644
+--- a/include/linux/mfd/macsmc.h
++++ b/include/linux/mfd/macsmc.h
+@@ -119,6 +119,10 @@ struct apple_smc {
+ 	bool sleep_warned;
+ 	/* In a noirq phase: replies are polled for. */
+ 	bool polled;
++	/* smc-notice-late: the notice left to the sleep's finisher, and how it went */
++	bool notice_late;
++	int late_ret;
++	unsigned int late_us;
+ 	/* MBSW at the last wake: what the SMC had woken the AP for. */
+ 	u64 wake_record;
+ 
+diff --git a/tools/asahi/run-host-tests.py b/tools/asahi/run-host-tests.py
+index a5c8fec014..ca57db7eae 100755
+--- a/tools/asahi/run-host-tests.py
++++ b/tools/asahi/run-host-tests.py
+@@ -192,6 +192,11 @@ ASAHI_TESTS = {
+                                    'reader-writes', 'key-dropped', 'mark-after-notice',
+                                    'no-mark', 'mark-unbracketed', 'commit-cycles-late',
+                                    'mark-not-cleared'), out()),
++    'smc-notice-late-tests.py': [(out(), PASS)]
++        + mutations('--mutation', ('default-on', 'both-notices', 'unbounded', 'sleeps',
++                                   'no-id-check', 'no-result-check', 'no-arm-gap', 'no-undo',
++                                   'notified-late', 'not-unregistered', 'no-fatal', 'no-clean',
++                                   'stage-0x50', 'want-ignored', 'rx-kept'), out()),
+     'rtkit-crashlog-tests.py': [(out(), PASS)]
+         + mutations('--mutation', ('buffer-header', 'section-header', 'section-size', 'footer-room',
+                                    'mailbox-minimum', 'version-string', 'message-string'), out()),
+diff --git a/tools/asahi/smc-notice-late-tests.py b/tools/asahi/smc-notice-late-tests.py
+new file mode 100755
+index 0000000000..52460ad138
+--- /dev/null
++++ b/tools/asahi/smc-notice-late-tests.py
+@@ -0,0 +1,253 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Check smc-notice-late: the SMC's sleep notice sent from the T8132 finisher.
++
++With macsmc.notice_late (default off), macsmc's noirq suspend leaves slpa and
++the AP idle notice to apple-s2r's T8132 finisher, which sends them right
++before the commit. The finisher runs with interrupts off and timekeeping
++suspended, so this checks, from the sources, that the parameter is off by
++default; that an armed noirq sends nothing itself and that the notice is
++taken back at resume; that the late path takes no lock and uses no clock,
++sleep or completion wait; that it keeps apple_smc_sleep_commit()'s order
++(CLKU, slpa, the arm gap, the AP idle notice, the idle gap) and takes back
++an idle notice not answered; that RTKit's polled AP notice waits for the
++state it asked for and gives the receive path back; and that apple-s2r sends
++it after both watchdogs are armed and before the commit counter, the last
++cleans and the commit, resets with its own stage if it fails, and cleans what
++the notice dirtied. It then builds apple_smc_cmd_counted() against a fake
++RTKit and checks the reply, a timeout after exactly the counted steps, and a
++wrong sequence number or result.
++"""
++import argparse
++import re
++import subprocess
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[2]
++MUTATIONS = {
++    'default-on': ('static bool notice_late;\nmodule_param(notice_late', 'static bool notice_late = true;\nmodule_param(notice_late'),
++    'both-notices': ('\tif (apple_smc_notice_late_arm(smc)) {\n\t\tapple_smc_set_polled(smc, false);\n\t\treturn 0;\n\t}\n',
++                     '\tapple_smc_notice_late_arm(smc);\n'),
++    'unbounded': ('\t\tif (i == SMC_COUNTED_STEPS)\n\t\t\treturn -ETIMEDOUT;\n', ''),
++    'sleeps': ('\t\tudelay(SMC_COUNTED_STEP_US);\n\t}\n', '\t\tusleep_range(10, 20);\n\t}\n'),
++    'no-id-check': ('\tif (FIELD_GET(SMC_ID, smc->cmd_ret) != smc->msg_id)\n\t\treturn -EIO;\n', ''),
++    'no-result-check': ('\tif (FIELD_GET(SMC_RESULT, smc->cmd_ret))\n\t\treturn -EIO;\n', ''),
++    'no-arm-gap': ('\t\tmdelay(SMC_SLEEP_ARM_MS);\n\t\tsmc->ap_notified = true;\n', '\t\tsmc->ap_notified = true;\n'),
++    'no-undo': ('\t\t\tapple_rtkit_ap_power_polled(smc->rtk, true, &back);\n', ''),
++    'notified-late': ('\t\tsmc->ap_notified = true;\n\t\tret = apple_rtkit_ap_power_polled(smc->rtk, false, &us);\n',
++                      '\t\tret = apple_rtkit_ap_power_polled(smc->rtk, false, &us);\n\t\tsmc->ap_notified = true;\n'),
++    'not-unregistered': ('\tapple_sleep_smc_late_unregister(smc);\n\tsmc->notice_late = false;\n', '\tsmc->notice_late = false;\n'),
++    'no-fatal': ('\t\t\tapple_s2r_t8132_fatal(s2r, S2R_CRUMB_T8132_NOTICE);\n', '\t\t\treturn ret;\n'),
++    'no-clean': ('\t\tdcache_clean_poc((unsigned long)apple_s2r_late.data,\n'
++                 '\t\t\t\t (unsigned long)apple_s2r_late.data + apple_s2r_late.size);\n', ''),
++    'stage-0x50': ('\tS2R_CRUMB_T8132_NOTICE = 0x51,', '\tS2R_CRUMB_T8132_NOTICE = 0x50,'),
++    'want-ignored': ('\t\t\tFIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, want),\n',
++                     '\t\t\tFIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_IDLE),\n'),
++    'rx-kept': ('\t\t\t\t       &rtk->ap_power_state, us);\n\n\tspin_lock_irqsave(&rtk->mbox->rx_lock, flags);\n'
++                '\trtk->mbox->rx = apple_rtkit_rx;\n',
++                '\t\t\t\t       &rtk->ap_power_state, us);\n\n\tspin_lock_irqsave(&rtk->mbox->rx_lock, flags);\n'),
++}
++FORBIDDEN = ('mutex', 'guard(', 'jiffies', 'ktime', 'wait_for_', 'msleep', 'usleep', 'schedule',
++             'apple_smc_cmd_locked', 'apple_smc_write', 'apple_smc_read(', 'dev_info', 'dev_warn', 'dev_err')
++DEFINES = ('SMC_DATA', 'SMC_WSIZE', 'SMC_SIZE', 'SMC_ID', 'SMC_MSG', 'SMC_RESULT', 'SMC_MSG_READ_KEY',
++           'SMC_MSG_WRITE_KEY', 'SMC_COUNTED_STEP_US', 'SMC_COUNTED_STEPS', 'SMC_ENDPOINT')
++
++FIXTURE = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stddef.h>
++typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64; typedef u32 smc_key;
++#define EIO 5
++#define ETIMEDOUT 110
++#define GENMASK_ULL(h, l) (((~0ULL) >> (63 - (h))) & (~0ULL << (l)))
++#define FIELD_PREP(m, v) ((((u64)(v)) << __builtin_ctzll(m)) & (m))
++#define FIELD_GET(m, v) ((((u64)(v)) & (m)) >> __builtin_ctzll(m))
++%(defines)s
++enum { APPLE_SMC_BOOTING, APPLE_SMC_INITIALIZED };
++struct completion { int done; };
++struct apple_smc { int boot_stage; bool atomic_mode, ap_notified; unsigned int msg_id;
++		   struct completion cmd_done; u64 cmd_ret; void *rtk; };
++static struct apple_smc smc0;
++static u64 sent; static int sends, send_ret, polls, reply_after = -1, reply_id = -1, reply_result;
++static long delays;
++static void reinit_completion(struct completion *c) { c->done = 0; }
++static bool completion_done(struct completion *c) { return c->done; }
++static int apple_rtkit_send_message(void *rtk, int ep, u64 msg, void *x, bool atomic)
++{ assert(atomic && ep == SMC_ENDPOINT); sent = msg; sends++; return send_ret; }
++static int apple_rtkit_poll(void *rtk)
++{
++	if (reply_after >= 0 && ++polls > reply_after && !smc0.cmd_done.done) {
++		smc0.cmd_ret = FIELD_PREP(SMC_ID, reply_id >= 0 ? (unsigned)reply_id : smc0.msg_id) |
++			       FIELD_PREP(SMC_RESULT, reply_result) | FIELD_PREP(SMC_SIZE, 8);
++		smc0.cmd_done.done = 1;
++	}
++	return 0;
++}
++static void udelay(unsigned long us) { assert(us == SMC_COUNTED_STEP_US); assert(++delays < 1000000); }
++%(fn)s
++}
++static void reset(void)
++{
++	smc0 = (struct apple_smc){ .boot_stage = APPLE_SMC_INITIALIZED, .msg_id = 15 };
++	sends = send_ret = polls = reply_result = 0; reply_after = reply_id = -1; delays = 0;
++}
++int main(void)
++{
++	reset(); reply_after = 3;
++	assert(apple_smc_cmd_counted(&smc0, SMC_MSG_READ_KEY, 0x434c4b55, 8) == 8);
++	assert(FIELD_GET(SMC_MSG, sent) == SMC_MSG_READ_KEY && FIELD_GET(SMC_SIZE, sent) == 8);
++	assert(FIELD_GET(SMC_DATA, sent) == 0x434c4b55 && FIELD_GET(SMC_ID, sent) == 0 && smc0.msg_id == 0);
++	assert(delays == 3);
++	reset();
++	assert(apple_smc_cmd_counted(&smc0, SMC_MSG_WRITE_KEY, 1, 4) == -ETIMEDOUT);
++	assert(delays == SMC_COUNTED_STEPS);
++	reset(); reply_after = 0; reply_id = 7;
++	assert(apple_smc_cmd_counted(&smc0, SMC_MSG_WRITE_KEY, 1, 4) == -EIO);
++	reset(); reply_after = 0; reply_result = 0x84;
++	assert(apple_smc_cmd_counted(&smc0, SMC_MSG_WRITE_KEY, 1, 4) == -EIO);
++	reset(); smc0.ap_notified = true;
++	assert(apple_smc_cmd_counted(&smc0, SMC_MSG_WRITE_KEY, 1, 4) == -EIO && sends == 0);
++	reset(); smc0.atomic_mode = true;
++	assert(apple_smc_cmd_counted(&smc0, SMC_MSG_WRITE_KEY, 1, 4) == -EIO && sends == 0);
++	reset(); send_ret = -16;
++	assert(apple_smc_cmd_counted(&smc0, SMC_MSG_WRITE_KEY, 1, 4) == -EIO && polls == 0);
++	puts("counted command ok");
++	return 0;
++}
++'''
++
++
++def fn_body(src, head):
++    at = src.index(head)
++    return src[at:src.index('\n}\n', at)]
++
++
++def order(body, needles, what):
++    pos = [body.find(n) for n in needles]
++    assert all(p >= 0 for p in pos) and pos == sorted(pos), f'Assertion failed: {what}: {list(zip(needles, pos))}'
++
++
++def check(smc, smc_h, s2r, rtkit, rtkit_h, sleep_h):
++    assert re.search(r'^static bool notice_late;\nmodule_param\(notice_late, bool, 0644\);', smc, re.M), \
++        'Assertion failed: notice_late must be a bool parameter, off by default'
++    noirq = fn_body(smc, 'static int apple_smc_suspend_noirq(struct device *dev)')
++    arm = noirq.find('\tif (apple_smc_notice_late_arm(smc)) {\n\t\tapple_smc_set_polled(smc, false);\n\t\treturn 0;\n\t}\n')
++    assert arm >= 0, 'Assertion failed: an armed noirq must send nothing itself'
++    order(noirq, ['apple_smc_set_polled(smc, true);', 'apple_smc_outbox_settle(smc);',
++                  'apple_smc_notice_late_arm(smc)', 'apple_smc_clock_mark(smc);', 'apple_smc_sleep_commit(smc);'],
++          'the noirq order')
++    armf = fn_body(smc, 'static bool apple_smc_notice_late_arm(struct apple_smc *smc)')
++    order(armf, ['if (!READ_ONCE(notice_late))', 'apple_sleep_smc_late_register(apple_smc_notice_late, smc, sizeof(*smc))',
++                 'smc->late_ret = -ENODATA;', 'smc->notice_late = true;'], 'arming')
++    end = fn_body(smc, 'static void apple_smc_notice_late_end(struct apple_smc *smc)')
++    assert 'apple_sleep_smc_late_unregister(smc);' in end, 'Assertion failed: the late notice must be unregistered'
++    res = fn_body(smc, 'static int apple_smc_resume_noirq(struct device *dev)')
++    order(res, ['apple_smc_notice_late_end(smc);', 'if (smc->ap_notified)'], 'resume')
++
++    cmd = fn_body(smc, 'static int apple_smc_cmd_counted(struct apple_smc *smc, u64 cmd, smc_key key, u64 size)')
++    late = fn_body(smc, 'static int apple_smc_notice_late(void *data)')
++    for name, body in (('the counted command', cmd), ('the late notice', late)):
++        for bad in FORBIDDEN:
++            assert bad not in body, f'Assertion failed: {name} uses {bad}'
++    assert 'if (i == SMC_COUNTED_STEPS)\n\t\t\treturn -ETIMEDOUT;' in cmd, 'Assertion failed: the reply wait must be bounded'
++    order(late, ['apple_smc_cmd_counted(smc, SMC_MSG_READ_KEY, SMC_KEY(CLKU), sizeof(smc_us));',
++                 'apple_sleep_smc_clock_mark(smc_us, before, after);',
++                 'memcpy_toio(smc->shmem.iomem, &slpa, sizeof(slpa));',
++                 'apple_smc_cmd_counted(smc, SMC_MSG_WRITE_KEY, SMC_KEY(MBSE), sizeof(slpa));',
++                 'mdelay(SMC_SLEEP_ARM_MS);', 'smc->ap_notified = true;',
++                 'apple_rtkit_ap_power_polled(smc->rtk, false, &us);',
++                 'apple_rtkit_ap_power_polled(smc->rtk, true, &back);', 'smc->ap_notified = false;',
++                 'mdelay(SMC_SLEEP_IDLE_MS);'], 'the late notice order')
++    assert 'u32 slpa = SMC_KEY(slpa);' in late
++    assert 'int late_ret;' in smc_h and 'bool notice_late;' in smc_h
++
++    ps = fn_body(rtkit, 'static int apple_rtkit_polled_state(struct apple_rtkit *rtk, u8 type, unsigned int want,')
++    assert 'FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, want),' in ps and 'READ_ONCE(*state) == want' in ps, \
++        'Assertion failed: the polled state must ask for and wait for @want'
++    idle = fn_body(rtkit, 'int apple_rtkit_sleep_idle_polled(struct apple_rtkit *rtk, void __iomem *cpu_control,')
++    assert len(re.findall(r'APPLE_RTKIT_PWR_STATE_IDLE,\s*&rtk->', idle)) == 2, 'Assertion failed: the sleep idle still asks for idle'
++    ap = fn_body(rtkit, 'int apple_rtkit_ap_power_polled(struct apple_rtkit *rtk, bool on, unsigned int *us)')
++    order(ap, ['rtk->mbox->rx = apple_rtkit_polled_rx;', 'apple_mbox_poll(rtk->mbox);',
++               'APPLE_RTKIT_MGMT_SET_AP_PWR_STATE, want,', 'rtk->mbox->rx = apple_rtkit_rx;'],
++          'the polled AP notice')
++    assert 'unsigned int want = on ? APPLE_RTKIT_PWR_STATE_ON : APPLE_RTKIT_PWR_STATE_IDLE;' in ap, \
++        'Assertion failed: the polled AP notice must ask for on or idle as told'
++    for bad in ('jiffies', 'wait_for_', 'msleep', 'usleep', 'ktime', 'MGMT_SET_IOP_PWR_STATE'):
++        assert bad not in ap, f'Assertion failed: the polled AP notice uses {bad}'
++    assert 'int apple_rtkit_ap_power_polled(struct apple_rtkit *rtk, bool on, unsigned int *us);' in rtkit_h
++    assert 'static inline int apple_sleep_smc_late_register(' in sleep_h
++
++    vals = {int(v, 16) for v in re.findall(r'S2R_CRUMB_\w+ = (0x[0-9a-f]+),', s2r)}
++    m = re.search(r'S2R_CRUMB_T8132_NOTICE = (0x[0-9a-f]+),', s2r)
++    assert m, 'Assertion failed: no stage for the late notice'
++    stage = int(m.group(1), 16)
++    assert stage not in (0x50, 0x3f) and list(re.findall(r'= (0x[0-9a-f]+),', s2r)).count(m.group(1)) == 1, \
++        f'Assertion failed: stage {stage:#x} is taken (0x50 macOS, 0x3f user space)'
++    assert len(vals) >= 5
++    fin = fn_body(s2r, 'static int apple_s2r_t8132_finish(unsigned long arg)')
++    order(fin, ['apple_s2r_t8132_set_wd2(s2r, T8132_WD2_SLEEP_SECS);',
++                'apple_s2r_wdt_arm_secs(s2r, min_t(u32, wdt_timeout, T8132_WD1_COMMIT_SECS));',
++                'ret = apple_s2r_late.notice(apple_s2r_late.data);',
++                'apple_s2r_t8132_fatal(s2r, S2R_CRUMB_T8132_NOTICE);',
++                'dcache_clean_poc((unsigned long)apple_s2r_late.data,',
++                't->commit_cycles = get_cycles();',
++                'dcache_clean_poc((unsigned long)task_stack_page(current),',
++                'writel(S2R_TIMER_START, t->commit);'], 'the finisher order')
++    reg = fn_body(s2r, 'int apple_sleep_smc_late_register(int (*notice)(void *data), void *data, size_t size)')
++    assert 'if (!apple_s2r || !t8132_sequence)' in reg, 'Assertion failed: only the T8132 sequence takes it'
++    return cmd, smc
++
++
++def build(cmd, smc):
++    lines = []
++    for name in DEFINES:
++        m = re.search(r'^#define ' + name + r'\s.*$', smc, re.M)
++        assert m, f'Assertion failed: no {name}'
++        lines.append(m.group(0))
++    with tempfile.TemporaryDirectory() as d:
++        c = Path(d) / 'counted.c'
++        c.write_text(FIXTURE % {'defines': '\n'.join(lines), 'fn': cmd})
++        exe = Path(d) / 'counted'
++        subprocess.run(['gcc', '-std=gnu11', '-O1', '-Wall', '-Werror', '-Wno-unused-function',
++                        '-o', str(exe), str(c)], check=True)
++        p = subprocess.run([str(exe)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++        print(p.stdout, end='')
++        if p.returncode:
++            raise SystemExit(1)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--out', type=Path)
++    parser.add_argument('--mutation', choices=MUTATIONS)
++    args = parser.parse_args()
++    files = {
++        'smc': 'drivers/mfd/macsmc.c', 'smc_h': 'include/linux/mfd/macsmc.h',
++        's2r': 'drivers/soc/apple/apple-s2r.c', 'rtkit': 'drivers/soc/apple/rtkit.c',
++        'rtkit_h': 'include/linux/soc/apple/rtkit.h', 'sleep_h': 'include/linux/soc/apple/sleep.h',
++    }
++    text = {k: (ROOT / v).read_text() for k, v in files.items()}
++    if args.mutation:
++        old, new = MUTATIONS[args.mutation]
++        hit = [k for k in text if old in text[k]]
++        assert hit, f'missing mutation site: {old}'
++        text[hit[0]] = text[hit[0]].replace(old, new, 1)
++    try:
++        cmd, smc = check(**text)
++    except (AssertionError, ValueError, AttributeError) as e:
++        print(e if str(e).startswith('Assertion') else f'Assertion failed: {e}')
++        raise SystemExit(1)
++    build(cmd, smc)
++    line = ('smc-notice-late: off by default, armed noirq sends nothing, late path lock- and clock-free in '
++            'sleep_commit order with the undo, polled AP notice to the asked state, sent after both watchdogs '
++            'and before the commit, stage 0x51 on refusal, counted reply exact')
++    if args.out:
++        args.out.write_text(line + '\n')
++    print(line)
++
++
++if __name__ == '__main__':
++    main()
+-- 
+2.43.0
+

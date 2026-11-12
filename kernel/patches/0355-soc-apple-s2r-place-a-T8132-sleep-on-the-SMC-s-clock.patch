@@ -1,0 +1,449 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 07:57:51 +0000
+Subject: [PATCH 355/358] soc: apple: s2r: place a T8132 sleep on the SMC's
+ clock
+
+On macOS the SMC stamps the sleep it registers (CLSP) within 1 ms of the
+last AP step. Ours tells the SMC at its noirq suspend, well before the
+commit, so where a CLSP stamp falls against our own steps is what tells
+whether the SMC took the notice or saw the SoC go down.
+
+After the AP idle notice the SMC answers no key read, so its clock can't
+be read at the commit. Instead:
+
+- macsmc reads CLKU right before the notice, after the debug link's
+  settle, between two AP counter reads (get_cycles()), and hands the
+  three values to apple-s2r through apple_sleep_smc_clock_mark().
+- apple-s2r's T8132 finisher reads the AP counter right before the
+  commit, ahead of the last cache clean, and the report after ->enter
+  prints the CLKU mark and the commit on the SMC's clock, counted from
+  the middle of the mark's read (mul_u64_u32_div(), so long spans
+  can't overflow).
+- ->begin and ->enter forget the marks of an earlier cycle.
+
+Nothing the sleep does changes; this adds one SMC key read before the
+notice. The marks don't outlive a reset: no byte beside the PMU boot
+stage is known to be free (0xf802, 0xf803 and 0xf80f are iBoot's, the
+others have no named owner), so they are not written there.
+
+tools/asahi/smc-stamp-tests.py checks the reader and the order of the
+reads from the sources, builds the conversion and checks it on fixed
+values over a 30-day span, and kills eleven mutations.
+
+Assisted-by: LLM
+---
+ drivers/mfd/macsmc.c            |  22 ++++
+ drivers/soc/apple/apple-s2r.c   |  72 +++++++++++++
+ include/linux/soc/apple/sleep.h |   4 +
+ tools/asahi/run-host-tests.py   |   5 +
+ tools/asahi/smc-stamp-tests.py  | 181 ++++++++++++++++++++++++++++++++
+ 5 files changed, 284 insertions(+)
+ create mode 100755 tools/asahi/smc-stamp-tests.py
+
+diff --git a/drivers/mfd/macsmc.c b/drivers/mfd/macsmc.c
+index 4d49a44a4a..d876028773 100644
+--- a/drivers/mfd/macsmc.c
++++ b/drivers/mfd/macsmc.c
+@@ -29,6 +29,7 @@
+ #include <linux/soc/apple/rtkit.h>
+ #include <linux/soc/apple/sleep.h>
+ #include <linux/suspend.h>
++#include <linux/timex.h>
+ #include <linux/unaligned.h>
+ #include <linux/suspend.h>
+ 
+@@ -1096,6 +1097,26 @@ static void apple_smc_outbox_settle(struct apple_smc *smc)
+ 		count, last, quiet >= SMC_OUTBOX_QUIET_MS ? "quiet" : "still busy", ms);
+ }
+ 
++/*
++ * The SMC's clock at the sleep notice, for the sleep driver to place the
++ * commit on it: after the notice the SMC answers no key read, so the commit's
++ * time is derived from the AP counter read around this one.
++ */
++static void apple_smc_clock_mark(struct apple_smc *smc)
++{
++	u64 smc_us, before, after;
++	int ret;
++
++	before = get_cycles();
++	ret = apple_smc_read_u64(smc, SMC_KEY(CLKU), &smc_us);
++	after = get_cycles();
++	if (ret) {
++		dev_warn(smc->dev, "SMC clock not read before the sleep notice: %d\n", ret);
++		return;
++	}
++	apple_sleep_smc_clock_mark(smc_us, before, after);
++}
++
+ static int apple_smc_suspend_noirq(struct device *dev)
+ {
+ 	struct apple_smc *smc = dev_get_drvdata(dev);
+@@ -1107,6 +1128,7 @@ static int apple_smc_suspend_noirq(struct device *dev)
+ 	apple_smc_set_polled(smc, true);
+ 	if (apple_sleep_debug_link_cut())
+ 		apple_smc_outbox_settle(smc);
++	apple_smc_clock_mark(smc);
+ 	ret = apple_smc_sleep_commit(smc);
+ 	apple_smc_set_polled(smc, false);
+ 
+diff --git a/drivers/soc/apple/apple-s2r.c b/drivers/soc/apple/apple-s2r.c
+index 3f028b2e62..f0f104086d 100644
+--- a/drivers/soc/apple/apple-s2r.c
++++ b/drivers/soc/apple/apple-s2r.c
+@@ -96,6 +96,7 @@
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ #include <linux/kdebug.h>
++#include <linux/math64.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -113,6 +114,7 @@
+ #include <linux/string.h>
+ #include <linux/suspend.h>
+ #include <linux/syscore_ops.h>
++#include <linux/timex.h>
+ 
+ #include <dt-bindings/gpio/gpio.h>
+ 
+@@ -538,6 +540,9 @@ struct apple_s2r_t8132 {
+ 	/* the sleep was refused for it (t8132_pwrgate_strict) */
+ 	bool pga_refused;
+ 	bool pga_commit_read;
++	/* smc-stamp: the AP counter right before the commit */
++	u64 commit_cycles;
++	bool commit_cycles_read;
+ 	bool pga_read;
+ 
+ 	/* ANS's APCIe block, from the apple,apcie host node and its loader-published tables */
+@@ -3358,6 +3363,10 @@ static int apple_s2r_t8132_finish(unsigned long arg)
+ 	if (s2r->wdt_armed)
+ 		apple_s2r_wdt_arm_secs(s2r, min_t(u32, wdt_timeout, T8132_WD1_COMMIT_SECS));
+ 
++	/* smc-stamp: the commit's time on the AP counter, cleaned with the rest */
++	t->commit_cycles = get_cycles();
++	t->commit_cycles_read = true;
++
+ 	/* What this path has dirtied since the sweep. */
+ 	dcache_clean_poc((unsigned long)task_stack_page(current),
+ 			 (unsigned long)task_stack_page(current) + THREAD_SIZE);
+@@ -3592,6 +3601,7 @@ static int apple_s2r_t8132_enter(struct apple_s2r *s2r)
+ 	int ret, i;
+ 
+ 	t->returned = false;
++	t->commit_cycles_read = false;
+ 	t->cpus_stop_ret = 0;
+ 	t->cluster_e_ret = 0;
+ 	t->stop_word[0] = apple_cpu_stop_word();
+@@ -3656,12 +3666,73 @@ static int apple_s2r_t8132_enter(struct apple_s2r *s2r)
+ 	return ret;
+ }
+ 
++/*
++ * smc-stamp: the SMC's clock (CLKU) at its sleep notice, and the AP counter
++ * around that read (macsmc, noirq). It and the counter at the commit place
++ * our sleep on the clock the SMC stamps its sleeps (CLSP) on.
++ */
++static struct {
++	u64 smc_us;
++	u64 before;
++	u64 after;
++	bool valid;
++} apple_s2r_smc_mark;
++
++void apple_sleep_smc_clock_mark(u64 smc_us, u64 cycles_before, u64 cycles_after)
++{
++	apple_s2r_smc_mark.smc_us = smc_us;
++	apple_s2r_smc_mark.before = cycles_before;
++	apple_s2r_smc_mark.after = cycles_after;
++	apple_s2r_smc_mark.valid = true;
++}
++EXPORT_SYMBOL_GPL(apple_sleep_smc_clock_mark);
++
++/*
++ * The SMC's clock @cycles AP counter ticks: counted from the middle of the
++ * mark's read, rounded down. 0 when it can't be placed.
++ */
++static u64 apple_s2r_smc_us_at(u64 smc_us, u64 before, u64 after, u64 cycles, u32 freq)
++{
++	u64 mid = before + (after - before) / 2;
++
++	if (!freq || after < before || cycles < mid)
++		return 0;
++	return smc_us + mul_u64_u32_div(cycles - mid, USEC_PER_SEC, freq);
++}
++
++static void apple_s2r_smc_stamp_report(struct apple_s2r *s2r)
++{
++	struct apple_s2r_t8132 *t = &s2r->t8132;
++	u64 smc_us = apple_s2r_smc_mark.smc_us;
++	u64 ticks = apple_s2r_smc_mark.after - apple_s2r_smc_mark.before;
++	u32 freq = arch_timer_get_cntfrq();
++	u64 at;
++
++	if (!apple_s2r_smc_mark.valid) {
++		dev_info(s2r->dev, "smc-stamp: no SMC clock read at the notice\n");
++	} else if (!t->commit_cycles_read) {
++		dev_info(s2r->dev,
++			 "smc-stamp: CLKU at the notice %llu us (read in %llu ticks), commit not reached\n",
++			 smc_us, ticks);
++	} else {
++		at = apple_s2r_smc_us_at(smc_us, apple_s2r_smc_mark.before,
++					 apple_s2r_smc_mark.after, t->commit_cycles, freq);
++		dev_info(s2r->dev,
++			 "smc-stamp: CLKU at the notice %llu us (read in %llu ticks), at the commit %llu us (+%llu us, AP counter at %u Hz)\n",
++			 smc_us, ticks, at, at ? at - smc_us : 0, freq);
++	}
++	apple_s2r_smc_mark.valid = false;
++	t->commit_cycles_read = false;
++}
++
+ /* After ->enter: what the wake found, and what didn't go as macOS has it. */
+ static void apple_s2r_t8132_report(struct apple_s2r *s2r)
+ {
+ 	struct apple_s2r_t8132 *t = &s2r->t8132;
+ 	unsigned int i, id;
+ 
++	apple_s2r_smc_stamp_report(s2r);
++
+ 	if (t->pmu_err)
+ 		dev_warn(s2r->dev, "T8132: PMU boot stage write failed %u time(s)\n", t->pmu_err);
+ 	t->pmu_err = 0;
+@@ -4319,6 +4390,7 @@ static int apple_s2r_begin(suspend_state_t state)
+ 		return 0;
+ 	WRITE_ONCE(apple_s2r_powered_down, false);
+ 	WRITE_ONCE(apple_s2r_lost_n, 0);
++	apple_s2r_smc_mark.valid = false;
+ 	if (apple_s2r) {
+ 		if (apple_s2r->wdt) {
+ 			apple_s2r->wdt_begin_ctl = readl_relaxed(apple_s2r->wdt + WDT_CTL);
+diff --git a/include/linux/soc/apple/sleep.h b/include/linux/soc/apple/sleep.h
+index 5379534d57..ca1c9a8371 100644
+--- a/include/linux/soc/apple/sleep.h
++++ b/include/linux/soc/apple/sleep.h
+@@ -115,6 +115,8 @@ void apple_sleep_radio_port_up(void);
+ int apple_sleep_apcie_port_down(unsigned int port);
+ /* Whether a T8132 sleep holds this PCIe host's power domains on (its own lowering owns them). */
+ bool apple_sleep_apcie_hold(struct device_node *np);
++/* The SMC's clock (CLKU, us) at its sleep notice, read between two get_cycles(). */
++void apple_sleep_smc_clock_mark(u64 smc_us, u64 cycles_before, u64 cycles_after);
+ #else
+ static inline int apple_sleep_coproc_register(struct device *dev, void __iomem *asc,
+ 					      bool pcie_ans, int (*last_stop)(void *data),
+@@ -138,6 +140,8 @@ static inline void apple_sleep_apcie_port_up(unsigned int port) { }
+ static inline void apple_sleep_radio_port_up(void) { }
+ static inline int apple_sleep_apcie_port_down(unsigned int port) { return 0; }
+ static inline bool apple_sleep_apcie_hold(struct device_node *np) { return false; }
++static inline void apple_sleep_smc_clock_mark(u64 smc_us, u64 cycles_before,
++					      u64 cycles_after) { }
+ #endif
+ 
+ /*
+diff --git a/tools/asahi/run-host-tests.py b/tools/asahi/run-host-tests.py
+index dc214ad13f..a5c8fec014 100755
+--- a/tools/asahi/run-host-tests.py
++++ b/tools/asahi/run-host-tests.py
+@@ -187,6 +187,11 @@ ASAHI_TESTS = {
+                                    'not-split', 'mode-unknown', 'lowers-real',
+                                    'lowers-notice', 'lowers-depth', 'lost-io-depth',
+                                    'lost-ans-cycle', 'lost-gp'), out()),
++    'smc-stamp-tests.py': [(out(), PASS)]
++        + mutations('--mutation', ('mid-after', 'naive-mul', 'early-ok', 'reader-writable',
++                                   'reader-writes', 'key-dropped', 'mark-after-notice',
++                                   'no-mark', 'mark-unbracketed', 'commit-cycles-late',
++                                   'mark-not-cleared'), out()),
+     'rtkit-crashlog-tests.py': [(out(), PASS)]
+         + mutations('--mutation', ('buffer-header', 'section-header', 'section-size', 'footer-room',
+                                    'mailbox-minimum', 'version-string', 'message-string'), out()),
+diff --git a/tools/asahi/smc-stamp-tests.py b/tools/asahi/smc-stamp-tests.py
+new file mode 100755
+index 0000000000..292f95a999
+--- /dev/null
++++ b/tools/asahi/smc-stamp-tests.py
+@@ -0,0 +1,181 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Check smc-stamp: the SMC's sleep keys read only, and our sleep on the SMC's clock.
++
++On macOS (J604, 26B123) the SMC stamps each sleep it registers in CLSP within
++1 ms of the last AP step and counts it in MPPR. This checks, from the sources,
++that macsmc's debugfs file reads exactly the keys CLSP, CLWK, CLKU, CLBT,
++MPPR, MBSE and MBSW, root-only and read-only, with no SMC write or command in
++its path; that the SMC's clock CLKU is read, between two AP counter reads,
++before the sleep notice and after the debug link's settle; that apple-s2r
++takes the AP counter right before the commit, before the last cache clean,
++and forgets an older notice at ->begin. It then builds apple-s2r's conversion
++from the AP counter to the SMC's clock and checks it on fixed values,
++including a 30-day span that overflows a plain 64-bit product.
++"""
++import argparse
++import os
++import re
++import subprocess
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[2]
++KEYS = ['CLSP', 'CLWK', 'CLKU', 'CLBT', 'MPPR', 'MBSE', 'MBSW']
++MUTATIONS = {
++    'mid-after': ('\tu64 mid = before + (after - before) / 2;\n', '\tu64 mid = after;\n'),
++    'naive-mul': ('return smc_us + mul_u64_u32_div(cycles - mid, USEC_PER_SEC, freq);',
++                  'return smc_us + (cycles - mid) * USEC_PER_SEC / freq;'),
++    'early-ok': ('\tif (!freq || after < before || cycles < mid)\n', '\tif (!freq || after < before)\n'),
++    'reader-writable': ('debugfs_create_file("sleep-keys", 0400,', 'debugfs_create_file("sleep-keys", 0600,'),
++    'reader-writes': ('\t\t\tret = apple_smc_read(smc, key, buf, info.size);\n',
++                      '\t\t\tret = apple_smc_write(smc, key, buf, info.size);\n'),
++    'key-dropped': ('\tSMC_KEY(MPPR), SMC_KEY(MBSE), SMC_KEY(MBSW),\n', '\tSMC_KEY(MBSE), SMC_KEY(MBSW),\n'),
++    'mark-after-notice': ('\tapple_smc_clock_mark(smc);\n\tret = apple_smc_sleep_commit(smc);\n',
++                          '\tret = apple_smc_sleep_commit(smc);\n\tapple_smc_clock_mark(smc);\n'),
++    'no-mark': ('\tapple_smc_clock_mark(smc);\n\tret = apple_smc_sleep_commit(smc);\n',
++                '\tret = apple_smc_sleep_commit(smc);\n'),
++    'mark-unbracketed': ('\tbefore = get_cycles();\n\tret = apple_smc_read_u64(smc, SMC_KEY(CLKU), &smc_us);\n',
++                         '\tret = apple_smc_read_u64(smc, SMC_KEY(CLKU), &smc_us);\n\tbefore = get_cycles();\n'),
++    'commit-cycles-late': ('\t/* smc-stamp: the commit\'s time on the AP counter, cleaned with the rest */\n'
++                           '\tt->commit_cycles = get_cycles();\n\tt->commit_cycles_read = true;\n\n', ''),
++    'mark-not-cleared': ('\tWRITE_ONCE(apple_s2r_lost_n, 0);\n\tapple_s2r_smc_mark.valid = false;\n',
++                         '\tWRITE_ONCE(apple_s2r_lost_n, 0);\n'),
++}
++
++FIXTURE = r'''
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++typedef uint64_t u64;
++typedef uint32_t u32;
++#define USEC_PER_SEC 1000000UL
++static __attribute__((unused)) u64 mul_u64_u32_div(u64 a, u32 mul, u32 divisor)
++{
++	return (u64)(((unsigned __int128)a * mul) / divisor);
++}
++%s
++}
++int main(void)
++{
++	const u32 f = 24000000;
++	const u64 base = 1566400294738ULL;
++	/* a 100 us read: from its middle, 2200 */
++	assert(apple_s2r_smc_us_at(base, 1000, 3400, 2200 + 5ULL * f, f) == base + 5000000);
++	assert(apple_s2r_smc_us_at(base, 1000, 3400, 2200 + 23, f) == base);
++	assert(apple_s2r_smc_us_at(base, 1000, 3400, 2200 + 24, f) == base + 1);
++	assert(apple_s2r_smc_us_at(base, 1000, 3400, 2200, f) == base);
++	/* before the mark, a reversed read, no frequency: unknown */
++	assert(apple_s2r_smc_us_at(base, 1000, 3400, 2199, f) == 0);
++	assert(apple_s2r_smc_us_at(base, 3400, 1000, 9000, f) == 0);
++	assert(apple_s2r_smc_us_at(base, 1000, 3400, 9000, 0) == 0);
++	/* 30 days: (cycles - mid) * 10^6 needs more than 64 bits */
++	assert(apple_s2r_smc_us_at(base, 1000, 1000, 1000 + 30ULL * 86400 * f, f) == base + 30ULL * 86400 * 1000000);
++	puts("conversion ok");
++	return 0;
++}
++'''
++
++
++def fn_body(src, head):
++    at = src.index(head)
++    return src[at:src.index('\n}\n', at)]
++
++
++def check_sources(smc, s2r, sleep_h):
++    m = re.search(r'static const smc_key apple_smc_sleep_keys\[\] = \{(.*?)\};', smc, re.S)
++    assert m, 'Assertion failed: no apple_smc_sleep_keys'
++    keys = re.findall(r'SMC_KEY\((\w+)\)', m.group(1))
++    assert keys == KEYS, f'Assertion failed: sleep keys {keys}, want {KEYS}'
++    init = fn_body(smc, 'static void apple_smc_debugfs_init(struct apple_smc *smc)')
++    assert 'debugfs_create_file("sleep-keys", 0400, dir, smc, &apple_smc_sleep_keys_fops);' in init, \
++        'Assertion failed: sleep-keys must be a root-only read-only file'
++    assert 'DEFINE_SHOW_ATTRIBUTE(apple_smc_sleep_keys);' in smc, \
++        'Assertion failed: sleep-keys must be a show attribute (no write op)'
++    show = fn_body(smc, 'static int apple_smc_sleep_keys_show(struct seq_file *m, void *unused)')
++    for bad in ('apple_smc_write', 'apple_smc_rw', '_atomic(', 'apple_smc_ap_power', 'MBSE)'):
++        assert bad not in show, f'Assertion failed: the reader must not use {bad}'
++    for need in ('apple_smc_get_key_info(smc, key, &info)', 'info.size > sizeof(buf)',
++                 'apple_smc_read(smc, key, buf, info.size)'):
++        assert need in show, f'Assertion failed: the reader lacks {need}'
++    probe = fn_body(smc, 'static int apple_smc_probe(struct platform_device *pdev)')
++    assert probe.find('smc->key_count = be32_to_cpu(count);') < probe.find('apple_smc_debugfs_init(smc);'), \
++        'Assertion failed: the reader is created once the SMC answers'
++
++    mark = fn_body(smc, 'static void apple_smc_clock_mark(struct apple_smc *smc)')
++    i_b = mark.find('before = get_cycles();')
++    i_r = mark.find('apple_smc_read_u64(smc, SMC_KEY(CLKU), &smc_us)')
++    i_a = mark.find('after = get_cycles();')
++    assert 0 <= i_b < i_r < i_a, 'Assertion failed: CLKU must be read between two AP counter reads'
++    assert 'apple_sleep_smc_clock_mark(smc_us, before, after);' in mark
++    noirq = fn_body(smc, 'static int apple_smc_suspend_noirq(struct device *dev)')
++    i_p = noirq.find('apple_smc_set_polled(smc, true);')
++    i_s = noirq.find('apple_smc_outbox_settle(smc);')
++    i_m = noirq.find('apple_smc_clock_mark(smc);')
++    i_c = noirq.find('apple_smc_sleep_commit(smc);')
++    assert 0 <= i_p < i_s < i_m < i_c, \
++        'Assertion failed: the mark goes after the settle and before the notice (commands fail after it)'
++    assert 'void apple_sleep_smc_clock_mark(u64 smc_us, u64 cycles_before, u64 cycles_after);' in sleep_h
++    assert 'static inline void apple_sleep_smc_clock_mark(' in sleep_h, 'Assertion failed: no stub without APPLE_S2R'
++
++    fin = fn_body(s2r, 'static int apple_s2r_t8132_finish(unsigned long arg)')
++    i_cc = fin.find('t->commit_cycles = get_cycles();')
++    i_cl = fin.find('dcache_clean_poc((unsigned long)task_stack_page(current),')
++    i_cm = fin.find('writel(S2R_TIMER_START, t->commit);')
++    assert 0 <= i_cc < i_cl < i_cm, \
++        'Assertion failed: the commit counter is read before the last clean and the commit'
++    assert 't->commit_cycles_read = true;' in fin[i_cc:i_cl]
++    begin = fn_body(s2r, 'static int apple_s2r_begin(suspend_state_t state)')
++    assert 'apple_s2r_smc_mark.valid = false;' in begin, 'Assertion failed: ->begin must forget an older mark'
++    enter = fn_body(s2r, 'static int apple_s2r_t8132_enter(struct apple_s2r *s2r)')
++    assert 't->commit_cycles_read = false;' in enter, 'Assertion failed: ->enter must forget an older commit'
++    rep = fn_body(s2r, 'static void apple_s2r_t8132_report(struct apple_s2r *s2r)')
++    assert 'apple_s2r_smc_stamp_report(s2r);' in rep, 'Assertion failed: the report must print the marks'
++    return fn_body(s2r, 'static u64 apple_s2r_smc_us_at(u64 smc_us, u64 before, u64 after, u64 cycles, u32 freq)')
++
++
++def check_conversion(fn):
++    with tempfile.TemporaryDirectory() as d:
++        c = Path(d) / 'smc-stamp.c'
++        c.write_text(FIXTURE % fn)
++        exe = Path(d) / 'smc-stamp'
++        subprocess.run(['gcc', '-std=gnu11', '-O1', '-Wall', '-Werror', '-o', str(exe), str(c)], check=True)
++        p = subprocess.run([str(exe)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
++        print(p.stdout, end='')
++        if p.returncode:
++            print(f'"exit": {p.returncode}' + (' Assertion failed (C)' if 'Assertion' in p.stdout else ''))
++            raise SystemExit(1)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--out', type=Path)
++    parser.add_argument('--mutation', choices=MUTATIONS)
++    args = parser.parse_args()
++    files = {
++        'smc': ROOT / 'drivers/mfd/macsmc.c',
++        's2r': ROOT / 'drivers/soc/apple/apple-s2r.c',
++        'sleep_h': ROOT / 'include/linux/soc/apple/sleep.h',
++    }
++    text = {k: v.read_text() for k, v in files.items()}
++    if args.mutation:
++        old, new = MUTATIONS[args.mutation]
++        hit = [k for k in text if old in text[k]]
++        assert hit, f'missing mutation site: {old}'
++        text[hit[0]] = text[hit[0]].replace(old, new, 1)
++    try:
++        fn = check_sources(**text)
++    except (AssertionError, ValueError, AttributeError) as e:
++        print(e if str(e).startswith('Assertion') else f'Assertion failed: {e}')
++        raise SystemExit(1)
++    check_conversion(fn)
++    line = ('smc-stamp: 7 SMC sleep keys read only (0400, no write path), CLKU read between two AP counter reads '
++            'before the notice, the commit counter before the last clean, conversion exact over 30 days')
++    if args.out:
++        args.out.write_text(line + '\n')
++    print(line)
++
++
++if __name__ == '__main__':
++    os.environ.setdefault('LC_ALL', 'C')
++    main()
+-- 
+2.43.0
+

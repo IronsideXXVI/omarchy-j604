@@ -7,9 +7,10 @@ This repository is the working set for running [Omarchy](https://github.com/omac
 The J604 runs the official Omarchy **edge** channel (switched with the official `omarchy-channel-set edge` on 2026-11-09): `omarchy-dev` and `omarchy-settings-dev` built from the `quattro` branch, plus the official `omarchy-mac`. This repository carries only what the stock packages lack for this Mac:
 
 - the hardware enablement (kernel, boot chain, Mesa admission, audio profiles, firmware extraction, initramfs and unlock-prompt fixes, Touch ID eligibility, the Touch ID library update the 7.3 kernel's Secure Enclave interface needs, and the VA-API driver alias the 7.3 kernel's renamed GPU driver needs);
-- two userland additions:
+- three userland additions:
   - the keyboard-backlight series in `omarchy-dev` / `omarchy-settings-dev` (the backlight comes on with activity, goes off after 10 s idle, Ctrl+F1/F2 change it, and Super+K leaves out keys a MacBook doesn't have);
-  - built-in panel defaults: `omarchy-settings-dev` reads a `panel` line from the platform package, and `omarchy-mac` names this Mac's panel there (10-bit, Display P3). A setting in the user's `monitors.lua` still wins.
+  - built-in panel defaults: `omarchy-settings-dev` reads a `panel` line from the platform package, and `omarchy-mac` names this Mac's panel there (10-bit, Display P3). A setting in the user's `monitors.lua` still wins;
+  - blur only where it can show (the owner's decision, to be proposed upstream): Hyprland blurs only inside a surface's declared blur region, and the Omarchy bar declares its strip as that region. The look is unchanged; the 120 Hz composite rate with blur on is still open (see `STATUS.md`).
 
 Everything else is stock. Each piece is a patch on top of an official recipe, built with a local `pkgrel`. Earlier userland changes that are not installed are listed in [`not-installed/README.md`](not-installed/README.md).
 
@@ -27,7 +28,7 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | CPU | Working: 10 cores, cpufreq and cpuidle (performance cores up to 4.46 GHz requested, efficiency 2.89 GHz); one busy performance core runs at about 4.36 GHz and two to four at about 3.9 GHz, as under macOS with all cores loaded; since 1.723 the reported frequency is the reached one |
 | GPU | Accelerated (OpenGL 4.6 / Vulkan 1.4); idle GPU power 0.041 W on 1.710, 0.076 W on 1.711 |
 | Internal display | 3024x1964 at 120 Hz, scale 2, 10-bit (XRGB2101010) and Display P3 as package defaults, with no user setting. The panel link is most likely 8 bits per channel with dithering (not yet verified). VRR stays off, as in upstream Omarchy |
-| Glassy bar | Stock holds about 59 fps on this 120 Hz panel (re-measured on 1.731). 119 fps needs the change in [omacom/omarchy#18176](https://github.com/omacom/omarchy/pull/18176), which is not carried here. With blur on, the desktop composites at 60 per second, not 120 (open; a carried Hyprland and bar pair was installed with 1.847 and taken out with 1.848, see `STATUS.md`) |
+| Glassy bar | Stock holds about 59 fps on this 120 Hz panel (re-measured on 1.731). 119 fps needs the change in [omacom/omarchy#18176](https://github.com/omacom/omarchy/pull/18176), which is not carried here. With blur on, the desktop does not composite 120 times a second (open: 80 per second with windowed 60 fps video on 1.856 with the carried Hyprland and bar pair, see `STATUS.md`) |
 | Smoothness at 120 Hz | Both fixes on by default since 1.718: a full-window animation runs at 120 fps (about 90 before), scrolling at 120 fps, and 24, 30 and 60 fps video in Chromium stays on its cadence in our tests. YouTube fullscreen 1080p60 since 1.730: 1.8-3.4 % of frames off cadence, 0 dropped (1.6-7.2 % before, 23 % before pacing). 4K60 in Chromium is held back by its software decoding; stock mpv plays the same 4K60 clip with 0 of 600 frames off (see `STATUS.md`). After idle, a terminal open/close animation sometimes ran below about 68 fps (cause: the frame pacing's start value after idle); 1.804 carries the fix, and its first 8-burst check held no frame |
 | Camera | Working, tuned: 1080p30 and 720p30 capture only today (the sensor has more modes; work in progress) with the sensor tuning file loaded, seen by stock apps and Chromium; colour close to neutral in a bright scene, not yet judged by eye |
 | Wi-Fi and Bluetooth | Working |
@@ -57,7 +58,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`a82a1ebda940`), 353 patches | `1.854` |
+| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`a82a1ebda940`), 358 patches | `1.856` |
 | `m1n1-aurora` | 1.6.1.aurora22, omacom/m1n1 (`bc79acc434`), 41 patches | `1.612` |
 | `uboot-aurora` | 2026.07.aurora6, aurora-silicon/u-boot (`d30213eadc`) | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261107, omacom/mesa (`b7b03c5b3b`) | `1.8140` |
@@ -73,12 +74,13 @@ The J604 builds carried here, as installed on the machine on 2026-11-09 (checked
 | `gpu-screen-recorder` | 6.1.7, gpu-screen-recorder (Arch Linux recipe, built for aarch64) | `1.604` (captures monitors on the Apple display controller) |
 | `omarchy-mac-boot` | 20261104, omacom/omarchy-mac-pkgs (`7e50e937b5`) | `1.616` |
 | `omarchy-mac` | 0.2.3, omacom/omarchy-mac-pkgs (`ea0097a523`) | `2.17` (adds the panel line, Chromium hardware video decode on the J604 for H.264 and VP9 profile 0, and a Touch ID start-up race fix) |
-| `omarchy-dev` | 4.0.0.r7641.gf97d3e7 (edge), omacom/omarchy `quattro` (`f97d3e7dc8`), omacom recipe (`5c7fdeaecf`) | `1.3` (keyboard-backlight patches only; the `1.1` content) |
+| `omarchy-dev` | 4.0.0.r7641.gf97d3e7 (edge), omacom/omarchy `quattro` (`f97d3e7dc8`), omacom recipe (`5c7fdeaecf`) | `1.4` (keyboard-backlight patches + the bar declares its strip as its blur region; look unchanged) |
 | `omarchy-settings-dev` | 4.0.0.r7641.gf97d3e7 (edge), omacom/omarchy `quattro` (`f97d3e7dc8`) | `1.1` (keyboard-backlight patches + built-in panel defaults) |
+| `hyprland` | 0.57.1, hyprwm/Hyprland (`v0.57.1`), omacom recipe (`0c7102d724`) | `2.606` (Omarchy's three patches + one: blur only inside a surface's declared blur region, so the full-screen bar no longer makes Hyprland blur everything that changes under it; look unchanged) |
 
-Also installed, unchanged from the official repositories: Hyprland 0.57.1 and the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
+Also installed, unchanged from the official repositories: the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
-Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.854 changed over 1.617).
+Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.856 changed over 1.617).
 
 ## Layout
 
@@ -99,7 +101,8 @@ Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only
 | `plymouth/` | SimpleDRM recognized by driver name, so the disk unlock prompt opens on the panel | Plymouth | GPL-2.0 |
 | `omarchy-mac-boot/` | boot package fixes for the J604, and `update-m1n1` builds `boot.bin` with only the running Mac's own device tree | omacom/omarchy-mac-pkgs | MIT |
 | `omarchy-mac/` | keyboard backlight idle timeout, Apple F-row key names, Touch ID on the J604, the 14-inch MacBook Pro panel line (10-bit, Display P3) | omacom/omarchy-mac-pkgs | MIT |
-| `omarchy-dev/`, `omarchy-settings-dev/` | the keyboard-backlight series on the edge recipes (the same four patches in both); `omarchy-settings-dev` also carries the built-in panel defaults (`disp-0201`) | omacom/omarchy | MIT |
+| `omarchy-dev/`, `omarchy-settings-dev/` | the keyboard-backlight series on the edge recipes (the same four patches in both); `omarchy-settings-dev` also carries the built-in panel defaults (`disp-0201`), and `omarchy-dev` since 1.4 the bar's blur region (`bar-0301`) | omacom/omarchy | MIT |
+| `hyprland/` | blur only inside a surface's declared blur region (`0001`), on the official recipe with Omarchy's own three patches | hyprwm/Hyprland (omacom `hyprland` recipe) | BSD-3-Clause |
 | `not-installed/` | earlier userland changes that are not installed, and where they are | | |
 
 Every component directory has the same shape:

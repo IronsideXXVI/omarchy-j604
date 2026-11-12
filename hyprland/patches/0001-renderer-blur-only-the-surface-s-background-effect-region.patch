@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 21:58:10 +0000
+Subject: [PATCH] renderer: blur only the surface's background-effect region
+
+A surface that sets an ext-background-effect-v1 blur region shows the
+blur only inside that region: the final draw of the blurred background is
+clipped to it (blurClipRegion in renderTextureWithBlurInternal). The blur
+itself was still computed over the whole see-through part of the surface
+intersected with the frame's damage.
+
+Shells draw bars as a full-screen transparent layer surface that paints a
+thin strip, so the input region can change for drags without resizing the
+surface. With live blur behind such a bar, everything that changes anywhere
+under its clear expanse is blurred every frame and then thrown away. A
+1080p60 video in a window under a full-screen bar on a 3024x1964 output
+made the compositor blur almost the whole output 60 times a second.
+
+Intersect the region handed to the blur with the surface's blur region,
+transformed the same way the final clip is. The blur pass expands its
+working damage by the blur radius itself, so the pixels inside the region
+come out the same.
+
+When the damage does not reach the region at all, skip the blur chain:
+its result would not be drawn anywhere, yet it still acquired the work
+buffers, cleared them over the whole output and ran its passes. With the
+blurred strip of a bar unchanged, every frame paid that for nothing.
+
+The render pass also took such a surface's whole box as the live-blur
+area: every damage rect was expanded by the blur reach, and no opaque
+window touching that box was used for occlusion, so with a full-screen
+bar nothing on the output was culled. Give pass elements a live-blur box
+(the bounding box by default); for a surface with a blur region it is
+that region grown by what the blur reads around it: one blur damage
+radius, in output pixels, the margin the blur pass itself grows its
+working damage by. Damage within that margin still re-blurs the strip;
+the pass adds its usual damage and occlusion margins on top. A window
+tiled under a bar starts just past it, so its frames no longer run the
+blur chain behind the strip at every composite.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ src/render/ElementRenderer.cpp         | 26 ++++++++++++++++++++++++
+ src/render/pass/Pass.cpp               |  4 ++--
+ src/render/pass/PassElement.hpp        |  4 ++++
+ src/render/pass/SurfacePassElement.cpp | 28 ++++++++++++++++++++++++++
+ src/render/pass/SurfacePassElement.hpp |  1 +
+ 5 files changed, 61 insertions(+), 2 deletions(-)
+
+diff --git a/src/render/ElementRenderer.cpp b/src/render/ElementRenderer.cpp
+index e6ffe0fc1..52b2cdff0 100644
+--- a/src/render/ElementRenderer.cpp
++++ b/src/render/ElementRenderer.cpp
+@@ -514,7 +514,33 @@ void IElementRenderer::drawTex(CRenderContext& ctx, WP<CTexPassElement> element,
+         if (element->m_data.blockBlurOptimization.value_or(false)) {
+             inverseOpaque.translate(box.pos());
+             m_renderData.renderModif.applyToRegion(inverseOpaque);
++
++            // A surface that names its blur region (ext-background-effect-v1)
++            // only ever shows the blur inside it: the final draw is clipped to
++            // that region. Blur only there, not the whole see-through surface:
++            // a full-screen shell surface with a small blurred strip otherwise
++            // re-blurs everything that changes underneath it, every frame.
++            if (const auto PSURFACE = Desktop::View::CWLSurface::fromResource(surface); PSURFACE && PSURFACE->m_hasBackgroundEffect && !PSURFACE->m_blurRegion.empty()) {
++                CRegion protocolBlur = PSURFACE->m_blurRegion.copy();
++                protocolBlur.intersect(CBox{0, 0, box.width, box.height});
++                protocolBlur.scale(m_renderData.pMonitor->m_scale);
++                protocolBlur.translate(box.pos());
++                m_renderData.renderModif.applyToRegion(protocolBlur);
++                inverseOpaque.intersect(protocolBlur);
++            }
++
+             inverseOpaque.intersect(element->m_data.damage);
++
++            // Nothing to blur this frame: the blur is drawn only inside the damage it was
++            // computed for, so an empty region means it would not be shown. Skip the blur
++            // chain (its work buffers, full clears and passes) and draw the surface as is.
++            if (inverseOpaque.empty()) {
++                element->m_data.blurredBG = nullptr;
++                transformClipRegion();
++                draw(ctx, element, damage);
++                return;
++            }
++
+             auto patternBox = element->m_data.blurPatternBox.value_or(box);
+             m_renderData.renderModif.applyToBox(patternBox);
+             std::optional<SBlurShape> shape;
+diff --git a/src/render/pass/Pass.cpp b/src/render/pass/Pass.cpp
+index 913be945d..88e520ea7 100644
+--- a/src/render/pass/Pass.cpp
++++ b/src/render/pass/Pass.cpp
+@@ -102,7 +102,7 @@ void CRenderPass::simplify(CRenderContext& ctx, bool willBlur, const CRegion& li
+             if (!el2.element->needsLiveBlurCached)
+                 continue;
+ 
+-            const auto BB = el2.element->boundingBox(ctx);
++            const auto BB = el2.element->liveBlurBox(ctx);
+             RASSERT(BB, "No bounding box for an element with live blur is illegal");
+ 
+             m_totalLiveBlurRegion.add(BB->copy().scale(pMonitor->m_scale));
+@@ -154,7 +154,7 @@ CRegion CRenderPass::render(CRenderContext& ctx, const CRegion& damage_) {
+ 
+         if (el.element->needsLiveBlurCached) {
+             willBlur      = true;
+-            const auto BB = el.element->boundingBox(ctx);
++            const auto BB = el.element->liveBlurBox(ctx);
+             RASSERT(BB, "No bounding box for an element with live blur is illegal");
+             blurRegion.add(*BB);
+         }
+diff --git a/src/render/pass/PassElement.hpp b/src/render/pass/PassElement.hpp
+index 75738fb03..1d116b91c 100644
+--- a/src/render/pass/PassElement.hpp
++++ b/src/render/pass/PassElement.hpp
+@@ -38,6 +38,10 @@ class IPassElement {
+     virtual void                discard(Render::CRenderContext& ctx);
+     virtual bool                undiscardable(Render::CRenderContext& ctx);
+     virtual std::optional<CBox> boundingBox(Render::CRenderContext& ctx);  // in monitor-local logical coordinates
++    // where a live blur of this element can show (monitor-local logical); defaults to the bounding box
++    virtual std::optional<CBox> liveBlurBox(Render::CRenderContext& ctx) {
++        return boundingBox(ctx);
++    }
+     virtual CRegion             opaqueRegion(Render::CRenderContext& ctx); // in monitor-local logical coordinates
+     virtual bool                disableSimplification(Render::CRenderContext& ctx);
+     virtual bool                requiresFullDamage(Render::CRenderContext& ctx);
+diff --git a/src/render/pass/SurfacePassElement.cpp b/src/render/pass/SurfacePassElement.cpp
+index a67f1e578..d7e4cb9b8 100644
+--- a/src/render/pass/SurfacePassElement.cpp
++++ b/src/render/pass/SurfacePassElement.cpp
+@@ -118,6 +118,34 @@ std::optional<CBox> CSurfacePassElement::boundingBox(Render::CRenderContext& ctx
+     return getTexBox();
+ }
+ 
++std::optional<CBox> CSurfacePassElement::liveBlurBox(Render::CRenderContext& ctx) {
++    const auto TEXBOX   = getTexBox();
++    const auto PSURFACE = Desktop::View::CWLSurface::fromResource(m_data.surface);
++    if (!m_data.surface || !PSURFACE || !PSURFACE->m_hasBackgroundEffect || PSURFACE->m_blurRegion.empty())
++        return TEXBOX;
++
++    // The blur shows only inside the surface's blur region (ext-background-effect-v1). Damage
++    // farther away than the blur's reach cannot change it, so it needs neither the blur nor
++    // the damage expansion and occlusion exemption a live blur gets over its whole box.
++    const auto SIZE = m_data.surface->m_current.size;
++    if (SIZE.x <= 0 || SIZE.y <= 0)
++        return TEXBOX;
++    CRegion region = PSURFACE->m_blurRegion.copy().intersect(CBox{{}, SIZE});
++    if (region.empty())
++        return TEXBOX;
++    const auto EXT = region.getExtents();
++    const auto SX = TEXBOX.w / SIZE.x, SY = TEXBOX.h / SIZE.y;
++    CRegion    reach{CBox{TEXBOX.x + EXT.x * SX, TEXBOX.y + EXT.y * SY, EXT.w * SX, EXT.h * SY}};
++    // The blur of the region reads the pixels up to one blur damage radius around it (the radius
++    // the blur pass itself grows its working damage by), and that radius is in output pixels. The
++    // render pass grows this box further for damage and occlusion, as it does for any live blur.
++    const double SCALE = m_data.pMonitor ? m_data.pMonitor->m_scale : 1.0;
++    reach.scale(SCALE);
++    g_pHyprRenderer->expandBlurDamage(reach, 1.F);
++    reach.scale(1.0 / SCALE);
++    return reach.getExtents().intersection(TEXBOX);
++}
++
+ CRegion CSurfacePassElement::opaqueRegion(Render::CRenderContext& ctx) {
+     auto        PSURFACE = Desktop::View::CWLSurface::fromResource(m_data.surface);
+ 
+diff --git a/src/render/pass/SurfacePassElement.hpp b/src/render/pass/SurfacePassElement.hpp
+index 86f402e02..2db08c828 100644
+--- a/src/render/pass/SurfacePassElement.hpp
++++ b/src/render/pass/SurfacePassElement.hpp
+@@ -61,6 +61,7 @@ class CSurfacePassElement : public IPassElement {
+     virtual bool                needsLiveBlur(Render::CRenderContext& ctx);
+     virtual bool                needsPrecomputeBlur(Render::CRenderContext& ctx);
+     virtual std::optional<CBox> boundingBox(Render::CRenderContext& ctx);
++    virtual std::optional<CBox> liveBlurBox(Render::CRenderContext& ctx);
+     virtual CRegion             opaqueRegion(Render::CRenderContext& ctx);
+     virtual void                discard(Render::CRenderContext& ctx);
+     CRegion                     visibleRegion(Render::CRenderContext& ctx, bool& cancel);
+-- 
+2.43.0
+
