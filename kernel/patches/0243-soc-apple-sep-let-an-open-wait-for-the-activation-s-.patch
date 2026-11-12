@@ -1,0 +1,414 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 18:30:24 +0000
+Subject: [PATCH] soc: apple: sep: let an open wait for the
+ activation's own open
+
+/dev/sep-bio takes one opener at a time, and the first open of a boot
+activates Touch ID inside the open itself: the enclave restore and the
+unlock preflight, most of a second. Its opener, omarchy-mac's activation
+unit, closes at once afterwards. An open that arrived in that window was
+refused with EBUSY, and libfprint takes EBUSY as a reader it cannot use
+for the daemon's whole life, so a J604 boot was left without Touch ID
+until fprintd exited.
+
+Keep what the holder of the node is doing in a small module the host
+tests can build: whether its open is still preparing the node, and
+whether that open ran this boot's activation. An open now waits, for at
+most 5 s, while the holder is the activation's own open, the same way it
+already waits for an outgoing enrol or verify worker. A node still held
+after that, or held by anyone else, is refused as before.
+
+This is the kernel half of a race whose user-space half omarchy-mac
+0.2.3-2.17 closes by ordering fprintd after the activation.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/soc/apple/bio.rs           |  20 ++++
+ drivers/soc/apple/bio_open_gate.rs |  53 +++++++++++
+ drivers/soc/apple/sbio.rs          |  38 ++++++++
+ drivers/soc/apple/sep.rs           |   6 ++
+ tools/asahi/run-host-tests.py      |   1 +
+ tools/asahi/sep-bio-open-tests.rs  | 143 +++++++++++++++++++++++++++++
+ 6 files changed, 261 insertions(+)
+ create mode 100644 drivers/soc/apple/bio_open_gate.rs
+ create mode 100644 tools/asahi/sep-bio-open-tests.rs
+
+diff --git a/drivers/soc/apple/bio.rs b/drivers/soc/apple/bio.rs
+index d2567ab596..635be68398 100644
+--- a/drivers/soc/apple/bio.rs
++++ b/drivers/soc/apple/bio.rs
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ // Copyright 2026 Dj
+ 
++use crate::bio_open_gate::Hold;
+ use crate::store::{Key, Store};
+ use kernel::ioctl::{_IO, _IOR, _IOW, _IOWR};
+ use kernel::prelude::*;
+@@ -561,6 +562,8 @@ pub(crate) struct Session {
+     // An enrolment capture was not usable; the next poll reports it once.
+     enrol_retry_unseen: bool,
+     token: Option<ResultToken>,
++    // What the holder of the node is doing, while the node is open.
++    hold: Hold,
+ }
+ 
+ impl Session {
+@@ -574,6 +577,7 @@ impl Session {
+             enrol_stage_unseen: false,
+             enrol_retry_unseen: false,
+             token: None,
++            hold: Hold::new(),
+         }
+     }
+ 
+@@ -585,6 +589,7 @@ impl Session {
+         self.enrol_stage_unseen = false;
+         self.enrol_retry_unseen = false;
+         self.token = None;
++        self.hold.end();
+     }
+ 
+     fn start_worker(&mut self) -> Result<()> {
+@@ -1313,9 +1318,24 @@ pub(crate) fn open(session: &mut Session) -> Result<()> {
+     }
+     session.reset();
+     session.open = true;
++    session.hold.begin();
+     Ok(())
+ }
+ 
++/// The open that took the node has finished preparing it; `activated` says
++/// whether it ran this boot's activation.
++pub(crate) fn opened(session: &mut Session, activated: bool) {
++    if session.open {
++        session.hold.opened(activated);
++    }
++}
++
++/// Whether an open would be refused only because the node is held by the
++/// activation's own open, still preparing the node or about to close it.
++pub(crate) fn waiting_on_activation(session: &Session) -> bool {
++    session.hold.transient(session.open)
++}
++
+ pub(crate) fn release(session: &mut Session) {
+     session.reset();
+ }
+diff --git a/drivers/soc/apple/bio_open_gate.rs b/drivers/soc/apple/bio_open_gate.rs
+new file mode 100644
+index 0000000000..63e92eff09
+--- /dev/null
++++ b/drivers/soc/apple/bio_open_gate.rs
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! The hold an activating open has on /dev/sep-bio.
++//!
++//! The node takes one opener at a time. The first open of a boot activates
++//! Touch ID inside the open itself (the enclave restore and the unlock
++//! preflight, most of a second), and the activation's own opener usually
++//! closes at once afterwards. A second opener arriving in that window was
++//! refused with EBUSY, which libfprint takes as a reader it cannot use for
++//! the daemon's whole life. Such an open now waits for the holder instead,
++//! for a bounded time, and is refused only if the node is still held then.
++
++/// What the current holder of the node is doing.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Hold {
++    /// The holder's open is still preparing the node (the activation).
++    activating: bool,
++    /// The holder's open ran this boot's activation: a hold that ends soon.
++    activation_open: bool,
++}
++
++impl Hold {
++    pub(crate) const fn new() -> Hold {
++        Hold {
++            activating: false,
++            activation_open: false,
++        }
++    }
++
++    /// An open has taken the node and is preparing it.
++    pub(crate) fn begin(&mut self) {
++        self.activating = true;
++        self.activation_open = false;
++    }
++
++    /// That open has finished preparing the node; `activated` says whether it
++    /// ran this boot's activation.
++    pub(crate) fn opened(&mut self, activated: bool) {
++        self.activating = false;
++        self.activation_open = activated;
++    }
++
++    /// The holder has closed the node, or its open failed.
++    pub(crate) fn end(&mut self) {
++        *self = Hold::new();
++    }
++
++    /// Whether a new opener should wait for the holder rather than be refused:
++    /// the node is `open`, and its holder is the activation's own open.
++    pub(crate) fn transient(&self, open: bool) -> bool {
++        open && (self.activating || self.activation_open)
++    }
++}
+diff --git a/drivers/soc/apple/sbio.rs b/drivers/soc/apple/sbio.rs
+index 0c3b733941..f2553ef215 100644
+--- a/drivers/soc/apple/sbio.rs
++++ b/drivers/soc/apple/sbio.rs
+@@ -4957,18 +4957,28 @@ impl SepData {
+         }
+         let mut session = self.bio_session.lock();
+         self.wait_for_worker_exit(&mut session, true)?;
++        self.wait_for_activation(&mut session)?;
+         bio::open(&mut session)?;
+         drop(session);
++        let first = !self.touchid_started.load(Relaxed);
+         if let Err(e) = self.prepare_bio_open() {
+             bio::release(&mut self.bio_session.lock());
++            self.worker_gone.notify_all();
+             return Err(e);
+         }
++        bio::opened(
++            &mut self.bio_session.lock(),
++            first && self.touchid_started.load(Relaxed),
++        );
++        self.worker_gone.notify_all();
+         self.bio_open_gen.fetch_add(1, Relaxed);
+         Ok(())
+     }
+ 
+     pub(crate) fn bio_release(&self) {
+         bio::release(&mut self.bio_session.lock());
++        // An open may be waiting for the activation's own opener to close.
++        self.worker_gone.notify_all();
+         if let Some(dev) = self.bio_dev.lock().as_ref() {
+             dev.wake();
+         }
+@@ -5036,6 +5046,34 @@ impl SepData {
+         Ok(())
+     }
+ 
++    /// Holds an open while the node's holder is the activation's own open: it
++    /// is still restoring the enclave and passing the unlock preflight, or it
++    /// has just done so and closes at once. A refusal then would leave a
++    /// caller such as fprintd without a reader for its whole life. If the hold
++    /// has not ended in time, the open is refused as before.
++    fn wait_for_activation(&self, session: &mut MutexGuard<'_, bio::Session>) -> Result<()> {
++        let mut remaining = time::msecs_to_jiffies(ACTIVATION_OPEN_WAIT_MS);
++        while bio::waiting_on_activation(session) {
++            if self.shutting_down.load(Relaxed) {
++                return Err(ENODEV);
++            }
++            if remaining == 0 {
++                dev_warn!(
++                    self.dev,
++                    "Touch ID: the activation's open still held the node after {} ms\n",
++                    ACTIVATION_OPEN_WAIT_MS
++                );
++                return Ok(());
++            }
++            match self.worker_gone.wait_interruptible_timeout(session, remaining) {
++                CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
++                CondVarTimeoutResult::Timeout => remaining = 0,
++                CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
++            }
++        }
++        Ok(())
++    }
++
+     /// The system is about to suspend. End any capture in progress, hold new
+     /// ones, and wait for the enrol or verify work to stop touching the sensor
+     /// before devices go down.
+diff --git a/drivers/soc/apple/sep.rs b/drivers/soc/apple/sep.rs
+index 57a9d28e22..f9c458b38d 100644
+--- a/drivers/soc/apple/sep.rs
++++ b/drivers/soc/apple/sep.rs
+@@ -13,6 +13,7 @@ compile_error!("apple_sep requires CONFIG_OF_DYNAMIC: the SEP and DART nodes shi
+ mod ratelimit;
+ mod attach;
+ mod bio;
++mod bio_open_gate;
+ mod catacomb;
+ mod control;
+ mod der;
+@@ -155,6 +156,11 @@ static_assert!(SLEEP_DRAIN_MS as u64 > SBIO_TIMEOUT_MS as u64);
+ // so it gets the same bound as a capture draining before sleep.
+ const WORKER_EXIT_WAIT_MS: time::Msecs = SLEEP_DRAIN_MS;
+ 
++// How long an open waits for the activation's own open of /dev/sep-bio (the
++// enclave restore and the unlock preflight, then its opener's close) before it
++// is refused as busy. The activation takes under a second on a J604.
++const ACTIVATION_OPEN_WAIT_MS: time::Msecs = 5000;
++
+ const SKS_ALLOC: usize = 0x8000;
+ 
+ const SKS_SECRET_LEN: usize = 32;
+diff --git a/tools/asahi/run-host-tests.py b/tools/asahi/run-host-tests.py
+index 4eeece1173..0519b8f614 100755
+--- a/tools/asahi/run-host-tests.py
++++ b/tools/asahi/run-host-tests.py
+@@ -222,6 +222,7 @@ ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh']
+ # Production G17 decoder vectors also build directly with rustc --test.
+ ASAHI_RUST += ['g17-telemetry-tests.rs', 'legacy-frequency-tests.rs']
+ ASAHI_RUST.append('m3-firmware-tests.rs')
++ASAHI_RUST.append('sep-bio-open-tests.rs')
+ 
+ # Python that runs on the host but imports its neighbours, so it keeps the
+ # script directory on sys.path (-E -s instead of -I).
+diff --git a/tools/asahi/sep-bio-open-tests.rs b/tools/asahi/sep-bio-open-tests.rs
+new file mode 100644
+index 0000000000..9473681102
+--- /dev/null
++++ b/tools/asahi/sep-bio-open-tests.rs
+@@ -0,0 +1,143 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! Host tests for the hold an activating open has on /dev/sep-bio.
++
++#[path = "../../drivers/soc/apple/bio_open_gate.rs"]
++mod bio_open_gate;
++
++use bio_open_gate::Hold;
++
++/// The node's single opener, kept the way `bio::open`, `bio::opened` and
++/// `bio::release` keep it (the enrol and verify worker has its own tests).
++struct Node {
++    open: bool,
++    hold: Hold,
++}
++
++#[derive(Debug, PartialEq, Eq)]
++enum Second {
++    Opens,
++    Waits,
++    Busy,
++}
++
++impl Node {
++    fn new() -> Node {
++        Node {
++            open: false,
++            hold: Hold::new(),
++        }
++    }
++
++    fn open(&mut self) -> Result<(), ()> {
++        if self.open {
++            return Err(());
++        }
++        self.open = true;
++        self.hold.begin();
++        Ok(())
++    }
++
++    fn opened(&mut self, activated: bool) {
++        if self.open {
++            self.hold.opened(activated);
++        }
++    }
++
++    fn release(&mut self) {
++        self.open = false;
++        self.hold.end();
++    }
++
++    /// What `SepData::bio_open` does with a second opener at this moment.
++    fn second(&self) -> Second {
++        if self.hold.transient(self.open) {
++            Second::Waits
++        } else if self.open {
++            Second::Busy
++        } else {
++            Second::Opens
++        }
++    }
++}
++
++// The J604 boot that failed its gate (1.841, 5a92b3b3): the activation unit
++// opened the node and was still in its restore and preflight when fprintd
++// opened it. fprintd now waits, then gets the node once the unit has closed.
++#[test]
++fn the_failed_boot_replayed_gives_fprintd_the_node() {
++    let mut node = Node::new();
++    node.open().unwrap();
++    assert_eq!(node.second(), Second::Waits, "during the activation");
++    node.opened(true);
++    assert_eq!(
++        node.second(),
++        Second::Waits,
++        "the activation's opener has not closed yet"
++    );
++    node.release();
++    assert_eq!(node.second(), Second::Opens);
++    node.open().unwrap();
++    node.opened(false);
++    assert_eq!(
++        node.second(),
++        Second::Busy,
++        "fprintd's own hold is a hold like any other"
++    );
++}
++
++// A holder that did not run the activation (it ran earlier this boot) is a
++// device in use: a second opener is refused at once, as before.
++#[test]
++fn a_holder_after_the_activation_is_busy_at_once() {
++    let mut node = Node::new();
++    node.open().unwrap();
++    node.opened(false);
++    assert_eq!(node.second(), Second::Busy);
++}
++
++// An open whose activation failed releases the node: the next opener goes on.
++#[test]
++fn a_failed_activation_frees_the_node() {
++    let mut node = Node::new();
++    node.open().unwrap();
++    node.release();
++    assert_eq!(node.second(), Second::Opens);
++    assert_eq!(node.hold, Hold::new());
++}
++
++// The activation's mark belongs to one holder: a later holder starts clean.
++#[test]
++fn a_later_holder_does_not_inherit_the_activation_mark() {
++    let mut node = Node::new();
++    node.open().unwrap();
++    node.opened(true);
++    node.release();
++    node.open().unwrap();
++    assert_eq!(node.second(), Second::Waits, "while it prepares");
++    node.opened(false);
++    assert_eq!(node.second(), Second::Busy);
++}
++
++// fprintd can be the first opener (the activation unit skipped or late): it
++// keeps the node, so a second opener's wait runs out and it is refused then.
++// The bound itself is the driver's (ACTIVATION_OPEN_WAIT_MS); here the hold
++// stays transient until fprintd closes.
++#[test]
++fn an_activating_daemon_holds_until_it_closes() {
++    let mut node = Node::new();
++    node.open().unwrap();
++    node.opened(true);
++    assert!(node.hold.transient(node.open));
++    node.release();
++    assert!(!node.hold.transient(node.open));
++}
++
++#[test]
++fn a_closed_node_is_never_waited_for() {
++    let mut hold = Hold::new();
++    hold.begin();
++    assert!(!hold.transient(false));
++    hold.opened(true);
++    assert!(!hold.transient(false));
++}
+-- 
+2.43.0
+

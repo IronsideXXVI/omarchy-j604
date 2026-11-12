@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 22:38:16 +0000
+Subject: [PATCH] arm64: apple: describe the T8132 CPU complexes, used
+ only on request
+
+Suspend-to-RAM saves and re-initialises each CPU cluster's CPU complex,
+and cluster power gating needs it too. The J604 device tree describes
+none, so neither can run: the state save fails with -ENODEV.
+
+The CPU complex layout this driver knows is T6020's. On T8132 only one
+register of it is known to match: the p-state request, which is the
+command register of each cluster's DVFS block that the cpufreq driver
+uses every boot (same fields, at 0x20 there). The ACC init and APSC
+snooze controls of the T6020 layout are not known on T8132.
+
+And the T6020 place of the cluster power state words, PMGR + 0x8000, is
+the VENC_DMA power state on a J604: the PMGR device table of its
+firmware lists VENC_DMA there and only per-core words for the CPUs. A
+cluster gate would have switched the video encoder's DMA off.
+
+So for T8132:
+ - give no cluster power state word, and never gate a cluster without
+   one;
+ - take the CPU complex at the DVFS block, with the p-state request at
+   0x20 and nothing else of the T6020 layout: a re-init only requests
+   p-states;
+ - use it only with the new parameter apple_cpu.unproven_acc (default
+   off). Without it nothing changes: no cluster has a CPU complex in
+   use, so suspend-to-RAM is still not offered.
+
+Describe the DVFS blocks of the J604's two clusters as acc0 and acc1 of
+its CPU start controller.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi | 11 ++-
+ arch/arm64/kernel/apple_cpu.c                 | 79 ++++++++++++++++---
+ 2 files changed, 77 insertions(+), 13 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi b/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
+index b2c72ce41d..fe3ddf0737 100644
+--- a/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
++++ b/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
+@@ -258,8 +258,15 @@
+ 	};
+ 	cpu_ctrl: cpu-ctrl@380734000 {
+ 		compatible = "apple,t8132-cpu-ctrl";
+-		reg = <0x03 0x80734000 0x00 0x40>;
+-		reg-names = "cpu-start";
++		/*
++		 * acc0 and acc1: the DVFS blocks of the E and P clusters (ADT pmgr
++		 * reg[5] and reg[16], the cpufreq nodes' registers). Only their
++		 * p-state request is used, and only with apple_cpu.unproven_acc.
++		 */
++		reg = <0x03 0x80734000 0x00 0x40>,
++		      <0x02 0x10e20000 0x00 0x1000>,
++		      <0x02 0x11e20000 0x00 0x1000>;
++		reg-names = "cpu-start", "acc0", "acc1";
+ 		apple,pmgr = <&pmgr>;
+ 	};
+ 	cluster_pwrgate: power-gate@380724000 {
+diff --git a/arch/arm64/kernel/apple_cpu.c b/arch/arm64/kernel/apple_cpu.c
+index 99a1baaf28..35696ddaa4 100644
+--- a/arch/arm64/kernel/apple_cpu.c
++++ b/arch/arm64/kernel/apple_cpu.c
+@@ -98,6 +98,17 @@ module_param(cluster_gating, bool, 0644);
+ MODULE_PARM_DESC(cluster_gating,
+ 		 "Power gate a CPU cluster once all of its CPUs are offline, if the boot loader allows it (default: on)");
+ 
++/*
++ * A CPU complex whose layout is taken from another SoC (T8132) is mapped but
++ * left unused unless this is set: no state save or re-init, so no
++ * suspend-to-RAM, and no cluster power gating. Set on the kernel command line
++ * for suspend-to-RAM to be offered at boot.
++ */
++static bool unproven_acc;
++module_param(unproven_acc, bool, 0644);
++MODULE_PARM_DESC(unproven_acc,
++		 "Use the CPU complex of clusters whose layout is not proven on this SoC (T8132: only its p-state request) for state save and re-init (default: off)");
++
+ /* Core power control, see apple_cpu_power_down() and apple_cpu_park() */
+ #define SYS_IMP_APL_CYC_OVRD		sys_reg(3, 5, 15, 5, 0)
+ #define CYC_OVRD_DISABLE_WFI_RET	BIT_ULL(0)
+@@ -188,7 +199,19 @@ struct apple_acc_feature {
+ 
+ struct apple_cpu_ctrl_data {
+ 	unsigned int apsc_pstate;
++	/* PMGR offset of cluster 0's power state word; 0: not known, no gating */
+ 	unsigned int cluster_ps;
++	/*
++	 * CPU complex: offset of the p-state request and the size the region
++	 * must have (0: the T6020 layout, ACC_PSTATE and ACC_SIZE). With
++	 * acc_pstate_only, a re-init only requests p-states: the ACC init and
++	 * APSC snooze controls of the T6020 layout are left alone. With
++	 * acc_unproven, the CPU complex is only used with unproven_acc set.
++	 */
++	unsigned int acc_pstate;
++	unsigned int acc_size;
++	bool acc_pstate_only;
++	bool acc_unproven;
+ 	/*
+ 	 * CYC_OVRD is an undefined instruction (T8132, and the other SoCs
+ 	 * XNU builds with NO_CPU_OVRD): WFI power gating is left to the
+@@ -228,18 +251,28 @@ static const struct apple_cpu_ctrl_data t6020_cpu_ctrl_data = {
+ };
+ 
+ /*
+- * T8132 (M4): PMGR cluster power states as on T6020; CPU start block at
++ * T8132 (M4): CPU start block at
+  * PMGR + 0x34000 (as on T8112, the offset m1n1 starts the J604's CPUs with);
+  * no CYC_OVRD. Its six E cores (cluster 0) and four P cores (cluster 1) are
+  * not four-core banks: the start/stop/alive bits are taken to run E0-E5
+  * then P0-P3, as m1n1 handles the T8142, which has the same 6+4 layout. The ACC feature list is left empty until the T8132 bits are
+  * known, so its clusters are only power cycled by suspend-to-RAM itself.
++ *
++ * Its cluster power state words are not known: PMGR + 0x8000, the T6020 place,
++ * is the VENC_DMA power state on a J604 (ADT pmgr devices table), so no
++ * cluster word is given and clusters are never gated. Its CPU complex is
++ * described at the cluster's DVFS block, whose p-state request at 0x20 is the
++ * one the cpufreq driver uses (the T6020 ACC_PSTATE, same fields); nothing
++ * else of the T6020 layout is used, and only with unproven_acc set.
+  */
+ static const u8 t8132_start_bank[] = { 0, 6 };
+ 
+ static const struct apple_cpu_ctrl_data t8132_cpu_ctrl_data = {
+ 	.apsc_pstate = 1,
+-	.cluster_ps = 0x8000,
++	.acc_pstate = 0x20,
++	.acc_size = 0x28,
++	.acc_pstate_only = true,
++	.acc_unproven = true,
+ 	.no_cyc_ovrd = true,
+ 	.start_bank = t8132_start_bank,
+ 	.nr_start_banks = ARRAY_SIZE(t8132_start_bank),
+@@ -436,6 +469,19 @@ static unsigned int apple_cpu_min_pstate(struct device_node *cpu_np)
+ 	return min == UINT_MAX ? 0 : min;
+ }
+ 
++static unsigned int apple_acc_pstate_reg(const struct apple_cpu_ctrl_data *data)
++{
++	return data->acc_pstate ?: ACC_PSTATE;
++}
++
++/* The CPU complex of @cl, if it may be used, else NULL */
++static void __iomem *apple_cluster_acc(const struct apple_cluster *cl)
++{
++	if (cl->acc && cl->ctrl->data->acc_unproven && !READ_ONCE(unproven_acc))
++		return NULL;
++	return cl->acc;
++}
++
+ static struct apple_cluster *apple_cluster_get(struct apple_cpu_ctrl *ctrl,
+ 					       unsigned int idx,
+ 					       struct device_node *cpu_np)
+@@ -458,7 +504,14 @@ static struct apple_cluster *apple_cluster_get(struct apple_cpu_ctrl *ctrl,
+ 	/* Cluster power gating needs the cluster PMGR control and its ACC. */
+ 	snprintf(name, sizeof(name), "acc%u", idx);
+ 	if (ctrl->pmgr && ctrl->data->nr_features <= APPLE_ACC_MAX_FEATURES)
+-		cl->acc = apple_cpu_ctrl_map(ctrl->np, name, ACC_SIZE);
++		cl->acc = apple_cpu_ctrl_map(ctrl->np, name,
++					     ctrl->data->acc_size ?: ACC_SIZE);
++	if (cl->acc)
++		pr_info("cluster %u: CPU complex mapped%s%s\n", idx,
++			ctrl->data->acc_unproven ?
++			" (layout not proven: used only with apple_cpu.unproven_acc)" : "",
++			ctrl->data->cluster_ps ? "" :
++			"; power state word not known, cluster not power gated");
+ 	cl->min_pstate = apple_cpu_min_pstate(cpu_np);
+ 
+ 	return cl;
+@@ -789,7 +842,7 @@ static void apple_reentry_quiet(void)
+ 
+ static int apple_acc_set_pstate(struct apple_cluster *cl, unsigned int pstate)
+ {
+-	void __iomem *reg = cl->acc + ACC_PSTATE;
++	void __iomem *reg = cl->acc + apple_acc_pstate_reg(cl->ctrl->data);
+ 	u64 val = readq(reg);
+ 
+ 	if (FIELD_GET(ACC_PSTATE_DESIRED, val) == pstate)
+@@ -811,7 +864,8 @@ static void apple_acc_save(struct apple_cluster *cl)
+ 	for (i = 0; i < data->nr_features; i++)
+ 		cl->features[i] = readq(cl->acc + data->features[i].offset) &
+ 				  data->features[i].mask;
+-	cl->pstate = FIELD_GET(ACC_PSTATE_DESIRED, readq(cl->acc + ACC_PSTATE));
++	cl->pstate = FIELD_GET(ACC_PSTATE_DESIRED,
++			       readq(cl->acc + apple_acc_pstate_reg(data)));
+ 	cl->saved = true;
+ }
+ 
+@@ -875,9 +929,11 @@ static int apple_acc_reinit(struct apple_cluster *cl)
+ 			return ret;
+ 	}
+ 
+-	writeq(1, cl->acc + ACC_INIT_CTL);
+-	val = readq(cl->acc + ACC_APSC_SNOOZE_CTL);
+-	writeq(val | ACC_APSC_SNOOZE, cl->acc + ACC_APSC_SNOOZE_CTL);
++	if (!data->acc_pstate_only) {
++		writeq(1, cl->acc + ACC_INIT_CTL);
++		val = readq(cl->acc + ACC_APSC_SNOOZE_CTL);
++		writeq(val | ACC_APSC_SNOOZE, cl->acc + ACC_APSC_SNOOZE_CTL);
++	}
+ 
+ 	return apple_acc_set_pstate(cl, cl->pstate);
+ }
+@@ -1304,7 +1360,7 @@ int apple_cpu_acc_save(void)
+ 		struct apple_cluster *cl = &apple_clusters[i];
+ 
+ 		/* A cluster awaiting re-init still holds its capture. */
+-		if (!cl->acc || cl->gated || cl->reinit)
++		if (!apple_cluster_acc(cl) || cl->gated || cl->reinit)
+ 			continue;
+ 		apple_acc_save(cl);
+ 		found = true;
+@@ -1383,7 +1439,7 @@ int apple_cpu_acc_restore(void)
+ 		struct apple_cluster *cl = &apple_clusters[i];
+ 		int err;
+ 
+-		if (!cl->acc || cl->gated || !cl->saved)
++		if (!apple_cluster_acc(cl) || cl->gated || !cl->saved)
+ 			continue;
+ 		found = true;
+ 		err = apple_acc_reinit(cl);
+@@ -1410,7 +1466,8 @@ static bool apple_cluster_can_gate(unsigned int cpu, struct apple_cluster *cl)
+ {
+ 	unsigned int other;
+ 
+-	if (!READ_ONCE(cluster_gating) || !cl->acc || !cl->min_pstate ||
++	if (!READ_ONCE(cluster_gating) || !apple_cluster_acc(cl) ||
++	    !cl->ctrl->data->cluster_ps || !cl->min_pstate ||
+ 	    apple_reentry.mode == APPLE_REENTRY_UNKNOWN)
+ 		return false;
+ 
+-- 
+2.43.0
+

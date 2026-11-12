@@ -1,0 +1,354 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 02:19:36 +0000
+Subject: [PATCH] arm64: apple_cpu: Support T8132, which has no
+ CYC_OVRD
+
+On T8132 (M4), as on T8140 and T6041, CYC_OVRD (s3_5_c15_c5_0) is an
+undefined instruction: cpuidle-apple already keeps these SoCs on plain
+WFI for that reason, and Apple's own XNU builds T8132 with NO_CPU_OVRD
+("CPU_OVRD register accesses are banned", pexpert/arm64/board_config.h).
+apple_cpu uses CYC_OVRD for the park loop, for the PMGR power-down of an
+offline core and for the boot CPU's final suspend-to-RAM WFI, so on T8132
+the first CPU offline would oops.
+
+Add a T8132 CPU control (apple,t8132-cpu-ctrl) that marks CYC_OVRD as
+absent and, for such SoCs:
+
+ - parks offline cores at a plain WFI: on these SoCs WFI already power
+   gates an idle core with state retention (cpuidle-apple),
+ - powers a core down the way XNU's NO_CPU_OVRD path does in
+   arm64_prepare_for_sleep(): stop the timers so they cannot wake it
+   (CNTV/CNTP, and ACNTHV_CTL_EL2 at EL2), clean the L1, set the PMGR
+   stop request or, for the deep variant, the ACC_OVRD deep sleep bits
+   (H16 defines __ARM_GLOBAL_SLEEP_BIT__, so XNU sets them on T8132),
+   then WFI in a loop that acknowledges a pending fast IPI after every
+   wake-up (IPI_SR, s3_5_c15_c1_1), as XNU does.
+
+The PMGR cluster power states (+0x8000) are laid out as on T6020. The
+CPU start block is at PMGR + 0x34000 on T8132 (the T8112 offset, which
+m1n1 uses to start the J604's CPUs; the J604 ADT has a PMGR range at
+PMGR + 0x30000..0x44000 around it). T8132 has six E cores and four P
+cores, so its CPU start/stop/alive bits cannot be four-core banks: the
+T8132 data lists the first bit of each cluster, E0-E5 then P0-P3, as
+m1n1 does for the T8142, which has the same 6+4 layout (to verify on a
+J604 against the CPU start block's alive bits before the first CPU is
+stopped). The ACC feature list is left empty until the T8132 bits are
+known, so T8132 clusters are not gated when their CPUs go offline; only
+suspend-to-RAM power cycles them.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit a84cf37633e3557738a217f7a4c882d8d724a93c)
+(cherry picked from commit 2297fa947915ef4e306fccc532a4d55abac9c11d)
+---
+ arch/arm64/kernel/apple_cpu.c      | 165 ++++++++++++++++++++++++++---
+ arch/arm64/kernel/apple_cpu_park.S |   7 +-
+ 2 files changed, 158 insertions(+), 14 deletions(-)
+
+diff --git a/arch/arm64/kernel/apple_cpu.c b/arch/arm64/kernel/apple_cpu.c
+index 36a79458b9..99a1baaf28 100644
+--- a/arch/arm64/kernel/apple_cpu.c
++++ b/arch/arm64/kernel/apple_cpu.c
+@@ -91,6 +91,9 @@
+ #define MODULE_PARAM_PREFIX "apple_cpu."
+ 
+ static bool cluster_gating = true;
++
++/* Set once a CPU control without CYC_OVRD is found, see no_cyc_ovrd */
++static bool apple_cpu_no_cyc_ovrd;
+ module_param(cluster_gating, bool, 0644);
+ MODULE_PARM_DESC(cluster_gating,
+ 		 "Power gate a CPU cluster once all of its CPUs are offline, if the boot loader allows it (default: on)");
+@@ -123,9 +126,10 @@ MODULE_PARM_DESC(cluster_gating,
+ #define CPU_START_STOP			0x0
+ #define CPU_START_ALIVE			0x4
+ #define CPU_START_CLUSTER(cl)		(0x8 + 4 * (cl))
+-#define CPU_START_CORE_BIT(cl, core)	BIT(4 * (cl) + (core))
+ #define CPU_START_MAX_CLUSTERS		8
+-#define CPU_START_MAX_CORES		4
++/* Per cluster; four unless the SoC lists its own start bit banks */
++#define CPU_START_MAX_CORES		8
++#define CPU_START_BANK_CORES		4
+ 
+ /* PMGR CPU cluster power states, in the PMGR syscon ("apple,pmgr") */
+ #define CLUSTER_PS(data, cl)		((data)->cluster_ps + 4 * (cl))
+@@ -185,6 +189,19 @@ struct apple_acc_feature {
+ struct apple_cpu_ctrl_data {
+ 	unsigned int apsc_pstate;
+ 	unsigned int cluster_ps;
++	/*
++	 * CYC_OVRD is an undefined instruction (T8132, and the other SoCs
++	 * XNU builds with NO_CPU_OVRD): WFI power gating is left to the
++	 * hardware and interrupts are kept off the core by other means.
++	 */
++	bool no_cyc_ovrd;
++	/*
++	 * First CPU start/stop/alive bit of each cluster, and the core count
++	 * of the largest cluster, where clusters are not four-core banks.
++	 */
++	const u8 *start_bank;
++	unsigned int nr_start_banks;
++	unsigned int max_cores;
+ 	const struct apple_acc_feature *features;
+ 	unsigned int nr_features;
+ };
+@@ -210,8 +227,28 @@ static const struct apple_cpu_ctrl_data t6020_cpu_ctrl_data = {
+ 	.nr_features = ARRAY_SIZE(t6020_acc_features),
+ };
+ 
++/*
++ * T8132 (M4): PMGR cluster power states as on T6020; CPU start block at
++ * PMGR + 0x34000 (as on T8112, the offset m1n1 starts the J604's CPUs with);
++ * no CYC_OVRD. Its six E cores (cluster 0) and four P cores (cluster 1) are
++ * not four-core banks: the start/stop/alive bits are taken to run E0-E5
++ * then P0-P3, as m1n1 handles the T8142, which has the same 6+4 layout. The ACC feature list is left empty until the T8132 bits are
++ * known, so its clusters are only power cycled by suspend-to-RAM itself.
++ */
++static const u8 t8132_start_bank[] = { 0, 6 };
++
++static const struct apple_cpu_ctrl_data t8132_cpu_ctrl_data = {
++	.apsc_pstate = 1,
++	.cluster_ps = 0x8000,
++	.no_cyc_ovrd = true,
++	.start_bank = t8132_start_bank,
++	.nr_start_banks = ARRAY_SIZE(t8132_start_bank),
++	.max_cores = 6,
++};
++
+ static const struct of_device_id apple_cpu_ctrl_of_match[] = {
+ 	{ .compatible = "apple,t6020-cpu-ctrl", .data = &t6020_cpu_ctrl_data },
++	{ .compatible = "apple,t8132-cpu-ctrl", .data = &t8132_cpu_ctrl_data },
+ 	{}
+ };
+ 
+@@ -366,6 +403,8 @@ static struct apple_cpu_ctrl *apple_cpu_ctrl_get(struct device_node *np)
+ 
+ 	ctrl = &apple_cpu_ctrls[apple_nr_cpu_ctrls];
+ 	ctrl->data = match->data;
++	if (ctrl->data->no_cyc_ovrd)
++		apple_cpu_no_cyc_ovrd = true;
+ 	ctrl->start = apple_cpu_ctrl_map(np, "cpu-start",
+ 					 CPU_START_CLUSTER(CPU_START_MAX_CLUSTERS));
+ 	ctrl->pmgr = syscon_regmap_lookup_by_phandle(np, "apple,pmgr");
+@@ -454,6 +493,13 @@ static int apple_cpu_setup(unsigned int cpu)
+ 	if (!ctrl)
+ 		goto out_put_ctrl;
+ 
++	ret = -EINVAL;
++	if (ctrl->data->start_bank ?
++	    args.args[1] >= ctrl->data->max_cores ||
++	    args.args[0] >= ctrl->data->nr_start_banks :
++	    args.args[1] >= CPU_START_BANK_CORES)
++		goto out_put_ctrl;
++
+ 	ret = -ENOMEM;
+ 	ac = kzalloc_obj(*ac);
+ 	if (!ac)
+@@ -921,6 +967,76 @@ static void apple_l1_sw(struct apple_l1_sw *sw)
+ 	sw->way_shift = 32 - order_base_2(sw->ways);
+ }
+ 
++#define SYS_APL_ACNTHV_CTL_EL2		sys_reg(3, 1, 15, 7, 4)
++
++/*
++ * apple_cpu_power_down() for SoCs without CYC_OVRD (T8132). This follows
++ * XNU's NO_CPU_OVRD sleep path (arm64_prepare_for_sleep): the timers are
++ * stopped so that they cannot wake the core, the PMGR stop request (or, for
++ * the boot CPU's final suspend-to-RAM entry, the ACC deep sleep bits) takes
++ * the core down at WFI, and every wake-up acknowledges a pending fast IPI
++ * before going back to WFI. Without CYC_OVRD a core can keep waking up
++ * until the cluster-wide deep sleep bits are set; the loop just retries.
++ */
++static void __noreturn apple_cpu_power_down_no_cyc(void __iomem *stop,
++						   u32 stop_bit,
++						   unsigned int flags)
++{
++	struct apple_l1_sw sw;
++	u64 acc;
++
++	/* The EL1 timers, and the Apple EL2 virtual timer when at EL2 */
++	write_sysreg(0, cntv_ctl_el0);
++	write_sysreg(0, cntp_ctl_el0);
++	if (is_kernel_in_hyp_mode())
++		sysreg_clear_set_s(SYS_APL_ACNTHV_CTL_EL2, BIT(0), 0);
++	isb();
++
++	acc = read_sysreg_s(SYS_IMP_APL_ACC_OVRD);
++	acc &= ~(ACC_OVRD_PWR_DN_SRM | ACC_OVRD_DIS_L2_FLUSH_ACC_SLEEP |
++		 ACC_OVRD_TRAIN_DOWN_LINK | ACC_OVRD_POWER_DOWN_CPM);
++	acc |= FIELD_PREP(ACC_OVRD_PWR_DN_SRM, 3) |
++	       FIELD_PREP(ACC_OVRD_DIS_L2_FLUSH_ACC_SLEEP, 2) |
++	       FIELD_PREP(ACC_OVRD_TRAIN_DOWN_LINK, 3) |
++	       FIELD_PREP(ACC_OVRD_POWER_DOWN_CPM, 3) |
++	       ACC_OVRD_DISABLE_PIO_ON_WFI_CPU | ACC_OVRD_DEEP_SLEEP;
++
++	apple_l1_sw(&sw);
++
++	asm volatile(
++	"	sub	%[way], %[way], #1\n"
++	"1:	sub	x10, %[sets], #1\n"
++	"2:	lslv	x11, %[way], %[way_shift]\n"
++	"	lslv	x12, x10, %[line_shift]\n"
++	"	orr	x11, x11, x12\n"
++	"	dc	cisw, x11\n"
++	"	subs	x10, x10, #1\n"
++	"	b.ge	2b\n"
++	"	subs	%[way], %[way], #1\n"
++	"	b.ge	1b\n"
++	"	dsb	sy\n"
++	"	cbz	%[stop], 3f\n"
++	"	str	%w[stop_bit], [%[stop]]\n"
++	"	dsb	sy\n"
++	"3:	cbz	%[acc_deep], 4f\n"
++	"	msr	s3_5_c15_c6_0, %[acc]\n"
++	"4:	isb\n"
++	"5:	dsb	sy\n"
++	"	isb\n"
++	"	wfi\n"
++	"	mov	x10, #1\n"
++	"	msr	s3_5_c15_c1_1, x10\n"
++	"	b	5b\n"
++	: [way] "+r" (sw.ways)
++	: [sets] "r" (sw.sets), [way_shift] "r" (sw.way_shift),
++	  [line_shift] "r" (sw.line_shift), [stop] "r" (stop),
++	  [stop_bit] "r" (stop_bit), [acc] "r" (acc),
++	  [acc_deep] "r" ((u64)(flags & APPLE_CPU_SLEEP_ACC_DEEP))
++	: "x10", "x11", "x12", "cc", "memory");
++
++	unreachable();
++}
++
+ /*
+  * Take this core out of the coherent domain and power it down:
+  *
+@@ -940,7 +1056,12 @@ static void __noreturn apple_cpu_power_down(void __iomem *stop, u32 stop_bit,
+ 					    unsigned int flags)
+ {
+ 	struct apple_l1_sw sw;
+-	u64 cyc, acc;
++	u64 cyc = 0, acc;
++
++	if (READ_ONCE(apple_cpu_no_cyc_ovrd)) {
++		apple_cpu_power_down_no_cyc(stop, stop_bit, flags);
++		unreachable();
++	}
+ 
+ 	cyc = read_sysreg_s(SYS_IMP_APL_CYC_OVRD);
+ 	if (flags & APPLE_CPU_SLEEP_MASK_IRQ) {
+@@ -1010,6 +1131,18 @@ void __noreturn apple_cpu_deep_sleep(unsigned int flags)
+ }
+ EXPORT_SYMBOL_GPL(apple_cpu_deep_sleep);
+ 
++
++static u32 apple_cpu_start_bit(const struct apple_cluster *cl,
++			       unsigned int core)
++{
++	const struct apple_cpu_ctrl_data *data = cl->ctrl->data;
++
++	if (data->start_bank)
++		return BIT(data->start_bank[cl->idx] + core);
++
++	return BIT(CPU_START_BANK_CORES * cl->idx + core);
++}
++
+ /*
+  * Runs on the dying CPU, with every exception masked. The core parks at a
+  * WFI that powers it down with state retention: WFI_MODE(3) without
+@@ -1029,9 +1162,15 @@ static void __noreturn apple_cpu_park(struct apple_cpu *ac)
+ 	struct apple_l1_sw sw;
+ 	u64 cyc, park, cmd;
+ 
+-	cyc = read_sysreg_s(SYS_IMP_APL_CYC_OVRD);
+-	park = (cyc & ~(CYC_OVRD_WFI_MODE | CYC_OVRD_DISABLE_WFI_RET)) |
+-	       FIELD_PREP(CYC_OVRD_WFI_MODE, CYC_OVRD_WFI_MODE_POWER_DOWN);
++	/* Without CYC_OVRD, plain WFI already power gates with retention */
++	if (READ_ONCE(apple_cpu_no_cyc_ovrd)) {
++		cyc = 0;
++		park = 0;
++	} else {
++		cyc = read_sysreg_s(SYS_IMP_APL_CYC_OVRD);
++		park = (cyc & ~(CYC_OVRD_WFI_MODE | CYC_OVRD_DISABLE_WFI_RET)) |
++		       FIELD_PREP(CYC_OVRD_WFI_MODE, CYC_OVRD_WFI_MODE_POWER_DOWN);
++	}
+ 	apple_l1_sw(&sw);
+ 
+ 	/* Pairs with the acquire in cpu_kill: everything above is done. */
+@@ -1044,8 +1183,10 @@ static void __noreturn apple_cpu_park(struct apple_cpu *ac)
+ 	} while (cmpxchg(&ac->park_cmd, cmd, PARK_CMD_TAKEN) != cmd);
+ 
+ 	if (cmd == PARK_CMD_RESUME) {
+-		write_sysreg_s(cyc, SYS_IMP_APL_CYC_OVRD);
+-		isb();
++		if (park) {
++			write_sysreg_s(cyc, SYS_IMP_APL_CYC_OVRD);
++			isb();
++		}
+ 
+ 		/* Into the holding pen with the MMU off, as on first boot */
+ 		cpu_install_idmap();
+@@ -1056,7 +1197,7 @@ static void __noreturn apple_cpu_park(struct apple_cpu *ac)
+ 	}
+ 
+ 	apple_cpu_power_down(cl->ctrl->start + CPU_START_STOP,
+-			     CPU_START_CORE_BIT(cl->idx, ac->core),
++			     apple_cpu_start_bit(cl, ac->core),
+ 			     APPLE_CPU_SLEEP_MASK_IRQ);
+ }
+ 
+@@ -1118,7 +1259,7 @@ static int apple_cpu_park_power_down(unsigned int cpu, struct apple_cpu *ac)
+ {
+ 	struct apple_cluster *cl = ac->cluster;
+ 	void __iomem *stop = cl->ctrl->start + CPU_START_STOP;
+-	u32 bit = CPU_START_CORE_BIT(cl->idx, ac->core);
++	u32 bit = apple_cpu_start_bit(cl, ac->core);
+ 	u32 stopped;
+ 	u64 val;
+ 	int ret;
+@@ -1384,7 +1525,7 @@ static void apple_spin_table_cpu_die(unsigned int cpu)
+ 	}
+ 
+ 	apple_cpu_power_down(cl->ctrl->start + CPU_START_STOP,
+-			     CPU_START_CORE_BIT(cl->idx, ac->core), flags);
++			     apple_cpu_start_bit(cl, ac->core), flags);
+ }
+ 
+ /* The cluster lost power: each of its offline cores can be started once. */
+@@ -1500,7 +1641,7 @@ static int apple_cpu_start(unsigned int cpu, struct apple_cpu *ac)
+ 	apple_reentry_quiet();
+ 	smp_spin_table_write_pen_release(cpu_logical_map(cpu));
+ 
+-	writel(CPU_START_CORE_BIT(cl->idx, ac->core),
++	writel(apple_cpu_start_bit(cl, ac->core),
+ 	       cl->ctrl->start + CPU_START_ALIVE);
+ 	writel(BIT(ac->core), cl->ctrl->start + CPU_START_CLUSTER(cl->idx));
+ 
+diff --git a/arch/arm64/kernel/apple_cpu_park.S b/arch/arm64/kernel/apple_cpu_park.S
+index ec142bbe01..c24873a314 100644
+--- a/arch/arm64/kernel/apple_cpu_park.S
++++ b/arch/arm64/kernel/apple_cpu_park.S
+@@ -17,7 +17,8 @@
+  *			  u64 way_shift, u64 line_shift)
+  *
+  * Clean and invalidate the L1 data cache by set/way (@ways, @sets and the
+- * shifts of the way and set fields), set CYC_OVRD to @cyc, then WFI until
++ * shifts of the way and set fields), set CYC_OVRD to @cyc unless it is 0
++ * (SoCs without CYC_OVRD), then WFI until
+  * *@cmd is non-zero and return it. Every wake-up acknowledges a fast IPI.
+  *
+  * A WFI that powers the core down with state retention keeps only sp and
+@@ -46,8 +47,10 @@ SYM_FUNC_START(apple_cpu_park_wfi)
+ 	b.ge	1b
+ 	dsb	sy
+ 
++	/* @cyc == 0: no CYC_OVRD on this SoC, plain WFI */
++	cbz	x1, 4f
+ 	msr	SYS_IMP_APL_CYC_OVRD, x1
+-	isb
++4:	isb
+ 
+ 3:	dsb	sy
+ 	wfi
+-- 
+2.43.0
+

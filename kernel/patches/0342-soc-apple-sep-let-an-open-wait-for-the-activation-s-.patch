@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 22:25:04 +0000
+Subject: [PATCH] soc: apple: sep: let an open wait for the
+ activation's own open
+
+/dev/sep-bio takes one opener at a time, and the first open of a boot
+activates Touch ID inside the open itself: the enclave restore and the
+unlock preflight, most of a second. Its opener, omarchy-mac's activation
+unit, closes at once afterwards. An open that arrived in that window was
+refused with EBUSY, and libfprint takes EBUSY as a reader it cannot use
+for the daemon's whole life, so a J604 boot was left without Touch ID
+until fprintd exited.
+
+Keep what the holder of the node is doing in a small module the host
+tests can build: whether its open is still preparing the node, and
+whether that open ran this boot's activation. An open now waits, for at
+most 5 s, while the holder is the activation's own open, the same way it
+already waits for an outgoing enrol or verify worker. A node still held
+after that, or held by anyone else, is refused as before.
+
+This is the kernel half of a race whose user-space half omarchy-mac
+0.2.3-2.17 closes by ordering fprintd after the activation.
+
+Carried onto integration/aurora's SEP crate unchanged: rebuilding the
+J604 series there took Aurora's sbio.rs whole and dropped it, while the
+host test that covers it stayed listed in run-host-tests.py.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/bio.rs           | 20 +++++++++++
+ drivers/soc/apple/bio_open_gate.rs | 53 ++++++++++++++++++++++++++++++
+ drivers/soc/apple/sbio.rs          | 38 +++++++++++++++++++++
+ drivers/soc/apple/sep.rs           |  6 ++++
+ 4 files changed, 117 insertions(+)
+ create mode 100644 drivers/soc/apple/bio_open_gate.rs
+
+diff --git a/drivers/soc/apple/bio.rs b/drivers/soc/apple/bio.rs
+index d2567ab596..635be68398 100644
+--- a/drivers/soc/apple/bio.rs
++++ b/drivers/soc/apple/bio.rs
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ // Copyright 2026 Dj
+ 
++use crate::bio_open_gate::Hold;
+ use crate::store::{Key, Store};
+ use kernel::ioctl::{_IO, _IOR, _IOW, _IOWR};
+ use kernel::prelude::*;
+@@ -561,6 +562,8 @@ pub(crate) struct Session {
+     // An enrolment capture was not usable; the next poll reports it once.
+     enrol_retry_unseen: bool,
+     token: Option<ResultToken>,
++    // What the holder of the node is doing, while the node is open.
++    hold: Hold,
+ }
+ 
+ impl Session {
+@@ -574,6 +577,7 @@ impl Session {
+             enrol_stage_unseen: false,
+             enrol_retry_unseen: false,
+             token: None,
++            hold: Hold::new(),
+         }
+     }
+ 
+@@ -585,6 +589,7 @@ impl Session {
+         self.enrol_stage_unseen = false;
+         self.enrol_retry_unseen = false;
+         self.token = None;
++        self.hold.end();
+     }
+ 
+     fn start_worker(&mut self) -> Result<()> {
+@@ -1313,9 +1318,24 @@ pub(crate) fn open(session: &mut Session) -> Result<()> {
+     }
+     session.reset();
+     session.open = true;
++    session.hold.begin();
+     Ok(())
+ }
+ 
++/// The open that took the node has finished preparing it; `activated` says
++/// whether it ran this boot's activation.
++pub(crate) fn opened(session: &mut Session, activated: bool) {
++    if session.open {
++        session.hold.opened(activated);
++    }
++}
++
++/// Whether an open would be refused only because the node is held by the
++/// activation's own open, still preparing the node or about to close it.
++pub(crate) fn waiting_on_activation(session: &Session) -> bool {
++    session.hold.transient(session.open)
++}
++
+ pub(crate) fn release(session: &mut Session) {
+     session.reset();
+ }
+diff --git a/drivers/soc/apple/bio_open_gate.rs b/drivers/soc/apple/bio_open_gate.rs
+new file mode 100644
+index 0000000000..63e92eff09
+--- /dev/null
++++ b/drivers/soc/apple/bio_open_gate.rs
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! The hold an activating open has on /dev/sep-bio.
++//!
++//! The node takes one opener at a time. The first open of a boot activates
++//! Touch ID inside the open itself (the enclave restore and the unlock
++//! preflight, most of a second), and the activation's own opener usually
++//! closes at once afterwards. A second opener arriving in that window was
++//! refused with EBUSY, which libfprint takes as a reader it cannot use for
++//! the daemon's whole life. Such an open now waits for the holder instead,
++//! for a bounded time, and is refused only if the node is still held then.
++
++/// What the current holder of the node is doing.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Hold {
++    /// The holder's open is still preparing the node (the activation).
++    activating: bool,
++    /// The holder's open ran this boot's activation: a hold that ends soon.
++    activation_open: bool,
++}
++
++impl Hold {
++    pub(crate) const fn new() -> Hold {
++        Hold {
++            activating: false,
++            activation_open: false,
++        }
++    }
++
++    /// An open has taken the node and is preparing it.
++    pub(crate) fn begin(&mut self) {
++        self.activating = true;
++        self.activation_open = false;
++    }
++
++    /// That open has finished preparing the node; `activated` says whether it
++    /// ran this boot's activation.
++    pub(crate) fn opened(&mut self, activated: bool) {
++        self.activating = false;
++        self.activation_open = activated;
++    }
++
++    /// The holder has closed the node, or its open failed.
++    pub(crate) fn end(&mut self) {
++        *self = Hold::new();
++    }
++
++    /// Whether a new opener should wait for the holder rather than be refused:
++    /// the node is `open`, and its holder is the activation's own open.
++    pub(crate) fn transient(&self, open: bool) -> bool {
++        open && (self.activating || self.activation_open)
++    }
++}
+diff --git a/drivers/soc/apple/sbio.rs b/drivers/soc/apple/sbio.rs
+index 0c3b733941..f2553ef215 100644
+--- a/drivers/soc/apple/sbio.rs
++++ b/drivers/soc/apple/sbio.rs
+@@ -4957,18 +4957,28 @@ impl SepData {
+         }
+         let mut session = self.bio_session.lock();
+         self.wait_for_worker_exit(&mut session, true)?;
++        self.wait_for_activation(&mut session)?;
+         bio::open(&mut session)?;
+         drop(session);
++        let first = !self.touchid_started.load(Relaxed);
+         if let Err(e) = self.prepare_bio_open() {
+             bio::release(&mut self.bio_session.lock());
++            self.worker_gone.notify_all();
+             return Err(e);
+         }
++        bio::opened(
++            &mut self.bio_session.lock(),
++            first && self.touchid_started.load(Relaxed),
++        );
++        self.worker_gone.notify_all();
+         self.bio_open_gen.fetch_add(1, Relaxed);
+         Ok(())
+     }
+ 
+     pub(crate) fn bio_release(&self) {
+         bio::release(&mut self.bio_session.lock());
++        // An open may be waiting for the activation's own opener to close.
++        self.worker_gone.notify_all();
+         if let Some(dev) = self.bio_dev.lock().as_ref() {
+             dev.wake();
+         }
+@@ -5036,6 +5046,34 @@ impl SepData {
+         Ok(())
+     }
+ 
++    /// Holds an open while the node's holder is the activation's own open: it
++    /// is still restoring the enclave and passing the unlock preflight, or it
++    /// has just done so and closes at once. A refusal then would leave a
++    /// caller such as fprintd without a reader for its whole life. If the hold
++    /// has not ended in time, the open is refused as before.
++    fn wait_for_activation(&self, session: &mut MutexGuard<'_, bio::Session>) -> Result<()> {
++        let mut remaining = time::msecs_to_jiffies(ACTIVATION_OPEN_WAIT_MS);
++        while bio::waiting_on_activation(session) {
++            if self.shutting_down.load(Relaxed) {
++                return Err(ENODEV);
++            }
++            if remaining == 0 {
++                dev_warn!(
++                    self.dev,
++                    "Touch ID: the activation's open still held the node after {} ms\n",
++                    ACTIVATION_OPEN_WAIT_MS
++                );
++                return Ok(());
++            }
++            match self.worker_gone.wait_interruptible_timeout(session, remaining) {
++                CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
++                CondVarTimeoutResult::Timeout => remaining = 0,
++                CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
++            }
++        }
++        Ok(())
++    }
++
+     /// The system is about to suspend. End any capture in progress, hold new
+     /// ones, and wait for the enrol or verify work to stop touching the sensor
+     /// before devices go down.
+diff --git a/drivers/soc/apple/sep.rs b/drivers/soc/apple/sep.rs
+index 9987fcd18d..de734231a9 100644
+--- a/drivers/soc/apple/sep.rs
++++ b/drivers/soc/apple/sep.rs
+@@ -13,6 +13,7 @@ compile_error!("apple_sep requires CONFIG_OF_DYNAMIC: the SEP and DART nodes shi
+ mod ratelimit;
+ mod attach;
+ mod bio;
++mod bio_open_gate;
+ mod catacomb;
+ mod control;
+ mod der;
+@@ -155,6 +156,11 @@ static_assert!(SLEEP_DRAIN_MS as u64 > SBIO_TIMEOUT_MS as u64);
+ // so it gets the same bound as a capture draining before sleep.
+ const WORKER_EXIT_WAIT_MS: time::Msecs = SLEEP_DRAIN_MS;
+ 
++// How long an open waits for the activation's own open of /dev/sep-bio (the
++// enclave restore and the unlock preflight, then its opener's close) before it
++// is refused as busy. The activation takes under a second on a J604.
++const ACTIVATION_OPEN_WAIT_MS: time::Msecs = 5000;
++
+ const SKS_ALLOC: usize = 0x8000;
+ 
+ const SKS_SECRET_LEN: usize = 32;
+-- 
+2.43.0
+

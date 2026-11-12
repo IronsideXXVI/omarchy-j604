@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 00:15:26 +0000
+Subject: [PATCH] mmc: sdhci-pci-gli: optionally runtime suspend an
+ idle GL9755
+
+The GL9755 has no runtime PM, so an SD reader without a card stays in
+D0 for as long as the system runs. The GL9763E already runtime
+suspends, but it serves eMMC, which cannot be removed.
+
+A GL9755 slot can: runtime suspend masks every interrupt but the SDIO
+card interrupt, including card detect, and the slot has no card detect
+GPIO. So when runtime PM is allowed, ask the core to poll for a card
+(MMC_CAP_NEEDS_POLL); each poll resumes the host, and autosuspend puts
+it back after 50 ms.
+
+The vendor configuration written at probe, card detect and write
+protect inversion included, is not known to survive D3hot, so it is
+applied again on runtime resume before the host is used.
+
+Keep it off by default behind gl9755_runtime_pm, read when the device
+is bound: with it off nothing changes.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/mmc/host/sdhci-pci-gli.c | 44 ++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/drivers/mmc/host/sdhci-pci-gli.c b/drivers/mmc/host/sdhci-pci-gli.c
+index b55618566d..0a3eb26daf 100644
+--- a/drivers/mmc/host/sdhci-pci-gli.c
++++ b/drivers/mmc/host/sdhci-pci-gli.c
+@@ -20,6 +20,11 @@
+ #include "cqhci.h"
+ #include "sdhci-uhs2.h"
+ 
++static bool gl9755_runtime_pm;
++module_param(gl9755_runtime_pm, bool, 0644);
++MODULE_PARM_DESC(gl9755_runtime_pm,
++		 "Runtime suspend an idle GL9755, polling for a card once a second; read when the device is bound (default: off)");
++
+ /*  Genesys Logic extra registers */
+ #define SDHCI_GLI_9750_WT         0x800
+ #define   SDHCI_GLI_9750_WT_EN      BIT(0)
+@@ -1591,6 +1596,15 @@ static int gli_probe_slot_gl9755(struct sdhci_pci_slot *slot)
+ 	sdhci_enable_v4_mode(host);
+ 	gl9755_vendor_init(host);
+ 
++	/*
++	 * Runtime suspend masks the card detect interrupt, and the slot has
++	 * no card detect GPIO, so a card is then found by polling.
++	 */
++	if (gl9755_runtime_pm) {
++		host->mmc->caps |= MMC_CAP_NEEDS_POLL;
++		slot->chip->allow_runtime_pm = true;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1867,6 +1881,31 @@ static void gl9763e_hw_setting(struct sdhci_pci_slot *slot)
+ }
+ 
+ #ifdef CONFIG_PM
++static int gl9755_runtime_suspend(struct sdhci_pci_chip *chip)
++{
++	struct sdhci_host *host = chip->slots[0]->host;
++
++	sdhci_runtime_suspend_host(host);
++	if (chip->rpm_retune && host->tuning_mode != SDHCI_TUNING_MODE_3)
++		mmc_retune_needed(host->mmc);
++
++	return 0;
++}
++
++static int gl9755_runtime_resume(struct sdhci_pci_chip *chip)
++{
++	struct sdhci_pci_slot *slot = chip->slots[0];
++
++	/*
++	 * The vendor configuration, card detect inversion included, is not
++	 * known to survive D3hot: apply it again before using the host.
++	 */
++	gl9755_hw_setting(slot);
++	sdhci_runtime_resume_host(slot->host, 0);
++
++	return 0;
++}
++
+ static int gl9763e_runtime_suspend(struct sdhci_pci_chip *chip)
+ {
+ 	struct sdhci_pci_slot *slot = chip->slots[0];
+@@ -2054,6 +2093,11 @@ const struct sdhci_pci_fixes sdhci_gl9755 = {
+ #ifdef CONFIG_PM_SLEEP
+ 	.resume         = sdhci_pci_gli_resume,
+ #endif
++#ifdef CONFIG_PM
++	/* Used only when gl9755_runtime_pm allows runtime PM at probe */
++	.runtime_suspend = gl9755_runtime_suspend,
++	.runtime_resume  = gl9755_runtime_resume,
++#endif
+ };
+ 
+ static const struct sdhci_ops sdhci_gl9750_ops = {
+-- 
+2.43.0
+

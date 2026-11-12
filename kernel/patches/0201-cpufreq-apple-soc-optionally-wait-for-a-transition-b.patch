@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 19:51:47 +0000
+Subject: [PATCH] cpufreq: apple-soc: optionally wait for a transition
+ before an idle drop
+
+The last CPU of a T8132 performance cluster to enter idle drops the
+cluster to its slowest state, unless a transition is still in flight.
+That transition is usually the restore asked for by the same CPU's
+wake: a wake shorter than a transition (about 50 us), such as a timer
+or an IPI handled in a few microseconds, finds it still running when
+the CPU idles again. The drop is then skipped, and the cluster stays at
+its top state for the whole idle, until the next wake.
+
+On a J604 at idle the P cores are 99.8 % idle, but the cluster asked
+for its top state in about half of 2000 samples taken from an E core,
+with 600-900 P-core wakes a second; capped at the slowest state, the
+same idle cluster draws 64 mW instead of 0.75-0.85 W.
+
+Add the parameter idle_drop_wait (default off, writable at runtime).
+With it set, the drop waits for the transition, at most 100 us, and
+drops the cluster once it has finished, if every CPU of the cluster is
+still idle. A CPU waking meanwhile waits for the lock and restores the
+cluster right after the drop, as before. With it off nothing changes.
+In both cases count the drops that found a transition in flight and
+the ones that left the cluster up for it, and show both after the
+existing fields of dvfs_registers.
+
+Fixes: bb9efa6b5785 ("cpufreq: apple-soc: drop the all-idle T8132 P cluster to its slowest state")
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/cpufreq/apple-soc-cpufreq.c | 65 +++++++++++++++++++++++------
+ 1 file changed, 53 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/cpufreq/apple-soc-cpufreq.c b/drivers/cpufreq/apple-soc-cpufreq.c
+index 0562472ce3..4ef9eeaf28 100644
+--- a/drivers/cpufreq/apple-soc-cpufreq.c
++++ b/drivers/cpufreq/apple-soc-cpufreq.c
+@@ -86,6 +86,13 @@
+ #define APPLE_DVFS_TRANSITION_NS	(50 * NSEC_PER_USEC)
+ #define APPLE_DVFS_RETRY_NS		(4 * NSEC_PER_USEC)
+ 
++/*
++ * How long the last CPU of a cluster entering idle waits for a transition
++ * still in flight before dropping the cluster, see "Cluster idle drop". A
++ * transition takes about 50 us.
++ */
++#define APPLE_DVFS_IDLE_WAIT_US		100
++
+ /*
+  * Fast die-temperature limit
+  *
+@@ -263,8 +270,9 @@ struct apple_cpu_priv {
+ 	 * Cluster idle drop: the CPUs of the policy waiting in cpuidle's
+ 	 * cluster state (atomic bit operations), the policy's online CPUs, the
+ 	 * P-state the governor last asked for, the slowest P-state, whether the
+-	 * cluster was moved to it and how often. The last four are protected
+-	 * by @lock.
++	 * cluster was moved to it and how often, how often a drop found a
++	 * transition in flight, and how often the cluster was left up for that
++	 * reason. The last six are protected by @lock.
+ 	 */
+ 	struct cpumask idle_cpus;
+ 	const struct cpumask *cpus;
+@@ -272,6 +280,8 @@ struct apple_cpu_priv {
+ 	unsigned int idle_pstate;
+ 	bool idle_dropped;
+ 	unsigned long idle_drops;
++	unsigned long idle_busy;
++	unsigned long idle_skipped;
+ };
+ 
+ static struct cpufreq_driver apple_soc_cpufreq_driver;
+@@ -548,6 +558,12 @@ static int apple_soc_cpufreq_set_pstate(struct apple_cpu_priv *priv,
+  * frequency. A CPU brought online into a dropped cluster runs slow until the
+  * cluster's next wake, a few milliseconds at most.
+  *
++ * A wake shorter than a transition finds the restore it asked for still in
++ * flight when its CPU goes idle again. By default the drop is then skipped,
++ * which leaves the cluster at its top state for the whole idle; with
++ * idle_drop_wait it waits for that transition (APPLE_DVFS_IDLE_WAIT_US at
++ * most) instead. Both cases are counted in dvfs_registers.
++ *
+  * Only the clusters of the fastest cores take part: the J604's E cluster
+  * costs about 20 mW at its top state, not worth slower wakes for the
+  * background work it runs.
+@@ -556,6 +572,10 @@ static bool idle_drop = true;
+ module_param(idle_drop, bool, 0644);
+ MODULE_PARM_DESC(idle_drop, "T8132: while every CPU of the performance cluster waits in a long idle, run the cluster at its slowest P-state and restore the governor's state on the first wake (default: on)");
+ 
++static bool idle_drop_wait;
++module_param(idle_drop_wait, bool, 0644);
++MODULE_PARM_DESC(idle_drop_wait, "T8132: when the cluster is still changing state as its last CPU goes idle, wait for the transition (at most 100 us) and drop the cluster, instead of leaving it at its state for that idle (default: off)");
++
+ static DEFINE_PER_CPU(struct apple_cpu_priv *, apple_idle_priv);
+ 
+ /* The policy of @cpu if its cluster takes part in the idle drop, or NULL. */
+@@ -592,16 +612,34 @@ static void apple_soc_cpufreq_idle_enter(unsigned int cpu)
+ 		return;
+ 
+ 	raw_spin_lock(&priv->lock);
+-	if (!priv->idle_dropped && priv->run_pstate > priv->idle_pstate &&
+-	    cpumask_subset(priv->cpus, &priv->idle_cpus)) {
+-		reg = readq_relaxed(priv->reg_base + APPLE_DVFS_CMD);
+-		/* A transition in flight means a CPU just asked: leave it. */
+-		if (!(reg & APPLE_DVFS_CMD_BUSY)) {
+-			apple_soc_cpufreq_write(priv, reg, priv->idle_pstate);
+-			priv->idle_dropped = true;
+-			priv->idle_drops++;
++	if (priv->idle_dropped || priv->run_pstate <= priv->idle_pstate ||
++	    !cpumask_subset(priv->cpus, &priv->idle_cpus))
++		goto out;
++
++	reg = readq_relaxed(priv->reg_base + APPLE_DVFS_CMD);
++	if (reg & APPLE_DVFS_CMD_BUSY) {
++		/*
++		 * Usually the restore asked by this CPU's own wake, if the
++		 * wake took less than a transition. Skipping the drop leaves
++		 * the cluster at its top state for the whole idle; with
++		 * idle_drop_wait, wait for the transition instead. A CPU
++		 * waking meanwhile waits for the lock and restores the
++		 * cluster right after the drop.
++		 */
++		priv->idle_busy++;
++		if (!READ_ONCE(idle_drop_wait) ||
++		    readq_poll_timeout_atomic(priv->reg_base + APPLE_DVFS_CMD, reg,
++					      !(reg & APPLE_DVFS_CMD_BUSY), 1,
++					      APPLE_DVFS_IDLE_WAIT_US) ||
++		    !cpumask_subset(priv->cpus, &priv->idle_cpus)) {
++			priv->idle_skipped++;
++			goto out;
+ 		}
+ 	}
++	apple_soc_cpufreq_write(priv, reg, priv->idle_pstate);
++	priv->idle_dropped = true;
++	priv->idle_drops++;
++out:
+ 	raw_spin_unlock(&priv->lock);
+ }
+ 
+@@ -1778,10 +1816,13 @@ static ssize_t show_dvfs_registers(struct cpufreq_policy *policy, char *buf)
+ 	cmd = readq_relaxed(priv->reg_base + APPLE_DVFS_CMD);
+ 	status = readl_relaxed(priv->reg_base + APPLE_DVFS_STATUS);
+ 	if (priv->info->idle_drop)
+-		return sysfs_emit(buf, "cmd %#018llx requested %llu status %#010x idle_drops %lu run %u\n",
++		return sysfs_emit(buf,
++				  "cmd %#018llx requested %llu status %#010x idle_drops %lu run %u idle_busy %lu idle_skipped %lu\n",
+ 				  cmd, (cmd & priv->info->ps1_mask) >> priv->info->ps1_shift,
+ 				  status, READ_ONCE(priv->idle_drops),
+-				  READ_ONCE(priv->run_pstate));
++				  READ_ONCE(priv->run_pstate),
++				  READ_ONCE(priv->idle_busy),
++				  READ_ONCE(priv->idle_skipped));
+ 	return sysfs_emit(buf, "cmd %#018llx requested %llu status %#010x\n",
+ 			  cmd, (cmd & priv->info->ps1_mask) >> priv->info->ps1_shift,
+ 			  status);
+-- 
+2.43.0
+

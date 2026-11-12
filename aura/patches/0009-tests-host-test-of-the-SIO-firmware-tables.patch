@@ -1,0 +1,343 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 20:09:04 +0000
+Subject: [PATCH 09/13] tests: host test of the SIO firmware tables
+
+tests/run-sio-host.sh compiles src/sio.c as it is, with host stand-ins
+for the m1n1 headers it includes, and runs sio_setup_fwdata() on the host
+(ASan/UBSan) against a Mac's binary ADT, read with aura's own ADT reader,
+in four cases: the T8132 and the T6030 get the protocol-10 tables
+(tunables, the three fixed buffers, map ranges 4 x 16 bytes, six 36-byte
+DMA shims each ending in "no interrupt", nine device types), the M1 gets
+five 32-byte shims and eight types, and an ADT without
+asio-ascwrap-tunables gets no tables. The first case also checks that
+T8132_PATH_SIO admits a J604 DTB.
+
+With the T8132 taken out of the protocol-10 selection, the first host
+case fails. Neither input file is copied into the tree; only parameter
+keys, sizes and whether each record is set are printed.
+
+Assisted-by: LLM
+---
+ tests/run-sio-host.sh | 131 ++++++++++++++++++++++++++++++++
+ tests/sio_host.c      | 173 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 304 insertions(+)
+ create mode 100644 tests/run-sio-host.sh
+ create mode 100644 tests/sio_host.c
+
+diff --git a/tests/run-sio-host.sh b/tests/run-sio-host.sh
+new file mode 100644
+index 00000000..7ebe3f56
+--- /dev/null
++++ b/tests/run-sio-host.sh
+@@ -0,0 +1,131 @@
++#!/bin/sh
++# Host test of the SIO firmware tables (src/sio.c) and the T8132 SIO board admission.
++#
++#   sh tests/run-sio-host.sh <adt.bin> <kernel.dtb>
++#
++# Runs sio_setup_fwdata() against a Mac's binary ADT (with an /arm-io/sio node carrying map-range,
++# dmashim, device-type and asio-ascwrap-tunables) and checks the parameter list the kernel will
++# receive: on the T8132 and the T6030 the protocol-10 tables (map ranges 4 x 16 bytes, six 36-byte
++# DMA shims, nine device types) that the kernel's boot-table check expects; on the M1 the earlier
++# layout; and a refusal without asio-ascwrap-tunables. <kernel.dtb> is a J604 DTB (root compatible
++# apple,j604), for the admission. Neither file is copied into the tree; nothing but parameter keys,
++# sizes and record states is printed.
++set -eu
++cd "$(dirname "$0")/.."
++root=$(pwd)
++fail() {
++    echo "FAIL: $*" >&2
++    exit 1
++}
++[ "$#" = 2 ] || fail "usage: $0 <adt.bin> <kernel.dtb>"
++ADT=$1 DTB=$2
++tmp=$(mktemp -d)
++trap 'rm -rf "$tmp"' EXIT HUP INT TERM
++
++# aura's ADT reader, built for the host as tests/run-kboot-ave.sh does
++mkdir -p "$tmp/rs" "$tmp/src"
++if grep -q 'CStr::from_bytes_until_nul(&self.name)' rust/src/adt.rs; then
++    sed 's|CStr::from_bytes_until_nul(&self.name)|CStr::from_bytes_until_nul(unsafe { \&*(\&self.name as *const [c_char; 32] as *const [u8; 32]) })|' \
++        rust/src/adt.rs > "$tmp/rs/adt.rs"
++elif grep -q 'from_raw_parts(self.name.as_ptr() as \*const u8, 32)' rust/src/adt.rs; then
++    cp rust/src/adt.rs "$tmp/rs/adt.rs"
++else
++    fail "rust/src/adt.rs changed; update the host build in $0"
++fi
++printf '#![allow(non_camel_case_types, dead_code, unused_imports)]\ntype c_size_t = usize;\nmod adt;\n' \
++    > "$tmp/rs/lib.rs"
++RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.89.0} rustc --edition 2021 --crate-type staticlib -O \
++    -o "$tmp/rs/libadt_host.a" "$tmp/rs/lib.rs" || fail "host build of the ADT reader"
++
++# Host stand-ins for the m1n1 headers src/sio.c includes
++# src/sio.c is compiled from a copy beside the stand-ins, so that its quoted includes find them
++cp src/adt.h src/sio.c src/sio.h src/soc.h src/t8132_board.h tests/kboot_audio_host/types.h tests/sio_host.c "$tmp/src/"
++cp config.h "$tmp/config.h"
++cat > "$tmp/src/utils.h" <<'EOF'
++/* Host stand-in for src/utils.h, for tests/sio_host.c */
++#ifndef UTILS_H
++#define UTILS_H
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "types.h"
++#define ARRAY_SIZE(s) (sizeof(s) / sizeof((s)[0]))
++#define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
++#define SZ_4K  (1 << 12)
++#define SZ_16K (1 << 14)
++void memset64(void *dst, u64 value, size_t size);
++void memcpy8(void *dst, void *src, size_t size);
++u64 top_of_memory_alloc(size_t size);
++extern u32 chip_id;
++#endif
++EOF
++printf '#include <stdlib.h>\n' > "$tmp/src/malloc.h"
++printf '/* host: src/sio.c uses no errno values */\n' > "$tmp/src/errno.h"
++${CC:-cc} -std=gnu11 -D_GNU_SOURCE -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
++    -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined \
++    -iquote "$tmp/src" -I"$root/src" \
++    "$tmp/src/sio_host.c" "$tmp/src/sio.c" src/libfdt/fdt.c src/libfdt/fdt_ro.c src/libfdt/fdt_strerror.c \
++    "$tmp/rs/libadt_host.a" -lm -lpthread -ldl -o "$tmp/sio-host" || fail "host build"
++export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0}"
++
++fails=0
++run() { # name args... -- expects...
++    name=$1; shift
++    args=""
++    while [ "$1" != -- ]; do args="$args $1"; shift; done; shift
++    # shellcheck disable=SC2086
++    out=$("$tmp/sio-host" "$ADT" "$DTB" $args 2>&1) || { echo "== $name: host binary failed"; printf '%s\n' "$out"; fails=$((fails + 1)); return; }
++    bad=0
++    echo "== $name"
++    printf '%s\n' "$out" | sed 's/^/  /'
++    for e in "$@"; do
++        case $e in
++        !*) if printf '%s\n' "$out" | grep -q -F -x -e "${e#!}"; then
++                echo "  UNEXPECTED: ${e#!}"; fails=$((fails + 1)); bad=1
++            fi ;;
++        *) if ! printf '%s\n' "$out" | grep -q -F -x -e "$e"; then
++                echo "  MISSING: $e"; fails=$((fails + 1)); bad=1
++            fi ;;
++        esac
++    done
++    [ $bad = 0 ] && echo "  OK" || echo "  CASE FAIL"
++}
++# The protocol-10 parameter set: every table at the size the kernel's boot-table check expects.
++V10="sio ret=ok
++sio param 0x1f 0x30
++sio param 0xc 0x1b80
++sio param 0x10 0x1e000
++sio param 0x30e 0x4000
++sio param 0x1b 0x40
++sio param 0x23 0xd8
++sio param 0x1d 0x48
++sio shim 0 set irq=0xffffffff
++sio shim 1 set irq=0xffffffff
++sio shim 2 set irq=0xffffffff
++sio shim 3 zero irq=0xffffffff
++sio shim 4 zero irq=0xffffffff
++sio shim 5 zero irq=0xffffffff
++sio type 0 set
++sio type 1 set
++sio type 3 set
++sio type 2 zero
++sio type 8 zero"
++IFS='
++'
++# shellcheck disable=SC2086
++set -- $V10
++unset IFS
++run "1 T8132: protocol-10 tables from the J604 ADT, SIO path admitted" 8132 -- "$@" \
++    '!sio shim 6 zero irq=0xffffffff' "sio admitted=1"
++IFS='
++'
++# shellcheck disable=SC2086
++set -- $V10
++unset IFS
++run "2 T6030: the same protocol-10 tables" 6030 -- "$@" '!sio shim 6 zero irq=0xffffffff'
++run "3 M1 (T8103): the earlier layout, five 32-byte shims and eight types" 8103 -- \
++    "sio ret=ok" "sio param 0x23 0xa0" "sio param 0x1d 0x40" "sio shim 4 zero" "!sio shim 5 zero"
++run "4 T8132 without asio-ascwrap-tunables: no tables" 8132 notunables -- \
++    "sio ret=null" "sio_setup_fwdata: missing ADT property 'asio-ascwrap-tunables'"
++[ $fails = 0 ] || fail "$fails expectation(s) not met"
++echo "sio host test: 4/4 cases as expected"
+diff --git a/tests/sio_host.c b/tests/sio_host.c
+new file mode 100644
+index 00000000..bcd681c6
+--- /dev/null
++++ b/tests/sio_host.c
+@@ -0,0 +1,173 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Host test of the SIO firmware tables (src/sio.c sio_setup_fwdata()) and of the T8132 SIO board
++ * admission (src/t8132_board.h), with aura's own ADT reader (rust/src/adt.rs, built for the host)
++ * and libfdt. src/sio.c is compiled as it is; tests/run-sio-host.sh supplies host stand-ins for
++ * m1n1's headers.
++ *
++ *   sio-host <in.adt> <in.dtb> <chip> [notunables]
++ *
++ * <chip> is a hex chip ID (8132, 6030, 8103). notunables renames the ADT property
++ * asio-ascwrap-tunables before the call, as on an ADT without it.
++ *
++ * Prints "sio ret=ok|null", then one "sio param KEY VALUE" line per parameter, the value being
++ * the table size for the second key of each pair and "page" for the IOVA page under the first;
++ * then "sio shim N set|zero irq=X" and "sio type N set|zero" for every DMA shim and device type
++ * record, and "sio admitted=0|1" for T8132_PATH_SIO against the DT's root compatible.
++ */
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "types.h"
++#include "utils.h"
++#ifndef PACKED
++#define PACKED __attribute__((packed))
++#endif
++#include "adt.h"
++#include "sio.h"
++
++#include "libfdt/libfdt.h"
++#include "t8132_board.h"
++
++void *adt;
++u32 chip_id;
++static u32 adt_size;
++
++u32 adt_get_size(void)
++{
++    return adt_size;
++}
++
++u64 top_of_memory_alloc(size_t size)
++{
++    void *p = aligned_alloc(SZ_16K, ALIGN_UP(size, SZ_16K) + SZ_16K);
++
++    if (!p) {
++        printf("setup: allocation failed\n");
++        exit(2);
++    }
++    return (u64)(uintptr_t)p;
++}
++
++void memset64(void *dst, u64 value, size_t size)
++{
++    u64 *d = dst;
++
++    for (size_t i = 0; i < size / 8; i++)
++        d[i] = value;
++}
++
++void memcpy8(void *dst, void *src, size_t size)
++{
++    memcpy(dst, src, size);
++}
++
++static void *slurp(const char *path, size_t *size)
++{
++    FILE *f = fopen(path, "rb");
++    long n;
++    void *buf;
++
++    if (!f || fseek(f, 0, SEEK_END) || (n = ftell(f)) < 0 || fseek(f, 0, SEEK_SET)) {
++        perror(path);
++        exit(2);
++    }
++    buf = calloc(1, n);
++    if (!buf || fread(buf, 1, n, f) != (size_t)n) {
++        perror(path);
++        exit(2);
++    }
++    fclose(f);
++    *size = n;
++    return buf;
++}
++
++/* The fwdata block that holds IOVA page @page, or NULL. */
++static u8 *block(struct sio_data *s, u32 page, u32 size)
++{
++    u64 iova = (u64)page << 12;
++
++    for (int i = 0; i < s->num_fwdata; i++) {
++        struct sio_mapping *m = &s->fwdata[i];
++        if (iova >= m->iova && iova + size <= m->iova + ALIGN_UP(m->size, SZ_16K))
++            return (u8 *)(uintptr_t)(m->phys + (iova - m->iova));
++    }
++    return NULL;
++}
++
++static void records(struct sio_data *s, u32 key, const char *what, u32 stride, bool irq)
++{
++    u32 page = 0, size = 0;
++
++    for (int i = 0; i < s->num_fwparams; i++) {
++        if (s->fwparams[i].key == key)
++            page = s->fwparams[i].value;
++        if (s->fwparams[i].key == key + 1)
++            size = s->fwparams[i].value;
++    }
++    u8 *p = block(s, page, size);
++    if (!p || !size) {
++        printf("sio %s missing\n", what);
++        return;
++    }
++    for (u32 off = 0, n = 0; off + stride <= size; off += stride, n++) {
++        u32 w0, ir;
++        memcpy(&w0, p + off, 4);
++        if (irq) {
++            memcpy(&ir, p + off + stride - 4, 4);
++            printf("sio %s %u %s irq=%#x\n", what, n, w0 ? "set" : "zero", ir);
++        } else {
++            printf("sio %s %u %s\n", what, n, w0 ? "set" : "zero");
++        }
++    }
++}
++
++int main(int argc, char **argv)
++{
++    size_t asize, dsize;
++
++    if (argc < 4) {
++        fprintf(stderr, "usage: %s <in.adt> <in.dtb> <chip> [notunables]\n", argv[0]);
++        return 2;
++    }
++    adt = slurp(argv[1], &asize);
++    adt_size = asize;
++    void *dt = slurp(argv[2], &dsize);
++    chip_id = strtoul(argv[3], NULL, 16);
++    if (argc > 4 && !strcmp(argv[4], "notunables")) {
++        int n = adt_path_offset(adt, "/arm-io/sio");
++        u32 len;
++        const u8 *p = n < 0 ? NULL : adt_getprop(adt, n, "asio-ascwrap-tunables", &len);
++        if (!p) {
++            printf("setup: no ADT /arm-io/sio asio-ascwrap-tunables\n");
++            return 2;
++        }
++        /* An ADT property is its 32-byte name, its length word, then its value. */
++        char *name = (char *)p - 36;
++        if (strcmp(name, "asio-ascwrap-tunables")) {
++            printf("setup: unexpected ADT property layout\n");
++            return 2;
++        }
++        name[strlen(name) - 1] = 'x';
++    }
++
++    struct sio_data *s = sio_setup_fwdata("/arm-io/sio");
++    printf("sio ret=%s\n", s ? "ok" : "null");
++    if (s) {
++        for (int i = 0; i < s->num_fwparams; i++) {
++            u32 k = s->fwparams[i].key;
++            /* add_fwdata() appends each table as a pair: its IOVA page, then its size. */
++            if (i & 1)
++                printf("sio param %#x %#x\n", k, s->fwparams[i].value);
++            else
++                printf("sio param %#x page\n", k);
++        }
++        bool v10 = chip_id == 0x6030 || chip_id == 0x8132;
++        records(s, 0x22, "shim", v10 ? 36 : 32, v10);
++        records(s, 0x1c, "type", 8, false);
++    }
++    printf("sio admitted=%d\n", t8132_board_admitted(dt, T8132_PATH_SIO) ? 1 : 0);
++    return 0;
++}

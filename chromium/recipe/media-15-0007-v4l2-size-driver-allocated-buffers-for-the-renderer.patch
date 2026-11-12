@@ -1,0 +1,75 @@
+media/gpu/v4l2: size driver-allocated CAPTURE buffers for the Renderer
+
+On Linux, VideoDecoderPipeline drops its frame pool when the V4L2 decoder
+can output a renderable format, and V4L2VideoDecoder allocates MMAP
+buffers itself: the codec's reference frames plus two. Those buffers are
+also the frames the Renderer queues and the compositor shows, so the
+decoder runs out of buffers while the Renderer holds frames. When there is
+a frame pool, VideoDecoderPipeline sizes it as reference frames + 1 + the
+Renderer pipeline estimate. Expose that estimate to the decoder through
+VideoDecoderMixin::Client and size the MMAP queue the same way, within
+VIDEO_MAX_FRAME.
+
+--- a/media/gpu/chromeos/video_decoder_pipeline.cc
++++ b/media/gpu/chromeos/video_decoder_pipeline.cc
+@@ -1114,6 +1114,11 @@
+   if (image_processor_)
+     return auxiliary_frame_pool_.get();
+   return main_frame_pool_.get();
++}
++
++size_t VideoDecoderPipeline::GetEstimatedNumBuffersForRenderer() const {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(decoder_sequence_checker_);
++  return estimated_num_buffers_for_renderer_;
+ }
+ 
+ void VideoDecoderPipeline::NotifyEstimatedMaxDecodeRequests(int num) {
+--- a/media/gpu/chromeos/video_decoder_pipeline.h
++++ b/media/gpu/chromeos/video_decoder_pipeline.h
+@@ -64,6 +64,12 @@
+     // callers may not assume that the returned pointer is valid after a call to
+     // PickDecoderOutputFormat().
+     virtual DmabufVideoFramePool* GetVideoFramePool() const = 0;
++
++    // Returns how many output buffers the Renderer pipeline is expected to
++    // hold at once. A decoder that allocates its own output buffers (when
++    // GetVideoFramePool() returns nullptr) adds these to its codec needs, as
++    // the frame pool does when there is one.
++    virtual size_t GetEstimatedNumBuffersForRenderer() const { return 0; }
+ 
+     // After this method is called from |decoder_|, the client needs to call
+     // VideoDecoderMixin::ApplyResolutionChange() when all pending frames are
+@@ -258,6 +264,7 @@
+ 
+   // VideoDecoderMixin::Client implementation.
+   DmabufVideoFramePool* GetVideoFramePool() const override;
++  size_t GetEstimatedNumBuffersForRenderer() const override;
+   void PrepareChangeResolution() override;
+   void NotifyEstimatedMaxDecodeRequests(int num) override;
+   CroStatus::Or<ImageProcessor::PixelLayoutCandidate> PickDecoderOutputFormat(
+--- a/media/gpu/v4l2/v4l2_video_decoder.cc
++++ b/media/gpu/v4l2/v4l2_video_decoder.cc
+@@ -1203,10 +1203,19 @@
+   // If we don't use driver-allocated buffers, request as many as possible
+   // (VIDEO_MAX_FRAME) since they are shallow allocations. Otherwise, allocate
+   // |num_codec_reference_frames| plus one for the video frame being decoded,
+-  // and one for our client (presumably an ImageProcessor).
+-  const size_t v4l2_num_buffers = use_v4l2_allocated_buffers
+-                                      ? num_codec_reference_frames + 2
+-                                      : VIDEO_MAX_FRAME;
++  // plus the frames the Renderer pipeline holds: with no frame pool and no
++  // ImageProcessor, the driver's buffers are the frames the Renderer queues
++  // and the compositor shows. VideoDecoderPipeline sizes its frame pool the
++  // same way when it has one. With a single spare buffer the decoder stalls
++  // while the Renderer holds frames.
++  size_t v4l2_num_buffers = VIDEO_MAX_FRAME;
++  if (use_v4l2_allocated_buffers) {
++    const size_t renderer_buffers =
++        client_ ? client_->GetEstimatedNumBuffersForRenderer() : 0;
++    v4l2_num_buffers = std::clamp<size_t>(
++        num_codec_reference_frames + 1 + renderer_buffers,
++        num_codec_reference_frames + 2, VIDEO_MAX_FRAME);
++  }
+ 
+   VLOGF(1) << "Requesting: " << v4l2_num_buffers << " CAPTURE buffers of type "
+            << (use_v4l2_allocated_buffers ? "V4L2_MEMORY_MMAP"

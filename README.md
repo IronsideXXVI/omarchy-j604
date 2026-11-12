@@ -14,7 +14,7 @@ The J604 runs the official Omarchy **edge** channel (switched with the official 
 
 Everything else is stock. Each piece is a patch on top of an official recipe, built with a local `pkgrel`. Earlier userland changes that are not installed are listed in [`not-installed/README.md`](not-installed/README.md).
 
-It uses the official chain only: the [linux-aurora](https://github.com/omacom/linux-aurora) kernel with a J604 patch series, omacom [m1n1](https://github.com/omacom/m1n1) and U-Boot, the official installer, Omarchy edge, and normal `omarchy update`.
+It uses the official chain only: the [linux-aurora](https://github.com/omacom/linux-aurora) kernel with a J604 patch series, Aurora's [aura](https://github.com/aurora-silicon/aura) boot loader and U-Boot, the official installer, Omarchy edge, and normal `omarchy update`.
 
 Changes go to the official repositories as reviewed pull requests, one topic at a time, in whatever shape the team prefers. Until each one lands, this repository holds the full set so anyone can read and rebuild it. Much of the kernel work is other people's: carried with its authorship, or already in Aurora's 7.3 base (see Credits and `CREDITS.md`).
 
@@ -27,7 +27,7 @@ Only what's measured on the machine is listed as working. The full per-block sta
 | Boot chain (m1n1, U-Boot, Limine, disk unlock), storage, keyboard and trackpad, USB, battery, lid | Working |
 | CPU | Working: 10 cores, cpufreq and cpuidle (performance cores up to 4.46 GHz requested, efficiency 2.89 GHz); one busy performance core runs at about 4.36 GHz and two to four at about 3.9 GHz, as under macOS with all cores loaded; since 1.723 the reported frequency is the reached one |
 | GPU | Accelerated (OpenGL 4.6 / Vulkan 1.4); idle GPU power 0.041 W on 1.710, 0.076 W on 1.711 |
-| Internal display | 3024x1964 at 120 Hz, scale 2, 10-bit (XRGB2101010) and Display P3 as package defaults, with no user setting. The panel link is most likely 8 bits per channel with dithering (not yet verified). VRR stays off, as in upstream Omarchy |
+| Internal display | 3024x1964 at 120 Hz, scale 2, 10-bit (XRGB2101010) and Display P3 as package defaults, with no user setting. The panel link is most likely 8 bits per channel with dithering (not yet verified). Adaptive sync (VRR) on since `omarchy-mac` 2.18 |
 | Glassy bar | Stock holds about 59 fps on this 120 Hz panel (re-measured on 1.731). 119 fps needs the change in [omacom/omarchy#18176](https://github.com/omacom/omarchy/pull/18176), which is not carried here. With blur on, the desktop does not composite 120 times a second (open: 80 per second with windowed 60 fps video on 1.856 with the carried Hyprland and bar pair, see `STATUS.md`) |
 | Smoothness at 120 Hz | Both fixes on by default since 1.718: a full-window animation runs at 120 fps (about 90 before), scrolling at 120 fps, and 24, 30 and 60 fps video in Chromium stays on its cadence in our tests. YouTube fullscreen 1080p60 since 1.730: 1.8-3.4 % of frames off cadence, 0 dropped (1.6-7.2 % before, 23 % before pacing). 4K60 in Chromium is held back by its software decoding; stock mpv plays the same 4K60 clip with 0 of 600 frames off (see `STATUS.md`). After idle, a terminal open/close animation sometimes ran below about 68 fps (cause: the frame pacing's start value after idle); 1.804 carries the fix, and its first 8-burst check held no frame |
 | Camera | Working, tuned: 1080p30 and 720p30 capture only today (the sensor has more modes; work in progress) with the sensor tuning file loaded, seen by stock apps and Chromium; colour close to neutral in a bright scene, not yet judged by eye |
@@ -54,40 +54,41 @@ Until these changes land in the official packages, these builds target the J604 
 
 ## Versions
 
-The J604 builds carried here, as installed on the machine on 2026-11-09 (checked with `pacman -Q`):
+The J604 builds carried here, as installed on the machine on 2026-11-12 (checked with `pacman -Q`):
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`a82a1ebda940`), 368 patches | `1.858` |
-| `m1n1-aurora` | 1.6.1.aurora22, omacom/m1n1 (`bc79acc434`), 41 patches | `1.612` |
+| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`cc7696978e4c`, Aurora's tip), 353 patches | `1.862` |
+| `aura` | 1.0.0b12.1, aurora-silicon/aura (`54678354b7`), aurora-silicon/alarm-aurora recipe, 13 patches | `1.604` (replaced `m1n1-aurora` on 2026-11-12) |
 | `uboot-aurora` | 2026.07.aurora11, aurora-silicon/u-boot (`250385f8c8`, the version Aurora packages), 1 patch | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261107, omacom/mesa (`b7b03c5b3b`) | `1.8140` |
 | `alsa-ucm-conf-aurora` | 10.aurora3, aurora-silicon/alsa-ucm-conf-asahi (`b9b2d0c82c`) | `1.605` |
-| `aurora-audio` | 4.1.aurora3, aurora-silicon/asahi-audio (`06aec67a8a`) | `3.607` |
+| `aurora-audio` | 4.1.aurora3, aurora-silicon/asahi-audio (`06aec67a8a`) | `3.609` |
 | `speakersafetyd` | 2.0.1, AsahiLinux/speakersafetyd | `1.605` |
 | `asahi-fwextract` | 0.9.2, asahi-alarm/asahi-alarm-installer | `1.609` |
-| `asahi-scripts` | 20261023, asahi-alarm/asahi-scripts | `1.2` |
+| `asahi-scripts` | 20261023, asahi-alarm/asahi-scripts, aurora-silicon/alarm-aurora recipe | `9.604` |
 | `plymouth` | 26.134.222, Plymouth (Arch Linux recipe) | `3.604` |
 | `libfprint-git` | 1:1.94.100.r10.g6f9479c, libfprint (`6f9479c3d5`), omacom recipe | `5.604` (accepts Secure Enclave interface v4 and v5) |
-| `libva-v4l2_request-avd` | 1.3.r11.r169.gc653eaa, omacom/libva-v4l2_request (`c653eaa623`), omacom recipe | `1.606` (adds the `aurora_drv_video.so` alias, VA-API H.264/HEVC encoding on the Apple video encoder and AV1 10-bit decoding up to 7680x4320; the alias is open as [omacom/omarchy-pkgs#2375](https://github.com/omacom/omarchy-pkgs/pull/2375), and its official `-2` will replace this build) |
-| `chromium` | 156.0.8078.79, Arch Linux ARM recipe (`6227c4d28b`) | `1.605` (patches for hardware video on the Apple decoder: 10-bit P010 frames, BT.709 colours, decoder errors reported, HEVC only with Annex-B; Chromium's 10-bit hardware path stays off under `omarchy-mac` 2.17) |
+| `libva-v4l2_request-avd` | 1.3.r11.r169.gc653eaa, omacom/libva-v4l2_request (`c653eaa623`), omacom recipe | `1.607` (adds the `aurora_drv_video.so` alias, VA-API H.264/HEVC encoding on the Apple video encoder, AV1 10-bit decoding up to 7680x4320 and the VP9 maximum frame size from the kernel; the alias is open as [omacom/omarchy-pkgs#2375](https://github.com/omacom/omarchy-pkgs/pull/2375), and its official `-2` will replace this build) |
+| `chromium` | 156.0.8078.79, Arch Linux ARM recipe (`6227c4d28b`) | `1.607` (patches for hardware video on the Apple decoder: 10-bit P010 frames, BT.709 colours, decoder errors reported, HEVC only with Annex-B, frame errors, HDR metadata, capture buffers sized for the renderer; with `omarchy-mac` 2.19 Chromium decodes 10-bit VP9, AV1 and HEVC on the decoder) |
+| `avd-fw` | 0.1, AsahiLinux/avd-fw (`v0.1`), omacom recipe (`c1fcff4dec`), 15 patches | `1.604` (aurora-silicon/avd-fw's queue transport and the T8132 SRAM aperture) |
 | `gpu-screen-recorder` | 6.1.7, gpu-screen-recorder (Arch Linux recipe, built for aarch64) | `1.604` (captures monitors on the Apple display controller) |
 | `omarchy-mac-boot` | 20261104, omacom/omarchy-mac-pkgs (`7e50e937b5`) | `1.616` |
-| `omarchy-mac` | 0.2.3, omacom/omarchy-mac-pkgs (`ea0097a523`) | `2.17` (adds the panel line, Chromium hardware video decode on the J604 for H.264 and VP9 profile 0, and a Touch ID start-up race fix) |
+| `omarchy-mac` | 0.2.3, omacom/omarchy-mac-pkgs (`ea0097a523`) | `2.19` (adds the panel line with adaptive sync, Chromium hardware video decode on the J604 (every codec with the J604 Chromium), and a Touch ID start-up race fix) |
 | `omarchy-dev` | 4.0.0.r7641.gf97d3e7 (edge), omacom/omarchy `quattro` (`f97d3e7dc8`), omacom recipe (`5c7fdeaecf`) | `1.4` (keyboard-backlight patches + the bar declares its strip as its blur region; look unchanged) |
-| `omarchy-settings-dev` | 4.0.0.r7641.gf97d3e7 (edge), omacom/omarchy `quattro` (`f97d3e7dc8`) | `1.1` (keyboard-backlight patches + built-in panel defaults) |
-| `hyprland` | 0.57.1, hyprwm/Hyprland (`v0.57.1`), omacom recipe (`0c7102d724`) | `2.606` (Omarchy's three patches + one: blur only inside a surface's declared blur region, so the full-screen bar no longer makes Hyprland blur everything that changes under it; look unchanged) |
+| `omarchy-settings-dev` | 4.0.0.r7641.gf97d3e7 (edge), omacom/omarchy `quattro` (`f97d3e7dc8`) | `1.2` (keyboard-backlight patches + built-in panel defaults, adaptive sync from the panel line) |
+| `hyprland` | 0.57.2, hyprwm/Hyprland (`v0.57.2`), omacom recipe (`573dd5c7fb`) | `2.607` (Omarchy's three patches + one: blur only inside a surface's declared blur region, so the full-screen bar no longer makes Hyprland blur everything that changes under it; look unchanged) |
 
 Also installed, unchanged from the official repositories: the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
-Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only the J604 device tree, which `omarchy-mac-boot` 1.616 now selects on its own (see `STATUS.md`, which lists what 1.703 to 1.858 changed over 1.617).
+Since 2026-11-12 the Mac boots through Aurora's aura boot loader: the Stage 2 on the ESP (`m1n1/boot-ctxr.bin`) holds aura, the J604 device tree and U-Boot, and `asahi-scripts`' `update-m1n1` writes it as a trial and commits it after a good boot. Kernel 1.862 is on Aurora's tip (`cc7696978e4c`); `STATUS.md` lists what 1.703 to 1.862 changed over 1.617.
 
 ## Layout
 
 | Directory | What | Upstream it applies to | License |
 | --- | --- | --- | --- |
 | `kernel/` | `git format-patch` series (apply in `series` order); `BASE` names the commit it applies to and the official recipe | aurora-silicon/linux `integration/aurora` (built with the omacom `linux-aurora` recipe) | GPL-2.0 (see `kernel/COPYING`) |
-| `m1n1/` | patches and the `m1n1-aurora` recipe | omacom/m1n1 | MIT |
+| `aura/` | J604 patches and the `aura` recipe (Aurora's boot loader; it replaced `m1n1-aurora` on 2026-11-12, whose last published `m1n1/` is in commit 6c7bda4) | aurora-silicon/aura (aurora-silicon/alarm-aurora recipe) | MIT and GPL-2.0-only (see `aura/LICENSE`) |
 | `uboot-aurora/` | J604 board patch and the `uboot-aurora` recipe | aurora-silicon/u-boot | GPL-2.0+ |
 | `mesa/` | T8132 patch, the "aurora" driver-name patch, seven G16 fixes from aurora-silicon/mesa, opt-in G16G sparse binding, the P010 conversion fix and the `mesa-aurora` recipe (builds `mesa-aurora` and `vulkan-aurora`) | omacom/mesa | MIT (main code) |
 | `alsa-ucm-conf-aurora/` | J604 headphone jack, microphone and speaker UCM | aurora-silicon/alsa-ucm-conf-asahi | BSD-3-Clause |
@@ -97,7 +98,8 @@ Since 2026-11-09 the kernel is on the Aurora 7.3 base, and `boot.bin` holds only
 | `libfprint-git/` | Touch ID on the 7.3 kernel: the Apple Secure Enclave driver accepts biometric interface v4 and v5 (two upstream Aurora patches as one) | libfprint (omacom recipe) | LGPL-2.1-or-later |
 | `libva-v4l2_request-avd/` | VA-API on the 7.3 kernel: the recipe adds the `aurora_drv_video.so` alias (upstream aurora-silicon/alarm-aurora aedcf240ca91). `patches/` holds that recipe diff and, since 1.605, a driver patch that adds VA-API H.264 and HEVC encoding on V4L2 stateful encoders such as the Apple video encoder, and since 1.606 a second one that sizes surfaces exported before their first decode for 10-bit AV1 and VP9 | omacom/omarchy-pkgs recipe, omacom/libva-v4l2_request | GPL-3.0-or-later |
 | `gpu-screen-recorder/` | the stock recorder captures monitors on the Apple display controller (a KMS-only device with no render node, handled like DisplayLink's) | gpu-screen-recorder (Arch Linux recipe) | GPL-3.0-only |
-| `asahi-scripts/` | adds the `apple_nvmem_spmi` and `dwc3-apple` modules to the initramfs | asahi-alarm/asahi-scripts | MIT |
+| `asahi-scripts/` | Aurora's recipe (its `update-m1n1` writes aura's Stage 2 as a trial and commits it after a good boot) + our two patches that add the `apple_nvmem_spmi` and `dwc3-apple` modules to the initramfs | asahi-alarm/asahi-scripts (aurora-silicon/alarm-aurora recipe) | MIT |
+| `avd-fw/` | the open Apple Video Decoder firmware with aurora-silicon/avd-fw's queue transport and the T8132 SRAM aperture | AsahiLinux/avd-fw (omacom recipe) | MIT |
 | `plymouth/` | SimpleDRM recognized by driver name, so the disk unlock prompt opens on the panel | Plymouth | GPL-2.0 |
 | `omarchy-mac-boot/` | boot package fixes for the J604, and `update-m1n1` builds `boot.bin` with only the running Mac's own device tree | omacom/omarchy-mac-pkgs | MIT |
 | `omarchy-mac/` | keyboard backlight idle timeout, Apple F-row key names, Touch ID on the J604, the 14-inch MacBook Pro panel line (10-bit, Display P3) | omacom/omarchy-mac-pkgs | MIT |
@@ -112,11 +114,11 @@ Every component directory has the same shape:
 - `recipe/`: the J604 `PKGBUILD` and the same patches. Every other file of the recipe is unchanged from the official recipe named in `BASE`.
 - The upstream license text.
 
-`kernel/` has `BASE`, `series`, `patches/` and the kernel's license files.
+`kernel/` has `BASE`, `series`, `patches/`, the kernel's license files and, since 1.862, `recipe/` (the J604 `PKGBUILD` and kernel config; put the files of `patches/` next to it to build).
 
-The kernel series still carries one test-only setting: the J604 device-tree file that patch 0157 adds (`t8132-j604-lab.dtsi`) enables the CPU performance-counter (PMU) node for a counter measurement, as the test-only patch 0616 did in 1.617. It is published because the installed kernel carries it, and it is not proposed upstream as it is; the node is enabled for good only after that measurement passes.
+The kernel series still carries one test-only setting: the J604 device-tree file that patch 0157 adds (the 1.862 file 0122) (`t8132-j604-lab.dtsi`) enables the CPU performance-counter (PMU) node for a counter measurement, as the test-only patch 0616 did in 1.617. It is published because the installed kernel carries it, and it is not proposed upstream as it is; the node is enabled for good only after that measurement passes.
 
-Each patch keeps its original author. Patch 0157 ("j604: integrate the J604 series onto Aurora 7.3") folds the part of the 1.617 series that Aurora's 7.3 base does not already contain into one commit; the authors of that work are those of the 1.617 series (see the history of `kernel/`). Apart from the pull requests and issues listed in `UPSTREAM.md`, these patches have not been submitted upstream yet.
+Each patch keeps its original author. Patch 0157 ("j604: integrate the J604 series onto Aurora 7.3", the 1.862 file 0122) folds the part of the 1.617 series that Aurora's 7.3 base does not already contain into one commit; the authors of that work are those of the 1.617 series (see the history of `kernel/`). Apart from the pull requests and issues listed in `UPSTREAM.md`, these patches have not been submitted upstream yet.
 
 No Apple firmware, binaries or device dumps are in this repository. The firmware the machine needs is extracted on the machine itself at install time, as on every Omarchy Mac.
 

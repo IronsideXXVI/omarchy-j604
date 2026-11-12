@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 02:16:44 +0000
+Subject: [PATCH] drm/asahi: g16: let same-queue dependents reach the
+ engine before their predecessor retires
+
+A SUBMIT whose input fence is the job fence of an earlier SUBMIT on the same
+logical queue waits in the DRM scheduler until that fence signals: the engine
+retires the predecessor, completes its job after dropping the device lock,
+the fence signals, the scheduler worker wakes, runs the job, and the job takes
+the device lock again to be published. A chain of dependent render passes
+(a compositor's blur: five passes, each sampling the last) pays that round trip
+per pass, about 0.39 ms measured on the M4.
+
+The engine already orders a queue's commands by itself: its queue ordinals
+require the previous ordinal of the queue to have retired, it publishes one
+command at a time (flights 1) or a render only behind healthy renders whose
+ordinals it checks, and a predecessor's failure latches the VM so the dependent
+fails too. With g16_submit_ahead=1 such a same-queue input fence is therefore
+not handed to the scheduler: the dependent job enters the engine at once and is
+published in the poll pass that retires its predecessor. Fences of other
+queues, other contexts, syncobj timeline chains and shared-buffer fences are
+unchanged.
+
+The parameter is runtime 0644 and defaults to 0, which leaves every path as it
+was: the same inputs, the same scheduler dependencies, the same wire.
+aurora-g16/stats prints the level and how many inputs were released.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/fence.rs  | 17 +++++++++++++++++
+ drivers/gpu/drm/asahi/g16/params.rs | 21 +++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  6 ++++++
+ drivers/gpu/drm/asahi/g16/queue.rs  |  8 ++++++++
+ 4 files changed, 52 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/fence.rs b/drivers/gpu/drm/asahi/g16/fence.rs
+index 01ba768b31..b1a071fa3a 100644
+--- a/drivers/gpu/drm/asahi/g16/fence.rs
++++ b/drivers/gpu/drm/asahi/g16/fence.rs
+@@ -21,8 +21,13 @@ use kernel::{
+     sync::{Arc, LockClassKey, Mutex},
+ };
+ 
++use core::sync::atomic::{AtomicU64, Ordering};
++
+ use crate::file::SyncItem;
+ 
++/// Same-queue input fences released to engine ordering (`g16_submit_ahead` >= 1), all queues.
++pub(crate) static SAME_QUEUE_RELEASED: AtomicU64 = AtomicU64::new(0);
++
+ /// Reads a retained dependency's completion status without waiting or invoking callbacks.
+ pub(crate) fn dependency_status(fence: &Fence) -> i32 {
+     // SAFETY: The Fence reference keeps its dma_fence alive throughout the status read.
+@@ -103,6 +108,8 @@ pub(crate) struct Timeline {
+     pending: Mutex<KVec<Pending>>,
+     /// Pre-signalled ENOMEM fence for a refused submission when no error fence can be allocated.
+     allocation_failure: Fence,
++    /// The dma_fence context of `jobs` (u64::MAX until the first job fence exists).
++    job_context: AtomicU64,
+ }
+ 
+ impl Timeline {
+@@ -115,11 +122,19 @@ impl Timeline {
+                 errors,
+                 pending <- new_mutex!(KVec::new(), "g16::Timeline::pending"),
+                 allocation_failure,
++                job_context: AtomicU64::new(u64::MAX),
+             }),
+             GFP_KERNEL,
+         )
+     }
+ 
++    /// Whether `fence` is a job fence of this queue's own timeline.
++    pub(crate) fn owns(&self, fence: &Fence) -> bool {
++        let context = self.job_context.load(Ordering::Relaxed);
++        // SAFETY: The Fence reference keeps its dma_fence alive for the read.
++        context != u64::MAX && unsafe { (*fence.raw()).context } == context
++    }
++
+     /// Creates the fence of the next accepted job. Fences are created in submission order: the
+     /// caller holds the queue (SUBMIT is serialized per queue).
+     pub(crate) fn next(self: &Arc<Self>) -> Result<JobFence> {
+@@ -127,6 +142,8 @@ impl Timeline {
+         // taking pending preserves creation order. Fence completion needs pending too:
+         // never enter reclaim while holding that mutex.
+         let fence: UserFence<JobFenceOps> = self.jobs.new_fence(0, JobFenceOps)?.into();
++        // SAFETY: `fence` is a live dma_fence owned by this function.
++        self.job_context.store(unsafe { (*fence.raw()).context }, Ordering::Relaxed);
+         let mut pending = self.pending.lock();
+         pending.reserve(1, GFP_NOWAIT)?;
+         pending
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 1678dea9df..2537f426db 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -510,6 +510,27 @@ live_u32_param!(
+     "G16: render commands in flight at once, 1 (default, the qualified one-at-a-time protocol) or 2 (one render published behind a running render; experimental; runtime 0644)"
+ );
+ 
++/// Storage of `g16_submit_ahead` (runtime 0644, default 0).
++static SUBMIT_AHEAD: AtomicU32 = AtomicU32::new(0);
++
++/// G16 submit-ahead level: 0 (default) = today's protocol, byte-identical; 1 = a SUBMIT's input
++/// fence that is a job fence of the SAME logical queue is not waited for by the scheduler (the
++/// engine's queue ordinals and its one-at-a-time publication already order it), so the dependent
++/// job reaches the engine before its predecessor retires and is published in the retiring poll
++/// pass instead of after fence signal -> scheduler -> run. Levels above 1 are reserved.
++pub(crate) fn submit_ahead() -> u32 {
++    SUBMIT_AHEAD.load(Ordering::Relaxed).min(1)
++}
++
++live_u32_param!(
++    SUBMIT_AHEAD_PARAM,
++    SUBMIT_AHEAD_PARMTYPE,
++    SUBMIT_AHEAD_PARM,
++    SUBMIT_AHEAD,
++    "g16_submit_ahead",
++    "G16: 0 (default) today's protocol; 1 = same-queue input fences are ordered by the engine, not waited for by the scheduler (experimental; runtime 0644)"
++);
++
+ /// Storage of `g16_pb_reuse` (runtime 0644, default 1).
+ static PB_REUSE: AtomicU32 = AtomicU32::new(1);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 7f503e8086..f953a24d0e 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1002,6 +1002,12 @@ impl Firmware {
+             "publications: compute {} render {}",
+             s.publications[0], s.publications[1]
+         )?;
++        writeln!(
++            f,
++            "submit_ahead: level {} same_queue_inputs_released {}",
++            params::submit_ahead(),
++            super::fence::SAME_QUEUE_RELEASED.load(core::sync::atomic::Ordering::Relaxed)
++        )?;
+         let (live, handles) = self.vms.counts();
+         writeln!(f, "vm_bindings: live {} handles {}", live, handles)?;
+         writeln!(f, "epoch_budget_waits: {}", super::budget::waits())?;
+diff --git a/drivers/gpu/drm/asahi/g16/queue.rs b/drivers/gpu/drm/asahi/g16/queue.rs
+index 41da5b94c7..f127147aff 100644
+--- a/drivers/gpu/drm/asahi/g16/queue.rs
++++ b/drivers/gpu/drm/asahi/g16/queue.rs
+@@ -187,8 +187,16 @@ impl Queue {
+             self.state.check(order)?;
+         }
+         let mut inputs = KVec::with_capacity(syncs.inputs().len(), GFP_KERNEL)?;
++        let submit_ahead = params::submit_ahead() >= 1;
+         for sync in syncs.inputs() {
+             if let Some(fence) = &sync.fence {
++                // Submit-ahead: a predecessor of this very queue is ordered by the engine (queue
++                // ordinals, one command published at a time) and its failure latches this VM, so
++                // the scheduler need not wait for it to complete.
++                if submit_ahead && self.timeline.owns(fence) {
++                    super::fence::SAME_QUEUE_RELEASED.fetch_add(1, Ordering::Relaxed);
++                    continue;
++                }
+                 inputs.push(fence.clone(), GFP_KERNEL)?;
+             }
+         }
+-- 
+2.43.0
+

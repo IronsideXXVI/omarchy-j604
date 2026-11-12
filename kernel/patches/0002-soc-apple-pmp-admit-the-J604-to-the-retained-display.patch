@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 4 Nov 2026 05:27:22 -0600
+Subject: [PATCH] soc: apple: pmp: admit the J604 to the retained
+ display vote
+
+The firmware 26.6.2 DCP backend takes its DISP power vote through the
+retained PMP bridge, which only registers on the MacBook Air (13-inch,
+M4) and checks that the loader-published apple,tunable-soc-device
+table has the qualified 34-entry shape with entry 15 being DISP.
+
+On the MacBook Pro (14-inch, M4) the PMP is at the same address and
+its soc-device table in the Apple device tree (/arm-io/pmp/iop-pmp-nub,
+25G83 and 26B123 j604ap templates) is byte-identical to the J713's,
+4216 bytes, as is its soc-device-ps-group.
+
+Add a display-board predicate that admits the J604 next to the J713 and
+use it for the bridge registration, the retained-board query and the
+display entry points. The AGX vote is not qualified on the J604, so the
+GPU entry points and the AGX consumer check stay J713-only. Nothing
+changes on the J713, and no J604 device tree enables the PMP yet.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+(cherry picked from commit 5626a93624bb8ca0e55250b555fa01721f6f217f)
+(cherry picked from commit 435dec2d870682e955b64657f30017759b1787b5)
+---
+ drivers/soc/apple/pmp-display.c       | 25 +++++++++++++------------
+ include/linux/soc/apple/pmp-display.h | 17 +++++++++++++++--
+ 2 files changed, 28 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/soc/apple/pmp-display.c b/drivers/soc/apple/pmp-display.c
+index b32e155ec0..632982ddc3 100644
+--- a/drivers/soc/apple/pmp-display.c
++++ b/drivers/soc/apple/pmp-display.c
+@@ -222,7 +222,7 @@ static DEFINE_MUTEX(pmp_display_registration);
+ 
+ bool apple_pmp_display_retained_board(void)
+ {
+-	return apple_pmp_j713_board();
++	return apple_pmp_display_board();
+ }
+ 
+ /* The qualified loader publishes the existing PMP through its alias. */
+@@ -238,24 +238,24 @@ struct apple_pmp_display *apple_pmp_display_register(struct device *dev,
+ 	struct device_node *node, *qualified;
+ 	const void *table;
+ 	int size;
+-	bool match, j713 = apple_pmp_j713_board();
++	bool match, board = apple_pmp_display_board();
+ 
+-	if (!j713 || !dev->of_node ||
++	if (!board || !dev->of_node ||
+ 	    !of_device_is_compatible(dev->of_node,
+ 		"apple,t8132-pmp-v2"))
+ 		return NULL;
+ 	node = pmp_bridge_node();
+ 	match = node == dev->of_node;
+ 	of_node_put(node);
+-	if (j713) {
++	if (board) {
+ 		qualified = of_find_node_by_path("/soc/pmp@380500000");
+ 		match = match && qualified == dev->of_node;
+ 		of_node_put(qualified);
+ 	}
+-	/* J713 has a qualified fixed table shape. */
++	/* J713 and J604 share a qualified fixed table shape. */
+ 	table = of_get_property(dev->of_node, "apple,tunable-soc-device", &size);
+ 	if (!match || !of_property_present(dev->of_node, "apple,tunable-soc-device") ||
+-	    !cookie || !send || (j713 && !j713_disp_table(table, size)))
++	    !cookie || !send || (board && !j713_disp_table(table, size)))
+ 		return NULL;
+ 	mutex_lock(&pmp_display_registration);
+ 	if (pmp_display)
+@@ -267,7 +267,7 @@ struct apple_pmp_display *apple_pmp_display_register(struct device *dev,
+ 	p->driver = dev->driver;
+ 	p->cookie = cookie;
+ 	p->send = send;
+-	p->agx_table_valid = !j713 || j713_agx_table(table, size);
++	p->agx_table_valid = !board || j713_agx_table(table, size);
+ 	mutex_init(&p->request);
+ 	spin_lock_init(&p->lock);
+ 	init_completion(&p->reply);
+@@ -276,7 +276,7 @@ struct apple_pmp_display *apple_pmp_display_register(struct device *dev,
+ 	pm_runtime_get_noresume(dev);
+ 	smp_store_release(&pmp_display, p);
+ 	dev_info(dev, "%s PMP vote bridge ready; retained existing PMP owner\n",
+-		 j713 ? "J713" : "J514S");
++		 apple_pmp_j713_board() ? "J713" : "J604");
+ out:
+ 	mutex_unlock(&pmp_display_registration);
+ 	return p;
+@@ -319,9 +319,10 @@ static struct apple_pmp_display *pmp_power_consumer(struct device *consumer,
+ 	struct device_node *pmp, *supplier;
+ 	bool match;
+ 
+-	if (apple_pmp_j713_board()) {
++	if (apple_pmp_display_board()) {
+ 		/* Both consumers must name the exact boot-profile node. */
+ 		if ((kind != PMP_POWER_AGX && kind != PMP_POWER_DISP) || !consumer->of_node ||
++		    (kind == PMP_POWER_AGX && !apple_pmp_j713_board()) ||
+ 		    !of_device_is_compatible(consumer->of_node,
+ 			kind == PMP_POWER_AGX ? "apple,agx-t8132" : "apple,t8132-dcp"))
+ 			return ERR_PTR(-ENODEV);
+@@ -514,7 +515,7 @@ out:
+ /* Probe creates the retained supplier links; get/check never change owners. */
+ int apple_pmp_j713_display_prepare(struct device *consumer)
+ {
+-	return apple_pmp_j713_board() ? pmp_power_prepare(consumer, PMP_POWER_DISP) : -ENODEV;
++	return apple_pmp_display_board() ? pmp_power_prepare(consumer, PMP_POWER_DISP) : -ENODEV;
+ }
+ EXPORT_SYMBOL_GPL(apple_pmp_j713_display_prepare);
+ 
+@@ -526,7 +527,7 @@ EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_prepare);
+ 
+ int apple_pmp_j713_display_check(struct device *consumer)
+ {
+-	return apple_pmp_j713_board() ? pmp_power_check(consumer, PMP_POWER_DISP, false) : -ENODEV;
++	return apple_pmp_display_board() ? pmp_power_check(consumer, PMP_POWER_DISP, false) : -ENODEV;
+ }
+ EXPORT_SYMBOL_GPL(apple_pmp_j713_display_check);
+ 
+@@ -544,7 +545,7 @@ EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_check);
+ 
+ int apple_pmp_j713_display_get(struct device *consumer)
+ {
+-	return apple_pmp_j713_board() ? pmp_power_get(consumer, PMP_POWER_DISP) : -ENODEV;
++	return apple_pmp_display_board() ? pmp_power_get(consumer, PMP_POWER_DISP) : -ENODEV;
+ }
+ EXPORT_SYMBOL_GPL(apple_pmp_j713_display_get);
+ 
+diff --git a/include/linux/soc/apple/pmp-display.h b/include/linux/soc/apple/pmp-display.h
+index e65effb337..e3f8122ff3 100644
+--- a/include/linux/soc/apple/pmp-display.h
++++ b/include/linux/soc/apple/pmp-display.h
+@@ -12,6 +12,18 @@ static inline bool apple_pmp_j713_board(void)
+ 	return apple_t8132_firmware_path() && of_machine_is_compatible("apple,t8132");
+ }
+ 
++/*
++ * Boards whose retained PMP session carries the DISP vote. The J604 PMP
++ * publishes the same soc-device table as the J713; its AGX vote is not
++ * qualified, so the GPU entry points below stay J713-only.
++ */
++static inline bool apple_pmp_display_board(void)
++{
++	return apple_pmp_j713_board() ||
++	       (of_machine_is_compatible("apple,j604") &&
++		of_machine_is_compatible("apple,t8132"));
++}
++
+ struct device;
+ struct apple_pmp_display;
+ 
+@@ -30,12 +42,13 @@ void apple_pmp_display_fail(struct apple_pmp_display *display, int error);
+ /* Internal: caller holds the bound supplier device lock. */
+ struct apple_pmp_display *apple_pmp_display_bound_owner(struct device *dev);
+ 
+-/* J713 votes share the existing PMP owner's untagged request stream.
++/* Retained votes share the existing PMP owner's untagged request stream.
+  * Prepare is probe-only; supplier links persist until reboot, and so do
+  * accepted votes, except that the DCP releases its DISP vote while it has
+  * powered the display domains down (put) and takes it again (get). Before
+  * that it asks, changing nothing, whether the vote can be released now and
+- * taken again later (check_release).
++ * taken again later (check_release). The display entry points serve every
++ * apple_pmp_display_board(), the GPU ones only the J713.
+  */
+ int apple_pmp_j713_display_prepare(struct device *consumer);
+ int apple_pmp_j713_display_get(struct device *consumer);
+-- 
+2.43.0
+

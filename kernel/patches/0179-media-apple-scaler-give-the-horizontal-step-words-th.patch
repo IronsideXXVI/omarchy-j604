@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 06:19:49 +0000
+Subject: [PATCH] media: apple: scaler: give the horizontal step words
+ the reciprocal
+
+Horizontal reductions never complete: every job that makes the picture
+narrower times out with the engine still running, whatever the formats,
+while vertical reductions and enlargements in either direction work.
+
+The scaler programming wrote the source-to-destination ratio into all
+six ratio words of each direction. m1n1's scaler experiment notes that
+horizontal word 2 must hold the destination-to-source ratio instead, and
+on the J604 that alone fixes horizontal reductions of RGB pictures;
+pictures with subsampled chroma also need word 3, its chroma
+counterpart, set the same way. Vertical words are unaffected.
+
+Write out/in into horizontal words 2 and 3. Measured on the J604:
+1920x1080 to 1280x720 NV12 54.8 dB and 1920x1080 to 1280x1080 RGB
+54.0 dB against bicubic, where both timed out before; 1280x720 to
+1920x1080 RGB unchanged at 52.3 dB.
+
+Fixes: 61897f78e907 ("media: apple: scaler: scale to another size")
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit 875c5bf1935aa189099ab2f89a8120058b34b398)
+---
+ .../platform/apple/scaler/apple-scaler-hw.c   | 22 +++++++++-----
+ .../platform/apple/scaler/apple-scaler-test.c | 30 +++++++++++++++++++
+ 2 files changed, 44 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/media/platform/apple/scaler/apple-scaler-hw.c b/drivers/media/platform/apple/scaler/apple-scaler-hw.c
+index a41a908577..95a9c40108 100644
+--- a/drivers/media/platform/apple/scaler/apple-scaler-hw.c
++++ b/drivers/media/platform/apple/scaler/apple-scaler-hw.c
+@@ -415,15 +415,21 @@ void asc_filter_compute(u32 in, u32 out, unsigned int taps, s16 *coef)
+ EXPORT_SYMBOL_IF_KUNIT(asc_filter_compute);
+ 
+ /*
+- * One direction of the scaler with its filter: enable, the ratio in every
+- * ratio word (the 1:1 setup writes one in each), zero initial phase, then
+- * the coefficients, each once per 16-bit half of the first block and two
++ * One direction of the scaler with its filter: enable, the ratio words
++ * (the 1:1 setup writes one in each), zero initial phase, then the
++ * coefficients, each once per 16-bit half of the first block and two
+  * phases per word in the second.
++ *
++ * Horizontally, words 2 and 3 take the reciprocal, out/in: m1n1's scaler
++ * experiment notes word 2 must be out/in, and with in/out in either word a
++ * horizontal reduction never completes (word 2 for RGB, word 3 as well for
++ * subsampled chroma). Vertically every word takes in/out.
+  */
+ static void asc_emit_scale_dir(struct asc_emit *e, u32 base, u32 flags, u32 in, u32 out,
+-			       unsigned int taps)
++			       unsigned int taps, bool horizontal)
+ {
+ 	u32 ratio = asc_scale_ratio(in, out);
++	u32 step = horizontal ? asc_scale_ratio(out, in) : ratio;
+ 	s16 coef[15 * 32];
+ 	unsigned int i;
+ 
+@@ -433,8 +439,8 @@ static void asc_emit_scale_dir(struct asc_emit *e, u32 base, u32 flags, u32 in,
+ 	asc_emit(e, base + 0x08, 0);
+ 	asc_emit(e, base + 0x0c, ratio);
+ 	asc_emit(e, base + 0x10, ratio);
+-	asc_emit(e, base + 0x14, ratio);
+-	asc_emit(e, base + 0x18, ratio);
++	asc_emit(e, base + 0x14, step);
++	asc_emit(e, base + 0x18, step);
+ 	asc_emit(e, base + 0x1c, 0);
+ 	asc_emit(e, base + 0x20, ratio);
+ 	asc_emit(e, base + 0x24, ratio);
+@@ -551,8 +557,8 @@ int asc_job_build(const struct asc_job *job, struct asc_reg *w, unsigned int max
+ 		u32 flags = job->src.fmt->yuv && job->src.fmt->hsub > 1 ? BIT(1) : 0;
+ 
+ 		/* Vertical (0x1000, 9 taps) then horizontal (0x2000, 15 taps). */
+-		asc_emit_scale_dir(&e, 0x1000, flags, job->src.height, job->dst.height, 9);
+-		asc_emit_scale_dir(&e, 0x2000, flags, job->src.width, job->dst.width, 15);
++		asc_emit_scale_dir(&e, 0x1000, flags, job->src.height, job->dst.height, 9, false);
++		asc_emit_scale_dir(&e, 0x2000, flags, job->src.width, job->dst.width, 15, true);
+ 		asc_emit(&e, 0x480, 0);
+ 	} else {
+ 		asc_emit_unscaled(&e, job);
+diff --git a/drivers/media/platform/apple/scaler/apple-scaler-test.c b/drivers/media/platform/apple/scaler/apple-scaler-test.c
+index 763d8a4010..8a2991f3e2 100644
+--- a/drivers/media/platform/apple/scaler/apple-scaler-test.c
++++ b/drivers/media/platform/apple/scaler/apple-scaler-test.c
+@@ -638,6 +638,36 @@ static void asc_test_job_rejects(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, asc_job_build(&job, w, ASC_JOB_MAX_WRITES), -EINVAL);
+ }
+ 
++/* Horizontally, ratio words 2 and 3 take out/in; vertically all take in/out. */
++static void asc_test_job_scaled(struct kunit *test)
++{
++	struct asc_reg *w = kunit_kcalloc(test, ASC_JOB_MAX_WRITES, sizeof(*w), GFP_KERNEL);
++	struct asc_csc csc;
++	struct asc_job job = {
++		.src = { .fmt = asc_find_format(V4L2_PIX_FMT_NV12M), .width = 64, .height = 64 },
++		.dst = { .fmt = asc_find_format(V4L2_PIX_FMT_ARGB32), .width = 32, .height = 128 },
++		.scale = true,
++	};
++	int n;
++
++	KUNIT_ASSERT_NOT_NULL(test, w);
++	KUNIT_ASSERT_EQ(test, asc_csc_compute(V4L2_YCBCR_ENC_709,
++					      V4L2_QUANTIZATION_LIM_RANGE, true, &csc), 0);
++	job.csc = &csc;
++	n = asc_job_build(&job, w, ASC_JOB_MAX_WRITES);
++	KUNIT_ASSERT_GT(test, n, 0);
++	KUNIT_EXPECT_EQ(test, asc_last(w, n, 0x200c), 0x800000);
++	KUNIT_EXPECT_EQ(test, asc_last(w, n, 0x2010), 0x800000);
++	KUNIT_EXPECT_EQ(test, asc_last(w, n, 0x2014), 0x200000);
++	KUNIT_EXPECT_EQ(test, asc_last(w, n, 0x2018), 0x200000);
++	KUNIT_EXPECT_EQ(test, asc_last(w, n, 0x2020), 0x800000);
++	KUNIT_EXPECT_EQ(test, asc_last(w, n, 0x100c), 0x200000);
++	KUNIT_EXPECT_EQ(test, asc_last(w, n, 0x1014), 0x200000);
++	KUNIT_EXPECT_EQ(test, asc_last(w, n, 0x1018), 0x200000);
++	KUNIT_EXPECT_EQ(test, asc_last(w, n, 0x2000) & 1, 1);
++	KUNIT_EXPECT_EQ(test, asc_last(w, n, 0x1000) & 1, 1);
++}
++
+ static struct kunit_case asc_test_cases[] = {
+ 	KUNIT_CASE_PARAM(asc_test_csc, asc_csc_gen_params),
+ 	KUNIT_CASE(asc_test_csc_rejects),
+-- 
+2.43.0
+

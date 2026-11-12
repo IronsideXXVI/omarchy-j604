@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 18:33:12 +0000
+Subject: [PATCH] drm/apple: iomfb_m4: keep the internal panel's
+ present timeline in debugfs
+
+A page-flip event on the internal panel is stamped when the flush returns
+(dcp_drm_crtc_vblank() after iomfb_m4_present(), no vblank interrupt), so
+every client that schedules by presentation feedback trusts the arrival
+of the firmware's swap-complete (D590) as the time the frame was shown.
+Measured end to end, pictures reach the panel 11 to 24 ms later than
+players assume; where that time goes cannot be told from outside.
+
+Keep, for the last 256 internal presents, the architectural counter when
+the swap was started (after any swap_pace hold), when A407 was answered,
+when the D590 arrived and when the present returned, next to the
+CLOCK_MONOTONIC time of that return (the flip event's time), plus the
+swap_pace sleep asked for. Keep the last two D590 payloads with the
+counter at their arrival: the 0x730-byte record carries more than the
+displayed flag, and a time in it would date the frame on the panel.
+
+Read-only: nothing in the present path changes, the record is written
+under dcp->lock where the present already runs, and the new file,
+iomfb_m4_present, sits next to iomfb_m4 in the connector's debugfs
+directory (root only, 0400).
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/iomfb_m4.c | 118 +++++++++++++++++++++++++++++++
+ 1 file changed, 118 insertions(+)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 0e65fe4bc4..d9d36d0c63 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -1137,6 +1137,27 @@ struct dcp_m4_ext_done {
+ #define DCP_M4_STEP_MS		5000
+ #define DCP_M4_CALL_LIMIT_MS	15000
+ 
++/*
++ * One internal-panel present for debugfs (iomfb_m4_present): architectural
++ * counter times of each step, and the CLOCK_MONOTONIC time taken next to the
++ * counter when the flush returns, which is the time of the page-flip event.
++ */
++struct dcp_m4_prec {
++	u32 id;
++	/* swap_pace sleep asked for, us (0: not held) */
++	u32 pace_us;
++	/* A406 sent, A407 answered, D590 arrived */
++	u64 start_cnt;
++	u64 reply_cnt;
++	u64 done_cnt;
++	/* counter and CLOCK_MONOTONIC ns when the present returned */
++	u64 flip_cnt;
++	s64 flip_ns;
++};
++
++#define DCP_M4_PREC_N		256
++#define DCP_M4_D590_DIAG_SIZE	0x730
++
+ struct dcp_m4_runtime {
+ 	struct iomfb_m4 *dcp;
+ 	/* Architectural counter at the internal panel's last swap completion (swap_target) */
+@@ -1172,6 +1193,17 @@ struct dcp_m4_runtime {
+ 	u64 int_iv_ewma;
+ 	/* The last interval between internal-panel swap completions (0 after idle) */
+ 	u64 int_last_iv;
++	/*
++	 * debugfs iomfb_m4_present: the last DCP_M4_PREC_N internal presents,
++	 * the one in flight, and the last two internal D590 payloads with the
++	 * counter at their arrival. Read-only diagnostics, under dcp->lock.
++	 */
++	struct dcp_m4_prec prec[DCP_M4_PREC_N];
++	struct dcp_m4_prec prec_cur;
++	u64 prec_count;
++	u8 int_d590[2][DCP_M4_D590_DIAG_SIZE];
++	u64 int_d590_cnt[2];
++	u64 int_d590_count;
+ 	struct dcp_m4_properties *properties;
+ 	struct dcp_m4_timing timing;
+ 	/*
+@@ -2490,6 +2522,10 @@ static int dcp_m4_runtime_callback(struct dcp_m4_runtime *r, u64 word)
+ 	    packet.input_size == dcp_m4_pf->done_size) {
+ 		r->int_shown = snapshot[4] != 0;
+ 		r->int_shown_valid = true;
++		memcpy(r->int_d590[r->int_d590_count % 2], snapshot,
++		       min_t(u32, packet.input_size, DCP_M4_D590_DIAG_SIZE));
++		r->int_d590_cnt[r->int_d590_count % 2] = __arch_counter_get_cntpct();
++		r->int_d590_count++;
+ 	}
+ 	dev_dbg(dcp->dev, "DCP callback D%03d %u/%u remote=%u flag9=%u\n",
+ 		 dcp_m4_callback_method(packet.tag), packet.input_size, packet.output_size,
+@@ -2946,6 +2982,8 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
+ 		}
+ 		r->int_held = pace != 0;
+ 		WRITE_ONCE(r->int_start_cnt, __arch_counter_get_cntpct());
++		r->prec_cur = (struct dcp_m4_prec){ .pace_us = pace,
++						   .start_cnt = r->int_start_cnt };
+ 		if (pace && r->pace_start && r->int_start_cnt > r->pace_start) {
+ 			u64 over = r->int_start_cnt - r->pace_start;
+ 			u64 us = div64_u64(over * USEC_PER_SEC, arch_timer_get_cntfrq() ?: 1);
+@@ -3028,6 +3066,10 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
+ 		ret = dcp_m4_swap_record_reply(&r->swap, submitted, sizeof(submitted));
+ 		refused = ret && dcp_m4_swap_submit_reply(submitted, sizeof(submitted)) == -EPROTO;
+ 	}
++	if (!ret && !ext && primary && frame && r->prec_cur.start_cnt) {
++		r->prec_cur.reply_cnt = __arch_counter_get_cntpct();
++		r->prec_cur.id = id;
++	}
+ 	/*
+ 	 * A direct swap does not wait for its D590: it joins the swaps in flight
+ 	 * and is tracked there (r->swap may begin the next one) until its D590,
+@@ -3099,6 +3141,12 @@ static int dcp_m4_runtime_swap_full(struct dcp_m4_runtime *r, bool primary,
+ 		dcp_m4_failed(dcp, ret);
+ 	} else {
+ 		dev_dbg(dcp->dev, "Display swap %u complete: A407 reply and D590\n", r->swap.id);
++		if (!ext && primary && frame && r->prec_cur.reply_cnt) {
++			r->prec_cur.done_cnt = READ_ONCE(r->int_done_cnt);
++			r->prec[r->prec_count++ % DCP_M4_PREC_N] = r->prec_cur;
++		}
++		r->prec_cur.start_cnt = 0;
++		r->prec_cur.reply_cnt = 0;
+ 	}
+ 	return ret;
+ }
+@@ -5101,6 +5149,15 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+ 	if (dcp->last_flip_ns)
+ 		dcp->flip_interval_ns = now - dcp->last_flip_ns;
+ 	dcp->last_flip_ns = now;
++	if (dcp->runtime->prec_count) {
++		struct dcp_m4_prec *p = &dcp->runtime->prec[(dcp->runtime->prec_count - 1) %
++							      DCP_M4_PREC_N];
++
++		if (!p->flip_cnt) {
++			p->flip_cnt = __arch_counter_get_cntpct();
++			p->flip_ns = ktime_get_ns();
++		}
++	}
+ 	iomfb_m4_idle_cache_kick(dcp);
+ out:
+ 	mutex_unlock(&dcp->lock);
+@@ -7834,7 +7891,68 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(iomfb_m4_status);
+ 
++/*
++ * The internal panel's present timeline, oldest first, in architectural
++ * counter ticks (frq per second), each with the CLOCK_MONOTONIC time of its
++ * flip event, then the last two D590 payloads with the counter at arrival.
++ */
++static int iomfb_m4_present_show(struct seq_file *s, void *unused)
++{
++	struct apple_dcp *owner = s->private;
++	struct iomfb_m4 *dcp = owner->v26_6;
++	struct dcp_m4_runtime *r;
++	struct dcp_m4_prec *snap;
++	u8 (*d590)[DCP_M4_D590_DIAG_SIZE];
++	u64 count, d590_count, d590_cnt[2], first, i;
++
++	if (!dcp)
++		return -ENODEV;
++	snap = kvmalloc_array(DCP_M4_PREC_N, sizeof(*snap), GFP_KERNEL);
++	d590 = kvmalloc(2 * DCP_M4_D590_DIAG_SIZE, GFP_KERNEL);
++	if (!snap || !d590) {
++		kvfree(snap);
++		kvfree(d590);
++		return -ENOMEM;
++	}
++	mutex_lock(&dcp->lock);
++	r = dcp->runtime;
++	if (!r) {
++		mutex_unlock(&dcp->lock);
++		kvfree(snap);
++		kvfree(d590);
++		return -ENODEV;
++	}
++	memcpy(snap, r->prec, DCP_M4_PREC_N * sizeof(*snap));
++	count = r->prec_count;
++	memcpy(d590, r->int_d590, 2 * DCP_M4_D590_DIAG_SIZE);
++	d590_cnt[0] = r->int_d590_cnt[0];
++	d590_cnt[1] = r->int_d590_cnt[1];
++	d590_count = r->int_d590_count;
++	mutex_unlock(&dcp->lock);
++
++	seq_printf(s, "frq %llu presents %llu\n", (u64)arch_timer_get_cntfrq(), count);
++	seq_puts(s, "# id pace_us start_cnt reply_cnt done_cnt flip_cnt flip_ns\n");
++	first = count > DCP_M4_PREC_N ? count - DCP_M4_PREC_N : 0;
++	for (i = first; i < count; i++) {
++		struct dcp_m4_prec *p = &snap[i % DCP_M4_PREC_N];
++
++		seq_printf(s, "%u %u %llu %llu %llu %llu %lld\n", p->id, p->pace_us, p->start_cnt,
++			   p->reply_cnt, p->done_cnt, p->flip_cnt, p->flip_ns);
++	}
++	first = d590_count > 2 ? d590_count - 2 : 0;
++	for (i = first; i < d590_count; i++) {
++		seq_printf(s, "# d590 %llu arrived_cnt %llu\n", i + 1, d590_cnt[i % 2]);
++		seq_hex_dump(s, "", DUMP_PREFIX_OFFSET, 16, 1, d590[i % 2],
++			     DCP_M4_D590_DIAG_SIZE, false);
++	}
++	kvfree(snap);
++	kvfree(d590);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(iomfb_m4_present);
++
+ void iomfb_m4_debugfs_init(struct apple_dcp *owner, struct dentry *root)
+ {
+ 	debugfs_create_file("iomfb_m4", 0400, root, owner, &iomfb_m4_status_fops);
++	debugfs_create_file("iomfb_m4_present", 0400, root, owner, &iomfb_m4_present_fops);
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,591 @@
+From 6756ca99328dcb32b692e31b8bf1fd10e5f489f3 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 18:58:36 +1100
+Subject: [PATCH 14/15] queue: advertise and validate per-image codec VP pools
+ on ABI 2
+
+Rebuild the earlier multi-VP pool table on bf49a31b while retaining its
+queued SRAM transport, per-VP picture ownership and tagged VP DONE events.
+Publish an optional AVM2 record and reject codec/engine mismatches before
+feeding a program. The existing scheduler already overlaps different VPs
+and starts PP in submission order, so its current ownership rules stay.
+
+Include the non-LSR v3-t2 image in both build matrices. Mark T6040's pool
+as inferred. Test every image's codec/engine pairs, reverse VP completion,
+per-engine notifications, outbox backpressure and ordered PP.
+[dylan: one co-author trailer of the original message is not reproduced here]
+
+---
+ docs/queue.md                 | 68 +++++++++++++++++++++++++++++++--
+ meson.build                   |  1 +
+ src/hw/tunables/tunables_v3.h |  2 +-
+ src/pool.h                    | 38 ++++++++++++++++++
+ src/queue-fw.c                | 14 +++++--
+ src/queue.c                   |  9 +++--
+ src/queue.h                   |  5 ++-
+ tests/build-all.sh            |  2 +-
+ tests/queue-test.c            | 41 ++++++++++++++------
+ tests/transport-test.py       | 72 +++++++++++++++++++++++++++++++++--
+ 10 files changed, 223 insertions(+), 29 deletions(-)
+ create mode 100644 src/pool.h
+
+diff --git a/docs/queue.md b/docs/queue.md
+index d0f5917..defb3f3 100644
+--- a/docs/queue.md
++++ b/docs/queue.md
+@@ -27,7 +27,7 @@ information block at SRAM `+0x7fc0` before raising the existing boot-ready flag:
+ | 0x20 | VP register index limit (exclusive), 4 / 9 / 12 |
+ | 0x24 | codec mask: bits HEVC=0, H.264=1, VP9=2, AV1=3 |
+ | 0x28 | hardware FIFO slots: cap frames in flight at min(16, this) |
+-| 0x2c | features: bit 0 SRAM ring, bit 1 multi-kick PP |
++| 0x2c | features: bit 0 SRAM ring, bit 1 multi-kick PP, bit 2 VP DONE, bit 3 VP pools |
+ | 0x30 | SRAM ring offset, `0x0` |
+ | 0x34 | SRAM ring size in words, `0x1800` (24 KiB) |
+ | 0x38 | firmware: SRAM ring words consumed (free-running, live) |
+@@ -39,7 +39,7 @@ Check count/stride/packet size and the actual SRAM resource length. Use the
+ advertised address instead of deriving it from the host physical address.
+ 
+ The ring occupies `+0x8000..+0x83ff`. Firmware private state is at
+-`+0x6000..+0x7fbf`, and its 1024-byte PIODMA staging buffer is at `+0x9000`.
++`+0x6000..+0x7f7f`, and its 1024-byte PIODMA staging buffer is at `+0x9000`.
+ The minimum SRAM size supported by the existing images is `0xc000`. The stack
+ stays at the existing per-image SRAM end. Do not use these regions for codec
+ scratch or legacy commands in queue mode.
+@@ -49,7 +49,7 @@ Current firmware aperture addresses are:
+ | Image | SRAM address | PIODMA CM3 base | VP FIFO / PP FIFO offset from decode base |
+ | --- | --- | --- | --- |
+ | v2-t0 | `0x0108c000` | `0x40070000` | `0x4004 + 4*vp` / `0x4014` |
+-| v3-t0, v3-t1 | `0x01090000` | `0x40070000` | `0x000c + 4*vp` / `0x0030` |
++| v3-t0, v3-t1, v3-t2 | `0x01090000` | `0x40070000` | `0x000c + 4*vp` / `0x0030` |
+ | v4-t0 | `0x01092000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
+ | v5-t0 | `0x01090000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
+ | v5-t1 | `0x01092000` | `0x41070000` | `0x000c + 4*vp` / `0x0040` |
+@@ -76,7 +76,7 @@ Each descriptor is exactly 16 u32 words (`struct avdq_desc` in `src/queue.h`):
+ | 0x00 | magic | host: `0x41565131` |
+ | 0x04 | tag | host: full u32 `(sequence << 4) | ring_index` |
+ | 0x08 | codec | host: HEVC=0, H.264=1, VP9=2, AV1=3 |
+-| 0x0c | vp_slot | host: hardware VP index from SoC codec match data |
++| 0x0c | vp_slot | host: hardware VP index from the advertised pool or SoC match data |
+ | 0x10 | program_lo | host: low 32 bits of packet-buffer PIODMA IOVA |
+ | 0x14 | program_hi | host: high 32 bits of that IOVA |
+ | 0x18 | program_words | host: instruction words, excludes packet headers/padding |
+@@ -339,3 +339,63 @@ the earlier picture is PP-ready or running PP. Independent VPs can still run
+ concurrently. A blocked program cannot be skipped because the SRAM word ring is
+ in global submission order. The host watchdog continues to bound a missing
+ DONE; errors halt all accepted work as before.
++
++## Optional codec VP pools (ABI 2 feature bit 3)
++
++`avd/multi-vp-2` retains the ABI 2 SRAM ring and tagged VP DONE feature from
++`bf49a31b`. It ports the per-image codec pools from the earlier MIT multi-VP
++implementation without changing descriptor offsets or restoring its older
++transport. No AVM1 descriptor extension is accepted or required.
++
++When info word 11 has bit 3, SRAM +0x7f80 contains eight little-endian u32 words:
++
++| Word | Meaning |
++| --- | --- |
++| 0 | `0x41564d32` (AVM2), published before the main info magic |
++| 1 | Pool record version, 1 |
++| 2..5 | HEVC, H.264, VP9, AV1 masks; bit n names hardware VP n |
++| 6 | Bit n means codec n's pool count is inferred |
++| 7 | Reserved, zero |
++
++The masks must be disjoint, fit the VP register limit in info word 8 and agree
++with info word 9's codec mask. Firmware validates every descriptor's codec/VP
++pair against the same pool used to publish the record, including tier-0 holes.
++Older hosts continue to submit the first VP of each codec with unchanged ABI 2
++descriptors. New hosts use one VP per codec unless feature bit 3 and a valid
++pool record are both present.
++
++| Image | HEVC VPs | H.264 VPs | VP9 VPs | AV1 VPs |
++| --- | --- | --- | --- | --- |
++| v2-t0 (T8103) | 0..1 | 2 | 3 | none |
++| v3-t0 (T6000) | 0..3 | 4..7 | 8 | none |
++| v3-t1 (T8112) | 0..3 | 4..7 | 8 | none |
++| v3-t2 (T6020) | 0..3 | 4..7 | 8 | none |
++| v4-t0 (T8122) | 0..3 | 4..7 | 8 | 9..10 |
++| v5-t0 (T8140) | 0..1 | 4 | 8 | 9 |
++| v5-t1 (T8132) | 0..3 | 4..7 | 8 | 9..11 |
++| v5-t2 (T6040) | 0..3 | 4..7 | 8 | 9..11 |
++
++The T6040 row is inferred from the T8132 pool, not measured on silicon; its
++inferred mask is 15. Other rows follow the public codec variant tables already
++used by `avd/multi-vp`. The non-LSR T6020 image reuses the v3-t1 tunable set,
++as in that earlier implementation. This image association still needs device
++qualification. No register probing or guessed engine counts are needed in the
++host driver.
++
++SRAM programs remain globally ordered and a VP owns its picture state until
++that engine's DONE. Different VPs may execute simultaneously, but PP always
++starts in descriptor submission order, including when later VPs finish first.
++Each frame keeps a distinct instruction FIFO and its buffers until the full
++PP completion. Tagged VP notifications and their outbox backpressure work
++independently for each engine; they do not release a FIFO or descriptor.
++H.264/HEVC VP work reads the picture's bitstream and private slice/scratch state;
++reference reconstruction is consumed by ordered PP. VP9/AV1 host dependency
++checks remain necessary: selecting another VP cannot satisfy a CPU probability,
++CDF or segmentation input dependency.
++
++`make test` checks every pool pair plus the scheduler ownership cases.
++`sh tests/build-all.sh` builds all eight images. Run
++`python3 tests/transport-test.py build/avd-fw-*.bin` with Unicorn to exercise
++all image pools, reverse VP completion, per-engine tagged VP events, ordered PP,
++outbox stalls, codec/engine rejection, SRAM streaming and legacy PIODMA.
++These tests model completion events and do not decode pixels or measure speed.
+diff --git a/meson.build b/meson.build
+index 522e7e8..424a417 100644
+--- a/meson.build
++++ b/meson.build
+@@ -26,6 +26,7 @@ avd_variants = [
+     { 'name': 'avd-fw-v2-t0', 'version': '2', 'tier': '0', 'pad': '0xc000'},
+     { 'name': 'avd-fw-v3-t0', 'version': '3', 'tier': '0', 'pad': '0x10000'},
+     { 'name': 'avd-fw-v3-t1', 'version': '3', 'tier': '1', 'pad': '0x10000'},
++    { 'name': 'avd-fw-v3-t2', 'version': '3', 'tier': '2', 'pad': '0x10000'},
+     { 'name': 'avd-fw-v4-t0', 'version': '4', 'tier': '0', 'pad': '0x12000'},
+     { 'name': 'avd-fw-v5-t0', 'version': '5', 'tier': '0', 'pad': '0x10000'},
+     { 'name': 'avd-fw-v5-t1', 'version': '5', 'tier': '1', 'pad': '0x12000'},
+diff --git a/src/hw/tunables/tunables_v3.h b/src/hw/tunables/tunables_v3.h
+index 2d39242..a225af8 100644
+--- a/src/hw/tunables/tunables_v3.h
++++ b/src/hw/tunables/tunables_v3.h
+@@ -3,7 +3,7 @@
+ #ifndef __TUNABLES_V3__H
+ #define __TUNABLES_V3__H
+ 
+-#if AVD_TIER == 1
++#if AVD_TIER == 1 || AVD_TIER == 2
+ #include "tunables_v3t1.h"
+ #else
+ #include "tunables_v3t0.h"
+diff --git a/src/pool.h b/src/pool.h
+new file mode 100644
+index 0000000..f565b83
+--- /dev/null
++++ b/src/pool.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef AVD_FW_POOL_H
++#define AVD_FW_POOL_H
++#include <stdint.h>
++
++#define AVDQ_POOL_OFFSET 0x7f80u
++#define AVDQ_POOL_MAGIC 0x41564d32u /* AVM2, distinct from the earlier AVM1 ABI */
++#define AVDQ_POOL_VERSION 1u
++
++struct avdq_pool {
++	uint32_t codec[4]; /* bit n selects hardware VP register index n */
++	uint32_t inferred; /* bit n: codec n's count is inferred */
++};
++
++/* Public codec pools, ported from avd/multi-vp's MIT variant table. */
++static const struct avdq_pool avdq_pools[] = {
++	{ {0x003, 0x004, 0x008, 0x000}, 0 }, /* v2-t0, T8103 */
++	{ {0x00f, 0x0f0, 0x100, 0x000}, 0 }, /* v3-t0, T6000 */
++	{ {0x00f, 0x0f0, 0x100, 0x000}, 0 }, /* v3-t1, T8112 */
++	{ {0x00f, 0x0f0, 0x100, 0x000}, 0 }, /* v3-t2, T6020 */
++	{ {0x00f, 0x0f0, 0x100, 0x600}, 0 }, /* v4-t0, T8122 */
++	{ {0x003, 0x010, 0x100, 0x200}, 0 }, /* v5-t0, T8140 */
++	{ {0x00f, 0x0f0, 0x100, 0xe00}, 0 }, /* v5-t1, T8132 */
++	{ {0x00f, 0x0f0, 0x100, 0xe00}, 15 }, /* v5-t2, T6040 inferred */
++};
++
++#if defined(AVD_VER)
++#if AVD_VER == 2
++#define AVDQ_IMAGE_POOL (&avdq_pools[0])
++#elif AVD_VER == 3
++#define AVDQ_IMAGE_POOL (&avdq_pools[1 + AVD_TIER])
++#elif AVD_VER == 4
++#define AVDQ_IMAGE_POOL (&avdq_pools[4])
++#else
++#define AVDQ_IMAGE_POOL (&avdq_pools[5 + AVD_TIER])
++#endif
++#endif
++#endif
+diff --git a/src/queue-fw.c b/src/queue-fw.c
+index a481e62..0496376 100644
+--- a/src/queue-fw.c
++++ b/src/queue-fw.c
+@@ -55,6 +55,7 @@
+ 		   AVDQ_RING_OFFSET + (i) * AVDQ_DESC_BYTES))
+ #define Q_STAGE REG(SRAM_ALIAS + AVDQ_STAGE_OFFSET)
+ #define Q_INFO REG(SRAM_ALIAS + 0x7fc0u)
++#define Q_POOL REG(SRAM_ALIAS + AVDQ_POOL_OFFSET)
+ #define Q_RING_WORD REG(SRAM_ALIAS + AVDQ_SRAM_RING_OFFSET)
+ #define Q_INFO_RP 14	/* firmware: ring words consumed */
+ #define Q_INFO_WP 15	/* host: ring words written */
+@@ -73,7 +74,7 @@ struct queue_fw {
+ 	unsigned int ring_rp;	/* SRAM ring words consumed (free-running) */
+ };
+ #define FW ((struct queue_fw *)(SRAM_ALIAS + 0x6000u))
+-_Static_assert(sizeof(struct queue_fw) <= 0x1fc0u, "SRAM queue state overlaps ABI");
++_Static_assert(sizeof(struct queue_fw) <= AVDQ_POOL_OFFSET - 0x6000u, "SRAM queue state overlaps ABI");
+ 
+ static void barrier(void)
+ {
+@@ -86,7 +87,13 @@ void avdq_fw_init(void)
+ 	volatile unsigned int *p = (volatile unsigned int *)FW;
+ 	for (i = 0; i < sizeof(*FW) / sizeof(*p); i++)
+ 		p[i] = 0;
+-	avdq_init(&FW->q);
++	avdq_init(&FW->q, AVDQ_IMAGE_POOL);
++	Q_POOL[0] = 0;
++	Q_POOL[1] = AVDQ_POOL_VERSION;
++	for (i = 0; i < 4; i++)
++		Q_POOL[2 + i] = AVDQ_IMAGE_POOL->codec[i];
++	Q_POOL[6] = AVDQ_IMAGE_POOL->inferred;
++	Q_POOL[7] = 0;
+ 	for (i = 0; i < 16; i++)
+ 		Q_INFO[i] = 0;
+ 	Q_INFO[1] = AVDQ_VERSION;
+@@ -100,10 +107,11 @@ void avdq_fw_init(void)
+ 	Q_INFO[9] = AVD_VER <= 3 ? 7u : 15u;
+ 	Q_INFO[10] = FIFO_SLOTS;
+ 	Q_INFO[11] = AVDQ_FEAT_SRAM_RING | AVDQ_FEAT_MULTI_KICK |
+-		     AVDQ_FEAT_VP_DONE;
++		     AVDQ_FEAT_VP_DONE | AVDQ_FEAT_MULTI_VP;
+ 	Q_INFO[12] = AVDQ_SRAM_RING_OFFSET;
+ 	Q_INFO[13] = AVDQ_SRAM_RING_WORDS;
+ 	barrier();
++	Q_POOL[0] = AVDQ_POOL_MAGIC;
+ 	Q_INFO[0] = AVDQ_MAGIC;
+ }
+ 
+diff --git a/src/queue.c b/src/queue.c
+index 058c5d5..858a163 100644
+--- a/src/queue.c
++++ b/src/queue.c
+@@ -1,16 +1,17 @@
+ /* SPDX-License-Identifier: MIT */
+ #include "queue.h"
+ 
+-void avdq_init(struct avdq *q)
++void avdq_init(struct avdq *q, const struct avdq_pool *pool)
+ {
+ 	unsigned int i;
++	q->pool = pool;
+ 	q->head = q->count = q->halted = q->stray_pp = 0;
+ 	q->pp_active = -1;
+ 	for (i = 0; i < AVDQ_COUNT; i++)
+ 		q->frame[i].phase = AVDQ_FREE;
+ }
+ 
+-static int valid(const struct avdq_desc *d, unsigned int idx,
++static int valid(const struct avdq *q, const struct avdq_desc *d, unsigned int idx,
+ 		 unsigned int vp_count, unsigned int codec_mask)
+ {
+ 	uint64_t addr = ((uint64_t)d->program_hi << 32) | d->program_lo;
+@@ -24,6 +25,8 @@ static int valid(const struct avdq_desc *d, unsigned int idx,
+ 	    !d->pp_kick || (d->flags & ~(AVDQ_FLAG_SRAM | AVDQ_FLAG_VP_DONE)) ||
+ 	    d->pp_extra > AVDQ_MAX_PP_EXTRA || (d->pp_extra && !d->pp_cont))
+ 		return 0;
++	if (q->pool && !(q->pool->codec[d->codec] & (1u << d->vp_slot)))
++		return 0;
+ 	if (d->flags & AVDQ_FLAG_SRAM) {
+ 		/* program_lo is the ring write count at the first word. */
+ 		if (d->program_hi)
+@@ -50,7 +53,7 @@ int avdq_submit(struct avdq *q, unsigned int idx, const struct avdq_desc *d,
+ 	f->desc = *d;
+ 	f->pushed = 0;
+ 	f->vp_notified = 0;
+-	f->status = valid(d, idx, vp_count, codec_mask) ? AVDQ_OK : AVDQ_INVALID;
++	f->status = valid(q, d, idx, vp_count, codec_mask) ? AVDQ_OK : AVDQ_INVALID;
+ 	f->phase = f->status ? AVDQ_DONE : AVDQ_PENDING;
+ 	q->order[(q->head + q->count) & (AVDQ_COUNT - 1)] = idx;
+ 	q->count++;
+diff --git a/src/queue.h b/src/queue.h
+index ddd6082..0c631ce 100644
+--- a/src/queue.h
++++ b/src/queue.h
+@@ -3,6 +3,7 @@
+ #define AVD_FW_QUEUE_H
+ 
+ #include <stdint.h>
++#include "pool.h"
+ 
+ #define AVDQ_VERSION 2u
+ #define AVDQ_MAGIC 0x41565131u /* AVQ1 */
+@@ -28,6 +29,7 @@
+ #define AVDQ_FLAG_VP_DONE (1u << 1)
+ #define AVDQ_VP_NOTIFY 0x54540000u
+ #define AVDQ_FEAT_MULTI_KICK 2u
++#define AVDQ_FEAT_MULTI_VP (1u << 3)
+ #define AVDQ_SRAM_RING_OFFSET 0x0u
+ #define AVDQ_SRAM_RING_WORDS 0x1800u
+ #define AVDQ_MAX_PP_EXTRA 255u
+@@ -84,6 +86,7 @@ struct avdq_frame {
+ 	uint32_t phase, pushed, status, vp_notified;
+ };
+ struct avdq {
++	const struct avdq_pool *pool;
+ 	struct avdq_frame frame[AVDQ_COUNT];
+ 	uint32_t order[AVDQ_COUNT], head, count, halted;
+ 	int pp_active;
+@@ -100,7 +103,7 @@ struct avdq_ops {
+ 	int (*complete)(void *cookie, unsigned int idx,
+ 			const struct avdq_frame *f);
+ };
+-void avdq_init(struct avdq *q);
++void avdq_init(struct avdq *q, const struct avdq_pool *pool);
+ int avdq_submit(struct avdq *q, unsigned int idx, const struct avdq_desc *d,
+ 	       unsigned int vp_count, unsigned int codec_mask);
+ void avdq_fault(struct avdq *q);
+diff --git a/tests/build-all.sh b/tests/build-all.sh
+index 00cc618..5dea4fa 100644
+--- a/tests/build-all.sh
++++ b/tests/build-all.sh
+@@ -2,7 +2,7 @@
+ # SPDX-License-Identifier: MIT
+ set -eu
+ cd "$(dirname "$0")/.."
+-for variant in 2:0 3:0 3:1 4:0 5:0 5:1 5:2; do
++for variant in 2:0 3:0 3:1 3:2 4:0 5:0 5:1 5:2; do
+     version=${variant%:*}
+     tier=${variant#*:}
+     make AVD_VER="$version" AVD_TIER="$tier"
+diff --git a/tests/queue-test.c b/tests/queue-test.c
+index c7bf651..b1f5620 100644
+--- a/tests/queue-test.c
++++ b/tests/queue-test.c
+@@ -90,7 +90,7 @@ static void invalid(void)
+ 		struct avdq q;
+ 		struct fake io = {0};
+ 		struct avdq_desc d = descriptor(0x100, 0);
+-		avdq_init(&q);
++		avdq_init(&q, NULL);
+ 		switch (n) {
+ 		case 0: d.magic = 0; break;
+ 		case 1: d.tag++; break;
+@@ -120,7 +120,7 @@ static void invalid(void)
+ 		io.blocked = 0; step(&q, &io);
+ 		assert(!q.count && io.completions == 1);
+ 		assert(io.tags[0] == d.tag && io.statuses[0] == AVDQ_INVALID);
+-		avdq_init(&q);
++		avdq_init(&q, NULL);
+ 	}
+ }
+ static void pipeline(void)
+@@ -130,7 +130,7 @@ static void pipeline(void)
+ 	struct avdq_desc a = descriptor(0x12340000, 0);
+ 	struct avdq_desc b = descriptor(0x56780001, 1);
+ 	struct avdq_desc c = descriptor(0xabcd0002, 0);
+-	avdq_init(&q);
++	avdq_init(&q, NULL);
+ 	assert(!avdq_submit(&q, 0, &a, 12, 15));
+ 	assert(!avdq_submit(&q, 1, &b, 12, 15));
+ 	assert(!avdq_submit(&q, 2, &c, 12, 15));
+@@ -166,7 +166,7 @@ static void vp_ownership(void)
+ 	for (unsigned int depth = 2; depth <= 15; depth++) {
+ 		struct avdq q;
+ 		struct fake io = {0};
+-		avdq_init(&q);
++		avdq_init(&q, NULL);
+ 		for (unsigned int i = 0; i < depth; i++) {
+ 			struct avdq_desc d = descriptor(0x100 | i, 4);
+ 			assert(!avdq_submit(&q, i, &d, 12, 15));
+@@ -194,7 +194,7 @@ static void wrap_and_full(void)
+ 	struct avdq q;
+ 	struct fake io = {0};
+ 	unsigned int round, i;
+-	avdq_init(&q);
++	avdq_init(&q, NULL);
+ 	for (round = 0; round < 3; round++) {
+ 		for (i = 0; i < 16; i++) {
+ 			struct avdq_desc d = descriptor((round << 28) | i, 0);
+@@ -219,7 +219,7 @@ static void partial_program(void)
+ 	struct avdq_desc a = descriptor(0, 0), b = descriptor(1, 1);
+ 	unsigned int i;
+ 	a.program_words = 513;
+-	avdq_init(&q);
++	avdq_init(&q, NULL);
+ 	avdq_submit(&q, 0, &a, 12, 15); avdq_submit(&q, 1, &b, 12, 15);
+ 	io.blocked = 1; step(&q, &io);
+ 	assert(q.frame[0].pushed == 0 && q.frame[1].phase == AVDQ_PENDING);
+@@ -236,7 +236,7 @@ static void arbitrary_indices(void)
+ 	struct avdq q;
+ 	struct fake io = {0};
+ 	struct avdq_desc a = descriptor(0x1007, 0), b = descriptor(0x2003, 0);
+-	avdq_init(&q);
++	avdq_init(&q, NULL);
+ 	assert(!avdq_submit(&q, 7, &a, 12, 15));
+ 	assert(!avdq_submit(&q, 3, &b, 12, 15));
+ 	step(&q, &io); step(&q, &io);
+@@ -249,7 +249,7 @@ static void errors(void)
+ 	struct avdq q;
+ 	struct fake io = {0};
+ 	struct avdq_desc a = descriptor(0, 0), b = descriptor(1, 1);
+-	avdq_init(&q);
++	avdq_init(&q, NULL);
+ 	avdq_submit(&q, 0, &a, 12, 15); avdq_submit(&q, 1, &b, 12, 15);
+ 	io.fail = 1; step(&q, &io);
+ 	assert(q.halted && q.count == 2);
+@@ -259,9 +259,9 @@ static void errors(void)
+ 	avdq_vp_done(&q, 0); avdq_pp_done(&q); /* late events after a fault */
+ 	assert(!io.kicks);
+ 	/* A stray PP DONE (multi-kick frames) is counted, not fatal. */
+-	avdq_init(&q);
++	avdq_init(&q, NULL);
+ 	avdq_pp_done(&q); assert(!q.halted && q.stray_pp == 1);
+-	avdq_init(&q);
++	avdq_init(&q, NULL);
+ 	avdq_vp_done(&q, 0); assert(q.halted);
+ }
+ static void sram_ring(void)
+@@ -274,7 +274,7 @@ static void sram_ring(void)
+ 	d.program_hi = 0;
+ 	d.pp_extra = 3;
+ 	d.pp_cont = 0x2b000000u;
+-	avdq_init(&q);
++	avdq_init(&q, NULL);
+ 	assert(!avdq_submit(&q, 0, &d, 12, 15));
+ 	assert(q.frame[0].phase == AVDQ_PENDING);
+ 	step(&q, &io);
+@@ -286,9 +286,26 @@ static void sram_ring(void)
+ 	avdq_pp_done(&q); avdq_pp_done(&q); step(&q, &io);
+ 	assert(!q.halted && q.stray_pp == 2);
+ }
++static void pools(void)
++{
++	for (unsigned int variant = 0; variant < sizeof(avdq_pools) / sizeof(avdq_pools[0]); variant++) {
++		const struct avdq_pool *pool = &avdq_pools[variant];
++		uint32_t used = 0;
++		for (unsigned int codec = 0; codec < 4; codec++) {
++			assert(!(used & pool->codec[codec])); used |= pool->codec[codec];
++			for (unsigned int vp = 0; vp < 12; vp++) {
++				struct avdq q; struct avdq_desc d = descriptor(0x100, vp);
++				avdq_init(&q, pool); d.codec = codec;
++				assert(!avdq_submit(&q, 0, &d, 12, 15));
++				assert(q.frame[0].status == ((pool->codec[codec] & (1u << vp)) ? AVDQ_OK : AVDQ_INVALID));
++			}
++		}
++		assert(!(used & ~0xfffu));
++	}
++}
+ int main(void)
+ {
+-	vp_ownership(); wire(); sram_ring(); invalid(); pipeline(); wrap_and_full(); partial_program(); arbitrary_indices(); errors();
++	pools(); vp_ownership(); wire(); sram_ring(); invalid(); pipeline(); wrap_and_full(); partial_program(); arbitrary_indices(); errors();
+ 	puts("queue: wire, sram ring, validation, pipeline, backpressure, wrap, tags, errors passed");
+ 	return 0;
+ }
+diff --git a/tests/transport-test.py b/tests/transport-test.py
+index d464c19..ef18572 100644
+--- a/tests/transport-test.py
++++ b/tests/transport-test.py
+@@ -42,6 +42,7 @@ class Transport:
+         self.pp_idx = 4 if self.version == 2 else 9 if self.version == 3 else 13
+         self.packets = {}
+         self.stores, self.kicks, self.notifications, self.fetches = [], [], [], []
++        self.engine_stores = []
+         self.busy, self.full, self.dma_ticks, self.dma_timeout = False, False, 0, False
+         self.clear = set()
+         self.ring_writes = set()
+@@ -50,11 +51,17 @@ class Transport:
+         self.call("avdq_fw_init")
+         self.info = [self.u32(0x10007fc0 + i * 4) for i in range(16)]
+         assert self.info[:4] == [0x41565131, 2, 16, 64]
+-        assert self.info[11:16] == [7, 0, 0x1800, 0, 0]
++        assert self.info[11:16] == [15, 0, 0x1800, 0, 0]
+         expected = 0x0108c000 if self.version == 2 else 0x01090000 if self.version == 3 or (self.version == 5 and self.tier == 0) else 0x01094000 if (self.version == 5 and self.tier == 2) else 0x01092000
+         assert self.info[4] == expected and self.info[8] == self.vps
+         assert self.info[10] == (7 if self.version == 2 or (self.version == 5 and self.tier == 0) else 15)
+         self.ring = self.info[4] + self.info[5]
++        pool = [self.u32(0x10007f80 + i * 4) for i in range(8)]
++        assert pool[:2] == [0x41564d32, 1] and pool[7] == 0
++        self.pool = pool[2:6]
++        assert pool[6] == (15 if (self.version, self.tier) == (5, 2) else 0)
++        expected_pool = [3, 4, 8, 0] if self.version == 2 else [15, 240, 256, 0] if self.version == 3 else [15, 240, 256, 1536] if self.version == 4 else [3, 16, 256, 512] if self.tier == 0 else [15, 240, 256, 3584]
++        assert self.pool == expected_pool
+ 
+     def u32(self, addr):
+         return struct.unpack("<I", self.uc.mem_read(addr, 4))[0]
+@@ -104,6 +111,7 @@ class Transport:
+             self.put(self.dma + 4, 0)
+         if self.decode + self.fifo <= addr < self.decode + self.fifo + self.vps * 4:
+             self.stores.append(value)
++            self.engine_stores.append(((addr - self.decode - self.fifo) // 4, value))
+         if addr == self.decode + self.pp:
+             self.kicks.append(value)
+         if addr == 0x50010060:
+@@ -148,9 +156,9 @@ def ring_write(t, start, words):
+         t.put(0x10000000 + 4 * ((start + i) % RING_WORDS), w)
+ 
+ 
+-def submit_sram(t, idx, tag, start, count, extra=0, cont=0, vp=0):
+-    desc = [0x41565131, tag, 0, vp, start & 0xffffffff, 0, count,
+-            0x2b000400 | idx << 4, 1, 0, 0, 1, extra, cont, 0, 0]
++def submit_sram(t, idx, tag, start, count, extra=0, cont=0, vp=0, codec=0, flags=1):
++    desc = [0x41565131, tag, codec, vp, start & 0xffffffff, 0, count,
++            0x2b000400 | idx << 4, 1, 0, 0, flags, extra, cont, 0, 0]
+     t.uc.mem_write(0x10008000 + idx * 64, struct.pack("<16I", *desc))
+     t.put(0x50010058, t.ring + idx * 64)
+     t.call("irq1")
+@@ -271,9 +279,65 @@ def check(image):
+     print(image.stem + ": legacy IRQs, 64-bit PIODMA, packets, FIFO pressure, VP->PP, outbox, tags, error/reset passed", flush=True)
+ 
+ 
++def check_multi(image):
++    # Every engine of every supported codec, with reverse-order VP DONE.
++    for codec in range(4):
++        t = Transport(image)
++        engines = [vp for vp in range(t.vps) if t.pool[codec] & (1 << vp)]
++        if not engines:
++            continue
++        for idx, vp in enumerate(engines):
++            ring_write(t, idx, [0xc0000000 | idx])
++            submit_sram(t, idx, 0xa0000 | idx, idx, 1, vp=vp, codec=codec, flags=3)
++        t.put(0x10007ffc, len(engines))
++        t.poll(20)
++        assert t.engine_stores == [(vp, 0xc0000000 | idx) for idx, vp in enumerate(engines)]
++        assert not t.kicks and not t.notifications
++        # Hold the outbox while all engine IRQs arrive. Check both routers.
++        t.busy = True
++        for idx in reversed(range(len(engines))):
++            vp = engines[idx]
++            irq = (18 if t.version == 2 else 78) + 5 * vp + 2
++            bank, bit = divmod(irq - 14, 32)
++            assert t.u32(0x50010014 + bank * 4) & (1 << bit)
++            t.call('irq' + str(irq))
++            t.poll()
++            assert t.result(idx)[0] == 1
++            if idx:
++                assert not t.kicks, 'PP bypassed an earlier VP'
++        assert not t.notifications
++        # Drain one tagged VP event per engine without releasing its descriptor.
++        for _ in engines:
++            t.busy = False
++            t.poll()
++        assert t.notifications == [0x54540000 | idx for idx in range(len(engines))]
++        for idx in range(len(engines)):
++            assert t.u32(0x10008038 + idx * 64) == (0xa0000 | idx)
++            assert t.u32(0x1000803c + idx * 64) == 1
++            assert t.result(idx)[0] == 1
++        # PP and full completions stay submission ordered, even with outbox stalls.
++        for idx in range(len(engines)):
++            assert len(t.kicks) == idx + 1
++            assert t.kicks[idx] == 0x2b000400 | idx << 4
++            t.pp_done(); t.poll()
++            assert t.result(idx)[0] == 1
++            t.busy = False; t.poll()
++            assert t.result(idx) == [2, 0, 0xa0000 | idx]
++        assert t.notifications[len(engines):] == [0x54530000 | idx for idx in range(len(engines))]
++    # Reject a codec/engine mismatch, including a tier-0 hole, before feeding.
++    t = Transport(image)
++    bad = next(vp for vp in range(t.vps) if not t.pool[1] & (1 << vp))
++    ring_write(t, 0, [1]); t.put(0x10007ffc, 1)
++    submit_sram(t, 0, 0x10000, 0, 1, vp=bad, codec=1)
++    t.poll(4)
++    assert not t.stores and t.result(0) == [2, 1, 0x10000]
++    print(image.stem + ': every codec VP, reverse VP DONE, tagged per-engine events, ordered PP, outbox stalls and pool rejection passed', flush=True)
++
++
+ if __name__ == "__main__":
+     for arg in sys.argv[1:]:
+         check(pathlib.Path(arg))
+         check_sram(pathlib.Path(arg))
++        check_multi(pathlib.Path(arg))
+     if len(sys.argv) < 2:
+         raise SystemExit("usage: transport-test.py build/avd-fw-*.bin")
+-- 
+2.43.0
+

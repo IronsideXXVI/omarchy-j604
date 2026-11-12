@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 02:30:58 +0000
+Subject: [PATCH] drm/apple: m4: hold J604 panel frames for the grid
+ only at video rates
+
+swap_pace keeps every frame of a 60 or 24 fps video on the 120 Hz grid of
+the J604 panel, which makes video cadence even. A page that keeps the GPU
+busy at about 90 frames per second, with frames 2 or 3 ticks apart, lost
+frames instead (about 70 per second): its 3-tick frames were held for the
+next grid tick and often shown one tick later still.
+
+Keep a smoothed interval between internal-panel swap completions (an idle
+gap counts as 50 ms) and hold frames only while it is at least
+swap_pace_min_us (0644, default 14600, about 3.5 ticks; 0 holds every
+frame), so video and slower content stay on the grid and animation or
+scrolling faster than that is shown as soon as possible, as without
+swap_pace. The interval also appears on the debugfs pace line.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit 8b642ddb3e98b1d91cc92a24a58287dc119d6b1b)
+---
+ drivers/gpu/drm/apple/iomfb_m4.c | 26 +++++++++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index da16a450c8..cca0a312bd 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -190,6 +190,11 @@ module_param(swap_pace, bool, 0644);
+ MODULE_PARM_DESC(swap_pace,
+ 		 "J604: before an internal-panel swap, wait when the frame would otherwise be shown on the panel tick between two 120 Hz refreshes (4.17 ms after one), so it is shown on the 120 Hz grid of the last completion (experimental; default: off)");
+ 
++static unsigned int swap_pace_min_us = 14600;
++module_param(swap_pace_min_us, uint, 0644);
++MODULE_PARM_DESC(swap_pace_min_us,
++		 "J604: with swap_pace, hold frames only while the smoothed interval between swaps is at least this long, us (default 14600, about 3.5 ticks: 60 fps and slower video; 0 = every frame)");
++
+ static unsigned int swap_pace_lead_us;
+ module_param(swap_pace_lead_us, uint, 0644);
+ MODULE_PARM_DESC(swap_pace_lead_us,
+@@ -1126,6 +1131,9 @@ struct dcp_m4_runtime {
+ 	u64 pace_n[6];
+ 	u64 pace_over_sum;
+ 	u64 pace_over_max;
++	/* Smoothed interval between internal-panel swap completions (counter ticks, 1/8 EWMA) */
++	u64 int_prev_done;
++	u64 int_iv_ewma;
+ 	struct dcp_m4_properties *properties;
+ 	struct dcp_m4_timing timing;
+ 	struct dcp_m4_swap_state swap;
+@@ -1756,6 +1764,13 @@ static void dcp_m4_pace_learn(struct dcp_m4_runtime *r)
+ 	u64 start = READ_ONCE(r->int_start_cnt), done = READ_ONCE(r->int_done_cnt), lat;
+ 	u64 e = READ_ONCE(r->pace_e);
+ 
++	if (r->int_prev_done && done > r->int_prev_done) {
++		/* An idle gap counts as 50 ms: a burst after it shows within frames. */
++		u64 iv = min_t(u64, done - r->int_prev_done, div_u64(arch_timer_get_cntfrq(), 20));
++
++		WRITE_ONCE(r->int_iv_ewma, r->int_iv_ewma ? (r->int_iv_ewma * 7 + iv) / 8 : iv);
++	}
++	r->int_prev_done = done;
+ 	if (e) {
+ 		s64 half = div_u64(arch_timer_get_cntfrq(), 240), d = (s64)(done - e);
+ 
+@@ -2667,13 +2682,17 @@ static bool dcp_m4_ext_swap_give_up(struct dcp_m4_runtime *r, struct dcp_m4_swap
+ static unsigned long dcp_m4_swap_pace_us(struct dcp_m4_runtime *r)
+ {
+ 	u64 freq, half, margin, base, now, lead, k, start;
+-	unsigned int lead_us;
++	unsigned int lead_us, min_us;
+ 
+ 	if (!READ_ONCE(swap_pace))
+ 		return 0;
+ 	WRITE_ONCE(r->pace_e, 0);
+ 	r->pace_start = 0;
+ 	freq = arch_timer_get_cntfrq();
++	/* Frames faster than video (animation, scrolling) go as soon as possible. */
++	min_us = READ_ONCE(swap_pace_min_us);
++	if (min_us && READ_ONCE(r->int_iv_ewma) < div_u64(freq * min_us, USEC_PER_SEC))
++		return 0;
+ 	half = div_u64(freq, 240);
+ 	margin = half / 4;
+ 	base = READ_ONCE(r->int_done_cnt);
+@@ -7431,12 +7450,13 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
+ 	if (r) {
+ 		u64 f = arch_timer_get_cntfrq() ?: 1;
+ 
+-		seq_printf(s, "pace waits=%llu nowait=%llu hit=%llu early=%llu late1=%llu late2=%llu over_avg_us=%llu over_max_us=%llu lead_us=%llu\n",
++		seq_printf(s, "pace waits=%llu nowait=%llu hit=%llu early=%llu late1=%llu late2=%llu over_avg_us=%llu over_max_us=%llu lead_us=%llu iv_us=%llu\n",
+ 			   r->pace_n[0], r->pace_n[1], r->pace_n[2], r->pace_n[3], r->pace_n[4],
+ 			   r->pace_n[5],
+ 			   div64_u64(r->pace_over_sum * USEC_PER_SEC, f * (r->pace_n[0] ?: 1)),
+ 			   div64_u64(r->pace_over_max * USEC_PER_SEC, f),
+-			   div64_u64(READ_ONCE(r->int_lat_min) * USEC_PER_SEC, f));
++			   div64_u64(READ_ONCE(r->int_lat_min) * USEC_PER_SEC, f),
++			   div64_u64(READ_ONCE(r->int_iv_ewma) * USEC_PER_SEC, f));
+ 	}
+ 	if (r)
+ 		seq_printf(s, "idle_cache=%u state=%u fences=%u registered=%u entries=%llu\n",
+-- 
+2.43.0
+

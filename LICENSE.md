@@ -5,7 +5,8 @@ This repository collects patches and package recipes for several projects. Each 
 | Path | License | Upstream license file |
 | --- | --- | --- |
 | `kernel/` | GPL-2.0 WITH Linux-syscall-note; device tree sources GPL-2.0+ OR MIT, as marked in each file | `kernel/COPYING`, `kernel/LICENSES/` (copied from the kernel tree) |
-| `m1n1/` | MIT, Copyright The Asahi Linux Contributors | `m1n1/LICENSE` (copied from omacom/m1n1) |
+| `aura/` | MIT for the m1n1 code it is built from (Copyright The Asahi Linux Contributors); GPL-2.0-only for Aurora Silicon's contributions; third-party parts as listed upstream | `aura/LICENSE` (copied from aurora-silicon/aura 54678354) |
+| `avd-fw/` | MIT | `avd-fw/LICENSE` (copied from AsahiLinux/avd-fw v0.1) |
 | `uboot-aurora/` | GPL-2.0+ (U-Boot's default; individual files carry their own SPDX identifiers) | `uboot-aurora/LICENSE` and `uboot-aurora/LICENSE.README` (copied from aurora-silicon/u-boot `Licenses/gpl-2.0.txt` and `Licenses/README`) |
 | `mesa/` | MIT for the main Mesa code; other components as listed in Mesa's license page | `mesa/LICENSE` (copied from omacom/mesa `docs/license.rst`) |
 | `alsa-ucm-conf-aurora/` | BSD-3-Clause, Copyright (c) 2022, Asahi Linux Contributors | `alsa-ucm-conf-aurora/LICENSE` (copied from aurora-silicon/alsa-ucm-conf-asahi `LICENSE.asahi`) |
@@ -19,7 +20,7 @@ This repository collects patches and package recipes for several projects. Each 
 | `omarchy-mac-boot/` | MIT, Copyright (c) David Heinemeier Hansson | `omarchy-mac-boot/LICENSE` (copied from omacom/omarchy-mac-pkgs) |
 | `omarchy-mac/` | MIT, Copyright (c) David Heinemeier Hansson | `omarchy-mac/LICENSE` (copied from omacom/omarchy-mac-pkgs) |
 | `omarchy-dev/`, `omarchy-settings-dev/` | MIT, Copyright (c) David Heinemeier Hansson | `omarchy-dev/LICENSE`, `omarchy-settings-dev/LICENSE` (copied from omacom/omarchy) |
-| `*/recipe/PKGBUILD` | The license of the official recipe each one changes: MIT for the omacom/omarchy-pkgs recipes (`m1n1`, `uboot-aurora`, `mesa`, `alsa-ucm-conf-aurora`, `aurora-audio`, `omarchy-mac-boot`, `omarchy-mac`, `omarchy-dev`, `omarchy-settings-dev`, `libfprint-git`, `libva-v4l2_request-avd`); 0BSD for the Arch Linux `plymouth` recipe; the asahi-alarm/PKGBUILDs recipes (`speakersafetyd`, `asahi-fwextract`, `asahi-scripts`) as published there | the official recipe named on line 3 of each `BASE` |
+| `*/recipe/PKGBUILD` | The license of the official recipe each one changes: MIT for the omacom/omarchy-pkgs recipes (`uboot-aurora`, `avd-fw`, `mesa`, `alsa-ucm-conf-aurora`, `aurora-audio`, `omarchy-mac-boot`, `omarchy-mac`, `omarchy-dev`, `omarchy-settings-dev`, `libfprint-git`, `libva-v4l2_request-avd`); 0BSD for the Arch Linux `plymouth` recipe; the asahi-alarm/PKGBUILDs recipes (`speakersafetyd`, `asahi-fwextract`) and the aurora-silicon/alarm-aurora recipes (`aura`, `asahi-scripts`) as published there | the official recipe named on line 3 of each `BASE` |
 | `README.md`, `LICENSE.md`, `CREDITS.md`, `STATUS.md`, `UPSTREAM.md`, `not-installed/README.md` | MIT | `omarchy-mac/LICENSE` terms |
 
 Every patch keeps its original author. Contributions from other people are redistributed under their projects' licenses.

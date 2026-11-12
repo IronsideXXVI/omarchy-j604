@@ -1,0 +1,85 @@
+From 90a7b8ba7dec217a911884a139835bd48eb97650 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 22:50:45 +1100
+Subject: [PATCH 05/15] avd-fw: encode PIODMA packet lengths in bytes
+
+The transfer-size field counts bytes including the destination header. Cross-check the encoder against existing Tansy HEADER, WORK and SLICE command constants, and have the ARM transport model decode byte size independently.
+[dylan: one co-author trailer of the original message is not reproduced here]
+
+---
+ docs/queue.md           | 8 +++++---
+ src/queue.h             | 3 ++-
+ tests/queue-test.c      | 8 ++++++--
+ tests/transport-test.py | 4 +++-
+ 4 files changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/docs/queue.md b/docs/queue.md
+index b405a86..cd97a30 100644
+--- a/docs/queue.md
++++ b/docs/queue.md
+@@ -127,9 +127,11 @@ packet[1..256]  = up to 256 instruction words; zero-pad final unused words
+ ```
+ 
+ For packet p, firmware fetches from `program_iova + p * 1028`. It writes low/high
+-IOVA at PIODMA `+0x4c/+0x50` and starts command `((payload_words + 1) << 6) | 0x11`
+-at `+0x54`. The size includes the four-byte packet header. It clears stale DONE
+-at `+0x04` before issuing, polls DONE bit 0 without masking interrupts, then
++IOVA at PIODMA `+0x4c/+0x50` and starts command `((payload_words + 1) << 8) | 0x11`
++at `+0x54`. Command bits 31:6 encode the transfer size in **bytes**, including
++the four-byte packet header (payload words plus one, times four). For comparison, the existing
++Tansy `0x5c11` command fetches 368 bytes: a header plus 91 continuation words.
++It clears stale DONE at `+0x04` before issuing, polls DONE bit 0 without masking interrupts, then
+ acknowledges DONE. Polling has a bounded software iteration timeout.
+ 
+ The engine consumes the destination header and places the payload into SRAM
+diff --git a/src/queue.h b/src/queue.h
+index 79ad4c8..6f8cbab 100644
+--- a/src/queue.h
++++ b/src/queue.h
+@@ -40,7 +40,8 @@ static inline uint32_t avdq_packet_header(uint32_t dst)
+ 
+ static inline uint32_t avdq_dma_command(uint32_t words)
+ {
+-	return ((words + 1u) << 6) | 0x11u;
++	/* Command bits 31:6 encode bytes, including the destination header. */
++	return ((words + 1u) << 8) | 0x11u;
+ }
+ 
+ static inline uint32_t avdq_notification(uint32_t tag, unsigned int idx)
+diff --git a/tests/queue-test.c b/tests/queue-test.c
+index 7aad65f..eff37c0 100644
+--- a/tests/queue-test.c
++++ b/tests/queue-test.c
+@@ -70,8 +70,12 @@ static void wire(void)
+ 	assert(avdq_notification(0x12345678u, 8) == 0x54535678u);
+ 	assert(avdq_notification(0xffffffffu, 15) == 0x5453ffffu);
+ 	assert(avdq_notification(0xffffffffu, 15) != AVDQ_FATAL);
+-	assert(avdq_dma_command(1) == 0x91);
+-	assert(avdq_dma_command(256) == 0x4051);
++	assert(avdq_dma_command(1) == 0x211);
++	assert(avdq_dma_command(256) == 0x10111);
++	/* Cross-check byte units against the existing Tansy transport packets. */
++	assert(avdq_dma_command(221) == 0xde11); /* HEADER */
++	assert(avdq_dma_command(11) == 0x0c11); /* WORK */
++	assert(avdq_dma_command(91) == 0x5c11); /* SLICE: 91-word continuation */
+ 	for (i = 0; i < 0x20000; i += 4) {
+ 		uint32_t h = avdq_packet_header(i);
+ 		/* Destination decode from the MIT public emulator. */
+diff --git a/tests/transport-test.py b/tests/transport-test.py
+index 5c66f3b..d148fa5 100644
+--- a/tests/transport-test.py
++++ b/tests/transport-test.py
+@@ -90,7 +90,9 @@ class Transport:
+             source = self.u32(self.dma + 0x4c) | self.u32(self.dma + 0x50) << 32
+             header, payload = self.packets[source]
+             assert header == self.info[7]
+-            assert value == ((len(payload) + 1) << 6) | 0x11
++            size_bytes = (value << 2) >> 8  # public emulator command decode
++            assert size_bytes == 4 * (len(payload) + 1)
++            assert value & 0xff == 0x11
+             self.fetches.append(source)
+             self.uc.mem_write(0x10009000, struct.pack("<" + "I" * len(payload), *payload))
+             self.dma_ticks = 3
+-- 
+2.43.0
+

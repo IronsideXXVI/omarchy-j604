@@ -11,6 +11,7 @@ The J604 runs the stock Omarchy **edge** userland (`omarchy-dev` and `omarchy-se
 | Battery charge threshold | Read the battery's own charge threshold | Not installed. 96827b7: `omarchy/patches/0007` |
 | Custom repository hook | Put the add-custom-repo hook into use | Not installed. 96827b7: `omarchy-settings/patches/0002` |
 | Internal display defaults (`apple-display.lua`) | J604 panel defaults (bit depth, colour management, adaptive sync) | Never published here and not installed. Replaced on 2026-11-09 by the installed panel defaults (10-bit, Display P3; VRR left off) in `omarchy-settings-dev/` 1.4 and `omarchy-mac/` 2.12 |
+| `m1n1-aurora` boot loader (`m1n1/`, last local 1.612) | Stage 1 and Stage 2 boot loader with the J604 patches | Replaced on 2026-11-12 by Aurora's aura (`aura/`). Commit 6c7bda4 holds the last published `m1n1/` |
 | Neural Engine userland rebuilds | Local rebuilds of the ANE packages | Withdrawn; the J604 uses the official edge builds of `omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler` and `omarchy-mac-ml`. Never published here |
 
 Two earlier topics are installed again, in a new form:

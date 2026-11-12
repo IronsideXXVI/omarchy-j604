@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bartosz Nitka <niteria@gmail.com>
+Date: Tue, 10 Nov 2026 00:29:58 +0100
+Subject: [PATCH] soc: apple: mcc: write T8132's cache back for a deep
+ sleep
+
+T8132's system level cache had to stay off: with it on, a deep sleep lost
+its dirty lines and resume died at random points, and nothing known could
+drain it. macOS's own sleep shows how (25G83, traced under the
+hypervisor): on its last CPU, about 6 ms before the commit, it writes 0
+to the same two multicast registers that turn the cache on, and polls
+each plane's status as it counts down to 0.
+
+Do the same at the noirq step, as the T8140 path does. The cache comes
+back on after the sleep or after a refusal, and a write-back that doesn't
+finish refuses the sleep. With that, turn the cache on by default.
+
+Assisted-by: LLM
+Signed-off-by: Bartosz Nitka <niteria@gmail.com>
+(cherry picked from commit 7cf8f3de9bdfed59fcb69844c8b6d0f9bdd4538a)
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/mcc.c | 50 ++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 45 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/soc/apple/mcc.c b/drivers/soc/apple/mcc.c
+index 12d40d05b3..89cd3b807c 100644
+--- a/drivers/soc/apple/mcc.c
++++ b/drivers/soc/apple/mcc.c
+@@ -54,8 +54,9 @@ static void apple_mcc_writel(struct apple_mcc *mcc, unsigned int plane,
+ 	writel(value, mcc->planes[plane] + offset);
+ }
+ 
+-/* T8132 powers the whole cache through two multicast apertures. Unlike
+- * T8140 allocation control, its dirty-data drain is not qualified yet.
++/*
++ * T8132 powers the whole cache through two multicast apertures: 1 turns it on,
++ * and 0 writes it back and turns it off, see apple_mcc_disable_t8132().
+  */
+ static int apple_mcc_enable_t8132(struct apple_mcc *mcc)
+ {
+@@ -93,6 +94,37 @@ static int apple_mcc_enable_t8132(struct apple_mcc *mcc)
+ 	return 0;
+ }
+ 
++/*
++ * As traced on macOS: both multicast apertures to 0, then each plane's status counts down to 0
++ * while it writes back. Nothing allocates from here on, so whatever runs after this goes straight
++ * to memory. A write-back that doesn't finish refuses the sleep, as the data would be lost.
++ */
++static int apple_mcc_disable_t8132(struct apple_mcc *mcc)
++{
++	u32 first, status;
++	ktime_t start;
++	unsigned int p;
++
++	start = ktime_get();
++	first = readl(mcc->planes[0] + 0x1c04);
++	writel(0, mcc->planes[0] + 0x1c1c00);
++	writel(0, mcc->planes[1] + 0x1c1c00);
++	/* Complete both multicast requests before observing per-plane status. */
++	mb();
++	for (p = 0; p < 4; p++) {
++		void __iomem *plane = mcc->planes[p / 2] + (p % 2) * 0x40000;
++
++		if (readl_poll_timeout_atomic(plane + 0x1c04, status, !status, 10,
++					      MCC_FLUSH_TIMEOUT_US)) {
++			dev_err(mcc->dev, "plane %u write-back timed out: status %#x\n", p, status);
++			return -ETIMEDOUT;
++		}
++	}
++	dev_dbg(mcc->dev, "cache written back in %lld us, status was %#x\n",
++		 ktime_us_delta(ktime_get(), start), first);
++	return 0;
++}
++
+ static int apple_mcc_wait_boot_dma(struct device *dev)
+ {
+ 	struct of_phandle_iterator it;
+@@ -247,10 +279,18 @@ static void apple_mcc_shutdown(struct platform_device *pdev)
+ static int apple_mcc_suspend_noirq(struct device *dev)
+ {
+ 	struct apple_mcc *mcc = dev_get_drvdata(dev);
++	int ret;
+ 
+-	if (!pm_suspend_via_firmware() || !mcc->enabled || mcc->retained)
++	if (!pm_suspend_via_firmware() || !mcc->enabled)
+ 		return 0;
+-	apple_mcc_quiesce(mcc);
++	if (mcc->retained) {
++		ret = apple_mcc_disable_t8132(mcc);
++		if (ret)
++			return ret;
++		mcc->enabled = false;
++	} else {
++		apple_mcc_quiesce(mcc);
++	}
+ 	mcc->sleep_disabled = true;
+ 
+ 	return 0;
+@@ -265,7 +305,7 @@ static int apple_mcc_resume_noirq(struct device *dev)
+ 		return 0;
+ 	mcc->sleep_disabled = false;
+ 	/* Only a performance setting: a cache not ready after the wake stays off. */
+-	ret = apple_mcc_enable(mcc);
++	ret = mcc->retained ? apple_mcc_enable_t8132(mcc) : apple_mcc_enable(mcc);
+ 	mcc->enabled = !ret;
+ 	if (ret)
+ 		dev_warn(dev, "system level cache allocation stays off after the sleep: %d\n", ret);
+-- 
+2.43.0
+

@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erik Bourget <erik@ebourget.net>
+Date: Mon, 9 Nov 2026 14:45:03 -0500
+Subject: [PATCH] Bluetooth: bcm4377: restore private PCI windows
+ before J713 resume
+
+Shared radio PERST resets private BAR windows that generic PCI saved
+state does not cover. Restore the windows and subsystem control in
+resume_noirq, before interrupts or UNQUIESCE access the retained device.
+Without this, Wi-Fi returns after sleep but Bluetooth HCI commands time
+out. Restoring the windows permits Read Local Version to complete.
+
+Coordinate QUIESCE and recovery work with the managed host transaction,
+leaving other controllers on their existing path. Cover config failures
+and retained-path skips with a fault-injection fixture.
+
+Signed-off-by: Erik Bourget <erik@ebourget.net>
+[niteria: bcm4377-resume-tests' mocks now have the radio sleep hooks]
+Assisted-by: LLM
+Signed-off-by: Bartosz Nitka <niteria@gmail.com>
+(cherry picked from commit 6745e46a8030efcd28f9d3612344845866e6ebe7)
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ MAINTAINERS                               |   1 +
+ tools/asahi/bcm4377-resume/fixture.h      |  10 ++
+ tools/asahi/bcm4377-sleep-config-tests.c  | 120 ++++++++++++++++++++++
+ tools/asahi/bcm4377-sleep-config-tests.py |  36 +++++++
+ 4 files changed, 167 insertions(+)
+ create mode 100644 tools/asahi/bcm4377-sleep-config-tests.c
+ create mode 100644 tools/asahi/bcm4377-sleep-config-tests.py
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 8781e7c368..3994ea7de4 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2771,6 +2771,7 @@ F:	Documentation/hwmon/macsmc-hwmon.rst
+ F:	Documentation/power/apple-s2idle.rst
+ F:	arch/arm64/boot/dts/apple/
+ F:	drivers/bluetooth/hci_bcm4377.c
++F:	tools/asahi/bcm4377-sleep-config-tests.*
+ F:	drivers/clk/clk-apple-nco.c
+ F:	drivers/cpufreq/apple-soc-cpufreq.c
+ F:	drivers/dma/apple-admac.c
+diff --git a/tools/asahi/bcm4377-resume/fixture.h b/tools/asahi/bcm4377-resume/fixture.h
+index 23e499594f..f1ec5517f9 100644
+--- a/tools/asahi/bcm4377-resume/fixture.h
++++ b/tools/asahi/bcm4377-resume/fixture.h
+@@ -127,6 +127,16 @@ static void *pci_get_drvdata(struct pci_dev *p) {return p->data;}
+ static void iowrite32(int val,void *addr) {if(val==1){assert(!request.fn && !active->resume_work.queued && !active_running);quiesces++;}}
+ static bool fixture_wakeup;
+ static bool device_may_wakeup(struct device *d) { return fixture_wakeup; }
++/* Not a J713 sleep: the radio sleep hooks do nothing, as on every other board. */
++static bool apple_radio_sleep_owned(struct device *d) { return false; }
++static int apple_radio_sleep_endpoint_prepare(struct device *d,
++					      void (*finish)(struct device *))
++{
++	return 0;
++}
++static int apple_radio_sleep_endpoint_suspended(struct device *d) { return 0; }
++static int apple_radio_sleep_endpoint_resume(struct device *d) { return 0; }
++static void apple_radio_sleep_endpoint_resumed(struct device *d, int result) {}
+ static void pci_save_state(struct pci_dev *p) {}
+ static int enable_irq_wake(int irq) { return 0; }
+ static void disable_irq_wake(int irq) {}
+diff --git a/tools/asahi/bcm4377-sleep-config-tests.c b/tools/asahi/bcm4377-sleep-config-tests.c
+new file mode 100644
+index 0000000000..8740031cc6
+--- /dev/null
++++ b/tools/asahi/bcm4377-sleep-config-tests.c
+@@ -0,0 +1,120 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <setjmp.h>
++#include <stdio.h>
++#include <string.h>
++typedef uint32_t u32;
++#define BIT(n) (1U << (n))
++#define dev_info(...) ((void)0)
++struct device {
++	int unused;
++};
++struct pci_dev {
++	int unused;
++};
++struct hardware {
++	u32 bar0_window1, bar0_window2, bar0_core2_window2;
++	bool has_bar0_core2_window2, clear_pciecfg_subsystem_ctrl_bit19;
++};
++struct bcm4377_data {
++	struct pci_dev *pdev;
++	struct hardware *hw;
++};
++static struct pci_dev pci;
++static struct hardware hw = { 0x18002000, 0x18109000, 0x18106000, true, false };
++static struct bcm4377_data data = { &pci, &hw };
++static bool owned, physical, ignore_window;
++static unsigned int ops, writes, fail;
++static u32 cfg[64];
++static jmp_buf fatal;
++static struct pci_dev *to_pci_dev(struct device *d)
++{
++	(void)d;
++	return &pci;
++}
++static struct bcm4377_data *pci_get_drvdata(struct pci_dev *d)
++{
++	(void)d;
++	return &data;
++}
++static bool apple_radio_sleep_owned(struct device *d)
++{
++	(void)d;
++	return owned;
++}
++static bool pm_resume_via_firmware(void)
++{
++	return physical;
++}
++static int pci_read_config_dword(struct pci_dev *d, unsigned int off, u32 *v)
++{
++	(void)d;
++	if (++ops == fail)
++		return 0x87;
++	*v = cfg[off / 4];
++	return 0;
++}
++static int pci_write_config_dword(struct pci_dev *d, unsigned int off, u32 v)
++{
++	(void)d;
++	writes++;
++	if (++ops == fail)
++		return 0x87;
++	if (!(ignore_window && off == 0x80))
++		cfg[off / 4] = v;
++	return 0;
++}
++#define panic(...) longjmp(fatal, 1)
++/* ACTUAL */
++static void fresh(void)
++{
++	owned = physical = true;
++	ignore_window = false;
++	ops = writes = fail = 0;
++	memset(cfg, 0, sizeof(cfg));
++	cfg[0x88 / 4] = BIT(19) | 0x80;
++}
++int main(void)
++{
++	struct device dev = {};
++
++	fresh();
++
++	assert(!bcm4377_resume_noirq(&dev));
++	assert(cfg[0x80 / 4] == hw.bar0_window1);
++	assert(cfg[0x70 / 4] == hw.bar0_window2);
++	assert(cfg[0x74 / 4] == 0x18011000);
++	assert(cfg[0x78 / 4] == hw.bar0_core2_window2);
++	assert(cfg[0x84 / 4] == 0x19000000);
++	assert(cfg[0x88 / 4] == (BIT(19) | BIT(16) | 0x80));
++	unsigned int count = ops;
++
++	fresh();
++
++	owned = false;
++	assert(!bcm4377_resume_noirq(&dev));
++	assert(!ops);
++	fresh();
++	physical = false;
++	assert(!bcm4377_resume_noirq(&dev));
++	assert(!ops);
++	for (unsigned int i = 1; i <= count; i++) {
++		fresh();
++		fail = i;
++		if (!setjmp(fatal)) {
++			bcm4377_resume_noirq(&dev);
++			assert(0);
++		}
++		assert(ops == i);
++	}
++	fresh();
++	ignore_window = true;
++	if (!setjmp(fatal)) {
++		bcm4377_resume_noirq(&dev);
++		assert(0);
++	}
++	puts("PASS: private PCI windows, retained-path skip and restore failures");
++	return 0;
++}
+diff --git a/tools/asahi/bcm4377-sleep-config-tests.py b/tools/asahi/bcm4377-sleep-config-tests.py
+new file mode 100644
+index 0000000000..cdbdf0f7e9
+--- /dev/null
++++ b/tools/asahi/bcm4377-sleep-config-tests.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only OR MIT
++"""Exercise private PCI-window restoration before Bluetooth resume IRQs."""
++
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++source = (root / "drivers/bluetooth/hci_bcm4377.c").read_text()
++functions = []
++for name in ("bcm4377_init_cfg", "bcm4377_resume_noirq"):
++    match = re.search(
++        r"^static int " + name + r"\([^;]+?\{.*?\n\}", source, re.M | re.S
++    )
++    assert match, name
++    functions.append(match.group())
++constants = "\n".join(
++    line for line in source.splitlines() if line.startswith("#define BCM4377_PCIECFG_")
++)
++code = (
++    Path(__file__)
++    .with_suffix(".c")
++    .read_text()
++    .replace("/* ACTUAL */", constants + "\n" + "\n".join(functions))
++)
++with tempfile.TemporaryDirectory() as tmp:
++    c = Path(tmp) / "test.c"
++    c.write_text(code)
++    exe = Path(tmp) / "test"
++    subprocess.run(
++        ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", str(c), "-o", str(exe)],
++        check=True,
++    )
++    subprocess.run([str(exe)], check=True)
+-- 
+2.43.0
+

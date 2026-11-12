@@ -1,0 +1,290 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 22:18:47 +0000
+Subject: [PATCH] omarchy-mac: let the J604's carried Chromium decode 10-bit,
+ AV1 and HEVC
+
+The J604's own Chromium build (local pkgrel N.6xx) lays out the Apple
+Video Decoder's 10-bit (P010) pictures and sizes the decoder's capture
+buffers for the renderer, so VP9 profile 2, AV1 and HEVC no longer
+stall on its V4L2 decoder. The GPU workaround switches that keep those
+codecs in software are only needed for any other Chromium.
+
+Move the browser flags into lib/chromium-flags, which user setup runs
+as before. On the J604 it adds the three switches, once each, only when
+the installed Chromium is not the carried build, and takes them off
+when it is. A chromium pacman hook runs it again after every chromium
+install or upgrade for each login account with a Chromium flags file,
+so the flags follow a switch between the carried and a stock build. It
+is skipped in a chroot and never fails the transaction. Other browsers
+and other Macs are unchanged.
+---
+ omarchy-mac/bin/omarchy-mac-setup-user        | 58 +--------------
+ omarchy-mac/lib/chromium-flags                | 73 +++++++++++++++++++
+ omarchy-mac/lib/chromium-flags-users          | 15 ++++
+ .../91-omarchy-mac-chromium-decoder.hook      | 15 ++++
+ omarchy-mac/test/desktop-setup-test.sh        | 55 ++++++++++++++
+ 5 files changed, 161 insertions(+), 55 deletions(-)
+ create mode 100755 omarchy-mac/lib/chromium-flags
+ create mode 100755 omarchy-mac/lib/chromium-flags-users
+ create mode 100644 omarchy-mac/share/libalpm/hooks/91-omarchy-mac-chromium-decoder.hook
+
+diff --git a/omarchy-mac/bin/omarchy-mac-setup-user b/omarchy-mac/bin/omarchy-mac-setup-user
+index 8bddf67..2cfa158 100755
+--- a/omarchy-mac/bin/omarchy-mac-setup-user
++++ b/omarchy-mac/bin/omarchy-mac-setup-user
+@@ -8,61 +8,9 @@ root=${root%/}
+ omarchy-hw-apple-silicon || exit 0
+ config=${XDG_CONFIG_HOME:-$HOME/.config}
+ 
+-# Chromium-family browsers built with VA-API, such as Brave, pick up the Apple
+-# Video Decoder through libva-v4l2_request-avd and render green frames on some
+-# streams, so each browser's flags turn AcceleratedVideoDecoder off: browsers
+-# decode in software while mpv, ffmpeg and GStreamer keep the decoder. A
+-# second --disable-features would replace the first, so the feature joins an
+-# existing list. Runs again after a browser install writes a fresh flags file.
+-# Browser installs write the flags in ~/.config; Chromium reads them from
+-# XDG_CONFIG_HOME, which may be another directory.
+-#
+-# The 14-inch MacBook Pro with M4 (J604) is the exception for Chromium itself:
+-# its kernel applies the decode requests Chromium sends first (refusing them is
+-# what turned frames green), and Arch Linux ARM's Chromium, built without
+-# VA-API, reaches the decoder through V4L2 only with AcceleratedVideoDecoder
+-# turned on, which such builds leave off. There Chromium's flags take the
+-# feature out of --disable-features, which wins over --enable-features, and add
+-# it to --enable-features. Its other browsers and every other Mac keep the
+-# workaround until the decoder is known to work for them.
+-#
+-# Chromium's V4L2 decoder cannot lay out the decoder's 10-bit (P010)
+-# pictures, so 10-bit VP9, AV1 and HEVC would stall instead of falling back
+-# to software. Its GPU workaround switches keep VP9 profile 2, AV1 (one
+-# profile covers 8 and 10 bit) and HEVC off the hardware decoder: those
+-# play in software, as without the feature, while H.264 and VP9 profile 0
+-# stay on the Apple Video Decoder.
+-chromium_decodes() {
+-  [[ ${1##*/} == chromium-flags.conf ]] && omarchy-hw-match-device-tree apple,j604 2>/dev/null
+-}
+-enable_decoder() {
+-  sed -i -E '/^--disable-features=/{s/([=,])AcceleratedVideoDecoder([,[:space:]]|$)/\1\2/;s/,,/,/;s/=,/=/;s/,([[:space:]]|$)/\1/;/^--disable-features=[[:space:]]*$/d}' "$1"
+-  if grep -q -- '^--enable-features=' "$1"; then
+-    sed -i -E '/^--enable-features=/{/[=,]AcceleratedVideoDecoder([,[:space:]]|$)/!s/^(--enable-features=[^[:space:]]*)/\1,AcceleratedVideoDecoder/;s/^--enable-features=,/--enable-features=/}' "$1"
+-  else
+-    [[ -z $(tail -c1 "$1") ]] || echo >>"$1"
+-    echo '--enable-features=AcceleratedVideoDecoder' >>"$1"
+-  fi
+-  local switch
+-  for switch in --disable_accelerated_vp9_profile2_decode --disable_accelerated_av1_decode --disable_accelerated_hevc_decode; do
+-    grep -Fxq -- "$switch" "$1" || echo "$switch" >>"$1"
+-  done
+-}
+-flag_dirs=("$config")
+-[[ $config == "$HOME/.config" ]] || flag_dirs+=("$HOME/.config")
+-for flags_dir in "${flag_dirs[@]}"; do
+-  for flags in "$flags_dir"/{chromium,chrome,microsoft-edge-stable,brave,brave-origin}-flags.conf; do
+-    [[ -f $flags ]] || continue
+-    if chromium_decodes "$flags"; then
+-      enable_decoder "$flags"
+-    elif grep -q -- '^--disable-features=' "$flags"; then
+-      sed -i -E '/^--disable-features=/{/[=,]AcceleratedVideoDecoder([,[:space:]]|$)/!s/^(--disable-features=[^[:space:]]*)/\1,AcceleratedVideoDecoder/;s/^--disable-features=,/--disable-features=/}' "$flags"
+-    else
+-      [[ -z $(tail -c1 "$flags") ]] || echo >>"$flags"
+-      echo '--disable-features=AcceleratedVideoDecoder' >>"$flags"
+-    fi
+-  done
+-done
++# Browser flags (hardware video decode per browser and Mac): lib/chromium-flags, which a
++# pacman hook also runs after every chromium install or upgrade.
++"$root/usr/lib/omarchy-mac/chromium-flags"
+ 
+ # The microphone mapper: enabled once, keeping every override and a later
+ # disable.
+diff --git a/omarchy-mac/lib/chromium-flags b/omarchy-mac/lib/chromium-flags
+new file mode 100755
+index 0000000..28389e6
+--- /dev/null
++++ b/omarchy-mac/lib/chromium-flags
+@@ -0,0 +1,73 @@
++#!/bin/bash
++# Hardware video decode flags of the user's Chromium-family browsers on Apple
++# Silicon: run by omarchy-mac-setup-user and, for each user with a Chromium flags
++# file, by the chromium pacman hook (lib/chromium-flags-users). Runs as the user.
++set -euo pipefail
++omarchy-hw-apple-silicon || exit 0
++[[ -n ${HOME:-} ]] || HOME=$(getent passwd "$EUID" | cut -d: -f6)
++config=${XDG_CONFIG_HOME:-$HOME/.config}
++
++# Chromium-family browsers built with VA-API, such as Brave, pick up the Apple
++# Video Decoder through libva-v4l2_request-avd and render green frames on some
++# streams, so each browser's flags turn AcceleratedVideoDecoder off: browsers
++# decode in software while mpv, ffmpeg and GStreamer keep the decoder. A
++# second --disable-features would replace the first, so the feature joins an
++# existing list. Runs again after a browser install writes a fresh flags file.
++# Browser installs write the flags in ~/.config; Chromium reads them from
++# XDG_CONFIG_HOME, which may be another directory.
++#
++# The 14-inch MacBook Pro with M4 (J604) is the exception for Chromium itself:
++# its kernel applies the decode requests Chromium sends first (refusing them is
++# what turned frames green), and Arch Linux ARM's Chromium, built without
++# VA-API, reaches the decoder through V4L2 only with AcceleratedVideoDecoder
++# turned on, which such builds leave off. There Chromium's flags take the
++# feature out of --disable-features, which wins over --enable-features, and add
++# it to --enable-features. Its other browsers and every other Mac keep the
++# workaround until the decoder is known to work for them.
++#
++# Every codec the decoder handles stays on it in Chromium, 10-bit included,
++# when the installed Chromium is the J604's carried build (local pkgrel N.6xx),
++# which lays out the decoder's 10-bit (P010) pictures. Any other Chromium
++# (Arch Linux ARM's own, or a newer one before the carried build follows) cannot,
++# and would stall on 10-bit VP9, AV1 and HEVC: it gets Chromium's GPU workaround
++# switches --disable_accelerated_vp9_profile2_decode,
++# --disable_accelerated_av1_decode and --disable_accelerated_hevc_decode, once
++# each, so those streams play in software while H.264 and VP9 profile 0 stay on
++# the decoder. A pacman hook runs this again after every chromium transaction.
++chromium_decodes() {
++  [[ ${1##*/} == chromium-flags.conf ]] && omarchy-hw-match-device-tree apple,j604 2>/dev/null
++}
++chromium_carried() {
++  [[ $(pacman -Q chromium 2>/dev/null) =~ ^chromium\ [^[:space:]]+-[0-9]+\.6[0-9][0-9]$ ]]
++}
++enable_decoder() {
++  local switch
++  sed -i -E '/^--disable-features=/{s/([=,])AcceleratedVideoDecoder([,[:space:]]|$)/\1\2/;s/,,/,/;s/=,/=/;s/,([[:space:]]|$)/\1/;/^--disable-features=[[:space:]]*$/d}' "$1"
++  if grep -q -- '^--enable-features=' "$1"; then
++    sed -i -E '/^--enable-features=/{/[=,]AcceleratedVideoDecoder([,[:space:]]|$)/!s/^(--enable-features=[^[:space:]]*)/\1,AcceleratedVideoDecoder/;s/^--enable-features=,/--enable-features=/}' "$1"
++  else
++    [[ -z $(tail -c1 "$1") ]] || echo >>"$1"
++    echo '--enable-features=AcceleratedVideoDecoder' >>"$1"
++  fi
++  sed -i -E '/^--disable_accelerated_(vp9_profile2|av1|hevc)_decode[[:space:]]*$/d' "$1"
++  chromium_carried && return 0
++  [[ -z $(tail -c1 "$1") ]] || echo >>"$1"
++  for switch in --disable_accelerated_vp9_profile2_decode --disable_accelerated_av1_decode --disable_accelerated_hevc_decode; do
++    echo "$switch" >>"$1"
++  done
++}
++flag_dirs=("$config")
++[[ $config == "$HOME/.config" ]] || flag_dirs+=("$HOME/.config")
++for flags_dir in "${flag_dirs[@]}"; do
++  for flags in "$flags_dir"/{chromium,chrome,microsoft-edge-stable,brave,brave-origin}-flags.conf; do
++    [[ -f $flags ]] || continue
++    if chromium_decodes "$flags"; then
++      enable_decoder "$flags"
++    elif grep -q -- '^--disable-features=' "$flags"; then
++      sed -i -E '/^--disable-features=/{/[=,]AcceleratedVideoDecoder([,[:space:]]|$)/!s/^(--disable-features=[^[:space:]]*)/\1,AcceleratedVideoDecoder/;s/^--disable-features=,/--disable-features=/}' "$flags"
++    else
++      [[ -z $(tail -c1 "$flags") ]] || echo >>"$flags"
++      echo '--disable-features=AcceleratedVideoDecoder' >>"$flags"
++    fi
++  done
++done
+diff --git a/omarchy-mac/lib/chromium-flags-users b/omarchy-mac/lib/chromium-flags-users
+new file mode 100755
+index 0000000..95443c0
+--- /dev/null
++++ b/omarchy-mac/lib/chromium-flags-users
+@@ -0,0 +1,15 @@
++#!/bin/bash
++# Run by the chromium pacman hook as root: re-apply lib/chromium-flags for every
++# account that has a Chromium flags file, as that account, so the decode flags
++# follow the Chromium just installed (carried build or not). Never fails the
++# transaction; an account that cannot be updated is named.
++set -uo pipefail
++omarchy-hw-apple-silicon || exit 0
++while IFS=: read -r user _ uid _ _ home shell; do
++  (( uid >= 1000 && uid < 60000 )) || continue
++  [[ $shell == */nologin || $shell == */false ]] && continue
++  [[ -f $home/.config/chromium-flags.conf ]] || continue
++  runuser -u "$user" -- env HOME="$home" /usr/lib/omarchy-mac/chromium-flags ||
++    echo "omarchy-mac: could not update Chromium's decode flags for $user" >&2
++done < <(getent passwd)
++exit 0
+diff --git a/omarchy-mac/share/libalpm/hooks/91-omarchy-mac-chromium-decoder.hook b/omarchy-mac/share/libalpm/hooks/91-omarchy-mac-chromium-decoder.hook
+new file mode 100644
+index 0000000..4f58426
+--- /dev/null
++++ b/omarchy-mac/share/libalpm/hooks/91-omarchy-mac-chromium-decoder.hook
+@@ -0,0 +1,15 @@
++# Chromium's hardware decode flags follow the installed Chromium: the J604's
++# carried build decodes every codec on the Apple Video Decoder, any other build
++# gets the 10-bit, AV1 and HEVC workaround switches back (lib/chromium-flags).
++[Trigger]
++Type = Package
++Operation = Install
++Operation = Upgrade
++Target = chromium
++
++[Action]
++Description = Updating Chromium's hardware video decode flags...
++When = PostTransaction
++# Skipped in a chroot or an unbooted root, as the Touch ID hook is. Never fails
++# the transaction.
++Exec = /usr/bin/sh -c 'systemd-detect-virt --quiet --chroot || /usr/lib/omarchy-mac/chromium-flags-users || true'
+diff --git a/omarchy-mac/test/desktop-setup-test.sh b/omarchy-mac/test/desktop-setup-test.sh
+index 5ed03fa..1f26556 100644
+--- a/omarchy-mac/test/desktop-setup-test.sh
++++ b/omarchy-mac/test/desktop-setup-test.sh
+@@ -219,6 +219,61 @@ grep -Fxq -- '--disable-features=AcceleratedVideoDecoder' "$HOME/.config/brave-f
+ ! grep -q -- '_decode$' "$HOME/.config/brave-flags.conf" ||
+   fail "the J604's other browsers get no Chromium decoder workarounds"
+ pass 'the J604 keeps Chromium hardware decode on for H.264 and VP9 profile 0, once; other Macs and browsers keep the workaround'
++
++# The J604's carried Chromium (local pkgrel N.6xx) lays out the decoder's
++# 10-bit pictures, so its flags drop the workaround switches; any other
++# Chromium gets them back, once each. A pacman hook re-applies the flags for
++# every account with a Chromium flags file after each chromium transaction.
++cat >"$work/bin/pacman" <<'STUB'
++#!/bin/bash
++[[ $* == '-Q chromium' && -n ${TEST_CHROMIUM:-} ]] || exit 1
++echo "chromium $TEST_CHROMIUM"
++STUB
++chmod +x "$work/bin/pacman"
++printf '%s\n' "$stock" >"$flags"
++TEST_COMPATIBLE='apple,j604' TEST_CHROMIUM=156.0.8078.79-1.607 "$setup_user" "$stage"
++[[ $(<"$flags") == $'--ozone-platform=wayland\n--enable-features=TouchpadOverscrollHistoryNavigation,OverlayScrollbar,AcceleratedVideoDecoder\n--no-default-browser-check' ]] ||
++  fail "the J604's carried Chromium keeps every codec on the decoder" "$(cat "$flags")"
++TEST_COMPATIBLE='apple,j604' TEST_CHROMIUM=156.0.8078.79-1 "$setup_user" "$stage"
++TEST_COMPATIBLE='apple,j604' TEST_CHROMIUM=156.0.8078.79-1 "$setup_user" "$stage"
++[[ $(<"$flags") == $'--ozone-platform=wayland\n--enable-features=TouchpadOverscrollHistoryNavigation,OverlayScrollbar,AcceleratedVideoDecoder\n--no-default-browser-check\n--disable_accelerated_vp9_profile2_decode\n--disable_accelerated_av1_decode\n--disable_accelerated_hevc_decode' ]] ||
++  fail 'a stock Chromium gets the 10-bit, AV1 and HEVC switches back, once each' "$(cat "$flags")"
++TEST_COMPATIBLE='apple,j604' TEST_CHROMIUM=156.0.8078.79-1.607 "$setup_user" "$stage"
++[[ $(<"$flags") == $'--ozone-platform=wayland\n--enable-features=TouchpadOverscrollHistoryNavigation,OverlayScrollbar,AcceleratedVideoDecoder\n--no-default-browser-check' ]] ||
++  fail 'the carried Chromium takes the switches off again' "$(cat "$flags")"
++hook=$stage/usr/share/libalpm/hooks/91-omarchy-mac-chromium-decoder.hook
++[[ -f $hook ]] && grep -Fxq 'Type = Package' "$hook" && grep -Fxq 'Target = chromium' "$hook" &&
++  grep -Fxq 'Operation = Install' "$hook" && grep -Fxq 'Operation = Upgrade' "$hook" &&
++  grep -Fxq 'When = PostTransaction' "$hook" &&
++  grep -Fxq "Exec = /usr/bin/sh -c 'systemd-detect-virt --quiet --chroot || /usr/lib/omarchy-mac/chromium-flags-users || true'" "$hook" ||
++  fail 'the chromium pacman hook re-applies the flags after the transaction, outside a chroot, and never fails it'
++sed 's| /usr/lib/omarchy-mac/chromium-flags | '"$stage"'/usr/lib/omarchy-mac/chromium-flags |' \
++  "$stage/usr/lib/omarchy-mac/chromium-flags-users" >"$work/flags-users-live"
++chmod +x "$work/flags-users-live"
++mkdir -p "$work/svc/.config"
++: >"$work/svc/.config/chromium-flags.conf"
++printf '%s\n' "owner:x:1000:1000::$HOME:/bin/bash" "svc:x:1001:1001::$work/svc:/usr/bin/nologin" \
++  "root:x:0:0::$work/svc:/bin/bash" "nochrome:x:1002:1002::$work/missing:/bin/bash" >"$work/passwd"
++cat >"$work/bin/getent" <<'STUB'
++#!/bin/bash
++[[ $1 == passwd ]] && cat "$TEST_PASSWD"
++STUB
++cat >"$work/bin/runuser" <<'STUB'
++#!/bin/bash
++[[ $1 == -u && $3 == -- ]] || exit 2
++printf 'runuser %s\n' "$2" >>"$CALLS"
++shift 3
++exec "$@"
++STUB
++chmod +x "$work/bin/getent" "$work/bin/runuser"
++printf '%s\n' "$stock" >"$flags"
++: >"$CALLS"
++TEST_PASSWD=$work/passwd TEST_COMPATIBLE='apple,j604' TEST_CHROMIUM=156.0.8078.79-1.607 "$work/flags-users-live" ||
++  fail 'the hook helper never fails the transaction'
++[[ $(<"$CALLS") == 'runuser owner' && $(<"$flags") == $'--ozone-platform=wayland\n--enable-features=TouchpadOverscrollHistoryNavigation,OverlayScrollbar,AcceleratedVideoDecoder\n--no-default-browser-check' && ! -s $work/svc/.config/chromium-flags.conf ]] ||
++  fail 'the hook helper updates, as each owner, only login accounts with a Chromium flags file' "$(cat "$CALLS" "$flags")"
++rm -f "$work/bin/pacman" "$work/bin/getent" "$work/bin/runuser"
++pass "the J604's Chromium flags follow the installed Chromium, also after a chromium upgrade"
+ rm -f "$work/bin/omarchy-hw-match-device-tree"
+ 
+ : >"$CALLS"
+-- 
+2.43.0
+

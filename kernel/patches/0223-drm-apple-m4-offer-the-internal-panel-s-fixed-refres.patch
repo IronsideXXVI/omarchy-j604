@@ -1,0 +1,690 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 00:45:12 +0000
+Subject: [PATCH] drm/apple: m4: offer the internal panel's fixed
+ refresh rates, on request
+
+The J604's display coprocessor lists six timings for its panel. Besides
+the preferred 120 Hz one (ID 2), which the driver adopts from the boot
+loader, it has the fixed rates macOS offers in its display settings:
+60 Hz (ID 3), 48 Hz (ID 4), 59.94 Hz (ID 5), 47.952 Hz (ID 6) and 50 Hz
+(ID 7, with a longer vertical front porch). The connector only ever
+offered the 120 Hz mode.
+
+Read the catalog's promoted timings at startup, read-only and never
+fatal: the qualified active size, colour ID 1 as ID 2 has it, no
+variable range, and a rate from 24 Hz to below ID 2's. With the new
+appledrm.panel_fixed_modes (default off), offer them as modes next to
+the 120 Hz one, which stays preferred, so a desktop that picks the
+preferred mode still runs at 120 Hz.
+
+A commit whose mode is one of them first switches the panel's timing,
+with A364 then A413 (set_digital_out_mode) as the external outputs do.
+The present-time grid, the vblank length and the fixed rate of the
+adaptive-sync request follow the running timing. If the firmware refuses
+a switch, the panel goes back to ID 2, the fixed rates are off until
+reboot, and the commit fails.
+
+Whether this firmware accepts A413 for the panel the boot loader brought
+up is not known: the M4 Pro/Max desktop firmware refuses it before 27.0
+(0x8000000b, no vblank). With the parameter off nothing is sent and
+nothing changes.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp-m4-timing.h | 129 ++++++++++++
+ drivers/gpu/drm/apple/dcp.c           |   2 +-
+ drivers/gpu/drm/apple/iomfb.c         |  21 +-
+ drivers/gpu/drm/apple/iomfb_m4.c      | 292 +++++++++++++++++++++++---
+ drivers/gpu/drm/apple/iomfb_m4.h      |  21 ++
+ 5 files changed, 420 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-m4-timing.h b/drivers/gpu/drm/apple/dcp-m4-timing.h
+index 13af59e83c..5429dc1db1 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-timing.h
++++ b/drivers/gpu/drm/apple/dcp-m4-timing.h
+@@ -241,4 +241,133 @@ done:
+ 	return ret;
+ }
+ 
++/* The most fixed-rate timings kept beside the preferred one. */
++#define DCP_M4_FIXED_MAX 8
++
++/*
++ * One axis of a catalog timing: Active, Total, FrontPorch, SyncWidth,
++ * BackPorch and PreciseSyncRate into @v, with the qualified active size, no
++ * pixel repetition, and porches and sync that add up to the total.
++ */
++static inline int dcp_m4_fixed_axis(const struct dcp_m4_timing_parser *p, unsigned int mode,
++				    const char *name, u32 active, u32 v[6])
++{
++	static const char * const fields[] = {
++		"Active", "Total", "FrontPorch", "SyncWidth", "BackPorch", "PreciseSyncRate",
++	};
++	int axis = dcp_m4_timing_field(p, mode, name, 1);
++
++	if (axis < 0)
++		return axis;
++	for (unsigned int i = 0; i < ARRAY_SIZE(fields); i++) {
++		int index = dcp_m4_timing_field(p, axis, fields[i], 4);
++
++		if (index < 0 || p->token[index].value > U32_MAX)
++			return -EINVAL;
++		v[i] = p->token[index].value;
++	}
++	if (!dcp_m4_timing_equals(p, axis, "PixelRepetition", 4, 0) || v[0] != active ||
++	    (u64)v[0] + v[2] + v[3] + v[4] != v[1] || !v[5])
++		return -EINVAL;
++	return 0;
++}
++
++/* Whether a timing's ColorModes has colour ID 1, 8 bpc RGB SDR, as ID 2's. */
++static inline bool dcp_m4_fixed_colour(const struct dcp_m4_timing_parser *p, unsigned int mode)
++{
++	static const char * const fields[] = {
++		"ID", "Depth", "PixelEncoding", "DynamicRange", "EOTF", "Colorimetry",
++		"SupportsDSC",
++	};
++	static const u32 values[] = { 1, 8, 0, 0, 0, 16, 0 };
++	int colors = dcp_m4_timing_field(p, mode, "ColorModes", 2);
++	unsigned int color;
++
++	if (colors < 0)
++		return false;
++	color = colors + 1;
++	for (unsigned int j = 0; j < p->token[colors].count; j++, color = p->token[color].next) {
++		unsigned int i;
++
++		if (!dcp_m4_timing_equals(p, color, "IsVirtual", 11, 0))
++			continue;
++		for (i = 0; i < ARRAY_SIZE(fields); i++)
++			if (!dcp_m4_timing_equals(p, color, fields[i], 4, values[i]))
++				break;
++		if (i == ARRAY_SIZE(fields))
++			return true;
++	}
++	return false;
++}
++
++/*
++ * The panel's other fixed-rate timings, from its TimingElements catalog:
++ * promoted, not preferred, virtual, interlaced, split or overscanned, timing
++ * type 3, no variable range, the qualified timing's active size, colour ID 1
++ * as ID 2 has it, and a rate from 24 Hz to below ID 2's. On the J604 these
++ * are IDs 3 to 7: 60, 48, 59.94, 47.952 and 50 Hz. Returns how many were
++ * taken into @out, or an error for a catalog that does not parse.
++ */
++static inline int dcp_m4_parse_fixed_timings(const void *data, size_t size,
++					     struct dcp_m4_timing *out, unsigned int max)
++{
++	struct dcp_m4_timing_parser *p;
++	const u32 (*q)[8] = dcp_m4_pf->timing;
++	unsigned int element = 1;
++	int ret, n = 0;
++
++	if (!q)
++		return -ENODEV;
++	if (!data || !out || size < 4 || size > (1U << 20) || get_unaligned_le32(data) != 0xd3)
++		return -EINVAL;
++	p = kzalloc_obj(*p);
++	if (!p)
++		return -ENOMEM;
++	p->data = data;
++	p->size = size;
++	p->pos = 4;
++	ret = dcp_m4_timing_object(p, 0);
++	if (!ret && (p->pos != size || p->token[0].type != 2))
++		ret = -EINVAL;
++	if (ret)
++		goto done;
++	for (unsigned int i = 0; i < p->token[0].count && n < max;
++	     i++, element = p->token[element].next) {
++		int index = dcp_m4_timing_field(p, element, "ID", 4);
++		u32 h[6], v[6];
++		u64 id;
++
++		if (index < 0)
++			continue;
++		id = p->token[index].value;
++		if (id == 2 || id > U32_MAX ||
++		    !dcp_m4_timing_equals(p, element, "IsPromoted", 11, 1) ||
++		    !dcp_m4_timing_equals(p, element, "IsPreferred", 11, 0) ||
++		    !dcp_m4_timing_equals(p, element, "IsVirtual", 11, 0) ||
++		    !dcp_m4_timing_equals(p, element, "IsInterlaced", 11, 0) ||
++		    !dcp_m4_timing_equals(p, element, "IsSplit", 11, 0) ||
++		    !dcp_m4_timing_equals(p, element, "IsOverscanned", 11, 0) ||
++		    !dcp_m4_timing_equals(p, element, "TimingType", 4, 3) ||
++		    !dcp_m4_timing_equals(p, element, "MinimumVariableRefreshRate", 4, 0) ||
++		    !dcp_m4_timing_equals(p, element, "MaximumVariableRefreshRate", 4, 0) ||
++		    dcp_m4_fixed_axis(p, element, "HorizontalAttributes", q[0][0], h) ||
++		    dcp_m4_fixed_axis(p, element, "VerticalAttributes", q[1][0], v) ||
++		    v[5] < (24U << 16) || v[5] >= q[1][5] || !dcp_m4_fixed_colour(p, element))
++			continue;
++		out[n++] = (struct dcp_m4_timing) {
++			.id = id, .color_id = 1,
++			.hdisplay = h[0], .hsync_start = h[0] + h[2],
++			.hsync_end = h[0] + h[2] + h[3], .htotal = h[1],
++			.vdisplay = v[0], .vsync_start = v[0] + v[2],
++			.vsync_end = v[0] + v[2] + v[3], .vtotal = v[1],
++			.clock_khz = (((u64)h[1] * v[1] * v[5] >> 16) + 500) / 1000,
++			.refresh_16_16 = v[5],
++		};
++	}
++	ret = n;
++done:
++	kfree(p);
++	return ret;
++}
++
+ #endif
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index 73ad3abd39..3286c50c2a 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -1807,7 +1807,7 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
+ 		if (ret)
+ 			return ret;
+ 		ret = iomfb_m4_get_mode(dcp, &mode);
+-		return ret ? ret : drm_mode_equal(&crtc_state->mode, &mode) ? 0 : -EINVAL;
++		return ret ? ret : iomfb_m4_mode_ok(dcp, &crtc_state->mode) ? 0 : -EINVAL;
+ 	}
+ 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
+ 		return iomfb_v26_6_atomic_check(dcp, crtc, commit);
+diff --git a/drivers/gpu/drm/apple/iomfb.c b/drivers/gpu/drm/apple/iomfb.c
+index 304bb0840c..08f7d2b964 100644
+--- a/drivers/gpu/drm/apple/iomfb.c
++++ b/drivers/gpu/drm/apple/iomfb.c
+@@ -2305,21 +2305,17 @@ int dcp_get_modes(struct drm_connector *connector)
+ 	}
+ 	dcp = platform_get_drvdata(pdev);
+ 	if (iomfb_is_m4(dcp)) {
+-		struct drm_display_mode fixed;
++		int count = iomfb_m4_get_modes(dcp, connector);
+ 
+-		if (iomfb_m4_get_mode(dcp, &fixed))
+-			return 0;
+-		mode = drm_mode_duplicate(dev, &fixed);
+-		if (!mode)
++		if (count <= 0)
+ 			return 0;
+-		drm_mode_probed_add(connector, mode);
+ 		of_property_read_u32(dcp->dev->of_node, "apple,panel-width-mm",
+ 				     &connector->display_info.width_mm);
+ 		of_property_read_u32(dcp->dev->of_node, "apple,panel-height-mm",
+ 				     &connector->display_info.height_mm);
+ 		if (iomfb_m4_panel_edid(dcp, connector))
+ 			dev_warn_once(dcp->dev, "panel EDID publication failed\n");
+-		return 1;
++		return count;
+ 	}
+ 	modes = dcp_modes_snapshot(dcp, apple_connector, &nr_modes);
+ 
+@@ -3031,12 +3027,8 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
+ 	if (!pdev)
+ 		return MODE_ERROR;
+ 	dcp = platform_get_drvdata(pdev);
+-	if (iomfb_is_m4(dcp)) {
+-		struct drm_display_mode fixed;
+-
+-		return !iomfb_m4_get_mode(dcp, &fixed) && drm_mode_equal(mode, &fixed) ?
+-			MODE_OK : MODE_BAD;
+-	}
++	if (iomfb_is_m4(dcp))
++		return iomfb_m4_mode_ok(dcp, mode) ? MODE_OK : MODE_BAD;
+ 
+ 	scoped_guard(mutex, &dcp->modes_lock)
+ 		if (!dcp_modes_for_connector(dcp, apple_connector))
+@@ -3690,6 +3682,9 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
+ 		if (!new || !new->active)
+ 			return;
+ 		ret = iomfb_m4_error(dcp);
++		/* A mode of another fixed rate: the panel's timing first. */
++		if (!ret)
++			ret = iomfb_m4_atomic_mode(dcp, &new->mode);
+ 		if (!ret) {
+ 			iomfb_m4_atomic_hdr(dcp, crtc, commit);
+ 			iomfb_m4_atomic_vrr(dcp, new->vrr_enabled);
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 6874b209f4..0e65fe4bc4 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -226,6 +226,11 @@ module_param(panel_media_hz, uint, 0644);
+ MODULE_PARM_DESC(panel_media_hz,
+ 		 "J604: mediaTargetRate of the internal panel's adaptive-sync request, Hz (experimental; default 0 = none; at most 120; applies from the next commit)");
+ 
++static bool panel_fixed_modes;
++module_param(panel_fixed_modes, bool, 0644);
++MODULE_PARM_DESC(panel_fixed_modes,
++		 "J604: also offer the internal panel's fixed refresh rates from its timing catalog (60, 59.94, 50, 48 and 47.95 Hz) as modes; the 120 Hz mode stays preferred, and a refused switch turns them off until reboot (experimental; default: off; applies from the next probe)");
++
+ static unsigned int panel_media_word = 2;
+ module_param(panel_media_word, uint, 0644);
+ MODULE_PARM_DESC(panel_media_word,
+@@ -435,6 +440,9 @@ struct iomfb_m4 {
+ 	/* The minimum when the panel EDID was first published, 0: no VRR offered. */
+ 	u32 vrr_offered_hz;
+ 	bool vrr_latched;
++	/* panel_fixed_modes: a switch was refused (off until reboot), and switches made */
++	bool fixed_failed;
++	u64 fixed_switches;
+ 	/*
+ 	 * Bright surroundings (panel_boost_nits): the ADT ceiling (supports-aurora,
+ 	 * aurora-maximum-nits; 0: none) and the one the last carried level used.
+@@ -1166,6 +1174,14 @@ struct dcp_m4_runtime {
+ 	u64 int_last_iv;
+ 	struct dcp_m4_properties *properties;
+ 	struct dcp_m4_timing timing;
++	/*
++	 * The panel's other fixed-rate timings (panel_fixed_modes), set once
++	 * at startup, and the timing it runs: ID and rate (16.16 Hz).
++	 */
++	struct dcp_m4_timing fixed[DCP_M4_FIXED_MAX];
++	u32 fixed_count;
++	u32 live_id;
++	u32 live_refresh_16_16;
+ 	struct dcp_m4_swap_state swap;
+ 	/* EDR words for the next primary present (dcp->lock), NULL: none */
+ 	const struct dcp_m4_edr_words *edr;
+@@ -2747,6 +2763,18 @@ static bool dcp_m4_ext_swap_give_up(struct dcp_m4_runtime *r, struct dcp_m4_swap
+  */
+ 
+ 
++/* The running timing's rate, 16.16 Hz. */
++static u32 dcp_m4_live_rate(struct dcp_m4_runtime *r)
++{
++	return READ_ONCE(r->live_refresh_16_16) ?: r->timing.refresh_16_16;
++}
++
++/* Whether the panel runs a timing other than the adopted one. */
++static bool dcp_m4_live_fixed(struct dcp_m4_runtime *r)
++{
++	return READ_ONCE(r->live_id) != r->timing.id;
++}
++
+ /*
+  * swap_pace: internal-panel swaps carry "as soon as possible" timing words,
+  * so the panel shows a frame at the first 4.17 ms tick it can make. Measured
+@@ -2764,7 +2792,8 @@ static unsigned long dcp_m4_swap_pace_us(struct dcp_m4_runtime *r)
+ 	unsigned int lead_us, min_us;
+ 
+ 	r->int_gated = false;
+-	if (!READ_ONCE(swap_pace))
++	/* The 120 Hz grid is the adopted timing's only (panel_fixed_modes). */
++	if (!READ_ONCE(swap_pace) || dcp_m4_live_fixed(r))
+ 		return 0;
+ 	WRITE_ONCE(r->pace_e, 0);
+ 	r->pace_start = 0;
+@@ -2836,6 +2865,8 @@ static u64 dcp_m4_swap_target(struct dcp_m4_runtime *r)
+ 	now = __arch_counter_get_cntpct();
+ 	if (mode == 1)
+ 		return now;
++	if (dcp_m4_live_fixed(r))
++		return 0;
+ 	freq = arch_timer_get_cntfrq();
+ 	base = READ_ONCE(r->int_done_cnt);
+ 	period = div_u64(freq, 120);
+@@ -3131,7 +3162,7 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
+ 	ktime_t start = 0;
+ 	unsigned long flags;
+ 	u8 output[4];
+-	int ret, slot;
++	int ret, slot, fixed;
+ 
+ 	ret = -EBUSY;
+ 	if (!READ_ONCE(dcp->ready) || READ_ONCE(dcp->error) || dcp->startup_started)
+@@ -3216,6 +3247,17 @@ static int dcp_m4_startup(struct iomfb_m4 *dcp)
+ 					       r->properties->raw[slot].size, &r->timing);
+ 	if (ret)
+ 		goto failed;
++	r->live_id = r->timing.id;
++	r->live_refresh_16_16 = r->timing.refresh_16_16;
++	/* The other fixed rates, for panel_fixed_modes: read only, never fatal. */
++	slot = dcp_m4_raw_slot(r->properties, 0, "TimingElements", false);
++	fixed = slot < 0 ? slot :
++		dcp_m4_parse_fixed_timings(r->properties->raw[slot].data,
++					   r->properties->raw[slot].size, r->fixed,
++					   ARRAY_SIZE(r->fixed));
++	r->fixed_count = fixed > 0 ? fixed : 0;
++	dev_info(dev, "panel catalog: %d fixed-rate timings beside ID %u (panel_fixed_modes)\n",
++		 fixed, r->timing.id);
+ 	ret = dcp_m4_runtime_health(r);
+ 	if (ret)
+ 		goto failed;
+@@ -3760,6 +3802,21 @@ out:
+ 	return ret;
+ }
+ 
++/* The DRM mode of a catalog timing. */
++static void dcp_m4_timing_mode(const struct dcp_m4_timing *t, struct drm_display_mode *mode,
++			       bool preferred)
++{
++	*mode = (struct drm_display_mode) {
++		.clock = t->clock_khz,
++		.hdisplay = t->hdisplay, .hsync_start = t->hsync_start,
++		.hsync_end = t->hsync_end, .htotal = t->htotal,
++		.vdisplay = t->vdisplay, .vsync_start = t->vsync_start,
++		.vsync_end = t->vsync_end, .vtotal = t->vtotal,
++		.type = DRM_MODE_TYPE_DRIVER | (preferred ? DRM_MODE_TYPE_PREFERRED : 0),
++	};
++	drm_mode_set_name(mode);
++}
++
+ int iomfb_m4_get_mode(struct apple_dcp *owner, struct drm_display_mode *mode)
+ {
+ 	struct iomfb_m4 *dcp = owner->v26_6;
+@@ -3770,18 +3827,194 @@ int iomfb_m4_get_mode(struct apple_dcp *owner, struct drm_display_mode *mode)
+ 	if (READ_ONCE(dcp->error))
+ 		return READ_ONCE(dcp->error);
+ 	t = &dcp->runtime->timing;
+-	*mode = (struct drm_display_mode) {
+-		.clock = t->clock_khz,
+-		.hdisplay = t->hdisplay, .hsync_start = t->hsync_start,
+-		.hsync_end = t->hsync_end, .htotal = t->htotal,
+-		.vdisplay = t->vdisplay, .vsync_start = t->vsync_start,
+-		.vsync_end = t->vsync_end, .vtotal = t->vtotal,
+-		.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
+-	};
+-	drm_mode_set_name(mode);
++	dcp_m4_timing_mode(t, mode, true);
+ 	return 0;
+ }
+ 
++/*
++ * The catalog timing a mode asks for: the adopted one (ID 2) exactly as
++ * before, or with panel_fixed_modes one of the other fixed rates, by its
++ * timings and clock (to 1 kHz). The running one stays acceptable after the parameter
++ * goes off, so a commit that keeps it passes. NULL: none.
++ */
++static const struct dcp_m4_timing *iomfb_m4_mode_timing(struct iomfb_m4 *dcp,
++							const struct drm_display_mode *mode)
++{
++	struct dcp_m4_runtime *r = dcp->runtime;
++	struct drm_display_mode m;
++	bool allowed;
++
++	/* Pairs with the release store of r->done in startup: r->fixed is set. */
++	if (!r || !smp_load_acquire(&r->done))
++		return NULL;
++	dcp_m4_timing_mode(&r->timing, &m, true);
++	if (drm_mode_equal(mode, &m))
++		return &r->timing;
++	allowed = READ_ONCE(panel_fixed_modes) && !READ_ONCE(dcp->fixed_failed);
++	for (unsigned int i = 0; i < r->fixed_count; i++) {
++		if (!allowed && r->fixed[i].id != READ_ONCE(r->live_id))
++			continue;
++		dcp_m4_timing_mode(&r->fixed[i], &m, false);
++		/* A modeline gives the clock in MHz: take it to within 1 kHz. */
++		if (drm_mode_match(mode, &m, DRM_MODE_MATCH_TIMINGS) &&
++		    abs(mode->clock - m.clock) <= 1)
++			return &r->fixed[i];
++	}
++	return NULL;
++}
++
++bool iomfb_m4_mode_ok(struct apple_dcp *owner, const struct drm_display_mode *mode)
++{
++	struct iomfb_m4 *dcp = owner->v26_6;
++
++	return dcp && !dcp->external && !READ_ONCE(dcp->error) &&
++	       iomfb_m4_mode_timing(dcp, mode);
++}
++
++/*
++ * The connector's modes: the adopted timing, preferred, then with
++ * panel_fixed_modes the other fixed rates (and the running one in any case).
++ */
++int iomfb_m4_get_modes(struct apple_dcp *owner, struct drm_connector *connector)
++{
++	struct iomfb_m4 *dcp = owner->v26_6;
++	struct drm_display_mode base, *mode;
++	struct dcp_m4_runtime *r;
++	bool allowed;
++	int n = 0;
++
++	if (iomfb_m4_get_mode(owner, &base))
++		return 0;
++	mode = drm_mode_duplicate(connector->dev, &base);
++	if (!mode)
++		return 0;
++	drm_mode_probed_add(connector, mode);
++	n++;
++	r = dcp->runtime;
++	allowed = READ_ONCE(panel_fixed_modes) && !READ_ONCE(dcp->fixed_failed);
++	for (unsigned int i = 0; i < r->fixed_count; i++) {
++		if (!allowed && r->fixed[i].id != READ_ONCE(r->live_id))
++			continue;
++		dcp_m4_timing_mode(&r->fixed[i], &base, false);
++		mode = drm_mode_duplicate(connector->dev, &base);
++		if (!mode)
++			break;
++		drm_mode_probed_add(connector, mode);
++		n++;
++	}
++	return n;
++}
++
++/* A364: the firmware's record of a timing and colour pair. */
++struct dcp_m4_mode_info_req {
++	u8 mode[0x64];
++	u8 mode_null;
++	u8 padding0[3];
++	__le64 opaque;
++	__le32 timing_mode_id;
++	__le32 color_mode_id;
++	u8 result_null;
++	u8 padding1[3];
++} __packed;
++static_assert(sizeof(struct dcp_m4_mode_info_req) == 0x7c);
++
++#define DCP_M4_MODE_INFO_REPLY 0x74
++
++/* A364 then A413 on the internal panel, under dcp->lock: an error or the status. */
++static int dcp_m4_int_set_mode(struct iomfb_m4 *dcp, const struct dcp_m4_timing *t,
++			       u32 *status)
++{
++	struct dcp_m4_runtime *r = dcp->runtime;
++	struct dcp_m4_mode_info_req info;
++	struct {
++		__le32 color_mode_id;
++		__le32 timing_mode_id;
++	} __packed mode = { cpu_to_le32(t->color_id), cpu_to_le32(t->id) };
++	u8 reply[DCP_M4_MODE_INFO_REPLY], out[4];
++	int ret;
++
++	lockdep_assert_held(&dcp->lock);
++	*status = 0;
++	if (!r || dcp->powered_off || dcp->gated)
++		return -EBUSY;
++	ret = dcp_m4_runtime_live(r);
++	if (ret)
++		return ret;
++	memset(&info, 0xaa, sizeof(info));
++	memset(info.mode, 0, sizeof(info.mode));
++	info.mode_null = 0;
++	info.timing_mode_id = cpu_to_le32(t->id);
++	info.color_mode_id = cpu_to_le32(t->color_id);
++	info.result_null = 0;
++	memset(info.padding1, 0, sizeof(info.padding1));
++	memset(reply, 0, sizeof(reply));
++	/*
++	 * The default call wait: 5 s re-armed by each firmware message, at most
++	 * 15 s, past the about 8 s the firmware itself gives a modeset.
++	 */
++	ret = dcp_m4_runtime_call(r, 364, false, &info, sizeof(info), reply, sizeof(reply));
++	if (!ret) {
++		memset(out, 0, sizeof(out));
++		ret = dcp_m4_runtime_call(r, 413, false, &mode, sizeof(mode), out, sizeof(out));
++		*status = get_unaligned_le32(out);
++	}
++	dev_info(dcp->dev, "panel timing %u (%u.%03u Hz): A364/A413 %d, status %#x (panel_fixed_modes)\n",
++		 t->id, t->refresh_16_16 >> 16,
++		 (u32)(((u64)(t->refresh_16_16 & 0xffff) * 1000) >> 16), ret, *status);
++	return ret;
++}
++
++/*
++ * Before a commit's present: switch the panel to the timing of the commit's
++ * mode when it is not the running one (panel_fixed_modes). A refused switch
++ * goes back to the adopted timing, turns the fixed rates off until reboot and
++ * fails the commit.
++ */
++int iomfb_m4_atomic_mode(struct apple_dcp *owner, const struct drm_display_mode *mode)
++{
++	struct iomfb_m4 *dcp = owner->v26_6;
++	const struct dcp_m4_timing *want;
++	struct dcp_m4_runtime *r;
++	u32 status;
++	int ret;
++
++	if (!dcp || dcp->external)
++		return 0;
++	r = dcp->runtime;
++	/* Pairs with the release store of r->done in startup. */
++	if (!r || !smp_load_acquire(&r->done))
++		return 0;
++	want = iomfb_m4_mode_timing(dcp, mode);
++	if (!want)
++		return -EINVAL;
++	if (want->id == READ_ONCE(r->live_id))
++		return 0;
++	mutex_lock(&dcp->lock);
++	ret = dcp_m4_int_set_mode(dcp, want, &status);
++	if (!ret && !status) {
++		WRITE_ONCE(r->live_refresh_16_16, want->refresh_16_16);
++		WRITE_ONCE(r->live_id, want->id);
++		dcp->fixed_switches++;
++		mutex_unlock(&dcp->lock);
++		return 0;
++	}
++	WRITE_ONCE(dcp->fixed_failed, true);
++	dev_err(dcp->dev, "panel timing %u refused (%d, status %#x): fixed rates off until reboot\n",
++		want->id, ret, status);
++	if (r->live_id != r->timing.id && ret != -EBUSY) {
++		ret = dcp_m4_int_set_mode(dcp, &r->timing, &status);
++		if (!ret && !status) {
++			WRITE_ONCE(r->live_refresh_16_16, r->timing.refresh_16_16);
++			WRITE_ONCE(r->live_id, r->timing.id);
++		} else {
++			dev_err(dcp->dev, "panel timing %u not restored (%d, status %#x)\n",
++				r->timing.id, ret, status);
++		}
++	}
++	mutex_unlock(&dcp->lock);
++	return -EIO;
++}
++
+ /*
+  * The panel EDID: make, model, size and the colour target. The DCP gives
+  * none for the internal panel, so a compositor sees a nameless display with
+@@ -4026,14 +4259,17 @@ void iomfb_m4_atomic_vrr(struct apple_dcp *owner, bool vrr_enabled)
+ 	struct iomfb_m4 *dcp = owner->v26_6;
+ 	unsigned int hz = READ_ONCE(panel_vrr_min_hz);
+ 	bool adaptive = vrr_enabled || READ_ONCE(panel_adaptive);
+-	u32 media = min_t(u32, READ_ONCE(panel_media_hz), DCP_M4_VRR_FIXED_HZ) << 16;
+-	u32 min;
++	u32 media, min, fixed;
+ 
+ 	if (!dcp || dcp->external || !READ_ONCE(dcp->vrr_offered_hz))
+ 		return;
+ 	mutex_lock(&dcp->lock);
+-	/* panel_vrr_min_hz written 0 at run time holds the panel at 120 Hz. */
+-	min = (adaptive && hz ? hz : DCP_M4_VRR_FIXED_HZ) << 16;
++	/* The fixed rate is the running timing's: 120 Hz unless panel_fixed_modes. */
++	fixed = dcp->runtime && dcp_m4_live_fixed(dcp->runtime) ?
++		dcp_m4_live_rate(dcp->runtime) : DCP_M4_VRR_FIXED_HZ << 16;
++	media = min_t(u32, READ_ONCE(panel_media_hz) << 16, fixed) & ~0xffffU;
++	/* panel_vrr_min_hz written 0 at run time holds the panel at its fixed rate. */
++	min = adaptive && hz && (hz << 16) < fixed ? hz << 16 : fixed;
+ 	if ((dcp->vrr_min_sent || (adaptive && hz) || media) &&
+ 	    (min != dcp->vrr_min_sent || media != dcp->vrr_media_sent) &&
+ 	    dcp->runtime && !dcp->powered_off &&
+@@ -5418,21 +5654,6 @@ static void iomfb_m4_gate_work(struct work_struct *work)
+ 	mutex_unlock(&dcp->lock);
+ }
+ 
+-/* A364: the firmware's record of a timing and colour pair. */
+-struct dcp_m4_mode_info_req {
+-	u8 mode[0x64];
+-	u8 mode_null;
+-	u8 padding0[3];
+-	__le64 opaque;
+-	__le32 timing_mode_id;
+-	__le32 color_mode_id;
+-	u8 result_null;
+-	u8 padding1[3];
+-} __packed;
+-static_assert(sizeof(struct dcp_m4_mode_info_req) == 0x7c);
+-
+-#define DCP_M4_MODE_INFO_REPLY 0x74
+-
+ /*
+  * The colour element of a timing: RGB with the SDR gamma EOTF, not virtual,
+  * not unsafe for the timing, at 8 bpc if the timing lists it as needing DSC;
+@@ -7415,7 +7636,7 @@ int iomfb_m4_resume(struct apple_dcp *owner)
+ /* One vblank of the running mode in ns; 120 Hz until the timing is known. */
+ static u64 iomfb_m4_vblank_ns(struct iomfb_m4 *dcp)
+ {
+-	u32 rate = dcp->runtime ? dcp->runtime->timing.refresh_16_16 : 0;
++	u32 rate = dcp->runtime ? dcp_m4_live_rate(dcp->runtime) : 0;
+ 
+ 	if (rate < (24U << 16) || rate > (240U << 16))
+ 		return div_u64(NSEC_PER_SEC, 120);
+@@ -7573,6 +7794,15 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
+ 			   dcp->xdr.min_cap, dcp->xdr_asked, dcp->xdr_last_us,
+ 			   dcp->runtime ? dcp->runtime->int_lost.given_up : 0,
+ 			   dcp->runtime ? dcp->runtime->int_lost.late : 0, !!dcp->lost_fb);
++	if (dcp->runtime && dcp->runtime->fixed_count) {
++		bool offered = READ_ONCE(panel_fixed_modes) && !READ_ONCE(dcp->fixed_failed);
++
++		seq_printf(s, "fixed modes=%u offered=%c live_id=%u live_mhz=%llu failed=%u switches=%llu\n",
++			   dcp->runtime->fixed_count, offered ? 'Y' : 'N',
++			   READ_ONCE(dcp->runtime->live_id),
++			   ((u64)dcp_m4_live_rate(dcp->runtime) * 1000) >> 16,
++			   READ_ONCE(dcp->fixed_failed), dcp->fixed_switches);
++	}
+ 	if (READ_ONCE(panel_vrr_min_hz))
+ 		seq_printf(s, "vrr min_hz=%u min_sent=%#x media_sent=%#x calls=%llu status=%#x\n",
+ 			   READ_ONCE(panel_vrr_min_hz), dcp->vrr_min_sent, dcp->vrr_media_sent,
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.h b/drivers/gpu/drm/apple/iomfb_m4.h
+index 635362a475..2e1c3ffcab 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.h
++++ b/drivers/gpu/drm/apple/iomfb_m4.h
+@@ -65,6 +65,10 @@ int iomfb_m4_adopt_external(struct apple_dcp *dcp);
+ int iomfb_m4_start(struct apple_dcp *dcp, struct device *scanout);
+ int iomfb_m4_activate(struct apple_dcp *dcp);
+ int iomfb_m4_get_mode(struct apple_dcp *dcp, struct drm_display_mode *mode);
++/* The internal panel's modes; the fixed rates only with appledrm.panel_fixed_modes. */
++int iomfb_m4_get_modes(struct apple_dcp *dcp, struct drm_connector *connector);
++bool iomfb_m4_mode_ok(struct apple_dcp *dcp, const struct drm_display_mode *mode);
++int iomfb_m4_atomic_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode);
+ int iomfb_m4_panel_edid(struct apple_dcp *dcp, struct drm_connector *connector);
+ /* EDR on the internal panel: opt-in (appledrm.panel_edr), see iomfb_m4.c. */
+ bool iomfb_m4_panel_edr_requested(struct apple_dcp *dcp);
+@@ -135,6 +139,23 @@ static inline int iomfb_m4_get_mode(struct apple_dcp *dcp, struct drm_display_mo
+ {
+ 	return -ENODEV;
+ }
++
++static inline int iomfb_m4_get_modes(struct apple_dcp *dcp, struct drm_connector *connector)
++{
++	return 0;
++}
++
++static inline bool iomfb_m4_mode_ok(struct apple_dcp *dcp, const struct drm_display_mode *mode)
++{
++	return false;
++}
++
++static inline int iomfb_m4_atomic_mode(struct apple_dcp *dcp,
++				       const struct drm_display_mode *mode)
++{
++	return 0;
++}
++
+ static inline int iomfb_m4_panel_edid(struct apple_dcp *dcp, struct drm_connector *connector)
+ {
+ 	return 0;
+-- 
+2.43.0
+

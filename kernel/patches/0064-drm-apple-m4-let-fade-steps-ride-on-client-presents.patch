@@ -1,0 +1,395 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 13:17:33 +0000
+Subject: [PATCH] drm/apple: m4: let fade steps ride on client presents
+
+The fade between panel backlight levels was meant to ride on the
+compositor's flips, and every client present does carry a pending level:
+iomfb_m4_swap() calls dcp_backlight_prepare() for each present and sends
+a dirty level with it. But each fade step kicks the backlight work at
+once, and the work takes dcp->lock and sends a brightness-only present of
+the active frame within microseconds, long before the client's next
+present 8 ms later. That present then finds nothing pending. So every
+step took a swap slot of its own: on a MacBook Pro (14-inch, M4) with the
+ambient-light brightness service running, a 120 Hz vkmark run did about
+12 brightness-only presents per brightness change (backlight_swaps +290
+for 24 changes) and its client flips dropped by 5.5%, from 119 to 113
+frames per second. With the service stopped and backlight_swaps flat,
+the same runs gave 119 frames per second.
+
+Leave a pending level to the client while it flips. The backlight work
+sends a brightness-only present only once no client frame is due: the
+client's own frame interval after its last present, bounded to one to
+two vblanks, plus half a vblank. Until then it looks again at that time;
+a client present in between carries the level and the work finds nothing
+pending. Brightness-only presents are also at most one per vblank. The
+vblank is the running mode's (PreferredTimingElements), 120 Hz until it
+is known.
+
+The fade's clock, its steps and its last level are unchanged; this only
+picks the present that carries each step. With no client presents a
+level goes out at once, as before, so a fade on an idle screen still ends
+at its target when its 250 ms are up. debugfs iomfb_m4 gains
+backlight_carried (client presents that carried a new level) and
+backlight_deferred (brightness-only presents put off).
+
+Add KUnit cases for the decision: a 120 Hz and a 60 Hz client, a stopped
+client, the two-vblank bound and the one-per-vblank limit; a fade under a
+120 Hz client that needs no brightness-only present and ends at its
+target; and the same fade on an idle screen, which presents its target
+between 250 and 300 ms.
+
+Fixes: d434b638c87b ("drm/apple: m4: fade between panel backlight levels")
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit 312efefe283e195810bf1290d34414fab2f67261)
+[k612 head: re-applied after the drm/apple file-level sync (e37e898874 rebased), which replaced
+ dcp_backlight.h, dcp_backlight_test.c and iomfb_m4.c; same 3-file diff, +224/-6]
+(cherry picked from commit 879a746127c85be3c18d5946e4fa90ca784418d5)
+---
+ drivers/gpu/drm/apple/dcp_backlight.h      |  25 ++++
+ drivers/gpu/drm/apple/dcp_backlight_test.c | 137 +++++++++++++++++++++
+ drivers/gpu/drm/apple/iomfb_m4.c           |  65 +++++++++-
+ 3 files changed, 221 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp_backlight.h b/drivers/gpu/drm/apple/dcp_backlight.h
+index cc2d321fb1..e5bcd7028d 100644
+--- a/drivers/gpu/drm/apple/dcp_backlight.h
++++ b/drivers/gpu/drm/apple/dcp_backlight.h
+@@ -368,6 +368,31 @@ static inline bool dcp_bl_swap_finish(struct dcp_backlight_state *state,
+ 			      swap->accepted && swap->completed);
+ }
+ 
++/*
++ * A brightness-only present takes a swap slot of its own, while every client
++ * present already carries a pending level (dcp_bl_prepare() runs for each).
++ * So while a client flips, leave a fade step to its next present: send a
++ * brightness-only present only when no client frame is due, that is once the
++ * client's own frame interval after its last present, bounded to one to two
++ * vblanks, and half a vblank more have passed without one.  Brightness-only
++ * presents are also at most one per vblank.  Times are in ns, 0 before the
++ * first present of each kind.  Returns how long to wait; 0 sends it now.
++ */
++static inline u64 dcp_bl_ride_wait_ns(u64 now, u64 last_flip, u64 flip_interval,
++				      u64 last_swap, u64 vblank)
++{
++	u64 due = 0;
++
++	if (!vblank)
++		return 0;
++	if (last_flip)
++		due = last_flip + clamp(flip_interval, vblank, 2 * vblank) +
++		      vblank / 2;
++	if (last_swap)
++		due = max(due, last_swap + vblank);
++	return due > now ? due - now : 0;
++}
++
+ struct apple_dcp;
+ 
+ void dcp_backlight_desktop_power(struct apple_dcp *dcp, bool on);
+diff --git a/drivers/gpu/drm/apple/dcp_backlight_test.c b/drivers/gpu/drm/apple/dcp_backlight_test.c
+index 9cbf111430..55e92a3b9f 100644
+--- a/drivers/gpu/drm/apple/dcp_backlight_test.c
++++ b/drivers/gpu/drm/apple/dcp_backlight_test.c
+@@ -808,6 +808,143 @@ static void edr_timed_limits_test(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, dcp_edr_next_timed(15000, 16000, 16000, 60, 30, 8333), 16000U);
+ }
+ 
++#define RIDE_VBLANK	8333333ULL	/* 120 Hz */
++#define RIDE_MS		1000000ULL
++
++static void backlight_ride_wait_test(struct kunit *test)
++{
++	const u64 v = RIDE_VBLANK, t0 = 1000 * RIDE_MS;
++
++	/* No client present and no brightness-only present yet: send now. */
++	KUNIT_EXPECT_EQ(test, dcp_bl_ride_wait_ns(t0, 0, 0, 0, v), 0ULL);
++	/* No vblank known: never hold a level back. */
++	KUNIT_EXPECT_EQ(test, dcp_bl_ride_wait_ns(t0, t0, v, t0, 0), 0ULL);
++
++	/* A 120 Hz client: its next present is due within 1.5 vblanks. */
++	KUNIT_EXPECT_EQ(test, dcp_bl_ride_wait_ns(t0 + RIDE_MS, t0, v, 0, v),
++			v + v / 2 - RIDE_MS);
++	/* The first present after a pause counts one vblank. */
++	KUNIT_EXPECT_EQ(test, dcp_bl_ride_wait_ns(t0, t0, 0, 0, v), v + v / 2);
++	/* A 60 Hz client on the 120 Hz panel: two vblanks and a half. */
++	KUNIT_EXPECT_EQ(test, dcp_bl_ride_wait_ns(t0 + RIDE_MS, t0, 2 * v, 0, v),
++			2 * v + v / 2 - RIDE_MS);
++	/* A slower client is bounded to two vblanks: a 30 Hz gap is free. */
++	KUNIT_EXPECT_EQ(test, dcp_bl_ride_wait_ns(t0 + 25 * RIDE_MS, t0, 4 * v, 0, v),
++			0ULL);
++	/* The client stopped: no frame is due, send now. */
++	KUNIT_EXPECT_EQ(test, dcp_bl_ride_wait_ns(t0 + 13 * RIDE_MS, t0, v, 0, v),
++			0ULL);
++
++	/* At most one brightness-only present per vblank, flips or not. */
++	KUNIT_EXPECT_EQ(test, dcp_bl_ride_wait_ns(t0 + 3 * RIDE_MS, 0, 0, t0, v),
++			v - 3 * RIDE_MS);
++	KUNIT_EXPECT_EQ(test, dcp_bl_ride_wait_ns(t0 + v, 0, 0, t0, v), 0ULL);
++	/* Both bounds: the later one wins. */
++	KUNIT_EXPECT_EQ(test, dcp_bl_ride_wait_ns(t0 + RIDE_MS, t0, v, t0, v),
++			v + v / 2 - RIDE_MS);
++}
++
++/*
++ * A fade under a 120 Hz client: each step is carried by the next client
++ * present, no step needs a brightness-only present, and the fade ends at
++ * its target at the same time as without the client.
++ */
++static void backlight_ride_fade_test(struct kunit *test)
++{
++	struct dcp_backlight_state state;
++	struct dcp_backlight_present present;
++	const u64 v = RIDE_VBLANK;
++	u64 now, last_flip = 0, interval = 0, start = 1000 * RIDE_MS;
++	unsigned int carried = 0, own = 0, step = 0;
++	u32 prev;
++
++	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 600, true, 186, false, 0), 0);
++	state.fade = true;
++	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 246, false, false), 0);
++	KUNIT_ASSERT_TRUE(test, state.fading);
++	prev = state.actual;
++
++	/* 1 ms ticks for 400 ms: steps every 16 ms, client presents every vblank. */
++	for (now = start; now < start + 400 * RIDE_MS; now += RIDE_MS) {
++		u32 elapsed = div_u64(now - start, RIDE_MS);
++
++		if (elapsed % 16 == 0)
++			dcp_bl_fade_step(&state, elapsed, 250);
++		/* The worker, kicked by a dirty step, asks whether it may send. */
++		if (state.dirty && !state.in_flight &&
++		    !dcp_bl_ride_wait_ns(now, last_flip, interval, 0, v)) {
++			KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
++			KUNIT_ASSERT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
++			own++;
++		}
++		/* A client present on each vblank boundary carries any pending level. */
++		if (now - start >= (u64)step * v) {
++			int ret = dcp_bl_prepare(&state, true, &present);
++
++			if (!ret) {
++				KUNIT_ASSERT_TRUE(test, dcp_bl_complete(&state, present.sequence,
++									true));
++				carried++;
++			} else {
++				KUNIT_EXPECT_EQ(test, ret, -EALREADY);
++			}
++			/* Monotonic up to the target, never past it. */
++			KUNIT_EXPECT_GE(test, state.actual, prev);
++			KUNIT_EXPECT_LE(test, state.actual, 246U);
++			prev = state.actual;
++			if (last_flip)
++				interval = now - last_flip;
++			last_flip = now;
++			step++;
++		}
++	}
++	KUNIT_EXPECT_EQ(test, own, 0U);
++	KUNIT_EXPECT_GE(test, carried, 12U);
++	KUNIT_EXPECT_FALSE(test, state.fading);
++	KUNIT_EXPECT_FALSE(test, state.dirty);
++	KUNIT_EXPECT_EQ(test, state.actual, 246U);
++}
++
++/*
++ * The same fade with no client presents: every step goes out on its own,
++ * one per vblank at most, and the target is presented when the fade's clock
++ * ends, within the 300 ms the W6 r5 gate allows.
++ */
++static void backlight_ride_idle_fade_test(struct kunit *test)
++{
++	struct dcp_backlight_state state;
++	struct dcp_backlight_present present;
++	const u64 v = RIDE_VBLANK;
++	u64 now, last_swap = 0, start = 1000 * RIDE_MS, done = 0;
++	unsigned int own = 0;
++
++	KUNIT_ASSERT_EQ(test, dcp_bl_init(&state, 600, true, 246, false, 0), 0);
++	state.fade = true;
++	KUNIT_ASSERT_EQ(test, dcp_bl_request(&state, 186, false, false), 0);
++
++	for (now = start; now < start + 400 * RIDE_MS; now += RIDE_MS) {
++		u32 elapsed = div_u64(now - start, RIDE_MS);
++
++		if (elapsed % 16 == 0)
++			dcp_bl_fade_step(&state, elapsed, 250);
++		if (state.dirty && !state.in_flight &&
++		    !dcp_bl_ride_wait_ns(now, 0, 0, last_swap, v)) {
++			if (last_swap)
++				KUNIT_EXPECT_GE(test, now - last_swap, v);
++			KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
++			KUNIT_ASSERT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
++			last_swap = now;
++			own++;
++			if (state.actual == 186U && !done)
++				done = now - start;
++		}
++	}
++	KUNIT_EXPECT_GE(test, own, 12U);
++	KUNIT_EXPECT_EQ(test, state.actual, 186U);
++	KUNIT_EXPECT_GE(test, done, 250 * RIDE_MS);
++	KUNIT_EXPECT_LT(test, done, 300 * RIDE_MS);
++}
++
+ static struct kunit_case backlight_cases[] = {
+ 	KUNIT_CASE(backlight_reports_keep_target_test),
+ 	KUNIT_CASE(backlight_millinits_takeover_test),
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index fcd8b93a4d..a84ed1de82 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -208,7 +208,7 @@ struct iomfb_m4 {
+ 	size_t coproc_size;
+ 	/* The realtime bandwidth mailbox from the DT (0: none), see dcp_m4_bw_mailbox() */
+ 	u64 bw_mailbox;
+-	struct work_struct backlight_work;
++	struct delayed_work backlight_work;
+ 	void __iomem *coproc;
+ 	struct apple_rtkit *rtkit;
+ 	struct mutex lock;
+@@ -247,6 +247,15 @@ struct iomfb_m4 {
+ 	struct drm_framebuffer *uncertain_fb;
+ 	struct dcp_m4_frame active_frame;
+ 	u64 flips, blanks, brightness_swaps;
++	/*
++	 * Fade steps ride on client presents (dcp_bl_ride_wait_ns()): the last
++	 * client present and the interval before it, the last brightness-only
++	 * present (ktime ns), the client presents that carried a new level, the
++	 * brightness-only presents put off, and whether the last swap carried one.
++	 */
++	u64 last_flip_ns, flip_interval_ns, last_brightness_ns;
++	u64 brightness_carried, brightness_deferred;
++	bool swap_carried;
+ 	/* The ADT panel properties, read once by iomfb_m4_panel_edid(). */
+ 	bool panel_adt_read, panel_p3;
+ 	u32 panel_edr_headroom; /* 16.16, 0 if the ADT has none */
+@@ -2863,7 +2872,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
+ 	mutex_init(&dcp->ext_modes_lock);
+ 	spin_lock_init(&dcp->state_lock);
+ 	init_completion(&dcp->reply);
+-	INIT_WORK(&dcp->backlight_work, iomfb_m4_backlight_work);
++	INIT_DELAYED_WORK(&dcp->backlight_work, iomfb_m4_backlight_work);
+ 	spin_lock_init(&dcp->ext_put_lock);
+ 	INIT_LIST_HEAD(&dcp->ext_puts);
+ 	INIT_WORK(&dcp->ext_put_work, iomfb_m4_ext_put_work);
+@@ -3810,6 +3819,7 @@ static int iomfb_m4_swap(struct iomfb_m4 *dcp, const struct dcp_m4_frame *frame)
+ 	dcp->runtime->level = 0;
+ 	if (!prepared)
+ 		dcp_backlight_complete(dcp->owner, present.sequence, !ret);
++	dcp->swap_carried = !prepared && !ret;
+ 	return ret;
+ }
+ 
+@@ -3819,6 +3829,7 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+ 	struct iomfb_m4 *dcp = owner->v26_6;
+ 	struct drm_framebuffer *retire = NULL;
+ 	struct dcp_m4_frame frame;
++	u64 now;
+ 	int ret;
+ 
+ 	if (!dcp || !dcp->runtime || !fb || fb->format->num_planes != 1 ||
+@@ -3869,6 +3880,13 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+ 	dcp->active_fb = fb;
+ 	dcp->active_frame = frame;
+ 	dcp->flips++;
++	if (dcp->swap_carried)
++		dcp->brightness_carried++;
++	/* The client's cadence: its next present will carry a pending level. */
++	now = ktime_get_ns();
++	if (dcp->last_flip_ns)
++		dcp->flip_interval_ns = now - dcp->last_flip_ns;
++	dcp->last_flip_ns = now;
+ 	iomfb_m4_idle_cache_kick(dcp);
+ out:
+ 	mutex_unlock(&dcp->lock);
+@@ -5839,9 +5857,27 @@ int iomfb_m4_resume(struct apple_dcp *owner)
+ 	return ret;
+ }
+ 
++/* One vblank of the running mode in ns; 120 Hz until the timing is known. */
++static u64 iomfb_m4_vblank_ns(struct iomfb_m4 *dcp)
++{
++	u32 rate = dcp->runtime ? dcp->runtime->timing.refresh_16_16 : 0;
++
++	if (rate < (24U << 16) || rate > (240U << 16))
++		return div_u64(NSEC_PER_SEC, 120);
++	return div_u64((u64)NSEC_PER_SEC << 16, rate);
++}
++
++/*
++ * A pending level goes out on the next client present while the client
++ * flips; only once none is due does it take a brightness-only present of
++ * its own, so a fade does not take swap slots from the client.  The fade's
++ * clock and levels are those of dcp_backlight.c; this only picks the present.
++ */
+ static void iomfb_m4_backlight_work(struct work_struct *work)
+ {
+-	struct iomfb_m4 *dcp = container_of(work, struct iomfb_m4, backlight_work);
++	struct iomfb_m4 *dcp = container_of(to_delayed_work(work), struct iomfb_m4,
++					    backlight_work);
++	u64 wait;
+ 	int ret;
+ 
+ 	mutex_lock(&dcp->lock);
+@@ -5849,12 +5885,25 @@ static void iomfb_m4_backlight_work(struct work_struct *work)
+ 	    !dcp_backlight_pending(dcp->owner) || !dcp->active_frame.dva)
+ 		goto out;
+ 	ret = dcp_m4_runtime_live(dcp->runtime);
+-	if (!ret)
++	if (!ret) {
++		wait = dcp_bl_ride_wait_ns(ktime_get_ns(), dcp->last_flip_ns,
++					   dcp->flip_interval_ns,
++					   dcp->last_brightness_ns,
++					   iomfb_m4_vblank_ns(dcp));
++		if (wait) {
++			/* Looked at again then; a client present may carry it first. */
++			dcp->brightness_deferred++;
++			queue_delayed_work(dcp->runtime->wq, &dcp->backlight_work,
++					   usecs_to_jiffies(div_u64(wait, NSEC_PER_USEC) + 1));
++			goto out;
++		}
+ 		ret = iomfb_m4_swap(dcp, &dcp->active_frame);
++	}
+ 	if (ret) {
+ 		dcp_m4_failed(dcp, ret);
+ 	} else {
+ 		dcp->brightness_swaps++;
++		dcp->last_brightness_ns = ktime_get_ns();
+ 		iomfb_m4_idle_cache_kick(dcp);
+ 	}
+ out:
+@@ -5865,8 +5914,9 @@ static void iomfb_m4_backlight_kick(struct apple_dcp *owner)
+ {
+ 	struct iomfb_m4 *dcp = owner->v26_6;
+ 
++	/* A put-off present stays put off: it is looked at again in time. */
+ 	if (dcp && dcp->runtime && !READ_ONCE(owner->quiescing))
+-		queue_work(dcp->runtime->wq, &dcp->backlight_work);
++		queue_delayed_work(dcp->runtime->wq, &dcp->backlight_work, 0);
+ }
+ 
+ void iomfb_m4_configure_backlight(struct apple_dcp *owner)
+@@ -5890,7 +5940,7 @@ void iomfb_m4_quiesce(struct apple_dcp *owner)
+ 		return;
+ 	/* Wake any RPC waiter before waiting for workers; never recycle its DMA. */
+ 	dcp_m4_failed(dcp, -ENODEV);
+-	cancel_work_sync(&dcp->backlight_work);
++	cancel_delayed_work_sync(&dcp->backlight_work);
+ 	if (dcp->runtime)
+ 		flush_workqueue(dcp->runtime->wq);
+ 	/* After the flush, as drained callbacks can queue it. */
+@@ -5925,6 +5975,9 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
+ 	seq_printf(s, "flips=%llu blanks=%llu backlight_swaps=%llu active=%u uncertain=%u\n",
+ 		   dcp->flips, dcp->blanks, dcp->brightness_swaps,
+ 		   !!dcp->active_fb, !!dcp->uncertain_fb);
++	seq_printf(s, "backlight_carried=%llu backlight_deferred=%llu vblank_us=%llu\n",
++		   dcp->brightness_carried, dcp->brightness_deferred,
++		   div_u64(iomfb_m4_vblank_ns(dcp), NSEC_PER_USEC));
+ 	seq_printf(s, "display_off=%u off_cycles=%llu off_us=%lld/%lld on_us=%lld/%lld\n",
+ 		   dcp->display_off, dcp->display_off_cycles,
+ 		   dcp->display_off_us, dcp->display_off_us_max,
+-- 
+2.43.0
+

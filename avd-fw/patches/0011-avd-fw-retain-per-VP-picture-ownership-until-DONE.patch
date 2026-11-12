@@ -1,0 +1,190 @@
+From a112b70d4b1e437e4ce9c0353b2a0e805ebf41e5 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:36:35 +1100
+Subject: [PATCH 11/15] avd-fw: retain per-VP picture ownership until DONE
+
+Feeding a program's last word does not release its VP. The scheduler can
+otherwise start another picture on the same VP before receiving DONE.
+Keep the next program pending until that event, while allowing it to
+overlap the earlier picture's PP and allowing independent VPs to run.
+
+Do not skip a blocked program: the SRAM ring has one global word order.
+Keep existing ordered PP, backpressure and fault handling. Add a native
+2..15-picture ownership regression and update transport tests to deliver
+DONE at the picture boundary.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+---
+ docs/queue.md           | 11 ++++++++++
+ src/queue.c             | 15 ++++++++++++++
+ tests/queue-test.c      | 45 +++++++++++++++++++++++++++++++++++------
+ tests/transport-test.py | 10 +++++----
+ 4 files changed, 71 insertions(+), 10 deletions(-)
+
+diff --git a/docs/queue.md b/docs/queue.md
+index ddf4583..d0f5917 100644
+--- a/docs/queue.md
++++ b/docs/queue.md
+@@ -328,3 +328,14 @@ the input or output format. Use the existing core's trace/debug instrumentation
+ to record maximum in-flight count and tag correlation; ABI 1 adds no queue-depth
+ module parameter. To measure steady-state decode independently of output disk
+ I/O, repeat the hardware decode with `-benchmark -f null -` as the output.
++
++### VP picture ownership
++
++A fully fed program still owns its VP until that VP's DONE event. FIFO capacity
++only permits more words; it does not release the VP's live picture state.
++The foreground scheduler therefore leaves a successor pending when an earlier
++frame on the same VP is in `AVDQ_VP`. After DONE it can feed the successor while
++the earlier picture is PP-ready or running PP. Independent VPs can still run
++concurrently. A blocked program cannot be skipped because the SRAM word ring is
++in global submission order. The host watchdog continues to bound a missing
++DONE; errors halt all accepted work as before.
+diff --git a/src/queue.c b/src/queue.c
+index 53755fa..4c5eb53 100644
+--- a/src/queue.c
++++ b/src/queue.c
+@@ -137,9 +137,24 @@ void avdq_step(struct avdq *q, const struct avdq_ops *ops, void *cookie)
+ 	/* One SRAM staging buffer; preserve program order across chunks. */
+ 	for (i = 0; i < q->count; i++) {
+ 		struct avdq_frame *f = &q->frame[q->order[(q->head + i) & 15u]];
++		unsigned int j;
+ 		int result;
+ 		if (f->phase != AVDQ_PENDING && f->phase != AVDQ_PUSH)
+ 			continue;
++		/*
++		 * FIFO space is not picture completion. A VP still owns its live
++		 * picture state after the last word is fed, until its DONE event.
++		 * Its successor may overlap PP, but must not start on that VP yet.
++		 * Do not skip a blocked program: SRAM words are globally ordered.
++		 */
++		for (j = 0; j < i; j++) {
++			struct avdq_frame *prev =
++				&q->frame[q->order[(q->head + j) & 15u]];
++
++			if (prev->phase == AVDQ_VP &&
++			    prev->desc.vp_slot == f->desc.vp_slot)
++				return;
++		}
+ 		f->phase = AVDQ_PUSH;
+ 		result = ops->feed(cookie, f);
+ 		if (result < 0)
+diff --git a/tests/queue-test.c b/tests/queue-test.c
+index f3bc848..e739f2e 100644
+--- a/tests/queue-test.c
++++ b/tests/queue-test.c
+@@ -128,8 +128,8 @@ static void pipeline(void)
+ 	struct avdq q;
+ 	struct fake io = {0};
+ 	struct avdq_desc a = descriptor(0x12340000, 0);
+-	struct avdq_desc b = descriptor(0x56780001, 0);
+-	struct avdq_desc c = descriptor(0xabcd0002, 1);
++	struct avdq_desc b = descriptor(0x56780001, 1);
++	struct avdq_desc c = descriptor(0xabcd0002, 0);
+ 	avdq_init(&q);
+ 	assert(!avdq_submit(&q, 0, &a, 12, 15));
+ 	assert(!avdq_submit(&q, 1, &b, 12, 15));
+@@ -137,11 +137,14 @@ static void pipeline(void)
+ 	assert(avdq_submit(&q, 0, &b, 12, 15) == -1);
+ 	step(&q, &io); step(&q, &io); step(&q, &io);
+ 	assert(q.frame[0].phase == AVDQ_VP && q.frame[1].phase == AVDQ_VP);
+-	assert(io.feeds == 3 && !io.kicks && !io.completions);
++	assert(io.feeds == 2 && !io.kicks && !io.completions);
+ 	/* A later VP can finish first; PP still runs in submission order. */
+ 	avdq_vp_done(&q, 1); step(&q, &io);
+-	assert(!io.kicks && q.frame[2].phase == AVDQ_PP_READY);
+-	avdq_vp_done(&q, 0); avdq_vp_done(&q, 0); step(&q, &io);
++	assert(!io.kicks && q.frame[1].phase == AVDQ_PP_READY);
++	assert(!q.frame[2].pushed);
++	avdq_vp_done(&q, 0); step(&q, &io);
++	assert(q.frame[2].phase == AVDQ_VP && io.feeds == 3);
++	avdq_vp_done(&q, 0); step(&q, &io);
+ 	assert(io.kicks == 1 && io.words[0] == a.pp_kick);
+ 	assert(q.frame[1].phase == AVDQ_PP_READY);
+ 	avdq_pp_done(&q); step(&q, &io);
+@@ -156,6 +159,36 @@ static void pipeline(void)
+ 	assert(io.tags[0] == a.tag && io.tags[1] == b.tag && io.tags[2] == c.tag);
+ 	assert(!io.statuses[0] && !io.statuses[1] && !io.statuses[2]);
+ }
++static void vp_ownership(void)
++{
++	/* SRAM is ordered globally. Do not overwrite a busy VP's picture state,
++	 * or skip its waiting program to reach a different VP's later program. */
++	for (unsigned int depth = 2; depth <= 15; depth++) {
++		struct avdq q;
++		struct fake io = {0};
++		avdq_init(&q);
++		for (unsigned int i = 0; i < depth; i++) {
++			struct avdq_desc d = descriptor(0x100 | i, 4);
++			assert(!avdq_submit(&q, i, &d, 12, 15));
++		}
++		step(&q, &io);
++		for (unsigned int i = 0; i < depth; i++) {
++			assert(q.frame[i].phase == AVDQ_VP);
++			for (unsigned int n = 0; n < 20; n++)
++				step(&q, &io);
++			assert(io.feeds == i + 1);
++			if (i + 1 < depth)
++				assert(!q.frame[i + 1].pushed);
++			avdq_vp_done(&q, 4);
++			step(&q, &io);
++			/* VP of i+1 overlaps PP of i, not VP of i. */
++			assert(io.kicks == i + 1);
++			avdq_pp_done(&q);
++			step(&q, &io);
++		}
++		assert(!q.count && !q.halted && io.completions == depth);
++	}
++}
+ static void wrap_and_full(void)
+ {
+ 	struct avdq q;
+@@ -255,7 +288,7 @@ static void sram_ring(void)
+ }
+ int main(void)
+ {
+-	wire(); sram_ring(); invalid(); pipeline(); wrap_and_full(); partial_program(); arbitrary_indices(); errors();
++	vp_ownership(); wire(); sram_ring(); invalid(); pipeline(); wrap_and_full(); partial_program(); arbitrary_indices(); errors();
+ 	puts("queue: wire, sram ring, validation, pipeline, backpressure, wrap, tags, errors passed");
+ 	return 0;
+ }
+diff --git a/tests/transport-test.py b/tests/transport-test.py
+index 22d41c2..72c07c4 100644
+--- a/tests/transport-test.py
++++ b/tests/transport-test.py
+@@ -166,6 +166,8 @@ def check_sram(image):
+     submit_sram(t, 1, 0x50011, len(a), len(b))
+     t.poll(4)
+     assert t.stores == a and t.u32(0x10007ff8) == len(a)
++    t.vp_done(); t.poll()
++    assert t.kicks == [0x2b000400, 0x2b000010, 0x2b000010]
+     # Stream B: the host may only run RING_WORDS ahead of the firmware.
+     wp = len(a)
+     while wp < len(a) + len(b):
+@@ -183,8 +185,6 @@ def check_sram(image):
+     assert t.u32(0x10007ff8) == len(a) + len(b)
+     assert not t.fetches
+     t.vp_done(); t.poll()
+-    assert t.kicks == [0x2b000400, 0x2b000010, 0x2b000010]
+-    t.vp_done(); t.poll()
+     t.pp_done(); t.poll()
+     assert t.result(0) == [2, 0, 0x50000] and t.notifications == [0x54530000]
+     t.pp_done(); t.poll()  # stray PP DONE from a multi-kick frame is ignored
+@@ -222,9 +222,11 @@ def check(image):
+     assert not t.stores and len(t.fetches) == 1
+     t.full = False
+     t.poll(550)
+-    assert t.stores == words + [0xfeed]
+-    assert len(t.fetches) == 4 and not t.kicks and not t.notifications
++    assert t.stores == words
++    assert len(t.fetches) == 3 and not t.kicks and not t.notifications
+     t.vp_done(); t.poll()
++    t.poll(8)
++    assert t.stores == words + [0xfeed] and len(t.fetches) == 4
+     assert t.kicks == [0x2b000400] and not t.notifications
+     t.vp_done(); t.poll()
+     assert len(t.kicks) == 1
+-- 
+2.43.0
+

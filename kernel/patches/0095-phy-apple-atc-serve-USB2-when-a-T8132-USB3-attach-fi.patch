@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 18:03:24 +0000
+Subject: [PATCH] phy: apple: atc: serve USB2 when a T8132 USB3 attach
+ finds the common block in use
+
+A T8132 USB3 or USB3+DP attach refuses a common block that an earlier
+epoch left powered, so as not to reset someone else's epoch. It does so
+after marking the mode dirty and before touching anything for
+SuperSpeed, and returns -EBUSY with the PHY still off. From there the
+port has no USB at all: atcphy_usb3_route() refuses to route the PIPE
+while the mode is dirty, dwc3-apple does not start xHCI on a T8132 PIPE
+failure, and every later attach takes the same refusal, as only a
+successful configuration clears the dirty mode.
+
+Serve USB2 instead, the way the USB2 mode already runs whatever the
+common block's state: power the USB2 PHY up and finish in USB2 with the
+PIPE on the dummy backend. The controller then starts with both root
+hubs, a USB2 device works as before and a USB3 device enumerates on its
+USB2 pins. The Type-C mode still asks for USB3, so the next attach tries
+SuperSpeed again, for example once the common domain has been power
+cycled. Modes without USB (USB4, Thunderbolt) still refuse, and a cold
+common block takes the USB3 path as before.
+
+Count the refusals and keep the last error for the state the next
+change shows, and say so in the log.
+
+KUnit: the USB3 and USB3+DP attaches on a common block in use finish in
+USB2 with the common block untouched and the USB2 PHY running; a USB4
+request still refuses; a cold common block still starts the USB3
+sequence.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit 1b0a02363a897f52724705ebf20bbf43cc23ae71)
+(cherry picked from commit 244ec1cd2ed530f820de4a4b12b4913de80a161b)
+---
+ drivers/phy/apple/atc-test.c | 97 ++++++++++++++++++++++++++++++++++++
+ drivers/phy/apple/atc.c      | 28 +++++++++--
+ 2 files changed, 122 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/phy/apple/atc-test.c b/drivers/phy/apple/atc-test.c
+index 9224eb4ae3..e3c1454691 100644
+--- a/drivers/phy/apple/atc-test.c
++++ b/drivers/phy/apple/atc-test.c
+@@ -1351,6 +1351,99 @@ static void atcphy_test_t8132_restore_mode(struct kunit *test)
+ 			   PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+ }
+ 
++/*
++ * A T8132 USB attach that finds the common block in use touches nothing for
++ * SuperSpeed and serves USB2, so the controller can still start.
++ */
++static void atcphy_test_t8132_not_cold_usb(struct kunit *test, enum atcphy_mode mode)
++{
++	struct apple_atcphy *atcphy = atcphy_test_alloc_t8132_pd_off(test, APPLE_ATCPHY_MODE_OFF);
++	struct apple_tunable aux = {};
++	int ret;
++
++	atcphy->pd_was_off = false;
++	atcphy->t8132_ss = true;
++	atcphy->ss_tunables = true;
++	atcphy->tunables.usb3_dp = &aux;
++	/* Not cold: the power control is not at its clamped reset value. */
++	writel(ATCPHY_POWER_SLEEP_SMALL, atcphy->regs.core + ATCPHY_POWER_CTRL);
++	writel(USB2PHY_CTL_SIDDQ | USB2PHY_CTL_RESET, atcphy->regs.usb2phy + USB2PHY_CTL);
++
++	scoped_guard(mutex, &atcphy->lock)
++		ret = atcphy_configure_t8132(atcphy, mode);
++
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_USB2);
++	KUNIT_EXPECT_FALSE(test, atcphy->mode_dirty);
++	KUNIT_EXPECT_FALSE(test, atcphy->t8132_common_owned);
++	KUNIT_EXPECT_FALSE(test, atcphy->t8132_failed);
++	KUNIT_EXPECT_EQ(test, atcphy->usb3_refusals, 1U);
++	KUNIT_EXPECT_EQ(test, atcphy->usb3_refusal, -EBUSY);
++	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_DUMMY);
++	/* The common block is left as it was found. */
++	KUNIT_EXPECT_EQ(test, readl(atcphy->regs.core + ATCPHY_POWER_CTRL),
++			(u32)ATCPHY_POWER_SLEEP_SMALL);
++	KUNIT_EXPECT_EQ(test, readl(atcphy->regs.core + ATCPHY_MISC), 0U);
++	/* The USB2 PHY runs. */
++	KUNIT_EXPECT_FALSE(test, readl(atcphy->regs.usb2phy + USB2PHY_CTL) &
++			   (USB2PHY_CTL_SIDDQ | USB2PHY_CTL_RESET));
++	KUNIT_EXPECT_EQ(test, readl(atcphy->regs.usb2phy + USB2PHY_USBCTL),
++			(u32)USB2PHY_USBCTL_RUN);
++}
++
++static void atcphy_test_t8132_usb3_not_cold(struct kunit *test)
++{
++	atcphy_test_t8132_not_cold_usb(test, APPLE_ATCPHY_MODE_USB3);
++}
++
++static void atcphy_test_t8132_usb3_dp_not_cold(struct kunit *test)
++{
++	atcphy_test_t8132_not_cold_usb(test, APPLE_ATCPHY_MODE_USB3_DP);
++}
++
++/* Modes without USB still refuse a common block in use, and leave the USB2 PHY alone. */
++static void atcphy_test_t8132_cio_not_cold(struct kunit *test)
++{
++	struct apple_atcphy *atcphy = atcphy_test_alloc_t8132_pd_off(test, APPLE_ATCPHY_MODE_OFF);
++	int ret;
++
++	atcphy->pd_was_off = false;
++	atcphy->t8132_ss = true;
++	atcphy->ss_tunables = true;
++	atcphy->cio_tunables = true;
++	writel(ATCPHY_POWER_SLEEP_SMALL, atcphy->regs.core + ATCPHY_POWER_CTRL);
++	writel(USB2PHY_CTL_SIDDQ, atcphy->regs.usb2phy + USB2PHY_CTL);
++
++	scoped_guard(mutex, &atcphy->lock)
++		ret = atcphy_configure_t8132(atcphy, APPLE_ATCPHY_MODE_USB4);
++
++	KUNIT_EXPECT_EQ(test, ret, -EBUSY);
++	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_OFF);
++	KUNIT_EXPECT_EQ(test, atcphy->usb3_refusals, 0U);
++	KUNIT_EXPECT_TRUE(test, readl(atcphy->regs.usb2phy + USB2PHY_CTL) & USB2PHY_CTL_SIDDQ);
++}
++
++/* A cold common block takes the USB3 path as before: here its power handshake times out. */
++static void atcphy_test_t8132_usb3_cold(struct kunit *test)
++{
++	struct apple_atcphy *atcphy = atcphy_test_alloc_t8132_pd_off(test, APPLE_ATCPHY_MODE_OFF);
++	int ret;
++
++	atcphy->pd_was_off = false;
++	atcphy->t8132_ss = true;
++	atcphy->ss_tunables = true;
++	writel(ATCPHY_POWER_CLAMP_EN, atcphy->regs.core + ATCPHY_POWER_CTRL);
++
++	scoped_guard(mutex, &atcphy->lock)
++		ret = atcphy_configure_t8132(atcphy, APPLE_ATCPHY_MODE_USB3);
++
++	KUNIT_EXPECT_EQ(test, ret, -ETIMEDOUT);
++	KUNIT_EXPECT_TRUE(test, atcphy->t8132_common_owned);
++	KUNIT_EXPECT_TRUE(test, atcphy->t8132_failed);
++	KUNIT_EXPECT_EQ(test, atcphy->usb3_refusals, 0U);
++	KUNIT_EXPECT_NE(test, atcphy->mode, APPLE_ATCPHY_MODE_USB2);
++}
++
+ static void atcphy_test_t8103_usb3_machine_scope(struct kunit *test)
+ {
+ 	static const struct {
+@@ -1438,6 +1531,10 @@ static struct kunit_case atcphy_t8132_pm_test_cases[] = {
+ 	KUNIT_CASE(atcphy_test_t8132_rpm_hold),
+ 	KUNIT_CASE(atcphy_test_t8132_restore_idle),
+ 	KUNIT_CASE(atcphy_test_t8132_restore_mode),
++	KUNIT_CASE(atcphy_test_t8132_usb3_not_cold),
++	KUNIT_CASE(atcphy_test_t8132_usb3_dp_not_cold),
++	KUNIT_CASE(atcphy_test_t8132_cio_not_cold),
++	KUNIT_CASE(atcphy_test_t8132_usb3_cold),
+ #ifdef CONFIG_SUSPEND
+ 	KUNIT_CASE(atcphy_test_t8132_system_suspend),
+ #endif
+diff --git a/drivers/phy/apple/atc.c b/drivers/phy/apple/atc.c
+index b5523fc82a..308da1d1d6 100644
+--- a/drivers/phy/apple/atc.c
++++ b/drivers/phy/apple/atc.c
+@@ -765,6 +765,8 @@ enum atcphy_t8132_cio_tunable {
+  * @dp_tunables: T8140 has its complete DP bundle, or T8122 its common calibration
+  * @aux_power_requested: AUX power-up began and needs matching shutdown
+  * @mode_dirty: Mode transition needs cleanup before it can be retried
++ * @usb3_refusals: T8132 USB3 attaches served as USB2 as the common block was in use
++ * @usb3_refusal: Error of the last such refusal, 0 if there was none
+  * @dp_idle_pmas: J700 PMAs with an incomplete routing idle sequence
+  * @dp_owned_pmas: J700 PMAs requiring main-link cleanup
+  * @dp_usb_context_valid: Physical PMAs retaining their pre-DP USB field values
+@@ -868,6 +870,8 @@ struct apple_atcphy {
+ 	/* A touched failure has no qualified partial rollback or retry. */
+ 	bool t8132_failed;
+ 	bool t8132_suspended;
++	unsigned int usb3_refusals;
++	int usb3_refusal;
+ 	struct {
+ 		void __iomem *regs;
+ 		struct resource *resource;
+@@ -3990,9 +3994,27 @@ static int atcphy_configure_t8132(struct apple_atcphy *atcphy, enum atcphy_mode
+ 		goto done;
+ 	}
+ 
+-	/* Never reset an inherited common-power epoch to manufacture a cold state. */
+-	if (!atcphy_t8132_cold(atcphy))
+-		return -EBUSY;
++	/*
++	 * Never reset an inherited common-power epoch to manufacture a cold state.
++	 * Nothing has been touched for SuperSpeed yet, so a USB attach is served
++	 * on USB2 instead: the PIPE stays on the dummy backend and the controller
++	 * starts with its USB2 port, where every USB3 device also works. Refusing
++	 * would leave the mode dirty, the PIPE route refused and the controller
++	 * not started, so the port would have no USB at all. The Type-C mode
++	 * still asks for USB3, so the next attach tries it again.
++	 */
++	if (!atcphy_t8132_cold(atcphy)) {
++		if (atcphy->dp_only ||
++		    (mode != APPLE_ATCPHY_MODE_USB3 && mode != APPLE_ATCPHY_MODE_USB3_DP))
++			return -EBUSY;
++		atcphy->usb3_refusals++;
++		atcphy->usb3_refusal = -EBUSY;
++		dev_warn(atcphy->dev,
++			 "USB3 refused: the common block is in use by an earlier epoch; serving USB2\n");
++		atcphy_usb2_power_on(atcphy);
++		mode = APPLE_ATCPHY_MODE_USB2;
++		goto done;
++	}
+ 	if (!atcphy->dp_only) {
+ 		atcphy_usb2_power_on(atcphy);
+ 		ndelay(500);
+-- 
+2.43.0
+

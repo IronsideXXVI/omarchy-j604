@@ -1,0 +1,2109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erik Bourget <erik@ebourget.net>
+Date: Tue, 10 Nov 2026 00:00:48 -0500
+Subject: [PATCH] iommu: apple-dart: let a host power-cycle its J713
+ DART for a deep sleep
+
+A deep sleep with a Thunderbolt dock attached powers off the ACIO and
+tunneled PCIe DARTs and the external display coprocessors' DARTs, and
+their hosts have to bring them back before the first requester runs
+again. Runtime PM cannot do it: the host decides when its requesters
+are stopped and when its clocks are back.
+
+Add an owner interface for the T8110 DARTs whose device tree node names
+a clock protection slice, other than the internal display ones. The
+host binds once, then around a deep sleep calls prepare (before any
+suspend callback), off (requesters stopped, clocks still on), on
+(clocks back, before any DMA) and finish. off closes the DART to
+hardware commands, saves the stream table, tunables and partition
+words, disables the streams, flushes, and releases the clock-protection
+slice. on restores the slice and the saved state and reopens the DART.
+The generic suspend and resume callbacks leave an owned DART alone, and
+a DART without a bound owner takes no extra lock on its map paths.
+
+While a DART is closed, its page tables are still updated, in memory
+only: map, unmap, attach, release and free never touch its registers.
+Those writers are counted. Reopening, after a restore or after an off
+that failed before changing anything, waits for them, and if anything
+changed meanwhile flushes the whole TLB before the DART opens. finish
+always ends the transaction. A DART that was not restored stays closed,
+its registers unused, until reboot, even once its owner is gone;
+nothing panics on it.
+
+Things learned on the J713 that the restore accounts for:
+
+- The tunneled PCIe DART has 256 stream slots where Linux allocates 64.
+  The whole bank, as the hardware reports it, is saved, the reserved
+  bypass streams included.
+- An external display DART's clock-protection slice word reads zero
+  after the sleep. It is saved at off and written back at on.
+- A locked DART can come back with other bits set in the root of a
+  stream that is not enabled and whose root was, and still is, invalid.
+  That is accepted. Every control register and every valid root must
+  match, and a locked DART is never rewritten.
+
+The slice handling follows the internal display DART's power-down.
+A failed restore dumps the registers that differ.
+
+Add host-side models of the register sequence and of the ownership
+rules, each with negative controls.
+
+This builds on work by Bartosz Nitka.
+
+Signed-off-by: Erik Bourget <erik@ebourget.net>
+[niteria: credit moved from Based-on-work-by into the text; checkpatch fixes in the host-test harnesses; the DART fw and range host tests' mocks now have cio_active and the writer gate's return value]
+Assisted-by: LLM
+Signed-off-by: Bartosz Nitka <niteria@gmail.com>
+(cherry picked from commit 7e112fad2d81ac28d41019da07989a976ab1dd8d)
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/iommu/apple-dart-cio-owner.h   |  26 ++
+ drivers/iommu/apple-dart-cio-power.h   | 216 ++++++++++++++++
+ drivers/iommu/apple-dart-cio.c         | 324 +++++++++++++++++++++++
+ drivers/iommu/apple-dart-sleep.c       |  38 ++-
+ drivers/iommu/apple-dart.c             |  99 ++++++--
+ include/linux/soc/apple/dart-cio.h     |  54 ++++
+ tools/asahi/apple-dart-fw/fixture.c    |  19 ++
+ tools/asahi/apple-dart-range-tests.py  |   6 +-
+ tools/asahi/dart-cio-owner-tests.c     | 339 +++++++++++++++++++++++++
+ tools/asahi/dart-cio-owner-tests.py    |  86 +++++++
+ tools/asahi/dart-cio-power-tests.c     | 333 ++++++++++++++++++++++++
+ tools/asahi/dart-cio-power-tests.py    |  58 +++++
+ tools/asahi/dart-sleep-writer-tests.c  |  53 +++-
+ tools/asahi/dart-sleep-writer-tests.py |  31 +++
+ 14 files changed, 1643 insertions(+), 39 deletions(-)
+ create mode 100644 drivers/iommu/apple-dart-cio-owner.h
+ create mode 100644 drivers/iommu/apple-dart-cio-power.h
+ create mode 100644 drivers/iommu/apple-dart-cio.c
+ create mode 100644 include/linux/soc/apple/dart-cio.h
+ create mode 100644 tools/asahi/dart-cio-owner-tests.c
+ create mode 100644 tools/asahi/dart-cio-owner-tests.py
+ create mode 100644 tools/asahi/dart-cio-power-tests.c
+ create mode 100644 tools/asahi/dart-cio-power-tests.py
+
+diff --git a/drivers/iommu/apple-dart-cio-owner.h b/drivers/iommu/apple-dart-cio-owner.h
+new file mode 100644
+index 0000000000..c3b04e59f0
+--- /dev/null
++++ b/drivers/iommu/apple-dart-cio-owner.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Included by apple-dart.c before its writer gate, which reads this state. */
++#ifndef __APPLE_DART_CIO_OWNER_H
++#define __APPLE_DART_CIO_OWNER_H
++
++#include "apple-dart-power.h"
++#include "apple-dart-cio-power.h"
++
++struct apple_dart_cio {
++	struct apple_dart *dart;
++	struct device *owner;
++	struct device_link *link;
++	struct regmap *gapf;
++	struct dart_cio_power saved;
++	unsigned int slice;
++	u32 gapf_saved;
++	/*
++	 * Under managed_lock: writers updating page tables in memory only while
++	 * the DART is closed, and whether any did.
++	 */
++	unsigned int closed_writers;
++	bool tlb_stale;
++	bool changed, restored, dead;
++};
++
++#endif
+diff --git a/drivers/iommu/apple-dart-cio-power.h b/drivers/iommu/apple-dart-cio-power.h
+new file mode 100644
+index 0000000000..c6005c1408
+--- /dev/null
++++ b/drivers/iommu/apple-dart-cio-power.h
+@@ -0,0 +1,216 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Register state for a T8132 CIO DART. Its host must exclude every requester. */
++#ifndef __APPLE_DART_CIO_POWER_H
++#define __APPLE_DART_CIO_POWER_H
++
++#define DART_CIO_STREAMS 256
++#define DART_CIO_PARTITIONS 16
++#define DART_CIO_PARTITION_MASK 0x000f003f
++
++struct dart_cio_power {
++	struct dart_power_state common;
++	u32 tcr[DART_CIO_STREAMS], ttbr[DART_CIO_STREAMS];
++	u32 enabled[DART_CIO_STREAMS / 32];
++	u32 partition[DART_CIO_PARTITIONS];
++	u32 params[4];
++	unsigned int streams, partitions;
++	bool valid;
++};
++
++static bool dart_cio_fault(void __iomem *regs, const struct dart_cio_power *s)
++{
++	for (unsigned int i = 0; i < DIV_ROUND_UP(s->streams, 32); i++)
++		if (readl(regs + 0x4000 + 4 * i))
++			return true;
++	return readl(regs + 0x704) & 0x777;
++}
++
++static int dart_cio_idle(void __iomem *regs, const struct dart_cio_power *s)
++{
++	unsigned int ports = max(FIELD_GET(GENMASK(18, 16), s->params[1]),
++				 FIELD_GET(GENMASK(22, 20), s->params[1]));
++	u32 value;
++	int ret;
++
++	if (!ports || ports > 4 || dart_cio_fault(regs, s))
++		return -EIO;
++	ret = dart_power_tlb_idle(regs);
++	if (ret)
++		return ret;
++	for (unsigned int i = 0; i < ports; i++) {
++		ret = readl_poll_timeout_atomic(regs + 0x230 + 4 * i, value, !value,
++						1, 10000);
++		if (ret)
++			return ret;
++	}
++	return dart_cio_fault(regs, s) ? -EIO : 0;
++}
++
++/* Only the v2.2/v2.3 layout is admitted; do not guess at a newer revision. */
++static int dart_cio_capture(void __iomem *regs, struct dart_cio_power *s,
++			    unsigned int streams, bool partitions)
++{
++	struct dart_power_state *p = &s->common;
++	u32 version;
++	int ret;
++
++	s->valid = false;
++	if (!streams || streams > DART_CIO_STREAMS)
++		return -EINVAL;
++	for (unsigned int i = 0; i < ARRAY_SIZE(s->params); i++)
++		s->params[i] = readl(regs + 4 * i);
++	version = s->params[2] & 0xffff;
++	if (version < 0x202 || version > 0x203 ||
++	    FIELD_GET(GENMASK(8, 0), s->params[3]) != streams)
++		return -EOPNOTSUPP;
++	if (partitions && (!(s->params[0] & BIT(29)) ||
++			   FIELD_GET(GENMASK(24, 16), s->params[3]) < DART_CIO_PARTITIONS))
++		return -EOPNOTSUPP;
++	s->streams = streams;
++	s->partitions = partitions ? DART_CIO_PARTITIONS : 0;
++	ret = dart_cio_idle(regs, s);
++	if (ret)
++		return ret;
++	/* This owner restores the normal unmasked error policy on wake. */
++	if (readl(regs + DART_POWER_ERROR_MASK))
++		return -EBUSY;
++	p->version = version;
++	p->lock = readl(regs + 0x208);
++	p->diag = readl(regs + 0x210);
++	p->pair[0] = readl(regs + 0x228);
++	p->pair[1] = readl(regs + 0x22c);
++	p->has_tz = s->params[1] & BIT(2);
++	if (p->has_tz) {
++		if ((p->lock & GENMASK(4, 3)) != GENMASK(4, 3))
++			return -EPERM;
++		for (unsigned int i = 0; i < DART_POWER_TZ_WORDS; i++)
++			p->tz[i] = readl(regs + dart_power_tz[i].offset) &
++				   dart_power_tz[i].mask;
++	}
++	for (unsigned int i = 0; i < DART_POWER_TUNABLES; i++)
++		p->tunable[i] = readl(regs + dart_power_tunables[i].offset);
++	for (unsigned int i = 0; i < s->partitions; i++)
++		s->partition[i] = readl(regs + 0x800 + 4 * i);
++	for (unsigned int sid = 0; sid < streams; sid++) {
++		s->tcr[sid] = readl(regs + 0x1000 + 4 * sid);
++		s->ttbr[sid] = readl(regs + 0x1400 + 4 * sid);
++	}
++	for (unsigned int i = 0; i < DIV_ROUND_UP(streams, 32); i++)
++		s->enabled[i] = readl(regs + 0xc00 + 4 * i);
++	if (streams % 32 && (s->enabled[streams / 32] & ~GENMASK(streams % 32 - 1, 0)))
++		return -EUCLEAN;
++	s->valid = true;
++	return 0;
++}
++
++/* One command per SID; DISABLE_STREAMS has no readback equality contract. */
++static void dart_cio_disable_streams(void __iomem *regs, const struct dart_cio_power *s)
++{
++	for (unsigned int sid = 0; sid < s->streams; sid++)
++		if (s->enabled[sid / 32] & BIT(sid % 32))
++			writel(BIT(sid % 32), regs + 0xc20 + 4 * (sid / 32));
++	/* Complete the stream commands before flushing or releasing GAPF. */
++	mb();
++}
++
++static int dart_cio_disable(void __iomem *regs, const struct dart_cio_power *s)
++{
++	int ret;
++
++	if (!s->valid)
++		return -ENODATA;
++	ret = dart_cio_idle(regs, s);
++	if (ret)
++		return ret;
++	dart_power_mask_errors(regs, true);
++	dart_cio_disable_streams(regs, s);
++	ret = dart_power_flush(regs, true);
++	return ret ?: (dart_cio_fault(regs, s) ? -EIO : 0);
++}
++
++/* GAPF is already on; all requesters remain stopped until this returns zero. */
++static int dart_cio_restore(void __iomem *regs, const struct dart_cio_power *s)
++{
++	const struct dart_power_state *p = &s->common;
++	u32 protect, lock;
++	bool locked;
++	int ret;
++
++	if (!s->valid)
++		return -ENODATA;
++	for (unsigned int i = 0; i < ARRAY_SIZE(s->params); i++)
++		if (readl(regs + 4 * i) != s->params[i])
++			return -EUCLEAN;
++	protect = readl(regs + 0x200);
++	lock = readl(regs + 0x208);
++	locked = protect & lock & BIT(0);
++	if ((lock & GENMASK(4, 3)) != (p->lock & GENMASK(4, 3)) || dart_cio_fault(regs, s))
++		return -EUCLEAN;
++	/* A requester outside the saved set means ownership was lost. */
++	for (unsigned int i = 0; i < DIV_ROUND_UP(s->streams, 32); i++)
++		if (readl(regs + 0xc00 + 4 * i) & ~s->enabled[i])
++			return -EUCLEAN;
++	dart_power_mask_errors(regs, true);
++	/* Also handles an aborted shutdown with some streams still enabled. */
++	dart_cio_disable_streams(regs, s);
++	ret = dart_power_write(regs, 0x210, p->diag);
++	if (ret)
++		return ret;
++	if (p->has_tz)
++		for (unsigned int i = 0; i < DART_POWER_TZ_WORDS; i++)
++			if ((readl(regs + dart_power_tz[i].offset) & dart_power_tz[i].mask) !=
++			    p->tz[i])
++				return -EUCLEAN;
++	for (unsigned int i = 0; i < DART_POWER_TUNABLES; i++) {
++		bool apf_locked = dart_power_tunables[i].offset >= 0x300 &&
++				  (protect & lock & BIT(2));
++
++		ret = dart_power_config(regs, dart_power_tunables[i].offset,
++					dart_power_tunables[i].mask, p->tunable[i],
++					locked || apf_locked);
++		if (ret)
++			return ret;
++	}
++	for (unsigned int i = 0; i < s->partitions; i++) {
++		ret = dart_power_config(regs, 0x800 + 4 * i, DART_CIO_PARTITION_MASK,
++					s->partition[i], locked);
++		if (ret)
++			return ret;
++	}
++	/* Include reserved bypass SIDs: they are part of the port's DMA context. */
++	for (unsigned int sid = 0; sid < s->streams; sid++) {
++		ret = dart_power_config(regs, 0x1000 + 4 * sid, ~0U, s->tcr[sid], locked);
++		if (ret)
++			return ret;
++		/*
++		 * A locked DART can come back from a sleep with other bits in the
++		 * root of a stream that is not enabled, a root that was and still
++		 * is invalid: no translation either way.
++		 */
++		if (locked && !(s->enabled[sid / 32] & BIT(sid % 32)) &&
++		    !((s->ttbr[sid] | readl(regs + 0x1400 + 4 * sid)) & BIT(0)))
++			continue;
++		ret = dart_power_config(regs, 0x1400 + 4 * sid, ~0U, s->ttbr[sid], locked);
++		if (ret)
++			return ret;
++	}
++	ret = dart_power_flush(regs, false) ?:
++	      dart_power_config(regs, 0x228, ~0U, p->pair[0], locked) ?:
++	      dart_power_config(regs, 0x22c, ~0U, p->pair[1], locked);
++	if (ret)
++		return ret;
++	dart_power_mask_errors(regs, false);
++	for (unsigned int i = 0; i < DIV_ROUND_UP(s->streams, 32); i++) {
++		ret = dart_power_write(regs, 0xc00 + 4 * i, s->enabled[i]);
++		if (ret) {
++			dart_power_mask_errors(regs, true);
++			dart_cio_disable_streams(regs, s);
++			/* The caller keeps requesters stopped even if cleanup fails. */
++			dart_power_flush(regs, true);
++			return ret;
++		}
++	}
++	return 0;
++}
++
++#endif
+diff --git a/drivers/iommu/apple-dart-cio.c b/drivers/iommu/apple-dart-cio.c
+new file mode 100644
+index 0000000000..e88fedbacf
+--- /dev/null
++++ b/drivers/iommu/apple-dart-cio.c
+@@ -0,0 +1,324 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Included by apple-dart.c: owner-driven ACIO, PCIe-C and external display DART power cycles. */
++/*
++ * Called before publishing the IOMMU: writer accounting cannot start mid-map.
++ * A DART whose host can power-cycle it names its clock protection slice in the
++ * device tree. The internal display DARTs (@skip) name theirs for their DCP's
++ * own power-down instead.
++ */
++static int apple_dart_cio_init(struct apple_dart *dart, resource_size_t size, bool skip)
++{
++	struct device_node *np = dart->dev->of_node;
++	struct apple_dart_cio *s;
++	struct regmap *gapf;
++	unsigned int slice;
++
++	if (skip || dart->hw->type != DART_T8110 ||
++	    !of_property_present(np, "apple,clock-protection"))
++		return 0;
++	if (size < 0x4064)
++		return -EINVAL;
++	gapf = syscon_regmap_lookup_by_phandle_args(np, "apple,clock-protection", 1, &slice);
++	if (IS_ERR(gapf))
++		return dev_err_probe(dart->dev, PTR_ERR(gapf), "clock-protection bank\n");
++	if (slice >= APPLE_PS_PROT_SLICES)
++		return -EINVAL;
++	s = devm_kzalloc(dart->dev, sizeof(*s), GFP_KERNEL);
++	if (!s)
++		return -ENOMEM;
++	s->dart = dart;
++	s->gapf = gapf;
++	s->slice = slice;
++	dart->cio = s;
++	return 0;
++}
++
++static void apple_dart_cio_unbind(void *data)
++{
++	struct apple_dart_cio *s = data;
++
++	if (READ_ONCE(s->dart->cio_active))
++		panic("Apple CIO: removing owner with unresolved DMA state");
++	s->owner = NULL;
++	module_put(THIS_MODULE);
++}
++
++int apple_dart_cio_bind(struct device *owner, struct device *provider,
++			struct apple_dart_cio **state)
++{
++	struct apple_dart *dart;
++	struct apple_dart_cio *s;
++	int ret;
++
++	if (!provider || provider->driver != &apple_dart_driver.driver)
++		return -EPROBE_DEFER;
++	dart = dev_get_drvdata(provider);
++	if (!dart || !READ_ONCE(dart->iommu.ready))
++		return -EPROBE_DEFER;
++	s = dart->cio;
++	if (!s || dart->managed_sids || dart->hw->ttbr_count != 1)
++		return -EOPNOTSUPP;
++	if (s->owner)
++		return -EBUSY;
++	if (!try_module_get(THIS_MODULE))
++		return -ENODEV;
++	s->link = device_link_add(owner, provider, DL_FLAG_AUTOREMOVE_CONSUMER);
++	if (!s->link) {
++		module_put(THIS_MODULE);
++		return -EINVAL;
++	}
++	s->owner = owner;
++	ret = devm_add_action_or_reset(owner, apple_dart_cio_unbind, s);
++	if (!ret)
++		*state = s;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_dart_cio_bind);
++
++int apple_dart_cio_prepare(struct apple_dart_cio *s)
++{
++	struct apple_dart *dart;
++	unsigned long flags;
++	int ret;
++
++	if (!s || !s->owner || pm_suspend_target_state != PM_SUSPEND_MEM)
++		return -EINVAL;
++	dart = s->dart;
++	ret = pm_runtime_resume_and_get(dart->dev);
++	if (ret < 0)
++		return ret;
++	spin_lock_irqsave(&dart->managed_lock, flags);
++	if (s->dead) {
++		ret = -EIO;
++	} else if (dart->cio_active || dart->sleep_closed || dart->commands_gated) {
++		ret = -EBUSY;
++	} else {
++		s->saved.valid = false;
++		s->changed = false;
++		s->restored = false;
++		s->tlb_stale = false;
++		dart->cio_active = true;
++		ret = 0;
++	}
++	spin_unlock_irqrestore(&dart->managed_lock, flags);
++	if (ret)
++		pm_runtime_put(dart->dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_dart_cio_prepare);
++
++static int apple_dart_cio_gapf(struct apple_dart_cio *s, bool on)
++{
++	u32 value;
++	int ret;
++
++	ret = regmap_read(s->gapf, APPLE_PS_PROT_SLICE(s->slice), &value);
++	/*
++	 * An external display DART's slice word does not survive the sleep: give
++	 * it the value it had at power-down back, before its protection goes on.
++	 */
++	if (!ret && on && !(value & BIT(1)) && (s->gapf_saved & BIT(1))) {
++		u32 restore = s->gapf_saved | BIT(4);
++
++		dev_info(s->dart->dev, "CIO DART slice %u lost (%#x): restoring %#x\n",
++			 s->slice, value, restore);
++		ret = regmap_write(s->gapf, APPLE_PS_PROT_SLICE(s->slice), restore);
++		if (!ret)
++			ret = regmap_read(s->gapf, APPLE_PS_PROT_SLICE(s->slice), &value);
++	}
++	if (ret || !(value & BIT(1)))
++		return ret ?: -EPERM;
++	ret = regmap_update_bits(s->gapf, APPLE_PS_PROT_SLICE(s->slice), BIT(4),
++				 on ? BIT(4) : 0);
++	if (!ret)
++		ret = regmap_read(s->gapf, APPLE_PS_PROT_SLICE(s->slice), &value);
++	return ret ?: (!!(value & BIT(4)) == on ? 0 : -EIO);
++}
++
++/* Returns whether a page table changed while it was closed. */
++/*
++ * Reopen a DART whose registers hold its state. Writers that updated page
++ * tables in memory only finish first, and if there were any the whole TLB is
++ * flushed before the DART opens, so no stale translation outlives the
++ * closure. On failure it stays closed.
++ */
++static int apple_dart_cio_reopen(struct apple_dart_cio *s)
++{
++	struct apple_dart_stream_map all = { .dart = s->dart };
++	struct apple_dart *dart = s->dart;
++	unsigned long flags;
++	unsigned int tries;
++	bool stale;
++	int ret;
++
++	/* Under the lock its other writers hold; the restore was ordered by dma_wmb(). */
++	scoped_guard(spinlock_irqsave, &dart->lock)
++		WRITE_ONCE(dart->commands_gated, false);
++	bitmap_fill(all.sidmap, dart->num_streams);
++	for (tries = 0; tries < 10000; tries++) {
++		stale = false;
++		spin_lock_irqsave(&dart->managed_lock, flags);
++		if (!s->closed_writers) {
++			stale = s->tlb_stale;
++			s->tlb_stale = false;
++			if (!stale) {
++				WRITE_ONCE(dart->sleep_closed, false);
++				spin_unlock_irqrestore(&dart->managed_lock, flags);
++				return 0;
++			}
++		}
++		spin_unlock_irqrestore(&dart->managed_lock, flags);
++		if (stale) {
++			ret = dart->hw->invalidate_tlb(&all);
++			if (ret)
++				return ret;
++			continue;
++		}
++		usleep_range(10, 20);
++	}
++	return -EBUSY;
++}
++
++int apple_dart_cio_off(struct apple_dart_cio *s)
++{
++	u32 value, params0, params3;
++	struct apple_dart *dart;
++	unsigned int streams;
++	bool partitions;
++	int ret;
++
++	if (!s || !READ_ONCE(s->dart->cio_active) || s->changed || s->restored)
++		return -EINVAL;
++	dart = s->dart;
++	ret = apple_dart_sleep_close(dart);
++	if (ret)
++		return ret;
++	/* The bank size comes from the hardware, not from the stream allocator. */
++	params0 = readl(dart->regs);
++	params3 = readl(dart->regs + 12);
++	streams = FIELD_GET(GENMASK(8, 0), params3);
++	partitions = (params0 & BIT(29)) &&
++		     FIELD_GET(GENMASK(24, 16), params3) >= DART_CIO_PARTITIONS;
++	/* Drains the fault IRQ and any hardware command admitted before closure. */
++	apple_dart_quiesce_commands(dart->dev);
++	dma_wmb();
++	ret = regmap_read(s->gapf, APPLE_PS_PROT_SLICE(s->slice), &value);
++	if (!ret && !(value & BIT(1)))
++		ret = -EPERM;
++	if (!ret)
++		s->gapf_saved = value;
++	/* A display DART's firmware may have left its clock protection off. */
++	if (!ret && !(value & APPLE_PS_PROT_SLICE_ON))
++		ret = apple_dart_cio_gapf(s, true);
++	/*
++	 * PCIe-C allocates from only 64 SIDs, but its register bank has 256.
++	 * Preserve the entire bank, including the reserved bypass SIDs.
++	 */
++	if (!ret)
++		ret = dart_cio_capture(dart->regs, &s->saved, streams, partitions);
++	if (ret) {
++		dev_err(dart->dev, "CIO DART snapshot failed: %d, params=%08x/%08x/%08x/%08x\n",
++			ret, s->saved.params[0], s->saved.params[1],
++			s->saved.params[2], s->saved.params[3]);
++		/* Its registers were not changed: reopen it, flushing what changed meanwhile. */
++		if (apple_dart_cio_reopen(s)) {
++			s->dead = true;
++			dev_err(dart->dev, "CIO DART not reopened: closed until reboot\n");
++		}
++		return ret;
++	}
++	dev_info(dart->dev, "CIO DART stop: version=%#x streams=%u partitions=%u slice=%u\n",
++		 s->saved.common.version, s->saved.streams, s->saved.partitions, s->slice);
++	/* Any later failure needs on(), even if the domain never went off. */
++	s->changed = true;
++	ret = dart_cio_disable(dart->regs, &s->saved);
++	return ret ?: apple_dart_cio_gapf(s, false);
++}
++EXPORT_SYMBOL_GPL(apple_dart_cio_off);
++
++int apple_dart_cio_on(struct apple_dart_cio *s)
++{
++	int ret;
++
++	if (!s || !READ_ONCE(s->dart->cio_active))
++		return -EINVAL;
++	if (!s->changed || s->restored)
++		return 0;
++	ret = apple_dart_cio_gapf(s, true);
++	if (ret)
++		return ret;
++	ret = dart_cio_restore(s->dart->regs, &s->saved);
++	if (ret) {
++		void __iomem *regs = s->dart->regs;
++		unsigned int tz = 0, tcr = 0, ttbr = 0;
++
++		for (unsigned int i = 0; s->saved.common.has_tz && i < DART_POWER_TZ_WORDS; i++)
++			if ((readl(regs + dart_power_tz[i].offset) & dart_power_tz[i].mask) !=
++			    s->saved.common.tz[i])
++				tz |= BIT(i);
++		for (unsigned int sid = 0; sid < s->saved.streams; sid++) {
++			u32 now_tcr = readl(regs + 0x1000 + 4 * sid);
++			u32 now_ttbr = readl(regs + 0x1400 + 4 * sid);
++
++			tcr += now_tcr != s->saved.tcr[sid];
++			ttbr += now_ttbr != s->saved.ttbr[sid];
++			if (now_tcr != s->saved.tcr[sid] || now_ttbr != s->saved.ttbr[sid] ||
++			    (s->saved.enabled[sid / 32] & BIT(sid % 32)))
++				dev_err(s->dart->dev,
++					"CIO DART SID%u: TCR %08x had %08x, TTBR %08x had %08x\n",
++					sid, now_tcr, s->saved.tcr[sid], now_ttbr,
++					s->saved.ttbr[sid]);
++		}
++		dev_err(s->dart->dev,
++			"CIO DART restore failed: %d, params %08x/%08x/%08x/%08x had %08x/%08x/%08x/%08x\n",
++			ret, readl(regs), readl(regs + 4), readl(regs + 8), readl(regs + 12),
++			s->saved.params[0], s->saved.params[1], s->saved.params[2],
++			s->saved.params[3]);
++		dev_err(s->dart->dev,
++			"CIO DART state: protect %08x lock %08x had %08x, streams %08x had %08x, error %08x/%08x, tz%s differs %#x, tcr/ttbr differ %u/%u\n",
++			readl(regs + 0x200), readl(regs + 0x208), s->saved.common.lock,
++			readl(regs + 0xc00), s->saved.enabled[0], readl(regs + 0x4000),
++			readl(regs + 0x704), s->saved.common.has_tz ? "" : " (none)", tz, tcr,
++			ttbr);
++		return ret;
++	}
++	dma_wmb();
++	/* Updates that came after the restore's flush are flushed; requesters still wait. */
++	ret = apple_dart_cio_reopen(s);
++	if (ret) {
++		dev_err(s->dart->dev, "CIO DART reopen failed: %d\n", ret);
++		return ret;
++	}
++	s->restored = true;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(apple_dart_cio_on);
++
++/*
++ * Always ends the transaction. If the DART was not restored it stays closed for
++ * the rest of the boot, its streams off: page-table updates go to memory only
++ * and its registers are never used again, so its consumers can still unmap,
++ * be released and be removed. Returns -EIO then, and later prepares refuse.
++ */
++int apple_dart_cio_finish(struct apple_dart_cio *s)
++{
++	struct apple_dart *dart;
++	unsigned long flags;
++	int ret = 0;
++
++	if (!s || !READ_ONCE(s->dart->cio_active))
++		return -EINVAL;
++	dart = s->dart;
++	spin_lock_irqsave(&dart->managed_lock, flags);
++	if (s->changed && !s->restored) {
++		s->dead = true;
++		ret = -EIO;
++	}
++	dart->cio_active = false;
++	spin_unlock_irqrestore(&dart->managed_lock, flags);
++	if (ret)
++		dev_err(dart->dev, "CIO DART not restored: closed until reboot\n");
++	pm_runtime_put(dart->dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_dart_cio_finish);
+diff --git a/drivers/iommu/apple-dart-sleep.c b/drivers/iommu/apple-dart-sleep.c
+index dd85d9a166..630e7101d5 100644
+--- a/drivers/iommu/apple-dart-sleep.c
++++ b/drivers/iommu/apple-dart-sleep.c
+@@ -17,15 +17,34 @@ struct apple_dart_sleep_state {
+ 	bool power_off;
+ };
+ 
++/*
++ * A writer of a DART whose state a sleep owner keeps. 0: not gated, nothing to
++ * put; APPLE_DART_WRITER_COUNTED: admitted, put it afterwards;
++ * APPLE_DART_WRITER_CLOSED: a host-owned DART is closed for its power cycle,
++ * so write the page tables in memory only, never its registers (its owner
++ * flushes it when it reopens); negative: refused.
++ */
+ static int apple_dart_sleep_writer_get(struct apple_dart *dart)
+ {
++	struct apple_dart_cio *cio = dart->cio;
+ 	unsigned long flags;
+-	int ret = 0;
++	int ret = APPLE_DART_WRITER_COUNTED;
+ 
+-	if (!dart->managed_sids)
++	/* A live DART without a bound owner takes no lock; a closed one always does. */
++	if (!dart->managed_sids &&
++	    !(cio && (READ_ONCE(cio->owner) || READ_ONCE(dart->sleep_closed))))
+ 		return 0;
+ 	spin_lock_irqsave(&dart->managed_lock, flags);
+-	if (dart->sleep_closed) {
++	if (dart->sleep_closed && cio) {
++		/* Counted until done: reopening waits for them before its flush. */
++		if (cio->closed_writers == UINT_MAX) {
++			ret = -EOVERFLOW;
++		} else {
++			cio->closed_writers++;
++			cio->tlb_stale = true;
++			ret = APPLE_DART_WRITER_CLOSED;
++		}
++	} else if (dart->sleep_closed) {
+ 		if (dart->sleep_record)
+ 			WRITE_ONCE(dart->sleep_record->result, -EUCLEAN);
+ 		ret = -EBUSY;
+@@ -38,14 +57,17 @@ static int apple_dart_sleep_writer_get(struct apple_dart *dart)
+ 	return ret;
+ }
+ 
+-static void apple_dart_sleep_writer_put(struct apple_dart *dart)
++static void apple_dart_sleep_writer_put(struct apple_dart *dart, int gate)
+ {
+ 	unsigned long flags;
+ 
+-	if (!dart->managed_sids)
++	if (gate != APPLE_DART_WRITER_COUNTED && gate != APPLE_DART_WRITER_CLOSED)
+ 		return;
+ 	spin_lock_irqsave(&dart->managed_lock, flags);
+-	dart->sleep_writers--;
++	if (gate == APPLE_DART_WRITER_CLOSED)
++		dart->cio->closed_writers--;
++	else
++		dart->sleep_writers--;
+ 	spin_unlock_irqrestore(&dart->managed_lock, flags);
+ }
+ 
+@@ -59,7 +81,7 @@ static int apple_dart_sleep_close(struct apple_dart *dart)
+ 	if (dart->sleep_closed || dart->sleep_writers)
+ 		ret = -EBUSY;
+ 	else
+-		dart->sleep_closed = true;
++		WRITE_ONCE(dart->sleep_closed, true);
+ 	spin_unlock_irqrestore(&dart->managed_lock, flags);
+ 	return ret;
+ }
+@@ -67,7 +89,7 @@ static int apple_dart_sleep_close(struct apple_dart *dart)
+ /* A void unmap/free caller may release backing memory when we return. */
+ static void __noreturn apple_dart_sleep_release_failed(void)
+ {
+-	panic("J713 radio: DMA state cannot be released safely");
++	panic("Apple DART: DMA state cannot be released safely");
+ }
+ 
+ static int apple_dart_sleep_valid(struct apple_dart_sleep *sleep)
+diff --git a/drivers/iommu/apple-dart.c b/drivers/iommu/apple-dart.c
+index be7736a36e..3dc77ff8bc 100644
+--- a/drivers/iommu/apple-dart.c
++++ b/drivers/iommu/apple-dart.c
+@@ -33,6 +33,7 @@
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/soc/apple/dart.h>
++#include <linux/soc/apple/dart-cio.h>
+ #include <linux/soc/apple/dart-sleep.h>
+ #include <linux/soc/apple/t8132.h>
+ #include <linux/of.h>
+@@ -493,6 +494,8 @@ struct apple_dart {
+ 	/* Serialize owned TCR publication against IRQ quarantine. */
+ 	spinlock_t managed_lock;
+ 	struct apple_dart_sleep *sleep_record;
++	struct apple_dart_cio *cio;
++	bool cio_active;
+ 	unsigned int sleep_writers;
+ 	bool sleep_closed;
+ 
+@@ -533,9 +536,12 @@ struct apple_dart {
+ 	int locked_retire_err[DART_MAX_STREAMS];
+ };
+ 
++#define APPLE_DART_WRITER_COUNTED	1
++#define APPLE_DART_WRITER_CLOSED	2
+ static int apple_dart_sleep_writer_get(struct apple_dart *dart);
+-static void apple_dart_sleep_writer_put(struct apple_dart *dart);
++static void apple_dart_sleep_writer_put(struct apple_dart *dart, int gate);
+ static void __noreturn apple_dart_sleep_release_failed(void);
++static int apple_dart_cio_init(struct apple_dart *dart, resource_size_t size, bool skip);
+ 
+ #ifndef MODULE
+ static struct kexec_blocker apple_dart_radio_kexec = {
+@@ -2505,7 +2511,7 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
+ 	struct apple_dart_stream_map stream;
+ 	struct io_pgtable_cfg *cfg;
+ 	const u32 op = DART_T8110_TLB_CMD_OP_FLUSH_SID;
+-	int i, j, ret, err = 0;
++	int i, j, ret, gate, err = 0;
+ 	u64 start, end;
+ 
+ 	if (domain->dcp)
+@@ -2534,11 +2540,20 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
+ 			err = err ?: ret;
+ 			continue;
+ 		}
+-		if (apple_dart_sleep_writer_get(stream.dart))
++		gate = apple_dart_sleep_writer_get(stream.dart);
++		if (gate < 0)
+ 			apple_dart_sleep_release_failed();
++		/* Closed for its owner's power cycle: likewise, the owner flushes it. */
++		if (gate == APPLE_DART_WRITER_CLOSED) {
++			ret = stream.dart->locked ?
++				apple_dart_hw_sync_locked(cfg, &stream, true) : 0;
++			apple_dart_sleep_writer_put(stream.dart, gate);
++			err = err ?: ret;
++			continue;
++		}
+ 		ret = pm_runtime_resume_and_get(stream.dart->dev);
+ 		if (ret < 0) {
+-			apple_dart_sleep_writer_put(stream.dart);
++			apple_dart_sleep_writer_put(stream.dart, gate);
+ 			dev_err_ratelimited(stream.dart->dev,
+ 				"failed to power DART for TLB synchronization: %d\n", ret);
+ 			err = err ?: ret;
+@@ -2565,7 +2580,7 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
+ 		if (ret && stream.dart->managed_sids)
+ 			apple_dart_managed_quarantine(stream.dart);
+ 		pm_runtime_put(stream.dart->dev);
+-		apple_dart_sleep_writer_put(stream.dart);
++		apple_dart_sleep_writer_put(stream.dart, gate);
+ 		err = err ?: ret;
+ 	}
+ 	return err;
+@@ -2878,12 +2893,12 @@ static int apple_dart_map_pages(struct iommu_domain *domain, unsigned long iova,
+ 	int gate;
+ 
+ 	gate = dart ? apple_dart_sleep_writer_get(dart) : 0;
+-	if (gate)
++	if (gate < 0)
+ 		return gate;
+ 	result = apple_dart_map_pages_unguarded(domain, iova, paddr, pgsize, pgcount,
+ 						prot, gfp, mapped);
+ 	if (dart)
+-		apple_dart_sleep_writer_put(dart);
++		apple_dart_sleep_writer_put(dart, gate);
+ 	return result;
+ }
+ 
+@@ -2912,11 +2927,11 @@ static size_t apple_dart_unmap_pages(struct iommu_domain *domain, unsigned long
+ 	int gate;
+ 
+ 	gate = dart ? apple_dart_sleep_writer_get(dart) : 0;
+-	if (gate)
++	if (gate < 0)
+ 		apple_dart_sleep_release_failed();
+ 	result = apple_dart_unmap_pages_unguarded(domain, iova, pgsize, pgcount, gather);
+ 	if (dart)
+-		apple_dart_sleep_writer_put(dart);
++		apple_dart_sleep_writer_put(dart, gate);
+ 	return result;
+ }
+ 
+@@ -3267,11 +3282,16 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain, struct devi
+ 	int gate;
+ 
+ 	gate = dart ? apple_dart_sleep_writer_get(dart) : 0;
+-	if (gate)
++	if (gate < 0)
+ 		return gate;
++	/* These write the stream registers of a DART that is powered down. */
++	if (gate == APPLE_DART_WRITER_CLOSED) {
++		apple_dart_sleep_writer_put(dart, gate);
++		return -EBUSY;
++	}
+ 	result = apple_dart_attach_dev_paging_unguarded(domain, dev, old);
+ 	if (dart)
+-		apple_dart_sleep_writer_put(dart);
++		apple_dart_sleep_writer_put(dart, gate);
+ 	return result;
+ }
+ 
+@@ -3310,11 +3330,16 @@ static int apple_dart_attach_dev_identity(struct iommu_domain *domain, struct de
+ 	int gate;
+ 
+ 	gate = dart ? apple_dart_sleep_writer_get(dart) : 0;
+-	if (gate)
++	if (gate < 0)
+ 		return gate;
++	/* These write the stream registers of a DART that is powered down. */
++	if (gate == APPLE_DART_WRITER_CLOSED) {
++		apple_dart_sleep_writer_put(dart, gate);
++		return -EBUSY;
++	}
+ 	result = apple_dart_attach_dev_identity_unguarded(domain, dev, old);
+ 	if (dart)
+-		apple_dart_sleep_writer_put(dart);
++		apple_dart_sleep_writer_put(dart, gate);
+ 	return result;
+ }
+ 
+@@ -3362,11 +3387,16 @@ static int apple_dart_attach_dev_blocked(struct iommu_domain *domain, struct dev
+ 	int gate;
+ 
+ 	gate = dart ? apple_dart_sleep_writer_get(dart) : 0;
+-	if (gate)
++	if (gate < 0)
+ 		return gate;
++	/* These write the stream registers of a DART that is powered down. */
++	if (gate == APPLE_DART_WRITER_CLOSED) {
++		apple_dart_sleep_writer_put(dart, gate);
++		return -EBUSY;
++	}
+ 	result = apple_dart_attach_dev_blocked_unguarded(domain, dev, old);
+ 	if (dart)
+-		apple_dart_sleep_writer_put(dart);
++		apple_dart_sleep_writer_put(dart, gate);
+ 	return result;
+ }
+ 
+@@ -3418,13 +3448,24 @@ static void apple_dart_release_device(struct device *dev)
+ 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
+ 
+ 	for_each_stream_map(j, cfg, stream_map) {
++		int gate;
++
+ 		if (READ_ONCE(stream_map->dart->sleep_record))
+ 			apple_dart_sleep_release_failed();
+ 		/* Borrowed display roots stay exactly as the DCP left them. */
+ 		if (!stream_map->dart->locked || apple_dart_has_borrowed(stream_map->dart))
+ 			continue;
++		/* A DART closed for its owner's power cycle keeps its registers until then. */
++		gate = apple_dart_sleep_writer_get(stream_map->dart);
++		if (gate < 0)
++			continue;
++		if (gate == APPLE_DART_WRITER_CLOSED) {
++			apple_dart_sleep_writer_put(stream_map->dart, gate);
++			continue;
++		}
+ 		ret = pm_runtime_resume_and_get(stream_map->dart->dev);
+ 		if (ret < 0) {
++			apple_dart_sleep_writer_put(stream_map->dart, gate);
+ 			dev_err_ratelimited(stream_map->dart->dev,
+ 				"failed to power DART for consumer release: %d\n", ret);
+ 			continue;
+@@ -3433,6 +3474,7 @@ static void apple_dart_release_device(struct device *dev)
+ 			apple_dart_hw_unmap_locked_ttbr(stream_map, i);
+ 		(void)stream_map->dart->hw->invalidate_tlb(stream_map);
+ 		pm_runtime_put(stream_map->dart->dev);
++		apple_dart_sleep_writer_put(stream_map->dart, gate);
+ 	}
+ 
+ 	kfree(cfg);
+@@ -3480,7 +3522,7 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
+ 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
+ 	struct apple_dart_atomic_stream_map *map;
+ 	struct apple_dart_stream_map stream;
+-	int i, j, idx, ret;
++	int i, j, idx, ret, gate;
+ 
+ 	if (dart_domain->dcp) {
+ 		/* Registration rollback: no consumer could publish host DMA yet. */
+@@ -3502,8 +3544,17 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
+ 			stream.sidmap[j] = atomic_long_read(&map->sidmap[j]);
+ 		if (bitmap_empty(stream.sidmap, stream.dart->num_streams))
+ 			continue;
++		/* Its owner restores these roots from its copy: keep the tables they name. */
++		gate = apple_dart_sleep_writer_get(stream.dart);
++		if (gate < 0)
++			return;
++		if (gate == APPLE_DART_WRITER_CLOSED) {
++			apple_dart_sleep_writer_put(stream.dart, gate);
++			return;
++		}
+ 		j = pm_runtime_resume_and_get(stream.dart->dev);
+ 		if (j < 0) {
++			apple_dart_sleep_writer_put(stream.dart, gate);
+ 			dev_err_ratelimited(stream.dart->dev,
+ 				"retaining page tables after power failure: %d\n", j);
+ 			return;
+@@ -3516,6 +3567,7 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
+ 		j = stream.dart->hw->invalidate_tlb(&stream);
+ 		ret = ret ?: j;
+ 		pm_runtime_put(stream.dart->dev);
++		apple_dart_sleep_writer_put(stream.dart, gate);
+ 		/*
+ 		 * Do not free page tables that hardware may still cache, also
+ 		 * when a consumer release or an attach rollback retired the root.
+@@ -5142,6 +5194,9 @@ static int apple_dart_probe(struct platform_device *pdev)
+ 		dart->managed_sids = BIT(1) | BIT(2);
+ 	}
+ 	spin_lock_init(&dart->managed_lock);
++	ret = apple_dart_cio_init(dart, resource_size(res), j713_display);
++	if (ret)
++		return ret;
+ 	dart->preserve_display = j713_display || j713_dcpext || j713_dispext;
+ 	dart->dispext = j713_dispext;
+ 	dart->power_gated = j713_dispext;
+@@ -6001,7 +6056,9 @@ static const struct apple_dart_hw apple_dart_hw_t8110 = {
+ 	.ttbr_count = 1,
+ };
+ 
++#include "apple-dart-cio-owner.h"
+ #include "apple-dart-sleep.c"
++#include "apple-dart-cio.c"
+ 
+ static void apple_dart_save_state(struct apple_dart *dart)
+ {
+@@ -6201,8 +6258,8 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
+ 	/* Runtime PM may not stop the live MTP; system sleep uses its own callbacks. */
+ 	if (dart->live_mtp)
+ 		return -EBUSY;
+-	/* Native radio owner restores before the PCI functions resume. */
+-	if (dart->managed_sids && READ_ONCE(dart->sleep_record))
++	/* Native owners restore after host clocks and before their requesters. */
++	if ((dart->managed_sids && READ_ONCE(dart->sleep_record)) || READ_ONCE(dart->cio_active))
+ 		return 0;
+ 
+ 	dart->tunnel_state_restored = false;
+@@ -6355,8 +6412,8 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
+ 	unsigned int sid, idx;
+ 	int ret;
+ 
+-	/* Native radio owner restores before the PCI functions resume. */
+-	if (dart->managed_sids && READ_ONCE(dart->sleep_record))
++	/* Native owners restore after host clocks and before their requesters. */
++	if ((dart->managed_sids && READ_ONCE(dart->sleep_record)) || READ_ONCE(dart->cio_active))
+ 		return 0;
+ 
+ 	/* No reset or restore: see apple_dart_suspend(). */
+@@ -6469,7 +6526,7 @@ static __maybe_unused int apple_dart_resume_noirq(struct device *dev)
+ 	int ret;
+ 
+ 	/* Its host restores every register after the native port clocks return. */
+-	if (dart->managed_sids && READ_ONCE(dart->sleep_record))
++	if ((dart->managed_sids && READ_ONCE(dart->sleep_record)) || READ_ONCE(dart->cio_active))
+ 		return pm_runtime_force_resume(dev);
+ 
+ 	/*
+diff --git a/include/linux/soc/apple/dart-cio.h b/include/linux/soc/apple/dart-cio.h
+new file mode 100644
+index 0000000000..35cb98e3da
+--- /dev/null
++++ b/include/linux/soc/apple/dart-cio.h
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __LINUX_SOC_APPLE_DART_CIO_H
++#define __LINUX_SOC_APPLE_DART_CIO_H
++
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++
++struct device;
++struct apple_dart_cio;
++
++/*
++ * Bind once, while the host is probing. The synchronous host PM transaction
++ * calls prepare before suspend callbacks, off after every requester is stopped
++ * but before clocks go away, on after clocks return but before DMA, and finish
++ * after recovery. on also unwinds a partial off. While the DART is closed, page
++ * tables are updated in memory only. finish always ends the transaction; a DART
++ * that was not restored stays closed, its registers unused, until reboot.
++ */
++#if IS_REACHABLE(CONFIG_APPLE_DART)
++int apple_dart_cio_bind(struct device *owner, struct device *provider,
++			struct apple_dart_cio **state);
++int apple_dart_cio_prepare(struct apple_dart_cio *state);
++int apple_dart_cio_off(struct apple_dart_cio *state);
++int apple_dart_cio_on(struct apple_dart_cio *state);
++int apple_dart_cio_finish(struct apple_dart_cio *state);
++#else
++static inline int apple_dart_cio_bind(struct device *owner, struct device *provider,
++				      struct apple_dart_cio **state)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int apple_dart_cio_prepare(struct apple_dart_cio *s)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int apple_dart_cio_off(struct apple_dart_cio *s)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int apple_dart_cio_on(struct apple_dart_cio *s)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int apple_dart_cio_finish(struct apple_dart_cio *s)
++{
++	return -EOPNOTSUPP;
++}
++
++#endif
++#endif
+diff --git a/tools/asahi/apple-dart-fw/fixture.c b/tools/asahi/apple-dart-fw/fixture.c
+index c7469296b8..4ecb32bb7e 100644
+--- a/tools/asahi/apple-dart-fw/fixture.c
++++ b/tools/asahi/apple-dart-fw/fixture.c
+@@ -67,6 +67,7 @@ struct apple_dart {
+ 	int lock, locked_retire_err[2];
+ 	/* A J713 sleep's, never set here. */
+ 	void *sleep_record;
++	bool cio_active;
+ };
+ struct apple_dart_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
+ struct apple_dart_atomic_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
+@@ -131,6 +132,24 @@ static void apple_dart_sleep_release_failed(void)
+ {
+ 	abort();
+ }
++
++/* Admitted and counted, as a writer of a DART a sleep owns; every one must leave. */
++#define APPLE_DART_WRITER_COUNTED 1
++#define APPLE_DART_WRITER_CLOSED 2
++static int writers;
++static int apple_dart_sleep_writer_get(struct apple_dart *dart)
++{
++	(void)dart;
++	writers++;
++	return APPLE_DART_WRITER_COUNTED;
++}
++
++static void apple_dart_sleep_writer_put(struct apple_dart *dart, int gate)
++{
++	(void)dart;
++	assert(gate == APPLE_DART_WRITER_COUNTED && writers > 0);
++	writers--;
++}
+ #define dev_info(d,...) ((void)0)
+ /* PRODUCTION */
+ #define IOMMU_RESV_DIRECT 1
+diff --git a/tools/asahi/apple-dart-range-tests.py b/tools/asahi/apple-dart-range-tests.py
+index f12f5ce1fa..edebda6eb6 100644
+--- a/tools/asahi/apple-dart-range-tests.py
++++ b/tools/asahi/apple-dart-range-tests.py
+@@ -71,8 +71,10 @@ static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream, u64 fi
+ static int full(struct apple_dart_stream_map *stream) { fulls++; return 0; }
+ /* No J713 sleep owns this DART, so writers are admitted; each must still leave. */
+ static int writers;
+-static int apple_dart_sleep_writer_get(struct apple_dart *dart) { writers++; return 0; }
+-static void apple_dart_sleep_writer_put(struct apple_dart *dart) { assert(writers>0); writers--; }
++#define APPLE_DART_WRITER_COUNTED 1
++#define APPLE_DART_WRITER_CLOSED 2
++static int apple_dart_sleep_writer_get(struct apple_dart *dart) { writers++; return APPLE_DART_WRITER_COUNTED; }
++static void apple_dart_sleep_writer_put(struct apple_dart *dart, int gate) { assert(gate==APPLE_DART_WRITER_COUNTED && writers>0); writers--; }
+ static void apple_dart_sleep_release_failed(void) { assert(!"sleep writer refused"); }
+ '''
+     source += production
+diff --git a/tools/asahi/dart-cio-owner-tests.c b/tools/asahi/dart-cio-owner-tests.c
+new file mode 100644
+index 0000000000..5f68b65576
+--- /dev/null
++++ b/tools/asahi/dart-cio-owner-tests.c
+@@ -0,0 +1,339 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Included after the MMIO fixture and before the actual ownership methods. */
++#include <limits.h>
++#define READ_ONCE(x) (x)
++#define WRITE_ONCE(x, v) ((x) = (v))
++/* Single-threaded fixture: model publication without CPU barriers. */
++#define smp_store_release(p, v) (*(p) = (v))
++#define dma_wmb() \
++	do {      \
++	} while (0)
++#define spin_lock_irqsave(lock, flags) \
++	do {                           \
++		(void)(lock);          \
++		(flags) = 0;           \
++	} while (0)
++#define spin_unlock_irqrestore(lock, flags) \
++	do {                                \
++		(void)(lock);               \
++		(void)(flags);              \
++	} while (0)
++#define APPLE_PS_PROT_SLICE(n) (0x100 + 0x40 * (n))
++#define APPLE_PS_PROT_SLICE_ON BIT(4)
++#define APPLE_DART_WRITER_COUNTED 1
++#define APPLE_DART_WRITER_CLOSED 2
++#define scoped_guard(type, lock) for (int _g = ((void)(lock), 1); _g; _g = 0)
++#define bitmap_fill(map, n) ((void)sizeof(n), memset((map), 0xff, sizeof(map)))
++#define PM_SUSPEND_MEM 3
++static int pm_suspend_target_state = PM_SUSPEND_MEM;
++struct device {
++	int refs;
++};
++struct device_link {};
++struct regmap {
++	u32 value;
++	int fail, fail_read;
++	unsigned int offset;
++};
++struct apple_dart_sleep {
++	int result;
++};
++struct apple_dart_cio;
++struct apple_dart_stream_map;
++struct apple_dart_hw {
++	int (*invalidate_tlb)(struct apple_dart_stream_map *map);
++};
++struct apple_dart {
++	struct device *dev;
++	void *regs;
++	unsigned int num_streams, sleep_writers;
++	bool managed_sids, sleep_closed, commands_gated, cio_active;
++	int managed_lock, lock;
++	const struct apple_dart_hw *hw;
++	struct apple_dart_cio *cio;
++	struct apple_dart_sleep *sleep_record;
++};
++struct apple_dart_stream_map {
++	struct apple_dart *dart;
++	unsigned long sidmap[4];
++};
++static unsigned int invalidations, sleeps;
++static bool fail_flush;
++/* A flush issues commands, so it needs them reopened; it may precede the opening. */
++static int model_invalidate(struct apple_dart_stream_map *map)
++{
++	assert(!map->dart->commands_gated);
++	if (fail_flush)
++		return -ETIMEDOUT;
++	invalidations++;
++	return 0;
++}
++/* The drain of memory-only writers: a hook lets one finish meanwhile. */
++static void (*on_sleep)(void);
++static void usleep_range(unsigned long min, unsigned long max)
++{
++	(void)min;
++	(void)max;
++	sleeps++;
++	if (on_sleep)
++		on_sleep();
++}
++static void (*on_read)(void);
++static const struct apple_dart_hw model_hw = { .invalidate_tlb = model_invalidate };
++static int pm_runtime_resume_and_get(struct device *dev)
++{
++	dev->refs++;
++	return 0;
++}
++static void pm_runtime_put(struct device *dev)
++{
++	assert(dev->refs > 0);
++	dev->refs--;
++}
++static int regmap_read(struct regmap *map, unsigned int off, u32 *value)
++{
++	assert(off == map->offset);
++	if (on_read)
++		on_read();
++	if (map->fail_read)
++		return -EIO;
++	*value = map->value;
++	return 0;
++}
++static int regmap_write(struct regmap *map, unsigned int off, u32 value)
++{
++	assert(off == map->offset);
++	if (map->fail)
++		return -EIO;
++	map->value = value;
++	return 0;
++}
++static int regmap_update_bits(struct regmap *map, unsigned int off, u32 mask,
++			      u32 value)
++{
++	assert(off == map->offset && mask == BIT(4));
++	if (map->fail)
++		return -EIO;
++	map->value = (map->value & ~mask) | value;
++	return 0;
++}
++static struct apple_dart dart;
++static struct device provider, owner;
++static struct regmap gapf;
++static int apple_dart_quiesce_commands(struct device *dev)
++{
++	assert(dev == &provider && dart.sleep_closed && !dart.sleep_writers);
++	dart.commands_gated = true;
++	return 0;
++}
++
++/* Arguments are evaluated: a diagnostic's register reads still happen. */
++static inline void dev_log(void *dev, const char *fmt, ...)
++{
++	(void)dev;
++	(void)fmt;
++}
++#define dev_err(dev, ...) dev_log(dev, __VA_ARGS__)
++#define dev_info(dev, ...) dev_log(dev, __VA_ARGS__)
++/* ACTUAL_OWNER */
++
++static struct apple_dart_cio state;
++static void reset_owner(unsigned int slice, bool partitions)
++{
++	reset(partitions ? 28 : 256, partitions);
++	provider.refs = owner.refs = 0;
++	/* A live DART: its slice enabled, protection on. */
++	gapf = (struct regmap){ .offset = APPLE_PS_PROT_SLICE(slice),
++				.value = BIT(1) | BIT(4) | BIT(7) };
++	/* PCIe-C's software allocator covers 64 of the 256 hardware SIDs. */
++	dart = (struct apple_dart){ .regs = regs,
++				    .num_streams = partitions ? 28 : 64,
++				    .dev = &provider,
++				    .hw = &model_hw,
++				    .cio = &state };
++	state = (struct apple_dart_cio){ .dart = &dart,
++					 .owner = &owner,
++					 .gapf = &gapf,
++					 .slice = slice };
++	invalidations = sleeps = 0;
++	fail_flush = false;
++	on_sleep = on_read = NULL;
++}
++static struct apple_dart dart;
++/* A writer that updates page tables in memory while the DART is closed. */
++static void closed_writer(void)
++{
++	int gate = apple_dart_sleep_writer_get(&dart);
++
++	assert(gate == APPLE_DART_WRITER_CLOSED);
++	apple_dart_sleep_writer_put(&dart, gate);
++}
++static void finish_writer(void)
++{
++	apple_dart_sleep_writer_put(&dart, APPLE_DART_WRITER_CLOSED);
++	on_sleep = NULL;
++}
++int main(void)
++{
++	unsigned int cases = 0;
++	const unsigned int slices[] = { 14, 15, 18, 19 };
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(slices); i++) {
++		reset_owner(slices[i], i % 2);
++		for (unsigned int cycle = 0; cycle < 3; cycle++) {
++			assert(!apple_dart_cio_prepare(&state) &&
++			       provider.refs == 1 && dart.cio_active);
++			assert(apple_dart_cio_prepare(&state) == -EBUSY &&
++			       provider.refs == 1);
++			assert(!apple_dart_cio_off(&state) && state.changed &&
++			       !state.restored);
++			assert(state.saved.streams == (i % 2 ? 28 : 256));
++			assert(dart.commands_gated && dart.sleep_closed &&
++			       gapf.value == (BIT(1) | BIT(7)));
++			lose_power();
++			assert(!apple_dart_cio_on(&state) && state.restored);
++			assert(!dart.commands_gated && !dart.sleep_closed);
++			assert(gapf.value == (BIT(1) | BIT(4) | BIT(7)));
++			check_restored(&state.saved);
++			unsigned int before = writes;
++
++			assert(!apple_dart_cio_on(&state) && writes == before);
++			assert(apple_dart_cio_off(&state) == -EINVAL);
++			assert(!apple_dart_cio_finish(&state) &&
++			       !dart.cio_active && !provider.refs);
++			assert(apple_dart_cio_on(&state) == -EINVAL);
++			assert(apple_dart_cio_finish(&state) == -EINVAL);
++			cases++;
++		}
++	}
++	reset_owner(15, true);
++	assert(!apple_dart_cio_prepare(&state));
++	assert(!apple_dart_cio_on(&state));
++	assert(!apple_dart_cio_finish(&state) && !reads && !writes);
++	cases++;
++	assert(!apple_dart_cio_prepare(&state));
++	assert(apple_dart_sleep_writer_get(&dart) == APPLE_DART_WRITER_COUNTED);
++	assert(apple_dart_cio_off(&state) == -EBUSY && !reads && !writes);
++	apple_dart_sleep_writer_put(&dart, APPLE_DART_WRITER_COUNTED);
++	assert(!apple_dart_cio_finish(&state));
++	cases++;
++	for (unsigned int fault = 0; fault < 4; fault++) {
++		reset_owner(14, false);
++		assert(!apple_dart_cio_prepare(&state));
++		if (fault == 0)
++			gapf.fail_read = 1;
++		if (fault == 1)
++			gapf.value &= ~BIT(1);
++		if (fault == 2)
++			busy = 1;
++		if (fault == 3)
++			regs[2] = 0x204;
++		assert(apple_dart_cio_off(&state) < 0);
++		assert(!writes && !dart.commands_gated && !dart.sleep_closed &&
++		       !state.changed);
++		assert(!apple_dart_cio_finish(&state) && !provider.refs);
++		cases++;
++	}
++	reset_owner(19, true);
++	assert(!apple_dart_cio_prepare(&state));
++	gapf.fail = 1;
++	assert(apple_dart_cio_off(&state) == -EIO);
++	assert(state.changed && dart.sleep_closed && dart.commands_gated);
++	assert(apple_dart_cio_on(&state) == -EIO && !state.restored);
++	gapf.fail = 0;
++	ntrace = 0;
++	assert(!apple_dart_cio_on(&state));
++	check_restored(&state.saved);
++	assert(!apple_dart_cio_finish(&state) && !provider.refs);
++	cases++;
++	reset_owner(18, false);
++	assert(!apple_dart_cio_prepare(&state));
++	assert(!apple_dart_cio_off(&state));
++	lose_power();
++	drop = 0x1400;
++	assert(apple_dart_cio_on(&state) == -EIO && !state.restored);
++	assert(dart.sleep_closed && dart.commands_gated && provider.refs == 1);
++	drop = ~0U;
++	assert(!apple_dart_cio_on(&state) && !apple_dart_cio_finish(&state));
++	cases++;
++	reset_owner(15, true);
++	assert(!apple_dart_cio_prepare(&state));
++	assert(!apple_dart_cio_off(&state));
++	/* A map while closed goes to memory and is flushed once it reopens. */
++	assert(apple_dart_sleep_writer_get(&dart) == APPLE_DART_WRITER_CLOSED &&
++	       state.tlb_stale && !dart.sleep_writers && state.closed_writers == 1);
++	apple_dart_sleep_writer_put(&dart, APPLE_DART_WRITER_CLOSED);
++	lose_power();
++	assert(!invalidations && !apple_dart_cio_on(&state) && invalidations == 1);
++	assert(!state.tlb_stale && !apple_dart_cio_finish(&state));
++	cases++;
++	/* Without such a map, reopening issues no extra flush. */
++	reset_owner(18, false);
++	assert(!apple_dart_cio_prepare(&state) && !apple_dart_cio_off(&state));
++	lose_power();
++	assert(!apple_dart_cio_on(&state) && !invalidations);
++	assert(!apple_dart_cio_finish(&state));
++	cases++;
++	/* Not restored: the transaction ends, the DART stays closed, sleeps are refused. */
++	reset_owner(14, false);
++	assert(!apple_dart_cio_prepare(&state) && !apple_dart_cio_off(&state));
++	assert(apple_dart_cio_finish(&state) == -EIO && state.dead);
++	assert(!dart.cio_active && !provider.refs);
++	assert(dart.sleep_closed && dart.commands_gated);
++	closed_writer();
++	assert(apple_dart_cio_prepare(&state) == -EIO && !provider.refs);
++	/* Still closed once its owner is gone. */
++	state.owner = NULL;
++	closed_writer();
++	cases++;
++	/* A memory-only writer still running at reopening is waited for, then flushed. */
++	reset_owner(19, true);
++	assert(!apple_dart_cio_prepare(&state) && !apple_dart_cio_off(&state));
++	assert(apple_dart_sleep_writer_get(&dart) == APPLE_DART_WRITER_CLOSED);
++	lose_power();
++	on_sleep = finish_writer;
++	assert(!apple_dart_cio_on(&state) && sleeps == 1 && invalidations == 1);
++	assert(!dart.sleep_closed && !state.closed_writers && !state.tlb_stale);
++	assert(!apple_dart_cio_finish(&state));
++	cases++;
++	/* One that never finishes keeps it closed; the transaction then ends dead. */
++	reset_owner(15, true);
++	assert(!apple_dart_cio_prepare(&state) && !apple_dart_cio_off(&state));
++	assert(apple_dart_sleep_writer_get(&dart) == APPLE_DART_WRITER_CLOSED);
++	lose_power();
++	assert(apple_dart_cio_on(&state) == -EBUSY && !state.restored && dart.sleep_closed);
++	assert(apple_dart_cio_finish(&state) == -EIO && state.dead);
++	apple_dart_sleep_writer_put(&dart, APPLE_DART_WRITER_CLOSED);
++	cases++;
++	/* A flush that fails keeps it closed too. */
++	reset_owner(14, false);
++	assert(!apple_dart_cio_prepare(&state) && !apple_dart_cio_off(&state));
++	closed_writer();
++	lose_power();
++	fail_flush = true;
++	assert(apple_dart_cio_on(&state) == -ETIMEDOUT && dart.sleep_closed);
++	assert(apple_dart_cio_finish(&state) == -EIO && state.dead);
++	cases++;
++	/* A snapshot that fails after a memory-only update reopens with a flush. */
++	reset_owner(18, false);
++	assert(!apple_dart_cio_prepare(&state));
++	regs[2] = 0x204;
++	on_read = closed_writer;
++	assert(apple_dart_cio_off(&state) < 0 && !state.changed);
++	assert(!dart.sleep_closed && invalidations == 1 && !state.dead);
++	on_read = NULL;
++	assert(!apple_dart_cio_finish(&state));
++	cases++;
++	/* A display firmware left protection off: it is turned on before the snapshot. */
++	reset_owner(5, false);
++	gapf.value = BIT(1) | BIT(7);
++	assert(!apple_dart_cio_prepare(&state) && !apple_dart_cio_off(&state));
++	assert(gapf.value == (BIT(1) | BIT(7)));
++	lose_power();
++	/* After the sleep the slice word reads zero: it is written back. */
++	gapf.value = 0;
++	assert(!apple_dart_cio_on(&state) && gapf.value == (BIT(1) | BIT(4) | BIT(7)));
++	assert(!apple_dart_cio_finish(&state));
++	cases++;
++	printf("PASS %u CIO DART ownership cases\n", cases);
++}
+diff --git a/tools/asahi/dart-cio-owner-tests.py b/tools/asahi/dart-cio-owner-tests.py
+new file mode 100644
+index 0000000000..f9e717f607
+--- /dev/null
++++ b/tools/asahi/dart-cio-owner-tests.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise the actual owner transaction, writer gate and register helpers together."""
++import argparse
++import hashlib
++import json
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def function(source, name):
++    found = re.search(r'^(?:static )?(?:int|void|bool) ' + name + r'\([^;]+?\{.*?\n\}',
++                      source, re.M | re.S)
++    assert found, name
++    return found.group()
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--output', type=Path)
++    args = parser.parse_args()
++    paths = ['drivers/iommu/apple-dart-power.h', 'drivers/iommu/apple-dart-cio-power.h',
++             'drivers/iommu/apple-dart-cio.c', 'drivers/iommu/apple-dart-sleep.c',
++             'drivers/iommu/apple-dart-cio-owner.h']
++    sources = {p: (ROOT / p).read_text() for p in paths}
++    hw = '\n'.join(sources[p] for p in paths[:2])
++    owner = sources[paths[2]]
++    struct = re.search(r'^struct apple_dart_cio \{.*?\n\};', sources[paths[4]],
++                       re.M | re.S).group()
++    names = ['apple_dart_cio_prepare', 'apple_dart_cio_gapf', 'apple_dart_cio_reopen',
++             'apple_dart_cio_off', 'apple_dart_cio_on', 'apple_dart_cio_finish']
++    methods = '\n'.join(function(owner, n) for n in names)
++    gate = '\n'.join(function(sources[paths[3]], n) for n in [
++        'apple_dart_sleep_writer_get', 'apple_dart_sleep_writer_put', 'apple_dart_sleep_close'])
++    fixture = Path(__file__).with_name('dart-cio-power-tests.c').read_text().split('int main(void)')[0]
++    fixture = fixture.replace('/* ACTUAL_HEADERS */', hw)
++    fixture += Path(__file__).with_suffix('.c').read_text().replace('/* ACTUAL_OWNER */', struct + '\n' + gate + methods)
++    mutations = {
++        'allocator-is-not-hardware-size': (
++            'streams = FIELD_GET(GENMASK(8, 0), params3);', 'streams = dart->num_streams;'),
++        'skip-writer-close': ('ret = apple_dart_sleep_close(dart);', 'ret = 0;'),
++        'ignore-gapf-policy': ('if (!ret && !(value & BIT(1)))', 'if (false)'),
++        'forget-partial-off': ('s->changed = true;', 's->changed = false;'),
++        'open-on-failure': ('\t\treturn ret;\n\t}\n\tdma_wmb();',
++                            '\t\tapple_dart_cio_reopen(s);\n\t\treturn ret;\n\t}\n\tdma_wmb();'),
++        'forget-stale-flush': ('if (stale) {', 'if (false) {'),
++        'open-with-writers': ('if (!s->closed_writers) {', 'if (true) {'),
++        'owner-only-gate': ('(READ_ONCE(cio->owner) || READ_ONCE(dart->sleep_closed))',
++                            'READ_ONCE(cio->owner)'),
++        'open-after-failed-flush': ('if (ret)\n\t\t\t\treturn ret;\n\t\t\tcontinue;',
++                                    '(void)ret;\n\t\t\tcontinue;'),
++        'forget-dead': ('\t\ts->dead = true;\n', ''),
++        'reopen-unrestored': ('\tif (s->changed && !s->restored) {', '\tif (false) {'),
++        'overwrite-gapf-neighbors': ('APPLE_PS_PROT_SLICE(s->slice), BIT(4),',
++                                    'APPLE_PS_PROT_SLICE(s->slice), ~0U,'),
++    }
++    variants = {'real': fixture}
++    for name, (old, new) in mutations.items():
++        assert old in fixture, name
++        variants[name] = fixture.replace(old, new)
++    with tempfile.TemporaryDirectory(prefix='dart-cio-owner-') as tmp:
++        out = args.output or Path(tmp)
++        out.mkdir(parents=True, exist_ok=True)
++        results = {}
++        for name, text in variants.items():
++            unit, binary = out / (name + '.c'), out / name
++            unit.write_text(text)
++            subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
++                            '-Wno-unused-function', '-Wno-unused-parameter', '-g',
++                            '-fsanitize=address,undefined', str(unit), '-o', str(binary)], check=True)
++            run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
++            results[name] = {'exit': run.returncode, 'stdout': run.stdout, 'stderr': run.stderr}
++            assert (run.returncode == 0) == (name == 'real'), (name, results[name])
++            if name == 'real': print(run.stdout, end='')
++        (out / 'receipt.json').write_text(json.dumps({
++            'sha256': {p: hashlib.sha256(s.encode()).hexdigest() for p, s in sources.items()},
++            'results': results}, indent=2) + '\n')
++        print(f'PASS {len(mutations)} negative controls')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/asahi/dart-cio-power-tests.c b/tools/asahi/dart-cio-power-tests.c
+new file mode 100644
+index 0000000000..df853b59ca
+--- /dev/null
++++ b/tools/asahi/dart-cio-power-tests.c
+@@ -0,0 +1,333 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Fault-injected register model; no hardware accesses. */
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++typedef uint32_t u32;
++#define __iomem
++#define BIT(n) (1U << (n))
++#define GENMASK(h, l) ((~0U << (l)) & (~0U >> (31 - (h))))
++#define FIELD_GET(mask, val) (((val) & (mask)) >> __builtin_ctz(mask))
++#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
++#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
++#define max(a, b) ((a) > (b) ? (a) : (b))
++/* The MMIO mock records write order synchronously. */
++#define mb() \
++	do { \
++	} while (0)
++static u32 regs[0x9000 / 4];
++static unsigned int reads, writes, drop, busy, flushes, enables,
++	partition_reads;
++static unsigned int trace[4096], ntrace;
++static unsigned int offset(const void *p)
++{
++	uintptr_t off = (uintptr_t)p - (uintptr_t)regs;
++
++	assert(off < sizeof(regs) && !(off & 3));
++	return off;
++}
++static u32 readl(const void *p)
++{
++	unsigned int off = offset(p);
++
++	reads++;
++	assert(off != 0x100 && off != 0x104 && off < 0x6000);
++	if (off >= 0x800 && off < 0x840)
++		partition_reads++;
++	if (off == 0x80 && busy == 1)
++		return BIT(31);
++	if (off == 0x604 && busy == 2)
++		return 1;
++	if (off == 0x230 && busy == 3)
++		return 1;
++	return regs[off / 4];
++}
++static void writel(u32 value, void *p)
++{
++	unsigned int off = offset(p);
++
++	writes++;
++	assert(ntrace < ARRAY_SIZE(trace));
++	trace[ntrace++] = off;
++	assert(off != 0x100 && off != 0x104 && off != 0x200 && off != 0x208);
++	assert(off != 0x700 && off != 0x704 && off != 0x720);
++	assert(!(off >= 0x500 && off <= 0x548));
++	if (off == drop)
++		return;
++	if (off == 0x4060) {
++		/* Only implemented mask bits retain the write. */
++		regs[off / 4] = value & 0xff;
++	} else if (off >= 0xc20 && off < 0xc40) {
++		assert(value && !(value & (value - 1)));
++		regs[(off - 0x20) / 4] &= ~value;
++	} else if (off == 0x80) {
++		assert(value == 0xa000 || value == 0x8000);
++		assert(!regs[0xc00 / 4] && !regs[0xc1c / 4]);
++		flushes++;
++	} else {
++		if (off >= 0xc00 && off < 0xc20) {
++			assert(flushes && !regs[0x4060 / 4]);
++			enables++;
++		}
++		regs[off / 4] = value;
++	}
++}
++#define readl_poll_timeout_atomic(addr, value, condition, delay, timeout) \
++	({                                                                \
++		(void)(delay);                                            \
++		(void)(timeout);                                          \
++		int result = -ETIMEDOUT;                                  \
++		for (unsigned int tries = 0; tries < 4; tries++) {        \
++			value = readl(addr);                              \
++			if (condition) {                                  \
++				result = 0;                               \
++				break;                                    \
++			}                                                 \
++		}                                                         \
++		result;                                                   \
++	})
++
++/* ACTUAL_HEADERS */
++
++static void reset(unsigned int streams, bool partitions)
++{
++	memset(regs, 0, sizeof(regs));
++	reads = writes = busy = flushes = enables = partition_reads = ntrace =
++		0;
++	drop = ~0U;
++	regs[0] = partitions ? BIT(29) : 0;
++	regs[1] = BIT(16) | BIT(20) | BIT(2);
++	regs[2] = 0x203;
++	regs[3] = streams | (16 << 16);
++	regs[0x208 / 4] = BIT(3) | BIT(4);
++	regs[0x210 / 4] = 1;
++	regs[0x228 / 4] = 0x1122;
++	regs[0x22c / 4] = 0x3344;
++	for (unsigned int i = 0; i < DART_POWER_TUNABLES; i++)
++		regs[dart_power_tunables[i].offset / 4] =
++			dart_power_tunables[i].mask;
++	for (unsigned int i = 0; i < DART_POWER_TZ_WORDS; i++)
++		regs[dart_power_tz[i].offset / 4] = dart_power_tz[i].mask;
++	for (unsigned int i = 0; i < 16; i++)
++		regs[(0x800 + 4 * i) / 4] = 0xa0000000 | 0x20000 | (2 * i);
++	for (unsigned int sid = 0; sid < streams; sid++) {
++		regs[(0x1000 + 4 * sid) / 4] =
++			(sid == 253 || sid == 255) ? BIT(8) : BIT(0);
++		regs[(0x1400 + 4 * sid) / 4] =
++			(sid == 253 || sid == 255) ? 0 : BIT(31) | sid;
++		regs[(0xc00 + 4 * (sid / 32)) / 4] |= BIT(sid % 32);
++	}
++}
++static void lose_power(void)
++{
++	u32 params[4], tz[DART_POWER_TZ_WORDS], lock = regs[0x208 / 4];
++
++	memcpy(params, regs, sizeof(params));
++	for (unsigned int i = 0; i < DART_POWER_TZ_WORDS; i++)
++		tz[i] = regs[dart_power_tz[i].offset / 4];
++	memset(regs, 0, sizeof(regs));
++	memcpy(regs, params, sizeof(params));
++	for (unsigned int i = 0; i < DART_POWER_TZ_WORDS; i++)
++		regs[dart_power_tz[i].offset / 4] = tz[i];
++	regs[0x208 / 4] = lock;
++	flushes = enables = ntrace = 0;
++}
++static void check_restored(const struct dart_cio_power *s)
++{
++	for (unsigned int sid = 0; sid < s->streams; sid++) {
++		assert(regs[(0x1000 + 4 * sid) / 4] == s->tcr[sid]);
++		assert(regs[(0x1400 + 4 * sid) / 4] == s->ttbr[sid]);
++	}
++	for (unsigned int i = 0; i < DIV_ROUND_UP(s->streams, 32); i++)
++		assert(regs[(0xc00 + 4 * i) / 4] == s->enabled[i]);
++	for (unsigned int i = 0; i < s->partitions; i++)
++		assert((regs[(0x800 + 4 * i) / 4] & DART_CIO_PARTITION_MASK) ==
++		       (s->partition[i] & DART_CIO_PARTITION_MASK));
++	unsigned int flush = 0, pair = 0, enable = 0;
++
++	for (unsigned int i = 0; i < ntrace; i++) {
++		if (trace[i] == 0x80)
++			flush = i;
++		if (trace[i] == 0x228)
++			pair = i;
++		if (trace[i] == 0xc00)
++			enable = i;
++	}
++	assert(flush < enable && (!pair || (flush < pair && pair < enable)));
++}
++static int restore(struct dart_cio_power *s)
++{
++	ntrace = flushes = enables = 0;
++	return dart_cio_restore(regs, s);
++}
++int main(void)
++{
++	struct dart_cio_power s = {};
++	unsigned int cases = 0;
++	/* The live T8132 PCIe-C bank reports 256 SIDs, not the allocator's 64. */
++	reset(256, false);
++	regs[0] = 0xae313020;
++	regs[1] = 0x34110083;
++	regs[2] = 0x2a2a0202;
++	regs[3] = 0x00100100;
++	regs[0x208 / 4] = 0;
++	assert(dart_cio_capture(regs, &s, 64, false) == -EOPNOTSUPP && !writes);
++	assert(!dart_cio_capture(regs, &s, 256, false) && !s.common.has_tz);
++	assert(!dart_cio_disable(regs, &s));
++	lose_power();
++	assert(!restore(&s));
++	check_restored(&s);
++	cases++;
++	for (unsigned int streams = 28; streams <= 256; streams += 228) {
++		bool parts = streams == 28;
++
++		for (unsigned int version = 0x202; version <= 0x203;
++		     version++) {
++			reset(streams, parts);
++			regs[2] = version;
++			assert(!dart_cio_capture(regs, &s, streams, parts) &&
++			       s.valid && !writes);
++			assert(partition_reads == (parts ? 16 : 0));
++			assert(!dart_cio_disable(regs, &s));
++			for (unsigned int i = 0; i < DIV_ROUND_UP(streams, 32);
++			     i++)
++				assert(!regs[(0xc00 + 4 * i) / 4]);
++			lose_power();
++			assert(!restore(&s));
++			check_restored(&s);
++			cases++;
++			assert(!dart_cio_capture(regs, &s, streams, parts));
++			assert(!dart_cio_disable(regs, &s));
++			/* Abort without losing power also restores the saved context. */
++			assert(!restore(&s));
++			check_restored(&s);
++			cases++;
++		}
++	}
++	for (unsigned int i = 0; i < 8; i++) {
++		reset(256, false);
++		regs[(0x4000 + 4 * i) / 4] = BIT(i);
++		assert(dart_cio_capture(regs, &s, 256, false) == -EIO &&
++		       !writes && !s.valid);
++		cases++;
++	}
++	for (unsigned int kind = 0; kind < 9; kind++) {
++		reset(28, true);
++		switch (kind) {
++		case 0:
++			regs[2] = 0x201;
++			break;
++		case 1:
++			regs[2] = 0x204;
++			break;
++		case 2:
++			regs[0] = 0;
++			break;
++		case 3:
++			regs[3] = 28 | (15 << 16);
++			break;
++		case 4:
++			regs[3] = 27 | (16 << 16);
++			break;
++		case 5:
++			regs[0x704 / 4] = 0x100;
++			break;
++		case 6:
++			regs[0x4060 / 4] = 1;
++			break;
++		case 7:
++			regs[0x208 / 4] = 0;
++			break;
++		case 8:
++			regs[0xc00 / 4] |= BIT(31);
++			break;
++		}
++		assert(dart_cio_capture(regs, &s, 28, true) < 0 && !writes &&
++		       !s.valid);
++		cases++;
++	}
++	for (unsigned int kind = 1; kind <= 3; kind++) {
++		reset(28, true);
++		busy = kind;
++		assert(dart_cio_capture(regs, &s, 28, true) == -ETIMEDOUT &&
++		       !writes);
++		cases++;
++	}
++	const unsigned int badwrites[] = { 0x210,
++					   0x20c,
++					   0x220,
++					   0x224,
++					   0x300,
++					   0x308,
++					   0x310,
++					   0x800,
++					   0x83c,
++					   0x1000,
++					   0x1000 + 4 * 255,
++					   0x1400,
++					   0x228,
++					   0x22c,
++					   0xc00,
++					   0xc1c };
++	for (unsigned int i = 0; i < ARRAY_SIZE(badwrites); i++) {
++		reset(256, true);
++		assert(!dart_cio_capture(regs, &s, 256, true));
++		assert(!dart_cio_disable(regs, &s));
++		lose_power();
++		drop = badwrites[i];
++		assert(restore(&s) == -EIO);
++		assert(!regs[0xc00 / 4] && !regs[0xc1c / 4]);
++		drop = ~0U;
++		assert(!restore(&s));
++		check_restored(&s);
++		cases++;
++	}
++	for (unsigned int kind = 0; kind < 5; kind++) {
++		reset(256, true);
++		assert(!dart_cio_capture(regs, &s, 256, true));
++		assert(!dart_cio_disable(regs, &s));
++		lose_power();
++		if (kind == 0)
++			regs[0x208 / 4] ^= BIT(3);
++		if (kind == 1)
++			regs[0x500 / 4] ^= 1;
++		if (kind == 2)
++			regs[3] ^= 1;
++		if (kind == 3)
++			regs[0x4000 / 4] = 1;
++		if (kind == 4) {
++			regs[0x200 / 4] = 1;
++			regs[0x208 / 4] |= 1;
++		}
++		assert(restore(&s) == -EUCLEAN && !enables);
++		cases++;
++	}
++	reset(28, true);
++	assert(!dart_cio_capture(regs, &s, 28, true));
++	busy = 1;
++	assert(dart_cio_disable(regs, &s) == -ETIMEDOUT);
++	busy = 0;
++	assert(!restore(&s));
++	check_restored(&s);
++	cases++;
++	reset(28, true);
++	regs[0xc00 / 4] &= ~BIT(3);
++	assert(!dart_cio_capture(regs, &s, 28, true));
++	regs[0xc00 / 4] |= BIT(3);
++	unsigned int oldwrites = writes;
++
++	assert(restore(&s) == -EUCLEAN && writes == oldwrites);
++	cases++;
++	s.valid = false;
++	unsigned int before = reads + writes;
++
++	assert(dart_cio_disable(regs, &s) == -ENODATA);
++	assert(dart_cio_restore(regs, &s) == -ENODATA &&
++	       reads + writes == before);
++	cases++;
++	printf("PASS %u CIO DART power cases\n", cases);
++}
+diff --git a/tools/asahi/dart-cio-power-tests.py b/tools/asahi/dart-cio-power-tests.py
+new file mode 100644
+index 0000000000..82cf479315
+--- /dev/null
++++ b/tools/asahi/dart-cio-power-tests.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Compile the actual CIO register helpers against a fault-injected MMIO model."""
++import argparse
++import hashlib
++import json
++from pathlib import Path
++import subprocess
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[2]
++MUTATIONS = {
++    'skip-partitions': ('i < s->partitions; i++', 'i < 0; i++'),
++    'truncate-streams': ('sid < s->streams; sid++', 'sid < 28; sid++'),
++    'wrong-error-mask': ('#define DART_POWER_ERROR_MASK 0x4060', '#define DART_POWER_ERROR_MASK 0x104'),
++    'truncate-faults': ('i < DIV_ROUND_UP(s->streams, 32); i++', 'i < 1; i++'),
++    'skip-restore-flush': ('ret = dart_power_flush(regs, false) ?:', 'ret = 0 ?:'),
++    'ignore-lock': ('if (locked)\n\t\treturn -EUCLEAN;', 'if (false)\n\t\treturn -EUCLEAN;'),
++    'wrong-outstanding': ('regs + 0x230 + 4 * i', 'regs + 0x6000 + 4 * i'),
++    'skip-params': ('if (readl(regs + 4 * i) != s->params[i])', 'if (false)'),
++}
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--output', type=Path)
++    args = parser.parse_args()
++    paths = ['drivers/iommu/apple-dart-power.h', 'drivers/iommu/apple-dart-cio-power.h']
++    sources = {p: (ROOT / p).read_text() for p in paths}
++    source = '\n'.join(sources.values())
++    fixture = Path(__file__).with_suffix('.c').read_text()
++    variants = {'real': source}
++    for name, (old, new) in MUTATIONS.items():
++        assert old in source, name
++        variants[name] = source.replace(old, new)
++    with tempfile.TemporaryDirectory(prefix='dart-cio-power-') as tmp:
++        out = args.output or Path(tmp)
++        out.mkdir(parents=True, exist_ok=True)
++        results = {}
++        for name, prod in variants.items():
++            unit, binary = out / (name + '.c'), out / name
++            unit.write_text(fixture.replace('/* ACTUAL_HEADERS */', prod))
++            subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
++                            '-Wno-unused-function', '-Wno-unused-parameter', '-Wno-type-limits', '-g',
++                            '-fsanitize=address,undefined', str(unit), '-o', str(binary)], check=True)
++            run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
++            results[name] = {'exit': run.returncode, 'stdout': run.stdout, 'stderr': run.stderr}
++            assert (run.returncode == 0) == (name == 'real'), (name, results[name])
++            if name == 'real':
++                print(run.stdout, end='')
++        (out / 'receipt.json').write_text(json.dumps({
++            'sha256': {p: hashlib.sha256(s.encode()).hexdigest() for p, s in sources.items()},
++            'results': results}, indent=2) + '\n')
++        print(f'PASS {len(MUTATIONS)} negative controls')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/asahi/dart-sleep-writer-tests.c b/tools/asahi/dart-sleep-writer-tests.c
+index 8594dfb14d..dc4d0982b6 100644
+--- a/tools/asahi/dart-sleep-writer-tests.c
++++ b/tools/asahi/dart-sleep-writer-tests.c
+@@ -19,34 +19,71 @@
+ struct apple_dart_sleep {
+ 	int result;
+ };
++#define APPLE_DART_WRITER_COUNTED 1
++#define APPLE_DART_WRITER_CLOSED 2
++struct apple_dart_cio {
++	void *owner;
++	unsigned int closed_writers;
++	bool tlb_stale;
++};
+ struct apple_dart {
+ 	bool managed_sids, sleep_closed;
+ 	unsigned int sleep_writers;
+ 	int managed_lock;
+ 	struct apple_dart_sleep *sleep_record;
++	struct apple_dart_cio *cio;
++	bool cio_active;
+ };
+ /* ACTUAL_FUNCTIONS */
+ int main(void)
+ {
+ 	struct apple_dart_sleep s = { 0 };
+ 	struct apple_dart d = { .managed_sids = true, .sleep_record = &s };
++	struct apple_dart_cio cio = { 0 };
++	int owner, gate;
+ 
+-	assert(!apple_dart_sleep_writer_get(&d));
+-	assert(!apple_dart_sleep_writer_get(
+-		&d)); /* nested invalidation cannot deadlock */
++	assert(apple_dart_sleep_writer_get(&d) == APPLE_DART_WRITER_COUNTED);
++	/* nested invalidation cannot deadlock */
++	assert(apple_dart_sleep_writer_get(&d) == APPLE_DART_WRITER_COUNTED);
+ 	assert(apple_dart_sleep_close(&d) == -EBUSY && !d.sleep_closed);
+-	apple_dart_sleep_writer_put(&d);
++	apple_dart_sleep_writer_put(&d, APPLE_DART_WRITER_COUNTED);
+ 	assert(apple_dart_sleep_close(&d) == -EBUSY);
+-	apple_dart_sleep_writer_put(&d);
++	apple_dart_sleep_writer_put(&d, APPLE_DART_WRITER_COUNTED);
+ 	assert(!apple_dart_sleep_close(&d));
+ 	assert(apple_dart_sleep_writer_get(&d) == -EBUSY &&
+ 	       s.result == -EUCLEAN && !d.sleep_writers);
+ 	d.sleep_writers = UINT_MAX;
+ 	d.sleep_closed = false;
+ 	assert(apple_dart_sleep_writer_get(&d) == -EOVERFLOW);
++	/* Not gated at all: no lock, nothing counted. */
+ 	d = (struct apple_dart){ 0 };
+-	assert(!apple_dart_sleep_writer_get(&d));
+-	apple_dart_sleep_writer_put(&d);
++	gate = apple_dart_sleep_writer_get(&d);
++	assert(!gate);
++	apple_dart_sleep_writer_put(&d, gate);
++	assert(!d.sleep_writers);
++	/* A host-owned DART with no owner bound yet is not gated either. */
++	d = (struct apple_dart){ .cio = &cio };
++	gate = apple_dart_sleep_writer_get(&d);
++	assert(!gate && !d.sleep_writers);
++	apple_dart_sleep_writer_put(&d, gate);
+ 	assert(!d.sleep_writers);
+-	puts("DART writer gate: nested/in-flight/closed/legacy invariants PASS");
++	/* Bound: counted while open, memory-only while closed, never refused. */
++	cio.owner = &owner;
++	gate = apple_dart_sleep_writer_get(&d);
++	assert(gate == APPLE_DART_WRITER_COUNTED && d.sleep_writers == 1);
++	assert(apple_dart_sleep_close(&d) == -EBUSY);
++	apple_dart_sleep_writer_put(&d, gate);
++	assert(!apple_dart_sleep_close(&d) && !cio.tlb_stale);
++	gate = apple_dart_sleep_writer_get(&d);
++	assert(gate == APPLE_DART_WRITER_CLOSED && !d.sleep_writers && cio.tlb_stale &&
++	       cio.closed_writers == 1);
++	apple_dart_sleep_writer_put(&d, gate);
++	assert(!d.sleep_writers && !cio.closed_writers);
++	/* Closed for good, its owner gone: still memory-only, never its registers. */
++	cio.owner = NULL;
++	gate = apple_dart_sleep_writer_get(&d);
++	assert(gate == APPLE_DART_WRITER_CLOSED && cio.closed_writers == 1);
++	apple_dart_sleep_writer_put(&d, gate);
++	assert(!cio.closed_writers);
++	puts("DART writer gate: nested/in-flight/closed/legacy/CIO invariants PASS");
+ }
+diff --git a/tools/asahi/dart-sleep-writer-tests.py b/tools/asahi/dart-sleep-writer-tests.py
+index ed01d29474..e07f0a68a3 100644
+--- a/tools/asahi/dart-sleep-writer-tests.py
++++ b/tools/asahi/dart-sleep-writer-tests.py
+@@ -31,3 +31,34 @@ with tempfile.TemporaryDirectory() as t:
+         check=True,
+     )
+     subprocess.run([str(b)], check=True)
++
++
++def closed_branches_put(text):
++    """Every CLOSED admission is counted: each branch taking it must put it."""
++    assert "gate < 0 || gate == APPLE_DART_WRITER_CLOSED" not in text
++    found = 0
++    for m in re.finditer(r"if \(gate == APPLE_DART_WRITER_CLOSED\)", text):
++        exit_ = re.search(r"\b(return|continue)\b", text[m.end():])
++        assert exit_, "unterminated CLOSED branch"
++        body = text[m.end():m.end() + exit_.start()]
++        if "apple_dart_sleep_writer_put(" not in body:
++            line = text.count("\n", 0, m.start()) + 1
++            raise AssertionError(f"apple-dart.c:{line}: CLOSED branch exits without a put")
++        found += 1
++    return found
++
++
++driver = (root / "drivers/iommu/apple-dart.c").read_text()
++branches = closed_branches_put(driver)
++assert branches == 6, branches
++# Negative control: a branch that leaks its reference is caught.
++leak = driver.replace("\t\t\tapple_dart_sleep_writer_put(stream.dart, gate);\n\t\t\terr = err ?: ret;\n\t\t\tcontinue;",
++                      "\t\t\terr = err ?: ret;\n\t\t\tcontinue;", 1)
++assert leak != driver
++try:
++    closed_branches_put(leak)
++except AssertionError:
++    pass
++else:
++    raise SystemExit("negative control not caught")
++print(f"DART callers: {branches} CLOSED branches each put their reference; 1 negative control")
+-- 
+2.43.0
+

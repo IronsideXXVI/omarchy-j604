@@ -1,0 +1,1003 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 22:06:03 +0000
+Subject: [PATCH] media: apple: isp: stream the T8132 camera as macOS
+ does, with all its sizes
+
+macOS streams the J604's camera from the IMX958's config 6 through a
+2688x1738 window centred on the lens, and offers 640x480, 1280x720,
+1920x1080, 1760x1328, 1552x1552, 1328x1760 and 1080x1920. Our default view
+was config 5's 1920x1080 window, which serves only the first three.
+
+Make the lens window the default view (wide_view on, wide_window 1), which
+lists 1760x1328, 1552x1552 and 2560x1440 at once. Serve the two portrait
+sizes, which need more rows than that window has, from a taller config 6
+window as wide as the lens window and centred on the optical centre, cut
+at the sensor's pitch with no scaling: 1080x1920 at (980, 400) and
+1328x1760 at (856, 480). macOS enlarges them from its 1738-row window
+instead, so ours show slightly more of the scene. wide_view=N still gives
+back config 5's window.
+
+This replaces the debugfs upscale_probe and its enlarging cut, which were
+only there to find out whether the scaler would serve these sizes.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/isp/isp-cam.c | 105 ++----
+ drivers/media/platform/apple/isp/isp-drv.c |   3 -
+ drivers/media/platform/apple/isp/isp-drv.h |   6 +-
+ tools/asahi/isp-camera-sizes-tests.py      | 282 ++++++++++++++
+ tools/asahi/isp-upscale-probe-tests.py     | 419 ---------------------
+ tools/asahi/run-host-tests.py              |   8 +-
+ 6 files changed, 324 insertions(+), 499 deletions(-)
+ create mode 100755 tools/asahi/isp-camera-sizes-tests.py
+ delete mode 100755 tools/asahi/isp-upscale-probe-tests.py
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 5481de2a5d..397241cc81 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -459,41 +459,6 @@ static bool isp_size_from_crop(const struct isp_preset *source,
+ 	return true;
+ }
+ 
+-/*
+- * For the upscale probe only: the largest even-sized crop of the size's
+- * shape that the source crop holds, centred, which the scaler then has to
+- * enlarge. The shape is kept to within the pixel the even rounding costs.
+- * A size the source can serve without enlarging is refused here.
+- */
+-static bool isp_size_upscaled(const struct isp_preset *source,
+-			      struct coord size, struct isp_preset *preset)
+-{
+-	u32 w, h;
+-
+-	if (!size.x || !size.y || (size.x | size.y) & 1 ||
+-	    size.x > 16384 || size.y > 16384 || !isp_crop_in_input(source))
+-		return false;
+-
+-	h = source->crop_size.y;
+-	w = h * size.x / size.y;
+-	if (w > source->crop_size.x) {
+-		w = source->crop_size.x;
+-		h = w * size.y / size.x;
+-	}
+-	w = round_down(w, 2);
+-	h = round_down(h, 2);
+-	if (!w || !h || (w >= size.x && h >= size.y))
+-		return false;
+-
+-	*preset = *source;
+-	preset->output_dim = size;
+-	preset->crop_size = (struct coord){ w, h };
+-	preset->crop_offset.x += round_down((source->crop_size.x - w) / 2, 2);
+-	preset->crop_offset.y += round_down((source->crop_size.y - h) / 2, 2);
+-	preset->upscale_probe = true;
+-	return true;
+-}
+-
+ static unsigned int isp_append_size(struct isp_preset *presets, unsigned int num,
+ 				    unsigned int sources, struct coord size)
+ {
+@@ -501,8 +466,7 @@ static unsigned int isp_append_size(struct isp_preset *presets, unsigned int num
+ 	u32 area, best_area = 0;
+ 
+ 	for (unsigned int i = 0; i < num; i++)
+-		if (!presets[i].upscale_probe &&
+-		    presets[i].output_dim.x == size.x &&
++		if (presets[i].output_dim.x == size.x &&
+ 		    presets[i].output_dim.y == size.y)
+ 			return num;
+ 
+@@ -606,7 +570,7 @@ static const struct isp_preset isp_wide_source = {
+  * its frames reports a 2688x1738 sensor readout at (176, 494). That is
+  * centred horizontally on config 6's window and vertically on the lens's
+  * optical centre (1526.6, 1360.2), not on the window's centre: 1.4 times
+- * config 5's field. Selected with wide_window=1.
++ * config 5's field. The default (wide_window=1).
+  */
+ static const struct isp_preset isp_lens_source = {
+ 	.index = 6,
+@@ -616,15 +580,20 @@ static const struct isp_preset isp_lens_source = {
+ 	.output_dim = { 1920, 1080 },
+ };
+ 
+-static bool wide_view;
++/*
++ * macOS streams every size of this camera from config 6, through the lens
++ * window, so that is the default view; wide_view=N gives back config 5's
++ * narrower 1920x1080 window and its sizes only.
++ */
++static bool wide_view = true;
+ module_param(wide_view, bool, 0644);
+ MODULE_PARM_DESC(wide_view,
+-		 "T8132: start the next streams from the wider sensor config and offer 2560x1440, 1760x1328 and 1552x1552 (default: off)");
++		 "T8132: stream from the wider sensor config and offer 2560x1440, 1760x1328, 1552x1552, 1328x1760 and 1080x1920 (default: on, as macOS)");
+ 
+-static unsigned int wide_window;
++static unsigned int wide_window = 1;
+ module_param(wide_window, uint, 0644);
+ MODULE_PARM_DESC(wide_window,
+-		 "T8132 wide view window: 0 = the full-width 3040x1710 crop, 1 = the 2688x1738 window centred on the lens (default: 0)");
++		 "T8132 wide view window: 0 = the full-width 3040x1710 crop, 1 = the 2688x1738 window centred on the lens (default: 1, as macOS)");
+ 
+ static const struct isp_preset *isp_wide_window(void)
+ {
+@@ -639,8 +608,6 @@ bool apple_isp_wide_view(struct apple_isp *isp)
+ bool apple_isp_preset_offered(struct apple_isp *isp,
+ 			      const struct isp_preset *preset)
+ {
+-	if (preset->upscale_probe)
+-		return READ_ONCE(isp->upscale_probe);
+ 	return !preset->wide_only || apple_isp_wide_view(isp);
+ }
+ 
+@@ -667,11 +634,22 @@ static const struct coord isp_wide_sizes[] = {
+ };
+ 
+ /*
+- * macOS's two portrait sizes for this camera. Every window above has fewer
+- * rows than they do, so they are listed only with debugfs upscale_probe, cut
+- * for the scaler to enlarge, to find out whether it does.
++ * macOS's two portrait sizes for this camera need more rows than the
++ * windows above. Config 6 reads 2880 rows, so they are cut at the sensor's
++ * pitch from this taller window, as wide as the lens window and centred
++ * vertically on the optical centre: 1080x1920 at (980, 400) and 1328x1760 at
++ * (856, 480), not scaled. macOS enlarges them from its 1738-row window
++ * instead (about 1.11 and 1.02 times), so ours show slightly more.
+  */
+-static const struct coord isp_upscale_sizes[] = {
++static const struct isp_preset isp_tall_source = {
++	.index = 6,
++	.input_dim = { 3040, 5760 },
++	.crop_offset = { 176, 400 },
++	.crop_size = { 2688, 1920 },
++	.output_dim = { 1080, 1920 },
++};
++
++static const struct coord isp_tall_sizes[] = {
+ 	{ 1328, 1760 }, { 1080, 1920 },
+ };
+ 
+@@ -690,7 +668,7 @@ int apple_isp_add_wide_presets(struct apple_isp *isp)
+ 		return 0;
+ 
+ 	presets = devm_kcalloc(isp->dev, num + ARRAY_SIZE(isp_wide_sizes) +
+-			       ARRAY_SIZE(isp_upscale_sizes),
++			       ARRAY_SIZE(isp_tall_sizes),
+ 			       sizeof(*presets), GFP_KERNEL);
+ 	if (!presets)
+ 		return -ENOMEM;
+@@ -708,17 +686,18 @@ int apple_isp_add_wide_presets(struct apple_isp *isp)
+ 		presets[n].wide_only = true;
+ 		n++;
+ 	}
+-	for (unsigned int k = 0; k < ARRAY_SIZE(isp_upscale_sizes); k++) {
++	for (unsigned int k = 0; k < ARRAY_SIZE(isp_tall_sizes); k++) {
+ 		bool have = false;
+ 
+ 		for (unsigned int i = 0; i < n; i++)
+-			have |= presets[i].output_dim.x == isp_upscale_sizes[k].x &&
+-				presets[i].output_dim.y == isp_upscale_sizes[k].y;
+-		if (have || !isp_size_upscaled(&isp_wide_source,
+-					       isp_upscale_sizes[k], &cut))
++			have |= presets[i].output_dim.x == isp_tall_sizes[k].x &&
++				presets[i].output_dim.y == isp_tall_sizes[k].y;
++		if (have || !isp_size_from_crop(&isp_tall_source,
++						isp_tall_sizes[k], &cut))
+ 			continue;
+ 		presets[n] = cut;
+ 		presets[n].wide_only = true;
++		presets[n].tall = true;
+ 		n++;
+ 	}
+ 	isp->presets = presets;
+@@ -726,13 +705,13 @@ int apple_isp_add_wide_presets(struct apple_isp *isp)
+ 	return 0;
+ }
+ 
+-/* A wide stream's crop from the selected window; a probe size is enlarged. */
++/* A wide stream's crop: portrait sizes from the tall window, the rest from the selected one. */
+ static bool isp_cut_wide(const struct isp_preset *preset,
+ 			 struct isp_preset *wide)
+ {
+-	if (preset->upscale_probe)
+-		return isp_size_upscaled(isp_wide_window(), preset->output_dim,
+-					 wide);
++	if (preset->tall)
++		return isp_size_from_crop(&isp_tall_source, preset->output_dim,
++					  wide);
+ 	return isp_size_from_crop(isp_wide_window(), preset->output_dim, wide);
+ }
+ 
+@@ -780,16 +759,6 @@ static void isp_resolve_stream_preset(struct apple_isp *isp,
+ 			 isp->stream_preset.crop_offset.y,
+ 			 isp->stream_preset.crop_size.x,
+ 			 isp->stream_preset.crop_size.y);
+-	if (isp->stream_preset.upscale_probe)
+-		dev_info(isp->dev,
+-			 "upscale probe: %ux%u from sensor config %u, crop %u,%u %ux%u\n",
+-			 isp->stream_preset.output_dim.x,
+-			 isp->stream_preset.output_dim.y,
+-			 isp->stream_preset.index,
+-			 isp->stream_preset.crop_offset.x,
+-			 isp->stream_preset.crop_offset.y,
+-			 isp->stream_preset.crop_size.x,
+-			 isp->stream_preset.crop_size.y);
+ 	isp->streamed_wide = use_wide;
+ 	isp->streamed_crop_x = use_wide ? isp->stream_preset.crop_offset.x : 0;
+ }
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index 4d94b34bee..a1d154d9a0 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -588,9 +588,6 @@ static void apple_isp_debugfs_init(struct apple_isp *isp)
+ 			    &isp_stream_config_fops);
+ 	debugfs_create_u32("extra_frame_rate", 0600, isp->debugfs,
+ 			   &isp->extra_frame_rate);
+-	if (isp->hw->imx958_wide_cfg6)
+-		debugfs_create_bool("upscale_probe", 0600, isp->debugfs,
+-				    &isp->upscale_probe);
+ 	if (isp->meta_snap)
+ 		debugfs_create_file("frame_metadata", 0600, isp->debugfs, isp,
+ 				    &isp_frame_metadata_fops);
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index bcbb0fc98e..5a10970b41 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -157,8 +157,8 @@ struct isp_preset {
+ 	bool p010;
+ 	/* Offered only while the wide view is selected. */
+ 	bool wide_only;
+-	/* Needs enlarging: offered only while debugfs upscale_probe is set. */
+-	bool upscale_probe;
++	/* Cut from the tall portrait window (offered with the wide view). */
++	bool tall;
+ };
+ 
+ struct apple_isp_hw {
+@@ -441,8 +441,6 @@ struct apple_isp {
+ 	/* measurement overrides set in debugfs, read at stream start */
+ 	struct isp_preset stream_config;
+ 	bool stream_config_set;
+-	/* list the sizes that need enlarging, to probe the scaler (debugfs) */
+-	bool upscale_probe;
+ 	u32 extra_frame_rate;
+ 	struct dentry *debugfs;
+ 	/* one-shot copy of a returned metadata block for debugfs, under buf_lock */
+diff --git a/tools/asahi/isp-camera-sizes-tests.py b/tools/asahi/isp-camera-sizes-tests.py
+new file mode 100755
+index 0000000000..0d7af663dd
+--- /dev/null
++++ b/tools/asahi/isp-camera-sizes-tests.py
+@@ -0,0 +1,282 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Check the T8132 camera's default view and sizes in apple-isp (isp-cam.c).
++
++The driver's own preset functions and tables are compiled on the host and run
++against a J604-like preset list (config 5, 1920x1080 and 1280x720). They must:
++- default to macOS's view: wide_view on, wide_window 1 (the lens window);
++- offer macOS's sizes by default: 1920x1080, 1280x720 and, from config 6,
++  2560x1440, 1760x1328, 1552x1552, 1328x1760, 1080x1920 (none with wide_view
++  off);
++- cut the two portrait sizes at the sensor's pitch from the tall window:
++  1080x1920 at (980, 400) and 1328x1760 at (856, 480), never enlarged;
++- cut every other wide size from the selected window by the call-size rule,
++  which stays as it was (checked over a grid of sources and sizes);
++- carry no upscale probe any more.
++"""
++import argparse
++from math import gcd
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[2]
++ISP = 'drivers/media/platform/apple/isp/'
++FILES = ('isp-cam.c', 'isp-drv.c', 'isp-drv.h', 'isp-v4l2.c')
++
++MUTATIONS = {
++    'view-off': ('isp-cam.c', 'static bool wide_view = true;', 'static bool wide_view;'),
++    'window-0': ('isp-cam.c', 'static unsigned int wide_window = 1;', 'static unsigned int wide_window;'),
++    'tall-from-window': ('isp-cam.c', '\t\treturn isp_size_from_crop(&isp_tall_source, preset->output_dim,',
++                         '\t\treturn isp_size_from_crop(isp_wide_window(), preset->output_dim,'),
++    'tall-unflagged': ('isp-cam.c', '\t\tpresets[n].tall = true;\n', ''),
++    'tall-offset': ('isp-cam.c', '\t.crop_offset = { 176, 400 },', '\t.crop_offset = { 176, 494 },'),
++    'offered-always': ('isp-cam.c', '\treturn !preset->wide_only || apple_isp_wide_view(isp);', '\treturn true;'),
++    'refactor-odd': ('isp-cam.c', '\t       !((source->crop_offset.x | source->crop_offset.y) & 1) &&\n', ''),
++    'refactor-bound': ('isp-cam.c', '\t       source->crop_size.y <= source->input_dim.y - source->crop_offset.y;', '\t       true;'),
++}
++
++SHIM = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++typedef uint32_t u32;
++#define READ_ONCE(x) (x)
++#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
++#define round_down(x, y) ((x) & ~((__typeof__(x))((y) - 1)))
++#define min(a, b) ((a) < (b) ? (a) : (b))
++#define max(a, b) ((a) > (b) ? (a) : (b))
++#define GFP_KERNEL 0
++#define ENOMEM 12
++static u32 gcd(u32 a, u32 b) { while (b) { u32 t = a % b; a = b; b = t; } return a; }
++struct device { int unused; };
++static void *devm_kcalloc(struct device *dev, size_t n, size_t size, int gfp)
++{ (void)dev; (void)gfp; return calloc(n, size); }
++'''
++SHIM2 = r'''
++struct apple_isp_hw { bool imx958_wide_cfg6; };
++struct apple_isp { struct device *dev; const struct apple_isp_hw *hw; struct isp_preset *presets; int num_presets; };
++'''
++MAIN = r'''
++static void put(bool ok, const struct isp_preset *p)
++{
++	if (ok)
++		printf("1 %u %u %u %u\n", p->crop_offset.x, p->crop_offset.y, p->crop_size.x, p->crop_size.y);
++	else
++		printf("0\n");
++}
++static const struct apple_isp_hw hw = { .imx958_wide_cfg6 = true };
++static struct device dev;
++static struct isp_preset dt[2] = {
++	{ .index = 5, .input_dim = { 1920, 2160 }, .crop_size = { 1920, 1080 }, .output_dim = { 1920, 1080 } },
++	{ .index = 5, .input_dim = { 1920, 2160 }, .crop_size = { 1920, 1080 }, .output_dim = { 1280, 720 } },
++};
++int main(void)
++{
++	char cmd[16];
++	struct apple_isp isp = { .dev = &dev, .hw = &hw, .presets = dt, .num_presets = 2 };
++
++	printf("DEF %d %u\n", (int)wide_view, wide_window);
++	assert(apple_isp_add_wide_presets(&isp) == 0);
++	while (scanf("%15s", cmd) == 1) {
++		if (!strcmp(cmd, "F")) {
++			struct isp_preset s = { .index = 6 }, r;
++			struct coord size;
++
++			assert(scanf("%u %u %u %u %u %u %u %u", &s.input_dim.x, &s.input_dim.y, &s.crop_offset.x,
++				     &s.crop_offset.y, &s.crop_size.x, &s.crop_size.y, &size.x, &size.y) == 8);
++			memset(&r, 0, sizeof(r));
++			put(isp_size_from_crop(&s, size, &r), &r);
++		} else if (!strcmp(cmd, "LIST")) {
++			for (int i = 0; i < isp.num_presets; i++) {
++				const struct isp_preset *p = &isp.presets[i];
++
++				printf("P %u %u %u %d %d\n", p->index, p->output_dim.x, p->output_dim.y, p->wide_only, p->tall);
++			}
++			printf("END\n");
++		} else if (!strcmp(cmd, "OFFER")) {
++			int wv;
++
++			assert(scanf("%d", &wv) == 1);
++			wide_view = wv;
++			printf("O");
++			for (int i = 0; i < isp.num_presets; i++)
++				if (apple_isp_preset_offered(&isp, &isp.presets[i]))
++					printf(" %ux%u", isp.presets[i].output_dim.x, isp.presets[i].output_dim.y);
++			printf("\n");
++		} else if (!strcmp(cmd, "CUT")) {
++			assert(scanf("%u", &wide_window) == 1);
++			for (int i = 0; i < isp.num_presets; i++) {
++				struct isp_preset w;
++
++				if (!isp.presets[i].wide_only)
++					continue;
++				memset(&w, 0, sizeof(w));
++				printf("%ux%u ", isp.presets[i].output_dim.x, isp.presets[i].output_dim.y);
++				put(isp_cut_wide(&isp.presets[i], &w), &w);
++			}
++			printf("END\n");
++		} else {
++			abort();
++		}
++		fflush(stdout);
++	}
++	return 0;
++}
++'''
++FUNCS = ('isp_crop_in_input', 'isp_size_from_crop', 'isp_wide_window', 'apple_isp_wide_view',
++         'apple_isp_preset_offered', 'isp_preset_narrow', 'apple_isp_add_wide_presets', 'isp_cut_wide')
++TABLES = ('isp_wide_source', 'isp_lens_source', 'isp_tall_source', 'isp_wide_sizes', 'isp_tall_sizes')
++
++
++def fail(msg):
++    raise AssertionError('Assertion failed: ' + msg)
++
++
++def func(src, name):
++    m = re.search(r'^[a-z][^\n;]*\b' + name + r'\([^;{]*?\)\n\{', src, re.M | re.S)
++    if not m:
++        fail(f'no function {name} in isp-cam.c')
++    a, b, n = m.start(), m.end(), 1
++    while n:
++        n += {'{': 1, '}': -1}.get(src[b], 0)
++        b += 1
++    return src[a:b]
++
++
++def block(src, pattern, what):
++    m = re.search(pattern, src, re.M | re.S)
++    if not m:
++        fail(f'no {what}')
++    return m.group(0)
++
++
++def rd(v):
++    return v & ~1
++
++
++def ref_from_crop(s, size):
++    """The call-size rule as cam-08 wrote it."""
++    ix, iy, ox, oy, cx, cy = s
++    sx, sy = size
++    if (not sx or not sy or (sx | sy) & 1 or not cx or not cy or (ox | oy) & 1 or cx > 16384 or cy > 16384 or
++            ox > ix or cx > ix - ox or oy > iy or cy > iy - oy):
++        return None
++    d = gcd(sx, sy)
++    x, y = sx // d, sy // d
++    scale = rd(min(cx // x, cy // y))
++    if scale < d:
++        return None
++    return (ox + rd((cx - x * scale) // 2), oy + rd((cy - y * scale) // 2), x * scale, y * scale)
++
++
++WIDE = (3040, 5760, 0, 584, 3040, 1710)
++LENS = (3040, 5760, 176, 494, 2688, 1738)
++PORTRAIT = {(1080, 1920): (980, 400, 1080, 1920), (1328, 1760): (856, 480, 1328, 1760)}
++
++
++def run(src, work):
++    cam, hdr = src['isp-cam.c'], src['isp-drv.h']
++    for f in FILES:
++        if 'upscale' in src[f]:
++            fail(f'{f} still carries the upscale probe')
++    code = [SHIM, block(hdr, r'^struct coord \{.*?\n\};', 'struct coord'),
++            block(hdr, r'^struct isp_preset \{.*?\n\};', 'struct isp_preset'), SHIM2,
++            block(cam, r'^static bool wide_view[^;]*;', 'wide_view'),
++            block(cam, r'^static unsigned int wide_window[^;]*;', 'wide_window')]
++    for t in TABLES:
++        code.append(block(cam, r'^static const struct (?:isp_preset|coord) ' + t + r'(?:\[\])? = \{.*?\n\};', t))
++    code += [func(cam, f) for f in FUNCS] + [MAIN]
++    c, exe = work / 'isp-sizes.c', work / 'isp-sizes'
++    c.write_text('\n'.join(code))
++    p = subprocess.run(['cc', '-std=gnu11', '-O0', '-Werror=implicit-function-declaration', str(c), '-o', str(exe)],
++                       capture_output=True, text=True)
++    if p.returncode:
++        print(p.stderr)
++        fail('the extracted driver code does not build')
++    grid = [(i + o + cc, s) for i in [(3040, 5760), (1920, 2160)]
++            for o in [(0, 0), (176, 494), (1, 0), (0, 3), (3040, 0), (4000, 0)]
++            for cc in [(3040, 1710), (2688, 1738), (2688, 1920), (1920, 1080), (0, 8), (16386, 2), (1000, 6000)]
++            for s in [(640, 480), (1280, 720), (1920, 1080), (1080, 1920), (1760, 1328), (1328, 1760), (1552, 1552),
++                      (2560, 1440), (0, 2), (3, 2), (16384, 2)]]
++    cmds = ['F ' + ' '.join(map(str, s + z)) for s, z in grid]
++    cmds += ['LIST', 'OFFER 1', 'OFFER 0', 'CUT 1', 'CUT 0']
++    p = subprocess.run([str(exe)], input='\n'.join(cmds) + '\n', capture_output=True, text=True, timeout=20)
++    if p.returncode:
++        print(p.stderr)
++        fail(f'the harness stopped (exit {p.returncode})')
++    out = iter(p.stdout.splitlines())
++    d = next(out).split()
++    if d[1:] != ['1', '1']:
++        fail(f'default view {d[1:]}, want wide_view 1 and wide_window 1 (macOS)')
++
++    def res():
++        v = next(out).split()
++        return None if v[0] == '0' else tuple(int(x) for x in v[1:5])
++    for s, z in grid:
++        got = res()
++        if got != ref_from_crop(s, z):
++            fail(f'call-size rule changed: {s} {z}: {got} vs {ref_from_crop(s, z)}')
++    lst = []
++    for line in out:
++        if line == 'END':
++            break
++        lst.append(tuple(int(x) for x in line.split()[1:]))
++    base = [(1920, 1080), (1280, 720)]
++    wide = [(2560, 1440), (1760, 1328), (1552, 1552)]
++    port = [(1328, 1760), (1080, 1920)]
++    if [(q[1], q[2]) for q in lst] != base + wide + port:
++        fail(f'preset list {lst}')
++    for q in lst:
++        if q[4] != int((q[1], q[2]) in port) or q[3] != int((q[1], q[2]) in wide + port):
++            fail(f'preset {q}: wrong wide_only / tall')
++    for want in (base + wide + port, base):
++        got = [tuple(int(v) for v in t.split('x')) for t in next(out).split()[1:]]
++        if got != want:
++            fail(f'offered {got}, want {want}')
++    for ww, win in ((1, LENS), (0, WIDE)):
++        for line in out:
++            if line == 'END':
++                break
++            size = tuple(int(v) for v in line.split()[0].split('x'))
++            v = line.split()[1:]
++            got = None if v[0] == '0' else tuple(int(x) for x in v[1:5])
++            want = PORTRAIT[size] if size in PORTRAIT else ref_from_crop(win, size)
++            if got != want:
++                fail(f'wide_window {ww}: {size} cut {got}, want {want}')
++            if got[2] < size[0] or got[3] < size[1]:
++                fail(f'{size} would be enlarged from {got}')
++    return len(grid)
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument('--out', type=Path)
++    ap.add_argument('--mutation', choices=MUTATIONS)
++    args = ap.parse_args()
++    src = {f: (ROOT / ISP / f).read_text() for f in FILES}
++    if args.mutation:
++        f, old, new = MUTATIONS[args.mutation]
++        assert src[f].count(old) == 1, f'mutation site not found once: {old!r}'
++        src[f] = src[f].replace(old, new, 1)
++    with tempfile.TemporaryDirectory() as tmp:
++        work = args.out or Path(tmp)
++        work.mkdir(parents=True, exist_ok=True)
++        try:
++            n = run(src, work)
++        except (AssertionError, StopIteration, ValueError, IndexError, TypeError) as e:
++            print(e if str(e).startswith('Assertion') else f'Assertion failed: {type(e).__name__} {e}')
++            raise SystemExit(1)
++    line = ('isp camera sizes: macOS view by default (wide_view 1, wide_window 1); 7 sizes offered; portraits native '
++            'from the tall window; call-size rule unchanged over %d cases' % n)
++    if args.out:
++        (args.out / 'result.txt').write_text(line + '\n')
++    print(line)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/asahi/isp-upscale-probe-tests.py b/tools/asahi/isp-upscale-probe-tests.py
+deleted file mode 100755
+index a9243ecc06..0000000000
+--- a/tools/asahi/isp-upscale-probe-tests.py
++++ /dev/null
+@@ -1,419 +0,0 @@
+-#!/usr/bin/env python3
+-# SPDX-License-Identifier: GPL-2.0-only
+-"""Check apple-isp's upscale probe (debugfs upscale_probe) and the crop rules.
+-
+-The driver's own preset functions are compiled on the host from
+-drivers/media/platform/apple/isp/isp-cam.c and run against a J604-like
+-preset list (config 5, 1920x1080 and 1280x720). They must:
+-- keep the call-size rule (isp_size_from_crop) exactly as before its source
+-  check moved into isp_crop_in_input(), over a grid of sources and sizes;
+-- cut macOS's portrait sizes, 1328x1760 and 1080x1920, from the selected
+-  config 6 window as the largest even, centred crop of their shape, and
+-  refuse every size that window can serve without enlarging;
+-- list those two sizes only while upscale_probe is set, whatever the wide
+-  view, and leave every other size and the default list as they were;
+-- never let a probe size stand in for a real size of the same dimensions;
+-- and the debugfs file must be root-only, T8132 wide config only, and never
+-  set by the driver.
+-"""
+-import argparse
+-from math import gcd
+-from pathlib import Path
+-import re
+-import subprocess
+-import sys
+-import tempfile
+-
+-ROOT = Path(__file__).resolve().parents[2]
+-ISP = 'drivers/media/platform/apple/isp/'
+-FILES = ('isp-cam.c', 'isp-drv.c', 'isp-drv.h', 'isp-v4l2.c')
+-
+-MUTATIONS = {
+-    'offered-always': ('isp-cam.c', '\tif (preset->upscale_probe)\n\t\treturn READ_ONCE(isp->upscale_probe);\n', ''),
+-    'offered-on': ('isp-cam.c', 'return READ_ONCE(isp->upscale_probe);', 'return true;'),
+-    'debugfs-0644': ('isp-drv.c', 'debugfs_create_bool("upscale_probe", 0600,', 'debugfs_create_bool("upscale_probe", 0644,'),
+-    'debugfs-ungated': ('isp-drv.c', '\tif (isp->hw->imx958_wide_cfg6)\n\t\tdebugfs_create_bool("upscale_probe"',
+-                        '\tif (1)\n\t\tdebugfs_create_bool("upscale_probe"'),
+-    'default-on': ('isp-drv.c', '\tif (isp->hw->imx958_wide_cfg6)\n\t\tdebugfs_create_bool("upscale_probe"',
+-                   '\tisp->upscale_probe = true;\n\tif (isp->hw->imx958_wide_cfg6)\n\t\tdebugfs_create_bool("upscale_probe"'),
+-    'odd-crop': ('isp-cam.c', '\tw = round_down(w, 2);\n\th = round_down(h, 2);\n', ''),
+-    'no-clamp': ('isp-cam.c', '\tif (w > source->crop_size.x) {\n\t\tw = source->crop_size.x;\n\t\th = w * size.y / size.x;\n\t}\n', ''),
+-    'no-centre': ('isp-cam.c', '\tpreset->crop_offset.x += round_down((source->crop_size.x - w) / 2, 2);\n', ''),
+-    'allow-fit': ('isp-cam.c', ' || (w >= size.x && h >= size.y)', ''),
+-    'no-probe-flag': ('isp-cam.c', '\tpreset->upscale_probe = true;\n', ''),
+-    'probe-not-wide': ('isp-cam.c', '\t\t\t\t\t       isp_upscale_sizes[k], &cut))\n\t\t\tcontinue;\n\t\tpresets[n] = cut;\n\t\tpresets[n].wide_only = true;\n',
+-                       '\t\t\t\t\t       isp_upscale_sizes[k], &cut))\n\t\t\tcontinue;\n\t\tpresets[n] = cut;\n'),
+-    'dedupe-probe': ('isp-cam.c', '\t\tif (!presets[i].upscale_probe &&\n\t\t    presets[i].output_dim.x == size.x &&',
+-                     '\t\tif (presets[i].output_dim.x == size.x &&'),
+-    'cut-strict': ('isp-cam.c', '\tif (preset->upscale_probe)\n\t\treturn isp_size_upscaled(isp_wide_window(), preset->output_dim,\n\t\t\t\t\t wide);\n', ''),
+-    'cut-fixed-window': ('isp-cam.c', 'return isp_size_upscaled(isp_wide_window(),', 'return isp_size_upscaled(&isp_wide_source,'),
+-    'refactor-odd': ('isp-cam.c', '\t       !((source->crop_offset.x | source->crop_offset.y) & 1) &&\n', ''),
+-    'refactor-bound': ('isp-cam.c', '\t       source->crop_size.y <= source->input_dim.y - source->crop_offset.y;', '\t       true;'),
+-    'no-log': ('isp-cam.c', '"upscale probe: ', '"probe: '),
+-}
+-
+-SHIM = r'''
+-#include <assert.h>
+-#include <stdbool.h>
+-#include <stdint.h>
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <string.h>
+-typedef uint32_t u32;
+-#define READ_ONCE(x) (x)
+-#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+-#define round_down(x, y) ((x) & ~((__typeof__(x))((y) - 1)))
+-#define min(a, b) ((a) < (b) ? (a) : (b))
+-#define max(a, b) ((a) > (b) ? (a) : (b))
+-#define GFP_KERNEL 0
+-#define ENOMEM 12
+-static u32 gcd(u32 a, u32 b) { while (b) { u32 t = a % b; a = b; b = t; } return a; }
+-struct device { int unused; };
+-static void *devm_kcalloc(struct device *dev, size_t n, size_t size, int gfp)
+-{ (void)dev; (void)gfp; return calloc(n, size); }
+-'''
+-
+-SHIM2 = r'''
+-struct apple_isp_hw { bool imx958_wide_cfg6; };
+-struct apple_isp { struct device *dev; const struct apple_isp_hw *hw; struct isp_preset *presets;
+-		   int num_presets; bool upscale_probe; };
+-static bool wide_view;
+-static unsigned int wide_window;
+-'''
+-
+-MAIN = r'''
+-static void put(bool ok, const struct isp_preset *p)
+-{
+-	if (ok)
+-		printf("1 %u %u %u %u %d\n", p->crop_offset.x, p->crop_offset.y,
+-		       p->crop_size.x, p->crop_size.y, p->upscale_probe);
+-	else
+-		printf("0\n");
+-}
+-
+-static const struct apple_isp_hw hw = { .imx958_wide_cfg6 = true };
+-static struct device dev;
+-static struct isp_preset dt[2] = {
+-	{ .index = 5, .input_dim = { 1920, 2160 }, .crop_size = { 1920, 1080 }, .output_dim = { 1920, 1080 } },
+-	{ .index = 5, .input_dim = { 1920, 2160 }, .crop_size = { 1920, 1080 }, .output_dim = { 1280, 720 } },
+-};
+-
+-int main(void)
+-{
+-	char cmd[16];
+-	struct apple_isp isp = { .dev = &dev, .hw = &hw, .presets = dt, .num_presets = 2 };
+-
+-	assert(apple_isp_add_wide_presets(&isp) == 0);
+-	while (scanf("%15s", cmd) == 1) {
+-		if (!strcmp(cmd, "F") || !strcmp(cmd, "U")) {
+-			struct isp_preset s = { .index = 6 }, r;
+-			struct coord size;
+-
+-			assert(scanf("%u %u %u %u %u %u %u %u", &s.input_dim.x, &s.input_dim.y,
+-				     &s.crop_offset.x, &s.crop_offset.y, &s.crop_size.x,
+-				     &s.crop_size.y, &size.x, &size.y) == 8);
+-			memset(&r, 0, sizeof(r));
+-			put(cmd[0] == 'F' ? isp_size_from_crop(&s, size, &r) :
+-				isp_size_upscaled(&s, size, &r), &r);
+-		} else if (!strcmp(cmd, "LIST")) {
+-			for (int i = 0; i < isp.num_presets; i++) {
+-				const struct isp_preset *p = &isp.presets[i];
+-
+-				printf("P %u %u %u %u %u %u %u %d %d\n", p->index, p->output_dim.x,
+-				       p->output_dim.y, p->crop_offset.x, p->crop_offset.y,
+-				       p->crop_size.x, p->crop_size.y, p->wide_only, p->upscale_probe);
+-			}
+-			printf("END\n");
+-		} else if (!strcmp(cmd, "OFFER")) {
+-			int wv, fl;
+-
+-			assert(scanf("%d %d", &wv, &fl) == 2);
+-			wide_view = wv;
+-			isp.upscale_probe = fl;
+-			printf("O");
+-			for (int i = 0; i < isp.num_presets; i++)
+-				if (apple_isp_preset_offered(&isp, &isp.presets[i]))
+-					printf(" %ux%u", isp.presets[i].output_dim.x,
+-					       isp.presets[i].output_dim.y);
+-			printf("\n");
+-		} else if (!strcmp(cmd, "CUT")) {
+-			assert(scanf("%u", &wide_window) == 1);
+-			for (int i = 0; i < isp.num_presets; i++) {
+-				struct isp_preset w;
+-				bool ok;
+-
+-				if (!isp.presets[i].wide_only)
+-					continue;
+-				memset(&w, 0, sizeof(w));
+-				ok = isp_cut_wide(&isp.presets[i], &w);
+-				printf("%ux%u ", isp.presets[i].output_dim.x, isp.presets[i].output_dim.y);
+-				put(ok, &w);
+-			}
+-			printf("END\n");
+-		} else if (!strcmp(cmd, "DEDUP")) {
+-			unsigned int n = isp.num_presets, r1, r2;
+-			struct isp_preset *a = calloc(n + 3, sizeof(*a));
+-
+-			memcpy(a, isp.presets, n * sizeof(*a));
+-			a[n] = (struct isp_preset){ .index = 3, .input_dim = { 2000, 4000 },
+-						    .crop_size = { 2000, 4000 }, .output_dim = { 2000, 4000 } };
+-			r1 = isp_append_size(a, n + 1, n + 1, (struct coord){ 1080, 1920 });
+-			r2 = isp_append_size(a, r1, n + 1, (struct coord){ 1080, 1920 });
+-			printf("D %u %u %u %d\n", n, r1, r2, r1 > n + 1 ? a[n + 1].upscale_probe : -1);
+-		} else {
+-			abort();
+-		}
+-		fflush(stdout);
+-	}
+-	return 0;
+-}
+-'''
+-
+-FUNCS = ('isp_crop_in_input', 'isp_size_from_crop', 'isp_size_upscaled', 'isp_append_size', 'isp_wide_window',
+-         'apple_isp_wide_view', 'apple_isp_preset_offered', 'isp_preset_narrow', 'apple_isp_add_wide_presets',
+-         'isp_cut_wide')
+-TABLES = ('isp_wide_source', 'isp_lens_source', 'isp_wide_sizes', 'isp_upscale_sizes')
+-
+-
+-def fail(msg):
+-    raise AssertionError('Assertion failed: ' + msg)
+-
+-
+-def func(src, name):
+-    m = re.search(r'^[a-z][^\n;]*\b' + name + r'\([^;{]*?\)\n\{', src, re.M | re.S)
+-    if not m:
+-        fail(f'no function {name} in isp-cam.c')
+-    a, b, n = m.start(), m.end(), 1
+-    while n:
+-        n += {'{': 1, '}': -1}.get(src[b], 0)
+-        b += 1
+-    return src[a:b]
+-
+-
+-def block(src, pattern, what):
+-    m = re.search(pattern, src, re.M | re.S)
+-    if not m:
+-        fail(f'no {what}')
+-    return m.group(0)
+-
+-
+-def rd(v):
+-    return v & ~1
+-
+-
+-def valid(s):
+-    ix, iy, ox, oy, cx, cy = s
+-    return bool(cx and cy and not ((ox | oy) & 1) and cx <= 16384 and cy <= 16384 and
+-                ox <= ix and cx <= ix - ox and oy <= iy and cy <= iy - oy)
+-
+-
+-def old_from_crop(s, size):
+-    """isp_size_from_crop as cam-08 / cam-09 wrote it, before the source check moved."""
+-    ix, iy, ox, oy, cx, cy = s
+-    sx, sy = size
+-    if (not sx or not sy or (sx | sy) & 1 or not cx or not cy or (ox | oy) & 1 or cx > 16384 or cy > 16384 or
+-            ox > ix or cx > ix - ox or oy > iy or cy > iy - oy):
+-        return None
+-    d = gcd(sx, sy)
+-    x, y = sx // d, sy // d
+-    scale = rd(min(cx // x, cy // y))
+-    if scale < d:
+-        return None
+-    return (ox + rd((cx - x * scale) // 2), oy + rd((cy - y * scale) // 2), x * scale, y * scale)
+-
+-
+-def upscaled(s, size):
+-    ix, iy, ox, oy, cx, cy = s
+-    sx, sy = size
+-    if not sx or not sy or (sx | sy) & 1 or sx > 16384 or sy > 16384 or not valid(s):
+-        return None
+-    h = cy
+-    w = h * sx // sy
+-    if w > cx:
+-        w = cx
+-        h = w * sy // sx
+-    w, h = rd(w), rd(h)
+-    if not w or not h or (w >= sx and h >= sy):
+-        return None
+-    return (ox + rd((cx - w) // 2), oy + rd((cy - h) // 2), w, h)
+-
+-
+-WIDE = (3040, 5760, 0, 584, 3040, 1710)
+-LENS = (3040, 5760, 176, 494, 2688, 1738)
+-# Expected by hand (the windows macOS reads on this camera): offset x, y, crop w, h
+-J604 = {
+-    (WIDE, (1328, 1760)): (874, 584, 1290, 1710),
+-    (WIDE, (1080, 1920)): (1040, 584, 960, 1710),
+-    (LENS, (1328, 1760)): (864, 494, 1310, 1738),
+-    (LENS, (1080, 1920)): (1032, 494, 976, 1738),
+-    ((3040, 5760, 100, 0, 900, 1738), (1080, 1920)): (100, 68, 900, 1600),
+-}
+-REFUSED = [(LENS, (1920, 1080)), (LENS, (1760, 1328)), (LENS, (1552, 1552)), (LENS, (1328, 1761)),
+-           (LENS, (0, 1760)), (LENS, (16386, 2)), ((3040, 5760, 1, 494, 2688, 1738), (1080, 1920)),
+-           ((3040, 5760, 176, 494, 2688, 6000), (1080, 1920)), ((3040, 5760, 176, 494, 0, 1738), (1080, 1920))]
+-
+-
+-def source_checks(src):
+-    drv, cam = src['isp-drv.c'], src['isp-cam.c']
+-    if drv.count('debugfs_create_bool("upscale_probe", 0600, isp->debugfs,') != 1:
+-        fail('upscale_probe must be one root-only (0600) debugfs bool')
+-    if drv.count('\tif (isp->hw->imx958_wide_cfg6)\n\t\tdebugfs_create_bool("upscale_probe"') != 1:
+-        fail('upscale_probe must exist only on the IMX958 wide config (T8132)')
+-    for name in FILES:
+-        sets = re.findall(r'upscale_probe\s*=[^=]', src[name])
+-        want = 1 if name == 'isp-cam.c' else 0
+-        if len(sets) != want:
+-            fail(f'{name}: {len(sets)} assignments to upscale_probe; only the probe cut may set a preset\'s flag, '
+-                 'and nothing in the driver may set the debugfs one')
+-    if '\tpreset->upscale_probe = true;' not in func(cam, 'isp_size_upscaled'):
+-        fail('the probe cut must mark its preset')
+-    res = func(cam, 'isp_resolve_stream_preset')
+-    if 'isp_cut_wide(preset, &wide)' not in res:
+-        fail('the stream preset must be cut by isp_cut_wide')
+-    if '\tif (isp->stream_preset.upscale_probe)\n\t\tdev_info(isp->dev,\n\t\t\t "upscale probe: ' not in res:
+-        fail('a probe stream must log its crop ("upscale probe: ...")')
+-
+-
+-def run(src, work):
+-    cam = src['isp-cam.c']
+-    hdr = src['isp-drv.h']
+-    code = [SHIM,
+-            block(hdr, r'^struct coord \{.*?\n\};', 'struct coord'),
+-            block(hdr, r'^struct isp_preset \{.*?\n\};', 'struct isp_preset'),
+-            SHIM2]
+-    for t in TABLES:
+-        code.append(block(cam, r'^static const struct (?:isp_preset|coord) ' + t + r'(?:\[\])? = \{.*?\n\};', t))
+-    code += [func(cam, f) for f in FUNCS]
+-    code.append(MAIN)
+-    c = work / 'isp-upscale.c'
+-    exe = work / 'isp-upscale'
+-    c.write_text('\n'.join(code))
+-    p = subprocess.run(['cc', '-std=gnu11', '-O0', '-g', '-Werror=implicit-function-declaration', str(c), '-o', str(exe)],
+-                       capture_output=True, text=True)
+-    if p.returncode:
+-        print(p.stderr)
+-        fail('the extracted driver code does not build')
+-
+-    inputs = [(3040, 5760), (1920, 2160)]
+-    offsets = [(0, 0), (176, 494), (1, 0), (0, 3), (3040, 0), (4000, 0)]
+-    crops = [(3040, 1710), (2688, 1738), (1920, 1080), (0, 8), (16386, 2), (1000, 6000), (2, 2)]
+-    sizes = [(640, 480), (1280, 720), (1920, 1080), (1080, 1920), (1760, 1328), (1328, 1760), (1552, 1552),
+-             (1280, 960), (960, 1280), (2560, 1440), (0, 2), (3, 2), (2, 2), (16384, 2)]
+-    grid = [(i + o + c, s) for i in inputs for o in offsets for c in crops for s in sizes]
+-    ucases = grid + list(J604) + REFUSED
+-    cmds = [f'F {" ".join(map(str, s + z))}' for s, z in grid]
+-    cmds += [f'U {" ".join(map(str, s + z))}' for s, z in ucases]
+-    cmds += ['LIST', 'OFFER 0 0', 'OFFER 1 0', 'OFFER 0 1', 'OFFER 1 1', 'CUT 0', 'CUT 1', 'DEDUP', 'OFFER 0 0']
+-    p = subprocess.run([str(exe)], input='\n'.join(cmds) + '\n', capture_output=True, text=True, timeout=20)
+-    if p.returncode:
+-        print(p.stderr)
+-        fail(f'the harness stopped (exit {p.returncode})')
+-    out = iter(p.stdout.splitlines())
+-
+-    def res():
+-        v = next(out).split()
+-        return None if v[0] == '0' else tuple(int(x) for x in v[1:5])
+-
+-    for s, z in grid:
+-        got = res()
+-        if got != old_from_crop(s, z):
+-            fail(f'call-size rule changed: {s} {z}: {got} vs {old_from_crop(s, z)}')
+-    for s, z in ucases:
+-        got = res()
+-        if got != upscaled(s, z):
+-            fail(f'probe cut {s} {z}: {got}, want {upscaled(s, z)}')
+-        if (s, z) in J604 and got != J604[(s, z)]:
+-            fail(f'probe cut {s} {z}: {got}, want {J604[(s, z)]}')
+-        if (s, z) in REFUSED and got is not None:
+-            fail(f'probe cut {s} {z} must be refused, got {got}')
+-        if got:
+-            ox, oy, w, h = got
+-            ix, iy, sox, soy, cx, cy = s
+-            if (w | h | ox | oy) & 1:
+-                fail(f'odd probe crop {got}')
+-            if not (sox <= ox and ox + w <= sox + cx and soy <= oy and oy + h <= soy + cy):
+-                fail(f'probe crop {got} outside {s}')
+-            if abs((ox - sox) - (sox + cx - ox - w)) > 3 or abs((oy - soy) - (soy + cy - oy - h)) > 3:
+-                fail(f'probe crop {got} not centred in {s}')
+-            if not (w < z[0] or h < z[1]):
+-                fail(f'probe crop {got} does not need enlarging to {z}')
+-            if abs(w * z[1] - h * z[0]) > 2 * max(z):
+-                fail(f'probe crop {got} is not {z}\'s shape')
+-
+-    lst = []
+-    for line in out:
+-        if line == 'END':
+-            break
+-        lst.append(tuple(int(x) for x in line.split()[1:]))
+-    base = [(1920, 1080), (1280, 720)]
+-    wide = [(2560, 1440), (1760, 1328), (1552, 1552)]
+-    port = [(1328, 1760), (1080, 1920)]
+-    dims = [(p_[1], p_[2]) for p_ in lst]
+-    if dims != base + wide + port:
+-        fail(f'preset list {dims}, want {base + wide + port}')
+-    for p_ in lst:
+-        probe = (p_[1], p_[2]) in port
+-        if p_[8] != int(probe) or p_[7] != int((p_[1], p_[2]) in wide + port) or p_[0] != (6 if p_[7] else 5):
+-            fail(f'preset {p_}: wrong wide_only / upscale_probe / config')
+-    if [p_[3:7] for p_ in lst[5:]] != [J604[(WIDE, z)] for z in port]:
+-        fail(f'probe presets {lst[5:]} are not cut from the 3040x1710 window')
+-
+-    def offer():
+-        return [tuple(int(v) for v in t.split('x')) for t in next(out).split()[1:]]
+-    for want in (base, base + wide, base + port, base + wide + port):
+-        got = offer()
+-        if got != want:
+-            fail(f'offered {got}, want {want}')
+-
+-    for ww, win in ((0, WIDE), (1, LENS)):
+-        for line in out:
+-            if line == 'END':
+-                break
+-            size = tuple(int(v) for v in line.split()[0].split('x'))
+-            v = line.split()[1:]
+-            got = None if v[0] == '0' else tuple(int(x) for x in v[1:5])
+-            want = upscaled(win, size) if size in port else old_from_crop(win, size)
+-            if got != want or got is None:
+-                fail(f'wide_window {ww}: {size} cut {got}, want {want}')
+-            if int(v[-1]) != int(size in port):
+-                fail(f'wide_window {ww}: {size} probe flag {v[-1]}')
+-    d = next(out).split()
+-    n, r1, r2, flag = (int(x) for x in d[1:])
+-    if r1 != n + 2 or flag != 0:
+-        fail(f'a probe 1080x1920 blocked the real one derivable from a taller source (append {n}+1 -> {r1}, flag {flag})')
+-    if r2 != r1:
+-        fail('the real 1080x1920 was appended twice')
+-    if offer() != base:
+-        fail('turning the probe off does not restore the default list')
+-    return len(grid), len(ucases)
+-
+-
+-def main():
+-    parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument('--out', type=Path)
+-    parser.add_argument('--mutation', choices=MUTATIONS)
+-    args = parser.parse_args()
+-    src = {f: (ROOT / ISP / f).read_text() for f in FILES}
+-    if args.mutation:
+-        f, old, new = MUTATIONS[args.mutation]
+-        assert src[f].count(old) == 1, f'mutation site not found once: {old!r}'
+-        src[f] = src[f].replace(old, new, 1)
+-    with tempfile.TemporaryDirectory() as tmp:
+-        work = args.out if args.out else Path(tmp)
+-        work.mkdir(parents=True, exist_ok=True)
+-        try:
+-            source_checks(src)
+-            ng, nu = run(src, work)
+-        except (AssertionError, StopIteration, ValueError) as e:
+-            print(e if str(e).startswith('Assertion') else f'Assertion failed: {type(e).__name__} {e}')
+-            raise SystemExit(1)
+-    line = ('isp upscale probe: call-size rule unchanged over %d cases; probe cuts of 1328x1760 / 1080x1920 even, '
+-            'centred, in the window, refused when nothing needs enlarging (%d cases); listed only with upscale_probe; '
+-            'debugfs 0600, wide config only, never set by the driver' % (ng, nu))
+-    if args.out:
+-        (args.out / 'result.txt').write_text(line + '\n')
+-    print(line)
+-
+-
+-if __name__ == '__main__':
+-    main()
+diff --git a/tools/asahi/run-host-tests.py b/tools/asahi/run-host-tests.py
+index 8093b6486e..f21fb4f280 100755
+--- a/tools/asahi/run-host-tests.py
++++ b/tools/asahi/run-host-tests.py
+@@ -229,11 +229,9 @@ ASAHI_TESTS = {
+     'tb-dp-repair-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
+     'tbnet-refill-tests.py': [(out(), PASS)]
+         + mutations('--mutant', ('refill-count', 'no-retry', 'no-cancel', 'worker-allocation'), out()),
+-    'isp-upscale-probe-tests.py': [(out(), PASS)]
+-        + mutations('--mutation', ('offered-always', 'offered-on', 'debugfs-0644', 'debugfs-ungated',
+-                                   'default-on', 'odd-crop', 'no-clamp', 'no-centre', 'allow-fit',
+-                                   'no-probe-flag', 'probe-not-wide', 'dedupe-probe', 'cut-strict',
+-                                   'cut-fixed-window', 'refactor-odd', 'refactor-bound', 'no-log'), out()),
++    'isp-camera-sizes-tests.py': [(out(), PASS)]
++        + mutations('--mutation', ('view-off', 'window-0', 'tall-from-window', 'tall-unflagged', 'tall-offset',
++                                   'offered-always', 'refactor-odd', 'refactor-bound'), out()),
+     'tiled-split-tests.py': [(out(), PASS), (out() + ['--mutations'], PASS)],
+     'tunnel-route-tests.py': [(out(), PASS)],
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,568 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 09:33:33 +0000
+Subject: [PATCH] soc: apple: pmp: release the GPU's AGX vote at the
+ sleep's commit
+
+On the J604 a sleep that stops the PMP is refused at the PMP's
+.suspend_late for as long as the GPU holds its retained AGX vote, and
+the GPU always holds it on a running desktop:
+
+  apple_pmp 380500000.pmp: the AGX vote is held and has no release:
+  refusing the sleep
+
+The bridge has no AGX release at all, so with asahi.g16_deep_sleep=1 no
+suspend-to-RAM can get past that point.
+
+Aurora's M3 G15G driver releases the same vote (command 0x0f, logical
+device 5, state 0) only once it has proven its ASC stopped: "ASC and
+firmware queues must be stopped before the inner GPU vote is
+relinquished". The DCP's DISP vote follows the same order: the DCP
+stops, then DISP goes. With the G16 firmware stop now left for the
+sleep's commit, the release has to go there too, after it:
+
+- The GPU arms the release for one sleep in its .suspend_late
+  (apple_pmp_j713_gpu_sleep_enable()), once its own stop is left for the
+  commit (or done). This is refused while a request is in flight or the
+  stream has failed.
+- The PMP's verdict accepts a held AGX vote only while it is armed.
+  Without the sleep driver's commit, the PMP refuses the sleep.
+- The PMP's last stop at the commit, which runs after the GPU's
+  (registered first), sends the release with the new polled
+  apple_rtkit_send_polled() right before the PMP idles. The idle that
+  follows drops the reply. From then on the vote no longer counts as
+  held.
+- The GPU's .resume_early ends the arming and, before its warm restart,
+  takes AGX again with apple_pmp_j713_gpu_get() once the PMP is back.
+  After a sleep refused before the commit the vote was never sent away,
+  and the get sends nothing.
+
+The model test gains the commit order, a refusal before the commit and
+the arming refusals.
+
+Suspend-to-idle and g16_deep_sleep=0 are unchanged: nothing arms the
+release, and the PMP verdict is the same as before for an unarmed vote.
+
+Fixes: 6beaf1563c06 ("drm/asahi: g16: try a firmware stop and warm restart across suspend-to-RAM")
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+(cherry picked from commit a4a70f02aac55dc313d26319e0c56cc379afe521)
+---
+ drivers/gpu/drm/asahi/g16/sleep.rs         |   1 +
+ drivers/soc/apple/pmp-display-sleep-test.c |  95 ++++++++++++++++-
+ drivers/soc/apple/pmp-display-sleep.h      |  63 ++++++++++--
+ drivers/soc/apple/pmp-display.c            | 113 ++++++++++++++++++++-
+ drivers/soc/apple/pmp-export.c             |   9 ++
+ drivers/soc/apple/rtkit.c                  |   9 ++
+ include/linux/soc/apple/pmp-display.h      |  12 ++-
+ include/linux/soc/apple/rtkit.h            |   7 ++
+ 8 files changed, 293 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/sleep.rs b/drivers/gpu/drm/asahi/g16/sleep.rs
+index 6ed4a1fadc..e8abef6b8a 100644
+--- a/drivers/gpu/drm/asahi/g16/sleep.rs
++++ b/drivers/gpu/drm/asahi/g16/sleep.rs
+@@ -99,6 +99,7 @@ unsafe extern "C" fn sleep_suspend_late(dev: *mut bindings::device) -> core::ffi
+         Ok(()) => {
+             STOPPED.store(true, Ordering::Relaxed);
+             dev_info!(d, "G16: firmware idled and ASC stopped for the sleep\n");
++            arm_agx(d, dev);
+             0
+         }
+         Err(e) => {
+diff --git a/drivers/soc/apple/pmp-display-sleep-test.c b/drivers/soc/apple/pmp-display-sleep-test.c
+index 81f34c7ff3..fb5db42636 100644
+--- a/drivers/soc/apple/pmp-display-sleep-test.c
++++ b/drivers/soc/apple/pmp-display-sleep-test.c
+@@ -40,6 +40,18 @@ static int model_put_disp(struct model *m)
+ 	return 0;
+ }
+ 
++/* apple_pmp_j713_gpu_get(): the same for AGX, in the GPU's resume. */
++static int model_get_agx(struct model *m)
++{
++	if (!pmp_display_sleep_admits(&m->s))
++		return -EBUSY;
++	if (!m->v.agx_held) {
++		m->sends++;
++		m->v.agx_held = true;
++	}
++	return 0;
++}
++
+ static void model_boot(struct model *m)
+ {
+ 	*m = (struct model) {};
+@@ -108,7 +120,7 @@ static void pmp_sleep_refused_disp_held(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, m.sends, 1U);
+ }
+ 
+-/* AGX has no release: once the GPU took it, every such sleep is refused. */
++/* AGX held and its release not armed by the GPU: every such sleep is refused. */
+ static void pmp_sleep_refused_agx_held(struct kunit *test)
+ {
+ 	struct model m;
+@@ -212,7 +224,7 @@ static void pmp_sleep_disarm_on_resume(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, m.s.asleep);
+ }
+ 
+-/* Armed by the display, but the GPU holds AGX: still refused; the display's resume disarms. */
++/* Armed by the display, but the GPU holds AGX unarmed: still refused; the resume disarms. */
+ static void pmp_sleep_armed_agx_still_refused(struct kunit *test)
+ {
+ 	struct model m;
+@@ -227,6 +239,82 @@ static void pmp_sleep_armed_agx_still_refused(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, model_get_disp(&m), 0);
+ }
+ 
++/*
++ * The real order: DCP put and arm, GPU arms AGX, PMP suspend_late, then at the
++ * commit the GPU stops and the PMP's last stop sends AGX once; wake, GPU gets it.
++ */
++static void pmp_sleep_agx_released_at_commit(struct kunit *test)
++{
++	struct model m;
++
++	model_boot(&m);
++	KUNIT_EXPECT_EQ(test, model_get_agx(&m), 0);
++	model_put_disp(&m);
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_arm(&m.s, &m.v), PMP_DISPLAY_SLEEP_OK);
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_arm_agx(&m.s, &m.v), PMP_DISPLAY_SLEEP_OK);
++	KUNIT_EXPECT_TRUE(test, m.s.agx_at_commit);
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_enter(&m.s, &m.v), PMP_DISPLAY_SLEEP_OK);
++	KUNIT_EXPECT_TRUE(test, m.v.agx_held);
++	KUNIT_EXPECT_TRUE(test, pmp_display_sleep_commit_agx(&m.s, &m.v.agx_held));
++	KUNIT_EXPECT_FALSE(test, m.v.agx_held);
++	KUNIT_EXPECT_FALSE(test, pmp_display_sleep_commit_agx(&m.s, &m.v.agx_held));
++	/* Nothing reaches the stopped PMP. */
++	KUNIT_EXPECT_EQ(test, model_get_agx(&m), -EBUSY);
++	pmp_display_sleep_leave(&m.s);
++	KUNIT_EXPECT_FALSE(test, m.s.agx_at_commit);
++	KUNIT_EXPECT_EQ(test, model_get_agx(&m), 0);
++	KUNIT_EXPECT_TRUE(test, m.v.agx_held);
++	/* The next sleep needs the GPU to arm again. */
++	model_put_disp(&m);
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_arm(&m.s, &m.v), PMP_DISPLAY_SLEEP_OK);
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_enter(&m.s, &m.v), PMP_DISPLAY_SLEEP_AGX_HELD);
++}
++
++/* Refused after the PMP's suspend_late, before the commit: AGX never went and stays held. */
++static void pmp_sleep_agx_refused_before_commit(struct kunit *test)
++{
++	struct model m;
++	unsigned int sends;
++
++	model_boot(&m);
++	model_get_agx(&m);
++	model_put_disp(&m);
++	pmp_display_sleep_arm(&m.s, &m.v);
++	pmp_display_sleep_arm_agx(&m.s, &m.v);
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_enter(&m.s, &m.v), PMP_DISPLAY_SLEEP_OK);
++	sends = m.sends;
++	/* PMP resume_early (never stopped), then the GPU's resume. */
++	pmp_display_sleep_leave(&m.s);
++	pmp_display_sleep_disarm_agx(&m.s);
++	KUNIT_EXPECT_TRUE(test, m.v.agx_held);
++	KUNIT_EXPECT_EQ(test, model_get_agx(&m), 0);
++	KUNIT_EXPECT_EQ(test, m.sends, sends);
++	/* Not asleep: no commit sends it. */
++	m.s.agx_at_commit = true;
++	KUNIT_EXPECT_FALSE(test, pmp_display_sleep_commit_agx(&m.s, &m.v.agx_held));
++	KUNIT_EXPECT_TRUE(test, m.v.agx_held);
++}
++
++/* Arming AGX refused while in flight or failed; a vote not held arms nothing. */
++static void pmp_sleep_agx_arm_refused(struct kunit *test)
++{
++	struct model m;
++
++	model_boot(&m);
++	model_get_agx(&m);
++	m.v.pending = true;
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_arm_agx(&m.s, &m.v), PMP_DISPLAY_SLEEP_PENDING);
++	KUNIT_EXPECT_FALSE(test, m.s.agx_at_commit);
++	m.v.pending = false;
++	m.v.error = -EPROTO;
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_arm_agx(&m.s, &m.v), PMP_DISPLAY_SLEEP_FAILED);
++	KUNIT_EXPECT_FALSE(test, m.s.agx_at_commit);
++	m.v.error = 0;
++	m.v.agx_held = false;
++	KUNIT_EXPECT_EQ(test, pmp_display_sleep_arm_agx(&m.s, &m.v), PMP_DISPLAY_SLEEP_OK);
++	KUNIT_EXPECT_FALSE(test, m.s.agx_at_commit);
++}
++
+ static void pmp_sleep_reasons(struct kunit *test)
+ {
+ 	enum pmp_display_sleep_verdict v;
+@@ -248,6 +336,9 @@ static struct kunit_case pmp_display_sleep_cases[] = {
+ 	KUNIT_CASE(pmp_sleep_arm_one_sleep),
+ 	KUNIT_CASE(pmp_sleep_disarm_on_resume),
+ 	KUNIT_CASE(pmp_sleep_armed_agx_still_refused),
++	KUNIT_CASE(pmp_sleep_agx_released_at_commit),
++	KUNIT_CASE(pmp_sleep_agx_refused_before_commit),
++	KUNIT_CASE(pmp_sleep_agx_arm_refused),
+ 	KUNIT_CASE(pmp_sleep_reasons),
+ 	{}
+ };
+diff --git a/drivers/soc/apple/pmp-display-sleep.h b/drivers/soc/apple/pmp-display-sleep.h
+index a59ae97a5e..415480944f 100644
+--- a/drivers/soc/apple/pmp-display-sleep.h
++++ b/drivers/soc/apple/pmp-display-sleep.h
+@@ -7,13 +7,16 @@
+  * The bridge cannot release a vote on its own. DISP is released by its
+  * consumer, the DCP, which powers the display domains down first and calls
+  * apple_pmp_j713_display_put() (iomfb_m4_power_gate()); it takes the vote
+- * again with apple_pmp_j713_display_get() after power-up. AGX has no release
+- * at all. So a sleep that stops the PMP may only go ahead when the consumer
+- * has released DISP for this sleep and armed it (pmp_display_sleep_arm()),
+- * AGX is not held, nothing is in flight and the request stream works; from
+- * then until wake no vote may be taken, since a stopped PMP cannot accept
+- * one. The arming lasts one sleep: wake clears it, and so does the
+- * consumer's resume (pmp_display_sleep_disarm()).
++ * again with apple_pmp_j713_display_get() after power-up. AGX is released only
++ * at the sleep's commit, by the PMP's own last stop, after the GPU's firmware
++ * has stopped there (the GPU's ASC first, then its vote): the GPU arms that
++ * for one sleep (pmp_display_sleep_arm_agx()). So a sleep that stops the PMP
++ * may only go ahead when the consumer has released DISP for this sleep and
++ * armed it (pmp_display_sleep_arm()), AGX is not held or its release is
++ * armed, nothing is in flight and the request stream works; from then until
++ * wake no vote may be taken, since a stopped PMP cannot accept one. The
++ * armings last one sleep: wake clears them, and so do the consumers'
++ * resumes (pmp_display_sleep_disarm(), pmp_display_sleep_disarm_agx()).
+  */
+ #ifndef _APPLE_PMP_DISPLAY_SLEEP_H
+ #define _APPLE_PMP_DISPLAY_SLEEP_H
+@@ -28,7 +31,7 @@ enum pmp_display_sleep_verdict {
+ 	PMP_DISPLAY_SLEEP_FAILED,
+ 	/* A vote request is in flight. */
+ 	PMP_DISPLAY_SLEEP_PENDING,
+-	/* The AGX vote is held: it has no release. */
++	/* The AGX vote is held and the GPU has not armed its release at the commit. */
+ 	PMP_DISPLAY_SLEEP_AGX_HELD,
+ 	/* The DISP vote is held: its consumer has not powered the display down. */
+ 	PMP_DISPLAY_SLEEP_DISP_HELD,
+@@ -37,6 +40,8 @@ enum pmp_display_sleep_verdict {
+ struct pmp_display_sleep {
+ 	/* Armed for this sleep: the consumer released DISP. Cleared at wake. */
+ 	bool consumer;
++	/* Armed for this sleep by the GPU: AGX is released at the commit. Cleared at wake. */
++	bool agx_at_commit;
+ 	/* Between apple_pmp_display_sleep() and apple_pmp_display_wake(). */
+ 	bool asleep;
+ };
+@@ -60,7 +65,7 @@ pmp_display_sleep_check(const struct pmp_display_sleep *s, const struct pmp_disp
+ 		return PMP_DISPLAY_SLEEP_FAILED;
+ 	if (v->pending)
+ 		return PMP_DISPLAY_SLEEP_PENDING;
+-	if (v->agx_held)
++	if (v->agx_held && !s->agx_at_commit)
+ 		return PMP_DISPLAY_SLEEP_AGX_HELD;
+ 	if (v->disp_held)
+ 		return PMP_DISPLAY_SLEEP_DISP_HELD;
+@@ -89,6 +94,7 @@ static inline void pmp_display_sleep_leave(struct pmp_display_sleep *s)
+ {
+ 	s->asleep = false;
+ 	s->consumer = false;
++	s->agx_at_commit = false;
+ }
+ 
+ /*
+@@ -113,6 +119,43 @@ static inline void pmp_display_sleep_disarm(struct pmp_display_sleep *s)
+ 	s->consumer = false;
+ }
+ 
++/*
++ * The GPU, in its suspend, once its firmware's stop is left for the sleep's
++ * commit (or done): AGX is released at the commit, after that stop. Refused
++ * while a request is in flight or the stream failed (the GPU could not take
++ * AGX again after wake); nothing changes then. A vote not held arms nothing.
++ */
++static inline enum pmp_display_sleep_verdict
++pmp_display_sleep_arm_agx(struct pmp_display_sleep *s, const struct pmp_display_sleep_votes *v)
++{
++	if (v->provider_error || v->error)
++		return PMP_DISPLAY_SLEEP_FAILED;
++	if (v->pending)
++		return PMP_DISPLAY_SLEEP_PENDING;
++	s->agx_at_commit = v->agx_held;
++	return PMP_DISPLAY_SLEEP_OK;
++}
++
++/* The GPU's resume: also ends a sleep that was refused before the commit. */
++static inline void pmp_display_sleep_disarm_agx(struct pmp_display_sleep *s)
++{
++	s->agx_at_commit = false;
++}
++
++/*
++ * At the commit, interrupts off, before the PMP idles: whether to send AGX's
++ * release. Only once per sleep the PMP entered with it armed; the vote then
++ * no longer counts as held, whatever the outcome (as for an ambiguous
++ * release), and the GPU takes it again after wake.
++ */
++static inline bool pmp_display_sleep_commit_agx(struct pmp_display_sleep *s, bool *agx_held)
++{
++	if (!s->asleep || !s->agx_at_commit || !*agx_held)
++		return false;
++	*agx_held = false;
++	return true;
++}
++
+ /* Whether a vote may be taken now: not while the PMP is stopped for a sleep. */
+ static inline bool pmp_display_sleep_admits(const struct pmp_display_sleep *s)
+ {
+@@ -131,7 +174,7 @@ static inline const char *pmp_display_sleep_reason(enum pmp_display_sleep_verdic
+ 	case PMP_DISPLAY_SLEEP_PENDING:
+ 		return "a vote request is in flight";
+ 	case PMP_DISPLAY_SLEEP_AGX_HELD:
+-		return "the AGX vote is held and has no release";
++		return "the AGX vote is held and its release is not armed for the commit";
+ 	case PMP_DISPLAY_SLEEP_DISP_HELD:
+ 		return "the DISP vote is still held (display not powered down)";
+ 	}
+diff --git a/drivers/soc/apple/pmp-display.c b/drivers/soc/apple/pmp-display.c
+index b9a322fca8..ccb32d0f28 100644
+--- a/drivers/soc/apple/pmp-display.c
++++ b/drivers/soc/apple/pmp-display.c
+@@ -20,11 +20,17 @@
+ #include <linux/workqueue.h>
+ #include <linux/unaligned.h>
+ #include <linux/soc/apple/pmp-display.h>
++#include <linux/soc/apple/rtkit.h>
+ 
+ #include "pmp-display-sleep.h"
+ 
+ /* AGX: command 0x0f, logical device 5, state 1. The reply carries no tag. */
+ #define PMP_AGX_REQUEST		0x0020f50100000000ULL
++/*
++ * AGX, state 0: sent only at the sleep's commit, once the GPU's ASC has
++ * stopped, as Aurora's M3 G15G releases it only with its ASC stopped.
++ */
++#define PMP_AGX_RELEASE		0x0020f50000000000ULL
+ #define PMP_DISP_REQUEST	0x0020f80100000000ULL
+ /* DISP, state 0: released while its DCP has powered the display domains down. */
+ #define PMP_DISP_RELEASE	0x0020f80000000000ULL
+@@ -578,8 +584,11 @@ EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_get);
+  * domains down and calls apple_pmp_j713_display_put() in its suspend, and
+  * takes it again with apple_pmp_j713_display_get() in its resume, once the
+  * PMP is back. The device link apple_pmp_j713_display_prepare() made orders
+- * that suspend before the PMP's and that resume after it. AGX has no
+- * release: a held AGX vote keeps refusing such a sleep.
++ * that suspend before the PMP's and that resume after it. AGX goes at the
++ * sleep's commit, after the GPU's firmware stopped there: the GPU arms that
++ * (apple_pmp_j713_gpu_sleep_enable()), the PMP's last stop sends it
++ * (apple_pmp_display_commit()), and the GPU takes AGX again in its resume.
++ * Unarmed, a held AGX vote keeps refusing such a sleep.
+  *
+  * The consumer arms each such sleep after its put
+  * (apple_pmp_j713_display_sleep_enable()); the arming ends at the PMP's wake
+@@ -641,6 +650,106 @@ void apple_pmp_j713_display_sleep_disable(struct device *consumer)
+ }
+ EXPORT_SYMBOL_GPL(apple_pmp_j713_display_sleep_disable);
+ 
++/*
++ * The GPU's suspend, once its firmware's stop is left for the sleep's commit:
++ * the PMP's last stop releases AGX there, after it. Ends at the PMP's wake and
++ * with apple_pmp_j713_gpu_sleep_disable() in the GPU's resume.
++ */
++int apple_pmp_j713_gpu_sleep_enable(struct device *consumer)
++{
++	enum pmp_display_sleep_verdict verdict = PMP_DISPLAY_SLEEP_OK;
++	struct pmp_display_sleep_votes v = {};
++	struct apple_pmp_display *p;
++	unsigned long flags;
++	int ret;
++
++	if (!apple_pmp_display_board())
++		return -ENODEV;
++	p = pmp_power_consumer(consumer, PMP_POWER_AGX);
++	if (IS_ERR(p))
++		return PTR_ERR(p);
++	mutex_lock(&p->request);
++	ret = p->link[PMP_POWER_AGX] ? 0 : -ENODEV;
++	if (!ret) {
++		spin_lock_irqsave(&p->lock, flags);
++		v.provider_error = p->vote.provider_error;
++		v.error = p->vote.error;
++		v.pending = p->vote.pending != PMP_POWER_NONE;
++		v.agx_held = p->vote.held[PMP_POWER_AGX];
++		verdict = pmp_display_sleep_arm_agx(&p->sleep, &v);
++		spin_unlock_irqrestore(&p->lock, flags);
++		if (verdict == PMP_DISPLAY_SLEEP_FAILED)
++			ret = v.provider_error ?: v.error ?: -EIO;
++		else if (verdict != PMP_DISPLAY_SLEEP_OK)
++			ret = -EBUSY;
++	}
++	mutex_unlock(&p->request);
++	if (!ret && v.agx_held)
++		dev_info(p->dev, "%s armed the AGX release for this sleep's commit\n",
++			 dev_name(consumer));
++	else if (verdict != PMP_DISPLAY_SLEEP_OK)
++		dev_err(p->dev, "%s: %s: AGX release not armed\n", dev_name(consumer),
++			pmp_display_sleep_reason(verdict));
++	return ret;
++}
++EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_sleep_enable);
++
++/* The GPU's resume: the sleep it armed is over, whether or not AGX went. */
++void apple_pmp_j713_gpu_sleep_disable(struct device *consumer)
++{
++	struct apple_pmp_display *p;
++	unsigned long flags;
++
++	if (!apple_pmp_display_board())
++		return;
++	p = pmp_power_consumer(consumer, PMP_POWER_AGX);
++	if (IS_ERR(p))
++		return;
++	spin_lock_irqsave(&p->lock, flags);
++	pmp_display_sleep_disarm_agx(&p->sleep);
++	spin_unlock_irqrestore(&p->lock, flags);
++}
++EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_sleep_disable);
++
++/* Whether this sleep needs the commit for AGX: the PMP refuses one that can't take it. */
++bool apple_pmp_display_agx_at_commit(void)
++{
++	/* Pairs with the release in apple_pmp_display_register(). */
++	struct apple_pmp_display *p = smp_load_acquire(&pmp_display);
++	unsigned long flags;
++	bool armed;
++
++	if (!p)
++		return false;
++	spin_lock_irqsave(&p->lock, flags);
++	armed = p->sleep.agx_at_commit && p->vote.held[PMP_POWER_AGX];
++	spin_unlock_irqrestore(&p->lock, flags);
++	return armed;
++}
++
++/*
++ * The PMP's last stop at the sleep's commit, interrupts off and one CPU up,
++ * after the GPU's (registered first) and before the PMP idles: the AGX
++ * release, if the GPU armed it. 1: sent, 0: nothing to send, negative: the
++ * send failed. The vote no longer counts as held either way.
++ */
++int apple_pmp_display_commit(struct apple_rtkit *rtk)
++{
++	/* Pairs with the release in apple_pmp_display_register(). */
++	struct apple_pmp_display *p = smp_load_acquire(&pmp_display);
++	bool send;
++
++	if (!p)
++		return 0;
++	/* Nothing else runs now: the lock is free, taken for its ordering. */
++	spin_lock(&p->lock);
++	send = pmp_display_sleep_commit_agx(&p->sleep, &p->vote.held[PMP_POWER_AGX]);
++	spin_unlock(&p->lock);
++	if (!send)
++		return 0;
++	return apple_rtkit_send_polled(rtk, PMP_ENDPOINT, PMP_AGX_RELEASE) ?: 1;
++}
++
+ /*
+  * From the PMP's suspend_late, before it stops. 0: no vote is held or in
+  * flight, and none is taken until apple_pmp_display_wake(). Otherwise
+diff --git a/drivers/soc/apple/pmp-export.c b/drivers/soc/apple/pmp-export.c
+index 195452b8f0..98f25d3947 100644
+--- a/drivers/soc/apple/pmp-export.c
++++ b/drivers/soc/apple/pmp-export.c
+@@ -132,6 +132,8 @@ EXPORT_SYMBOL_GPL(apple_pmp_t6030_gpu_ready);
+  */
+ static struct apple_pmp_commit_stop pmp_commit;
+ static bool pmp_commit_registered, pmp_commit_used;
++/* What the commit did with the GPU's AGX release (apple_pmp_display_commit()). */
++static int pmp_commit_agx;
+ 
+ /* Interrupts off, one CPU: what apple_pmp_sleep() does, through pointers taken before. */
+ static int apple_pmp_commit_stop_fn(void *unused)
+@@ -141,6 +143,8 @@ static int apple_pmp_commit_stop_fn(void *unused)
+ 	size_t i;
+ 	int ret;
+ 
++	/* The GPU's vote, if it armed its release: its firmware stopped before this. */
++	pmp_commit_agx = apple_pmp_display_commit(c->rtk);
+ 	ret = apple_rtkit_sleep_idle_polled(c->rtk, c->control, &us);
+ 	apple_rtkit_mailbox_recv_off(c->rtk);
+ 	for (i = 0; c->sram && i < c->count; i++)
+@@ -238,6 +242,11 @@ static int apple_pmp_resume_early(struct device *dev)
+ 
+ 		pmp_commit_used = false;
+ 		apple_sleep_coproc_set_ready(dev, false);
++		if (stopped && pmp_commit_agx > 0)
++			dev_info(dev, "AGX released at the commit, after the GPU's stop\n");
++		else if (stopped && pmp_commit_agx < 0)
++			dev_err(dev, "AGX release at the commit not sent: %d\n", pmp_commit_agx);
++		pmp_commit_agx = 0;
+ 		if (!pm_resume_via_firmware() && !stopped) {
+ 			pmp_asleep = false;
+ 			apple_pmp_report_wake(dev, true);
+diff --git a/drivers/soc/apple/rtkit.c b/drivers/soc/apple/rtkit.c
+index 6df25b8462..ca4d97c86d 100644
+--- a/drivers/soc/apple/rtkit.c
++++ b/drivers/soc/apple/rtkit.c
+@@ -2821,6 +2821,15 @@ void apple_rtkit_mailbox_recv_off(struct apple_rtkit *rtk)
+ }
+ EXPORT_SYMBOL_GPL(apple_rtkit_mailbox_recv_off);
+ 
++int apple_rtkit_send_polled(struct apple_rtkit *rtk, u8 ep, u64 message)
++{
++	struct apple_mbox_msg msg = { .msg0 = message, .msg1 = ep };
++
++	dma_wmb();
++	return apple_rtkit_polled_send(rtk, msg) ? 0 : -ETIMEDOUT;
++}
++EXPORT_SYMBOL_GPL(apple_rtkit_send_polled);
++
+ int apple_rtkit_sleep_stop(struct apple_rtkit *rtk, void __iomem *cpu_control)
+ {
+ 	int ret;
+diff --git a/include/linux/soc/apple/pmp-display.h b/include/linux/soc/apple/pmp-display.h
+index 56bafd62af..ab2ff66334 100644
+--- a/include/linux/soc/apple/pmp-display.h
++++ b/include/linux/soc/apple/pmp-display.h
+@@ -65,13 +65,21 @@ int apple_pmp_j713_gpu_check(struct device *consumer);
+  * vote in its suspend, then arms this one sleep (display_sleep_enable;
+  * -EBUSY while DISP is held); it gets the vote again in its resume and ends
+  * the arming there (display_sleep_disable), as the PMP's wake also does.
+- * Unarmed, such a sleep is refused. The AGX vote has no release, so a held
+- * AGX vote refuses it too.
++ * Unarmed, such a sleep is refused. The AGX vote is released only at the
++ * sleep's commit, after the GPU's firmware stopped there: the GPU arms that
++ * in its suspend (gpu_sleep_enable), the PMP's last stop sends it, and the
++ * GPU gets the vote again in its resume and ends the arming
++ * (gpu_sleep_disable). A held AGX vote not armed so refuses the sleep.
+  */
+ int apple_pmp_j713_display_sleep_enable(struct device *consumer);
+ void apple_pmp_j713_display_sleep_disable(struct device *consumer);
++int apple_pmp_j713_gpu_sleep_enable(struct device *consumer);
++void apple_pmp_j713_gpu_sleep_disable(struct device *consumer);
+ /* Internal: the PMP owner, around its own stop and restart. */
++struct apple_rtkit;
+ int apple_pmp_display_sleep(void);
+ void apple_pmp_display_wake(void);
++bool apple_pmp_display_agx_at_commit(void);
++int apple_pmp_display_commit(struct apple_rtkit *rtk);
+ 
+ #endif
+diff --git a/include/linux/soc/apple/rtkit.h b/include/linux/soc/apple/rtkit.h
+index 5ca5fc9d29..3b160fffeb 100644
+--- a/include/linux/soc/apple/rtkit.h
++++ b/include/linux/soc/apple/rtkit.h
+@@ -369,6 +369,13 @@ int apple_rtkit_sleep_idle_polled(struct apple_rtkit *rtk, void __iomem *cpu_con
+  */
+ void apple_rtkit_mailbox_recv_off(struct apple_rtkit *rtk);
+ 
++/*
++ * A message sent with interrupts off and one CPU up, right before
++ * apple_rtkit_sleep_idle_polled(): waits for room in the FIFO by polling. A reply
++ * is not delivered; the idle that follows drops it.
++ */
++int apple_rtkit_send_polled(struct apple_rtkit *rtk, u8 ep, u64 message);
++
+ /*
+  * Prepare for a firmware being restarted with its buffers kept.
+  */
+-- 
+2.43.0
+

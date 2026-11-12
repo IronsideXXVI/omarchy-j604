@@ -1,0 +1,128 @@
+From 50d7f8698539ef230a7704b296593c91d3ce7834 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Sun, 1 Nov 2026 14:36:04 +1100
+Subject: [PATCH 10/15] avd-fw: route queued decoder interrupts and test FIFO
+ EMPTY status
+
+Queue mode enables NVIC and decoder IRQ sources but leaves the CM3 router
+masked. Enable the accepted descriptor's VP and PP routes when entering
+queue mode, preserving live engines and avoiding unimplemented VP holes.
+Leave the legacy transport's routing untouched.
+
+Outbox completion and fatal publication must test FIFO EMPTY status bit
+17, not the similarly named IRQ-source bit 2. Use a separate status
+constant and correct the emulator status model so the seven-image
+transport checks cannot conceal this error again.
+
+The routed CM3 regression boots the v3-t1 reset vector, consumes a real
+Linux H.264 program and produces one tagged completion at FIFO 0, 1 and
+14. Without the routes it remains SUBMITTED; routes alone still cannot
+publish a completion against the corrected FIFO status model.
+[dylan: one co-author trailer of the original message is not reproduced here]
+
+---
+ src/hw/reg/reg_common.h |  3 +++
+ src/queue-fw.c          | 33 +++++++++++++++++++++++++++++++--
+ tests/transport-test.py |  2 +-
+ 3 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/src/hw/reg/reg_common.h b/src/hw/reg/reg_common.h
+index 2df4d15..9e392d3 100644
+--- a/src/hw/reg/reg_common.h
++++ b/src/hw/reg/reg_common.h
+@@ -34,6 +34,9 @@
+ #define CM3_MBOX1_EMPTY		BIT(2)
+ #define CM3_MBOX1_NOT_EMPTY	BIT(3)
+ 
++/* FIFO status is separate from the mailbox IRQ-source bits above. */
++#define CM3_MBOX_STATUS_EMPTY	BIT(17)
++
+ #define DECODE_STATUS_UNK	BIT(0)
+ #define DECODE_STATUS_ERR	BIT(1)
+ #define DECODE_STATUS_DONE	BIT(2)
+diff --git a/src/queue-fw.c b/src/queue-fw.c
+index 7b2b532..c93bfcd 100644
+--- a/src/queue-fw.c
++++ b/src/queue-fw.c
+@@ -106,12 +106,39 @@ void avdq_fw_init(void)
+ 	Q_INFO[0] = AVDQ_MAGIC;
+ }
+ 
++/* The CM3 interrupt router is separate from the NVIC and decoder masks. */
++static void queue_enable_irq(unsigned int irq)
++{
++	unsigned int bank = (irq - 14u) / 32u;
++	unsigned int mask = 1u << ((irq - 14u) % 32u);
++
++	reg_write(CM3_MBOX_IRQEN(bank), reg_read(CM3_MBOX_IRQEN(bank)) | mask);
++}
++
++static void queue_enable_irqs(unsigned int vp)
++{
++	unsigned int event, first;
++
++	/* Enable only a validated descriptor's VP, not holes in the VP limit. */
++	first = (AVD_VER == 2 ? 18u : 78u) + vp * 5u;
++	for (event = 0; event < 3; event++)
++		queue_enable_irq(first + event); /* unknown/error/DONE, not FULL */
++	first = AVD_VER == 2 ? 38u : 62u;
++	queue_enable_irq(first); /* PP unknown */
++	queue_enable_irq(first + 2u); /* PP DONE */
++}
++
+ int avdq_fw_mailbox(unsigned int token)
+ {
+ 	int idx = avdq_index(token, Q_RING);
+ 	unsigned int write;
+ 	if (idx < 0)
+ 		return FW->mode != 0; /* Never run Tansy resets during a queue session. */
++	if (!FW->mode) {
++		/* Queue mode owns these routes; legacy mode before it is unchanged. */
++		for (unsigned int i = 0; i < 6; i++)
++			reg_write(CM3_MBOX_IRQEN(i), 0);
++	}
+ 	FW->mode = 1;
+ 	write = FW->in_write;
+ 	if (write - FW->in_read >= AVDQ_COUNT) {
+@@ -243,7 +270,7 @@ static int complete(void *cookie, unsigned int idx, const struct avdq_frame *f)
+ {
+ 	volatile struct avdq_desc *d = Q_DESC(idx);
+ 	(void)cookie;
+-	if (!(reg_read(CM3_MBOX1_STATUS) & CM3_MBOX1_EMPTY))
++	if (!(reg_read(CM3_MBOX1_STATUS) & CM3_MBOX_STATUS_EMPTY))
+ 		return 0;
+ 	d->status = f->status;
+ 	d->completion_tag = f->desc.tag;
+@@ -290,13 +317,15 @@ int avdq_fw_poll(void)
+ 		if (avdq_submit(&FW->q, idx, &d, VP_COUNT, AVD_VER <= 3 ? 7u : 15u)) {
+ 			FW->fatal = 1;
+ 			avdq_fault(&FW->q);
++		} else if (FW->q.frame[idx].status == AVDQ_OK) {
++			queue_enable_irqs(d.vp_slot);
+ 		}
+ 		/* Queue mode owns PIODMA; the Tansy transport cannot run concurrently. */
+ 		reg_write(Q_DMA(0x00), reg_read(Q_DMA(0x00)) & ~1u);
+ 	}
+ 	avdq_step(&FW->q, &ops, FW);
+ 	if (FW->fatal && !FW->q.count &&
+-	    (reg_read(CM3_MBOX1_STATUS) & CM3_MBOX1_EMPTY)) {
++	    (reg_read(CM3_MBOX1_STATUS) & CM3_MBOX_STATUS_EMPTY)) {
+ 		reg_write(CM3_MBOX1_TX, AVDQ_FATAL);
+ 		FW->fatal = 0;
+ 	}
+diff --git a/tests/transport-test.py b/tests/transport-test.py
+index 0b17513..22d41c2 100644
+--- a/tests/transport-test.py
++++ b/tests/transport-test.py
+@@ -76,7 +76,7 @@ class Transport:
+             self.put(addr, 0)
+             self.clear.remove(addr)
+         if addr == 0x5001005c:
+-            self.put(addr, 0 if self.busy else 4)
++            self.put(addr, 0x10101 if self.busy else 0x20001)
+         if self.decode + self.maximum <= addr < self.decode + self.maximum + self.vps * 4:
+             self.put(addr, 256)
+         if self.decode + self.current <= addr < self.decode + self.current + self.vps * 4:
+-- 
+2.43.0
+

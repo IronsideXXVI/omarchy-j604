@@ -1,0 +1,275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 7 Nov 2026 08:38:13 +0000
+Subject: [PATCH] drm/apple: m4: describe the J604 panel as Display P3
+ in its EDID
+
+The M4 backend publishes one fixed mode and the panel size for the
+internal panel, but no EDID, so a compositor sees a nameless display
+without primaries (Hyprland: no make/model, colour preset srgb).
+
+When the ADT names a Display P3 target (see dcp_panel_adt_read()), give
+the connector the base EDID dcp-panel-edid.c already builds for P3
+panels: make APP, the profile name (J604), the model year, P3 primaries,
+D65 white, gamma 2.2, and the native timing (3024x1964 at 120 Hz) in a
+DisplayID 2.0 extension. The EDID is a description only: the driver still
+publishes its single firmware timing and adds no mode from it, and the
+connector keeps its size in millimetres. A profile without a model year
+(the J713) or an ADT without a P3 target leaves the connector as before.
+
+Apple's technical specifications for the MacBook Pro (14-inch, M4, 2024)
+list "Wide color (P3)" for the built-in display.
+
+What a compositor does with it is its own setting (Hyprland's monitor
+cm, "edid" to map sRGB content into the panel's primaries); nothing
+changes by default.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+(cherry picked from commit 080e548a077ab7e6c1aafd8a4ce2a44f4fe5bb18)
+[j604: k610 drm sync: .model_year = 2024 goes on upstream's
+ dcp_m4_profile_j604 (dcp-m4-profile.h); the iomfb_m4.c board-table hunk
+ is not carried. Aurora's dcp-panel-adt.c (c7e3f37e7c and later) has no
+ standalone ADT reader (dcp.c reads the phram "adt" itself, for non-T8132
+ panels only), so dcp_panel_adt_read() is added to dcp-panel-adt.{c,h} as
+ it was in a15y; it parses with upstream's dcp_panel_adt_parse() and the
+ same /product gamut + calibration-matrix rule. Upstream gives T8132 no
+ panel identity EDID (dcp->panel_identity is not allocated for
+ iomfb_is_m4()), so this EDID path does not overlap with upstream's.]
+(cherry picked from commit 8d66b76e3483d96ad0bbb74ed2f15d35eacc3ef8)
+(cherry picked from commit 7c455bbaf429d432200ee9edb8c76f89aeb4ca10)
+---
+ drivers/gpu/drm/apple/dcp-m4-profile.h |  7 +++
+ drivers/gpu/drm/apple/dcp-panel-adt.c  | 37 +++++++++++++++
+ drivers/gpu/drm/apple/dcp-panel-adt.h  |  2 +
+ drivers/gpu/drm/apple/iomfb.c          |  2 +
+ drivers/gpu/drm/apple/iomfb_m4.c       | 66 ++++++++++++++++++++++++++
+ drivers/gpu/drm/apple/iomfb_m4.h       |  5 ++
+ 6 files changed, 119 insertions(+)
+
+diff --git a/drivers/gpu/drm/apple/dcp-m4-profile.h b/drivers/gpu/drm/apple/dcp-m4-profile.h
+index 47e5aa99b7..ee9c5a8531 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-profile.h
++++ b/drivers/gpu/drm/apple/dcp-m4-profile.h
+@@ -25,6 +25,11 @@ struct dcp_m4_profile {
+ 	u16 open_method;		/* first client open */
+ 	u32 brightness_max, brightness_default;
+ 	u32 width_mm, height_mm;
++	/*
++	 * The model year of the machine, for the panel EDID; 0 publishes none
++	 * (iomfb_m4_panel_edid()).
++	 */
++	u16 model_year;
+ 	/*
+ 	 * The qualified preferred timing (ID 2), horizontal then vertical:
+ 	 * Active, Total, FrontPorch, SyncWidth, BackPorch, PreciseSyncRate,
+@@ -107,6 +112,8 @@ static const struct dcp_m4_profile dcp_m4_profile_j604 = {
+ 	.swap_timestamps = true,
+ 	.brightness_max = 600, .brightness_default = 140,
+ 	.width_mm = 0, .height_mm = 0,
++	/* MacBook Pro (14-inch, M4, 2024): the panel EDID's model year. */
++	.model_year = 2024,
+ 	.timing = dcp_m4_timing_j604, .timing_elements = 6,
+ 	.alloc_page_align = true,
+ };
+diff --git a/drivers/gpu/drm/apple/dcp-panel-adt.c b/drivers/gpu/drm/apple/dcp-panel-adt.c
+index 80cb99a70d..df03f69598 100644
+--- a/drivers/gpu/drm/apple/dcp-panel-adt.c
++++ b/drivers/gpu/drm/apple/dcp-panel-adt.c
+@@ -5,7 +5,10 @@
+  * implementation or captured device identifiers are used here.
+  */
+ #include <linux/err.h>
++#include <linux/io.h>
+ #include <linux/kernel.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/string.h>
+ #include <linux/sizes.h>
+ #include <linux/unaligned.h>
+@@ -207,3 +210,37 @@ int dcp_panel_adt_parse(const void *data, size_t size, struct dcp_panel_adt *pan
+ 		*panel = parsed;
+ 	return ret;
+ }
++
++/*
++ * m1n1 reserves the original ADT as a phram node labelled "adt" (as
++ * dcp_panel_read_adt() in dcp.c reads it). Read it without an MTD dependency,
++ * for a backend that reads the panel properties itself (T8132).
++ */
++int dcp_panel_adt_read(struct dcp_panel_adt *panel)
++{
++	struct device_node *np;
++	const char *label;
++	struct resource res;
++	void *data;
++	int ret = -ENODATA;
++
++	for_each_compatible_node(np, NULL, "phram") {
++		if (of_property_read_string(np, "label", &label) || strcmp(label, "adt"))
++			continue;
++		if (of_address_to_resource(np, 0, &res) ||
++		    !resource_size(&res) || resource_size(&res) > SZ_16M) {
++			ret = -EINVAL;
++			break;
++		}
++		data = memremap(res.start, resource_size(&res), MEMREMAP_WB);
++		if (!data) {
++			ret = -ENOMEM;
++			break;
++		}
++		ret = dcp_panel_adt_parse(data, resource_size(&res), panel);
++		memunmap(data);
++		break;
++	}
++	of_node_put(np);
++	return ret;
++}
+diff --git a/drivers/gpu/drm/apple/dcp-panel-adt.h b/drivers/gpu/drm/apple/dcp-panel-adt.h
+index 4ed24a523a..f967b63652 100644
+--- a/drivers/gpu/drm/apple/dcp-panel-adt.h
++++ b/drivers/gpu/drm/apple/dcp-panel-adt.h
+@@ -18,4 +18,6 @@ struct dcp_panel_adt {
+ };
+ 
+ int dcp_panel_adt_parse(const void *data, size_t size, struct dcp_panel_adt *panel);
++/* m1n1's phram copy of the ADT ("adt"); -ENODATA without one. */
++int dcp_panel_adt_read(struct dcp_panel_adt *panel);
+ #endif
+diff --git a/drivers/gpu/drm/apple/iomfb.c b/drivers/gpu/drm/apple/iomfb.c
+index 4a7ff2127a..1b1b371001 100644
+--- a/drivers/gpu/drm/apple/iomfb.c
++++ b/drivers/gpu/drm/apple/iomfb.c
+@@ -2317,6 +2317,8 @@ int dcp_get_modes(struct drm_connector *connector)
+ 				     &connector->display_info.width_mm);
+ 		of_property_read_u32(dcp->dev->of_node, "apple,panel-height-mm",
+ 				     &connector->display_info.height_mm);
++		if (iomfb_m4_panel_edid(dcp, connector))
++			dev_warn_once(dcp->dev, "panel EDID publication failed\n");
+ 		return 1;
+ 	}
+ 	modes = dcp_modes_snapshot(dcp, apple_connector, &nr_modes);
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 57dc50d33a..ebcc65fb2f 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -26,6 +26,7 @@
+ #include <linux/minmax.h>
+ #include <linux/unaligned.h>
+ #include <linux/workqueue.h>
++#include <drm/drm_connector.h>
+ #include <drm/drm_framebuffer.h>
+ #include <drm/drm_modes.h>
+ #include <drm/drm_fourcc.h>
+@@ -48,6 +49,8 @@
+ #include "dcp.h"
+ #include "dptxep.h"
+ #include "iomfb_m4.h"
++#include "dcp-panel-adt.h"
++#include "dcp-panel-edid.h"
+ 
+ #include "dcp-m4-profile.h"
+ #include "dcp-m4-protocol.h"
+@@ -204,6 +207,9 @@ struct iomfb_m4 {
+ 	struct drm_framebuffer *uncertain_fb;
+ 	struct dcp_m4_frame active_frame;
+ 	u64 flips, blanks, brightness_swaps;
++	/* The ADT panel properties, read once by iomfb_m4_panel_edid(). */
++	bool panel_adt_read, panel_p3;
++	u32 panel_edr_headroom; /* 16.16, 0 if the ADT has none */
+ 	struct delayed_work idle_cache;
+ 	/*
+ 	 * Framebuffer references a window let go of, put
+@@ -3057,6 +3063,66 @@ int iomfb_m4_get_mode(struct apple_dcp *owner, struct drm_display_mode *mode)
+ 	return 0;
+ }
+ 
++/*
++ * The panel EDID: make, model, size and the colour target. The DCP gives
++ * none for the internal panel, so a compositor sees a nameless display with
++ * no primaries. The boot loader leaves Linux the populated ADT, whose
++ * /product artwork-display-gamut names the standard colour space the panel
++ * is factory-calibrated to (the DCP applies the per-unit matrix itself; it is
++ * never read here or sent as a CTM). Only a Display P3 target, with its
++ * version-1 calibration matrix, publishes the base EDID of a P3 panel
++ * (dcp-panel-edid.c: P3 primaries, D65, gamma 2.2, the native timing in a
++ * DisplayID extension). It adds no mode: the driver keeps its one timing.
++ * A profile without a model year, or an ADT without a P3 target, keeps the
++ * connector as before.
++ */
++int iomfb_m4_panel_edid(struct apple_dcp *owner, struct drm_connector *connector)
++{
++	struct iomfb_m4 *dcp = owner->v26_6;
++	u32 width_mm = connector->display_info.width_mm;
++	u32 height_mm = connector->display_info.height_mm;
++	struct dcp_panel_id id = {};
++	struct drm_display_mode mode;
++	int ret;
++
++	if (!dcp || !dcp_m4_pf->model_year)
++		return 0;
++	if (!dcp->panel_adt_read) {
++		struct dcp_panel_adt adt = {};
++
++		dcp->panel_adt_read = true;
++		ret = dcp_panel_adt_read(&adt);
++		dcp->panel_p3 = !ret && adt.gamut == DCP_PANEL_GAMUT_DISPLAY_P3;
++		dcp->panel_edr_headroom = ret ? 0 : adt.edr_potential_headroom;
++		dev_info(dcp->dev, "panel ADT: %s; colour target %s; EDR headroom %u.%03u\n",
++			 ret ? "unavailable" : "parsed",
++			 dcp->panel_p3 ? "Display P3" :
++			 adt.gamut == DCP_PANEL_GAMUT_SRGB ? "sRGB (no EDID)" : "none",
++			 dcp->panel_edr_headroom >> 16,
++			 (u32)(((u64)(dcp->panel_edr_headroom & 0xffff) * 1000) >> 16));
++	}
++	if (!dcp->panel_p3 || !width_mm || !height_mm)
++		return 0;
++	ret = iomfb_m4_get_mode(owner, &mode);
++	if (ret)
++		return ret;
++	strscpy(id.vendor, "APP", sizeof(id.vendor));
++	strscpy(id.name, dcp_m4_pf->name, sizeof(id.name));
++	id.model_year = dcp_m4_pf->model_year;
++	id.timing = (struct dcp_panel_timing) {
++		.clock_khz = mode.clock,
++		.hdisplay = mode.hdisplay, .hsync_start = mode.hsync_start,
++		.hsync_end = mode.hsync_end, .htotal = mode.htotal,
++		.vdisplay = mode.vdisplay, .vsync_start = mode.vsync_start,
++		.vsync_end = mode.vsync_end, .vtotal = mode.vtotal,
++	};
++	ret = dcp_panel_edid_update(connector, &id, width_mm, height_mm);
++	/* The base block holds whole centimetres: keep the millimetres. */
++	connector->display_info.width_mm = width_mm;
++	connector->display_info.height_mm = height_mm;
++	return ret;
++}
++
+ int iomfb_m4_error(struct apple_dcp *owner)
+ {
+ 	return owner->v26_6 ? READ_ONCE(owner->v26_6->error) : -ENODEV;
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.h b/drivers/gpu/drm/apple/iomfb_m4.h
+index c45d737b1d..496b4afb62 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.h
++++ b/drivers/gpu/drm/apple/iomfb_m4.h
+@@ -44,6 +44,7 @@ int iomfb_m4_adopt_external(struct apple_dcp *dcp);
+ int iomfb_m4_start(struct apple_dcp *dcp, struct device *scanout);
+ int iomfb_m4_activate(struct apple_dcp *dcp);
+ int iomfb_m4_get_mode(struct apple_dcp *dcp, struct drm_display_mode *mode);
++int iomfb_m4_panel_edid(struct apple_dcp *dcp, struct drm_connector *connector);
+ int iomfb_m4_health(struct apple_dcp *dcp);
+ int iomfb_m4_error(struct apple_dcp *dcp);
+ bool iomfb_m4_external_ready(struct apple_dcp *dcp);
+@@ -93,6 +94,10 @@ static inline int iomfb_m4_get_mode(struct apple_dcp *dcp, struct drm_display_mo
+ {
+ 	return -ENODEV;
+ }
++static inline int iomfb_m4_panel_edid(struct apple_dcp *dcp, struct drm_connector *connector)
++{
++	return 0;
++}
+ static inline int iomfb_m4_health(struct apple_dcp *dcp) { return -ENODEV; }
+ static inline int iomfb_m4_error(struct apple_dcp *dcp) { return -ENODEV; }
+ static inline bool iomfb_m4_external_ready(struct apple_dcp *dcp) { return false; }
+-- 
+2.43.0
+

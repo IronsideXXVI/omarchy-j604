@@ -1,0 +1,560 @@
+From bbb5b9706fdd1c15fd990f3783352870337a789f Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Sun, 1 Nov 2026 00:31:18 +1100
+Subject: [PATCH 08/15] avd-fw: queue ABI 2, SRAM ring programs and multi-kick
+ PP
+
+PIODMA program fetches need the decoder's second DART stream, which the
+device trees in use do not describe. Add a mode that needs no DMA: the host
+streams each program into a 0x1800-word ring in CM3 SRAM (+0x0, unused in
+queue mode) and publishes a free-running write count; firmware copies up
+to 64 words per step into the VP FIFO, publishes its read count, and
+faults if a descriptor's start disagrees with the ring position.
+
+Descriptors gain flags (bit 0: program in the SRAM ring), pp_extra and
+pp_cont, so HEVC, VP9 and AV1 frames that need one PP EXEC per segment
+get the same kick sequence the legacy host wrote. A PP DONE while no frame
+is in PP is counted and ignored instead of halting the queue, matching
+the legacy host. The Tansy VP0 counter in SRAM is only updated in legacy
+mode now, so it cannot land inside the ring.
+
+The info block reports ABI 2, the feature bits and the ring geometry.
+Host unit tests and the unicorn transport test cover wrap, streaming
+past the ring size, FIFO back-pressure, multi-kick, stray PP DONE and the
+position check on all seven images.
+[dylan: one co-author trailer of the original message is not reproduced here]
+
+---
+ docs/queue.md           | 48 ++++++++++++++++++++++++---
+ src/irq.c               |  8 +++--
+ src/queue-fw.c          | 59 +++++++++++++++++++++++++++++++--
+ src/queue.c             | 27 +++++++++++----
+ src/queue.h             | 23 +++++++++++--
+ tests/queue-test.c      | 42 ++++++++++++++++++++----
+ tests/transport-test.py | 73 +++++++++++++++++++++++++++++++++++++++--
+ 7 files changed, 252 insertions(+), 28 deletions(-)
+
+diff --git a/docs/queue.md b/docs/queue.md
+index 7eeb80f..ddf4583 100644
+--- a/docs/queue.md
++++ b/docs/queue.md
+@@ -1,4 +1,4 @@
+-# Open firmware frame queue, ABI 1
++# Open firmware frame queue, ABI 2
+ 
+ This is the MIT open backend protocol, not an Apple firmware ABI. All words are
+ little endian. It preserves legacy `0x100 | vp` / `0x1000` interrupt messages
+@@ -17,7 +17,7 @@ information block at SRAM `+0x7fc0` before raising the existing boot-ready flag:
+ | Offset | u32 value |
+ | --- | --- |
+ | 0x00 | magic `0x41565131` (`AVQ1`), published last |
+-| 0x04 | ABI version, 1 |
++| 0x04 | ABI version, 2 (ABI 1 plus the SRAM ring and multi-kick PP) |
+ | 0x08 | descriptor count, 16 |
+ | 0x0c | descriptor stride, 64 |
+ | 0x10 | SRAM aperture address in the four-byte doorbell address space |
+@@ -27,7 +27,11 @@ information block at SRAM `+0x7fc0` before raising the existing boot-ready flag:
+ | 0x20 | VP register index limit (exclusive), 4 / 9 / 12 |
+ | 0x24 | codec mask: bits HEVC=0, H.264=1, VP9=2, AV1=3 |
+ | 0x28 | hardware FIFO slots: cap frames in flight at min(16, this) |
+-| 0x2c..0x3c | reserved, zero |
++| 0x2c | features: bit 0 SRAM ring, bit 1 multi-kick PP |
++| 0x30 | SRAM ring offset, `0x0` |
++| 0x34 | SRAM ring size in words, `0x1800` (24 KiB) |
++| 0x38 | firmware: SRAM ring words consumed (free-running, live) |
++| 0x3c | host: SRAM ring words written (free-running, host-owned) |
+ 
+ Read the block after boot-ready. Missing magic means old firmware: use the
+ legacy backend, or reject queue mode. An unknown version must not be submitted.
+@@ -80,7 +84,10 @@ Each descriptor is exactly 16 u32 words (`struct avdq_desc` in `src/queue.h`):
+ | 0x20 | state | host publishes 1 (SUBMITTED); firmware publishes 2 (COMPLETE) |
+ | 0x24 | status | firmware: 0 success, 1 invalid descriptor, 2 fatal pipeline I/O |
+ | 0x28 | completion_tag | firmware: full unmodified 32-bit submitted tag |
+-| 0x2c..0x3c | reserved[5] | host: zero |
++| 0x2c | flags | host: bit 0 = program is in the SRAM ring (ABI 2) |
++| 0x30 | pp_extra | host: continuation PP kicks after pp_kick, 0..255 (ABI 2) |
++| 0x34 | pp_cont | host: continuation PP kick word, nonzero if pp_extra (ABI 2) |
++| 0x38..0x3c | reserved[2] | host: zero |
+ 
+ The host can choose any free index; doorbell arrival defines submission order.
+ There is no shared producer counter or sentinel entry: all 16 entries can be
+@@ -124,6 +131,39 @@ The firmware doorbell ISR only puts the index into its 16-entry inbox and
+ acknowledges the interrupt. Descriptor copies, DMA polling, and scheduling happen
+ in the foreground so slow fetches/FIFO pressure cannot block completion IRQs.
+ 
++## SRAM ring (ABI 2)
++
++PIODMA fetches need the decoder's second DART stream, which the device trees
++in use do not describe yet. ABI 2 adds a mode that needs no DMA at all: the
++host streams each program into a word ring in CM3 SRAM and the firmware copies
++it to the VP FIFO from there.
++
++* The ring is SRAM `+0x0000..+0x5fff`, 0x1800 words. Queue mode never runs the
++  Tansy diagnostic commands, so nothing else uses that range; firmware never
++  writes it.
++* Two free-running u32 word counters: the host's write count at info `+0x3c`
++  and the firmware's read count at info `+0x38`. Word `n` lives at ring word
++  `n % 0x1800`. Both start at 0 after every firmware boot.
++* A ring descriptor sets `flags` bit 0, `program_hi` = 0 and `program_lo` = the
++  write count of its first word. Firmware faults the queue (status 2) if that
++  does not equal its read count when the frame starts, so programs are consumed
++  in exactly doorbell order. Submit descriptors in the same order their words
++  were placed.
++* The host may ring the doorbell before the whole program is in the ring and
++  keep streaming: it may run at most 0x1800 words ahead of the read count, and
++  must publish the write count (after `wmb()`) as it goes. Programs of any
++  length up to `AVDQ_MAX_WORDS` work this way. The firmware copies at most 64
++  words per scheduler step, stops at the host's write count and at the VP FIFO
++  capacity, and waits otherwise; the host's per-frame watchdog covers a stall.
++* PIODMA descriptors (`flags` = 0) keep the ABI 1 rules. Do not mix the two in
++  one session.
++
++Multi-kick PP: codecs that issue one PP EXEC per tile or segment set `pp_extra`
++to the number of continuation kicks and `pp_cont` to that word. Firmware writes
++`pp_kick` then `pp_extra` copies of `pp_cont`, the same sequence the legacy host
++wrote after VP DONE. A frame completes on its first PP DONE; further PP DONEs
++while no frame is in PP are counted and ignored, as the legacy host did.
++
+ ## Program packets and PIODMA
+ 
+ `program_words` is in `[1, 0x100000]`. The IOVA is nonzero, four-byte aligned,
+diff --git a/src/irq.c b/src/irq.c
+index f256643..9f6ecd4 100644
+--- a/src/irq.c
++++ b/src/irq.c
+@@ -487,13 +487,15 @@ void irq_clear(u32 n, u32 status)
+ 
+ static void vpdone(u32 n)
+ {
++	irq_clear(n, DECODE_STATUS_DONE);
++	if (avdq_fw_event(n, DECODE_STATUS_DONE))
++		return;
+ #if AVD_VER == 5
++	/* Tansy bookkeeping lives in SRAM that queue mode uses as its ring. */
+ 	if (n == 0)
+ 		TANSY_CMD0[16]++;
+ #endif
+-	irq_clear(n, DECODE_STATUS_DONE);
+-	if (!avdq_fw_event(n, DECODE_STATUS_DONE))
+-		reg_write(CM3_MBOX1_TX, 0x100 | n);
++	reg_write(CM3_MBOX1_TX, 0x100 | n);
+ }
+ 
+ static void err(u32 n)
+diff --git a/src/queue-fw.c b/src/queue-fw.c
+index f5fe01f..7b2b532 100644
+--- a/src/queue-fw.c
++++ b/src/queue-fw.c
+@@ -55,6 +55,13 @@
+ 		   AVDQ_RING_OFFSET + (i) * AVDQ_DESC_BYTES))
+ #define Q_STAGE REG(SRAM_ALIAS + AVDQ_STAGE_OFFSET)
+ #define Q_INFO REG(SRAM_ALIAS + 0x7fc0u)
++#define Q_RING_WORD REG(SRAM_ALIAS + AVDQ_SRAM_RING_OFFSET)
++#define Q_INFO_RP 14	/* firmware: ring words consumed */
++#define Q_INFO_WP 15	/* host: ring words written */
++/* Words fed per foreground step before interrupts are serviced again. */
++#define Q_FEED_BATCH 64u
++_Static_assert(AVDQ_SRAM_RING_OFFSET + AVDQ_SRAM_RING_WORDS * 4u <= 0x6000u,
++	       "SRAM ring overlaps queue state");
+ 
+ /* Explicit SRAM placement: no dependency on the legacy uninitialized BSS. */
+ struct queue_fw {
+@@ -63,6 +70,7 @@ struct queue_fw {
+ 	volatile unsigned int inbox[AVDQ_COUNT];
+ 	volatile unsigned int vp_done[12], pp_done, error;
+ 	unsigned int dma_pending, dma_wait, stage_words, stage_used;
++	unsigned int ring_rp;	/* SRAM ring words consumed (free-running) */
+ };
+ #define FW ((struct queue_fw *)(SRAM_ALIAS + 0x6000u))
+ _Static_assert(sizeof(struct queue_fw) <= 0x1fc0u, "SRAM queue state overlaps ABI");
+@@ -91,6 +99,9 @@ void avdq_fw_init(void)
+ 	Q_INFO[8] = VP_COUNT;
+ 	Q_INFO[9] = AVD_VER <= 3 ? 7u : 15u;
+ 	Q_INFO[10] = FIFO_SLOTS;
++	Q_INFO[11] = AVDQ_FEAT_SRAM_RING | AVDQ_FEAT_MULTI_KICK;
++	Q_INFO[12] = AVDQ_SRAM_RING_OFFSET;
++	Q_INFO[13] = AVDQ_SRAM_RING_WORDS;
+ 	barrier();
+ 	Q_INFO[0] = AVDQ_MAGIC;
+ }
+@@ -131,11 +142,51 @@ int avdq_fw_event(unsigned int vp, unsigned int event)
+ 	return 1;
+ }
+ 
++/*
++ * ABI 2 SRAM ring: the host has already streamed (or is still streaming) the
++ * program into the ring at SRAM +0. Copy up to Q_FEED_BATCH words per step
++ * into the VP FIFO, never past the host's write count or the FIFO capacity.
++ */
++static int feed_sram(struct queue_fw *fw, struct avdq_frame *f)
++{
++	unsigned int max, cur, avail, n;
++	if (!f->pushed && f->desc.program_lo != fw->ring_rp)
++		return -1; /* host and firmware disagree about the ring position */
++	avail = Q_INFO[Q_INFO_WP] - fw->ring_rp;
++	if (avail > AVDQ_SRAM_RING_WORDS)
++		return -1;
++	if (!avail)
++		return 0; /* host is still writing; its watchdog covers a stall */
++	if (avail > f->desc.program_words - f->pushed)
++		avail = f->desc.program_words - f->pushed;
++	if (avail > Q_FEED_BATCH)
++		avail = Q_FEED_BATCH;
++	barrier();
++	for (n = 0; n < avail; n++) {
++		max = reg_read(REG(DECODE_CTRL_BASE + FIFO_MAX + f->desc.vp_slot * 4u));
++		cur = reg_read(REG(DECODE_CTRL_BASE + FIFO_CUR + f->desc.vp_slot * 4u));
++		if (!max || cur >= max)
++			break;
++		reg_write(REG(DECODE_CTRL_BASE + VP_FIFO + f->desc.vp_slot * 4u),
++			  Q_RING_WORD[fw->ring_rp % AVDQ_SRAM_RING_WORDS]);
++		__asm volatile("nop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop" ::: "memory");
++		fw->ring_rp++;
++		f->pushed++;
++	}
++	if (n) {
++		barrier();
++		Q_INFO[Q_INFO_RP] = fw->ring_rp;
++	}
++	return f->pushed == f->desc.program_words;
++}
++
+ static int feed(void *cookie, struct avdq_frame *f)
+ {
+ 	struct queue_fw *fw = cookie;
+ 	unsigned int words, max, cur;
+ 	uint64_t addr;
++	if (f->desc.flags & AVDQ_FLAG_SRAM)
++		return feed_sram(fw, f);
+ 	if (fw->stage_used == fw->stage_words) {
+ 		if (!fw->dma_pending) {
+ 			words = f->desc.program_words - f->pushed;
+@@ -178,10 +229,14 @@ static int feed(void *cookie, struct avdq_frame *f)
+ 	return 0;
+ }
+ 
+-static void kick(void *cookie, uint32_t word)
++static void kick(void *cookie, const struct avdq_desc *d)
+ {
++	unsigned int i;
+ 	(void)cookie;
+-	reg_write(REG(DECODE_CTRL_BASE + PP_FIFO), word);
++	reg_write(REG(DECODE_CTRL_BASE + PP_FIFO), d->pp_kick);
++	/* Same continuation EXEC words the legacy host wrote, one per segment. */
++	for (i = 0; i < d->pp_extra; i++)
++		reg_write(REG(DECODE_CTRL_BASE + PP_FIFO), d->pp_cont);
+ }
+ 
+ static int complete(void *cookie, unsigned int idx, const struct avdq_frame *f)
+diff --git a/src/queue.c b/src/queue.c
+index a7954e5..0f91db3 100644
+--- a/src/queue.c
++++ b/src/queue.c
+@@ -4,7 +4,7 @@
+ void avdq_init(struct avdq *q)
+ {
+ 	unsigned int i;
+-	q->head = q->count = q->halted = 0;
++	q->head = q->count = q->halted = q->stray_pp = 0;
+ 	q->pp_active = -1;
+ 	for (i = 0; i < AVDQ_COUNT; i++)
+ 		q->frame[i].phase = AVDQ_FREE;
+@@ -20,11 +20,19 @@ static int valid(const struct avdq_desc *d, unsigned int idx,
+ 	if (d->magic != AVDQ_MAGIC || (d->tag & 15u) != idx ||
+ 	    d->state != AVDQ_SUBMITTED || d->codec > AVDQ_AV1 ||
+ 	    !(codec_mask & (1u << d->codec)) || d->vp_slot >= vp_count ||
+-	    !addr || (addr & 3u) || !d->program_words ||
+-	    d->program_words > AVDQ_MAX_WORDS ||
+-	    addr > UINT64_MAX - packets * AVDQ_PACKET_BYTES || !d->pp_kick)
++	    !d->program_words || d->program_words > AVDQ_MAX_WORDS ||
++	    !d->pp_kick || (d->flags & ~AVDQ_FLAG_SRAM) ||
++	    d->pp_extra > AVDQ_MAX_PP_EXTRA || (d->pp_extra && !d->pp_cont))
+ 		return 0;
+-	for (i = 0; i < 5; i++)
++	if (d->flags & AVDQ_FLAG_SRAM) {
++		/* program_lo is the ring write count at the first word. */
++		if (d->program_hi)
++			return 0;
++	} else if (!addr || (addr & 3u) ||
++		   addr > UINT64_MAX - packets * AVDQ_PACKET_BYTES) {
++		return 0;
++	}
++	for (i = 0; i < 2; i++)
+ 		if (d->reserved[i])
+ 			return 0;
+ 	return 1;
+@@ -83,7 +91,12 @@ void avdq_pp_done(struct avdq *q)
+ 	if (q->halted)
+ 		return;
+ 	if (q->pp_active < 0) {
+-		avdq_fault(q);
++		/*
++		 * Multi-kick frames may raise more than one PP DONE. The legacy
++		 * host completes on the first and ignores the rest; do the same
++		 * rather than poisoning the queue.
++		 */
++		q->stray_pp++;
+ 		return;
+ 	}
+ 	q->frame[q->pp_active].phase = AVDQ_DONE;
+@@ -111,7 +124,7 @@ void avdq_step(struct avdq *q, const struct avdq_ops *ops, void *cookie)
+ 		if (f->phase == AVDQ_PP_READY && q->pp_active < 0) {
+ 			q->pp_active = (int)idx;
+ 			f->phase = AVDQ_PP;
+-			ops->kick(cookie, f->desc.pp_kick);
++			ops->kick(cookie, &f->desc);
+ 			break;
+ 		}
+ 	}
+diff --git a/src/queue.h b/src/queue.h
+index 6f8cbab..074e9a7 100644
+--- a/src/queue.h
++++ b/src/queue.h
+@@ -4,7 +4,7 @@
+ 
+ #include <stdint.h>
+ 
+-#define AVDQ_VERSION 1u
++#define AVDQ_VERSION 2u
+ #define AVDQ_MAGIC 0x41565131u /* AVQ1 */
+ #define AVDQ_COUNT 16u
+ #define AVDQ_DESC_BYTES 64u
+@@ -16,6 +16,19 @@
+ #define AVDQ_NOTIFY 0x54530000u
+ #define AVDQ_FATAL 0x5452ffffu
+ 
++/*
++ * ABI 2 SRAM ring: the host streams instruction words straight into CM3 SRAM
++ * (no PIODMA, so no second DART stream is needed). Free-running word counters
++ * live in the info block: firmware read count at info+0x38, host write count
++ * at info+0x3c.
++ */
++#define AVDQ_FLAG_SRAM 1u
++#define AVDQ_FEAT_SRAM_RING 1u
++#define AVDQ_FEAT_MULTI_KICK 2u
++#define AVDQ_SRAM_RING_OFFSET 0x0u
++#define AVDQ_SRAM_RING_WORDS 0x1800u
++#define AVDQ_MAX_PP_EXTRA 255u
++
+ #define AVDQ_SUBMITTED 1u
+ #define AVDQ_COMPLETE 2u
+ #define AVDQ_OK 0u
+@@ -28,7 +41,9 @@ enum avdq_codec { AVDQ_HEVC, AVDQ_H264, AVDQ_VP9, AVDQ_AV1 };
+ struct avdq_desc {
+ 	uint32_t magic, tag, codec, vp_slot;
+ 	uint32_t program_lo, program_hi, program_words, pp_kick;
+-	uint32_t state, status, completion_tag, reserved[5];
++	uint32_t state, status, completion_tag;
++	/* ABI 2: AVDQ_FLAG_*, continuation PP kick count and word. */
++	uint32_t flags, pp_extra, pp_cont, reserved[2];
+ };
+ _Static_assert(sizeof(struct avdq_desc) == AVDQ_DESC_BYTES, "wire size");
+ 
+@@ -69,13 +84,15 @@ struct avdq {
+ 	struct avdq_frame frame[AVDQ_COUNT];
+ 	uint32_t order[AVDQ_COUNT], head, count, halted;
+ 	int pp_active;
++	unsigned int stray_pp;
+ };
+ 
+ /* Single owner: IRQs only latch events, the foreground calls these methods. */
+ struct avdq_ops {
+ 	/* Feed a bounded amount: 0 waiting, 1 all words sent, -1 fatal I/O. */
+ 	int (*feed)(void *cookie, struct avdq_frame *f);
+-	void (*kick)(void *cookie, uint32_t word);
++	/* Write the frame's PP kick and its continuation kicks. */
++	void (*kick)(void *cookie, const struct avdq_desc *d);
+ 	/* Must publish record before notification; return 0 if outbox full. */
+ 	int (*complete)(void *cookie, unsigned int idx,
+ 			const struct avdq_frame *f);
+diff --git a/tests/queue-test.c b/tests/queue-test.c
+index eff37c0..32d8816 100644
+--- a/tests/queue-test.c
++++ b/tests/queue-test.c
+@@ -20,10 +20,10 @@ static int feed(void *cookie, struct avdq_frame *f)
+ 	f->pushed++;
+ 	return f->pushed == f->desc.program_words;
+ }
+-static void kick(void *cookie, uint32_t word)
++static void kick(void *cookie, const struct avdq_desc *d)
+ {
+ 	struct fake *io = cookie;
+-	io->words[io->kicks++] = word;
++	io->words[io->kicks++] = d->pp_kick;
+ }
+ static int complete(void *cookie, unsigned int idx, const struct avdq_frame *f)
+ {
+@@ -86,7 +86,7 @@ static void wire(void)
+ static void invalid(void)
+ {
+ 	unsigned int n;
+-	for (n = 0; n < 13; n++) {
++	for (n = 0; n < 18; n++) {
+ 		struct avdq q;
+ 		struct fake io = {0};
+ 		struct avdq_desc d = descriptor(0x100, 0);
+@@ -104,7 +104,12 @@ static void invalid(void)
+ 		case 9: d.program_words = AVDQ_MAX_WORDS + 1; break;
+ 		case 10: d.program_lo = 0xfffffffcu; d.program_hi = 0xffffffffu; break;
+ 		case 11: d.pp_kick = 0; break;
+-		case 12: d.reserved[4] = 1; break;
++		case 12: d.reserved[1] = 1; break;
++		case 13: d.flags = 2; break;
++		case 14: d.pp_extra = AVDQ_MAX_PP_EXTRA + 1; d.pp_cont = 1; break;
++		case 15: d.pp_extra = 1; break; /* continuation word missing */
++		case 16: d.flags = AVDQ_FLAG_SRAM; break; /* program_hi must be 0 */
++		case 17: d.flags = AVDQ_FLAG_SRAM; d.program_hi = 0; d.program_words = 0; break;
+ 		}
+ 		assert(!avdq_submit(&q, 0, &d, 9, 7));
+ 		assert(q.frame[0].phase == AVDQ_DONE);
+@@ -218,14 +223,37 @@ static void errors(void)
+ 	assert(avdq_submit(&q, 0, &a, 12, 15) == -1);
+ 	avdq_vp_done(&q, 0); avdq_pp_done(&q); /* late events after a fault */
+ 	assert(!io.kicks);
++	/* A stray PP DONE (multi-kick frames) is counted, not fatal. */
+ 	avdq_init(&q);
+-	avdq_pp_done(&q); assert(q.halted);
++	avdq_pp_done(&q); assert(!q.halted && q.stray_pp == 1);
+ 	avdq_init(&q);
+ 	avdq_vp_done(&q, 0); assert(q.halted);
+ }
++static void sram_ring(void)
++{
++	struct avdq q;
++	struct fake io = {0};
++	struct avdq_desc d = descriptor(0x40000, 0);
++	d.flags = AVDQ_FLAG_SRAM;
++	d.program_lo = 0xfffffff0u; /* free-running count may wrap */
++	d.program_hi = 0;
++	d.pp_extra = 3;
++	d.pp_cont = 0x2b000000u;
++	avdq_init(&q);
++	assert(!avdq_submit(&q, 0, &d, 12, 15));
++	assert(q.frame[0].phase == AVDQ_PENDING);
++	step(&q, &io);
++	assert(q.frame[0].phase == AVDQ_VP);
++	avdq_vp_done(&q, 0); step(&q, &io);
++	assert(io.kicks == 1 && io.words[0] == d.pp_kick);
++	avdq_pp_done(&q); step(&q, &io);
++	assert(io.completions == 1 && io.statuses[0] == AVDQ_OK);
++	avdq_pp_done(&q); avdq_pp_done(&q); step(&q, &io);
++	assert(!q.halted && q.stray_pp == 2);
++}
+ int main(void)
+ {
+-	wire(); invalid(); pipeline(); wrap_and_full(); partial_program(); arbitrary_indices(); errors();
+-	puts("queue: wire, validation, pipeline, backpressure, wrap, tags, errors passed");
++	wire(); sram_ring(); invalid(); pipeline(); wrap_and_full(); partial_program(); arbitrary_indices(); errors();
++	puts("queue: wire, sram ring, validation, pipeline, backpressure, wrap, tags, errors passed");
+ 	return 0;
+ }
+diff --git a/tests/transport-test.py b/tests/transport-test.py
+index dab0a5f..0b17513 100644
+--- a/tests/transport-test.py
++++ b/tests/transport-test.py
+@@ -44,11 +44,13 @@ class Transport:
+         self.stores, self.kicks, self.notifications, self.fetches = [], [], [], []
+         self.busy, self.full, self.dma_ticks, self.dma_timeout = False, False, 0, False
+         self.clear = set()
++        self.ring_writes = set()
+         self.uc.hook_add(UC_HOOK_MEM_READ, self.read)
+         self.uc.hook_add(UC_HOOK_MEM_WRITE, self.write)
+         self.call("avdq_fw_init")
+-        self.info = [self.u32(0x10007fc0 + i * 4) for i in range(11)]
+-        assert self.info[:4] == [0x41565131, 1, 16, 64]
++        self.info = [self.u32(0x10007fc0 + i * 4) for i in range(16)]
++        assert self.info[:4] == [0x41565131, 2, 16, 64]
++        assert self.info[11:16] == [3, 0, 0x1800, 0, 0]
+         expected = 0x0108c000 if self.version == 2 else 0x01090000 if self.version == 3 or (self.version == 5 and self.tier == 0) else 0x01094000 if (self.version == 5 and self.tier == 2) else 0x01092000
+         assert self.info[4] == expected and self.info[8] == self.vps
+         assert self.info[10] == (7 if self.version == 2 or (self.version == 5 and self.tier == 0) else 15)
+@@ -87,6 +89,8 @@ class Transport:
+                 self.put(addr, int(self.dma_ticks == 0))
+ 
+     def write(self, uc, access, addr, size, value, user):
++        if 0x10000000 <= addr < 0x10006000:
++            self.ring_writes.add(addr)  # firmware stores into the host ring
+         if addr == self.dma + 0x54:
+             source = self.u32(self.dma + 0x4c) | self.u32(self.dma + 0x50) << 32
+             header, payload = self.packets[source]
+@@ -136,6 +140,70 @@ class Transport:
+         return [self.u32(0x10008000 + idx * 64 + off) for off in (0x20, 0x24, 0x28)]
+ 
+ 
++RING_WORDS = 0x1800
++
++
++def ring_write(t, start, words):
++    for i, w in enumerate(words):
++        t.put(0x10000000 + 4 * ((start + i) % RING_WORDS), w)
++
++
++def submit_sram(t, idx, tag, start, count, extra=0, cont=0, vp=0):
++    desc = [0x41565131, tag, 0, vp, start & 0xffffffff, 0, count,
++            0x2b000400 | idx << 4, 1, 0, 0, 1, extra, cont, 0, 0]
++    t.uc.mem_write(0x10008000 + idx * 64, struct.pack("<16I", *desc))
++    t.put(0x50010058, t.ring + idx * 64)
++    t.call("irq1")
++
++
++def check_sram(image):
++    t = Transport(image)
++    a = list(range(0x100, 0x100 + 100))
++    b = [0xb0000000 | i for i in range(7000)]  # larger than the ring, wraps
++    ring_write(t, 0, a)
++    t.put(0x10007ffc, len(a))
++    submit_sram(t, 0, 0x50000, 0, len(a), extra=2, cont=0x2b000010)
++    submit_sram(t, 1, 0x50011, len(a), len(b))
++    t.poll(4)
++    assert t.stores == a and t.u32(0x10007ff8) == len(a)
++    # Stream B: the host may only run RING_WORDS ahead of the firmware.
++    wp = len(a)
++    while wp < len(a) + len(b):
++        rp = t.u32(0x10007ff8)
++        n = min(RING_WORDS - (wp - rp), len(a) + len(b) - wp, 1500)
++        ring_write(t, wp, b[wp - len(a):wp - len(a) + n])
++        wp += n
++        t.put(0x10007ffc, wp)
++        t.poll(40)
++    t.full = True
++    t.poll(3)
++    t.full = False
++    t.poll(200)
++    assert t.stores == a + b, (len(t.stores), len(a) + len(b))
++    assert t.u32(0x10007ff8) == len(a) + len(b)
++    assert not t.fetches
++    t.vp_done(); t.poll()
++    assert t.kicks == [0x2b000400, 0x2b000010, 0x2b000010]
++    t.vp_done(); t.poll()
++    t.pp_done(); t.poll()
++    assert t.result(0) == [2, 0, 0x50000] and t.notifications == [0x54530000]
++    t.pp_done(); t.poll()  # stray PP DONE from a multi-kick frame is ignored
++    assert t.kicks[-1] == 0x2b000410
++    t.pp_done(); t.busy = False; t.poll()
++    assert t.result(1) == [2, 0, 0x50011]
++    assert t.notifications == [0x54530000, 0x54530011]
++    assert not t.ring_writes, "firmware wrote into the SRAM ring: %s" % sorted(map(hex, t.ring_writes))
++    # A descriptor whose start disagrees with the ring position is fatal.
++    t.busy = False
++    rp = t.u32(0x10007ff8)
++    ring_write(t, rp, [1, 2])
++    t.put(0x10007ffc, rp + 2)
++    submit_sram(t, 2, 0x60002, rp + 1, 2)
++    t.poll(4); t.busy = False; t.poll(2)
++    assert t.result(2) == [2, 2, 0x60002]
++    print(image.stem + ": SRAM ring, wrap, streaming, multi-kick, stray PP DONE, position check passed", flush=True)
++
++
+ def check(image):
+     t = Transport(image)
+     # Legacy outputs before the first queue doorbell are unchanged.
+@@ -204,5 +272,6 @@ def check(image):
+ if __name__ == "__main__":
+     for arg in sys.argv[1:]:
+         check(pathlib.Path(arg))
++        check_sram(pathlib.Path(arg))
+     if len(sys.argv) < 2:
+         raise SystemExit("usage: transport-test.py build/avd-fw-*.bin")
+-- 
+2.43.0
+

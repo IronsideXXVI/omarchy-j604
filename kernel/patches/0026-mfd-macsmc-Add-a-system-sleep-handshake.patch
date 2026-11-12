@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RJ Skerry-Ryan <rryan@alum.mit.edu>
+Date: Sat, 10 Oct 2026 12:00:48 -0700
+Subject: [PATCH] mfd: macsmc: Add a system sleep handshake
+
+The SMC has keys for being told about system sleep and wake:
+
+- WKTP is set to 2 before sleep.
+- Writing MBSE = 'slpa' announces sleep. The SMC acknowledges it by setting
+  bit 16 of the status word read back from MBSE.
+- MBSW holds a 64-bit wake-reason bitmap.
+- Writing MBSE = 'waka' announces the wake and clears the sleep bit.
+
+Add system sleep callbacks that perform this handshake after the child
+cells (battery, RTC, hwmon, input) have suspended, and log MBSW on resume.
+
+Tested on a t6021 MacBook Pro across repeated s2idle cycles: the SMC sets
+and clears the sleep bit as expected and the system resumes normally. The
+handshake does not by itself reduce s2idle power; it is the SMC side of a
+deeper system sleep. It is on by default and can be turned off with the
+sleep_handshake module parameter.
+
+Signed-off-by: RJ Skerry-Ryan <rryan@alum.mit.edu>
+(cherry picked from commit 0dab2d243daf588c58cc49af98c3ce35cf761ce1)
+(cherry picked from commit ab9d2e7f393d2163ac5117b985b8a65bd824cee6)
+(cherry picked from commit 9c02e2dea8ec08089662970cb8c7a00f8ec1c8b4)
+[dylan: carried from aurora-silicon/linux 0dab2d243daf; one tool trailer of the original message is not reproduced here, see the upstream commit for the full text]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/mfd/macsmc.c       | 65 ++++++++++++++++++++++++++++++++++++++
+ include/linux/mfd/macsmc.h |  3 ++
+ 2 files changed, 68 insertions(+)
+
+diff --git a/drivers/mfd/macsmc.c b/drivers/mfd/macsmc.c
+index 7c525b6c7b..a498973b83 100644
+--- a/drivers/mfd/macsmc.c
++++ b/drivers/mfd/macsmc.c
+@@ -17,6 +17,7 @@
+ #include <linux/math.h>
+ #include <linux/mfd/core.h>
+ #include <linux/mfd/macsmc.h>
++#include <linux/moduleparam.h>
+ #include <linux/notifier.h>
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+@@ -653,6 +654,70 @@ static int apple_smc_probe(struct platform_device *pdev)
+ 					       ARRAY_SIZE(apple_smc_t6050_described_devs));
+ }
+ 
++/*
++ * Sleep handshake: after the children have suspended, write WKTP = 2 and
++ * announce sleep with MBSE = 'slpa'. The SMC acknowledges it by setting bit 16
++ * of the status word read back from MBSE. On resume, read the MBSW wake-reason
++ * bitmap and announce the wake with MBSE = 'waka', which clears that bit.
++ *
++ * The announcement only tells the SMC that the system is asleep; it does not
++ * by itself power anything down under s2idle. It can be disabled with the
++ * sleep_handshake module parameter. MBSW is read-only and always logged.
++ */
++static bool sleep_handshake = true;
++module_param(sleep_handshake, bool, 0644);
++MODULE_PARM_DESC(sleep_handshake, "Announce system sleep and wake to the SMC (default: on)");
++
++static int apple_smc_suspend(struct device *dev)
++{
++	struct apple_smc *smc = dev_get_drvdata(dev);
++	int ret;
++
++	smc->sleep_announced = false;
++	if (!sleep_handshake)
++		return 0;
++
++	if (apple_smc_key_exists(smc, SMC_KEY(WKTP))) {
++		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), 2);
++		if (ret < 0)
++			dev_warn(dev, "Failed to write WKTP (%d)\n", ret);
++	}
++
++	ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpa));
++	if (ret < 0) {
++		dev_warn(dev, "Failed to announce sleep (MBSE = slpa): %d\n", ret);
++		return 0;
++	}
++	smc->sleep_announced = true;
++
++	return 0;
++}
++
++static int apple_smc_resume(struct device *dev)
++{
++	struct apple_smc *smc = dev_get_drvdata(dev);
++	u64 wake_reasons;
++	int ret;
++
++	ret = apple_smc_read_u64(smc, SMC_KEY(MBSW), &wake_reasons);
++	if (ret < 0)
++		dev_dbg(dev, "Failed to read MBSW (%d)\n", ret);
++	else
++		dev_info(dev, "SMC wake reasons (MBSW): %#018llx\n", wake_reasons);
++
++	if (!smc->sleep_announced)
++		return 0;
++	smc->sleep_announced = false;
++
++	ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(waka));
++	if (ret < 0)
++		dev_warn(dev, "Failed to announce wake (MBSE = waka): %d\n", ret);
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(apple_smc_pm_ops, apple_smc_suspend, apple_smc_resume);
++
+ static const struct of_device_id apple_smc_of_match[] = {
+ 	{ .compatible = "apple,t8152-smc" },
+ 	{ .compatible = "apple,t6050-smc" },
+diff --git a/include/linux/mfd/macsmc.h b/include/linux/mfd/macsmc.h
+index 32a33410b4..0485a9693d 100644
+--- a/include/linux/mfd/macsmc.h
++++ b/include/linux/mfd/macsmc.h
+@@ -100,6 +100,7 @@ enum apple_smc_boot_stage {
+  * @cmd_ret: Return value from SMC for last command
+  * @mutex: Mutex for non-atomic mode
+  * @lock: Spinlock for atomic mode
++ * @sleep_announced: MBSE = 'slpa' was sent at suspend; send 'waka' at resume
+  */
+ struct apple_smc {
+ 	struct device *dev;
+@@ -139,6 +140,8 @@ struct apple_smc {
+ 
+ 	struct mutex mutex;
+ 	spinlock_t lock;
++
++	bool sleep_announced;
+ };
+ 
+ /**
+-- 
+2.43.0
+

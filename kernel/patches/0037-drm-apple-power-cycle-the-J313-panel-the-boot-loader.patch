@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Naeem Malik <malik2015naeem@gmail.com>
+Date: Sun, 1 Nov 2026 17:19:08 +0530
+Subject: [PATCH] drm/apple: power-cycle the J313 panel the boot loader
+ handed over
+
+On a MacBook Air (M1, 2020, J313) with DCP 13.5 the boot loader leaves
+the panel on.  The first dcp_poweron() then finds it enabled
+(set_device_enabled 1 -> 1) and only sets a mode: the firmware does not
+power up its video interface, assert HPD or load its LTM block, and logs
+that it could not find the Backlight service.  Brightness swaps are
+taken and the published level follows them, but the panel stays at the
+boot level.  A DPMS off/on runs the firmware's full power-on sequence,
+and every brightness change after it reaches the panel.
+
+Give the J313 panel that cycle once, on DCP 13.5, when the boot loader
+handed it over lit: an available simple-framebuffer whose "panel" points
+at it.  The first power-on then cancels the swap watchdog, disconnects
+the AV service and powers the pipe off, as dcp_poweroff() does for an
+internal panel, before powering on.  The node outlives the handover, so
+the cycle is marked done when it runs, and a later bind does not repeat
+it; a bind that fails before the first power-on leaves it for the retry.
+Other panels and firmware are unchanged.
+
+Measured on a MacBook Air (M1, 2020, J313, DCP firmware 13.5) running
+linux-aurora 7.2.11: brightness changes reach the panel straight after
+boot, after s2idle suspend/resume, and after a boot with the lid closed,
+where the boot loader still hands the panel over and the cycle completes
+without timeouts.  Before, backlight writes had no visible effect until
+one DPMS cycle.
+
+Signed-off-by: Naeem Malik <malik2015naeem@gmail.com>
+(cherry picked from commit 36bef1a058f514d56ee073262d0b91e8cf16c10f)
+[j604: k610 drm sync: dcp.c conflict; the panel is matched by its first compatible only, and the J516C EDID make/product read (dropped with the J516C EDID wiring) is not carried.]
+(cherry picked from commit 94db992f7b8a5caa644e2a8e61a337fe342c0265)
+(cherry picked from commit ae095e93116673e1c13188968a68066732af6fd4)
+[dylan: carried from aurora-silicon/linux 36bef1a058f5; one tool trailer of the original message is not reproduced here, see the upstream commit for the full text]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp-internal.h |  3 ++
+ drivers/gpu/drm/apple/dcp.c          | 81 ++++++++++++++++++++++++----
+ 2 files changed, 73 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-internal.h b/drivers/gpu/drm/apple/dcp-internal.h
+index 872789ba53..6046a0f216 100644
+--- a/drivers/gpu/drm/apple/dcp-internal.h
++++ b/drivers/gpu/drm/apple/dcp-internal.h
+@@ -734,6 +734,9 @@ struct apple_dcp {
+ 	/* clear all surfaces on init */
+ 	bool surfaces_cleared;
+ 
++	/* J313: the first dcp_poweron() cycles the panel handed over lit */
++	bool panel_cold_poweron;
++
+ 	/* enable CRC calculation */
+ 	bool crc_enabled;
+ 
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index f3765d6741..119134c3b8 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -4493,6 +4493,13 @@ int dcp_typec_prepare_route(struct apple_dcp *dcp)
+ 	return ready ? 0 : -ETIMEDOUT;
+ }
+ 
++/*
++ * Set once the boot loader's panel has been power-cycled.  The framebuffer
++ * node outlives the handover, so a later bind must not take it again; a bind
++ * that fails before the cycle leaves it for the retry.
++ */
++static bool dcp_panel_handover_taken;
++
+ void dcp_poweron(struct platform_device *pdev)
+ {
+ 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+@@ -4614,6 +4621,25 @@ void dcp_poweron(struct platform_device *pdev)
+ 			dcp_dptx_connect(dcp, 0);
+ 	}
+ 
++	/*
++	 * J313 on DCP 13.5 finds its panel already on from the boot loader
++	 * (set_device_enabled 1 -> 1), so the first power-on only sets a mode:
++	 * the firmware never powers up its video interface or LTM block and
++	 * logs that it could not find the Backlight service.  It then takes
++	 * the levels Linux swaps in and reports them back, but the panel stays
++	 * at the boot level until a DPMS cycle.  Give it that cycle once, as
++	 * dcp_poweroff() runs it for an internal panel.
++	 */
++	if (dcp->panel_cold_poweron) {
++		dcp->panel_cold_poweron = false;
++		dcp_panel_handover_taken = true;
++		dev_info(dcp->dev, "power-cycling the panel handed over by the boot loader\n");
++		cancel_delayed_work(&dcp->swap_watchdog_wq);
++		if (dcp->avep)
++			av_service_disconnect(dcp);
++		_dcp_poweroff(dcp);
++	}
++
+ 	switch (dcp->fw_compat) {
+ 	case DCP_FIRMWARE_V_12_3:
+ 		iomfb_poweron_v12_3(dcp);
+@@ -5669,6 +5695,34 @@ static bool dcp_panel_is_j313(const char *compatible)
+ 	return compatible && !strcmp(compatible, "apple,panel-j313");
+ }
+ 
++/*
++ * The boot loader hands a panel over lit as an available simple-framebuffer
++ * whose "panel" points at it, until the first power-on has cycled it (see
++ * dcp_panel_handover_taken).
++ */
++static bool dcp_panel_handed_over(struct device_node *panel_np)
++{
++	struct device_node *fb, *panel;
++	bool lit = false;
++
++	if (dcp_panel_handover_taken)
++		return false;
++
++	for_each_compatible_node(fb, NULL, "simple-framebuffer") {
++		if (!of_device_is_available(fb))
++			continue;
++		panel = of_parse_phandle(fb, "panel", 0);
++		lit = panel == panel_np;
++		of_node_put(panel);
++		if (lit) {
++			of_node_put(fb);
++			break;
++		}
++	}
++
++	return lit;
++}
++
+ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *data)
+ {
+ 	struct device_node *panel_np;
+@@ -5800,17 +5854,22 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
+ 		if (of_property_read_string_index(panel_np, "compatible", 0,
+ 						  &compatible))
+ 			compatible = NULL;
+-		/*
+-		 * Only this panel.  The backlight device's maximum is this
+-		 * value, so 100% asks the firmware for DCP_J313_MAX_NITS.
+-		 */
+-		if (dcp_panel_is_j313(compatible) &&
+-		    dcp->brightness.maximum > DCP_J313_MAX_NITS) {
+-			dcp->brightness.maximum = DCP_J313_MAX_NITS;
+-			if (dcp->brightness.nits > (int)DCP_J313_MAX_NITS)
+-				dcp->brightness.nits = DCP_J313_MAX_NITS;
+-			dev_info(dev, "capping panel backlight at %u nits\n",
+-				 DCP_J313_MAX_NITS);
++		if (dcp_panel_is_j313(compatible)) {
++			dcp->panel_cold_poweron =
++				dcp->fw_compat == DCP_FIRMWARE_V_13_5 &&
++				dcp_panel_handed_over(panel_np);
++			/*
++			 * Only this panel.  The backlight device's maximum is
++			 * this value, so 100% asks the firmware for
++			 * DCP_J313_MAX_NITS.
++			 */
++			if (dcp->brightness.maximum > DCP_J313_MAX_NITS) {
++				dcp->brightness.maximum = DCP_J313_MAX_NITS;
++				if (dcp->brightness.nits > (int)DCP_J313_MAX_NITS)
++					dcp->brightness.nits = DCP_J313_MAX_NITS;
++				dev_info(dev, "capping panel backlight at %u nits\n",
++					 DCP_J313_MAX_NITS);
++			}
+ 		}
+ 
+ 		of_node_put(panel_np);
+-- 
+2.43.0
+

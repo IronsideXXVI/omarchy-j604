@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erik Bourget <erik@ebourget.net>
+Date: Tue, 10 Nov 2026 00:00:20 -0500
+Subject: [PATCH] soc: apple: rtkit: add apple_rtkit_cold_restart()
+
+A coprocessor that was powered off with apple_rtkit_poweroff() and then
+lost its power domains has no session left to wake: it has to boot
+again. Add a helper for that: reset the session state, warm and
+port-only restart state included, let the caller start the CPU, then
+start the mailbox, enable receive and run the normal boot handshake.
+
+The CPU is started before the mailbox is touched at all. On T8132 the
+ACIO mailbox registers are only clocked once the caller's start step
+has run, as at the first start, and accessing them earlier takes an
+SError. On failure the caller has to stop the CPU it started.
+
+Signed-off-by: Erik Bourget <erik@ebourget.net>
+[niteria: rtkit-oslog-tests now copies apple_rtkit_reset_session() as well]
+Assisted-by: LLM
+Signed-off-by: Bartosz Nitka <niteria@gmail.com>
+(cherry picked from commit d7464b3ae525c6e9c8b17edad8dc99bad19648e8)
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/rtkit.c        | 34 ++++++++++++++++++++++++++++++--
+ include/linux/soc/apple/rtkit.h  |  7 +++++++
+ tools/asahi/rtkit-oslog-tests.py |  9 +++++++--
+ 3 files changed, 46 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/soc/apple/rtkit.c b/drivers/soc/apple/rtkit.c
+index 8535fd432f..ed9213e8f7 100644
+--- a/drivers/soc/apple/rtkit.c
++++ b/drivers/soc/apple/rtkit.c
+@@ -2026,10 +2026,10 @@ int apple_rtkit_port_restart(struct apple_rtkit *rtk)
+ }
+ EXPORT_SYMBOL_GPL(apple_rtkit_port_restart);
+ 
+-int apple_rtkit_reinit(struct apple_rtkit *rtk)
++/* Everything of a firmware session but the mailbox hardware. */
++static void apple_rtkit_reset_session(struct apple_rtkit *rtk)
+ {
+ 	unsigned long flags;
+-	int ret;
+ 
+ 	/* make sure we don't handle any messages while reinitializing */
+ 	apple_rtkit_detach_rx(rtk);
+@@ -2075,7 +2075,13 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
+ 	WRITE_ONCE(rtk->shutting_down, false);
+ 	rtk->mbox->rx = apple_rtkit_rx;
+ 	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
++}
+ 
++int apple_rtkit_reinit(struct apple_rtkit *rtk)
++{
++	int ret;
++
++	apple_rtkit_reset_session(rtk);
+ 	ret = apple_mbox_start(rtk->mbox);
+ 	if (ret) {
+ 		apple_rtkit_detach_rx(rtk);
+@@ -2305,6 +2311,30 @@ int apple_rtkit_ap_power_noirq(struct apple_rtkit *rtk, bool on)
+ }
+ EXPORT_SYMBOL_GPL(apple_rtkit_ap_power_noirq);
+ 
++/* Power is back, the CPU is stopped, and poweroff() discarded the old session. */
++int apple_rtkit_cold_restart(struct apple_rtkit *rtk, int (*start)(void *), void *ctx)
++{
++	int ret;
++
++	/* A fresh boot: no warm or port-only restart may answer its endpoint map. */
++	apple_rtkit_reset_session(rtk);
++	rtk->warm_restart = false;
++	rtk->port_only = false;
++	rtk->warm_last_mask = U32_MAX;
++	/* The mailbox registers may only be clocked once @start has run. */
++	ret = start(ctx);
++	if (!ret)
++		ret = apple_mbox_start(rtk->mbox);
++	if (ret) {
++		apple_rtkit_detach_rx(rtk);
++		flush_workqueue(rtk->wq);
++		return ret;
++	}
++	apple_mbox_set_recv_enabled(rtk->mbox, true);
++	return apple_rtkit_boot(rtk);
++}
++EXPORT_SYMBOL_GPL(apple_rtkit_cold_restart);
++
+ int apple_rtkit_quiesce(struct apple_rtkit *rtk)
+ {
+ 	int ret;
+diff --git a/include/linux/soc/apple/rtkit.h b/include/linux/soc/apple/rtkit.h
+index 44dcb386ef..244e60bbc6 100644
+--- a/include/linux/soc/apple/rtkit.h
++++ b/include/linux/soc/apple/rtkit.h
+@@ -257,6 +257,13 @@ int apple_rtkit_shutdown(struct apple_rtkit *rtk);
+ 
+ int apple_rtkit_poweroff(struct apple_rtkit *rtk);
+ 
++/*
++ * After poweroff and a power cycle: start a fresh session, let @start start the
++ * CPU, and only then start the mailbox and boot. On failure the CPU @start
++ * released may still run: the caller has to stop it.
++ */
++int apple_rtkit_cold_restart(struct apple_rtkit *rtk, int (*start)(void *), void *ctx);
++
+ /*
+  * Put the co-processor into idle mode
+  */
+diff --git a/tools/asahi/rtkit-oslog-tests.py b/tools/asahi/rtkit-oslog-tests.py
+index 9df97f65c1..40b9590773 100644
+--- a/tools/asahi/rtkit-oslog-tests.py
++++ b/tools/asahi/rtkit-oslog-tests.py
+@@ -166,7 +166,12 @@ def main():
+     # Older receivers have no LOG constant or inherited field writes.
+     if not re.search(r'#define APPLE_RTKIT_OSLOG_LOG\s', constants):
+         constants += '\n#define APPLE_RTKIT_OSLOG_LOG 2\n'
+-    bodies = '\n'.join(function(source, name) for name in ['apple_rtkit_oslog_rx', 'apple_rtkit_mark_running', 'apple_rtkit_reinit'])
++    # The session reset reinit() and a cold restart share, where the driver has one.
++    names = ['apple_rtkit_oslog_rx', 'apple_rtkit_mark_running']
++    if 'static void apple_rtkit_reset_session(' in source:
++        names.append('apple_rtkit_reset_session')
++    names.append('apple_rtkit_reinit')
++    bodies = '\n'.join(function(source, name) for name in names)
+     if args.mutate == 'admission':
+         bodies = bodies.replace('(!rtk->oslog_buffer.size && !rtk->oslog_inherited)', 'false')
+     elif args.mutate == 'channel':
+@@ -179,7 +184,7 @@ def main():
+         bodies = bodies.replace('apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);', '')
+     # A mutation that no longer matches the driver would test nothing.
+     assert not args.mutate or bodies != '\n'.join(
+-        function(source, name) for name in ['apple_rtkit_oslog_rx', 'apple_rtkit_mark_running', 'apple_rtkit_reinit']), \
++        function(source, name) for name in names), \
+         'stale mutation: ' + args.mutate
+     code = PREFIX.replace('struct apple_rtkit_shmem', constants + '\nstruct apple_rtkit_shmem', 1) + bodies + MAIN
+ 
+-- 
+2.43.0
+

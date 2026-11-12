@@ -1,0 +1,245 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 7 Nov 2026 08:47:21 +0000
+Subject: [PATCH] drm/apple: test the raw ADT panel parser
+
+Add a KUnit suite for dcp_panel_adt_parse() on synthetic trees in the
+layout of m1n1's src/adt.h: a Display P3 or sRGB /product target with a
+version-1 calibration matrix, the /backlight EDRPotentialHeadroom, a
+target without a matrix, with a version-2 or singular matrix, an unknown
+name, a target one node too deep, and trees cut short or with an
+impossible child count, which are refused without touching the result.
+No captured device tree is used.
+
+The parser is built for the T8132 panel only; build it for the DRM apple
+KUnit configuration too, so the suite runs with the others.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+(cherry picked from commit c392eee7ba4f7bfd31d859e61bb8b48bb1fa5f5c)
+[j604: k610 drm sync: Makefile conflict; Aurora 50d5865ea6 already builds dcp-panel-adt.o unconditionally, so the T8132/KUnit-only guard is not carried; only the test object is added. The suite now runs against the upstream parser (dcp_panel_adt_parse()).]
+(cherry picked from commit bc338d06afb9fd06f24e186b8a6629375eeeaae5)
+(cherry picked from commit f3307f05963b84b9b07e3c3849915d4a842283cf)
+---
+ drivers/gpu/drm/apple/Makefile             |   1 +
+ drivers/gpu/drm/apple/dcp-panel-adt-test.c | 196 +++++++++++++++++++++
+ 2 files changed, 197 insertions(+)
+ create mode 100644 drivers/gpu/drm/apple/dcp-panel-adt-test.c
+
+diff --git a/drivers/gpu/drm/apple/Makefile b/drivers/gpu/drm/apple/Makefile
+index 6468dca38c..a6855f67ea 100644
+--- a/drivers/gpu/drm/apple/Makefile
++++ b/drivers/gpu/drm/apple/Makefile
+@@ -29,6 +29,7 @@ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_announce_test.o
+ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_relink_test.o
+ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_dropped_swap_test.o
+ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-panel-edid-test.o
++appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-panel-adt-test.o
+ appledrm-y += iomfb_v26_6.o iomfb_v26_6_link.o j613_dcp_activate.o
+ appledrm-y += iomfb_v27.o
+ appledrm-y += epic/dpavservep.o
+diff --git a/drivers/gpu/drm/apple/dcp-panel-adt-test.c b/drivers/gpu/drm/apple/dcp-panel-adt-test.c
+new file mode 100644
+index 0000000000..76d46f4c23
+--- /dev/null
++++ b/drivers/gpu/drm/apple/dcp-panel-adt-test.c
+@@ -0,0 +1,196 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++/*
++ * The raw-ADT panel parser on synthetic trees in m1n1's src/adt.h layout:
++ * the /product colour target only with a valid version-1 calibration matrix,
++ * the /backlight EDR headroom, and malformed trees refused without touching
++ * the result.  No captured device tree is used.
++ */
++
++#include <kunit/test.h>
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++
++#include "dcp-panel-adt.h"
++
++#define ADT_Q24_ONE	(1U << 24)
++
++struct adt_buf {
++	u8 data[1024];
++	size_t len;
++};
++
++static void adt_node(struct adt_buf *b, u32 props, u32 children)
++{
++	put_unaligned_le32(props, b->data + b->len);
++	put_unaligned_le32(children, b->data + b->len + 4);
++	b->len += 8;
++}
++
++static void adt_prop(struct adt_buf *b, const char *name, const void *value, u32 size)
++{
++	memset(b->data + b->len, 0, 36 + ALIGN(size, 4));
++	strscpy((char *)b->data + b->len, name, 32);
++	put_unaligned_le32(size, b->data + b->len + 32);
++	memcpy(b->data + b->len + 36, value, size);
++	b->len += 36 + ALIGN(size, 4);
++}
++
++static void adt_name(struct adt_buf *b, const char *name)
++{
++	adt_prop(b, "name", name, strlen(name) + 1);
++}
++
++static void adt_u32(struct adt_buf *b, const char *name, u32 value)
++{
++	u8 v[4];
++
++	put_unaligned_le32(value, v);
++	adt_prop(b, name, v, sizeof(v));
++}
++
++/* A version-@version matrix: the identity, or rows of [1 0 0] if @singular. */
++static void adt_matrix(struct adt_buf *b, u32 version, bool singular)
++{
++	u8 m[40] = {};
++
++	put_unaligned_le32(version, m);
++	for (unsigned int i = 0; i < 3; i++)
++		put_unaligned_le32(ADT_Q24_ONE, m + 4 + 4 * (singular ? 3 * i : 4 * i));
++	adt_prop(b, "primary-calibration-matrix", m, sizeof(m));
++}
++
++struct adt_spec {
++	const char *gamut;	/* NULL: no artwork-display-gamut */
++	int matrix;		/* 0: none, else the matrix version */
++	bool singular;
++	u32 headroom;		/* 0: no EDRPotentialHeadroom */
++	bool gamut_in_child;	/* the target one level too deep */
++};
++
++/* / { product { ... } backlight { ... } } */
++static size_t adt_build(struct adt_buf *b, const struct adt_spec *s)
++{
++	u32 props = 1 + !!s->gamut + !!s->matrix;
++
++	b->len = 0;
++	adt_node(b, 1, 2);
++	adt_name(b, "device-tree");
++
++	if (s->gamut_in_child) {
++		adt_node(b, 1, 1);
++		adt_name(b, "product");
++		adt_node(b, props, 0);
++		adt_name(b, "product");
++	} else {
++		adt_node(b, props, 0);
++		adt_name(b, "product");
++	}
++	if (s->gamut)
++		adt_prop(b, "artwork-display-gamut", s->gamut, strlen(s->gamut) + 1);
++	if (s->matrix)
++		adt_matrix(b, s->matrix, s->singular);
++
++	adt_node(b, 1 + !!s->headroom, 0);
++	adt_name(b, "backlight");
++	if (s->headroom)
++		adt_u32(b, "EDRPotentialHeadroom", s->headroom);
++	return b->len;
++}
++
++static void adt_parse(struct kunit *test, const struct adt_spec *s,
++		      struct dcp_panel_adt *panel)
++{
++	struct adt_buf *b = kunit_kzalloc(test, sizeof(*b), GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, b);
++	*panel = (struct dcp_panel_adt) {};
++	KUNIT_ASSERT_EQ(test, dcp_panel_adt_parse(b->data, adt_build(b, s), panel), 0);
++}
++
++static void panel_adt_p3_and_headroom(struct kunit *test)
++{
++	const struct adt_spec s = { .gamut = "P3", .matrix = 1, .headroom = 16 << 16 };
++	struct dcp_panel_adt panel;
++
++	adt_parse(test, &s, &panel);
++	KUNIT_EXPECT_EQ(test, panel.gamut, DCP_PANEL_GAMUT_DISPLAY_P3);
++	KUNIT_EXPECT_EQ(test, panel.edr_potential_headroom, 16U << 16);
++}
++
++static void panel_adt_srgb(struct kunit *test)
++{
++	const struct adt_spec s = { .gamut = "sRGB", .matrix = 1 };
++	struct dcp_panel_adt panel;
++
++	adt_parse(test, &s, &panel);
++	KUNIT_EXPECT_EQ(test, panel.gamut, DCP_PANEL_GAMUT_SRGB);
++	KUNIT_EXPECT_EQ(test, panel.edr_potential_headroom, 0U);
++}
++
++/* The named target counts only with its factory matrix as provenance. */
++static void panel_adt_target_needs_a_valid_v1_matrix(struct kunit *test)
++{
++	const struct adt_spec cases[] = {
++		{ .gamut = "P3", .matrix = 0, .headroom = 16 << 16 },
++		{ .gamut = "P3", .matrix = 2, .headroom = 16 << 16 },
++		{ .gamut = "P3", .matrix = 1, .singular = true, .headroom = 16 << 16 },
++	};
++	struct dcp_panel_adt panel;
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(cases); i++) {
++		adt_parse(test, &cases[i], &panel);
++		KUNIT_EXPECT_EQ_MSG(test, panel.gamut, DCP_PANEL_GAMUT_UNSPECIFIED, "case %u", i);
++		/* The headroom does not depend on the colour target. */
++		KUNIT_EXPECT_EQ_MSG(test, panel.edr_potential_headroom, 16U << 16, "case %u", i);
++	}
++}
++
++static void panel_adt_unknown_or_misplaced_target(struct kunit *test)
++{
++	const struct adt_spec unknown = { .gamut = "XYZ", .matrix = 1 };
++	const struct adt_spec deep = { .gamut = "P3", .matrix = 1, .gamut_in_child = true };
++	struct dcp_panel_adt panel;
++
++	adt_parse(test, &unknown, &panel);
++	KUNIT_EXPECT_EQ(test, panel.gamut, DCP_PANEL_GAMUT_UNSPECIFIED);
++	adt_parse(test, &deep, &panel);
++	KUNIT_EXPECT_EQ(test, panel.gamut, DCP_PANEL_GAMUT_UNSPECIFIED);
++}
++
++/* A cut-off or oversized tree is refused and leaves the result alone. */
++static void panel_adt_malformed_tree(struct kunit *test)
++{
++	const struct adt_spec s = { .gamut = "P3", .matrix = 1, .headroom = 16 << 16 };
++	struct adt_buf *b = kunit_kzalloc(test, sizeof(*b), GFP_KERNEL);
++	struct dcp_panel_adt panel = { .gamut = DCP_PANEL_GAMUT_SRGB, .edr_potential_headroom = 7 };
++	size_t len;
++
++	KUNIT_ASSERT_NOT_NULL(test, b);
++	len = adt_build(b, &s);
++	KUNIT_EXPECT_LT(test, dcp_panel_adt_parse(b->data, len - 1, &panel), 0);
++	KUNIT_EXPECT_LT(test, dcp_panel_adt_parse(b->data, 7, &panel), 0);
++	KUNIT_EXPECT_EQ(test, dcp_panel_adt_parse(NULL, len, &panel), -EINVAL);
++	/* A child count the data cannot hold. */
++	put_unaligned_le32(5000, b->data + 4);
++	KUNIT_EXPECT_LT(test, dcp_panel_adt_parse(b->data, len, &panel), 0);
++	KUNIT_EXPECT_EQ(test, panel.gamut, DCP_PANEL_GAMUT_SRGB);
++	KUNIT_EXPECT_EQ(test, panel.edr_potential_headroom, 7U);
++}
++
++static struct kunit_case panel_adt_cases[] = {
++	KUNIT_CASE(panel_adt_p3_and_headroom),
++	KUNIT_CASE(panel_adt_srgb),
++	KUNIT_CASE(panel_adt_target_needs_a_valid_v1_matrix),
++	KUNIT_CASE(panel_adt_unknown_or_misplaced_target),
++	KUNIT_CASE(panel_adt_malformed_tree),
++	{}
++};
++
++static struct kunit_suite panel_adt_suite = {
++	.name = "apple-dcp-panel-adt",
++	.test_cases = panel_adt_cases,
++};
++
++kunit_test_suite(panel_adt_suite);
+-- 
+2.43.0
+

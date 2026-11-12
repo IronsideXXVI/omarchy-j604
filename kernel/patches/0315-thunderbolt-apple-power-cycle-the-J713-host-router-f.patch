@@ -1,0 +1,1708 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erik Bourget <erik@ebourget.net>
+Date: Tue, 10 Nov 2026 00:01:24 -0500
+Subject: [PATCH] thunderbolt: apple: power-cycle the J713 host router
+ for a deep sleep
+
+With thunderbolt_apple.cio_s2r=1 on the J713, the NHI owns the whole
+power cycle of its ACIO block around a deep sleep with a dock attached.
+
+In prepare it closes the connection manager, checks that only the
+control rings are in use, waits for the released displays' routes to go
+down and opens the PHY, DART and tunneled PCIe transactions. In its
+noirq suspend, once the PCIe port reports stopped, it puts the routers
+to sleep, powers the NHI DART down, powers the controller off, holds
+the LSTX pin, takes the four ACIO power domains down in order and
+powers the PHY down. The noirq resume does the reverse: PHY, domains,
+a cold restart of the controller, tunables, the DART, then the
+connection manager's wake. Complete closes the three transactions and
+reopens the connection manager.
+
+The host router is told to sleep the way its firmware expects: the
+router's own sleep bit (ROUTER_CS_5.SLP, with its PCIe and USB wake
+bits clear) first, then the vendor enter-sleep request, then a wait for
+the controller to report its sleep state. The vendor request on its own
+makes the firmware assert.
+
+After the restart the router is given its lane adapters unlocked and
+the cable word again, as at the first start, which is what starts link
+training.
+
+A dock lost during the sleep is retired as an unplug once the host side
+is back; if the host's PCIe tunnel went with it, the tunneled port is
+told not to wait for its link.
+
+A failure after the routers were changed recovers through a restart of
+the controller: the router only wakes from its vendor sleep that way.
+The ACIO reset cannot be asserted again, so the four domains are taken
+down first if they were not already, which resets the CPU, then the
+same power-on path runs. If a domain stays on, or the NHI DART could not
+be saved before the restart, or the recovery fails, the PCIe and USB
+devices behind the dock cannot be resumed safely, so it panics. A DART
+that is briefly busy with a mapping is waited for first.
+
+The power-on path replays the T8132 ACIO start sequence the driver
+already has for a cable connect.
+
+The parameter defaults to off. Without the PHY reference or the DART,
+the NHI logs it and runs without its deep-sleep transaction. Add
+host-side models of the ownership rules and of the dock's PM callback
+ordering.
+
+This builds on work by Diljit Singh.
+
+Signed-off-by: Erik Bourget <erik@ebourget.net>
+[niteria: credit moved from Based-on-work-by into the text; checkpatch fixes in the host-test harness]
+Assisted-by: LLM
+Signed-off-by: Bartosz Nitka <niteria@gmail.com>
+(cherry picked from commit 7a103fa787048d1d4a128e10fa0868f0415d52a5)
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/thunderbolt/apple-cio-sleep.c | 381 ++++++++++++++
+ drivers/thunderbolt/apple.c           |  82 ++-
+ tools/asahi/cio-native-tests.c        | 685 ++++++++++++++++++++++++++
+ tools/asahi/cio-native-tests.py       |  85 ++++
+ tools/asahi/tb-dock-pm-tests.py       | 247 ++++++++++
+ 5 files changed, 1461 insertions(+), 19 deletions(-)
+ create mode 100644 drivers/thunderbolt/apple-cio-sleep.c
+ create mode 100644 tools/asahi/cio-native-tests.c
+ create mode 100644 tools/asahi/cio-native-tests.py
+ create mode 100644 tools/asahi/tb-dock-pm-tests.py
+
+diff --git a/drivers/thunderbolt/apple-cio-sleep.c b/drivers/thunderbolt/apple-cio-sleep.c
+new file mode 100644
+index 0000000000..6a75dbf6b8
+--- /dev/null
++++ b/drivers/thunderbolt/apple-cio-sleep.c
+@@ -0,0 +1,381 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Included by apple.c: one owner for the bound host's complete power cycle. */
++static int apple_nhi_cio_router_sleep(struct tb_nhi *nhi)
++{
++	struct apple_nhi *anhi = nhi_to_anhi(nhi);
++	struct tb_switch *sw = anhi->tb->root_switch;
++	u32 command = 1, state, val;
++	int cap, ret;
++
++	cap = tb_switch_find_vse_cap(sw, TB_VSE_CAP_APPLE);
++	if (cap < 0)
++		return cap;
++	/*
++	 * The controller only accepts the vendor sleep request once the
++	 * host router itself was told to sleep. Router-level wakes stay off.
++	 */
++	ret = tb_sw_read(sw, &val, TB_CFG_SWITCH, ROUTER_CS_5, 1);
++	if (ret)
++		return ret;
++	val &= ~(ROUTER_CS_5_WOP | ROUTER_CS_5_WOU);
++	val |= ROUTER_CS_5_SLP;
++	ret = tb_sw_write(sw, &val, TB_CFG_SWITCH, ROUTER_CS_5, 1);
++	if (ret)
++		return ret;
++	/* Sleep ready is advisory here; the controller state below decides. */
++	for (unsigned int i = 0; i < 20; i++) {
++		ret = tb_sw_read(sw, &val, TB_CFG_SWITCH, ROUTER_CS_6, 1);
++		if (ret)
++			return ret;
++		if (val & ROUTER_CS_6_SLPR)
++			break;
++		usleep_range(10000, 11000);
++	}
++	dev_info(anhi->dev, "CIO host router sleep set, ready %s\n",
++		 val & ROUTER_CS_6_SLPR ? "reported" : "not reported");
++	ret = tb_sw_write(sw, &command, TB_CFG_SWITCH, cap + 0xb, 1);
++	if (ret)
++		return ret;
++	ret = readl_poll_timeout(anhi->acio->rc_base + APPLE_CIO_M3_STAT, state,
++				 state == 0x02000000, 10000, 1000000);
++	dev_info(anhi->dev, "CIO controller sleep state %#x: %d\n", state, ret);
++	return ret;
++}
++
++/* As at the first start: unlock the lane adapters, then the cable word starts the link. */
++static int apple_nhi_cio_router_wake(struct tb_nhi *nhi)
++{
++	struct apple_nhi *anhi = nhi_to_anhi(nhi);
++	struct tb_switch *sw = anhi->tb->root_switch;
++	struct tb_port *port;
++	int cap, ret;
++
++	cap = tb_switch_find_vse_cap(sw, TB_VSE_CAP_APPLE);
++	if (cap < 0)
++		return cap;
++	tb_switch_for_each_port(sw, port) {
++		if (!tb_port_is_null(port))
++			continue;
++		ret = tb_port_unlock(port);
++		if (ret)
++			dev_warn(anhi->dev, "CIO port %u unlock failed: %d\n", port->port, ret);
++	}
++	ret = tb_sw_write(sw, &anhi->acio->current_cable_info, TB_CFG_SWITCH,
++			  cap + TB_VSE_CAP_APPLE_CABLE_INFO, 1);
++	dev_info(anhi->dev, "CIO cable word %#x written: %d\n", anhi->acio->current_cable_info,
++		 ret);
++	return ret;
++}
++
++static int apple_nhi_cio_bind_owner(struct apple_nhi *anhi)
++{
++	struct of_phandle_args args;
++	struct platform_device *dart;
++	struct phy *phy;
++	int ret;
++
++	if (anhi->acio->pd_list->num_pds != 4)
++		return -EINVAL;
++	phy = devm_of_phy_get(anhi->dev, anhi->acio->np, "cio");
++	if (IS_ERR(phy))
++		return PTR_ERR(phy);
++	ret = of_parse_phandle_with_args(anhi->np, "iommus", "#iommu-cells", 0, &args);
++	if (ret)
++		return ret;
++	dart = of_find_device_by_node(args.np);
++	of_node_put(args.np);
++	if (!dart)
++		return -EPROBE_DEFER;
++	ret = apple_dart_cio_bind(anhi->dev, &dart->dev, &anhi->cio_dart);
++	put_device(&dart->dev);
++	if (ret)
++		return ret;
++	anhi->cio_phy = phy;
++	anhi->ops.router_sleep = apple_nhi_cio_router_sleep;
++	anhi->ops.router_wake = apple_nhi_cio_router_wake;
++	return 0;
++}
++
++/* Without the owner, a deep sleep with a dock attached takes the stock path. */
++static int apple_nhi_cio_bind(struct apple_nhi *anhi)
++{
++	int ret;
++
++	if (!cio_s2r)
++		return 0;
++	if (anhi->acio->hw != &apple_cio_t8132_hw ||
++	    !of_machine_is_compatible("apple,j713"))
++		return 0;
++	ret = apple_nhi_cio_bind_owner(anhi);
++	if (ret == -EPROBE_DEFER)
++		return ret;
++	if (ret)
++		dev_warn(anhi->dev, "no CIO sleep owner: %d\n", ret);
++	return 0;
++}
++
++static int apple_nhi_cio_prepare(struct apple_nhi *anhi)
++{
++	struct apple_cio *acio = anhi->acio;
++	struct platform_device *pcie;
++	int ret;
++
++	if (!anhi->cio_dart || pm_suspend_target_state != PM_SUSPEND_MEM)
++		return 0;
++	scoped_guard(mutex, &acio->lock) {
++		if (!acio->rtk || !acio->current_cable_info || acio->removing ||
++		    acio->current_cable_info != acio->target_cable_info || acio->native_sleep)
++			return -EBUSY;
++		WRITE_ONCE(acio->native_sleep, true);
++	}
++	/* No new rings or topology may appear after the connection manager closes. */
++	ret = tb_cio_sleep_prepare(anhi->tb);
++	if (ret)
++		goto release_cable;
++	/* The released displays' routes go down on this queue: wait for them. */
++	if (acio->dp_wq)
++		flush_workqueue(acio->dp_wq);
++	for (unsigned int i = 1; i < anhi->n_rings; i++) {
++		if (anhi->nhi.tx_rings[i] || anhi->nhi.rx_rings[i]) {
++			ret = -EBUSY;
++			goto release_cm;
++		}
++	}
++	cancel_delayed_work_sync(&anhi->dp_aux_work);
++	ret = apple_atcphy_cio_prepare(anhi->cio_phy);
++	if (ret)
++		goto release_cm;
++	ret = apple_dart_cio_prepare(anhi->cio_dart);
++	if (ret)
++		goto release_phy;
++	scoped_guard(mutex, &acio->pcie_tunnel_lock)
++		pcie = apple_cio_find_pcie_tunnel(acio);
++	if (!pcie) {
++		ret = -ENODEV;
++		goto release_dart;
++	}
++	ret = apple_pcie_tunnel_cio_prepare(&pcie->dev);
++	if (ret) {
++		put_device(&pcie->dev);
++		goto release_dart;
++	}
++	anhi->cio_pcie = &pcie->dev;
++	anhi->cio_prepared = true;
++	anhi->cio_pd_suspended = 0;
++	anhi->cio_rtk_off = false;
++	anhi->cio_cycled = false;
++	return 0;
++release_dart:
++	if (apple_dart_cio_finish(anhi->cio_dart))
++		panic("Apple CIO: failed to release unused DART transaction");
++release_phy:
++	if (apple_atcphy_cio_finish(anhi->cio_phy))
++		panic("Apple CIO: failed to release unused PHY transaction");
++release_cm:
++	tb_cio_sleep_complete(anhi->tb);
++release_cable:
++	scoped_guard(mutex, &acio->lock)
++		WRITE_ONCE(acio->native_sleep, false);
++	if (anhi->dp_aux_armed)
++		mod_delayed_work(system_dfl_wq, &anhi->dp_aux_work, 0);
++	return ret;
++}
++
++static int apple_nhi_cio_start_cpu(void *data)
++{
++	struct apple_nhi *anhi = data;
++
++	return reset_control_deassert(anhi->acio->reset);
++}
++
++static int apple_nhi_cio_power_on(struct apple_nhi *anhi)
++{
++	static const unsigned int order[] = { 3, 0, 2, 1 };
++	struct apple_cio *acio = anhi->acio;
++	u32 state;
++	int ret;
++
++	dev_info(anhi->dev, "CIO restore PHY\n");
++	ret = apple_atcphy_cio_on(anhi->cio_phy);
++	if (ret)
++		return ret;
++	for (unsigned int i = 0; i < ARRAY_SIZE(order); i++) {
++		unsigned int n = order[i];
++		struct device *pd = acio->pd_list->pd_devs[n];
++
++		if (!(anhi->cio_pd_suspended & BIT(n)))
++			continue;
++		/* Balance every attempted suspend, including one which stayed on. */
++		dev_info(anhi->dev, "CIO restore domain %u\n", n);
++		dev_pm_genpd_resume(pd);
++		anhi->cio_pd_suspended &= ~BIT(n);
++		ret = apple_pmgr_ps_verify_state(pd, true);
++		if (ret)
++			return ret;
++	}
++	if (anhi->cio_rtk_off) {
++		/* The ACIO reset only deasserts: only its domains going off reset the CPU. */
++		if (!anhi->cio_cycled)
++			return -EUCLEAN;
++		dev_info(anhi->dev, "CIO restart controller\n");
++		ret = apple_rtkit_cold_restart(acio->rtk, apple_nhi_cio_start_cpu, anhi);
++		if (ret)
++			return ret;
++		ret = apple_cio_lstx_release(acio);
++		if (ret)
++			return ret;
++		ret = readl_poll_timeout(acio->rc_base + APPLE_CIO_M3_STAT, state,
++					 (state & APPLE_CIO_M3_STAT_CODE_VALID) ||
++					 FIELD_GET(APPLE_CIO_M3_STAT_STATE, state) ==
++					 APPLE_CIO_M3_STAT_STATE_READY, 100, 500000);
++		if (ret || (state & APPLE_CIO_M3_STAT_CODE_VALID))
++			return ret ?: -EIO;
++		apple_tunable_apply(acio->rc_base, acio->rc_tunable);
++		if (acio->pcie_adapter_tunable)
++			apple_tunable_apply(acio->pcie_adapter_base, acio->pcie_adapter_tunable);
++		apple_tunable_apply(acio->router_ap_fw_base, acio->router_ap_fw_tunable);
++		apple_tunable_apply(anhi->nhi_base, anhi->nhi_tunable);
++		anhi->cio_rtk_off = false;
++		anhi->cio_cycled = false;
++	}
++	/* The CPU and domains are back before the DART opens the NHI streams. */
++	dev_info(anhi->dev, "CIO restore NHI DART\n");
++	return apple_dart_cio_on(anhi->cio_dart);
++}
++
++/* A PCIe-C port whose tunnel went with a lost router does not wait for its link. */
++static int apple_nhi_cio_wake(struct apple_nhi *anhi)
++{
++	bool pci_lost = false;
++	int ret;
++
++	ret = tb_cio_wake(anhi->tb, &pci_lost);
++	if (!ret && pci_lost) {
++		dev_warn(anhi->dev, "CIO dock lost during sleep; retiring its tunnels\n");
++		apple_pcie_tunnel_cio_lost(anhi->cio_pcie);
++	}
++	return ret;
++}
++
++/* Take the four domains down in order; one already attempted is only checked. */
++static int apple_nhi_cio_domains_off(struct apple_nhi *anhi)
++{
++	static const unsigned int order[] = { 1, 2, 0, 3 };
++	int ret;
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(order); i++) {
++		unsigned int n = order[i];
++		struct device *pd = anhi->acio->pd_list->pd_devs[n];
++
++		if (!(anhi->cio_pd_suspended & BIT(n))) {
++			anhi->cio_pd_suspended |= BIT(n);
++			dev_info(anhi->dev, "CIO stop domain %u\n", n);
++			dev_pm_genpd_suspend(pd);
++		}
++		ret = dev_pm_genpd_is_on(pd) ? -EBUSY : apple_pmgr_ps_verify_state(pd, false);
++		if (ret)
++			return ret;
++	}
++	anhi->cio_cycled = true;
++	return 0;
++}
++
++/* A map or unmap in flight closes the DART only briefly: wait for it. */
++static int apple_nhi_cio_dart_off(struct apple_nhi *anhi)
++{
++	int ret;
++
++	for (unsigned int i = 0; i < 20; i++) {
++		ret = apple_dart_cio_off(anhi->cio_dart);
++		if (ret != -EBUSY)
++			break;
++		usleep_range(500, 1000);
++	}
++	return ret;
++}
++
++static int apple_nhi_cio_suspend(struct apple_nhi *anhi)
++{
++	struct apple_cio *acio = anhi->acio;
++	int ret, recover;
++
++	if (!apple_pcie_tunnel_cio_stopped(anhi->cio_pcie))
++		return -EBUSY;
++	dev_info(anhi->dev, "CIO save paths and routers\n");
++	ret = tb_cio_sleep(anhi->tb);
++	if (ret)
++		return ret;
++	dev_info(anhi->dev, "CIO stop NHI DART\n");
++	ret = apple_nhi_cio_dart_off(anhi);
++	/* Asleep, the controller wakes only through a restart, which loses this DART. */
++	if (ret)
++		panic("Apple CIO: NHI DART not saved (%d) with the router asleep", ret);
++	dev_info(anhi->dev, "CIO stop controller\n");
++	ret = apple_rtkit_poweroff(acio->rtk);
++	if (ret)
++		panic("Apple CIO: CPU shutdown failed %d; DMA stays closed", ret);
++	anhi->cio_rtk_off = true;
++	apple_rtkit_mailbox_off(acio->rtk);
++	ret = apple_cio_lstx_hold(acio, !!(readl(acio->rc_base + APPLE_CIO_M3_CTRL) &
++						 APPLE_CIO_LSTX_CTRL_LEVEL));
++	if (ret)
++		goto unwind;
++	ret = apple_nhi_cio_domains_off(anhi);
++	if (ret)
++		goto unwind;
++	dev_info(anhi->dev, "CIO stop PHY\n");
++	ret = apple_atcphy_cio_off(anhi->cio_phy);
++	if (!ret)
++		return 0;
++unwind:
++	dev_warn(anhi->dev, "CIO suspend failed %d; restarting the controller\n", ret);
++	/*
++	 * The host router took the vendor sleep: only a controller restart wakes
++	 * it, and only its domains going off reset the CPU for that restart.
++	 */
++	if (!anhi->cio_cycled) {
++		recover = apple_nhi_cio_domains_off(anhi);
++		if (recover)
++			panic("Apple CIO: suspend %d; controller not reset: %d", ret, recover);
++	}
++	recover = apple_nhi_cio_power_on(anhi) ?: apple_nhi_cio_wake(anhi);
++	if (recover)
++		panic("Apple CIO: suspend %d, recovery %d", ret, recover);
++	return ret;
++}
++
++static int apple_nhi_cio_resume(struct apple_nhi *anhi)
++{
++	/* A lost dock is an unplug; only the host side must come back. */
++	int ret = apple_nhi_cio_power_on(anhi) ?: apple_nhi_cio_wake(anhi);
++
++	/* Child resume would otherwise access a dead tunnel or missing translations. */
++	if (ret)
++		panic("Apple CIO: resume failed %d; children remain suspended", ret);
++	return 0;
++}
++
++static void apple_nhi_cio_complete(struct apple_nhi *anhi)
++{
++	struct apple_cio *acio = anhi->acio;
++	int ret;
++
++	if (!anhi->cio_prepared)
++		return;
++	ret = apple_pcie_tunnel_cio_finish(anhi->cio_pcie) ?:
++	      apple_dart_cio_finish(anhi->cio_dart) ?:
++	      apple_atcphy_cio_finish(anhi->cio_phy);
++	if (ret)
++		panic("Apple CIO: incomplete recovery at complete: %d", ret);
++	tb_cio_sleep_complete(anhi->tb);
++	put_device(anhi->cio_pcie);
++	anhi->cio_pcie = NULL;
++	anhi->cio_prepared = false;
++	scoped_guard(mutex, &acio->lock) {
++		WRITE_ONCE(acio->native_sleep, false);
++		if (acio->target_cable_info != acio->current_cable_info)
++			dev_warn(acio->dev, "cable changed during native sleep; revalidation required\n");
++	}
++	if (anhi->dp_aux_armed)
++		mod_delayed_work(system_dfl_wq, &anhi->dp_aux_work, 0);
++}
+diff --git a/drivers/thunderbolt/apple.c b/drivers/thunderbolt/apple.c
+index c29615e9ab..e6b9d84eeb 100644
+--- a/drivers/thunderbolt/apple.c
++++ b/drivers/thunderbolt/apple.c
+@@ -100,6 +100,10 @@
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/reset.h>
++#include <linux/phy/phy.h>
++#include <linux/phy/apple-atc.h>
++#include <linux/soc/apple/dart-cio.h>
++#include <linux/soc/apple/pmgr-pwrstate.h>
+ #include <linux/soc/apple/rtkit.h>
+ #include <linux/soc/apple/dp-tunnel.h>
+ #include <linux/soc/apple/tunable.h>
+@@ -330,6 +334,10 @@ MODULE_PARM_DESC(dpin_mode_value,
+ /* DP IN adapters without an interrupt are polled this often (ms). */
+ #define APPLE_DPIN_POLL_MS 20
+ 
++static bool cio_s2r;
++module_param(cio_s2r, bool, 0400);
++MODULE_PARM_DESC(cio_s2r, "Enable experimental J713 attached-dock system sleep");
++
+ struct apple_dpin_binding;
+ 
+ /**
+@@ -388,6 +396,7 @@ struct apple_cio {
+ 
+ 	struct mutex lock; /* serializes cable transitions and ACIO power up/down */
+ 	bool removing; /* protected by lock */
++	bool native_sleep; /* freeze cable transitions for the bound NHI */
+ 	struct delayed_work resume_link_work;
+ 	unsigned int resume_link_failures; /* protected by lock */
+ 	u64 resume_activity; /* snapshot before the stock resume path */
+@@ -1314,6 +1323,12 @@ struct apple_nhi {
+ 	struct tb_nhi_ops ops;
+ 
+ 	void __iomem *nhi_base;
++	struct apple_tunable *nhi_tunable;
++	struct apple_dart_cio *cio_dart;
++	struct phy *cio_phy;
++	struct device *cio_pcie;
++	u8 cio_pd_suspended;
++	bool cio_prepared, cio_rtk_off, cio_cycled;
+ 	void __iomem *pdf_base;
+ 
+ 	int *tx_irqs;
+@@ -1331,6 +1346,12 @@ struct apple_nhi {
+ 	unsigned int dp_aux_polls;
+ };
+ 
++static int apple_nhi_cio_bind(struct apple_nhi *anhi);
++static int apple_nhi_cio_prepare(struct apple_nhi *anhi);
++static int apple_nhi_cio_suspend(struct apple_nhi *anhi);
++static int apple_nhi_cio_resume(struct apple_nhi *anhi);
++static void apple_nhi_cio_complete(struct apple_nhi *anhi);
++
+ #define nhi_to_anhi(nhi_) container_of((nhi_), struct apple_nhi, nhi)
+ 
+ /**
+@@ -2095,7 +2116,7 @@ static void apple_dp_aux_work(struct work_struct *work)
+ 		return;
+ 
+ 	mutex_lock(&anhi->tb->lock);
+-	if (!anhi->dp_aux_armed || !anhi->tb->root_switch)
++	if (!anhi->dp_aux_armed || !anhi->tb->root_switch || READ_ONCE(anhi->acio->native_sleep))
+ 		goto out_unlock;
+ 
+ 	port = &anhi->tb->root_switch->ports[anhi->dp_in_port];
+@@ -2456,6 +2477,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
+ 		ret = dev_err_probe(&pdev->dev, PTR_ERR(tunable), "Unable to load NHI tunable\n");
+ 		goto err;
+ 	}
++	anhi->nhi_tunable = tunable;
+ 	apple_tunable_apply(anhi->nhi_base, tunable);
+ 
+ 	/* Type 7 keeps the PDF masks in the receive ring registers only. */
+@@ -2495,6 +2517,9 @@ static int apple_nhi_probe(struct platform_device *pdev)
+ 		anhi->ops.dp_tunnel_deactivate = apple_nhi_dp_tunnel_deactivate;
+ 		anhi->nhi.host_dp_policy = acio->dp->host_policy;
+ 	}
++	ret = apple_nhi_cio_bind(anhi);
++	if (ret)
++		goto err;
+ 	anhi->nhi.ops = &anhi->ops;
+ 	anhi->nhi.ring_layout = &apple_nhi_ring_layout;
+ 	anhi->nhi.iobase = anhi->nhi_base;
+@@ -2692,29 +2717,38 @@ static int apple_nhi_prepare(struct device *dev)
+ {
+ 	struct apple_nhi *anhi = dev_get_drvdata(dev);
+ 	struct apple_cio *acio = anhi->acio;
++	int ret;
+ 
+ 	acio->resume_had_peer = false;
+ 	/* Only resume recovery reads it: don't take the domain lock otherwise. */
+-	if (!READ_ONCE(resume_recovery))
+-		return 0;
+-	scoped_guard(mutex, &anhi->tb->lock) {
+-		struct tb_port *port;
+-
+-		tb_switch_for_each_port(anhi->tb->root_switch, port) {
+-			if (tb_port_is_null(port) &&
+-			    ((port->xdomain && !port->xdomain->is_unplugged) ||
+-			     (port->remote && !port->remote->sw->is_unplugged)))
+-				acio->resume_had_peer = true;
++	if (READ_ONCE(resume_recovery)) {
++		scoped_guard(mutex, &anhi->tb->lock) {
++			struct tb_port *port;
++
++			tb_switch_for_each_port(anhi->tb->root_switch, port) {
++				if (tb_port_is_null(port) &&
++				    ((port->xdomain && !port->xdomain->is_unplugged) ||
++				     (port->remote && !port->remote->sw->is_unplugged)))
++					acio->resume_had_peer = true;
++			}
+ 		}
+ 	}
+ 
++	/* Worker admission and native PCIe PM ordering are required on every sleep. */
+ 	apple_dpin_pause_retries(acio);
+ 
+-	guard(mutex)(&acio->pcie_tunnel_lock);
+-	/* Keep an unresolved expectation across another sleep before revalidation. */
+-	acio->pcie_resume_expected |= READ_ONCE(acio->pcie_tunnel_requested);
+-	acio->pcie_pm_prepared = true;
+-	return 0;
++	scoped_guard(mutex, &acio->pcie_tunnel_lock) {
++		/* Keep an unresolved expectation until cable revalidation. */
++		acio->pcie_resume_expected |= READ_ONCE(acio->pcie_tunnel_requested);
++		acio->pcie_pm_prepared = true;
++	}
++	ret = apple_nhi_cio_prepare(anhi);
++	if (ret) {
++		apple_dpin_resume_retries(acio);
++		scoped_guard(mutex, &acio->pcie_tunnel_lock)
++			acio->pcie_pm_prepared = false;
++	}
++	return ret;
+ }
+ 
+ /*
+@@ -2757,6 +2791,8 @@ static int apple_nhi_suspend_noirq(struct device *dev)
+ {
+ 	struct apple_nhi *anhi = dev_get_drvdata(dev);
+ 
++	if (anhi->cio_prepared)
++		return apple_nhi_cio_suspend(anhi);
+ 	anhi->nhi.quirks &= ~(QUIRK_NO_SYSTEM_SLEEP | QUIRK_KEEP_TUNNELS);
+ 	if (!READ_ONCE(router_sleep)) {
+ 		anhi->nhi.quirks |= QUIRK_NO_SYSTEM_SLEEP;
+@@ -2793,6 +2829,8 @@ static int apple_nhi_resume_noirq(struct device *dev)
+ {
+ 	struct apple_nhi *anhi = dev_get_drvdata(dev);
+ 
++	if (anhi->cio_prepared)
++		return apple_nhi_cio_resume(anhi);
+ 	anhi->acio->resume_activity = atomic64_read(&anhi->tb->remote_activity);
+ 	WRITE_ONCE(anhi->acio->resume_link_pending, true);
+ 	return tb_domain_resume_noirq(anhi->tb);
+@@ -2824,6 +2862,7 @@ static void apple_nhi_complete(struct device *dev)
+ 	struct apple_nhi *anhi = dev_get_drvdata(dev);
+ 	struct apple_cio *acio = anhi->acio;
+ 
++	apple_nhi_cio_complete(anhi);
+ 	tb_domain_complete(anhi->tb);
+ 	apple_dpin_resume_retries(acio);
+ 
+@@ -2936,12 +2975,12 @@ static void apple_cio_remove_children(struct apple_cio *acio)
+  * While the router is off, the AP holds LSTX at the level the router last
+  * drove. The pin goes back to the router once it is up again.
+  */
+-static void apple_cio_lstx_hold(struct apple_cio *acio, bool high)
++static int apple_cio_lstx_hold(struct apple_cio *acio, bool high)
+ {
+ 	struct gpio_desc *gpio;
+ 
+ 	if (!acio->lstx_hold)
+-		return;
++		return 0;
+ 	acio->lstx_high = high;
+ 
+ 	/* The pin controller is strict: release the router's mux first. */
+@@ -2956,9 +2995,10 @@ static void apple_cio_lstx_hold(struct apple_cio *acio, bool high)
+ 		acio->lstx_high = false;
+ 		dev_warn(acio->dev, "failed to take the LSTX pin back: %ld\n",
+ 			 PTR_ERR(gpio));
+-		return;
++		return PTR_ERR(gpio);
+ 	}
+ 	acio->lstx_gpio = gpio;
++	return 0;
+ }
+ 
+ static int apple_cio_lstx_release(struct apple_cio *acio)
+@@ -3493,6 +3533,8 @@ static void apple_cio_resume_link_work(struct work_struct *work)
+ 		typec_thunderbolt_switch_notify(acio->tbt_switch);
+ }
+ 
++#include "apple-cio-sleep.c"
++
+ static int apple_cio_prepare(struct device *dev)
+ {
+ 	struct apple_cio *acio = dev_get_drvdata(dev);
+@@ -3606,6 +3648,8 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
+ 		break;
+ 	}
+ 
++	if (acio->native_sleep)
++		return acio->target_cable_info == acio->current_cable_info ? 0 : -EBUSY;
+ 	/* Until resume, record changes; CD321x reapplies fresh state afterwards. */
+ 	if (acio->sleep_phase == APPLE_CIO_SLEEP_CLOSED)
+ 		return 0;
+diff --git a/tools/asahi/cio-native-tests.c b/tools/asahi/cio-native-tests.c
+new file mode 100644
+index 0000000000..2de989c25e
+--- /dev/null
++++ b/tools/asahi/cio-native-tests.c
+@@ -0,0 +1,685 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Ordered PM model. It deliberately does not emulate silicon or firmware. */
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <setjmp.h>
++#include <errno.h>
++typedef uint32_t u32;
++#define BIT(n) (1U << (n))
++#define GENMASK(h, l) ((~0U << (l)) & (~0U >> (31 - (h))))
++#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
++#define FIELD_GET(m, v) (((v) & (m)) / ((m) & -(m)))
++#define READ_ONCE(v) (v)
++#define WRITE_ONCE(v, x) ((v) = (x))
++#define EXPORT_SYMBOL_GPL(n)
++#define PM_SUSPEND_MEM 3
++/* The MMIO mock records write order synchronously. */
++#define wmb() ((void)0)
++#define dev_warn(...) ((void)0)
++#define dev_info(...) ((void)0)
++#define dev_err(...) ((void)0)
++#define list_is_singular(l) ((l)->count == 1)
++#define list_first_entry(l, t, m) ((void)sizeof(#m), (t *)(l)->first)
++static unsigned int next_set_bit(unsigned long long m, unsigned int n, unsigned int i)
++{
++	while (i < n && !(m & BIT(i)))
++		i++;
++	return i;
++}
++
++#define for_each_set_bit(i, m, n) \
++	for ((i) = next_set_bit(*(m), (n), 0); (i) < (n); (i) = next_set_bit(*(m), (n), (i) + 1))
++#define read_poll_timeout_atomic(fn, v, cond, delay, time, sleep, ...) \
++	({                                                             \
++		(void)(delay);                                         \
++		(void)(time);                                          \
++		(void)(sleep);                                         \
++		int e = -ETIMEDOUT;                                    \
++		for (unsigned int j = 0; j < 2; j++) {                 \
++			(v) = fn(__VA_ARGS__);                         \
++			if (cond) {                                    \
++				e = 0;                                 \
++				break;                                 \
++			}                                              \
++		}                                                      \
++		e;                                                     \
++	})
++#define read_poll_timeout read_poll_timeout_atomic
++#define readl_poll_timeout(addr, v, cond, delay, time) \
++	read_poll_timeout_atomic(readl, v, cond, delay, time, 0, addr)
++/* ACTUAL_PORT_DEFINES */
++struct list_head {
++	void *first;
++	unsigned int count;
++};
++struct device {
++	void *data;
++	unsigned int index, refs;
++	bool on;
++};
++struct platform_device {
++	struct device dev;
++};
++struct apple_dart_cio {
++	unsigned int id;
++	bool active, off;
++};
++struct phy {
++	bool prepared, changed, restored;
++};
++struct hw_info {
++	u32 port_perst;
++};
++struct apple_pcie {
++	struct device *dev;
++	struct apple_dart_cio *cio_dart;
++	int cio_cfg_lock;
++	bool cio_prepared, cio_changed, cio_stopped, cio_port_reset, cio_lost,
++		bus_stopped, resume_failed;
++	struct list_head ports;
++	const struct hw_info *hw;
++};
++struct apple_pcie_port {
++	struct apple_pcie *pcie;
++	unsigned long *sid_map;
++	int sid_map_sz;
++	u32 saved_rid2sid[4], saved_intmask;
++	bool started, needs_stop, irq_disabled;
++};
++struct pd_list {
++	struct device *pd_devs[4];
++};
++struct rtkit {
++	bool off;
++};
++struct tb {
++	bool prepared, stopped, lost, restarted;
++};
++struct apple_cio {
++	int lock, pcie_tunnel_lock;
++	bool removing, native_sleep, lstx_high;
++	u32 current_cable_info, target_cable_info;
++	struct rtkit *rtk;
++	struct pd_list *pd_list;
++	void *reset, *rc_base, *pcie_adapter_base, *router_ap_fw_base;
++	void *rc_tunable, *pcie_adapter_tunable, *router_ap_fw_tunable;
++	struct device *dev;
++	void *dp_wq;
++};
++struct ring_nhi {
++	void *tx_rings[2], *rx_rings[2];
++};
++struct apple_nhi {
++	struct apple_cio *acio;
++	struct apple_dart_cio *cio_dart;
++	struct phy *cio_phy;
++	struct device *cio_pcie;
++	struct device *dev;
++	struct tb *tb;
++	struct ring_nhi nhi;
++	unsigned int n_rings, cio_pd_suspended;
++	bool cio_prepared, cio_rtk_off, cio_cycled, dp_aux_armed;
++	int dp_aux_work;
++	void *nhi_base, *nhi_tunable;
++};
++static struct platform_device pdev;
++static struct apple_pcie pc;
++static struct apple_pcie_port port;
++static struct hw_info hw = { .port_perst = PORT_PERST };
++static struct apple_dart_cio darts[2];
++static struct phy phy;
++static struct apple_cio cio;
++static struct apple_nhi nhi;
++static struct pd_list pds;
++static struct device pd[4];
++static struct rtkit rtk;
++static struct tb tb;
++static unsigned long sids = 3;
++static u32 reg[2048], rid[4], rc[0x100 / 4];
++static int pm_suspend_target_state = PM_SUSPEND_MEM;
++static int fault, polls, maps, checks, balances[4], resets, finished, callbacks;
++static bool pending_fault, expect_panic, cpu_reset;
++static bool port_setup, aperture;
++static jmp_buf fatal;
++static void panic(const char *fmt, ...)
++{
++	assert(expect_panic);
++	longjmp(fatal, 1);
++}
++static bool fail(int point)
++{
++	if (pending_fault && fault == point) {
++		pending_fault = false;
++		return true;
++	}
++	return false;
++}
++static struct apple_pcie *apple_pcie_lookup(struct device *d)
++{
++	return d->data;
++}
++static bool apple_pcie_tunnel_link_healthy(struct apple_pcie *p)
++{
++	return !fail(1);
++}
++static int apple_dart_cio_prepare(struct apple_dart_cio *d)
++{
++	if (fail(d->id ? 3 : 2))
++		return -EBUSY;
++	assert(!d->active);
++	d->active = true;
++	return 0;
++}
++static int apple_dart_cio_off(struct apple_dart_cio *d)
++{
++	assert(d->active);
++	if (d->id)
++		assert(!(reg[PORT_PERST / 4] & PORT_PERST_OFF) &&
++		       (reg[PORT_APPCLK / 4] & PORT_APPCLK_EN));
++	else
++		assert(tb.stopped && pc.cio_stopped);
++	if (d->id && fail(16))
++		return -EOPNOTSUPP;
++	d->off = true;
++	return fail(d->id ? 13 : 20) ? -EIO : 0;
++}
++static int apple_dart_cio_on(struct apple_dart_cio *d)
++{
++	assert(d->active);
++	if (d->id)
++		assert(pd[1].on && (reg[PORT_APPCLK / 4] & PORT_APPCLK_EN));
++	else
++		assert(!rtk.off && pd[0].on && pd[1].on && pd[2].on &&
++		       pd[3].on);
++	if (fail(d->id ? 32 : 31))
++		return -EIO;
++	d->off = false;
++	return 0;
++}
++/* As the real one: always ends; a DART left off stays closed. */
++static int apple_dart_cio_finish(struct apple_dart_cio *d)
++{
++	assert(d->active);
++	d->active = false;
++	finished++;
++	return d->off ? -EIO : 0;
++}
++static u32 apple_pcie_port_readl(struct apple_pcie_port *p, u32 off)
++{
++	/* A link that never trains stays down for the whole poll. */
++	if (off == PORT_LINKSTS && pending_fault && fault == 33)
++		return 0;
++	if (off == PORT_STATUS && pending_fault && fault == 14 &&
++	    !(reg[PORT_APPCLK / 4] & PORT_APPCLK_EN)) {
++		if (++polls == 2)
++			pending_fault = false;
++		return PORT_STATUS_READY;
++	}
++	if (off == 0x108c && pending_fault &&
++	    (fault == 12 ||
++	     (fault == 15 && (reg[0x1088 / 4] & PORT_TUNCTRL_PERST_ACK_REQ)))) {
++		u32 val = fault == 12 ? 0 : PORT_TUNSTAT_PERST_ON;
++
++		if (++polls == 2)
++			pending_fault = false;
++		return val;
++	}
++	return reg[off / 4];
++}
++static void apple_pcie_port_writel(struct apple_pcie_port *p, u32 v, u32 off)
++{
++	if (off == PORT_PERST && !(v & PORT_PERST_OFF) &&
++	    (reg[off / 4] & PORT_PERST_OFF)) {
++		port_setup = aperture = false;
++		memset(rid, 0, sizeof(rid));
++	}
++	reg[off / 4] = v;
++	if (off == 0x1088)
++		reg[0x108c / 4] = v & (PORT_TUNCTRL_PERST_ON |
++				       PORT_TUNCTRL_PERST_ACK_REQ);
++	if (off == PORT_APPCLK)
++		reg[PORT_STATUS / 4] =
++			(v & PORT_APPCLK_EN) ? PORT_STATUS_READY : 0;
++	if (off == PORT_LTSSMCTL) {
++		bool train = (v & PORT_LTSSMCTL_START) && port_setup &&
++			     aperture && !reg[0x108c / 4] && !darts[1].off;
++		reg[PORT_LINKSTS / 4] = train ? PORT_LINKSTS_UP : 0;
++	}
++}
++static void apple_pcie_port_rmw_set(struct apple_pcie_port *p, u32 m, u32 off)
++{
++	apple_pcie_port_writel(p, reg[off / 4] | m, off);
++}
++static void apple_pcie_port_rmw_clear(struct apple_pcie_port *p, u32 m, u32 off)
++{
++	apple_pcie_port_writel(p, reg[off / 4] & ~m, off);
++}
++static u32 apple_pcie_port_tunctrl(struct apple_pcie_port *p)
++{
++	return 0x1088;
++}
++static u32 apple_pcie_port_tunstat(struct apple_pcie_port *p)
++{
++	return 0x108c;
++}
++static u32 port_rid2sid_offset(struct apple_pcie_port *p, int i)
++{
++	return 0x828 + 4 * i;
++}
++static void apple_pcie_rid2sid_write(struct apple_pcie_port *p, int i, u32 v)
++{
++	rid[i] = v;
++	maps++;
++}
++static bool apple_pcie_tunnel_transactions_idle(struct apple_pcie_port *p)
++{
++	if (pending_fault && fault == 11) {
++		if (++polls == 2)
++			pending_fault = false;
++		return false;
++	}
++	return true;
++}
++static void apple_pcie_port_disable_irq(struct apple_pcie_port *p)
++{
++	p->irq_disabled = true;
++}
++static void apple_pcie_port_enable_irq(struct apple_pcie_port *p)
++{
++	assert(!darts[1].off);
++	p->irq_disabled = false;
++}
++static void apple_pcie_tunnel_hierarchy_lost(struct device *d)
++{
++	callbacks++;
++}
++static void apple_pcie_tunnel_pulse_intr2axi(struct apple_pcie *p)
++{
++	assert(port_setup && (reg[PORT_PERST / 4] & PORT_PERST_OFF));
++	aperture = true;
++}
++static int apple_pcie_tunnel_cold_init(struct apple_pcie_port *p)
++{
++	assert(reg[0x1088 / 4] & PORT_TUNCTRL_PERST_ON);
++	memset(rid, 0, sizeof(rid));
++	resets++;
++	port_setup = true;
++	apple_pcie_port_rmw_set(p, PORT_PERST_OFF, PORT_PERST);
++	apple_pcie_port_rmw_set(p, PORT_APPCLK_EN, PORT_APPCLK);
++	apple_pcie_tunnel_pulse_intr2axi(p->pcie);
++	return 0;
++}
++static void apple_pcie_tunnel_restore_irq_hw(struct apple_pcie_port *p)
++{
++	checks++;
++}
++static int apple_pcie_tunnel_release_reset(struct apple_pcie_port *p)
++{
++	assert(!darts[1].off && maps >= 2);
++	apple_pcie_port_writel(p, 0, 0x1088);
++	return 0;
++}
++static void apple_pcie_tunnel_link_up(struct apple_pcie *p)
++{
++}
++static void apple_pcie_tunnel_wait_ready(struct apple_pcie *p)
++{
++}
++static int *take(int *l)
++{
++	assert(!*l);
++	*l = 1;
++	return l;
++}
++static void drop(int **l)
++{
++	if (*l) {
++		assert(**l);
++		**l = 0;
++	}
++}
++#define scoped_guard(type, l)                                               \
++	for (int *g __attribute__((cleanup(drop))) = take(l), *once = NULL; \
++	     !once; once = g)
++/* ACTUAL_PCIE */
++static void put_device(struct device *d)
++{
++	assert(d->refs);
++	d->refs--;
++}
++static struct platform_device *apple_cio_find_pcie_tunnel(struct apple_cio *a)
++{
++	if (fail(4))
++		return NULL;
++	pdev.dev.refs++;
++	return &pdev;
++}
++static void cancel_delayed_work_sync(int *w)
++{
++}
++static void flush_workqueue(void *q)
++{
++}
++static void *system_dfl_wq;
++static void mod_delayed_work(void *wq, int *w, int d)
++{
++}
++static int apple_atcphy_cio_prepare(struct phy *p)
++{
++	if (fail(5))
++		return -EBUSY;
++	assert(!p->prepared);
++	p->prepared = true;
++	return 0;
++}
++static int apple_atcphy_cio_off(struct phy *p)
++{
++	assert(rtk.off);
++	for (unsigned int i = 0; i < 4; i++)
++		assert(!pd[i].on);
++	p->changed = true;
++	return fail(25) ? -EIO : 0;
++}
++static int apple_atcphy_cio_on(struct phy *p)
++{
++	assert(p->prepared);
++	if (fail(30))
++		return -EIO;
++	p->restored = true;
++	return 0;
++}
++static int apple_atcphy_cio_finish(struct phy *p)
++{
++	assert(p->prepared && (!p->changed || p->restored));
++	*p = (struct phy){};
++	return 0;
++}
++static int tb_cio_sleep_prepare(struct tb *t)
++{
++	if (fail(6))
++		return -EBUSY;
++	t->prepared = true;
++	return 0;
++}
++static int tb_cio_sleep(struct tb *t)
++{
++	assert(pc.cio_stopped);
++	if (fail(19))
++		return -EIO;
++	t->stopped = true;
++	t->restarted = false;
++	return 0;
++}
++/* After the vendor sleep only a controller restart wakes the router. */
++static int tb_cio_wake(struct tb *t, bool *pci_lost)
++{
++	assert(!darts[0].off && !rtk.off && (!t->stopped || t->restarted));
++	if (fail(34))
++		return -EIO;
++	t->stopped = false;
++	if (pci_lost)
++		*pci_lost = t->lost;
++	return 0;
++}
++static void tb_cio_sleep_complete(struct tb *t)
++{
++	assert(t->prepared && !t->stopped);
++	t->prepared = false;
++}
++static int apple_rtkit_poweroff(struct rtkit *r)
++{
++	assert(tb.stopped && darts[0].off);
++	if (fail(21))
++		return -EIO;
++	r->off = true;
++	return 0;
++}
++static void apple_rtkit_mailbox_off(struct rtkit *r)
++{
++	assert(r->off);
++}
++static int apple_cio_lstx_hold(struct apple_cio *a, bool high)
++{
++	return fail(22) ? -EIO : 0;
++}
++static void dev_pm_genpd_suspend(struct device *d)
++{
++	assert(rtk.off && darts[0].off && darts[1].off);
++	balances[d->index]++;
++	d->on = !fail(23) ? false : true;
++	if (!pd[0].on && !pd[1].on && !pd[2].on && !pd[3].on)
++		cpu_reset = true;
++}
++static bool dev_pm_genpd_is_on(struct device *d)
++{
++	return d->on;
++}
++static void dev_pm_genpd_resume(struct device *d)
++{
++	assert(balances[d->index] == 1);
++	balances[d->index]--;
++	d->on = true;
++}
++static int apple_pmgr_ps_verify_state(struct device *d, bool on)
++{
++	assert(d->on == on);
++	return fail(on ? 35 : 24) ? -EIO : 0;
++}
++/* The ACIO reset only deasserts: its domains going off are what reset the CPU. */
++static void usleep_range(unsigned long min, unsigned long max)
++{
++	(void)min;
++	(void)max;
++}
++static int reset_control_deassert(void *r)
++{
++	assert(phy.restored);
++	rtk.off = false;
++	return 0;
++}
++/* A cold restart needs a CPU that went through reset. */
++static int apple_rtkit_cold_restart(struct rtkit *r, int (*start)(void *),
++				    void *p)
++{
++	for (unsigned int i = 0; i < 4; i++)
++		assert(pd[i].on);
++	assert(cpu_reset);
++	cpu_reset = false;
++	tb.restarted = true;
++	return start(p);
++}
++static int apple_cio_lstx_release(struct apple_cio *a)
++{
++	return 0;
++}
++static u32 readl(void *p)
++{
++	return *(u32 *)p;
++}
++static void apple_tunable_apply(void *p, void *t)
++{
++}
++/* ACTUAL_NHI */
++static void setup(void)
++{
++	memset(&pc, 0, sizeof(pc));
++	memset(&nhi, 0, sizeof(nhi));
++	memset(&cio, 0, sizeof(cio));
++	memset(&port, 0, sizeof(port));
++	memset(darts, 0, sizeof(darts));
++	memset(&phy, 0, sizeof(phy));
++	memset(reg, 0, sizeof(reg));
++	memset(&tb, 0, sizeof(tb));
++	memset(&rtk, 0, sizeof(rtk));
++	memset(balances, 0, sizeof(balances));
++	memset(rid, 0, sizeof(rid));
++	fault = polls = maps = checks = resets = finished = callbacks = 0;
++	pending_fault = expect_panic = cpu_reset = false;
++	port_setup = aperture = true;
++	pdev.dev = (struct device){ .data = &pc, .refs = 1 };
++	pc.dev = &pdev.dev;
++	pc.hw = &hw;
++	pc.cio_dart = &darts[1];
++	darts[1].id = 1;
++	pc.ports = (struct list_head){ .first = &port, .count = 1 };
++	port.pcie = &pc;
++	port.sid_map = &sids;
++	port.sid_map_sz = 2;
++	port.started = true;
++	for (unsigned int i = 0; i < 4; i++) {
++		pd[i] = (struct device){ .index = i, .on = true };
++		pds.pd_devs[i] = &pd[i];
++	}
++	cio.rtk = &rtk;
++	cio.pd_list = &pds;
++	cio.rc_base = rc;
++	cio.current_cable_info = cio.target_cable_info = 1;
++	rc[APPLE_CIO_M3_STAT / 4] = BIT(24);
++	nhi.acio = &cio;
++	nhi.cio_phy = &phy;
++	nhi.cio_dart = &darts[0];
++	nhi.tb = &tb;
++	nhi.n_rings = 2;
++	reg[PORT_APPCLK / 4] = PORT_APPCLK_EN;
++	reg[PORT_PERST / 4] = PORT_PERST_OFF;
++	reg[PORT_LINKSTS / 4] = PORT_LINKSTS_UP;
++	reg[PORT_STATUS / 4] = PORT_STATUS_READY;
++	reg[0x828 / 4] = 0x1234;
++	reg[0x82c / 4] = 0x5678;
++}
++static void inject(int point)
++{
++	fault = point;
++	pending_fault = true;
++	polls = 0;
++}
++static void clean(void)
++{
++	assert(!phy.prepared && !pc.cio_prepared && !nhi.cio_prepared &&
++	       !cio.native_sleep);
++	assert(!darts[0].active && !darts[1].active && !tb.prepared &&
++	       !tb.stopped);
++	assert(!port.irq_disabled && !pc.cio_changed && pdev.dev.refs == 1);
++	for (unsigned int i = 0; i < 4; i++)
++		assert(pd[i].on && !balances[i]);
++}
++int main(void)
++{
++	unsigned int cases = 0;
++
++	setup();
++	for (int cycle = 0; cycle < 3; cycle++) {
++		assert(!apple_nhi_cio_prepare(&nhi));
++		assert(!apple_pcie_cio_suspend(&pc));
++		assert(!apple_nhi_cio_suspend(&nhi));
++		assert(nhi.cio_pd_suspended == 15 && phy.changed);
++		assert(!apple_nhi_cio_resume(&nhi));
++		assert(!apple_pcie_cio_resume(&pc));
++		assert(rid[0] == 0x1234 && rid[1] == 0x5678 &&
++		       resets == cycle + 1);
++		apple_nhi_cio_complete(&nhi);
++		clean();
++		cases++;
++	}
++	for (int point = 1; point <= 6; point++) {
++		setup();
++		inject(point);
++		assert(apple_nhi_cio_prepare(&nhi) < 0);
++		clean();
++		cases++;
++	}
++	setup();
++	assert(!apple_nhi_cio_prepare(&nhi));
++	apple_nhi_cio_complete(&nhi);
++	clean();
++	cases++;
++	for (int point = 11; point <= 16; point++) {
++		setup();
++		assert(!apple_nhi_cio_prepare(&nhi));
++		inject(point);
++		assert(apple_pcie_cio_suspend(&pc) < 0);
++		assert(resets == (point >= 13));
++		apple_nhi_cio_complete(&nhi);
++		clean();
++		cases++;
++	}
++	/*
++	 * A DART that cannot be saved with the router asleep, or a domain that
++	 * stays on, leaves no way to restart the controller.
++	 */
++	for (int point = 20; point <= 23; point += 3) {
++		setup();
++		assert(!apple_nhi_cio_prepare(&nhi));
++		assert(!apple_pcie_cio_suspend(&pc));
++		inject(point);
++		expect_panic = true;
++		if (!setjmp(fatal)) {
++			apple_nhi_cio_suspend(&nhi);
++			assert(false);
++		}
++		cases++;
++	}
++	for (int point = 19; point <= 25; point++) {
++		if (point == 20 || point == 21 || point == 23)
++			continue;
++		setup();
++		assert(!apple_nhi_cio_prepare(&nhi));
++		assert(!apple_pcie_cio_suspend(&pc));
++		inject(point);
++		assert(apple_nhi_cio_suspend(&nhi) < 0);
++		assert(!apple_pcie_cio_resume(&pc));
++		apple_nhi_cio_complete(&nhi);
++		clean();
++		cases++;
++	}
++	/* A dock gone during the sleep: the port stays down, the DART comes back. */
++	setup();
++	assert(!apple_nhi_cio_prepare(&nhi));
++	assert(!apple_pcie_cio_suspend(&pc));
++	assert(!apple_nhi_cio_suspend(&nhi));
++	tb.lost = true;
++	assert(!apple_nhi_cio_resume(&nhi) && pc.cio_lost);
++	assert(apple_pcie_cio_resume(&pc) == -ENOTCONN);
++	assert(!darts[1].off && pc.cio_changed && !(reg[PORT_LINKSTS / 4] & PORT_LINKSTS_UP));
++	/* A later teardown still has to stop the half-restarted port. */
++	assert(port.needs_stop && !port.started);
++	pc.resume_failed = true;
++	apple_nhi_cio_complete(&nhi);
++	assert(!pc.cio_prepared && !darts[0].active && !darts[1].active && !tb.prepared);
++	cases++;
++	/* A link that does not train, or a port DART that does not come back. */
++	for (int point = 32; point <= 33; point++) {
++		setup();
++		assert(!apple_nhi_cio_prepare(&nhi));
++		assert(!apple_pcie_cio_suspend(&pc));
++		assert(!apple_nhi_cio_suspend(&nhi));
++		assert(!apple_nhi_cio_resume(&nhi));
++		inject(point);
++		assert(apple_pcie_cio_resume(&pc) < 0);
++		assert(darts[1].off == (point == 32) && port.needs_stop);
++		pc.resume_failed = true;
++		apple_nhi_cio_complete(&nhi);
++		assert(!pc.cio_prepared && !darts[0].active && !darts[1].active);
++		cases++;
++	}
++	for (int point = 30; point <= 35; point++) {
++		if (point == 32 || point == 33)
++			continue;
++		setup();
++		assert(!apple_nhi_cio_prepare(&nhi));
++		assert(!apple_pcie_cio_suspend(&pc));
++		assert(!apple_nhi_cio_suspend(&nhi));
++		inject(point);
++		expect_panic = true;
++		if (!setjmp(fatal)) {
++			apple_nhi_cio_resume(&nhi);
++			assert(false);
++		}
++		cases++;
++	}
++	printf("PASS %u native CIO ownership cases\n", cases);
++}
+diff --git a/tools/asahi/cio-native-tests.py b/tools/asahi/cio-native-tests.py
+new file mode 100644
+index 0000000000..aa683604f6
+--- /dev/null
++++ b/tools/asahi/cio-native-tests.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise actual NHI/PCIe owner callbacks with modeled suppliers and injected failures."""
++import argparse
++import hashlib
++import json
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def function(source, name):
++    match = re.search(r'^(?:static )?(?:int|void) ' + name + r'\([^;]+?\{.*?\n\}',
++                      source, re.M | re.S)
++    assert match, name
++    return match.group()
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--output', type=Path)
++    args = parser.parse_args()
++    paths = ['drivers/pci/controller/pcie-apple-cio.c',
++             'drivers/thunderbolt/apple-cio-sleep.c',
++             'drivers/pci/controller/pcie-apple.c', 'drivers/thunderbolt/apple.c']
++    sources = {p: (ROOT / p).read_text() for p in paths}
++    names = ['apple_nhi_cio_prepare', 'apple_nhi_cio_start_cpu', 'apple_nhi_cio_power_on',
++             'apple_nhi_cio_wake', 'apple_nhi_cio_domains_off', 'apple_nhi_cio_dart_off',
++             'apple_nhi_cio_suspend', 'apple_nhi_cio_resume', 'apple_nhi_cio_complete']
++    methods = '\n'.join(function(sources[paths[1]], n) for n in names)
++    defines = '\n'.join(re.findall(r'^#define\s+(?:PORT_|APPLE_CIO_M3_|APPLE_CIO_LSTX_)[^\n]+',
++                                    sources[paths[2]] + sources[paths[3]], re.M))
++    fixture = Path(__file__).with_suffix('.c').read_text()
++    fixture = fixture.replace('/* ACTUAL_PORT_DEFINES */', defines)
++    fixture = fixture.replace('/* ACTUAL_PCIE */', sources[paths[0]])
++    fixture = fixture.replace('/* ACTUAL_NHI */', methods)
++    mutations = {
++        'forget-local-perst-loss': ('pcie->cio_port_reset = true;', 'pcie->cio_port_reset = false;'),
++        'inverted-t8132-reset-ack': ('stat & PORT_TUNSTAT_PERST_ACK_PEND,',
++                                   '!(stat & PORT_TUNSTAT_PERST_ACK_PEND),'),
++        'skip-port-dart-off': ('ret = apple_dart_cio_off(pcie->cio_dart);', 'ret = 0;'),
++        'skip-nhi-dart-off': ('ret = apple_nhi_cio_dart_off(anhi);', 'ret = 0;'),
++        'skip-dart-restore': ('return apple_dart_cio_on(anhi->cio_dart);', 'return 0;'),
++        'lose-partial-domain': ('anhi->cio_pd_suspended |= BIT(n);', '(void)n;'),
++        'skip-port-unwind': ('recover = apple_pcie_cio_resume(pcie);', 'recover = 0;'),
++        'skip-nhi-unwind': ('recover = apple_nhi_cio_power_on(anhi) ?: apple_nhi_cio_wake(anhi);',
++                            'recover = 0;'),
++        'skip-unwind-power-cycle': ('if (!anhi->cio_cycled) {\n\t\trecover', 'if (false) {\n\t\trecover'),
++        'panic-on-lost-port': ('return pcie->resume_failed ? 0 : ret;', 'return ret;'),
++        'wait-for-lost-link': ('if (pcie->cio_lost)\n\t\treturn -ENOTCONN;', ''),
++        'ignore-lost-pci': ('apple_pcie_tunnel_cio_lost(anhi->cio_pcie);', '(void)0;'),
++        'skip-failed-port-stop': ('/* Until it is back, a later teardown must still stop the port. */\n\tport->needs_stop = true;', ''),
++        'ignore-physical-state': ('ret = apple_pmgr_ps_verify_state(pd, true);',
++                                  'ret = 0;'),
++    }
++    variants = {'real': fixture}
++    for name, (old, new) in mutations.items():
++        assert fixture.count(old) == 1, name
++        variants[name] = fixture.replace(old, new)
++    with tempfile.TemporaryDirectory(prefix='cio-native-') as tmp:
++        out = args.output or Path(tmp)
++        out.mkdir(parents=True, exist_ok=True)
++        results = {}
++        for name, text in variants.items():
++            unit, binary = out / (name + '.c'), out / name
++            unit.write_text(text)
++            subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
++                            '-Wno-unused-function', '-Wno-unused-parameter',
++                            '-Wno-misleading-indentation', '-g', '-fsanitize=address,undefined',
++                            str(unit), '-o', str(binary)], check=True)
++            run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
++            results[name] = {'exit': run.returncode, 'stdout': run.stdout, 'stderr': run.stderr}
++            assert (run.returncode == 0) == (name == 'real'), (name, results[name])
++            if name == 'real': print(run.stdout, end='')
++        (out / 'receipt.json').write_text(json.dumps({
++            'sha256': {p: hashlib.sha256(s.encode()).hexdigest() for p, s in sources.items()},
++            'results': results}, indent=2) + '\n')
++        print(f'PASS {len(mutations)} negative controls')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/asahi/tb-dock-pm-tests.py b/tools/asahi/tb-dock-pm-tests.py
+new file mode 100644
+index 0000000000..bcd5fc0863
+--- /dev/null
++++ b/tools/asahi/tb-dock-pm-tests.py
+@@ -0,0 +1,247 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Exercise actual dock PM callbacks with ordered client/topology lifetimes.
++
++Hardware and the control channel are modeled; this does not qualify ACIO power
++loss. Assertions detect a changed stock resume, routes a native CIO wake lost
++that are not retired at complete, repeated cleanup and skipped NHI preparation.
++"""
++import argparse
++import hashlib
++import json
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def function(source, name):
++    match = re.search(r'^static (?:int|void) ' + name + r'\([^;]*?\)\n\{', source,
++                      re.M | re.S)
++    if not match:
++        raise ValueError(name)
++    pos, depth = source.index('{', match.start()) + 1, 1
++    while depth:
++        depth += (source[pos] == '{') - (source[pos] == '}')
++        pos += 1
++    return source[match.start():pos] + '\n'
++
++
++HEADER = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++#define BIT(n) (1U << (n))
++#define READ_ONCE(x) (x)
++#define QUIRK_KEEP_TUNNELS BIT(0)
++#define QUIRK_NO_SYSTEM_SLEEP BIT(1)
++#define TB_HOST_DP_NOTIFY BIT(0)
++struct list_head { int unused; };
++#define LIST_HEAD(name) struct list_head name = {}
++#define list_empty(x) true
++#define list_for_each_entry_safe(p,n,h,m) for ((p)=NULL,(n)=NULL;(p);(p)=NULL)
++#define list_for_each_entry_safe_reverse(p,n,h,m) list_for_each_entry_safe(p,n,h,m)
++struct tb_switch;
++struct tb_port { struct tb_switch *sw; struct tb_port *remote; struct tb_switch *xdomain; };
++struct tb_switch { bool is_unplugged; struct tb_port *ports; };
++struct tb_nhi { unsigned quirks, host_dp_policy; };
++struct tb { int lock; struct tb_switch *root_switch; struct tb_nhi *nhi; };
++struct tb_cm { bool hotplug_active, resume_cleanup_pending, dp_tunnel_pending;
++ struct list_head tunnel_list; };
++struct tb_tunnel { int unused; };
++struct device { void *data; };
++struct apple_cio { bool resume_had_peer, pcie_resume_expected, pcie_tunnel_requested,
++ pcie_pm_prepared; int pcie_tunnel_lock; };
++struct apple_nhi { struct tb *tb; struct apple_cio *acio; };
++static struct tb_cm cm;
++static struct tb tb;
++static struct tb_nhi nhi;
++static struct tb_switch root, child;
++static struct tb_port root_port, child_port;
++static struct apple_cio acio;
++static struct apple_nhi anhi;
++static struct device dev;
++static bool resume_recovery, client_awake, tunnel_alive, child_alive, lost;
++static unsigned stage, cleanup_calls, scans, queues, pauses, unregistered, probes;
++static unsigned locks, tb_locks, pc_locks, discovery, activations;
++static void lock(int *p)
++{
++ assert(!*p); *p=1; locks++;
++ if (p == &tb.lock) tb_locks++; else { assert(p == &acio.pcie_tunnel_lock); pc_locks++; }
++}
++static void unlock(int *p) { assert(*p); *p=0; assert(locks); locks--; }
++static int *guard_mutex_lock(int *p) { lock(p); return p; }
++static void guard_mutex_unlock(int **p) { if (*p) unlock(*p); }
++#define CAT_(a,b) a##b
++#define CAT(a,b) CAT_(a,b)
++#define guard(type) int *CAT(guard_,__COUNTER__) __attribute__((unused,cleanup(guard_##type##_unlock)))=guard_##type##_lock
++#define scoped_guard(type,x) \
++ for(int *scope __attribute__((cleanup(guard_##type##_unlock)))=guard_##type##_lock(x), *done=NULL; !done; done=scope)
++#define tb_switch_for_each_port(s,p) for ((p)=(s)->ports;(p);(p)=NULL)
++#define tb_dbg(...) ((void)0)
++static void *dev_get_drvdata(struct device *d) { return d->data; }
++static bool tb_port_is_null(struct tb_port *p) { return p != NULL; }
++static void apple_dpin_pause_retries(struct apple_cio *a)
++{ assert(a==&acio && !locks); pauses++; }
++static int apple_nhi_cio_prepare(struct apple_nhi *a) { return 0; }
++static void apple_dpin_resume_retries(struct apple_cio *a) { assert(!locks); }
++static struct tb_cm *tb_priv(struct tb *t) { assert(t==&tb); return &cm; }
++static bool tb_switch_is_usb4(struct tb_switch *s) { return true; }
++static void tb_switch_reset(struct tb_switch *s) { assert(false); }
++static int tb_switch_resume(struct tb_switch *s, bool runtime)
++{ assert(tb.lock && s==&root && !runtime); child.is_unplugged=lost; probes++; return 0; }
++static void tb_free_invalid_tunnels(struct tb *t)
++{
++ assert(tb.lock && client_awake && stage==0);
++ if (lost) { assert(tunnel_alive && child_alive); tunnel_alive=false; }
++ stage=1; cleanup_calls++;
++}
++static void tb_free_unplugged_children(struct tb_switch *s)
++{
++ assert(tb.lock && client_awake && stage==1);
++ if(lost) { assert(!tunnel_alive && child_alive); child_alive=false; }
++ stage=2;
++}
++static void tb_free_unplugged_xdomains(struct tb_switch *s)
++{ assert(tb.lock && stage==2); stage=3; }
++static void tb_restore_children(struct tb_switch *s) { assert(tb.lock); }
++static void tb_switch_discover_tunnels(struct tb_switch *s, struct list_head *l, bool alloc)
++{ assert(tb.lock); discovery++; }
++static bool tb_tunnel_is_usb3(struct tb_tunnel *t) { return false; }
++static void tb_tunnel_deactivate(struct tb_tunnel *t) { assert(client_awake); }
++static void tb_tunnel_put(struct tb_tunnel *t) { assert(false); }
++static int tb_tunnel_activate(struct tb_tunnel *t) { activations++; return 0; }
++static void msleep(unsigned ms) {}
++static void tb_switch_enter_redrive(struct tb_switch *s) { assert(tb.lock); }
++static void tb_queue_dp_tunnels(struct tb *t) { assert(tb.lock && cm.hotplug_active); queues++; }
++static bool tb_domain_unregister_unplugged_xdomains(struct tb *t)
++{ assert(!locks); unregistered++; return false; }
++static void tb_scan_switch(struct tb_switch *s)
++{ assert(tb.lock && client_awake && cm.hotplug_active && stage==3); scans++; }
++static void tb_restore_dp_resources(struct tb_switch *s) { assert(tb.lock && client_awake); }
++static void tb_tunnel_dp(struct tb *t) { assert(tb.lock && client_awake); }
++static void tb_dp_relink_replay(struct tb *t) { assert(tb.lock && client_awake); }
++'''
++
++FOOTER = r'''
++static void setup(void)
++{
++ memset(&cm,0,sizeof(cm)); memset(&acio,0,sizeof(acio));
++ tb=(struct tb){.root_switch=&root,.nhi=&nhi};
++ root=(struct tb_switch){.ports=&root_port}; child=(struct tb_switch){};
++ root_port=(struct tb_port){.sw=&root,.remote=&child_port};
++ child_port=(struct tb_port){.sw=&child};
++ anhi=(struct apple_nhi){.tb=&tb,.acio=&acio}; dev.data=&anhi;
++ nhi=(struct tb_nhi){};
++ client_awake=true; tunnel_alive=child_alive=true; lost=false;
++ stage=cleanup_calls=scans=queues=pauses=unregistered=probes=0;
++ locks=tb_locks=pc_locks=discovery=activations=0;
++}
++static void resume(void) { lock(&tb.lock); assert(!tb_resume_noirq(&tb)); unlock(&tb.lock); }
++int main(void)
++{
++ unsigned cases=0;
++ for (unsigned optional=0;optional<2;optional++) {
++  for (unsigned requested=0;requested<2;requested++) {
++   setup(); resume_recovery=optional; acio.pcie_tunnel_requested=requested;
++   assert(!apple_nhi_prepare(&dev));
++   assert(pauses==1 && acio.pcie_pm_prepared && !locks);
++   assert(acio.pcie_resume_expected==!!requested && acio.resume_had_peer==!!optional);
++   assert(tb_locks==optional && pc_locks==1); cases++;
++  }
++ }
++ setup(); resume_recovery=false; acio.pcie_resume_expected=true;
++ assert(!apple_nhi_prepare(&dev) && acio.pcie_resume_expected); cases++;
++ /* The stock resume is unchanged: it retires lost routes at once. */
++ for (unsigned quirks=0;quirks<4;quirks++) {
++  setup(); lost=quirks&1;
++  nhi.quirks=quirks&2 ? QUIRK_KEEP_TUNNELS|QUIRK_NO_SYSTEM_SLEEP : 0;
++  nhi.host_dp_policy=TB_HOST_DP_NOTIFY; cm.dp_tunnel_pending=true;
++  resume(); assert(cleanup_calls==1 && stage==3 && cm.hotplug_active && queues==1);
++  assert(tunnel_alive==!lost && child_alive==!lost && !cm.resume_cleanup_pending);
++  tb_complete(&tb); assert(cleanup_calls==1 && !scans && !locks); cases++;
++ }
++ /* A native CIO wake leaves lost routes to complete, after their clients resume. */
++ for (unsigned gone=0;gone<2;gone++) {
++  setup(); lost=gone; child.is_unplugged=gone;
++  cm.resume_cleanup_pending=true; cm.hotplug_active=true;
++  tb_complete(&tb);
++  assert(cleanup_calls==1 && scans==1 && stage==3 && !locks);
++  assert(tunnel_alive==!gone && child_alive==!gone);
++  assert(!cm.resume_cleanup_pending && cm.hotplug_active);
++  /* A second complete must not retire anything twice. */
++  tb_complete(&tb); assert(cleanup_calls==1 && scans==1 && !locks); cases++;
++ }
++ setup(); cm.hotplug_active=true;
++ assert(!apple_nhi_prepare(&dev)); tb_complete(&tb);
++ assert(!cleanup_calls && !scans && !locks); cases++;
++ setup();
++ for(unsigned cycle=0;cycle<3;cycle++) {
++  stage=0; cm.resume_cleanup_pending=true; cm.hotplug_active=true;
++  tb_complete(&tb);
++  assert(cleanup_calls==cycle+1 && scans==cycle+1 && !locks);
++  assert(tunnel_alive && child_alive && !cm.resume_cleanup_pending); cases++;
++ }
++ printf("PASS %u dock PM lifetime cases\n",cases);
++}
++'''
++
++MUTATIONS = {
++    'prepare-optional-again': ('acio->resume_had_peer = false;',
++                             'acio->resume_had_peer = false;\n if (!resume_recovery) return 0;'),
++    'skip-pause': ('apple_dpin_pause_retries(acio);', '(void)apple_dpin_pause_retries;'),
++    'skip-pcie-prepare': ('acio->pcie_pm_prepared = true;', 'acio->pcie_pm_prepared = false;'),
++    'lose-prior-pcie-expectation': ('acio->pcie_resume_expected |=', 'acio->pcie_resume_expected ='),
++    'stock-resume-defers': ('tb_resume_cleanup(tb);\n\ttb_restore_children(tb->root_switch);',
++                            'tcm->resume_cleanup_pending = true;\n\ttb_restore_children(tb->root_switch);'),
++    'repeat-cleanup': ('tcm->resume_cleanup_pending = false;', '/* leave pending */'),
++    'skip-rescan': ('rescan = true;', 'rescan = false;'),
++}
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--output', type=Path)
++    args = parser.parse_args()
++    sources = {p: (ROOT / p).read_text() for p in
++               ['drivers/thunderbolt/tb.c', 'drivers/thunderbolt/apple.c']}
++    bodies = {name: function(sources[path], name) for path, names in {
++        'drivers/thunderbolt/tb.c': ['tb_resume_cleanup', 'tb_resume_noirq', 'tb_complete'],
++        'drivers/thunderbolt/apple.c': ['apple_nhi_prepare'],
++    }.items() for name in names}
++    production = '\n'.join(bodies.values())
++    variants = {'real': production}
++    for name, (old, new) in MUTATIONS.items():
++        assert production.count(old) == 1, name
++        variants[name] = production.replace(old, new)
++    with tempfile.TemporaryDirectory(prefix='tb-dock-pm-') as tmp:
++        out = args.output or Path(tmp)
++        out.mkdir(parents=True, exist_ok=True)
++        results = {}
++        for name, source in variants.items():
++            unit, binary = out / (name + '.c'), out / name
++            unit.write_text(HEADER + source + FOOTER)
++            subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
++                            '-Wno-unused-parameter', '-Wno-unused-but-set-variable',
++                            '-g', '-fsanitize=address,undefined', str(unit), '-o', str(binary)],
++                           check=True)
++            run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
++            results[name] = {'exit': run.returncode, 'stdout': run.stdout, 'stderr': run.stderr}
++            if name == 'real':
++                assert run.returncode == 0, results[name]
++                print(run.stdout, end='')
++            else:
++                assert run.returncode != 0 and 'Assertion' in run.stderr, results[name]
++        (out / 'receipt.json').write_text(json.dumps({
++            'scope': __doc__, 'bodies_sha256': {
++                n: hashlib.sha256(s.encode()).hexdigest() for n, s in bodies.items()},
++            'results': results}, indent=2) + '\n')
++        print(f'PASS {len(MUTATIONS)} negative controls')
++
++
++if __name__ == '__main__':
++    main()
+-- 
+2.43.0
+

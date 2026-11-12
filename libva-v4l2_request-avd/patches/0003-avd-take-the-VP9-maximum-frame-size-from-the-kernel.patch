@@ -1,0 +1,79 @@
+From 866f83e4a1b9331cef81ba3bffa366b8696d80f4 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 20:10:33 +0000
+Subject: [PATCH] avd: take the VP9 maximum frame size from the kernel
+
+query_dimensions() capped VP9 on the Apple AVD at 4096x4096 on top of
+whatever the kernel enumerated, because the kernel's VP9 format was
+limited to 4096 at the time. The decoder handles more: kernels that
+decode VP9 at 8K enumerate 8192x8192, and libva then refused 7680x4320
+streams that the kernel takes, so FFmpeg fell back to software.
+
+Use the enumerated maximum for VP9 as for every other codec. Keep the
+64-pixel floor, and keep 4096 only as the bound for a kernel that cannot
+enumerate frame sizes.
+---
+ src/context.c      | 10 +++++++---
+ tests/dimensions.c | 10 +++++++---
+ 2 files changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/src/context.c b/src/context.c
+index ad60ea4..2a9b305 100644
+--- a/src/context.c
++++ b/src/context.c
+@@ -110,12 +110,14 @@ static bool query_dimensions(int fd, uint32_t pixelformat, bool is_avd,
+ 	};
+ 	/* asahi-7.1.13-3 / 94fb23346d522edf53722357c426a3e58030beea:
+ 	 * avd_enum_framesizes advertises 1 while avd-vp9.c rejects coded
+-	 * dimensions below 64. The format descriptor caps VP9 at 4096.
+-	 * This is a kernel contract, NOT evidence of a firmware minimum.
++	 * dimensions below 64. That floor is a kernel contract, NOT evidence of a
++	 * firmware minimum. The maximum is the one the kernel enumerates (8192
++	 * on kernels that decode VP9 at 8K); V4L2R_AVD_VP9_MAX_DIMENSION is only
++	 * the fallback for a kernel that cannot enumerate frame sizes.
+ 	 * Allocation steps (64 x 16) are not coded-size steps: 66x66 is valid. */
+ 	bool avd_vp9 = is_avd && pixelformat == v4l2_fourcc('V', 'P', '9', 'F');
+ 	uint32_t floor = avd_vp9 ? V4L2R_AVD_VP9_MIN_DIMENSION : 1;
+-	uint32_t ceiling = avd_vp9 ? V4L2R_AVD_VP9_MAX_DIMENSION : 65536;
++	uint32_t ceiling = 65536;
+ 	*bounds = (struct v4l2r_dimensions){0};
+ 	for (;;) {
+ 		int ret = ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize);
+@@ -123,6 +125,8 @@ static bool query_dimensions(int fd, uint32_t pixelformat, bool is_avd,
+ 			/* Preserve ENOTTY compatibility; EINVAL at index zero is
+ 			 * an empty/unsupported format, not a license to guess. */
+ 			if (!frmsize.index && errno == ENOTTY) {
++				if (avd_vp9)
++					ceiling = V4L2R_AVD_VP9_MAX_DIMENSION;
+ 				*bounds = (struct v4l2r_dimensions){floor, floor, ceiling, ceiling};
+ 				return !width || (width >= floor && width <= ceiling &&
+ 						 height >= floor && height <= ceiling);
+diff --git a/tests/dimensions.c b/tests/dimensions.c
+index 00416bb..6479bed 100644
+--- a/tests/dimensions.c
++++ b/tests/dimensions.c
+@@ -164,14 +164,18 @@ int main(int argc, char **argv)
+     const char *test = argv[1];
+     if (!strcmp(test, "avd") || !strcmp(test, "avd-missing")) {
+         avd = true;
+-        range(1, 65536, 1); /* Deliberately lying minimum and maximum. */
++        range(1, 8192, 1); /* A lying minimum; the 8K maximum is trusted. */
+         sizes[0].type = V4L2_FRMSIZE_TYPE_CONTINUOUS;
+         if (!strcmp(test, "avd-missing")) enum_error = ENOTTY;
+-        attributes(64, 4096);
++        unsigned int max = enum_error ? 4096 : 8192; /* 4096: no enumeration */
++        attributes(64, max);
+         create(8, 8, false); create(63, 64, false); create(64, 63, false);
+         create(64, 64, true); create(66, 66, true);
+         create(4096, 4096, true);
+-        create(4097, 64, false); create(64, 4097, false);
++        create(max + 1, 64, false); create(64, max + 1, false);
++        if (!enum_error) {
++            create(7680, 4320, true); create(8192, 8192, true);
++        }
+         if (!enum_error) {
+             range(64, 2048, 1); /* Preserve a narrower advertised contract. */
+             attributes(64, 2048);
+-- 
+2.43.0
+

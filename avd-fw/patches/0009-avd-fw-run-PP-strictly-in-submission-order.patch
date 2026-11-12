@@ -1,0 +1,76 @@
+From 7f2f41369d14e0deccbac9b7d2b7c9070e48e66d Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Sun, 1 Nov 2026 00:40:23 +1100
+Subject: [PATCH 09/15] avd-fw: run PP strictly in submission order
+
+The scheduler kicked PP for the first frame whose VP had finished. With
+frames spread over several VPs a later frame can finish its VP first,
+and its PP may read the pictures before it, so start PP only for the
+oldest unfinished frame. With one VP per codec nothing changes.
+[dylan: one co-author trailer of the original message is not reproduced here]
+
+---
+ src/queue.c        | 12 +++++++++---
+ tests/queue-test.c | 12 +++++++-----
+ 2 files changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/src/queue.c b/src/queue.c
+index 0f91db3..53755fa 100644
+--- a/src/queue.c
++++ b/src/queue.c
+@@ -118,15 +118,21 @@ void avdq_step(struct avdq *q, const struct avdq_ops *ops, void *cookie)
+ 	}
+ 	if (q->halted)
+ 		return;
+-	for (i = 0; i < q->count; i++) {
++	/*
++	 * PP runs strictly in submission order: a picture's PP may read the
++	 * pictures before it, and with several VPs a later VP can finish first.
++	 */
++	for (i = 0; q->pp_active < 0 && i < q->count; i++) {
+ 		unsigned int idx = q->order[(q->head + i) & 15u];
+ 		struct avdq_frame *f = &q->frame[idx];
+-		if (f->phase == AVDQ_PP_READY && q->pp_active < 0) {
++		if (f->phase == AVDQ_DONE)
++			continue;
++		if (f->phase == AVDQ_PP_READY) {
+ 			q->pp_active = (int)idx;
+ 			f->phase = AVDQ_PP;
+ 			ops->kick(cookie, &f->desc);
+-			break;
+ 		}
++		break;
+ 	}
+ 	/* One SRAM staging buffer; preserve program order across chunks. */
+ 	for (i = 0; i < q->count; i++) {
+diff --git a/tests/queue-test.c b/tests/queue-test.c
+index 32d8816..f3bc848 100644
+--- a/tests/queue-test.c
++++ b/tests/queue-test.c
+@@ -138,16 +138,18 @@ static void pipeline(void)
+ 	step(&q, &io); step(&q, &io); step(&q, &io);
+ 	assert(q.frame[0].phase == AVDQ_VP && q.frame[1].phase == AVDQ_VP);
+ 	assert(io.feeds == 3 && !io.kicks && !io.completions);
+-	/* Different VP can finish first; PP runs once at a time. */
++	/* A later VP can finish first; PP still runs in submission order. */
+ 	avdq_vp_done(&q, 1); step(&q, &io);
+-	assert(io.kicks == 1 && io.words[0] == c.pp_kick);
++	assert(!io.kicks && q.frame[2].phase == AVDQ_PP_READY);
+ 	avdq_vp_done(&q, 0); avdq_vp_done(&q, 0); step(&q, &io);
+-	assert(io.kicks == 1 && q.frame[1].phase == AVDQ_PP_READY);
++	assert(io.kicks == 1 && io.words[0] == a.pp_kick);
++	assert(q.frame[1].phase == AVDQ_PP_READY);
+ 	avdq_pp_done(&q); step(&q, &io);
+-	assert(io.kicks == 2 && io.words[1] == a.pp_kick && !io.completions);
++	assert(io.kicks == 2 && io.words[1] == b.pp_kick && io.completions == 1);
+ 	avdq_pp_done(&q);
+ 	io.blocked = 1; step(&q, &io);
+-	assert(q.count == 3 && !io.completions && io.kicks == 3);
++	assert(q.count == 2 && io.completions == 1 && io.kicks == 3);
++	assert(io.words[2] == c.pp_kick);
+ 	io.blocked = 0; step(&q, &io);
+ 	avdq_pp_done(&q); step(&q, &io); step(&q, &io);
+ 	assert(!q.count && io.completions == 3);
+-- 
+2.43.0
+

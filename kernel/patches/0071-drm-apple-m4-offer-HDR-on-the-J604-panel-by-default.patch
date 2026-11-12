@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 11:44:45 +0000
+Subject: [PATCH] drm/apple: m4: offer HDR on the J604 panel by default
+
+The J604's Liquid Retina XDR panel showed BT.2020 PQ content as EDR only
+with appledrm.panel_edr set at boot (default off). Ship it on, as the
+port rule asks and as Aurora does for the desktop 26.x panels
+(dcp_panel_edr_supported(): no parameter there), with a run-time path
+back:
+
+- The machine profile carries the default: J604 on, J713 and J715 off.
+  A value given on the command line wins over the profile.
+- The offer is decided once, at the panel EDID's first publication
+  (Colorspace and HDR_OUTPUT_METADATA are attached at connector creation
+  from the same value; the EDID gains its HDR block).
+- The parameter is now writable at run time: written off, frames are
+  shown without EDR from the next commit (EDR ends in one swap), while
+  PQ commits stay valid so a compositor in HDR mode is not refused.
+- Nothing changes on screen until a compositor sends PQ: Omarchy keeps
+  its outputs SDR (render.cm_auto_hdr = 0, no cm = "hdr"), so the
+  desktop is as before.
+
+The EDR words are the desktop 26.x dcp_swap's; the 26.6.2 laptop firmware
+honouring them is still TO-VERIFY: the 1.612 plan runs the A/B before
+this stays on.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+(cherry picked from commit 74a65c3592616c7181cfa6916808c24c99cc5d55)
+(cherry picked from commit 09ed061ad28c6a76a328d328eb6dd6d553c27b99)
+---
+ drivers/gpu/drm/apple/dcp-m4-profile.h |  7 ++++++
+ drivers/gpu/drm/apple/iomfb_m4.c       | 34 ++++++++++++++++++++++----
+ 2 files changed, 36 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-m4-profile.h b/drivers/gpu/drm/apple/dcp-m4-profile.h
+index 8a3127c8b2..fd9bec2028 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-profile.h
++++ b/drivers/gpu/drm/apple/dcp-m4-profile.h
+@@ -35,6 +35,11 @@ struct dcp_m4_profile {
+ 	 * 0 for none (appledrm.panel_vrr_min_hz given at boot overrides it).
+ 	 */
+ 	u16 vrr_min_hz;
++	/*
++	 * HDR offered on the panel by default, shown as EDR up to the ADT peak
++	 * (appledrm.panel_edr given at boot overrides it).
++	 */
++	bool edr;
+ 	/*
+ 	 * The qualified preferred timing (ID 2), horizontal then vertical:
+ 	 * Active, Total, FrontPorch, SyncWidth, BackPorch, PreciseSyncRate,
+@@ -125,6 +130,8 @@ static const struct dcp_m4_profile dcp_m4_profile_j604 = {
+ 	 * technical specifications). J713 and J715 keep VRR off.
+ 	 */
+ 	.vrr_min_hz = 48,
++	/* Liquid Retina XDR: 1600 nits peak (ADT LmaxProduct), SDR 600. */
++	.edr = true,
+ 	.timing = dcp_m4_timing_j604, .timing_elements = 6,
+ 	.alloc_page_align = true,
+ };
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 08d4643ac2..d2436cf4f7 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -163,9 +163,27 @@ MODULE_PARM_DESC(swap_timestamps,
+ 		 "J604: stamp presents with the swap timing words so the 120 Hz panel shows them at 120 Hz, not 60 Hz (default: on; applies from the next swap; J713: no effect)");
+ 
+ static bool panel_edr;
+-module_param(panel_edr, bool, 0444);
++/* Given on the command line or written: the machine default stays out. */
++static bool panel_edr_given;
++
++static int panel_edr_set(const char *val, const struct kernel_param *kp)
++{
++	int ret = param_set_bool(val, kp);
++
++	if (!ret)
++		WRITE_ONCE(panel_edr_given, true);
++	return ret;
++}
++
++static const struct kernel_param_ops panel_edr_ops = {
++	.flags = KERNEL_PARAM_OPS_FL_NOARG,
++	.set = panel_edr_set,
++	.get = param_get_bool,
++};
++
++module_param_cb(panel_edr, &panel_edr_ops, &panel_edr, 0644);
+ MODULE_PARM_DESC(panel_edr,
+-		 "J604: offer HDR to the compositor and show BT.2020 PQ content as EDR on the internal panel, up to its ADT peak (testing; default: off; boot time)");
++		 "J604: offer HDR to the compositor and show BT.2020 PQ content as EDR on the internal panel, up to its ADT peak (default: the machine's, J604 on, J713/J715 off). Set at boot it offers HDR (Colorspace, HDR_OUTPUT_METADATA, the EDID HDR block); written off later, frames are shown without EDR from the next commit");
+ 
+ static unsigned int panel_vrr_min_hz;
+ /* Given on the command line or written: the machine default stays out. */
+@@ -272,6 +290,7 @@ struct iomfb_m4 {
+ 	 */
+ 	u32 panel_peak, edr_ceiling;
+ 	bool edr_capable, output_edr;
++	bool edr_latched; /* the offer is decided once, at the first publication */
+ 	struct dcp_m4_edr_state edr;
+ 	u64 edr_swaps;
+ 	/*
+@@ -2839,6 +2858,8 @@ static void iomfb_m4_machine_defaults(const struct dcp_m4_profile *pf)
+ {
+ 	if (!READ_ONCE(panel_vrr_min_hz_given))
+ 		WRITE_ONCE(panel_vrr_min_hz, pf->vrr_min_hz);
++	if (!READ_ONCE(panel_edr_given))
++		WRITE_ONCE(panel_edr, pf->edr);
+ }
+ 
+ int iomfb_m4_init(struct apple_dcp *owner)
+@@ -3223,16 +3244,17 @@ int iomfb_m4_panel_edid(struct apple_dcp *owner, struct drm_connector *connector
+ 	 * maximum: then the EDID says HDR (BT.2020, PQ, the peak) and the
+ 	 * connector takes HDR_OUTPUT_METADATA (iomfb_m4_atomic_hdr()).
+ 	 */
+-	if (READ_ONCE(panel_edr) && !dcp->edr_capable) {
++	if (!dcp->edr_latched && READ_ONCE(panel_edr)) {
+ 		bool capable = dcp->panel_peak > dcp_m4_pf->brightness_max &&
+ 			       dcp->panel_peak <= DCP_M4_EDR_MAX_NITS;
+ 
+-		dev_info(dcp->dev, "panel EDR %s: peak %u nits, SDR maximum %u, headroom up to %u.%03u (panel_edr, testing)\n",
++		dev_info(dcp->dev, "panel EDR %s: peak %u nits, SDR maximum %u, headroom up to %u.%03u (panel_edr)\n",
+ 			 capable ? "offered" : "not offered", dcp->panel_peak,
+ 			 dcp_m4_pf->brightness_max, dcp->edr_ceiling / 1000,
+ 			 dcp->edr_ceiling % 1000);
+ 		WRITE_ONCE(dcp->edr_capable, capable);
+ 	}
++	dcp->edr_latched = true;
+ 	ret = iomfb_m4_get_mode(owner, &mode);
+ 	if (ret)
+ 		return ret;
+@@ -3416,8 +3438,10 @@ void iomfb_m4_atomic_hdr(struct apple_dcp *owner, struct drm_crtc *crtc,
+ 	if (!dcp || !READ_ONCE(dcp->edr_capable))
+ 		return;
+ 	conn_state = iomfb_m4_connector_state(owner, crtc, commit);
++	/* panel_edr written off at run time: PQ commits stay valid, shown without EDR. */
+ 	edr = iomfb_m4_eotf(conn_state) == HDMI_EOTF_SMPTE_ST2084 &&
+-	      conn_state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB;
++	      conn_state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB &&
++	      READ_ONCE(panel_edr);
+ 	mutex_lock(&dcp->lock);
+ 	if (edr != dcp->output_edr)
+ 		dev_info(dcp->dev, "panel EDR %s\n", edr ? "on: BT.2020 PQ" : "off");
+-- 
+2.43.0
+

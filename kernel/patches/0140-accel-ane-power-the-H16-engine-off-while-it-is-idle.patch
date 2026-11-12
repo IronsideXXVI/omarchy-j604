@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 00:35:46 +0000
+Subject: [PATCH] accel/ane: power the H16 engine off while it is idle
+
+Once the H16 firmware has run, the engine stays powered until reboot:
+the five ANE power domains and the three ANE DARTs are held even when
+no program is loaded.
+
+Platforms that sleep cold already have the path to give that power back
+and get it again: system sleep powers the engine off under its firmware
+and boots it again from the verified preload, which takes 13 ms on the
+J604 and leaves programs bit-exact afterwards.
+
+Use the same path while idle. After h16_idle_off_ms (default 1000) with
+no program loaded and no request in flight, the session is parked and
+the engine powered off. The next LOAD or EXECUTE powers it up again
+from ane_h16_session_enter() through a new optional session op, wake,
+before it waits for the session. System sleep leaves a parked engine
+off. h16_idle_off_ms=0 keeps the engine powered, as before.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit a11aa51bb4eb94442c6ef6093c54ddf306a2cc29)
+---
+ drivers/accel/ane/ane_h16_backend.c | 101 +++++++++++++++++++++++++++-
+ 1 file changed, 100 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/accel/ane/ane_h16_backend.c b/drivers/accel/ane/ane_h16_backend.c
+index cb4e9d7653..49f010be4d 100644
+--- a/drivers/accel/ane/ane_h16_backend.c
++++ b/drivers/accel/ane/ane_h16_backend.c
+@@ -104,6 +104,9 @@ struct ane_h16_device {
+ 	bool program_ready;
+ 	/* Firmware suspended and the engine power gated for system sleep. */
+ 	bool slept;
++	/* Powered off while idle (slept too); the next request boots it cold. */
++	bool parked;
++	struct delayed_work idle;
+ 	/* genpd's transitions of each of the five domains across a sleep. */
+ 	struct ane_h16_genpd {
+ 		struct notifier_block nb;
+@@ -219,6 +222,7 @@ static void ane_h16_quarantine(void *ctx, int error)
+ #define ANE_H16_WARM_BOOT 1
+ 
+ static void ane_h16_busy(void *ctx, bool busy);
++static void ane_h16_idle_arm(struct ane_h16_device *h);
+ static void ane_h16_sleep_trace(struct ane_h16_device *h, const char *when);
+ 
+ /*
+@@ -632,6 +636,9 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
+ 	int ret;
+ 
+ 	guard(mutex)(&ane_h16_lock);
++	/* Already powered off while idle: nothing to suspend. */
++	if (h->parked)
++		return 0;
+ 	for (unsigned int i = 0; i < ARRAY_SIZE(h->genpd); i++) {
+ 		h->genpd[i].offs = 0;
+ 		h->genpd[i].ons = 0;
+@@ -695,7 +702,8 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
+ 	int ret;
+ 
+ 	guard(mutex)(&ane_h16_lock);
+-	if (!h->slept)
++	/* Powered off while idle: it stays off until a request. */
++	if (!h->slept || h->parked)
+ 		return;
+ 	start = ktime_get_ns();
+ 	h->resume_ready_ns = 0;
+@@ -743,6 +751,93 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
+ 		 h->resume_restarts);
+ }
+ 
++/*
++ * Idle power-off. With no program loaded and nothing in flight for
++ * h16_idle_off_ms, the engine is powered off as for a cold system sleep
++ * (five domains and the three DARTs released) and the session parked; the
++ * next LOAD or EXECUTE boots it cold from the preload again. 0 keeps the
++ * engine powered from bring-up until reboot.
++ */
++static unsigned int h16_idle_off_ms = 1000;
++module_param(h16_idle_off_ms, uint, 0644);
++MODULE_PARM_DESC(h16_idle_off_ms,
++		 "Power the H16 ANE off after this many idle ms with no program loaded (0: keep it powered; default: 1000)");
++
++static void ane_h16_idle_arm(struct ane_h16_device *h)
++{
++	unsigned int ms = READ_ONCE(h16_idle_off_ms);
++
++	if (ms && h->program_ready && h->boot.soc->sleep_cold && !h->boot.soc->sleep_warm)
++		mod_delayed_work(system_wq, &h->idle, msecs_to_jiffies(ms));
++}
++
++static void ane_h16_idle_work(struct work_struct *work)
++{
++	struct ane_h16_device *h = container_of(to_delayed_work(work), struct ane_h16_device, idle);
++	struct ane_h16_session *s = &h->session;
++	bool loaded;
++
++	guard(mutex)(&ane_h16_lock);
++	if (!READ_ONCE(h16_idle_off_ms) || !h->program_ready || h->slept || h->parked ||
++	    h->boot.quarantined || s->quarantined)
++		return;
++	/* A program is loaded or a request runs: look again later. */
++	if (!list_empty(&s->programs) || READ_ONCE(s->active)) {
++		ane_h16_idle_arm(h);
++		return;
++	}
++	/* Closed to new requests and drained, then checked again. */
++	ane_h16_session_sleep(s, true);
++	mutex_lock(s->lock);
++	loaded = !list_empty(&s->programs) || s->active;
++	mutex_unlock(s->lock);
++	for (unsigned int ch = 0; !loaded && ch < ANE_FW_CHANNELS; ch++)
++		loaded = h->boot.transport.pending[ch].active;
++	if (loaded) {
++		ane_h16_session_sleep(s, false);
++		ane_h16_idle_arm(h);
++		return;
++	}
++	ane_h16_power_down(h);
++	WRITE_ONCE(h->slept, true);
++	h->parked = true;
++	WRITE_ONCE(s->parked, true);
++	dev_dbg(h->dev, "H16 ANE: powered off while idle\n");
++}
++
++/* ops->wake: the cold boot of a system resume, for one request. */
++static int ane_h16_wake(void *ctx)
++{
++	struct ane_h16_device *h = ctx;
++	u64 start;
++	int ret;
++
++	guard(mutex)(&ane_h16_lock);
++	if (!h->parked)
++		return 0;
++	start = ktime_get_ns();
++	h->parked = false;
++	WRITE_ONCE(h->session.parked, false);
++	h->resume_ready_ns = 0;
++	h->resume_first_ns = 0;
++	h->resume_replayed = 0;
++	h->resume_cold = true;
++	h->resume_restarts = 0;
++	ret = ane_h16_cold_boot(h);
++	WRITE_ONCE(h->slept, false);
++	if (ret) {
++		ane_h16_quarantine(h, ret);
++		h->boot.quarantined = true;
++		h->session.quarantined = true;
++	}
++	ane_h16_session_sleep(&h->session, false);
++	dev_info(h->dev, "H16 ANE: powered up for a request %s in %llu ms\n",
++		 ret ? "FAILED" : "ok", div_u64(ktime_get_ns() - start, NSEC_PER_MSEC));
++	if (!ret)
++		ane_h16_idle_arm(h);
++	return ret;
++}
++
+ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void *unused)
+ {
+ 	struct ane_h16_device *h = container_of(nb, struct ane_h16_device, pm_notifier);
+@@ -1577,6 +1672,9 @@ static void ane_h16_busy(void *ctx, bool busy)
+ 	struct ane_h16_device *h = ctx;
+ 
+ 	apple_clpc_ane_set_active(h->clpc, busy);
++	/* Idle from the end of the last request on. */
++	if (!busy)
++		ane_h16_idle_arm(h);
+ 	if (!h->perf)
+ 		return;
+ 	if (busy) {
+@@ -1880,6 +1978,7 @@ static int ane_h16_program_stage(struct ane_h16_device *h)
+ 	}
+ 	h->program_ready = true;
+ 	ane_h16_irq_wait_set(h, true);
++	ane_h16_idle_arm(h);
+ 	dev_info(h->dev, "H16 stage 5 program window %llx..%llx%s\n", h->program_next,
+ 		 h->program_end - 1, h->clpc ? ", CLPC input attached" : "");
+ 	return 0;
+-- 
+2.43.0
+
