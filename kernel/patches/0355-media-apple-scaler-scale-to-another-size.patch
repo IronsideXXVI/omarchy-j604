@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 05:37:10 +0000
+Subject: [PATCH] media: apple: scaler: scale to another size
+
+The scaler's mem2mem device only converted at 1:1. The engine also
+resamples, with a 9-tap vertical and a 15-tap horizontal polyphase
+filter of 32 phases each in Q4.12, and a Q22 source-to-destination ratio
+per direction; the register layout, the phase convention (phase p
+samples at p/32 for p < 16 and (p - 32)/32 otherwise, around the middle
+tap) and the coefficient packing are as m1n1's scaler experiment
+records them, and the 1:1 setup this driver already writes uses the same
+ratio words with a unit value.
+
+Let the CAPTURE size differ from the OUTPUT size, from a quarter to
+eight times in each direction, and program the scaler for such jobs:
+enable each direction whose size changes, put its ratio in every ratio
+word, start at phase zero, and load Catmull-Rom filters computed for
+the ratio (widened by the reduction when scaling down, so they also
+filter), normalised to 1.0 per phase. Same-size jobs are unchanged.
+
+apple_scaler.scaling=0 restores the 1:1-only behaviour.
+
+On this base the job builder already carries the scaling setup (with
+the horizontal reciprocal words), so only the driver side applies:
+the module parameter, the job flag and the CAPTURE size check.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ .../platform/apple/scaler/apple-scaler-drv.c  | 33 ++++++++++++++-----
+ 1 file changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/media/platform/apple/scaler/apple-scaler-drv.c b/drivers/media/platform/apple/scaler/apple-scaler-drv.c
+index d9707d2aec..f9f784612a 100644
+--- a/drivers/media/platform/apple/scaler/apple-scaler-drv.c
++++ b/drivers/media/platform/apple/scaler/apple-scaler-drv.c
+@@ -108,6 +108,10 @@ static void asc_write(struct apple_scaler *asc, u32 reg, u32 val)
+ 	writel_relaxed(val, asc->regs + reg);
+ }
+ 
++static bool scaling = true;
++module_param(scaling, bool, 0644);
++MODULE_PARM_DESC(scaling, "Allow a destination size other than the source size (default: yes)");
++
+ /* ---- hardware --------------------------------------------------------- */
+ 
+ 
+@@ -312,6 +316,7 @@ static void asc_device_run(void *priv)
+ 	/* Job tags as the engine is driven on macOS: a counter above bit 3, bit 2 set. */
+ 	job.transform_id = (++asc->transform_id << 3) | BIT(2);
+ 	job.msr20 = asc->variant->msr20;
++	job.scale = READ_ONCE(scaling);
+ 	n = asc_job_build(&job, asc->writes, ARRAY_SIZE(asc->writes));
+ 	if (n < 0) {
+ 		spin_unlock_irqrestore(&asc->hw_lock, flags);
+@@ -350,10 +355,22 @@ static const struct v4l2_m2m_ops asc_m2m_ops = {
+  * transfer function, since the engine converts only the encoding.
+  */
+ static void asc_fill(struct v4l2_pix_format_mplane *pix, const struct v4l2_pix_format_mplane *ref,
+-		     u32 default_fourcc)
++		     u32 default_fourcc, bool resize)
+ {
+ 	const struct asc_format *f = asc_find_format(pix->pixelformat);
+ 	u32 w = ref ? ref->width : pix->width, h = ref ? ref->height : pix->height;
++
++	/*
++	 * A destination may be scaled: down to a quarter (the filters keep
++	 * every source line up to a halving vertically and to 3.5x
++	 * horizontally, and still average beyond) or up to eight times.
++	 */
++	if (ref && resize && READ_ONCE(scaling) && pix->width && pix->height) {
++		w = clamp_t(u32, pix->width, max_t(u32, ref->width / 4, ASC_MIN_SIZE),
++			    min_t(u32, ref->width * 8, ASC_MAX_SIZE));
++		h = clamp_t(u32, pix->height, max_t(u32, ref->height / 4, ASC_MIN_SIZE),
++			    min_t(u32, ref->height * 8, ASC_MAX_SIZE));
++	}
+ 	struct v4l2_pix_format_mplane in = *pix;
+ 
+ 	if (!f)
+@@ -451,13 +468,13 @@ static int asc_g_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
+ 
+ static int asc_try_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
+ {
+-	asc_fill(&f->fmt.pix_mp, NULL, V4L2_PIX_FMT_NV12M);
++	asc_fill(&f->fmt.pix_mp, NULL, V4L2_PIX_FMT_NV12M, false);
+ 	return 0;
+ }
+ 
+ static int asc_try_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
+ {
+-	asc_fill(&f->fmt.pix_mp, &asc_file_to_ctx(file)->src, V4L2_PIX_FMT_ARGB32);
++	asc_fill(&f->fmt.pix_mp, &asc_file_to_ctx(file)->src, V4L2_PIX_FMT_ARGB32, true);
+ 	return 0;
+ }
+ 
+@@ -468,9 +485,9 @@ static int asc_s_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
+ 	if (vb2_is_busy(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)) ||
+ 	    vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
+ 		return -EBUSY;
+-	asc_fill(&f->fmt.pix_mp, NULL, V4L2_PIX_FMT_NV12M);
++	asc_fill(&f->fmt.pix_mp, NULL, V4L2_PIX_FMT_NV12M, false);
+ 	ctx->src = f->fmt.pix_mp;
+-	asc_fill(&ctx->dst, &ctx->src, V4L2_PIX_FMT_ARGB32);
++	asc_fill(&ctx->dst, &ctx->src, V4L2_PIX_FMT_ARGB32, false);
+ 	return 0;
+ }
+ 
+@@ -480,7 +497,7 @@ static int asc_s_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
+ 
+ 	if (vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
+ 		return -EBUSY;
+-	asc_fill(&f->fmt.pix_mp, &ctx->src, V4L2_PIX_FMT_ARGB32);
++	asc_fill(&f->fmt.pix_mp, &ctx->src, V4L2_PIX_FMT_ARGB32, true);
+ 	ctx->dst = f->fmt.pix_mp;
+ 	return 0;
+ }
+@@ -630,9 +647,9 @@ static int asc_open(struct file *file)
+ 	ctx->src.width = 1920;
+ 	ctx->src.height = 1080;
+ 	ctx->src.pixelformat = V4L2_PIX_FMT_NV12M;
+-	asc_fill(&ctx->src, NULL, V4L2_PIX_FMT_NV12M);
++	asc_fill(&ctx->src, NULL, V4L2_PIX_FMT_NV12M, false);
+ 	ctx->dst.pixelformat = V4L2_PIX_FMT_ARGB32;
+-	asc_fill(&ctx->dst, &ctx->src, V4L2_PIX_FMT_ARGB32);
++	asc_fill(&ctx->dst, &ctx->src, V4L2_PIX_FMT_ARGB32, false);
+ 	v4l2_fh_init(&ctx->fh, video_devdata(file));
+ 
+ 	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(asc->m2m_dev, ctx, asc_queue_init);
+-- 
+2.43.0
+
