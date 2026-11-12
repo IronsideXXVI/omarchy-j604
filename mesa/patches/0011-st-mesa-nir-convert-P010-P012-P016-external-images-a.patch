@@ -1,0 +1,315 @@
+From 88605b1235a29856c39076441d16f3785da76063 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 21:15:21 +0000
+Subject: [PATCH] st/mesa, nir: convert P010/P012/P016 external images at their
+ real depth
+
+External images in P010, P012 and P016 are sampled through R16 and RG1616
+UNORM views and lowered with lower_nv12 only, so nir_lower_tex builds the
+YCbCr -> RGB conversion with 8-bit narrow-range coefficients: luma offset
+16/255, chroma offset 128/255, and the 8-bit scales. On a UNORM16 sample
+of MSB-aligned 10-bit data the neutral chroma code 512 reads 0.50001, but
+the offset subtracted is 128/255 = 0.50196, and the scales are 0.4% off.
+Neutral grey comes out
+tinted (red and blue low, green high), by about one 8-bit code on SDR
+BT.709 content and by several codes once PQ content goes through a tone
+map.
+
+Convert these containers at the depth they hold. The new lower_msb10,
+lower_msb12 and lower_16bit external options give the conversion 10, 12 or
+16 bits per component, and util_ycbcr_container16_scale() turns a UNORM16
+sample of MSB-aligned data into the normalized code the range coefficients
+expect (65535 / ((2^bpc - 1) << (16 - bpc))). The existing LSB-aligned
+Y10X6/Y12X4 path uses the same helper and keeps its scale. P030 is left as
+it was.
+
+Tested on an Apple M4 (AGX G16) with hardware-decoded 10-bit video
+imported as P010 dma-bufs:
+- a model of the old coefficients predicts the measured on-screen error of
+  BT.709 10-bit colour bars to within 0.2 of a code (red -0.93, green
+  -0.06, blue -1.11 predicted; -0.71, -0.12, -1.14 measured);
+- u_ycbcr_test: P010 (BT.709, BT.2020), P012 and P016 conversions match
+  the exact narrow-range result within 2e-5; the LSB-aligned scales are
+  unchanged.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ src/compiler/nir/nir.h              |   7 ++
+ src/compiler/nir/nir_lower_tex.c    |  28 ++++---
+ src/mesa/state_tracker/st_program.c |   3 +
+ src/mesa/state_tracker/st_program.h |  15 +++-
+ src/util/tests/u_ycbcr_test.cpp     | 114 ++++++++++++++++++++++++++++
+ src/util/u_ycbcr.h                  |  17 +++++
+ 6 files changed, 173 insertions(+), 11 deletions(-)
+
+diff --git a/src/compiler/nir/nir.h b/src/compiler/nir/nir.h
+index 96421abd621..8f6052efc6e 100644
+--- a/src/compiler/nir/nir.h
++++ b/src/compiler/nir/nir.h
+@@ -6426,6 +6426,13 @@ typedef struct nir_lower_tex_options {
+    unsigned lower_y41x_external;
+    unsigned lower_sx10_external;
+    unsigned lower_sx12_external;
++   /**
++    * 16-bit containers holding MSB-aligned 10/12-bit data (P010, P012) or
++    * full 16-bit data (P016): convert at that depth, not as 8-bit values.
++    */
++   unsigned lower_msb10_external;
++   unsigned lower_msb12_external;
++   unsigned lower_16bit_external;
+    unsigned bt709_external;
+    unsigned bt2020_external;
+    unsigned yuv_full_range_external;
+diff --git a/src/compiler/nir/nir_lower_tex.c b/src/compiler/nir/nir_lower_tex.c
+index 74c97a8c162..8ab49f9e4d3 100644
+--- a/src/compiler/nir/nir_lower_tex.c
++++ b/src/compiler/nir/nir_lower_tex.c
+@@ -366,11 +366,23 @@ convert_yuv_to_rgb(nir_builder *b, nir_tex_instr *tex,
+       nir_def_rewrite_uses(&tex->def, result);
+       return;
+    }
++   const unsigned bit = 1u << texture_index;
+    unsigned bpc = 8;
+-   if (options->lower_sx10_external & (1u << texture_index)) {
++   float scale = 1.0f;
++   if (options->lower_sx10_external & bit) {
+       bpc = 10;
+-   } else if (options->lower_sx12_external & (1u << texture_index)) {
++      scale = util_ycbcr_container16_scale(10, false);
++   } else if (options->lower_sx12_external & bit) {
+       bpc = 12;
++      scale = util_ycbcr_container16_scale(12, false);
++   } else if (options->lower_msb10_external & bit) {
++      bpc = 10;
++      scale = util_ycbcr_container16_scale(10, true);
++   } else if (options->lower_msb12_external & bit) {
++      bpc = 12;
++      scale = util_ycbcr_container16_scale(12, true);
++   } else if (options->lower_16bit_external & bit) {
++      bpc = 16;
+    }
+    unsigned bpcs[3] = { bpc, bpc, bpc };
+ 
+@@ -411,14 +423,10 @@ convert_yuv_to_rgb(nir_builder *b, nir_tex_instr *tex,
+    nir_def *m1 = nir_f2fN(b, nir_build_imm(b, 4, 32, m.v[1]), bit_size);
+    nir_def *m2 = nir_f2fN(b, nir_build_imm(b, 4, 32, m.v[2]), bit_size);
+ 
+-   if (options->lower_sx10_external & (1u << texture_index)) {
+-      m0 = nir_fmul_imm(b, m0, 65535.0f / 1023.0f);
+-      m1 = nir_fmul_imm(b, m1, 65535.0f / 1023.0f);
+-      m2 = nir_fmul_imm(b, m2, 65535.0f / 1023.0f);
+-   } else if (options->lower_sx12_external & (1u << texture_index)) {
+-      m0 = nir_fmul_imm(b, m0, 65535.0f / 4095.0f);
+-      m1 = nir_fmul_imm(b, m1, 65535.0f / 4095.0f);
+-      m2 = nir_fmul_imm(b, m2, 65535.0f / 4095.0f);
++   if (scale != 1.0f) {
++      m0 = nir_fmul_imm(b, m0, scale);
++      m1 = nir_fmul_imm(b, m1, scale);
++      m2 = nir_fmul_imm(b, m2, scale);
+    }
+ 
+    nir_def *result =
+diff --git a/src/mesa/state_tracker/st_program.c b/src/mesa/state_tracker/st_program.c
+index 7cb7df7422e..9787fda213d 100644
+--- a/src/mesa/state_tracker/st_program.c
++++ b/src/mesa/state_tracker/st_program.c
+@@ -1247,6 +1247,9 @@ st_create_fp_variant(struct st_context *st,
+       options.lower_yv_yu_external = key->external.lower_yv_yu;
+       options.lower_y41x_external = key->external.lower_y41x;
+       options.lower_sx10_external = key->external.lower_sx10;
++      options.lower_msb10_external = key->external.lower_msb10;
++      options.lower_msb12_external = key->external.lower_msb12;
++      options.lower_16bit_external = key->external.lower_16bit;
+       options.lower_sx12_external = key->external.lower_sx12;
+       options.bt709_external = key->external.bt709;
+       options.bt2020_external = key->external.bt2020;
+diff --git a/src/mesa/state_tracker/st_program.h b/src/mesa/state_tracker/st_program.h
+index 7fa6d20fde3..8168c9e7fa1 100644
+--- a/src/mesa/state_tracker/st_program.h
++++ b/src/mesa/state_tracker/st_program.h
+@@ -61,6 +61,9 @@ struct st_external_sampler_key
+    GLuint lower_yv_yu;
+    GLuint lower_y41x;
+    GLuint lower_sx10;
++   GLuint lower_msb10;
++   GLuint lower_msb12;
++   GLuint lower_16bit;
+    GLuint lower_sx12;
+    GLuint bt709;
+    GLuint bt2020;
+@@ -122,11 +125,21 @@ st_get_external_sampler_key(struct st_context *st, struct gl_program *prog)
+          }
+          FALLTHROUGH;
+       case PIPE_FORMAT_NV24:
++      case PIPE_FORMAT_P030:
++         key.lower_nv12 |= (1 << unit);
++         break;
+       case PIPE_FORMAT_P010:
++         /* 10-bit codes in the top bits of 16-bit samples */
++         key.lower_nv12 |= (1 << unit);
++         key.lower_msb10 |= (1 << unit);
++         break;
+       case PIPE_FORMAT_P012:
++         key.lower_nv12 |= (1 << unit);
++         key.lower_msb12 |= (1 << unit);
++         break;
+       case PIPE_FORMAT_P016:
+-      case PIPE_FORMAT_P030:
+          key.lower_nv12 |= (1 << unit);
++         key.lower_16bit |= (1 << unit);
+          break;
+       case PIPE_FORMAT_NV21:
+          if (stObj->pt->format == PIPE_FORMAT_R8_B8G8_420_UNORM) {
+diff --git a/src/util/tests/u_ycbcr_test.cpp b/src/util/tests/u_ycbcr_test.cpp
+index 202f934ce9b..92f90df92e0 100644
+--- a/src/util/tests/u_ycbcr_test.cpp
++++ b/src/util/tests/u_ycbcr_test.cpp
+@@ -616,3 +616,117 @@ TEST(u_ycbcr_test, narrow_ycbcr_to_narrow_rgb)
+    test_narrow_ycbcr_to_narrow_rgb_coeffs(util_ycbcr_bt709_coeffs);
+    test_narrow_ycbcr_to_narrow_rgb_coeffs(util_ycbcr_bt2020_coeffs);
+ }
++
++/* Coefficients of the YCbCr -> RGB conversion nir_lower_tex builds for external
++ * images in 16-bit containers, applied the same way the pass applies them: a
++ * UNORM sample of each plane, times util_ycbcr_container16_scale(), through the
++ * range-adjusted matrix.
++ */
++
++static void
++container16_convert(const float coeffs[3], unsigned bpc, float scale, const float unorm[3],
++        float rgb[3])
++{
++   const unsigned bpcs[3] = { bpc, bpc, bpc };
++   float range[3][2];
++   float mat[3][4];
++
++   util_get_narrow_range_coeffs(range, bpcs);
++   util_get_ycbcr_to_rgb_matrix(mat, coeffs);
++   util_ycbcr_adjust_from_range(mat, range);
++
++   for (int i = 0; i < 3; i++)
++      rgb[i] = mat[i][0] * scale * unorm[0] + mat[i][1] * scale * unorm[1] +
++               mat[i][2] * scale * unorm[2] + mat[i][3];
++}
++
++/* The exact narrow-range result for N-bit codes. */
++static void
++container16_expected(const float coeffs[3], unsigned bpc, const unsigned code[3], float rgb[3])
++{
++   const float s = (float)(1u << (bpc - 8));
++   const float y = (code[0] - 16.0f * s) / (219.0f * s);
++   const float cb = (code[1] - 128.0f * s) / (224.0f * s);
++   const float cr = (code[2] - 128.0f * s) / (224.0f * s);
++   const float kr = coeffs[0], kb = coeffs[2], kg = 1.0f - kr - kb;
++
++   rgb[0] = y + 2.0f * (1.0f - kr) * cr;
++   rgb[2] = y + 2.0f * (1.0f - kb) * cb;
++   rgb[1] = (y - kr * rgb[0] - kb * rgb[2]) / kg;
++}
++
++/* A 16-bit container sample of an MSB-aligned N-bit code (P010, P012, P016). */
++static float
++msb_unorm(unsigned code, unsigned bpc)
++{
++   return (float)(code << (16 - bpc)) / 65535.0f;
++}
++
++static const unsigned codes10[][3] = {
++   { 64, 512, 512 },   /* black */
++   { 940, 512, 512 },  /* white */
++   { 416, 512, 512 },  /* 40 % grey */
++   { 720, 512, 512 },  /* 75 % grey */
++   { 672, 176, 544 },  /* 75 % yellow */
++   { 252, 772, 816 },  /* 75 % magenta */
++};
++
++static void
++check_msb(const float coeffs[3], unsigned bpc, unsigned shift_from_10)
++{
++   for (unsigned i = 0; i < sizeof(codes10) / sizeof(codes10[0]); i++) {
++      const unsigned code[3] = { codes10[i][0] << shift_from_10,
++                                 codes10[i][1] << shift_from_10,
++                                 codes10[i][2] << shift_from_10 };
++      const float unorm[3] = { msb_unorm(code[0], bpc), msb_unorm(code[1], bpc),
++                               msb_unorm(code[2], bpc) };
++      float got[3], want[3];
++
++      container16_convert(coeffs, bpc, util_ycbcr_container16_scale(bpc, true), unorm, got);
++      container16_expected(coeffs, bpc, code, want);
++      for (int c = 0; c < 3; c++)
++         EXPECT_NEAR(got[c], want[c], 2e-5) << "code " << code[0] << "," << code[1]
++                                            << "," << code[2] << " channel " << c;
++   }
++}
++
++TEST(u_ycbcr_test, p010_bt709_at_10_bits)
++{
++   check_msb(util_ycbcr_bt709_coeffs, 10, 0);
++}
++
++TEST(u_ycbcr_test, p010_bt2020_at_10_bits)
++{
++   check_msb(util_ycbcr_bt2020_coeffs, 10, 0);
++}
++
++TEST(u_ycbcr_test, p012_bt2020_at_12_bits)
++{
++   check_msb(util_ycbcr_bt2020_coeffs, 12, 2);
++}
++
++TEST(u_ycbcr_test, p016_bt709_at_16_bits)
++{
++   check_msb(util_ycbcr_bt709_coeffs, 16, 6);
++   EXPECT_FLOAT_EQ(util_ycbcr_container16_scale(16, true), 1.0f);
++}
++
++/* The LSB-aligned containers keep the scale they always had. */
++TEST(u_ycbcr_test, lsb_aligned_scale_unchanged)
++{
++   EXPECT_FLOAT_EQ(util_ycbcr_container16_scale(10, false), 65535.0f / 1023.0f);
++   EXPECT_FLOAT_EQ(util_ycbcr_container16_scale(12, false), 65535.0f / 4095.0f);
++}
++
++/* What P010 got before: 8-bit constants on 16-bit samples tint neutral grey
++ * (chroma offset 128/255 instead of 512/1023) by about half an 8-bit code.
++ */
++TEST(u_ycbcr_test, p010_with_8bit_constants_tints_grey)
++{
++   const float unorm[3] = { msb_unorm(720, 10), msb_unorm(512, 10), msb_unorm(512, 10) };
++   float rgb[3];
++
++   container16_convert(util_ycbcr_bt709_coeffs, 8, 1.0f, unorm, rgb);
++   EXPECT_GT(fabsf(rgb[0] - rgb[1]) * 255.0f, 0.5f);
++   EXPECT_GT(fabsf(rgb[2] - rgb[1]) * 255.0f, 0.5f);
++}
+diff --git a/src/util/u_ycbcr.h b/src/util/u_ycbcr.h
+index 9aac2d5ee34..ff7591a16b7 100644
+--- a/src/util/u_ycbcr.h
++++ b/src/util/u_ycbcr.h
+@@ -137,6 +137,23 @@ util_get_identity_range_coeffs(float out[3][2])
+    out[0][1] = out[1][1] = out[2][1] = 0.0f;
+ }
+ 
++/**
++ * Factor that turns a UNORM sample of a 16-bit container holding \p bpc
++ * significant bits into the \p bpc-bit normalized value (code / (2^bpc - 1))
++ * the range coefficients above expect: 65535 / (2^bpc - 1) for LSB-aligned
++ * data (Y10X6, Y12X4), 65535 / ((2^bpc - 1) << (16 - bpc)) for MSB-aligned
++ * data (P010, P012, P016).
++ */
++static inline float
++util_ycbcr_container16_scale(unsigned bpc, bool msb_aligned)
++{
++   float max = (float)((1u << bpc) - 1);
++
++   if (msb_aligned)
++      return 65535.0f / (max * (float)(1u << (16 - bpc)));
++   return 65535.0f / max;
++}
++
+ static inline void
+ util_ycbcr_adjust_from_range(float mat[3][4],
+                              const float range[3][2])
+-- 
+2.43.0
+

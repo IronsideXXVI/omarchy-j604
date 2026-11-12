@@ -13,8 +13,8 @@ their authors' names.
 
 | Author | Patches |
 | --- | --- |
-| Dylan Ironside | 332 |
-| Ryan Murray | 23 |
+| Dylan Ironside | 334 |
+| Ryan Murray | 24 |
 | Diljit Singh | 23 |
 | RJ Skerry-Ryan | 8 |
 | Bartosz Nitka | 7 |
@@ -24,10 +24,10 @@ their authors' names.
 | Naeem Malik | 2 |
 | Satya Benson | 3 |
 | Daniel Fernau | 1 |
-| DjDeveloperr | 1 |
+| DjDeveloperr | 2 |
 | Eryk Wieliczko | 1 |
 | Janne Grunau | 1 |
-| Jonathan Goyvaerts | 1 |
+| Jonathan Goyvaerts | 6 |
 | Rolando Trevino | 1 |
 | Sean Dolbec | 1 |
 | ewb | 1 |

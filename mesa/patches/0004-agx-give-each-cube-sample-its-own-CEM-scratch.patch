@@ -1,0 +1,346 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Goyvaerts <jonathan.goyvaerts@gmail.com>
+Date: Tue, 27 Oct 2026 21:52:10 -0300
+Subject: [PATCH 4/9] agx: give each cube sample its own CEM scratch
+
+The packer computed every cube sample's CEM in one shared scratch above
+the register allocation. A cube array stages CEM's face in a seven-bit
+PACK_SMPIR field, so for cube arrays that scratch had to sit below half
+128, and the whole register file of any shader sampling a cube array was
+capped at 112 halves. Counter-Strike 2's cube-array material shaders hold
+far more than that live and spilled heavily.
+
+Before RA, give each cube sample (but bias with minimum and scalar-
+coordinate samples) a seventh source: an undefined four-word vector,
+defined right before it, which emits no code. RA places it clear of every
+value live at the sample, and below half 128 for a cube array
+(texture_gpr); the packer computes that sample's CEM there. Cube arrays
+lose the 112-half cap and plain cubes the eight halves reserved above the
+allocation. Samples with their own scratch get a 176-half budget, which
+keeps a heavy shader at 576 threads: Counter-Strike 2's cube-array
+material passes ran faster at 177 halves than with the full 184 (185
+halves, 512 threads), though they spill more there.
+
+Counter-Strike 2's 1969 shaders (fossilize-replay of a capture): spills
+9958 -> 3510, fills 13995 -> 4313, scratch -57%, instructions -1.9%; 181
+shaders change, none with more instructions. The 90 cube-array shaders
+go from ~240 to ~100 spills at 177 instead of 121 halves (832 -> 576
+threads); 91 plain-cube shaders each free eight halves, several gaining
+an occupancy step. In de_dust2 (two runs each, kernel job traces), the
+median of the 50 longest render jobs fell from 1.60-1.65 ms to
+1.00-1.22 ms; average fps is within run-to-run noise.
+
+dEQP-VK cube and cube-array texture, shadow and GLSL texture-function
+cases (2615, all cube arrays and a quarter of the rest): same results as
+before, 586 pass, 0 fail. A cube-array pressure bench renders the same
+image. test-agx3-cube-scratch checks the pass.
+
+Signed-off-by: Jonathan Goyvaerts <jonathan.goyvaerts@gmail.com>
+Assisted-by: LLM
+(cherry picked from commit c6f52b508c9995d8ed39c54ece0f84b4ffdbab36)
+---
+ .../agx3_lower_texture_publications.c         | 45 +++++++++++++
+ src/asahi/compiler/agx3_pack_binary.c         | 34 +++++++++-
+ src/asahi/compiler/agx_compile.c              |  3 +
+ src/asahi/compiler/agx_compiler.h             |  1 +
+ src/asahi/compiler/agx_register_allocate.c    | 35 ++++++++--
+ src/asahi/compiler/meson.build                |  1 +
+ .../compiler/test/test-agx3-cube-scratch.cpp  | 67 +++++++++++++++++++
+ 7 files changed, 178 insertions(+), 8 deletions(-)
+ create mode 100644 src/asahi/compiler/test/test-agx3-cube-scratch.cpp
+
+diff --git a/src/asahi/compiler/agx3_lower_texture_publications.c b/src/asahi/compiler/agx3_lower_texture_publications.c
+index ba0821b5c0f..81fd40abcae 100644
+--- a/src/asahi/compiler/agx3_lower_texture_publications.c
++++ b/src/asahi/compiler/agx3_lower_texture_publications.c
+@@ -394,6 +394,51 @@ agx3_split_texture_coordinates(agx_context *ctx)
+    return progress;
+ }
+ 
++/* The packer computed every cube sample's CEM in one shared scratch above
++ * the allocation, eight halves the file had to leave free. A cube array
++ * stages CEM's face in a seven-bit PACK_SMPIR field
++ * (agx3_tex_stage_cube_array_layer), so for cube arrays that scratch had to
++ * sit below half 128 and capped the whole register file at 112 halves.
++ *
++ * Give each cube sample its own scratch instead: an undefined four-word
++ * vector the sample reads, which RA places clear of every value live at the
++ * sample, below half 128 for a cube array (texture_gpr). Its definition
++ * emits no code. Run right before RA, so the scratch lives for this one
++ * instruction. A bias with minimum also packs a word above the allocation
++ * and keeps the shared scratch, as do scalar-coordinate cube samples. */
++bool
++agx3_reserve_cube_scratch(agx_context *ctx)
++{
++   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B)
++      return false;
++
++   bool progress = false;
++   agx_foreach_instr_global_safe(ctx, I) {
++      if (I->op != AGX_OPCODE_TEXTURE_SAMPLE ||
++          (I->dim != AGX_DIM_CUBE && I->dim != AGX_DIM_CUBE_ARRAY) ||
++          I->nr_srcs != 6 || I->nr_dests != 1 ||
++          I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS_MIN)
++         continue;
++
++      agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
++      agx_index scratch = agx_vec_temp(ctx, AGX_SIZE_32, 4);
++      agx_instr *collect = agx_collect_to(&b, scratch, 4);
++      agx_foreach_src(collect, c)
++         collect->src[c] = agx_undef(AGX_SIZE_32);
++
++      agx_instr *sample = agx_alloc_instr(&b, I->op, 1, 7);
++      memcpy(&sample->op, &I->op, sizeof(*I) - offsetof(agx_instr, op));
++      sample->nr_srcs = 7;
++      sample->dest[0] = I->dest[0];
++      memcpy(sample->src, I->src, 6 * sizeof(agx_index));
++      sample->src[6] = scratch;
++      agx_builder_insert(&b.cursor, sample);
++      agx_remove_instruction(I);
++      progress = true;
++   }
++   return progress;
++}
++
+ static bool
+ ssa_preserves_publications(const agx_instr *I)
+ {
+diff --git a/src/asahi/compiler/agx3_pack_binary.c b/src/asahi/compiler/agx3_pack_binary.c
+index d53ab77bd10..dceec01e06a 100644
+--- a/src/asahi/compiler/agx3_pack_binary.c
++++ b/src/asahi/compiler/agx3_pack_binary.c
+@@ -2237,6 +2237,29 @@ agx3_is_staged_3d_bias_min(const agx_instr *I)
+           !I->offset_xyz;
+ }
+ 
++/* A cube sample with its own CEM scratch (agx3_reserve_cube_scratch)
++ * uses it in place of the shared scratch above the allocation. */
++static bool
++agx3_cube_own_scratch(const agx_instr *I)
++{
++   return I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
++          (I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY) &&
++          !I->agx3_cube_scalar_coords && I->nr_srcs == 7 &&
++          I->src[6].type == AGX_INDEX_REGISTER;
++}
++
++static const uint16_t *
++agx3_cube_scratch(const agx_instr *I, const uint16_t shared[3],
++                  uint16_t own[3])
++{
++   if (!agx3_cube_own_scratch(I))
++      return shared;
++   own[0] = I->src[6].value;
++   own[1] = I->src[6].value + 4;
++   own[2] = I->src[6].value + 6;
++   return own;
++}
++
+ /* Filtered 2D samples use scoreboard-signalling native staging producers.
+  * Plain implicit 2D keeps its coordinate layout. Explicit per-lane LOD and
+  * 2D-array samples stage coordinates into bank 0; their auxiliary scalar is
+@@ -2258,7 +2281,10 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
+    const bool published = agx_texture_resource(I) != 0;
+    const bool scalar_cube = I->agx3_cube_scalar_coords;
+    const bool split = I->agx3_split_coords;
+-   const unsigned source_count = scalar_cube || split ? 8 : 6;
++   const unsigned source_count = scalar_cube || split ? 8
++                                 : agx3_cube_own_scratch(I) ? 7 : 6;
++   uint16_t own_cem_scratch[3];
++   cem_scratch = agx3_cube_scratch(I, cem_scratch, own_cem_scratch);
+    const bool explicit_lod = I->lod_mode == AGX_LOD_MODE_LOD_MIN;
+    const bool bias_min = I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS_MIN;
+    const bool gradient_min = I->lod_mode == AGX_LOD_MODE_LOD_GRAD_MIN;
+@@ -9203,7 +9229,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
+                ((scan_I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
+                  scan_I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS) &&
+                 scan_I->src[1].type != AGX_INDEX_IMMEDIATE);
+-            has_cube_sample = true;
++            has_cube_sample |= !agx3_cube_own_scratch(scan_I);
+             /* So is a cube face packed beside a bias and minimum. */
+             if (register_lod &&
+                 (scan_I->dim == AGX_DIM_CUBE_ARRAY || bias_min))
+@@ -9850,7 +9876,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
+                ((I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
+                  I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS) &&
+                 I->src[1].type != AGX_INDEX_IMMEDIATE);
+-            const uint16_t *scratch = cem_scratch;
++            uint16_t own_scratch[3];
++            const uint16_t *scratch =
++               agx3_cube_scratch(I, cem_scratch, own_scratch);
+             assert(nd + 5 <= AGX3_SLOT_MAX_REGS);
+             e->dst[nd++] = scratch[0];
+             e->dst[nd++] = scratch[0] + 2;
+diff --git a/src/asahi/compiler/agx_compile.c b/src/asahi/compiler/agx_compile.c
+index 5443f4e509f..0abad1e79d1 100644
+--- a/src/asahi/compiler/agx_compile.c
++++ b/src/asahi/compiler/agx_compile.c
+@@ -10424,6 +10424,9 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
+       return false;
+    }
+ 
++   if (agx3_reserve_cube_scratch(ctx))
++      agx_validate(ctx, "cube-array scratch");
++
+    /* Record provenance before RA can create stack instructions. */
+    const bool imports_only_before_ra = agx3_cprog_spill_provenance(ctx);
+    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+diff --git a/src/asahi/compiler/agx_compiler.h b/src/asahi/compiler/agx_compiler.h
+index 20461fb035f..569b4512954 100644
+--- a/src/asahi/compiler/agx_compiler.h
++++ b/src/asahi/compiler/agx_compiler.h
+@@ -1210,6 +1210,7 @@ bool agx3_fuse_fma_texture_publications(agx_context *ctx);
+ bool agx3_lower_scalar_texture_publications(agx_context *ctx);
+ bool agx3_lower_scalar_cube_coordinates(agx_context *ctx);
+ bool agx3_split_texture_coordinates(agx_context *ctx);
++bool agx3_reserve_cube_scratch(agx_context *ctx);
+ void agx_lower_uniform_sources(agx_context *ctx);
+ void agx_opt_cse(agx_context *ctx);
+ bool agx_opt_collect_split(agx_context *ctx);
+diff --git a/src/asahi/compiler/agx_register_allocate.c b/src/asahi/compiler/agx_register_allocate.c
+index 2a794df2d04..22361ef82de 100644
+--- a/src/asahi/compiler/agx_register_allocate.c
++++ b/src/asahi/compiler/agx_register_allocate.c
+@@ -2799,6 +2799,7 @@ agx3_cube_register_budget(agx_context *ctx)
+ {
+    unsigned budget = AGX3B_NUM_REGS;
+    unsigned alignment = 8;
++   bool shared_cem = false, packed_layer = false;
+    agx_foreach_instr_global(ctx, I) {
+       agx_foreach_ssa_dest(I, d)
+          alignment = MAX2(alignment,
+@@ -2809,13 +2810,30 @@ agx3_cube_register_budget(agx_context *ctx)
+ 
+       /* A plain cube sample stages a register level or bias with CEM's face
+        * in a form that encodes the face's high bit, so only the level needs
+-       * a seven-bit register, and RA keeps it there (texture_gpr). The bias
+-       * with minimum also places a packed word above the allocation. */
++       * a seven-bit register, and RA keeps it there (texture_gpr). A cube
++       * array stages its face in a seven-bit field, from its own CEM scratch
++       * (agx3_reserve_cube_scratch) where it has one. The bias with
++       * minimum also places a packed word above the allocation. */
+       const bool bias_min = I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS_MIN;
++      /* With its own scratch, nothing of a cube sample sits above the
++       * allocation but a cube array's packed layer word. Its budget keeps
++       * the shader at 576 threads: Counter-Strike 2's register-heavy
++       * cube-array material passes ran faster at 177 halves than at 185
++       * (512 threads), though they spill a little more. */
++      const bool own_scratch = !I->agx3_cube_scalar_coords && I->nr_srcs == 7;
+       budget = MIN2(budget,
+-                    (I->dim == AGX_DIM_CUBE_ARRAY || bias_min) ? 112 :
+-                    AGX3B_NUM_REGS - 8);
+-   }
++                    ((I->dim == AGX_DIM_CUBE_ARRAY && !own_scratch) || bias_min)
++                       ? 112 : own_scratch ? AGX3B_NUM_REGS - 16
++                                           : AGX3B_NUM_REGS - 8);
++      shared_cem |= !own_scratch;
++      packed_layer |= own_scratch && I->src[1].type != AGX_INDEX_IMMEDIATE &&
++                      (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
++                       I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS);
++   }
++   /* The shared CEM scratch and a cube array's prepacked layer word both sit
++    * above the allocation, below half 191. */
++   if (shared_cem && packed_layer)
++      budget = MIN2(budget, AGX3B_NUM_REGS - 16);
+    return ROUND_DOWN_TO(budget, alignment);
+ }
+ 
+@@ -3277,6 +3295,13 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
+              (I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY) &&
+              I->src[1].type == AGX_INDEX_NORMAL)
+             BITSET_SET(texture_gpr, I->src[1].value);
++
++         /* A cube array's own CEM scratch holds its face, a seven-bit operand
++          * of the staging PACK_SMPIR (agx3_tex_stage_cube_array_layer). */
++         if (I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
++             I->dim == AGX_DIM_CUBE_ARRAY && I->nr_srcs == 7 &&
++             I->src[6].type == AGX_INDEX_NORMAL)
++            BITSET_SET(texture_gpr, I->src[6].value);
+       }
+ 
+       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+diff --git a/src/asahi/compiler/meson.build b/src/asahi/compiler/meson.build
+index 2b766a4f14d..5e60955d240 100644
+--- a/src/asahi/compiler/meson.build
++++ b/src/asahi/compiler/meson.build
+@@ -228,6 +228,7 @@ if with_tests
+          'test/test-agx3-integer-lowering.cpp',
+          'test/test-agx3-unary-lowering.cpp',
+          'test/test-agx3-fsel-uniform.cpp',
++         'test/test-agx3-cube-scratch.cpp',
+          'test/test-fminmax-constant-denorm.cpp',
+          'test/test-shared-byte-offsets.cpp',
+          'test/test-device-load-batches.cpp',
+diff --git a/src/asahi/compiler/test/test-agx3-cube-scratch.cpp b/src/asahi/compiler/test/test-agx3-cube-scratch.cpp
+new file mode 100644
+index 00000000000..257fe072e32
+--- /dev/null
++++ b/src/asahi/compiler/test/test-agx3-cube-scratch.cpp
+@@ -0,0 +1,67 @@
++/* SPDX-License-Identifier: MIT */
++#include <gtest/gtest.h>
++#include "agx_builder.h"
++#include "agx_test.h"
++
++/* A cube sample gets its own CEM scratch: an undefined four-word vector it
++ * reads, defined right before it, so RA places the scratch rather than the
++ * packer stacking it above the allocation. */
++static agx_instr *
++cube_sample(agx_builder *b, enum agx_dim dim, enum agx_lod_mode lod)
++{
++   agx_index coords = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
++   return agx_texture_sample_to(b, agx_temp(b->shader, AGX_SIZE_16), coords,
++                                agx_immediate(0), agx_immediate(0),
++                                agx_immediate(0), agx_immediate(0),
++                                agx_null(), dim, lod, 0xf, false, false, false,
++                                AGX_GATHER_NONE, false);
++}
++
++TEST(AGX3CubeScratch, CubeSamplesReadAnUndefinedScratchVector)
++{
++   void *mem = ralloc_context(NULL);
++   agx_shader_key key = {};
++   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
++   agx_builder *b = agx_test_builder(mem);
++   b->shader->key = &key;
++   cube_sample(b, AGX_DIM_CUBE_ARRAY, AGX_LOD_MODE_AUTO_LOD);
++   cube_sample(b, AGX_DIM_CUBE, AGX_LOD_MODE_AUTO_LOD);
++   /* The bias with minimum keeps the shared scratch and the capped file. */
++   cube_sample(b, AGX_DIM_CUBE_ARRAY, AGX_LOD_MODE_AUTO_LOD_BIAS_MIN);
++   cube_sample(b, AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD);
++
++   ASSERT_TRUE(agx3_reserve_cube_scratch(b->shader));
++
++   agx_instr *collect = NULL;
++   unsigned samples = 0, own = 0;
++   agx_foreach_instr_global(b->shader, I) {
++      if (I->op == AGX_OPCODE_COLLECT) {
++         collect = I;
++         continue;
++      }
++      ASSERT_EQ(I->op, AGX_OPCODE_TEXTURE_SAMPLE);
++      ++samples;
++      const bool expect_own = (I->dim == AGX_DIM_CUBE ||
++                               I->dim == AGX_DIM_CUBE_ARRAY) &&
++                              I->lod_mode != AGX_LOD_MODE_AUTO_LOD_BIAS_MIN;
++      if (!expect_own) {
++         EXPECT_EQ(I->nr_srcs, 6u);
++         continue;
++      }
++      ++own;
++      ASSERT_EQ(I->nr_srcs, 7u);
++      ASSERT_NE(collect, nullptr);
++      EXPECT_EQ(collect->dest[0].value, I->src[6].value);
++      EXPECT_EQ(agx_index_size_16(I->src[6]), 8u);
++      ASSERT_EQ(collect->nr_srcs, 4u);
++      agx_foreach_src(collect, s)
++         EXPECT_EQ(collect->src[s].type, AGX_INDEX_UNDEF);
++      collect = NULL;
++   }
++   EXPECT_EQ(samples, 4u);
++   EXPECT_EQ(own, 2u);
++
++   /* RA may be retried after a failed allocation: no second scratch. */
++   EXPECT_FALSE(agx3_reserve_cube_scratch(b->shader));
++   ralloc_free(mem);
++}

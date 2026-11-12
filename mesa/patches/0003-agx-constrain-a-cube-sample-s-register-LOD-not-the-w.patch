@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jonathan Goyvaerts <jonathan.goyvaerts@gmail.com>
+Date: Tue, 27 Oct 2026 17:22:27 -0300
+Subject: [PATCH 3/9] agx: constrain a cube sample's register LOD, not the
+ whole file
+
+A cube sample with a register level or bias capped the fragment shader's
+register file at 112 halves, so that the level, staged by
+agx3_tex_stage_cube_lod in a seven-bit field, could not land above half
+127. That cap applied to every value of the shader: material shaders that
+sample an environment cube with a computed level or bias spilled, though
+they fit in the file. Counter-Strike 2 has 48 such fragment shaders.
+
+The staging form encodes the high bit of the CEM face (f16 bit 7), so only
+the level needs a low register. Keep that one value below half 128
+through texture_gpr, as the coordinate already is, and give plain cube
+samples with a register level or bias the same budget as other cube
+samples. Cube arrays stage their face in a seven-bit field and bias with
+minimum places a packed word above the allocation; both keep the cap.
+
+Counter-Strike 2's 1969 shaders (fossilize-replay of a capture): spills
+11272 -> 9958, fills 15910 -> 13995, scratch -21%, instructions -0.4%;
+48 shaders change, none for the worse, typically from ~34 spills to none.
+A fragment shader with 18 live vec4s around a register-LOD cube sample
+goes from 245 instructions with 7 spills to 226 without, 8-11% faster
+per pass, with an identical image; its CEM face lands above half 128.
+A third of the dEQP-VK cube texture function, filtering, mipmap and
+gather cases (807) give the same results as before.
+
+Signed-off-by: Jonathan Goyvaerts <jonathan.goyvaerts@gmail.com>
+Assisted-by: LLM
+(cherry picked from commit 5704b5223f79305e7cce3131e4dd38bf9d7c8aa1)
+---
+ src/asahi/compiler/agx_register_allocate.c | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/src/asahi/compiler/agx_register_allocate.c b/src/asahi/compiler/agx_register_allocate.c
+index 11af5c589c1..2a794df2d04 100644
+--- a/src/asahi/compiler/agx_register_allocate.c
++++ b/src/asahi/compiler/agx_register_allocate.c
+@@ -2807,13 +2807,13 @@ agx3_cube_register_budget(agx_context *ctx)
+           (I->dim != AGX_DIM_CUBE && I->dim != AGX_DIM_CUBE_ARRAY))
+          continue;
+ 
++      /* A plain cube sample stages a register level or bias with CEM's face
++       * in a form that encodes the face's high bit, so only the level needs
++       * a seven-bit register, and RA keeps it there (texture_gpr). The bias
++       * with minimum also places a packed word above the allocation. */
+       const bool bias_min = I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS_MIN;
+-      const bool register_lod = bias_min ||
+-         ((I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
+-           I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS) &&
+-          I->src[1].type != AGX_INDEX_IMMEDIATE);
+       budget = MIN2(budget,
+-                    (I->dim == AGX_DIM_CUBE_ARRAY || register_lod) ? 112 :
++                    (I->dim == AGX_DIM_CUBE_ARRAY || bias_min) ? 112 :
+                     AGX3B_NUM_REGS - 8);
+    }
+    return ROUND_DOWN_TO(budget, alignment);
+@@ -3270,6 +3270,13 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
+          if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && I->shadow &&
+              I->src[5].type == AGX_INDEX_NORMAL)
+             BITSET_SET(texture_gpr, I->src[5].value);
++
++         /* A cube sample's register level or bias is a seven-bit operand of
++          * the staging PACK_SMPIR (agx3_tex_stage_cube_lod). */
++         if (I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
++             (I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY) &&
++             I->src[1].type == AGX_INDEX_NORMAL)
++            BITSET_SET(texture_gpr, I->src[1].value);
+       }
+ 
+       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
