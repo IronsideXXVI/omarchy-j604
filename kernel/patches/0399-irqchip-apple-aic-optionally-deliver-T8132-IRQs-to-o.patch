@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 03:11:21 +0000
+Subject: [PATCH] irqchip/apple-aic: optionally deliver T8132 IRQs to
+ one CPU cluster
+
+AICv3 has no per-IRQ target: each CPU's SIQ_CFG says whether it accepts
+AIC IRQs. On the J604 the boot chain leaves CPU 0, a P core, as the only
+one (SIQ_CFG route 0 there, route 3 on the six E cores and the other
+three P cores, read on every CPU at EL2), and Linux keeps it, so every
+device IRQ wakes the P cluster. macOS takes most device IRQs on E cores
+(about 92 % of non-IPI, non-timer interrupts in a powermetrics sample).
+
+Add irq_apple_aic.t8132_irq_cluster=N, off (-1) by default. At EL2 on
+T8132, each CPU of cluster N (MPIDR Aff1) sets its own SIQ_CFG to accept
+IRQs when it comes online, and only then are the boot CPUs outside the
+cluster set to accept none. Before the last CPU of the cluster goes
+offline, the boot CPUs accept IRQs again, so some CPU always does. The
+boot CPUs are the ones whose SIQ_CFG accepted IRQs as they started.
+Effective affinity is reported as before, and system sleep keeps each
+CPU's SIQ_CFG as it does today.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/irqchip/irq-apple-aic.c | 99 +++++++++++++++++++++++++++++++++
+ 1 file changed, 99 insertions(+)
+
+diff --git a/drivers/irqchip/irq-apple-aic.c b/drivers/irqchip/irq-apple-aic.c
+index 57a5f868a3..fa06a7f2b2 100644
+--- a/drivers/irqchip/irq-apple-aic.c
++++ b/drivers/irqchip/irq-apple-aic.c
+@@ -286,6 +286,8 @@ struct aic_info {
+ 	bool siq_cfg_routing;
+ 	/* A firmware-driven suspend powers the controller down: aic_syscore_ops keep it. */
+ 	bool fw_suspend;
++	/* SIQ_CFG may move IRQ delivery to another cluster (t8132_irq_cluster). */
++	bool siq_cluster_route;
+ };
+ 
+ static const struct aic_info aic1_info __initconst = {
+@@ -347,6 +349,7 @@ static const struct aic_info aic3_t8132_info __initconst = {
+ 	.fast_ipi = true,
+ 	.local_fast_ipi = true,
+ 	.fw_suspend = true,
++	.siq_cluster_route = true,
+ };
+ 
+ static const struct aic_info aic3_t8142_info __initconst = {
+@@ -418,6 +421,23 @@ static struct aic_irq_chip *aic_irqc;
+ /* CPUs that accept hardware IRQs, read from SIQ_CFG where siq_cfg_routing is set */
+ static struct cpumask aic_irq_cpus;
+ 
++/*
++ * T8132: the boot chain leaves one CPU accepting AIC IRQs. On the J604 that is
++ * CPU 0, a P core (SIQ_CFG route 0 there, route 3 = none on every other CPU),
++ * so every device IRQ wakes the P cluster, while macOS takes most device IRQs
++ * on E cores. t8132_irq_cluster=N moves delivery to the CPUs of cluster N
++ * (MPIDR Aff1) once one of them is online, and gives it back to the boot CPUs
++ * before the last of them goes offline, so some CPU always accepts IRQs.
++ * Effective affinity is still reported as before. -1 (the default) is off.
++ */
++static int t8132_irq_cluster = -1;
++module_param(t8132_irq_cluster, int, 0444);
++MODULE_PARM_DESC(t8132_irq_cluster, "T8132: deliver AIC IRQs to the CPUs of this cluster (MPIDR Aff1) instead of the boot CPU (-1 = off)");
++
++static struct cpumask aic_route_boot_cpus;	/* CPUs that accepted IRQs as booted */
++static struct cpumask aic_route_cpus;		/* CPUs of the cluster now accepting */
++static DEFINE_MUTEX(aic_route_lock);
++
+ static void aic_handle_ipi(struct pt_regs *regs);
+ 
+ static u32 aic_ic_read(struct aic_irq_chip *ic, u32 reg)
+@@ -1094,6 +1114,13 @@ static int aic_init_cpu(unsigned int cpu)
+ 			cpumask_set_cpu(cpu, &aic_irq_cpus);
+ 	}
+ 
++	/* Which CPUs the boot chain left accepting IRQs, for t8132_irq_cluster. */
++	if (aic_irqc->info.siq_cluster_route && t8132_irq_cluster >= 0 &&
++	    is_kernel_in_hyp_mode() &&
++	    FIELD_GET(SIQ_CFG_ROUTE, read_sysreg_s(SYS_IMP_APL_SIQ_CFG_EL1)) !=
++	    SIQ_CFG_ROUTE_NONE)
++		cpumask_set_cpu(cpu, &aic_route_boot_cpus);
++
+ 	/* Initialize the local mask state */
+ 	__this_cpu_write(aic_fiq_unmasked, 0);
+ 
+@@ -1461,3 +1488,75 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
+ IRQCHIP_DECLARE(apple_aic, "apple,aic", aic_of_ic_init);
+ IRQCHIP_DECLARE(apple_aic2, "apple,aic2", aic_of_ic_init);
+ IRQCHIP_DECLARE(apple_aic3, "apple,t8122-aic3", aic_of_ic_init);
++
++/* Runs on the CPU whose SIQ_CFG it sets: accept AIC IRQs (route 0) or none. */
++static void aic_siq_route(void *accept)
++{
++	sysreg_clear_set_s(SYS_IMP_APL_SIQ_CFG_EL1, SIQ_CFG_ROUTE,
++			   FIELD_PREP(SIQ_CFG_ROUTE, accept ? 0 : SIQ_CFG_ROUTE_NONE));
++	isb();
++}
++
++static bool aic_route_in_cluster(unsigned int cpu)
++{
++	return MPIDR_CLUSTER(cpu_logical_map(cpu)) == t8132_irq_cluster;
++}
++
++/* CPUHP_AP_ONLINE_DYN callbacks run on the CPU coming up or going down. */
++static int aic_route_online(unsigned int cpu)
++{
++	unsigned int b;
++
++	if (!aic_route_in_cluster(cpu))
++		return 0;
++	guard(mutex)(&aic_route_lock);
++	aic_siq_route((void *)1);
++	cpumask_set_cpu(cpu, &aic_route_cpus);
++	/* This CPU accepts IRQs now: release the boot CPUs outside the cluster. */
++	for_each_cpu(b, &aic_route_boot_cpus)
++		if (cpu_online(b) && !aic_route_in_cluster(b))
++			smp_call_function_single(b, aic_siq_route, NULL, 1);
++	return 0;
++}
++
++static int aic_route_offline(unsigned int cpu)
++{
++	unsigned int b;
++
++	if (!aic_route_in_cluster(cpu))
++		return 0;
++	guard(mutex)(&aic_route_lock);
++	cpumask_clear_cpu(cpu, &aic_route_cpus);
++	/* The last one: give IRQs back to the boot CPUs before this CPU stops. */
++	if (cpumask_empty(&aic_route_cpus))
++		for_each_cpu(b, &aic_route_boot_cpus)
++			if (cpu_online(b) && b != cpu)
++				smp_call_function_single(b, aic_siq_route, (void *)1, 1);
++	if (!cpumask_test_cpu(cpu, &aic_route_boot_cpus) || !cpumask_empty(&aic_route_cpus))
++		aic_siq_route(NULL);
++	return 0;
++}
++
++static int __init aic_route_init(void)
++{
++	int ret;
++
++	if (!aic_irqc || !aic_irqc->info.siq_cluster_route || t8132_irq_cluster < 0)
++		return 0;
++	if (!is_kernel_in_hyp_mode() || cpumask_empty(&aic_route_boot_cpus)) {
++		pr_warn("t8132_irq_cluster=%d ignored: not at EL2 or no boot IRQ CPU found\n",
++			t8132_irq_cluster);
++		return 0;
++	}
++	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "irqchip/apple-aic/route:online",
++				aic_route_online, aic_route_offline);
++	if (ret < 0) {
++		pr_err("t8132_irq_cluster=%d: hotplug state failed (%d)\n", t8132_irq_cluster, ret);
++		return 0;
++	}
++	pr_info("IRQs to cluster %d: CPUs %*pbl accept, boot CPUs were %*pbl\n",
++		t8132_irq_cluster, cpumask_pr_args(&aic_route_cpus),
++		cpumask_pr_args(&aic_route_boot_cpus));
++	return 0;
++}
++late_initcall(aic_route_init);
+-- 
+2.43.0
+

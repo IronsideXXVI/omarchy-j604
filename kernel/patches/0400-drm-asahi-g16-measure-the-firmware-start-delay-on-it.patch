@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 03:07:09 +0000
+Subject: [PATCH] drm/asahi: g16: measure the firmware start delay on
+ its own clock
+
+The latency counters compared each prefix's first stage stamp with its
+publication time as if both were 24 MHz ticks. The stage stamps are,
+but the publication time is CNTPCT, which runs at 1 GHz on M4 (the
+recorded last_bad pair is 41.67 apart, 1000/24), so no prefix ever
+passed the check and start_us was never measured.
+
+Convert the stage stamps to the counter with CNTFRQ_EL0 before the
+comparison, keep the sums in ns, and add, all in debugfs stats only:
+
+  start_hist_10us compute/render: publication to the first stage start
+      on the firmware's stamps, 10 us buckets;
+  phase200_10us, phase1ms_50us: the first stage start's phase on the
+      stage clock modulo 200 us and 1 ms, flat unless the firmware
+      starts work on a periodic tick;
+  retired_by: retired prefixes by the pass that found them (the EP 0x20
+      event pass, its trailing polls, or the timer re-poll), per kind.
+
+No submission, retirement or power behaviour changes.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 52 +++++++++++++++++++++++++++--
+ drivers/gpu/drm/asahi/g16/poll.rs   | 50 ++++++++++++++++++++++-----
+ 2 files changed, 91 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 1b9a4a551b..65de0eaeab 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -54,6 +54,39 @@ pub(crate) fn now_ns() -> u64 {
+     <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get() as u64
+ }
+ 
++/// `t * num / den` in 64-bit arithmetic: the fraction is reduced by its gcd, then split into
++/// whole and remainder parts (24 MHz and 1 GHz reduce to 3/125), so no 128-bit division is
++/// emitted (the module has no `__udivti3`). Saturates rather than wrapping; 0 for `den` 0.
++pub(crate) fn mul_div(t: u64, num: u64, den: u64) -> u64 {
++    if den == 0 {
++        return 0;
++    }
++    let (mut a, mut b) = (num, den);
++    while b != 0 {
++        (a, b) = (b, a % b);
++    }
++    let (num, den) = if a == 0 { (num, den) } else { (num / a, den / a) };
++    (t / den)
++        .saturating_mul(num)
++        .saturating_add((t % den).saturating_mul(num) / den)
++}
++
++/// CNTFRQ_EL0: the frequency of [`counter_ticks`] (1 GHz on M4; the firmware's stage stamps
++/// run at `hw::COMMAND_TIMESTAMP_HZ`, 24 MHz).
++pub(crate) fn counter_hz() -> u64 {
++    #[cfg(target_arch = "aarch64")]
++    {
++        let value: u64;
++        // SAFETY: CNTFRQ_EL0 is the read-only architectural counter frequency.
++        unsafe { core::arch::asm!("mrs {value}, cntfrq_el0", value = out(reg) value) };
++        value
++    }
++    #[cfg(not(target_arch = "aarch64"))]
++    {
++        1_000_000_000
++    }
++}
++
+ /// Counter value carried by a native 25G83 submit-pipe record.
+ pub(crate) fn counter_ticks() -> u64 {
+     #[cfg(target_arch = "aarch64")]
+@@ -262,9 +295,10 @@ pub(crate) struct Stats {
+     pub(crate) fs_ticks: u64,
+     pub(crate) cdm_ticks: u64,
+     pub(crate) span_ticks: u64,
+-    /// Retired prefixes whose stage stamps lie between publication and retirement on the
+-    /// architectural counter, and those that did not; publication to first stage start and
+-    /// last stage end to retirement (sums and maximum start, 24 MHz ticks).
++    /// Retired prefixes whose stage stamps, converted from the stage clock to the
++    /// architectural counter, lie between publication and retirement, and those that did not;
++    /// publication to first stage start and last stage end to retirement (sums and maximum
++    /// start, ns).
+     pub(crate) lat_n: u64,
+     pub(crate) lat_bad: u64,
+     pub(crate) start_ticks: u64,
+@@ -275,6 +309,18 @@ pub(crate) struct Stats {
+     pub(crate) lat_last_bad: [u64; 4],
+     /// Publication to first firmware event of render prefixes, 100 us buckets (last: >= 2 ms).
+     pub(crate) first_hist: [u64; 21],
++    /// Publication to first firmware stage start on the firmware's own stamps, 10 us
++    /// buckets (last: >= 310 us): [0] compute-only prefixes, [1] render and mixed.
++    pub(crate) start_hist: [[u64; 32]; 2],
++    /// Phase of the first stage start on the stage clock, modulo 200 us (10 us buckets) and
++    /// modulo 1 ms (50 us buckets): flat without a firmware tick, peaked with one.
++    pub(crate) phase200: [u64; 20],
++    pub(crate) phase1ms: [u64; 20],
++    /// Retired prefixes by the pass that found them: [event pass, trailing poll after an
++    /// event, timer re-poll or backup] x [compute-only, render, mixed].
++    pub(crate) retired_by: [[u64; 3]; 3],
++    /// The kind of the current retirement pass, an index into `retired_by`.
++    pub(crate) retire_src: u8,
+     /// Publication to first firmware event of render prefixes, split by whether the prefix's
+     /// VM differs from the previous retired render prefix's VM: [0] same, [1] cross (count, ns).
+     pub(crate) first_vm_n: [u64; 2],
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 708a0f2ef4..a39b18f1b1 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -275,6 +275,7 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+     pub(crate) fn retire(&mut self, evented: bool, done: &mut Completions) -> Result {
+         // After an event, a few short trailing polls catch the final receipts.
+         let mut tail = if evented && !params::irq_only() { 4 } else { 0 };
++        self.engine.stats.retire_src = if evented { 0 } else { 2 };
+         let mut ret;
+ 
+         loop {
+@@ -296,6 +297,7 @@ pub(crate) fn retire(&mut self, evented: bool, done: &mut Completions) -> Result
+                 break;
+             }
+             tail -= 1;
++            self.engine.stats.retire_src = 1;
+             delay::udelay(Delta::from_micros(5));
+         }
+         self.recovery.receipt_fault = ret.is_err();
+@@ -849,15 +851,26 @@ fn stat_retire(&mut self, f: &Flight) {
+         }
+         if hi > lo {
+             s.span_ticks = s.span_ticks.saturating_add(hi - lo);
+-            // Stage stamps and the publication time share the 24 MHz counter when they fall
+-            // between publication and now; anything else is counted, not summed.
++            // The stage stamps run at COMMAND_TIMESTAMP_HZ on the architectural counter's epoch;
++            // the publication time is the counter itself (CNTFRQ, 1 GHz on M4). Stamps that
++            // do not fall between publication and now are counted, not summed.
+             let now_ticks = counter_ticks();
+-            if f.published_ticks != 0 && lo >= f.published_ticks && hi <= now_ticks {
+-                let start = lo - f.published_ticks;
++            let freq = super::engine::counter_hz();
++            let hz = super::hw::COMMAND_TIMESTAMP_HZ;
++            let to_counter = |t: u64| super::engine::mul_div(t, freq, hz);
++            let ns = |t: u64| super::engine::mul_div(t, 1_000_000_000, freq);
++            let (lo_c, hi_c) = (to_counter(lo), to_counter(hi));
++            if f.published_ticks != 0 && freq != 0 && lo_c >= f.published_ticks && hi_c <= now_ticks
++            {
++                let start = ns(lo_c - f.published_ticks);
+                 s.start_ticks = s.start_ticks.saturating_add(start);
+                 s.start_max_ticks = s.start_max_ticks.max(start);
+-                s.tail_ticks = s.tail_ticks.saturating_add(now_ticks - hi);
++                s.tail_ticks = s.tail_ticks.saturating_add(ns(now_ticks - hi_c));
+                 s.lat_n += 1;
++                s.start_hist[usize::from(kind != 0)][((start / 10_000) as usize).min(31)] += 1;
++                let (p200, p1ms) = (hz / 5000, hz / 1000);
++                s.phase200[((lo % p200) * 20 / p200) as usize] += 1;
++                s.phase1ms[((lo % p1ms) * 20 / p1ms) as usize] += 1;
+             } else {
+                 s.lat_bad += 1;
+                 s.lat_last_bad = [f.published_ticks, lo, hi, now_ticks];
+@@ -896,6 +909,7 @@ fn stat_retire(&mut self, f: &Flight) {
+             s.last_render_vm = f.job.vm.id;
+         }
+         s.prefixes[kind] += 1;
++        s.retired_by[usize::from(s.retire_src.min(2))][kind] += 1;
+         s.busy_ns[kind] += d;
+         s.max_ns[kind] = s.max_ns[kind].max(d);
+     }
+@@ -1122,9 +1136,9 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             "latency: n {} bad {} start_us {} start_max_us {} tail_us {} last_bad {} {} {} {}",
+             s.lat_n,
+             s.lat_bad,
+-            s.start_ticks / 24,
+-            s.start_max_ticks / 24,
+-            s.tail_ticks / 24,
++            s.start_ticks / 1000,
++            s.start_max_ticks / 1000,
++            s.tail_ticks / 1000,
+             s.lat_last_bad[0],
+             s.lat_last_bad[1],
+             s.lat_last_bad[2],
+@@ -1135,6 +1149,26 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             write!(f, " {}", n)?;
+         }
+         writeln!(f)?;
++        for (name, h) in [("compute", &s.start_hist[0]), ("render", &s.start_hist[1])] {
++            write!(f, "start_hist_10us {}:", name)?;
++            for n in h.iter() {
++                write!(f, " {}", n)?;
++            }
++            writeln!(f)?;
++        }
++        for (name, h) in [("phase200_10us", &s.phase200), ("phase1ms_50us", &s.phase1ms)] {
++            write!(f, "{}:", name)?;
++            for n in h.iter() {
++                write!(f, " {}", n)?;
++            }
++            writeln!(f)?;
++        }
++        let r = &s.retired_by;
++        writeln!(
++            f,
++            "retired_by: event {}/{}/{} trail {}/{}/{} timer {}/{}/{}",
++            r[0][0], r[0][1], r[0][2], r[1][0], r[1][1], r[1][2], r[2][0], r[2][1], r[2][2]
++        )?;
+         writeln!(
+             f,
+             "first_vm: same {} same_us {} cross {} cross_us {}",
+-- 
+2.43.0
+

@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 03:06:52 +0000
+Subject: [PATCH] drm/asahi: g16: optionally publish a queue's next
+ render behind its running one
+
+A command is published only when Order::ready() sees every earlier
+command of its queue on the same engine retired. Mesa passes no
+same-queue input fence, so this frontier alone serialises a queue: job
+N+1 waits in the engine's pending list until job N's full receipt, and
+the firmware is never given a second command (overlaps 0, also with
+g16_flights=2 and g16_submit_ahead=1).
+
+The engine's render work rings are FIFO, so a same-queue render
+predecessor that is already published orders the next one in the ring.
+Add g16_depth (runtime 0644, default 0, unchanged). With 1, the first
+render command of a job may be published while its queue's single
+render predecessor is in flight: the queue keeps a published frontier
+next to the completed one, and Order::ready_in_flight() accepts a
+command whose predecessor is published but not retired. Explicit
+barriers and historical priors still wait for completion. It uses the
+existing render-behind path (ahead_ok, post_ahead, the receipt of the
+oldest of two flights), now allowed for 1 + g16_depth flights.
+
+Recovery is unchanged: the engine already retires flights oldest first
+(command_retired() still advances one ordinal at a time), a firmware
+notification may name either of two flights, and fail_flights() fails
+and retains every flight, latching the VM error so later commands of
+that VM are refused.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/command.rs | 15 +++++++++++++++
+ drivers/gpu/drm/asahi/g16/engine.rs  |  3 ++-
+ drivers/gpu/drm/asahi/g16/job.rs     | 25 ++++++++++++++++++++++---
+ drivers/gpu/drm/asahi/g16/params.rs  | 20 ++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/queue.rs   |  4 ++++
+ 5 files changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/command.rs b/drivers/gpu/drm/asahi/g16/command.rs
+index b326701955..c82e8d9678 100644
+--- a/drivers/gpu/drm/asahi/g16/command.rs
++++ b/drivers/gpu/drm/asahi/g16/command.rs
+@@ -114,6 +114,21 @@ pub(crate) fn new(
+     /// A same-engine command cannot jump a hole in its queue's completed frontier.
+     /// Cross-engine historical dependencies end at the named prefix, even while later
+     /// commands in that older submission remain pending.
++    /// `g16_depth` = 1: a render command whose one same-queue render predecessor is published
++    /// but not yet retired may follow it into the engine's FIFO render ring. Its explicit
++    /// barriers and historical priors (`wait_through`) must still have completed.
++    pub(crate) fn ready_in_flight(&self, completed: [u64; 2], published: [u64; 2]) -> bool {
++        let e = self.engine;
++        e == RENDER
++            && published[e].checked_add(1) == Some(self.sequence)
++            && published[e] == completed[e].saturating_add(1)
++            && self
++                .wait_through
++                .iter()
++                .zip(completed)
++                .all(|(prefix, observed)| prefix.is_none_or(|last| observed >= last))
++    }
++
+     pub(crate) fn ready(&self, completed: [u64; 2]) -> bool {
+         completed[self.engine].checked_add(1) == Some(self.sequence)
+             && self
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index af9ed473fe..07da2ce132 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -842,7 +842,7 @@ pub(crate) fn enqueue(&mut self, job: Arc<Job>) -> Result {
+     /// before publication; a dependency on a running command keeps it pending.
+     fn ahead_ok(&self, job: &Job) -> bool {
+         let n = self.engine.flights.len();
+-        n < params::flights().min(sizes::FLIGHTS)
++        n < params::flights().max(1 + params::depth() as usize).min(sizes::FLIGHTS)
+             && self.engine.draw != 0
+             && !self.engine.frozen
+             && matches!(command(job, job.progress.sent()), Some(Command::Render(_)))
+@@ -1332,6 +1332,7 @@ fn publish_prefix_into(
+         }
+         self.stat_publish(f);
+         self.renew_deadlines();
++        job.command_published(index);
+         job.progress.set_sent(index + 1);
+         let mut flight = Flight::new(job.clone());
+         core::mem::swap(&mut flight, f);
+diff --git a/drivers/gpu/drm/asahi/g16/job.rs b/drivers/gpu/drm/asahi/g16/job.rs
+index 31f06c80ab..1724a2f7d7 100644
+--- a/drivers/gpu/drm/asahi/g16/job.rs
++++ b/drivers/gpu/drm/asahi/g16/job.rs
+@@ -290,10 +290,29 @@ pub(crate) fn check_command_dependencies(&self, index: u32) -> Result {
+             .completed
+             .each_ref()
+             .map(|value| value.load(Ordering::Acquire));
+-        if !order.ready(completed) {
+-            return Err(EAGAIN);
++        if order.ready(completed) {
++            return Ok(());
++        }
++        // Only a job's first command goes behind an in-flight predecessor (of an earlier
++        // job): one job never occupies two flights.
++        if super::params::depth() != 0 && index == 0 {
++            let published = self
++                .queue
++                .published
++                .each_ref()
++                .map(|value| value.load(Ordering::Acquire));
++            if order.ready_in_flight(completed, published) {
++                return Ok(());
++            }
++        }
++        Err(EAGAIN)
++    }
++
++    /// Records the queue's published frontier for the command at `index` (`g16_depth`).
++    pub(crate) fn command_published(&self, index: u32) {
++        if let Some(order) = self.orders.get(index as usize) {
++            self.queue.published[order.engine].fetch_max(order.sequence, Ordering::AcqRel);
+         }
+-        Ok(())
+     }
+ 
+     /// Advances exactly one queue-local engine ordinal after a full successful wire receipt.
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index c9f31d6182..dc14f43739 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -550,6 +550,26 @@ pub(crate) fn submit_ts() -> u32 {
+     "G16: clock of the submit record time word (default 0: architectural counter; 1: firmware stage clock, 24 MHz; runtime 0644)"
+ );
+ 
++/// Storage of `g16_depth` (runtime 0644, default 0).
++static DEPTH: AtomicU32 = AtomicU32::new(0);
++
++/// How many earlier render commands of the same queue may still be in flight when the next
++/// one is published: 0 waits for their retirement (the qualified protocol), 1 lets one
++/// render command go behind its queue's running predecessor, ordered by the engine's FIFO
++/// render ring. Explicit barriers and historical priors still wait for completion.
++pub(crate) fn depth() -> u32 {
++    DEPTH.load(Ordering::Relaxed).min(1)
++}
++
++live_u32_param!(
++    DEPTH_PARAM,
++    DEPTH_PARMTYPE,
++    DEPTH_PARM,
++    DEPTH,
++    "g16_depth",
++    "G16: render commands of one queue that may stay in flight behind the next publication (default 0: publish after retirement; 1: one in flight; runtime 0644)"
++);
++
+ /// Storage of `g16_effort` (runtime 0644, default 0).
+ static EFFORT: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/queue.rs b/drivers/gpu/drm/asahi/g16/queue.rs
+index f127147aff..5806703ad7 100644
+--- a/drivers/gpu/drm/asahi/g16/queue.rs
++++ b/drivers/gpu/drm/asahi/g16/queue.rs
+@@ -55,6 +55,9 @@ pub(crate) struct QueueState {
+     /// Exact successful firmware receipts, independently for render and compute. These
+     /// survive aggregate-fence publication and never advance on aborted/failed commands.
+     pub(crate) completed: [AtomicU64; 2],
++    /// Highest ordinal published to the firmware, per engine (`g16_depth`). Never behind
++    /// `completed`; only read to let a command go behind its in-flight predecessor.
++    pub(crate) published: [AtomicU64; 2],
+     /// Owned-job counts at the queue's last 32 arrivals (compute horizon ahead), recorded by the
+     /// engine when a job arrives.
+     pub(crate) owned: [AtomicU32; 32],
+@@ -140,6 +143,7 @@ pub(crate) fn new(
+                 cancelled_at: [const { AtomicU64::new(0) }; 2],
+                 turn: AtomicU64::new(0),
+                 completed: [const { AtomicU64::new(0) }; 2],
++                published: [const { AtomicU64::new(0) }; 2],
+                 owned: [const { AtomicU32::new(0) }; 32],
+                 owned_index: AtomicU32::new(0),
+             },
+-- 
+2.43.0
+
