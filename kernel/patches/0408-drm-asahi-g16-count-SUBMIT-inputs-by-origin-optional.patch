@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 04:03:16 +0000
+Subject: [PATCH] drm/asahi: g16: count SUBMIT inputs by origin,
+ optionally release wrapped same-queue ones
+
+With g16_depth=1 and g16_submit_ahead=1 a queue's next render still
+never reaches the engine while its predecessor runs (overlaps 0 on
+1.873, also across processes). Timeline::owns() recognises an input
+only when it is a job fence of the queue itself. A timeline syncobj
+point is a dma_fence_chain, whose own context never matches, so such an
+input is still waited for in job.start() until the predecessor retires.
+
+Count every SUBMIT input in debugfs by origin (already signalled, a job
+fence of the same queue, a chain/array that wraps only unsignalled job
+fences of the same queue, anything else), and add g16_submit_ahead=2,
+which also releases the wrapped kind to engine ordering, as level 1
+does for direct ones. A member of another context that is unsignalled
+or failed keeps the input. Levels 0 and 1 are unchanged; the default
+stays 0.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/fence.rs  | 57 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/params.rs |  8 ++--
+ drivers/gpu/drm/asahi/g16/poll.rs   |  8 +++-
+ drivers/gpu/drm/asahi/g16/queue.rs  | 23 ++++++++++--
+ 4 files changed, 88 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/fence.rs b/drivers/gpu/drm/asahi/g16/fence.rs
+index b1a071fa3a..03407f4fdb 100644
+--- a/drivers/gpu/drm/asahi/g16/fence.rs
++++ b/drivers/gpu/drm/asahi/g16/fence.rs
+@@ -28,6 +28,30 @@
+ /// Same-queue input fences released to engine ordering (`g16_submit_ahead` >= 1), all queues.
+ pub(crate) static SAME_QUEUE_RELEASED: AtomicU64 = AtomicU64::new(0);
+ 
++/// SUBMIT input fences by origin, all queues: already signalled; a job fence of the same queue;
++/// a chain/array whose every unsignalled member is a job fence of the same queue; anything else.
++pub(crate) static INPUTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
++pub(crate) const INPUT_SIGNALED: usize = 0;
++pub(crate) const INPUT_OWN: usize = 1;
++pub(crate) const INPUT_WRAPPED_OWN: usize = 2;
++pub(crate) const INPUT_FOREIGN: usize = 3;
++
++/// `struct dma_fence_unwrap` (include/linux/dma-fence-unwrap.h).
++#[repr(C)]
++struct FenceUnwrap {
++    chain: *mut kernel::bindings::dma_fence,
++    array: *mut kernel::bindings::dma_fence,
++    index: core::ffi::c_uint,
++}
++
++extern "C" {
++    fn dma_fence_unwrap_first(
++        head: *mut kernel::bindings::dma_fence,
++        cursor: *mut FenceUnwrap,
++    ) -> *mut kernel::bindings::dma_fence;
++    fn dma_fence_unwrap_next(cursor: *mut FenceUnwrap) -> *mut kernel::bindings::dma_fence;
++}
++
+ /// Reads a retained dependency's completion status without waiting or invoking callbacks.
+ pub(crate) fn dependency_status(fence: &Fence) -> i32 {
+     // SAFETY: The Fence reference keeps its dma_fence alive throughout the status read.
+@@ -135,6 +159,39 @@ pub(crate) fn owns(&self, fence: &Fence) -> bool {
+         context != u64::MAX && unsafe { (*fence.raw()).context } == context
+     }
+ 
++    /// Whether `fence`, unwrapped (a dma_fence_chain and dma_fence_array to their members, or the
++    /// fence itself), has an unsignalled job fence of this queue and no other unsignalled or
++    /// failed member.
++    pub(crate) fn owns_wrapped(&self, fence: &Fence) -> bool {
++        let context = self.job_context.load(Ordering::Relaxed);
++        if context == u64::MAX {
++            return false;
++        }
++        let mut cursor = FenceUnwrap {
++            chain: core::ptr::null_mut(),
++            array: core::ptr::null_mut(),
++            index: 0,
++        };
++        let (mut own, mut other) = (false, false);
++        // SAFETY: The Fence reference keeps the head alive. The iteration always runs to its
++        // end, so the references the cursor takes on chain nodes are all dropped again; each
++        // member returned is kept alive by the node the cursor holds until the next step.
++        let mut member = unsafe { dma_fence_unwrap_first(fence.raw(), &mut cursor) };
++        while !member.is_null() {
++            // SAFETY: `member` is live until the next unwrap step (see above).
++            let (status, ctx) =
++                unsafe { (kernel::bindings::dma_fence_get_status(member), (*member).context) };
++            if ctx == context {
++                own |= status == 0;
++            } else if status <= 0 {
++                other = true;
++            }
++            // SAFETY: As above.
++            member = unsafe { dma_fence_unwrap_next(&mut cursor) };
++        }
++        own && !other
++    }
++
+     /// Creates the fence of the next accepted job. Fences are created in submission order: the
+     /// caller holds the queue (SUBMIT is serialized per queue).
+     pub(crate) fn next(self: &Arc<Self>) -> Result<JobFence> {
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index dc14f43739..0163e0672d 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -613,9 +613,11 @@ pub(crate) fn flights() -> usize {
+ /// fence that is a job fence of the SAME logical queue is not waited for by the scheduler (the
+ /// engine's queue ordinals and its one-at-a-time publication already order it), so the dependent
+ /// job reaches the engine before its predecessor retires and is published in the retiring poll
+-/// pass instead of after fence signal -> scheduler -> run. Levels above 1 are reserved.
++/// pass instead of after fence signal -> scheduler -> run. 2 = also an input that wraps such
++/// fences (a timeline-syncobj dma_fence_chain or a dma_fence_array) whose every unsignaled
++/// member is a job fence of the same queue. Levels above 2 are reserved.
+ pub(crate) fn submit_ahead() -> u32 {
+-    SUBMIT_AHEAD.load(Ordering::Relaxed).min(1)
++    SUBMIT_AHEAD.load(Ordering::Relaxed).min(2)
+ }
+ 
+ live_u32_param!(
+@@ -624,7 +626,7 @@ pub(crate) fn submit_ahead() -> u32 {
+     SUBMIT_AHEAD_PARM,
+     SUBMIT_AHEAD,
+     "g16_submit_ahead",
+-    "G16: 0 (default) today's protocol; 1 = same-queue input fences are ordered by the engine, not waited for by the scheduler (experimental; runtime 0644)"
++    "G16: 0 (default) today's protocol; 1 = same-queue input fences are ordered by the engine, not waited for by the scheduler; 2 = also chain/array inputs wrapping only same-queue fences (experimental; runtime 0644)"
+ );
+ 
+ /// Storage of `g16_pb_reuse` (runtime 0644, default 1).
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index a39b18f1b1..138af489b5 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1027,9 +1027,13 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         )?;
+         writeln!(
+             f,
+-            "submit_ahead: level {} same_queue_inputs_released {}",
++            "submit_ahead: level {} same_queue_inputs_released {} inputs signaled/own/wrapped_own/foreign {}/{}/{}/{}",
+             params::submit_ahead(),
+-            super::fence::SAME_QUEUE_RELEASED.load(core::sync::atomic::Ordering::Relaxed)
++            super::fence::SAME_QUEUE_RELEASED.load(core::sync::atomic::Ordering::Relaxed),
++            super::fence::INPUTS[0].load(core::sync::atomic::Ordering::Relaxed),
++            super::fence::INPUTS[1].load(core::sync::atomic::Ordering::Relaxed),
++            super::fence::INPUTS[2].load(core::sync::atomic::Ordering::Relaxed),
++            super::fence::INPUTS[3].load(core::sync::atomic::Ordering::Relaxed)
+         )?;
+         let (live, handles) = self.vms.counts();
+         writeln!(f, "vm_bindings: live {} handles {}", live, handles)?;
+diff --git a/drivers/gpu/drm/asahi/g16/queue.rs b/drivers/gpu/drm/asahi/g16/queue.rs
+index 5806703ad7..134ad1fe17 100644
+--- a/drivers/gpu/drm/asahi/g16/queue.rs
++++ b/drivers/gpu/drm/asahi/g16/queue.rs
+@@ -191,13 +191,30 @@ fn submit_job(
+             self.state.check(order)?;
+         }
+         let mut inputs = KVec::with_capacity(syncs.inputs().len(), GFP_KERNEL)?;
+-        let submit_ahead = params::submit_ahead() >= 1;
++        let submit_ahead = params::submit_ahead();
+         for sync in syncs.inputs() {
+             if let Some(fence) = &sync.fence {
++                use super::fence::{
++                    INPUTS, INPUT_FOREIGN, INPUT_OWN, INPUT_SIGNALED, INPUT_WRAPPED_OWN,
++                };
++                let own = self.timeline.owns(fence);
++                let pending = super::fence::dependency_status(fence) == 0;
++                let wrapped = !own && pending && self.timeline.owns_wrapped(fence);
++                let origin = if !pending {
++                    INPUT_SIGNALED
++                } else if own {
++                    INPUT_OWN
++                } else if wrapped {
++                    INPUT_WRAPPED_OWN
++                } else {
++                    INPUT_FOREIGN
++                };
++                INPUTS[origin].fetch_add(1, Ordering::Relaxed);
+                 // Submit-ahead: a predecessor of this very queue is ordered by the engine (queue
+                 // ordinals, one command published at a time) and its failure latches this VM, so
+-                // the scheduler need not wait for it to complete.
+-                if submit_ahead && self.timeline.owns(fence) {
++                // the scheduler need not wait for it to complete. Level 2 also releases a chain or
++                // array that wraps only such predecessors (a timeline-syncobj point).
++                if (submit_ahead >= 1 && own) || (submit_ahead >= 2 && wrapped) {
+                     super::fence::SAME_QUEUE_RELEASED.fetch_add(1, Ordering::Relaxed);
+                     continue;
+                 }
+-- 
+2.43.0
+

@@ -1,0 +1,308 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 04:00:48 +0000
+Subject: [PATCH] arm64: sleep: let a platform catch exceptions early
+ in cpu_resume
+
+Until cpu_do_resume restores VBAR, an exception in the resume path has
+nowhere to go. Before init_kernel_el it lands in whatever vectors the
+firmware left; after it, in the hyp stub's, whose EL2h sync entry
+erets back to the faulting instruction and whose other entries spin.
+Either way the CPU stops without a trace, and on a platform that can
+only see a resume through its watchdog that looks the same as a hang
+without any exception.
+
+Let a platform name vectors for that stretch: their PA, which
+cpu_resume installs at EL2 right after init_kernel_el with the MMU
+off, and their kernel VA, which _cpu_resume installs first thing with
+the MMU on. Nothing is added to the ID map, so the table can sit in
+.text. 0, the default, changes nothing.
+
+On T8132 the Apple sleep driver sets both, and its resume stub
+installs the PA before it jumps to cpu_resume. Each entry restarts
+WD2 for its class (sync 145 s, SError 160 s, IRQ or FIQ 175 s), using
+the watchdog's PA or VA as SCTLR.M says, and then leaves ESR's class
+and ISS low byte in PMU scratch 0xf804/0xf805 with 0xa5 in 0xf806.
+A reset at the stub's 60 s then means no exception at all.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ arch/arm64/include/asm/suspend.h |   8 ++
+ arch/arm64/kernel/sleep.S        |  20 ++++
+ arch/arm64/kernel/suspend.c      |   4 +
+ drivers/soc/apple/sleep.c        | 158 ++++++++++++++++++++++++++++++-
+ 4 files changed, 189 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/include/asm/suspend.h b/arch/arm64/include/asm/suspend.h
+index 6147e2d085..1501bae788 100644
+--- a/arch/arm64/include/asm/suspend.h
++++ b/arch/arm64/include/asm/suspend.h
+@@ -51,6 +51,14 @@ enum arm64_suspend_mark {
+ };
+ 
+ extern void (*arm64_suspend_mark_hook)(enum arm64_suspend_mark mark);
++
++/*
++ * Vectors a platform wants for the way back from a firmware resume, until cpu_do_resume
++ * restores VBAR: their PA, installed at EL2 by cpu_resume right after init_kernel_el
++ * (MMU off), and their kernel VA, installed by _cpu_resume (MMU on). 0: none.
++ */
++extern u64 arm64_resume_vbar;
++extern unsigned long arm64_resume_vbar_va;
+ extern void cpu_resume(void);
+ int __cpu_suspend_enter(struct sleep_stack_data *state);
+ void __cpu_suspend_exit(void);
+diff --git a/arch/arm64/kernel/sleep.S b/arch/arm64/kernel/sleep.S
+index 11a08cb030..5d4c2232d5 100644
+--- a/arch/arm64/kernel/sleep.S
++++ b/arch/arm64/kernel/sleep.S
+@@ -3,6 +3,7 @@
+ #include <linux/linkage.h>
+ #include <asm/asm-offsets.h>
+ #include <asm/assembler.h>
++#include <asm/ptrace.h>
+ #include <asm/smp.h>
+ 
+ 	.text
+@@ -105,6 +106,19 @@ SYM_CODE_START(cpu_resume)
+ #endif
+ 	bl	init_kernel_el
+ 	mov	x19, x0			// preserve boot mode
++	/*
++	 * init_kernel_el left the hyp stub's vectors, which spin on any exception
++	 * at EL2. A platform may catch them until cpu_do_resume restores VBAR.
++	 */
++	adr_l	x1, arm64_resume_vbar
++	ldr	x1, [x1]
++	cbz	x1, 0f
++	mrs	x2, CurrentEL
++	cmp	x2, #CurrentEL_EL2
++	b.ne	0f
++	msr	vbar_el2, x1
++	isb
++0:
+ 	bl	__cpu_setup
+ 	/* enable the MMU early - so we can access sleep_save_stash by va */
+ 	adrp	x1, swapper_pg_dir
+@@ -117,6 +131,12 @@ SYM_CODE_END(cpu_resume)
+ 	.popsection
+ 
+ SYM_FUNC_START(_cpu_resume)
++	/* The MMU is on now: the same vectors by their kernel VA (VBAR_EL2 under VHE). */
++	ldr_l	x1, arm64_resume_vbar_va
++	cbz	x1, 1f
++	msr	vbar_el1, x1
++	isb
++1:
+ 	mov	x0, x19
+ 	bl	finalise_el2
+ 
+diff --git a/arch/arm64/kernel/suspend.c b/arch/arm64/kernel/suspend.c
+index 142ec97529..2a404c44ac 100644
+--- a/arch/arm64/kernel/suspend.c
++++ b/arch/arm64/kernel/suspend.c
+@@ -44,6 +44,10 @@ void __init cpu_suspend_set_dbg_restorer(int (*hw_bp_restore)(unsigned int))
+ 
+ void (*arm64_suspend_mark_hook)(enum arm64_suspend_mark mark);
+ 
++/* Read by cpu_resume with the MMU off: the setter cleans it to the PoC. */
++u64 arm64_resume_vbar __section(".mmuoff.data.read");
++unsigned long arm64_resume_vbar_va;
++
+ static __always_inline void arm64_suspend_mark(enum arm64_suspend_mark mark)
+ {
+ 	void (*hook)(enum arm64_suspend_mark mark) = READ_ONCE(arm64_suspend_mark_hook);
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 5375cb54d2..312a1e2347 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -2987,6 +2987,135 @@ static void apple_sleep_wait_still_on(struct apple_sleep *s)
+ 		sleep_ps_wait_off(s, words->offset[i]);
+ }
+ 
++/*
++ * Until cpu_do_resume restores VBAR, an exception on T8132's way back lands in aura's
++ * vectors (before init_kernel_el) or the hyp stub's (after it), and both spin: the
++ * reset then reads as the stub's 60 s. These vectors are in .text, used by PA while
++ * the MMU is off and by kernel VA once _cpu_resume runs. Each restarts WD2 by class,
++ * sync 145 s, SError 160 s, IRQ or FIQ 175 s, then leaves ESR's class and ISS low
++ * byte in PMU scratch 0xf804/0xf805 with 0xa5 in 0xf806, which macsmc-reboot prints
++ * on the next boot. The SPMI writes come last: WD2 resets the SoC either way.
++ */
++u64 t8132_catch_io[4];
++asm(
++"\t.pushsection .text, \"ax\"\n"
++"\t.balign\t2048\n"
++"t8132_resume_vectors:\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #0\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #1\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #2\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #3\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #4\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #5\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #6\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #7\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #8\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #9\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #10\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #11\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #12\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #13\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #14\n"
++"\tb\tt8132_resume_catch\n"
++"\t.balign\t128\n"
++"\tmov\tw9, #15\n"
++"\tb\tt8132_resume_catch\n"
++"t8132_resume_catch:\n"
++"\tadrp\tx10, t8132_catch_io\n"
++"\tadd\tx10, x10, :lo12:t8132_catch_io\n"
++"\tmrs\tx11, sctlr_el2\n"
++"\ttbz\tx11, #0, 1f\n"
++"\tadd\tx10, x10, #16\n"
++"1:\n"
++"\tldr\tx11, [x10]\n"
++"\tldr\tx12, [x10, #8]\n"
++"\tand\tw13, w9, #3\n"
++"\tmovz\tw14, #0x9600\n"
++"\tmovk\tw14, #0xcf6c, lsl #16\n"
++"\tcbz\tw13, 2f\n"
++"\tmovz\tw14, #0xea00\n"
++"\tmovk\tw14, #0xfa56, lsl #16\n"
++"\tcmp\tw13, #3\n"
++"\tb.ne\t2f\n"
++"\tmovz\tw14, #0xc000\n"
++"\tmovk\tw14, #0xe4e1, lsl #16\n"
++"2:\n"
++"\tstr\twzr, [x11, #0x2c]\n"
++"\tstr\twzr, [x11, #0x20]\n"
++"\tstr\tw14, [x11, #0x28]\n"
++"\tmov\tw14, #1\n"
++"\tstr\tw14, [x11, #0x2c]\n"
++"\tcbz\tx12, 9f\n"
++"\tmrs\tx15, esr_el2\n"
++"\tmov\tw0, #0xf804\n"
++"\tubfx\tw1, w15, #26, #6\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf805\n"
++"\tand\tw1, w15, #0xff\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf806\n"
++"\tmov\tw1, #0xa5\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"9:\n"
++"\twfe\n"
++"\tb\t9b\n"
++"t8132_catch_pmu_write:\n"
++"\tmovz\tw2, #0x8e30\n"
++"\torr\tw2, w2, w0, lsl #16\n"
++"\tstr\tw2, [x12, #0x04]\n"
++"\tstr\tw1, [x12, #0x04]\n"
++"\tmov\tw3, #0x10000\n"
++"3:\n"
++"\tldr\tw4, [x12]\n"
++"\ttbz\tw4, #24, 4f\n"
++"\tsubs\tw3, w3, #1\n"
++"\tb.ne\t3b\n"
++"\tb\t6f\n"
++"4:\n"
++"\tmov\tw3, #64\n"
++"5:\n"
++"\tldr\tw4, [x12]\n"
++"\ttbnz\tw4, #24, 6f\n"
++"\tldr\tw4, [x12, #0x08]\n"
++"\tsubs\tw3, w3, #1\n"
++"\tb.ne\t5b\n"
++"6:\n"
++"\tmov\tw4, #1\n"
++"\tstr\tw4, [x12, #0x80]\n"
++"\tret\n"
++"\t.popsection\n"
++);
++void t8132_resume_vectors(void);
++
+ /*
+  * The first thing Linux runs after a wake, MMU off and no stack. The last wake program
+  * leaves WD2 running for 5 s: restart it for 60 s, in the order apple_sleep_set_wd2() uses. No
+@@ -2996,6 +3125,10 @@ asm(
+ "	.pushsection .text, \"ax\"\n"
+ "	.type	t8132_resume_stub, %function\n"
+ "t8132_resume_stub:\n"
++"\tadrp\tx9, t8132_resume_vectors\n"
++"\tadd\tx9, x9, :lo12:t8132_resume_vectors\n"
++"\tmsr\tvbar_el2, x9\n"
++"\tisb\n"
+ "	movz	x9, #0x882b, lsl #16\n"
+ "	movk	x9, #0x3, lsl #32\n"
+ "	str	wzr, [x9, #0x2c]\n"
+@@ -4336,6 +4469,29 @@ static int apple_sleep_alloc_books(struct apple_sleep *s)
+ 	return 0;
+ }
+ 
++/* What the resume marks and the early-exception vectors need, set once at probe. */
++static void t8132_catch_init(struct platform_device *pdev, struct apple_sleep *s)
++{
++	struct resource *wdt = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wdt");
++	struct resource *spmi = platform_get_resource_byname(pdev, IORESOURCE_MEM, "spmi");
++
++	WRITE_ONCE(arm64_suspend_mark_hook, t8132_return_mark);
++	if (!wdt)
++		return;
++	t8132_catch_io[0] = wdt->start;
++	t8132_catch_io[2] = (unsigned long)s->wdt;
++	if (spmi) {
++		t8132_catch_io[1] = spmi->start;
++		t8132_catch_io[3] = (unsigned long)s->spmi;
++	}
++	dcache_clean_poc((unsigned long)t8132_catch_io,
++			 (unsigned long)t8132_catch_io + sizeof(t8132_catch_io));
++	arm64_resume_vbar = __pa_symbol(t8132_resume_vectors);
++	arm64_resume_vbar_va = (unsigned long)t8132_resume_vectors;
++	dcache_clean_poc((unsigned long)&arm64_resume_vbar,
++			 (unsigned long)(&arm64_resume_vbar + 1));
++}
++
+ static int apple_sleep_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -4402,7 +4558,7 @@ static int apple_sleep_probe(struct platform_device *pdev)
+ 	/* Last: the exported helpers take it as a probed driver, and a failure frees s. */
+ 	apple_sleep = s;
+ 	if (s->soc->commit == t8132_sleep_commit)
+-		WRITE_ONCE(arm64_suspend_mark_hook, t8132_return_mark);
++		t8132_catch_init(pdev, s);
+ 	/* Deep becomes the default sleep state, unless mem_sleep_default= chose another. */
+ 	suspend_set_ops(&apple_sleep_ops);
+ 	/* Userspace may still pick deep through /sys/power/mem_sleep. */
+-- 
+2.43.0
+

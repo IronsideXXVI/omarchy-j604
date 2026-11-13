@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 04:00:48 +0000
+Subject: [PATCH] power: reset: macsmc-reboot: print an early resume
+ exception record
+
+On a J604, apple-sleep's early resume vectors leave ESR's class and
+ISS low byte in PMU scratch 0xf804/0xf805 and 0xa5 in 0xf806 before
+the watchdog resets the SoC. Nothing else survives that reset.
+
+Describe the three bytes as an nvmem cell on the J604 and, when the
+marker is set, print them once at probe. Clear them after reading and
+again in reboot_prepare, so a stale record is never read as a new one.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi |  8 ++++--
+ drivers/power/reset/macsmc-reboot.c           | 28 +++++++++++++++++++
+ 2 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi b/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
+index 6fb12d798c..8622d82729 100644
+--- a/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
++++ b/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
+@@ -200,6 +200,10 @@ boot_error_count: boot-error-count@f802,0 {
+ 				boot_error_stage: boot-error-stage@f803 {
+ 					reg = <0xf803 0x01>;
+ 				};
++				/* An early resume exception: ESR class, ISS, 0xa5. */
++				resume_exception: resume-exception@f804 {
++					reg = <0xf804 0x03>;
++				};
+ 				panic_count: panic-count@f802,4 {
+ 					reg = <0xf802 0x01>;
+ 					bits = <0x04 0x04>;
+@@ -1010,9 +1014,9 @@ typec3_dcpext1: endpoint@1 {
+ /* What ended the previous boot, printed once by macsmc-reboot (read-only). */
+ &{/soc/smc@38c600000/reboot} {
+ 	nvmem-cells = <&shutdown_flag>, <&boot_stage>, <&boot_error_count>, <&panic_count>,
+-		      <&pm_setting>, <&boot_error_stage>, <&fault_shadow>;
++		      <&pm_setting>, <&boot_error_stage>, <&fault_shadow>, <&resume_exception>;
+ 	nvmem-cell-names = "shutdown_flag", "boot_stage", "boot_error_count", "panic_count",
+-			   "pm_setting", "boot_error_stage", "fault_shadow";
++			   "pm_setting", "boot_error_stage", "fault_shadow", "resume_exception";
+ };
+ 
+ &{/soc/smc@38c600000/rtc} {
+diff --git a/drivers/power/reset/macsmc-reboot.c b/drivers/power/reset/macsmc-reboot.c
+index 9e913b1e69..1f9d1dd1da 100644
+--- a/drivers/power/reset/macsmc-reboot.c
++++ b/drivers/power/reset/macsmc-reboot.c
+@@ -185,6 +185,7 @@ static int macsmc_reboot_notify(struct notifier_block *this, unsigned long actio
+ 	if (reboot->nvm.boot_stage &&
+ 	    nvmem_cell_set_u8(reboot->nvm.boot_stage, BOOT_STAGE_SHUTDOWN) < 0)
+ 		dev_err(reboot->dev, "Failed to write boot_stage\n");
++	macsmc_reboot_resume_exception(reboot, false);
+ 
+ 	/*
+ 	 * Set the PMU flag to actually reboot into the off state.
+@@ -233,6 +234,32 @@ static void macsmc_reboot_print_last_end(struct macsmc_reboot *reboot)
+ 		nvmem_cell_put(fault_cell);
+ }
+ 
++/*
++ * Optional: the record an early resume exception leaves (ESR class, ISS low byte, then
++ * 0xa5 when valid, see apple-sleep). Printed once and cleared, so a stale one is never
++ * read as new, at boot and again before a clean reboot.
++ */
++static void macsmc_reboot_resume_exception(struct macsmc_reboot *reboot, bool print)
++{
++	struct nvmem_cell *cell = nvmem_cell_get(reboot->dev, "resume_exception");
++	u8 zero[3] = {};
++	size_t len = 0;
++	u8 *rec;
++
++	if (IS_ERR(cell))
++		return;
++	rec = nvmem_cell_read(cell, &len);
++	if (!IS_ERR(rec) && len >= 3 && rec[2] == 0xa5 && print)
++		dev_warn(reboot->dev,
++			 "previous boot: exception early on a resume: ESR class %#x, ISS low byte %#x\n",
++			 rec[0], rec[1]);
++	if (!IS_ERR(rec) && len >= 3 && (rec[0] || rec[1] || rec[2]))
++		nvmem_cell_write(cell, zero, sizeof(zero));
++	if (!IS_ERR(rec))
++		kfree(rec);
++	nvmem_cell_put(cell);
++}
++
+ static void macsmc_power_init_error_counts(struct macsmc_reboot *reboot)
+ {
+ 	int boot_error_count, panic_count;
+@@ -390,6 +417,7 @@ static int macsmc_reboot_probe(struct platform_device *pdev)
+ 	}
+ 	/* Before this boot changes anything: what ended the previous one. */
+ 	macsmc_reboot_print_last_end(reboot);
++	macsmc_reboot_resume_exception(reboot, true);
+ 
+ 	/* Set the boot_stage to indicate we're running the OS kernel */
+ 	if (reboot->nvm.boot_stage &&
+-- 
+2.43.0
+

@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 03:48:11 +0000
+Subject: [PATCH] media: apple: ave: keep the T8132 firmware ID and
+ bring-up aids
+
+The T8132 commits refer to pieces the J604 copy of the driver carried
+outside them: the AppleAVE2FW 9003.78.0 TEXT CRC of the T8132 build
+(0x9308d2ab) and its place among the known CRCs, the prototype of
+ave_large_frames(), and the root-only debugfs aids the probe-only path
+registers (t8132_regs, t8132_trial, fw_log). On Aurora's driver none of
+them exists, so the T8132 variant would not build.
+
+Add them as the J604 copy had them. The T8132 variant, its compatible
+and its layout match are unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/ave/ave-drv.c | 135 +++++++++++++++++++++
+ drivers/media/platform/apple/ave/ave-fw.c  |   1 +
+ drivers/media/platform/apple/ave/ave.h     |   3 +
+ 3 files changed, 139 insertions(+)
+
+diff --git a/drivers/media/platform/apple/ave/ave-drv.c b/drivers/media/platform/apple/ave/ave-drv.c
+index e24a62f413..035f0891f9 100644
+--- a/drivers/media/platform/apple/ave/ave-drv.c
++++ b/drivers/media/platform/apple/ave/ave-drv.c
+@@ -294,6 +294,141 @@ static int ave_inject_wedge(void *data, u64 value)
+ }
+ DEFINE_DEBUGFS_ATTRIBUTE(ave_inject_wedge_fops, NULL, ave_inject_wedge, "%llu\n");
+ 
++/*
++ * T8132 bring-up aids, root only and inert until used. The T8132 variant is
++ * probe only because its start-up values are not known; these let one boot
++ * test candidates without a rebuild:
++ *   t8132_regs   reads the coprocessor code base, control, status and boot
++ *                argument at the T6041 (v40) offsets and the mailbox, with
++ *                the encoder powered, and starts nothing;
++ *   t8132_trial  takes "<device id> <device type>": the next start uses the
++ *                T6041 register family, the 9003.78.0 command layout
++ *                (unqualified) and those values; only while the firmware has
++ *                never run, so each candidate needs a fresh boot;
++ *   fw_log       the firmware log ring of the last start.
++ */
++static int ave_t8132_regs_show(struct seq_file *s, void *unused)
++{
++	struct ave_dev *ave = s->private;
++	u64 vcbar, want;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(ave->dev);
++	if (ret < 0)
++		return ret;
++	mutex_lock(&ave->hw_lock);
++	if (ave->fw_state != AVE_FW_OFF) {
++		ret = -EBUSY;
++		goto out;
++	}
++	vcbar = readq(ave->coproc + AVE_COPROC_VCBAR);
++	want = ave->text.iova | AVE_COPROC_VCBAR_VALID;
++	seq_printf(s, "vcbar %#llx loader-text-iova %#llx v40-expects %#llx %s\n",
++		   vcbar, ave->text.iova, want,
++		   vcbar == want ? "match" : "differs");
++	seq_printf(s, "ctrl %#x status %#x boot_arg %#x keep_mappings %#x\n",
++		   readl(ave->coproc + AVE_COPROC_CTRL),
++		   readl(ave->coproc + AVE_COPROC_STATUS),
++		   readl(ave->coproc + AVE_COPROC_BOOT_ARG),
++		   readl(ave->coproc + AVE_COPROC_KEEP_MAPPINGS));
++	seq_printf(s, "mbox status %#x scratch", readl(ave->mbox + AVE_MBOX_STATUS));
++	for (unsigned int i = 0; i < AVE_MBOX_SCRATCH_COUNT; i++)
++		seq_printf(s, " %#x", readl(ave->mbox + AVE_MBOX_SCRATCH(i)));
++	seq_puts(s, "\n");
++out:
++	mutex_unlock(&ave->hw_lock);
++	pm_runtime_put_autosuspend(ave->dev);
++	return ret;
++}
++DEFINE_SHOW_ATTRIBUTE(ave_t8132_regs);
++
++static ssize_t ave_t8132_trial_write(struct file *file, const char __user *ubuf,
++				     size_t len, loff_t *ppos)
++{
++	struct ave_dev *ave = file->private_data;
++	struct ave_variant *v = &ave->trial_variant;
++	unsigned int id, type;
++	char buf[32];
++	ssize_t ret;
++
++	if (!len || len >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, len))
++		return -EFAULT;
++	buf[len] = '\0';
++	if (sscanf(buf, "%u %u", &id, &type) != 2 || !id || !type || id > 255 ||
++	    type > 255)
++		return -EINVAL;
++
++	mutex_lock(&ave->hw_lock);
++	if (ave->fw_state != AVE_FW_OFF || ave->data_dirty ||
++	    ave->text_crc != AVE_FW_TEXT_CRC_T8132_25G83) {
++		ret = -EBUSY;
++		goto out;
++	}
++	if (!ave->trial_log)
++		ave->trial_log = devm_kzalloc(ave->dev, AVE_LOG_BYTES, GFP_KERNEL);
++	if (!ave->trial_log) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	*v = ave_t8132;
++	v->regs = &ave_coproc_v40;
++	v->boot_device_id = id;
++	v->device_type = type;
++	v->boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE;
++	v->timebase_multiplier = 1;
++	v->vcbar_mask = U64_MAX;
++	v->vcbar_flags = AVE_COPROC_VCBAR_VALID;
++	v->boot_qualified = true;
++	ave->variant = v;
++	ave->layout = &ave_layout_9003_78_0;
++	ave->trial = true;
++	dev_warn(ave->dev,
++		 "T8132 start trial armed: device %u type %u, v40 registers, %s layout (unqualified)\n",
++		 id, type, ave->layout->name);
++	ret = len;
++out:
++	mutex_unlock(&ave->hw_lock);
++	return ret;
++}
++
++static const struct file_operations ave_t8132_trial_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = ave_t8132_trial_write,
++	.llseek = noop_llseek,
++};
++
++static ssize_t ave_fw_log_read(struct file *file, char __user *ubuf,
++			       size_t len, loff_t *ppos)
++{
++	struct ave_dev *ave = file->private_data;
++	void *copy;
++	ssize_t ret;
++
++	copy = kvzalloc(AVE_LOG_BYTES, GFP_KERNEL);
++	if (!copy)
++		return -ENOMEM;
++	mutex_lock(&ave->hw_lock);
++	if (ave->log.cpu)
++		memcpy(copy, ave->log.cpu,
++		       min_t(size_t, ave->log.size, AVE_LOG_BYTES));
++	else if (ave->trial_log)
++		memcpy(copy, ave->trial_log, AVE_LOG_BYTES);
++	mutex_unlock(&ave->hw_lock);
++	ret = simple_read_from_buffer(ubuf, len, ppos, copy, AVE_LOG_BYTES);
++	kvfree(copy);
++	return ret;
++}
++
++static const struct file_operations ave_fw_log_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = ave_fw_log_read,
++	.llseek = default_llseek,
++};
++
+ /*
+  * debugfs dart_audit: power the encoder (and through it its DARTs) without
+  * starting the coprocessor, run the stream audit and dump the DART
+diff --git a/drivers/media/platform/apple/ave/ave-fw.c b/drivers/media/platform/apple/ave/ave-fw.c
+index 50f6b8b36b..576c73115d 100644
+--- a/drivers/media/platform/apple/ave/ave-fw.c
++++ b/drivers/media/platform/apple/ave/ave-fw.c
+@@ -39,6 +39,7 @@ static const u32 ave_known_text_crc[] = {
+ 	0x2ce7359e, /* AppleAVE2FW 9003.78.0 */
+ 	0x69c54454, /* AppleAVE2FW 9003.78.0 (macOS 26.0.x) */
+ 	AVE_FW_TEXT_CRC_T6040_25G83, /* AppleAVE2FW 9003.78.0 / T6040 */
++	AVE_FW_TEXT_CRC_T8132_25G83, /* AppleAVE2FW 9003.78.0 / T8132 */
+ 	AVE_FW_TEXT_CRC_T6041_25G83, /* AppleAVE2FW 9003.78.0 / M4 Max */
+ 	AVE_FW_TEXT_CRC_T6050_26A428, /* AppleAVE2FW, macOS 27.0 26A428 / T6050 */
+ 	0x460c7a7c, /* AppleAVE2FW 6070.11.1 / T6000 */
+diff --git a/drivers/media/platform/apple/ave/ave.h b/drivers/media/platform/apple/ave/ave.h
+index 943c1eb07e..de9f2ce852 100644
+--- a/drivers/media/platform/apple/ave/ave.h
++++ b/drivers/media/platform/apple/ave/ave.h
+@@ -167,6 +167,8 @@ enum ave_opcode {
+ #define AVE_FW_TEXT_CRC_9003_78_0 0x69c54454
+ /* The M4 Pro (T6040) build of the same 25G83 firmware. */
+ #define AVE_FW_TEXT_CRC_T6040_25G83 0x68d5f9f6
++/* H16G (T8132) AppleAVE2FW 9003.78.0 from 25G83 */
++#define AVE_FW_TEXT_CRC_T8132_25G83 0x9308d2ab
+ /*
+  * The M4 Max (J575c) build of AppleAVE2FW 9003.78.0, as iBoot 25G83 loads it:
+  * DATA is 0x130000, and the loader writes a per-boot word at TEXT 0x4224, so
+@@ -626,6 +628,7 @@ void ave_vb2_put(void *buf_priv);
+ 
+ /* ave-sess.c */
+ u32 ave_cq_initial_qp(u32 quality);
++bool ave_large_frames(void);
+ int ave_sess_decode_result(const struct ave_fw_layout *fw, enum ave_codec codec,
+ 			   const u8 *meta, size_t meta_bytes,
+ 			   struct ave_frame_result *result);
+-- 
+2.43.0
+

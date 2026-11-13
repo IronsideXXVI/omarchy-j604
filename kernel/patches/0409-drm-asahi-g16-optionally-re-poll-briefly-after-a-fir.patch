@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 04:13:16 +0000
+Subject: [PATCH] drm/asahi: g16: optionally re-poll briefly after a
+ firmware event
+
+On 1.873 a light command spends about 91 us from publication to its
+first firmware stage and about 90 us from its last stage end to host
+retirement. After an EP 0x20 event the poll pass busy-waits up to four
+5 us polls; a receipt still incomplete then waits for the next
+g16_resnap_us re-poll (100 us). That catches 7% of compute and 2% of
+render prefixes, while most render receipts are only caught by the
+trailing polls.
+
+Add g16_tail_us (runtime 0644, default 0, unchanged). With 5..100, for
+300 us after each event the completion timer re-polls at that interval
+and the trailing busy polls are skipped. Outside that window, and with
+g16_irq_only, nothing changes.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 22 ++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 15 ++++++++++++++-
+ 2 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 0163e0672d..32cf12d5ab 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -570,6 +570,28 @@ pub(crate) fn depth() -> u32 {
+     "G16: render commands of one queue that may stay in flight behind the next publication (default 0: publish after retirement; 1: one in flight; runtime 0644)"
+ );
+ 
++/// Storage of `g16_tail_us` (runtime 0644, default 0).
++static TAIL_US: AtomicU32 = AtomicU32::new(0);
++
++/// Re-poll interval in the window after an EP 0x20 event, us: 0 (default) keeps the four
++/// trailing 5 us busy polls and then `g16_resnap_us`; 5..=100 re-polls at this interval for
++/// [`super::poll::TAIL_WINDOW_NS`] after each event instead, without busy polls.
++pub(crate) fn tail_us() -> u32 {
++    match TAIL_US.load(Ordering::Relaxed) {
++        0 => 0,
++        v => v.clamp(5, 100),
++    }
++}
++
++live_u32_param!(
++    TAIL_US_PARAM,
++    TAIL_US_PARMTYPE,
++    TAIL_US_PARM,
++    TAIL_US,
++    "g16_tail_us",
++    "G16: re-poll interval right after a firmware event, us (default 0: four 5 us busy polls, then g16_resnap_us; 5..100; runtime 0644)"
++);
++
+ /// Storage of `g16_effort` (runtime 0644, default 0).
+ static EFFORT: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 138af489b5..c4e66599c1 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -38,6 +38,11 @@
+ use super::recovery::logic::Retirement;
+ use super::regs::EngineState;
+ use super::{params, Firmware, Shared, POLL_WORK};
++
++/// How long after an EP 0x20 event `g16_tail_us` re-polls apply.
++pub(crate) const TAIL_WINDOW_NS: u64 = 300_000;
++/// End of the current `g16_tail_us` window (`now_ns()`), 0 for none.
++static TAIL_UNTIL_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+ use crate::module_parameters;
+ 
+ impl_has_hr_timer! {
+@@ -185,6 +190,10 @@ pub(crate) fn rearm(self: &Arc<Self>, chan_wait: bool) {
+         } else if params::irq_only() {
+             // The ring-service event retires the flights; this only catches a lost one.
+             us = params::watchdog_us();
++        } else if params::tail_us() != 0 && now_ns() < TAIL_UNTIL_NS.load(Ordering::Relaxed) {
++            // Shortly after an event the receipts complete within tens of us: re-poll at the
++            // short interval rather than busy-polling or waiting the full resnap interval.
++            us = params::tail_us();
+         }
+         {
+             let mut handle = self.resnap_handle.lock();
+@@ -274,7 +283,11 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+     /// checks.
+     pub(crate) fn retire(&mut self, evented: bool, done: &mut Completions) -> Result {
+         // After an event, a few short trailing polls catch the final receipts.
+-        let mut tail = if evented && !params::irq_only() { 4 } else { 0 };
++        let tail_us = params::tail_us();
++        if evented && tail_us != 0 {
++            TAIL_UNTIL_NS.store(now_ns().saturating_add(TAIL_WINDOW_NS), Ordering::Relaxed);
++        }
++        let mut tail = if evented && !params::irq_only() && tail_us == 0 { 4 } else { 0 };
+         self.engine.stats.retire_src = if evented { 0 } else { 2 };
+         let mut ret;
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 03:49:04 +0000
+Subject: [PATCH] media: apple: ave: add T8132 start-up trial controls
+ in debugfs
+
+The T8132 (M4) variant is probe only because the values its firmware
+start needs are not known: the device number and type the boot
+configuration carries, the coprocessor register family, and the command
+layout of its H16G build (TEXT CRC 9308d2ab, AppleAVE2FW 9003.78.0 like
+the T6041's H16S). None of them is in the ADT. Upstream found that a
+wrong device number makes the firmware stop after its hello rather than
+hang, so candidates can be tried on the machine itself, one per boot.
+
+Add three root-only debugfs files for the T8132 that do nothing until
+used:
+
+  t8132_regs   powers the encoder and reads the code base, control,
+               status and boot argument registers at the T6041 offsets
+               and the mailbox, and says whether the code base matches
+               the loader's TEXT address (what iBoot programs);
+  t8132_trial  takes "<device id> <device type>" and arms the next start
+               with those values, the T6041 register family and the
+               9003.78.0 layout, only while the firmware has never run;
+  fw_log       the firmware log ring of the last start, kept when its
+               buffer is released.
+
+A trial start also logs the firmware hello. Without a write to
+t8132_trial nothing changes: every encode is refused as before.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit 98e20a6bac048d528d5aaaf7cec5f03c8db196ba)
+---
+ drivers/media/platform/apple/ave/ave-drv.c | 15 +++++++++++-
+ drivers/media/platform/apple/ave/ave-fw.c  | 27 +++++++++++++++++++++-
+ drivers/media/platform/apple/ave/ave.h     |  9 ++++++++
+ 3 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/apple/ave/ave-drv.c b/drivers/media/platform/apple/ave/ave-drv.c
+index 1481d5dedb..3aedb4cbe8 100644
+--- a/drivers/media/platform/apple/ave/ave-drv.c
++++ b/drivers/media/platform/apple/ave/ave-drv.c
+@@ -319,8 +319,21 @@ static void ave_debugfs_init(struct ave_dev *ave)
+ 		{ "last_start_hevc", "last_process0_hevc" },
+ 	};
+ 
+-	if (!IS_ENABLED(CONFIG_DEBUG_FS) || !ave->layout)
++	if (!IS_ENABLED(CONFIG_DEBUG_FS))
+ 		return;
++	if (!ave->layout) {
++		if (ave->variant != &ave_t8132 ||
++		    ave->text_crc != AVE_FW_TEXT_CRC_T8132_25G83)
++			return;
++		ave->debugfs = debugfs_create_dir("apple-ave", NULL);
++		debugfs_create_file("t8132_regs", 0400, ave->debugfs, ave,
++				    &ave_t8132_regs_fops);
++		debugfs_create_file("t8132_trial", 0200, ave->debugfs, ave,
++				    &ave_t8132_trial_fops);
++		debugfs_create_file("fw_log", 0400, ave->debugfs, ave,
++				    &ave_fw_log_fops);
++		return;
++	}
+ 	ave->debugfs = debugfs_create_dir("apple-ave", NULL);
+ 	if (ave->layout->abi == &ave_abi_6070) {
+ 		debugfs_create_file("lifecycle_test", 0200, ave->debugfs, ave,
+diff --git a/drivers/media/platform/apple/ave/ave-fw.c b/drivers/media/platform/apple/ave/ave-fw.c
+index d635886675..50f6b8b36b 100644
+--- a/drivers/media/platform/apple/ave/ave-fw.c
++++ b/drivers/media/platform/apple/ave/ave-fw.c
+@@ -390,14 +390,34 @@ int ave_alloc(struct ave_dev *ave, struct ave_buf *b, size_t size,
+  * Lifecycle support and streaming qualification are independent: a known
+  * transport is not enough to send unqualified Start/Process payloads.
+  */
++/*
++ * The layout a firmware build must run with. An armed T8132 trial runs the
++ * H16G build, which carries the same 9003.78.0 version as the T6041's H16S,
++ * on that layout, unqualified.
++ */
++static const struct ave_fw_layout *ave_fw_expected_layout(struct ave_dev *ave)
++{
++	if (ave->trial && ave->text_crc == AVE_FW_TEXT_CRC_T8132_25G83)
++		return &ave_layout_9003_78_0;
++	return ave_layout_for_crc(ave->text_crc);
++}
++
+ int ave_fw_check_boot(struct ave_dev *ave)
+ {
+ 	if (ave->variant->boot_qualified && ave->variant->regs && ave->layout &&
+-	    ave->layout == ave_layout_for_crc(ave->text_crc))
++	    ave->layout == ave_fw_expected_layout(ave))
+ 		return 0;
+ 	return -EOPNOTSUPP;
+ }
+ 
++/* Keep the firmware log of a trial start. Caller holds hw_lock. */
++void ave_fw_trial_snapshot(struct ave_dev *ave)
++{
++	if (ave->trial && ave->trial_log && ave->log.cpu)
++		memcpy(ave->trial_log, ave->log.cpu,
++		       min_t(size_t, ave->log.size, AVE_LOG_BYTES));
++}
++
+ int ave_fw_check_build(struct ave_dev *ave)
+ {
+ 	if (!ave_fw_check_boot(ave) && ave->layout->encode_ready)
+@@ -418,6 +438,7 @@ void ave_fw_release_boot(struct ave_dev *ave)
+ 		ave->extra0_mapped = false;
+ 	}
+ 	ave_free(ave, &ave->heap);
++	ave_fw_trial_snapshot(ave);
+ 	ave_free(ave, &ave->log);
+ 	ave_free(ave, &ave->boot_cfg);
+ 	ave_free(ave, &ave->ipc);
+@@ -820,6 +841,9 @@ static int ave_fw_boot(struct ave_dev *ave)
+ 	for (unsigned int i = 0; i < 4; i++)
+ 		hello[i] = readl(ave->mbox + AVE_MBOX_SCRATCH(i));
+ 	dma_rmb();
++	if (ave->trial)
++		dev_info(ave->dev, "trial: hello {%#x, %#x, %#x, %#x}\n",
++			 hello[0], hello[1], hello[2], hello[3]);
+ 
+ 	/*
+ 	 * The reset witness: BOOT_ARG is nonzero while the coprocessor has
+@@ -845,6 +869,7 @@ static int ave_fw_boot(struct ave_dev *ave)
+ 
+ 	ret = ave_ipc_negotiate(ave, hello);
+ 	if (ret) {
++		ave_fw_trial_snapshot(ave);
+ 		dev_err(ave->dev, "firmware start-up failed: %d\n", ret);
+ 		return ret;
+ 	}
+diff --git a/drivers/media/platform/apple/ave/ave.h b/drivers/media/platform/apple/ave/ave.h
+index 25693eb451..8307df504b 100644
+--- a/drivers/media/platform/apple/ave/ave.h
++++ b/drivers/media/platform/apple/ave/ave.h
+@@ -275,6 +275,14 @@ struct ave_dev {
+ 	size_t extra0_map_size;
+ 	bool extra0_mapped;
+ 	bool module_pinned;
++	/*
++	 * T8132 start trial (debugfs, root only): a copy of the probe-only
++	 * variant with candidate start-up values, and the firmware log of the
++	 * last start kept after its buffer is released.
++	 */
++	struct ave_variant trial_variant;
++	bool trial;
++	void *trial_log;
+ 	/* A 6070 lifecycle command is serialized per logical operation. */
+ 	struct ave_reply expected[AVE_OP_COUNT];
+ 	u64 ipc_fw_base;
+@@ -534,6 +542,7 @@ extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112;
+ 
+ /* ave-fw.c */
+ u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
++void ave_fw_trial_snapshot(struct ave_dev *ave);
+ int ave_fw_probe(struct ave_dev *ave);
+ int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
+ 		       u64 data_iova, u32 *crc);
+-- 
+2.43.0
+
