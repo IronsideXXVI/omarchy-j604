@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 02:47:11 +0000
+Subject: [PATCH] thermal: apple-pmp: let the raw poll move to another
+ CPU at runtime
+
+The 5 ms raw poll is pinned to CPU 8, a P core, a choice measured on the
+J604 under schedutil. With the performance governor the poll is one of
+the steady wakeups of the P cluster: on an idle J604 at a black screen
+the cluster's idle drop fires about 390 times a second, and each wake
+asks for the top P-state again (P-cluster rail 1.37 W against 0.09 W
+with schedutil). Which CPU is best then is not known, and poll_cpu is
+read only at boot, so finding out takes a reboot per setting.
+
+Make poll_cpu writable at runtime. A write cancels the poll and arms it
+again on the new CPU, at a tick boundary as before, so the poll stops
+for at most one period and a tick. Writes take a new lock that setup and
+cleanup also take around arming and stopping the poll, and a CPU that
+is not online is refused. The default stays CPU 8.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/thermal/apple-pmp-thermal.c | 53 ++++++++++++++++++++++++-----
+ 1 file changed, 45 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/thermal/apple-pmp-thermal.c b/drivers/thermal/apple-pmp-thermal.c
+index b81a258a5f..5d8caf1502 100644
+--- a/drivers/thermal/apple-pmp-thermal.c
++++ b/drivers/thermal/apple-pmp-thermal.c
+@@ -127,8 +127,8 @@ module_param_named(governor_count, pmp_thermal.governor_count, ullong, 0444);
+ module_param_named(ready, pmp_thermal.ready, bool, 0444);
+ 
+ static int poll_cpu = APPLE_PMP_POLL_CPU;
+-module_param(poll_cpu, int, 0444);
+-MODULE_PARM_DESC(poll_cpu, "CPU that runs the 5 ms raw poll (default 8, a P core)");
++/* Serializes moving the raw poll against arming it at setup and stopping it. */
++static DEFINE_MUTEX(apple_pmp_poll_lock);
+ 
+ static int apple_pmp_power_status(char *buffer, const struct kernel_param *kp)
+ {
+@@ -590,6 +590,39 @@ static void apple_pmp_poll_arm(void)
+ 	apple_pmp_poll_start(NULL);
+ }
+ 
++/*
++ * The best CPU for the raw poll depends on the cpufreq governor: under
++ * schedutil a P core kept the P-cluster rail lower, while under the
++ * performance governor every poll wakes the P cluster from its idle drop
++ * back to its top state. Let the poll move at runtime so both can be
++ * measured on one boot. The poll stops for at most one period and a tick.
++ */
++static int apple_pmp_poll_cpu_set(const char *val, const struct kernel_param *kp)
++{
++	int cpu, ret;
++
++	ret = kstrtoint(val, 0, &cpu);
++	if (ret)
++		return ret;
++	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu))
++		return -EINVAL;
++
++	guard(mutex)(&apple_pmp_poll_lock);
++	WRITE_ONCE(poll_cpu, cpu);
++	if (!pmp_thermal.polling)
++		return 0;
++	hrtimer_cancel(&pmp_thermal.poll_timer);
++	apple_pmp_poll_arm();
++	return 0;
++}
++
++static const struct kernel_param_ops apple_pmp_poll_cpu_ops = {
++	.set = apple_pmp_poll_cpu_set,
++	.get = param_get_int,
++};
++module_param_cb(poll_cpu, &apple_pmp_poll_cpu_ops, &poll_cpu, 0644);
++MODULE_PARM_DESC(poll_cpu, "CPU that runs the 5 ms raw poll (default 8, a P core); writable at runtime");
++
+ static int apple_pmp_change_mode(struct thermal_zone_device *zone,
+ 				 enum thermal_device_mode mode)
+ {
+@@ -698,10 +731,12 @@ static void apple_pmp_thermal_cleanup(void)
+ 		hwmon_device_unregister(pmp_thermal.power_hwmon);
+ 		pmp_thermal.power_hwmon = NULL;
+ 	}
+-	if (pmp_thermal.polling) {
+-		hrtimer_cancel(&pmp_thermal.poll_timer);
+-		cancel_work_sync(&pmp_thermal.poll_work);
+-		pmp_thermal.polling = false;
++	scoped_guard(mutex, &apple_pmp_poll_lock) {
++		if (pmp_thermal.polling) {
++			hrtimer_cancel(&pmp_thermal.poll_timer);
++			cancel_work_sync(&pmp_thermal.poll_work);
++			pmp_thermal.polling = false;
++		}
+ 	}
+ 	/* Drain the publisher before the final invalidation. */
+ 	apple_pmp_gpu_publish(pmp_thermal.sensors, 0, 8, 0);
+@@ -799,8 +834,10 @@ static int apple_pmp_thermal_setup(void)
+ 	}
+ 	pmp_thermal.power_polling = true;
+ 	schedule_delayed_work(&pmp_thermal.power_work, msecs_to_jiffies(500));
+-	pmp_thermal.polling = true;
+-	apple_pmp_poll_arm();
++	scoped_guard(mutex, &apple_pmp_poll_lock) {
++		pmp_thermal.polling = true;
++		apple_pmp_poll_arm();
++	}
+ 	/* Both guards start at the minimum frequency: hand over the cpufreq cap. */
+ 	pmp_thermal.owner = true;
+ 	for (i = 0; i < ARRAY_SIZE(pmp_thermal.clusters); i++) {
+-- 
+2.43.0
+

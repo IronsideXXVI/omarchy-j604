@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 02:47:52 +0000
+Subject: [PATCH] soc: apple: sleep: report the cache state the boot
+ object found at a wake
+
+aura r8 copies each system level cache plane's control (+0x1c00) and
+status (+0x1c04) into the S2R mailbox on a T8132 wake, then enables
+the cache again as at boot before it takes resume_pa. It publishes
+/chosen/aurora,s2r-mailbox-size = 0x98 for that.
+
+Map the extra 0x28 bytes when the size says so and log them after a
+resume, invalidated first, as aura writes them with the MMU off.
+apple-mcc writes the cache back and turns it off for every deep
+sleep, so 0 and 0 per plane is the expected state; a plane left on
+says nothing wrote it back.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 38 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 7b13a2a2b1..a9bf57c1de 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -114,6 +114,23 @@ struct aura_s2r_check {
+ static_assert(sizeof(struct aura_s2r_mailbox) + sizeof(struct aura_s2r_check) ==
+ 	      AURA_S2R_CHECKED_SIZE);
+ 
++/*
++ * After the check, when the size says so: the system level cache as aura found it on a
++ * T8132 wake, per plane (AMCC0 p0, p1, AMCC1 p0, p1), before it enabled it again as at
++ * boot. Written by aura with the MMU off, read after a resume.
++ */
++#define AURA_S2R_SLC_PLANES	4
++#define AURA_S2R_SLC_SIZE	0x98
++
++struct aura_s2r_slc {
++	u32 planes;
++	u32 result;		/* 1: enabled again */
++	u32 ctrl[AURA_S2R_SLC_PLANES];	/* +0x1c00 */
++	u32 status[AURA_S2R_SLC_PLANES];	/* +0x1c04 */
++};
++
++static_assert(AURA_S2R_CHECKED_SIZE + sizeof(struct aura_s2r_slc) == AURA_S2R_SLC_SIZE);
++
+ /* PS word */
+ #define PS_AUTO_ENABLE		BIT(28)
+ #define PS_UNLATCH		BIT(12)
+@@ -595,6 +612,7 @@ struct apple_sleep {
+ 	struct aura_s2r_mailbox *mbox;
+ 	/* aura's DRAM check, and the 4 KiB it checks besides the kernel's own */
+ 	struct aura_s2r_check *mbox_check;
++	struct aura_s2r_slc *mbox_slc;
+ 	void *check_pattern;
+ 	u32 check_crc;
+ 	unsigned int check_ranges;
+@@ -3828,6 +3846,15 @@ static void apple_sleep_report(void)
+ 	if (s->check_ranges)
+ 		dev_info(s->dev, "DRAM came back: the boot object matched CRC-32 %08x over %u ranges\n",
+ 			 s->check_crc, s->check_ranges);
++	if (s->mbox_slc) {
++		struct aura_s2r_slc *slc = s->mbox_slc;
++
++		dcache_inval_poc((unsigned long)slc, (unsigned long)(slc + 1));
++		dev_info(s->dev, "SLC at the wake: %u planes, control %x %x %x %x, status %#x %#x %#x %#x, enabled again: %u\n",
++			 slc->planes, slc->ctrl[0], slc->ctrl[1], slc->ctrl[2], slc->ctrl[3],
++			 slc->status[0], slc->status[1], slc->status[2], slc->status[3],
++			 slc->result);
++	}
+ 	if (s->isr_wake & SLEEP_ISR_A)
+ 		dev_warn(s->dev, "an SError was pending on the way back: ISR_EL1 %#llx\n",
+ 			 s->isr_wake);
+@@ -4042,8 +4069,13 @@ static int apple_sleep_map_mailbox(struct apple_sleep *s)
+ 	}
+ 
+ 	checked = size >= AURA_S2R_CHECKED_SIZE;
+-	s->mbox = devm_memremap(s->dev, pa,
+-				checked ? AURA_S2R_CHECKED_SIZE : sizeof(*s->mbox), MEMREMAP_WB);
++	if (size >= AURA_S2R_SLC_SIZE)
++		size = AURA_S2R_SLC_SIZE;
++	else if (checked)
++		size = AURA_S2R_CHECKED_SIZE;
++	else
++		size = sizeof(*s->mbox);
++	s->mbox = devm_memremap(s->dev, pa, size, MEMREMAP_WB);
+ 	if (IS_ERR(s->mbox))
+ 		return PTR_ERR(s->mbox);
+ 
+@@ -4062,6 +4094,8 @@ static int apple_sleep_map_mailbox(struct apple_sleep *s)
+ 		if (s->check_pattern)
+ 			s->mbox_check = (struct aura_s2r_check *)(s->mbox + 1);
+ 	}
++	if (size >= AURA_S2R_SLC_SIZE)
++		s->mbox_slc = (void *)s->mbox + AURA_S2R_CHECKED_SIZE;
+ 	dev_info(s->dev, "boot object checks DRAM before a resume: %s\n",
+ 		 s->mbox_check ? "yes" : "no");
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 02:45:03 +0000
+Subject: [PATCH] soc: apple: sleep: let the boot object check DRAM
+ before a T8132 resume
+
+A J604 deep sleep resets the SoC after its RTC wake, in the resume
+stub's 60 s WD2 window: the CPU stops before apple_sleep_return(). The
+first thing it does after the stub is read memory with the MMU and the
+caches on: the saved cpu_suspend() context, through sleep_save_stash.
+If DRAM, or the newest writes to it, did not survive, that is where
+it stops, and nothing on the next boot says so.
+
+aura r7 can check that before it takes resume_pa. It publishes
+/chosen/aurora,s2r-mailbox-size = 0x70 and reads, after the 32-byte
+mailbox, up to four DRAM ranges and their CRC-32 (zlib's). With the
+MMU off it recomputes the CRC, then jumps on a match and stops on a
+mismatch or a malformed descriptor, each in its own WD2 window.
+
+Fill it in at the T8132 commit, after resume_pa: the resume stub's
+4 KiB, this CPU's saved context (per page: the stack is vmapped), a
+4 KiB pattern written for this sleep, and the stash. The magic goes
+last, then every range and the mailbox are cleaned to the PoC. Older
+aura publishes no size, and nothing past the 32 bytes is touched. A
+resume that comes back says which CRC aura matched.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 144 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 143 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index a76580d461..7b13a2a2b1 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -36,7 +36,9 @@
+ #include <linux/bitmap.h>
+ #include <linux/bits.h>
+ #include <linux/cacheflush.h>
++#include <linux/vmalloc.h>
+ #include <linux/cpu.h>
++#include <linux/crc32.h>
+ #include <linux/cpumask.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
+@@ -89,6 +91,29 @@ struct aura_s2r_mailbox {
+ 	u64 resumes;		/* aura: resume_pa taken this many times */
+ };
+ 
++/*
++ * Right after the mailbox, when /chosen/aurora,s2r-mailbox-size says it is there: DRAM
++ * ranges and their CRC-32 (zlib's), checked by aura with the MMU off before it takes
++ * resume_pa. It jumps on a match and stops on a mismatch, each with its own WD2 window.
++ * Armed for one sleep: aura clears the magic when it reads it.
++ */
++#define AURA_S2R_CHECK_MAGIC	0x3143524341525541ULL	/* "AURACRC1" */
++#define AURA_S2R_CHECK_RANGES	4
++#define AURA_S2R_CHECKED_SIZE	0x70
++
++struct aura_s2r_check {
++	u64 magic;		/* kernel, written last */
++	u32 nranges;
++	u32 crc32;		/* over the ranges in order, as one stream */
++	struct {
++		u64 pa;
++		u64 len;
++	} range[AURA_S2R_CHECK_RANGES];
++};
++
++static_assert(sizeof(struct aura_s2r_mailbox) + sizeof(struct aura_s2r_check) ==
++	      AURA_S2R_CHECKED_SIZE);
++
+ /* PS word */
+ #define PS_AUTO_ENABLE		BIT(28)
+ #define PS_UNLATCH		BIT(12)
+@@ -568,6 +593,11 @@ struct apple_sleep {
+ 	bool matched;
+ 	void __iomem *dvfm[SLEEP_CLUSTERS];
+ 	struct aura_s2r_mailbox *mbox;
++	/* aura's DRAM check, and the 4 KiB it checks besides the kernel's own */
++	struct aura_s2r_check *mbox_check;
++	void *check_pattern;
++	u32 check_crc;
++	unsigned int check_ranges;
+ 
+ 	u32 wake_enable[WAKE_SOURCES_MAX];
+ 	int wake_enable_count;
+@@ -3189,6 +3219,100 @@ static void t8132_clean_ram(void)
+ 	dsb(sy);
+ }
+ 
++/*
++ * A PA for a kernel VA: the kernel image (inside the vmalloc range on arm64, but block
++ * mapped), the vmap'd stack, or the linear map.
++ */
++static phys_addr_t sleep_check_pa(const void *va)
++{
++	unsigned long a = (unsigned long)va;
++
++	if (a >= (unsigned long)_text && a < (unsigned long)_end)
++		return __pa_symbol(a);
++	if (is_vmalloc_addr(va))
++		return page_to_phys(vmalloc_to_page(va)) + offset_in_page(va);
++	return virt_to_phys(va);
++}
++
++static void sleep_check_add(struct aura_s2r_check *c, const void **va, const void *p,
++			    size_t len)
++{
++	unsigned int n = c->nranges;
++
++	if (n >= AURA_S2R_CHECK_RANGES || !len)
++		return;
++	va[n] = p;
++	c->range[n].pa = sleep_check_pa(p);
++	c->range[n].len = len;
++	c->nranges = n + 1;
++}
++
++/*
++ * What a wake needs first, and a fresh pattern, for aura to check before it takes
++ * resume_pa: the resume stub's 4 KiB, this CPU's saved cpu_suspend() context (in
++ * cpu_suspend()'s frame, written before the commit and not again until cpu_resume reads
++ * it), a 4 KiB pattern written now, and the stash that points cpu_resume at the context.
++ * None of them changes after this. Last before the commit's own cleaning.
++ */
++static void t8132_arm_dram_check(struct apple_sleep *s)
++{
++	struct aura_s2r_check *c = s->mbox_check;
++	unsigned long stack = (unsigned long)task_stack_page(current);
++	unsigned long stub = (unsigned long)t8132_resume_stub & ~(SZ_4K - 1UL);
++	const size_t ctx_len = sizeof(struct sleep_stack_data);
++	const void *va[AURA_S2R_CHECK_RANGES];
++	unsigned long ctx = 0;
++	u64 *word = s->check_pattern;
++	u64 x = get_cycles() | 1;
++	unsigned int i;
++	u32 crc = ~0U;
++
++	s->check_ranges = 0;
++	if (!c)
++		return;
++
++	WRITE_ONCE(c->magic, 0);
++	c->nranges = 0;
++	sleep_check_add(c, va, (void *)stub, SZ_4K);
++
++	for (i = 0; i < mpidr_hash_size(); i++) {
++		unsigned long v = sleep_save_stash[i];
++
++		if (v >= stack && v + ctx_len <= stack + THREAD_SIZE) {
++			ctx = v;
++			break;
++		}
++	}
++	if (ctx) {
++		size_t first = min_t(size_t, ctx_len, PAGE_SIZE - offset_in_page(ctx));
++
++		sleep_check_add(c, va, (void *)ctx, first);
++		sleep_check_add(c, va, (void *)(ctx + first), ctx_len - first);
++	}
++
++	for (i = 0; i < SZ_4K / sizeof(*word); i++) {
++		x ^= x << 13;
++		x ^= x >> 7;
++		x ^= x << 17;
++		word[i] = x;
++	}
++	sleep_check_add(c, va, word, SZ_4K);
++	sleep_check_add(c, va, sleep_save_stash, mpidr_hash_size() * sizeof(*sleep_save_stash));
++
++	for (i = 0; i < c->nranges; i++)
++		crc = crc32_le(crc, va[i], c->range[i].len);
++	c->crc32 = ~crc;
++	dsb(ishst);
++	WRITE_ONCE(c->magic, AURA_S2R_CHECK_MAGIC);
++
++	for (i = 0; i < c->nranges; i++)
++		dcache_clean_poc((unsigned long)va[i], (unsigned long)va[i] + c->range[i].len);
++	dcache_clean_poc((unsigned long)s->mbox, (unsigned long)s->mbox + AURA_S2R_CHECKED_SIZE);
++	dsb(sy);
++	s->check_crc = c->crc32;
++	s->check_ranges = c->nranges;
++}
++
+ static int t8132_sleep_commit(unsigned long unused)
+ {
+ 	struct apple_sleep *s = apple_sleep;
+@@ -3243,6 +3367,7 @@ static int t8132_sleep_commit(unsigned long unused)
+ 	/* The wake comes back through the stub, which restarts WD2 for the resume. */
+ 	WRITE_ONCE(s->mbox->resume_pa, __pa_symbol(t8132_resume_stub));
+ 	dcache_clean_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
++	t8132_arm_dram_check(s);
+ 	/* What this path has dirtied since the sweep. */
+ 	dcache_clean_poc((unsigned long)task_stack_page(current),
+ 			 (unsigned long)task_stack_page(current) + THREAD_SIZE);
+@@ -3700,6 +3825,9 @@ static void apple_sleep_report(void)
+ 
+ 	dev_info(s->dev, "back from sleep, boot object resumes %llu -> %llu\n",
+ 		 s->resumes_before, s->resumes_after);
++	if (s->check_ranges)
++		dev_info(s->dev, "DRAM came back: the boot object matched CRC-32 %08x over %u ranges\n",
++			 s->check_crc, s->check_ranges);
+ 	if (s->isr_wake & SLEEP_ISR_A)
+ 		dev_warn(s->dev, "an SError was pending on the way back: ISR_EL1 %#llx\n",
+ 			 s->isr_wake);
+@@ -3896,6 +4024,8 @@ static int apple_sleep_map_regs(struct apple_sleep *s)
+ static int apple_sleep_map_mailbox(struct apple_sleep *s)
+ {
+ 	struct device_node *chosen;
++	bool checked;
++	u32 size;
+ 	u64 pa;
+ 	int ret;
+ 
+@@ -3903,13 +4033,17 @@ static int apple_sleep_map_mailbox(struct apple_sleep *s)
+ 	if (!chosen)
+ 		return -ENODEV;
+ 	ret = of_property_read_u64(chosen, "aurora,s2r-mailbox", &pa);
++	if (of_property_read_u32(chosen, "aurora,s2r-mailbox-size", &size))
++		size = 0;
+ 	of_node_put(chosen);
+ 	if (ret) {
+ 		dev_info(s->dev, "no aurora,s2r-mailbox from the boot object: no deep sleep\n");
+ 		return -ENODEV;
+ 	}
+ 
+-	s->mbox = devm_memremap(s->dev, pa, sizeof(*s->mbox), MEMREMAP_WB);
++	checked = size >= AURA_S2R_CHECKED_SIZE;
++	s->mbox = devm_memremap(s->dev, pa,
++				checked ? AURA_S2R_CHECKED_SIZE : sizeof(*s->mbox), MEMREMAP_WB);
+ 	if (IS_ERR(s->mbox))
+ 		return PTR_ERR(s->mbox);
+ 
+@@ -3923,6 +4057,14 @@ static int apple_sleep_map_mailbox(struct apple_sleep *s)
+ 				     "mailbox is for CPU %llx, not this boot CPU\n",
+ 				     s->mbox->boot_mpidr);
+ 
++	if (checked) {
++		s->check_pattern = devm_kmalloc(s->dev, SZ_4K, GFP_KERNEL);
++		if (s->check_pattern)
++			s->mbox_check = (struct aura_s2r_check *)(s->mbox + 1);
++	}
++	dev_info(s->dev, "boot object checks DRAM before a resume: %s\n",
++		 s->mbox_check ? "yes" : "no");
++
+ 	return 0;
+ }
+ 
+-- 
+2.43.0
+

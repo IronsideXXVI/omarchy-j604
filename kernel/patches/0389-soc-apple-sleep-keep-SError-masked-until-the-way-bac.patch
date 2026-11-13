@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 02:27:38 +0000
+Subject: [PATCH] soc: apple: sleep: keep SError masked until the way
+ back is done
+
+On 1.869 and 1.870 a J604 deep sleep reset the SoC 78 s after its
+RTC alarm both times: the resume stub's 60 s WD2 window plus a cold
+boot. The 80 s window set at the first line of apple_sleep_return()
+was never reached. So the CPU stopped in the generic return:
+cpu_resume, __cpu_suspend_exit() or cpu_suspend()'s
+local_daif_restore().
+
+That restore unmasks SError. One latched during the wake, by the wake
+program, the boot object or a fabric that is not back yet, is taken
+there, and with panic=0 the machine sits until WD2.
+
+Mask DAIF before cpu_suspend() so that its restore leaves everything
+masked, record ISR_EL1 after the way back, and unmask only at the end
+of .enter, inside a WD2 window of its own (140 s), with
+WDT_SUSPEND_SECS set again after it. The next reset then tells the
+two apart: still 60 s means the generic return itself, 140 s means a
+pending SError, and a later window or none means it got past both.
+The wake log names a pending SError when one was seen.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 6d9bd3f5c5..a76580d461 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -75,6 +75,7 @@
+ #include <asm/memory.h>
+ #include <asm/smp_plat.h>
+ #include <asm/suspend.h>
++#include <asm/daifflags.h>
+ #include <asm/sysreg.h>
+ #include <asm/virt.h>
+ 
+@@ -155,6 +156,10 @@ struct aura_s2r_mailbox {
+  */
+ #define WDT_RETURN_SECS		80
+ #define WDT_REWAKE_SECS		100
++/* Last on the way back: SError unmasked again, before device resume. */
++#define WDT_UNMASK_SECS		140
++/* ISR_EL1.A: an SError pending */
++#define SLEEP_ISR_A		BIT(8)
+ 
+ #define AON_AP_DEADLINE		0x08
+ 
+@@ -650,6 +655,8 @@ struct apple_sleep {
+ 	int radio_perst;
+ 	bool radio_perst_low;
+ 	bool returned;
++	/* ISR_EL1 just before SError was unmasked after a wake */
++	u64 isr_wake;
+ 	/* This wake came back down the deep path, not the DRAM-kept one. */
+ 	bool deep_ran;
+ 	/* This sleep's wake came from the SMC's sources alone. */
+@@ -3334,6 +3341,7 @@ static void apple_sleep_return(struct apple_sleep *s)
+ static int apple_sleep_enter(suspend_state_t state)
+ {
+ 	struct apple_sleep *s = apple_sleep;
++	unsigned long daif;
+ 	int ret;
+ 
+ 	ret = apple_sleep_refuse(s);
+@@ -3373,6 +3381,11 @@ static int apple_sleep_enter(suspend_state_t state)
+ 
+ 	s->cntkctl = read_sysreg(cntkctl_el1);
+ 	pm_set_resume_via_firmware();
++	/*
++	 * Everything masked until the way back is done: cpu_suspend() restores what it
++	 * found, so an SError latched during the wake waits for our unmask below.
++	 */
++	daif = local_daif_save();
+ 	ret = cpu_suspend(0, s->soc->commit);
+ 	if (ret)
+ 		panic("Apple committed sleep returned without physical wake: %d", ret);
+@@ -3384,6 +3397,11 @@ static int apple_sleep_enter(suspend_state_t state)
+ 	apple_sleep_stray_restore(s);
+ 	sleep_wake_restore(s);
+ 
++	s->isr_wake = read_sysreg(isr_el1);
++	apple_sleep_set_wd2(s, WDT_UNMASK_SECS);
++	local_daif_restore(daif);
++	apple_sleep_set_wd2(s, WDT_SUSPEND_SECS);
++
+ 	return ret;
+ }
+ 
+@@ -3682,6 +3700,9 @@ static void apple_sleep_report(void)
+ 
+ 	dev_info(s->dev, "back from sleep, boot object resumes %llu -> %llu\n",
+ 		 s->resumes_before, s->resumes_after);
++	if (s->isr_wake & SLEEP_ISR_A)
++		dev_warn(s->dev, "an SError was pending on the way back: ISR_EL1 %#llx\n",
++			 s->isr_wake);
+ 	for (i = 0; i < s->ps_unlatched_count; i++)
+ 		dev_warn(s->dev, "power word %#x was off with BUSY latched at the commit: %#x\n",
+ 			 s->ps_unlatched[i].offset, s->ps_unlatched[i].val);
+-- 
+2.43.0
+
