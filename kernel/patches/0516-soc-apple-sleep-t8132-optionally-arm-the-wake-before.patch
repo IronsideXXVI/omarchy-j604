@@ -1,0 +1,256 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 22:07:20 +0000
+Subject: [PATCH] soc: apple: sleep: t8132: optionally arm the wake
+ before DCS down
+
+Of the stores the T8132 commit makes after t8132_sleep_mcc_stop(), only
+the first one, resume_pa, is shown to reach DRAM at the wake; the DRAM
+check table, the stub checks and the stub config come milliseconds
+later and show no sign of arriving. Add t8132_arm_early (default N) to
+tell an order or time cutoff apart from an address one: when set, all
+of it is written and cleaned before DCS and the memory controller go
+down, and after mcc_stop the commit writes only MMIO and its own stack.
+
+The arm block becomes t8132_commit_arm(), unchanged, called after WD2
+with t8132_arm_early and where it was without. Late stores the wake
+reads, and what each does with t8132_arm_early:
+- sleep_ps_save(): ps_commit/ps_aon_commit, used by the wake's power
+  state restore. Taken and cleaned before DCS down. It then misses what
+  the CPM gate, cluster and clock mux writes change; to be checked.
+- aic_sleep_mask_all(): the AIC masks aic_sleep_restore() writes back.
+  New aic_sleep_save_masks() saves and cleans them early, unmasked. The
+  late save stores the same values (interrupts off, other cores
+  stopped), so losing it is harmless.
+- quiesce_still_on: a report only. Left 0.
+- spin_table_stop_released: read by the stopped cores before power
+  off, reset by spin_table_stop_finished() at the wake. Harmless.
+- the commit path's stack frames: dead once cpu_resume returns through
+  cpu_suspend()'s frame, written before the commit and in the check.
+
+t8132_probe_stub gains bit 3: the check table's nranges, read through
+t8132_mbox_pa, is non-zero. aura clears only the check magic and the
+mailbox is zeroed at each cold boot, so on a boot's first sleep it
+means the table arrived. WD2 becomes 24 + 10 * code seconds.
+
+.prepare logs the PAs of the mailbox, t8132_stubcfg, the check pattern
+and the suspending task's stack.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/irqchip/irq-apple-aic.c       | 15 +++++
+ drivers/soc/apple/sleep.c             | 82 +++++++++++++++++++++++----
+ include/linux/irqchip/irq-apple-aic.h |  2 +
+ 3 files changed, 87 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/irqchip/irq-apple-aic.c b/drivers/irqchip/irq-apple-aic.c
+index 6d8873be97..9fd031314a 100644
+--- a/drivers/irqchip/irq-apple-aic.c
++++ b/drivers/irqchip/irq-apple-aic.c
+@@ -60,6 +60,7 @@
+ #include <linux/syscore_ops.h>
+ #include <linux/irqchip/irq-apple-aic.h>
+ #include <asm/apple_m1_pmu.h>
++#include <asm/cacheflush.h>
+ #include <asm/cputype.h>
+ #include <asm/exception.h>
+ #include <asm/sysreg.h>
+@@ -510,6 +511,20 @@ void aic_sleep_mask_all(void)
+ 	}
+ }
+ 
++/* What aic_sleep_mask_all() saves, without masking, cleaned to the PoC. */
++void aic_sleep_save_masks(void)
++{
++	struct aic_irq_chip *ic = aic_irqc;
++	u32 words = ic->max_irq >> 5, off = 0, i;
++	u32 *saved = ic->sleep_masks;
++	int die;
++
++	for (die = 0; die < ic->nr_die; die++, off += ic->info.die_stride)
++		for (i = 0; i < words; i++)
++			*saved++ = aic_ic_read(ic, ic->info.mask_set + off + i * 4);
++	dcache_clean_poc((unsigned long)ic->sleep_masks, (unsigned long)saved);
++}
++
+ void aic_sleep_restore(void)
+ {
+ 	struct aic_irq_chip *ic = aic_irqc;
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index d2f3b805a2..f0b191164a 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -3970,8 +3970,10 @@ asm(
+ /*
+  * t8132_probe_entry: a flag-free probe (TB). Reads nothing written at suspend time to decide;
+  * code bit 0 = its own adr equals the link PA patched into the movz/movk at boot, bit 1 = the
+- * link-time canary at t8132_stubcfg+32, bit 2 = the commit-time magic. WD2 = 20 + 15 * code s,
+- * then park.
++ * link-time canary at t8132_stubcfg+32, bit 2 = the commit-time magic, bit 3 = the DRAM check
++ * table's nranges != 0, read through t8132_mbox_pa (aura clears only the check magic, and the
++ * mailbox is zeroed at every cold boot, so on a boot's first sleep it says the table arrived).
++ * WD2 = 24 + 10 * code s (24..174, under the 32-bit cap), then park.
+  */
+ "\t.type\tt8132_probe_stub, %function\n"
+ "t8132_probe_stub:\n"
+@@ -4002,9 +4004,15 @@ asm(
+ "\tcmp\tw4, w6\n"
+ "\tb.ne\t97f\n"
+ "\torr\tw5, w5, #4\n"
+-"97:\tmov\tw4, #15\n"
++"97:\tadrp\tx12, t8132_mbox_pa\n"
++"\tldr\tx12, [x12, :lo12:t8132_mbox_pa]\n"
++"\tcbz\tx12, 99f\n"
++"\tldr\tw4, [x12, #0x28]\n"
++"\tcbz\tw4, 99f\n"
++"\torr\tw5, w5, #8\n"
++"99:\tmov\tw4, #10\n"
+ "\tmul\tw5, w5, w4\n"
+-"\tadd\tw5, w5, #20\n"
++"\tadd\tw5, w5, #24\n"
+ "\tmovz\tw4, #0x3600\n"
+ "\tmovk\tw4, #0x16e, lsl #16\n"
+ "\tmul\tw10, w5, w4\n"
+@@ -4761,6 +4769,17 @@ module_param(t8132_dram_check, bool, 0644);
+ MODULE_PARM_DESC(t8132_dram_check,
+ 		 "T8132: have the boot object check the wake ranges in DRAM before it resumes (default: on)");
+ 
++/*
++ * Everything the wake reads from DRAM is written and cleaned before DCS and the memory
++ * controller go down, instead of after: the mailbox and resume_pa, the init_kernel_el marks,
++ * the stub's checks and config, the DRAM check, the power-state and AIC mask saves. After
++ * t8132_sleep_mcc_stop() the commit then writes only MMIO and its own dead stack.
++ */
++static bool t8132_arm_early;
++module_param(t8132_arm_early, bool, 0644);
++MODULE_PARM_DESC(t8132_arm_early,
++		 "T8132: write and clean what the wake reads before DCS and the memory controller go down (default: off)");
++
+ static bool t8132_cpu_perf_down = true;
+ module_param(t8132_cpu_perf_down, bool, 0644);
+ MODULE_PARM_DESC(t8132_cpu_perf_down,
+@@ -5247,9 +5266,13 @@ static void t8132_ovrd_apply(u32 m)
+ 	}
+ }
+ 
++static void t8132_commit_arm(struct apple_sleep *s);
++static void __noreturn t8132_commit_tail(struct apple_sleep *s);
++
+ static int t8132_sleep_commit(unsigned long unused)
+ {
+ 	struct apple_sleep *s = apple_sleep;
++	bool early = READ_ONCE(t8132_arm_early);
+ 	int i;
+ 
+ 	s->siq_cfg = read_sysreg_s(SYS_APL_SIQ_CFG_EL1);
+@@ -5259,6 +5282,20 @@ static int t8132_sleep_commit(unsigned long unused)
+ 	t8132_clean_extra(s);
+ 	t8132_sleep_lower_io(s);
+ 	apple_sleep_arm_wd2(s);
++	if (early) {
++		const struct apple_sleep_words *all = &s->soc->ps_all, *aon = &s->soc->ps_aon_all;
++
++		/* Read by the wake's power-state restore and aic_sleep_restore(). */
++		sleep_ps_save(s);
++		dcache_clean_poc((unsigned long)s->ps_commit,
++				 (unsigned long)(s->ps_commit + all->count));
++		dcache_clean_poc((unsigned long)s->ps_aon_commit,
++				 (unsigned long)(s->ps_aon_commit + aon->count));
++		aic_sleep_save_masks();
++		s->quiesce_still_on = 0;
++		t8132_commit_arm(s);
++		t8132_clean_ram();
++	}
+ 	/*
+ 	 * macOS has the SoC at its sleep perf state and DCS at state 4 by now. Its firmware
+ 	 * does that, with no write from the CPU. T8140's way gets the same states here,
+@@ -5293,10 +5330,13 @@ static int t8132_sleep_commit(unsigned long unused)
+ 		writel(0, s->cluster + CLUSTER_P);
+ 	}
+ 
+-	s->quiesce_still_on = 0;
+-	for (i = 0; i < ARRAY_SIZE(t8132_quiesce_words); i++)
+-		if (sleep_ps_on(s, t8132_quiesce_words[i]))
+-			s->quiesce_still_on |= BIT(i);
++	/* A report only; with t8132_arm_early it stays 0 rather than store after mcc_stop. */
++	if (!early) {
++		s->quiesce_still_on = 0;
++		for (i = 0; i < ARRAY_SIZE(t8132_quiesce_words); i++)
++			if (sleep_ps_on(s, t8132_quiesce_words[i]))
++				s->quiesce_still_on |= BIT(i);
++	}
+ 
+ 	/* All four read back unchanged on macOS. */
+ 	if (!sleep_skip(s, SKIP_CLK_MUX)) {
+@@ -5306,10 +5346,23 @@ static int t8132_sleep_commit(unsigned long unused)
+ 		writel(CLK_MUX_PARKED, s->clk_mux + T8132_CLK_MUX_44);
+ 	}
+ 
+-	sleep_ps_save(s);
++	if (!early)
++		sleep_ps_save(s);
+ 	/* macOS leaves this one to AUTO_ENABLE at the commit. */
+ 	if (!sleep_skip(s, SKIP_AON_A0_AUTO))
+ 		writel((readl(s->ps_aon + 0xa0) & ~PS_FLAGS) | PS_AUTO_ENABLE, s->ps_aon + 0xa0);
++	if (!early)
++		t8132_commit_arm(s);
++
++	if (s->ovrd)
++		t8132_ovrd_apply(s->ovrd);
++	writel(1, s->commit);
++	t8132_commit_tail(s);
++}
++
++/* What the wake reads from DRAM, written and cleaned; with t8132_arm_early, before DCS down. */
++static void t8132_commit_arm(struct apple_sleep *s)
++{
+ 	apple_sleep_arm_mailbox(s);
+ 	/* The wake comes back through the stub, which restarts WD2 for the resume. */
+ 	t8132_team_armed = READ_ONCE(t8132_team_entry);
+@@ -5347,10 +5400,10 @@ static int t8132_sleep_commit(unsigned long unused)
+ 			 (unsigned long)task_stack_page(current) + THREAD_SIZE);
+ 	dcache_clean_poc((unsigned long)s, (unsigned long)(s + 1));
+ 	dsb(sy);
++}
+ 
+-	if (s->ovrd)
+-		t8132_ovrd_apply(s->ovrd);
+-	writel(1, s->commit);
++static void t8132_commit_tail(struct apple_sleep *s)
++{
+ 	/*
+ 	 * macOS 26B123 on the J604, right after its commit (hv trace): PMU 0x200e <- 0 and
+ 	 * 0x2000 <- 0x41 ("go hib"), after its RTC alarm at 0x2008. #1314 sends neither.
+@@ -5788,6 +5841,11 @@ static int apple_sleep_prepare(void)
+ 		}
+ 		if (READ_ONCE(t8132_dirty_pages))
+ 			t8132_dirty_probe_run(s, READ_ONCE(t8132_dirty_pages));
++		dev_info(s->dev, "wake data: mailbox %#llx, stubcfg %pa, check pattern %pa, suspend stack %pa; arm_early %d\n",
++			 t8132_mbox_pa, &(phys_addr_t){ __pa_symbol(&t8132_stubcfg) },
++			 &(phys_addr_t){ s->check_pattern ? virt_to_phys(s->check_pattern) : 0 },
++			 &(phys_addr_t){ sleep_check_pa(task_stack_page(current)) },
++			 READ_ONCE(t8132_arm_early));
+ 	}
+ 
+ 	/* With an encoder's domain linked, genpd has it off once the encoders are. */
+diff --git a/include/linux/irqchip/irq-apple-aic.h b/include/linux/irqchip/irq-apple-aic.h
+index 3c3781322a..a806e8e109 100644
+--- a/include/linux/irqchip/irq-apple-aic.h
++++ b/include/linux/irqchip/irq-apple-aic.h
+@@ -6,10 +6,12 @@
+ 
+ #ifdef CONFIG_APPLE_AIC
+ void aic_sleep_mask_all(void);
++void aic_sleep_save_masks(void);
+ void aic_sleep_restore(void);
+ u32 aic_sleep_ack(void);
+ #else
+ static inline void aic_sleep_mask_all(void) { }
++static inline void aic_sleep_save_masks(void) { }
+ static inline void aic_sleep_restore(void) { }
+ static inline u32 aic_sleep_ack(void) { return 0; }
+ #endif
+-- 
+2.43.0
+
