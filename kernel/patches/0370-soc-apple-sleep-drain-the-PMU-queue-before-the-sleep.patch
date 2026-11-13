@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 23:47:57 +0000
+Subject: [PATCH] soc: apple: sleep: drain the PMU queue before the
+ sleep mask
+
+The match writes the PMU boot stage with the reply vector masked, reads
+at most one reply word, acknowledges the vector, and then enables the
+sleep notify mask, SPMI_NOTIFY_ENABLE_SLEEP. That mask includes bit 0,
+the reply vector itself.
+
+A second word in the AP queue, or one the PMU queues between the write
+and the mask, raises the reply vector again once the mask is set. The
+SoC then wakes at once on the PMU's SPMI notify. A T8132 deep sleep
+through the warm path did exactly that: it woke after 0.92 s on AP
+wake source 145 (NUB.SPMI0.SW3), with its RTC alarm still pending.
+
+Empty the queue, bounded, and acknowledge it after the PMU write and
+again right before the sleep mask is set.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 29 +++++++++++++++++++++++++----
+ 1 file changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index f1b337431e..0dda66ff5e 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -173,6 +173,8 @@ struct aura_s2r_mailbox {
+ #define SPMI_OP_SLEEP		0x11
+ #define SPMI_OP_WAKEUP		0x13
+ #define SPMI_POLL_US		20000
++/* More than the AP queue holds: a bound for the drain with IRQs off. */
++#define SPMI_DRAIN_MAX		64
+ 
+ /* A port controller on SPMI: registers go through a page select, then a data window. */
+ #define HPM_REG_SELECT		0x00
+@@ -2567,6 +2569,23 @@ static void sleep_ps_rewake_report(struct apple_sleep *s)
+ 
+ #define T8132_PS_AON_ON_STATE	4
+ 
++/*
++ * Empties the AP queue, then acknowledges the reply vector. The sleep's notify
++ * mask enables that vector (bit 0), so a word still queued at the commit
++ * raises it again and wakes the SoC at once.
++ */
++static void sleep_spmi_drain(struct apple_sleep *s)
++{
++	unsigned int n;
++
++	for (n = 0; n < SPMI_DRAIN_MAX; n++) {
++		if (readl(s->spmi + SPMI_STATUS) & SPMI_STATUS_RX_EMPTY)
++			break;
++		readl(s->spmi + SPMI_REPLY);
++	}
++	writel(1, s->spmi + SPMI_NOTIFY_ACK);
++}
++
+ /* As macOS writes the PMU: the reply's vector masked, then acknowledged, so none is left raised. */
+ static void sleep_pmu_write(struct apple_sleep *s, u16 reg, u8 val)
+ {
+@@ -2576,10 +2595,10 @@ static void sleep_pmu_write(struct apple_sleep *s, u16 reg, u8 val)
+ 	writel(enable & ~SPMI_NOTIFY_REPLY, s->spmi + SPMI_NOTIFY_ENABLE);
+ 	writel(((u32)reg << 16) | SPMI_CMD_WRITE, s->spmi + SPMI_CMD);
+ 	writel(val, s->spmi + SPMI_CMD);
+-	if (!readl_poll_timeout_atomic(s->spmi + SPMI_STATUS, status,
+-				       !(status & SPMI_STATUS_RX_EMPTY), 1, 1000))
+-		readl(s->spmi + SPMI_REPLY);
+-	writel(1, s->spmi + SPMI_NOTIFY_ACK);
++	/* The reply, or a timeout: either way nothing may stay queued. */
++	readl_poll_timeout_atomic(s->spmi + SPMI_STATUS, status,
++				  !(status & SPMI_STATUS_RX_EMPTY), 1, 1000);
++	sleep_spmi_drain(s);
+ 	writel(enable, s->spmi + SPMI_NOTIFY_ENABLE);
+ }
+ 
+@@ -2629,6 +2648,8 @@ static void apple_sleep_match(struct apple_sleep *s)
+ 
+ 	s->spmi_saved[0] = readl(s->spmi + SPMI_NOTIFY_ENABLE);
+ 	s->spmi_saved[1] = readl(s->spmi_a0);
++	/* Anything the PMU queued since the write would wake the SoC at once. */
++	sleep_spmi_drain(s);
+ 	writel(SPMI_NOTIFY_ENABLE_SLEEP, s->spmi + SPMI_NOTIFY_ENABLE);
+ 	writel(SPMI_NOTIFY_ENABLE_SLEEP, s->spmi_a0);
+ 
+-- 
+2.43.0
+
