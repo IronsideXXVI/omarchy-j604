@@ -1,0 +1,302 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 02:44:01 +0000
+Subject: [PATCH] smp: turn the T8132 system-level cache on again before an S2R
+ wake resumes
+
+On the T8132 aura turns the system-level cache on itself at boot
+(mcc_init_t8122 sets has_cache_control, and kboot calls
+mcc_enable_cache()), unlike T8140 and T6041, where the cache is
+firmware-owned. A deep sleep takes the cache's power, Linux writes it
+back and turns it off before the commit, and nothing turns it on at the
+wake before the OS's first cacheable access.
+
+After the DRAM check, record each plane's cache control and status
+(+0x1c00, +0x1c04) as the wake left them in the mailbox, which grows
+from 0x70 to 0x98 bytes (/chosen/aurora,s2r-mailbox-size), for the OS
+to read after it resumes. Then turn the cache on as mcc_enable_cache()
+does at boot, without printing, as the OS owns the console by then. If
+a plane's cache does not come up, stop with WD2 at 50 s instead of
+jumping. An OS that arms no DRAM check gets this step too.
+
+Assisted-by: LLM
+---
+ src/mcc.c                        |  47 ++++++++++++++
+ src/mcc.h                        |   1 +
+ src/smp.c                        |  38 +++++++++--
+ src/wdt.h                        |   2 +
+ tests/python/test_mcc_s2r_slc.py | 108 +++++++++++++++++++++++++++++++
+ 5 files changed, 190 insertions(+), 6 deletions(-)
+ create mode 100644 tests/python/test_mcc_s2r_slc.py
+
+diff --git a/src/mcc.c b/src/mcc.c
+index 81bb060d..934e6347 100644
+--- a/src/mcc.c
++++ b/src/mcc.c
+@@ -250,6 +250,53 @@ int mcc_enable_cache(void)
+     return ret;
+ }
+ 
++/*
++ * T8132 S2R wake: each plane's cache control and status as the wake left them (the first @max,
++ * in plane order; @count says how many), then the cache enabled as mcc_enable_cache() does at
++ * boot. aura enables it itself at boot on this SoC, and nothing else does after a wake. No
++ * printing: the OS owns the console by now. -1 if a plane's enable did not complete.
++ */
++int mcc_s2r_enable_cache(u32 *ctrl, u32 *status, u32 max, u32 *count)
++{
++    u32 n = 0;
++    int ret = 0;
++
++    *count = 0;
++    if (!mcc_initialized)
++        return 0;
++
++    for (int mcc = 0; mcc < mcc_count; mcc++) {
++        if (!mcc_regs[mcc].has_cache_control)
++            continue;
++        u32 enable = mcc_regs[mcc].cache_enable ?: PLANE_CACHE_ENABLE;
++        u32 stat = mcc_regs[mcc].cache_status ?: PLANE_CACHE_STATUS;
++        for (int plane = 0; plane < mcc_regs[mcc].plane_count; plane++, n++) {
++            if (n < max) {
++                ctrl[n] = plane_read32(mcc, plane, enable);
++                status[n] = plane_read32(mcc, plane, stat);
++            }
++        }
++    }
++    *count = n;
++
++    for (int mcc = 0; mcc < mcc_count; mcc++) {
++        if (!mcc_regs[mcc].has_cache_control)
++            continue;
++        u32 enable = mcc_regs[mcc].cache_enable ?: PLANE_CACHE_ENABLE;
++        u32 stat = mcc_regs[mcc].cache_status ?: PLANE_CACHE_STATUS;
++        for (int plane = 0; plane < mcc_regs[mcc].plane_count; plane++) {
++            plane_write32(mcc, plane, enable, mcc_regs[mcc].cache_enable_val);
++            if (plane_poll32(mcc, plane, stat, mcc_regs[mcc].cache_status_mask,
++                             mcc_regs[mcc].cache_status_val, CACHE_ENABLE_TIMEOUT))
++                ret = -1;
++            else if (mcc_regs[mcc].cache_disable)
++                plane_write32(mcc, plane, mcc_regs[mcc].cache_disable, 0);
++        }
++    }
++
++    return ret;
++}
++
+ int mcc_unmap_carveouts(void)
+ {
+     mcc_carveout_count = 0;
+diff --git a/src/mcc.h b/src/mcc.h
+index c0c95255..4a8a8649 100644
+--- a/src/mcc.h
++++ b/src/mcc.h
+@@ -16,5 +16,6 @@ extern struct mcc_carveout mcc_carveouts[];
+ int mcc_init(void);
+ int mcc_unmap_carveouts(void);
+ int mcc_enable_cache(void);
++int mcc_s2r_enable_cache(u32 *ctrl, u32 *status, u32 max, u32 *count);
+ 
+ #endif
+diff --git a/src/smp.c b/src/smp.c
+index 8cc1bdb8..3555ef42 100644
+--- a/src/smp.c
++++ b/src/smp.c
+@@ -8,6 +8,7 @@
+ #include "cpu_regs.h"
+ #include "dockchannel_uart.h"
+ #include "malloc.h"
++#include "mcc.h"
+ #include "memory.h"
+ #include "pmgr.h"
+ #include "soc.h"
+@@ -417,11 +418,12 @@ bool smp_resets_return_here(void)
+  * OS's release target. The boot core takes resume_pa. Linux reads this layout in
+  * drivers/soc/apple/t8140-sleep.c.
+  */
+-#define AURA_S2R_MAGIC     0x3152325341525541ULL /* "AURAS2R1" */
+-#define AURA_S2R_CHECK     0x3143524341525541ULL /* "AURACRC1" */
+-#define AURA_S2R_RANGES    4
+-#define AURA_S2R_RANGE_MAX (4 * SZ_16K)
+-#define AURA_S2R_TOTAL_MAX (16 * SZ_16K)
++#define AURA_S2R_MAGIC      0x3152325341525541ULL /* "AURAS2R1" */
++#define AURA_S2R_CHECK      0x3143524341525541ULL /* "AURACRC1" */
++#define AURA_S2R_RANGES     4
++#define AURA_S2R_RANGE_MAX  (4 * SZ_16K)
++#define AURA_S2R_TOTAL_MAX  (16 * SZ_16K)
++#define AURA_S2R_SLC_PLANES 4
+ 
+ struct aura_s2r_mailbox {
+     u64 magic;      /* aura, before the OS starts */
+@@ -440,9 +442,18 @@ struct aura_s2r_mailbox {
+         u64 pa;
+         u64 len;
+     } range[AURA_S2R_RANGES];
++    /*
++     * T8132: the system-level cache as each wake left it, aura's to write, for the OS to read
++     * after it resumes. slc_planes is how many planes there are (the first four are kept);
++     * slc_result 1 means aura enabled the cache again before the jump.
++     */
++    u32 slc_planes;
++    u32 slc_result;
++    u32 slc_ctrl[AURA_S2R_SLC_PLANES];   /* plane +0x1c00 */
++    u32 slc_status[AURA_S2R_SLC_PLANES]; /* plane +0x1c04 */
+ };
+ 
+-static_assert(sizeof(struct aura_s2r_mailbox) == 0x70, "the OS's layout of the mailbox");
++static_assert(sizeof(struct aura_s2r_mailbox) == 0x98, "the OS's layout of the mailbox");
+ 
+ static struct aura_s2r_mailbox s2r_mailbox SMP_SHARED ALIGNED(64);
+ 
+@@ -546,6 +557,21 @@ void smp_s2r_return_to_os(void)
+             while (1)
+                 sysop("wfe");
+         }
++
++        /*
++         * aura turned the system-level cache on at boot, and the wake doesn't: record it as
++         * the wake left it, then turn it on again before the OS's first cacheable access.
++         */
++        u32 planes;
++        int slc = mcc_s2r_enable_cache(s2r_mailbox.slc_ctrl, s2r_mailbox.slc_status,
++                                       AURA_S2R_SLC_PLANES, &planes);
++        s2r_mailbox.slc_planes = planes;
++        s2r_mailbox.slc_result = slc ? 2 : 1;
++        if (slc) {
++            wdt_s2r_wake_mark(WDT_S2R_SLC_SECONDS);
++            while (1)
++                sysop("wfe");
++        }
+     }
+ 
+     s2r_mailbox.resume_pa = 0;
+diff --git a/src/wdt.h b/src/wdt.h
+index ffa9a0d7..d6c3417d 100644
+--- a/src/wdt.h
++++ b/src/wdt.h
+@@ -23,6 +23,8 @@ void wdt_host_attached(void);
+ /* The same mark when aura stops instead: DRAM not kept, or the OS's check malformed. */
+ #define WDT_S2R_DRAM_LOST_SECONDS 20
+ #define WDT_S2R_MALFORMED_SECONDS 30
++/* ... or the system-level cache didn't come back on. */
++#define WDT_S2R_SLC_SECONDS 50
+ void wdt_s2r_wake_mark(unsigned seconds);
+ bool wdt_boot_watchdog_armed(void);
+ 
+diff --git a/tests/python/test_mcc_s2r_slc.py b/tests/python/test_mcc_s2r_slc.py
+new file mode 100644
+index 00000000..5ec2c9ec
+--- /dev/null
++++ b/tests/python/test_mcc_s2r_slc.py
+@@ -0,0 +1,108 @@
++"""aura r8: on a T8132 S2R wake, the system-level cache is recorded as the wake left it, then
++enabled exactly as mcc_enable_cache() does at boot, without printing."""
++from pathlib import Path
++import subprocess
++
++
++def test_mcc_s2r_enable_cache(tmp_path):
++    repo = Path(__file__).resolve().parents[2]
++    src = (repo / 'src/mcc.c').read_text()
++    defines = src[src.index('#define PLANE_CACHE_ENABLE'):src.index('#define T8103_DCC_DRAMCFG0 ')]
++    regs = src[src.index('struct mcc_regs {'):src.index('static struct mcc_regs mcc_regs[')]
++    helpers = src[src.index('static u32 plane_read32('):src.index('int mcc_enable_cache(void)')]
++    s2r = src[src.index('int mcc_s2r_enable_cache('):src.index('int mcc_unmap_carveouts(void)')]
++    harness = r"""
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++typedef uint32_t u32;
++typedef uint64_t u64;
++#define BIT(n) (1UL << (n))
++#define GENMASK(h, l) (((~0UL) << (l)) & (~0UL >> (63 - (h))))
++#define FIELD_PREP(m, v) (((u64)(v) << __builtin_ctzl(m)) & (m))
++struct tz_regs;
++""" + defines + regs + r"""
++#define MAX_MCC_INSTANCES 16
++static struct mcc_regs mcc_regs[MAX_MCC_INSTANCES];
++static int mcc_count;
++static bool mcc_initialized;
++/* 2 AMCCs x 2 planes, as the J604's ADT: plane i at 0x100000 * (amcc) + 0x40000 * plane. */
++static u32 mem[2][2][0x2000 / 4];
++static int writes, prints, stuck_plane = -1;
++static u32 *reg(u64 a)
++{
++    int m = (a >> 20) & 1, p = (a >> 18) & 3;
++    assert(m < 2 && p < 2 && (a & 0x3ffff) < 0x2000);
++    return &mem[m][p][(a & 0x3ffff) / 4];
++}
++static u32 read32(u64 a) { return *reg(a); }
++static void write32(u64 a, u32 v)
++{
++    writes++;
++    *reg(a) = v;
++    /* The status follows the enable, except on a stuck plane. */
++    if ((a & 0x3ffff) == PLANE_CACHE_ENABLE && v && (int)(((a >> 18) & 3) + 2 * ((a >> 20) & 1)) != stuck_plane)
++        *reg(a + 4) = T8122_CACHE_STATUS_VAL;
++}
++static int poll32(u64 a, u32 mask, u32 target, u32 timeout)
++{
++    (void)timeout;
++    return (read32(a) & mask) == target ? 0 : -1;
++}
++#define printf(...) (prints++, 0)
++""" + helpers + s2r + r"""
++int main(void)
++{
++    u32 ctrl[4], status[4], n = 99;
++    assert(mcc_s2r_enable_cache(ctrl, status, 4, &n) == 0 && n == 0 && writes == 0);
++
++    mcc_count = 2;
++    for (int i = 0; i < 2; i++) {
++        mcc_regs[i].plane_base = 0x100000 * i;
++        mcc_regs[i].plane_stride = 0x40000;
++        mcc_regs[i].plane_count = 2;
++        mcc_regs[i].cache_enable_val = 1;
++        mcc_regs[i].cache_status_mask = T8122_CACHE_STATUS_MASK;
++        mcc_regs[i].cache_status_val = T8122_CACHE_STATUS_VAL;
++        mcc_regs[i].has_cache_control = true;
++    }
++    mcc_initialized = true;
++    /* As a wake could leave them: off on all four, one plane with a part status. */
++    mem[1][0][PLANE_CACHE_STATUS / 4] = 0x123;
++
++    assert(mcc_s2r_enable_cache(ctrl, status, 4, &n) == 0 && n == 4);
++    assert(ctrl[0] == 0 && ctrl[3] == 0 && status[2] == 0x123 && status[0] == 0);
++    for (int m = 0; m < 2; m++)
++        for (int p = 0; p < 2; p++)
++            assert(mem[m][p][PLANE_CACHE_ENABLE / 4] == 1 &&
++                   mem[m][p][PLANE_CACHE_STATUS / 4] == T8122_CACHE_STATUS_VAL);
++    assert(writes == 4 && prints == 0);
++
++    /* Only the first @max are kept, every plane is still enabled. */
++    memset(mem, 0, sizeof(mem));
++    writes = 0;
++    assert(mcc_s2r_enable_cache(ctrl, status, 2, &n) == 0 && n == 4 && writes == 4);
++
++    /* A plane that doesn't come up: -1, the others still enabled. */
++    memset(mem, 0, sizeof(mem));
++    stuck_plane = 3;
++    assert(mcc_s2r_enable_cache(ctrl, status, 4, &n) == -1);
++    assert(mem[0][0][PLANE_CACHE_STATUS / 4] == T8122_CACHE_STATUS_VAL);
++
++    /* A firmware-owned cache (T8140, T6041) is left alone, as at boot. */
++    memset(mem, 0, sizeof(mem));
++    stuck_plane = -1;
++    writes = 0;
++    mcc_regs[0].has_cache_control = mcc_regs[1].has_cache_control = false;
++    assert(mcc_s2r_enable_cache(ctrl, status, 4, &n) == 0 && n == 0 && writes == 0);
++    return 0;
++}
++"""
++    binary = tmp_path / 'mcc-s2r-slc'
++    subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function',
++                    '-fsanitize=address,undefined', '-x', 'c', '-', '-o', str(binary)],
++                   input=harness, text=True, check=True)
++    subprocess.run([str(binary)], check=True)
+-- 
+2.43.0
+
