@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 15:12:14 +0000
+Subject: [PATCH] soc: apple: sleep: let a T8132 sleep resume through
+ #1314's own stub
+
+To tell whether one of the J604's additions stops the wake, one sleep
+should come back exactly the way #1314 does. t8132_team_entry, read at
+each commit, points the boot object at a copy of #1314's stub (60 s
+WD2, then cpu_resume) and turns off, for that sleep, the early catch
+vectors, the resume assembly's and the C return's WD2 marks, elchk,
+elchk2 and the stub instruments. Off by default.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 73 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 69 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 386e5fc780..2d297fd2ed 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -3810,6 +3810,20 @@ asm(
+ "\tstr\tw10, [x9, #0x2c]\n"
+ "\tret\n"
+ "\t.size\tt8132_stub_wd2, . - t8132_stub_wd2\n"
++/* #1314's resume stub, instruction for instruction (aurora-silicon/linux#1314 at 04f43c7fd9). */
++"\t.type\tt8132_team_stub, %function\n"
++"t8132_team_stub:\n"
++"\tmovz\tx9, #0x882b, lsl #16\n"
++"\tmovk\tx9, #0x3, lsl #32\n"
++"\tstr\twzr, [x9, #0x2c]\n"
++"\tstr\twzr, [x9, #0x20]\n"
++"\tmovz\tw10, #0xa800\n"
++"\tmovk\tw10, #0x55d4, lsl #16\n"
++"\tstr\tw10, [x9, #0x28]\n"
++"\tmov\tw10, #1\n"
++"\tstr\tw10, [x9, #0x2c]\n"
++"\tb\tcpu_resume\n"
++"\t.size\tt8132_team_stub, . - t8132_team_stub\n"
+ "t8132_resume_end:\n"
+ "\t.popsection\n"
+ );
+@@ -3945,6 +3959,43 @@ static int t8132_rec_selftest(struct apple_sleep *s, unsigned int mode)
+ 	return -EAGAIN;
+ }
+ 
++void t8132_team_stub(void);
++
++/*
++ * apple_sleep.t8132_team_entry (read at each commit): the way back as #1314 has it. aura
++ * takes t8132_team_stub, #1314's own (60 s WD2, then cpu_resume): no vectors, no
++ * ctxr_stay_el2 read, no elchk or elchk2, no stub instruments, and the resume assembly's and
++ * the C return's WD2 marks and early vectors are off for that sleep. The commit itself is
++ * unchanged; t8132_dram_check=0 and t8132_commit_skip cover what can be left out there.
++ */
++static bool t8132_team_entry;
++module_param(t8132_team_entry, bool, 0644);
++MODULE_PARM_DESC(t8132_team_entry, "T8132 deep sleep: resume through #1314's own stub, with no marks, vectors or checks on the way back (default off)");
++static bool t8132_team_armed;
++
++/* On: the marks, the early vectors and the C hook off. Off: as t8132_catch_init() set them. */
++static void t8132_team_marks(bool team)
++{
++	WRITE_ONCE(arm64_suspend_mark_hook, team ? NULL : t8132_return_mark);
++	if (team) {
++		arm64_resume_vbar = 0;
++		arm64_resume_vbar_va = 0;
++		arm64_resume_wdt[0] = 0;
++		arm64_resume_wdt[1] = 0;
++	} else if (t8132_catch_io[0]) {
++		arm64_resume_vbar = __pa_symbol(t8132_resume_vectors);
++		arm64_resume_vbar_va = (unsigned long)t8132_resume_vectors;
++		arm64_resume_wdt[0] = t8132_catch_io[0];
++		arm64_resume_wdt[1] = t8132_catch_io[2];
++	}
++	dcache_clean_poc((unsigned long)arm64_resume_wdt,
++			 (unsigned long)arm64_resume_wdt + sizeof(arm64_resume_wdt));
++	dcache_clean_poc((unsigned long)&arm64_resume_vbar,
++			 (unsigned long)(&arm64_resume_vbar + 1));
++	dcache_clean_poc((unsigned long)&arm64_resume_vbar_va,
++			 (unsigned long)(&arm64_resume_vbar_va + 1));
++}
++
+ /* aura reads this with the MMU off. */
+ static void apple_sleep_arm_mailbox(struct apple_sleep *s)
+ {
+@@ -5064,7 +5115,11 @@ static int t8132_sleep_commit(unsigned long unused)
+ 		writel((readl(s->ps_aon + 0xa0) & ~PS_FLAGS) | PS_AUTO_ENABLE, s->ps_aon + 0xa0);
+ 	apple_sleep_arm_mailbox(s);
+ 	/* The wake comes back through the stub, which restarts WD2 for the resume. */
+-	WRITE_ONCE(s->mbox->resume_pa, __pa_symbol(t8132_resume_stub));
++	t8132_team_armed = READ_ONCE(t8132_team_entry);
++	if (t8132_team_armed)
++		t8132_team_marks(true);
++	WRITE_ONCE(s->mbox->resume_pa, t8132_team_armed ? __pa_symbol(t8132_team_stub) :
++							 __pa_symbol(t8132_resume_stub));
+ 	dcache_clean_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
+ 	/* init_kernel_el's marks (59 58 56 s), on this way back only. */
+ 	WRITE_ONCE(arm64_resume_armed, 1);
+@@ -5079,9 +5134,15 @@ static int t8132_sleep_commit(unsigned long unused)
+ 				 (unsigned long)s->mbox + AURA_S2R_CHECKED_SIZE);
+ 		s->check_ranges = 0;
+ 	}
+-	t8132_arm_el_check();
+-	t8132_arm_el_check2();
+-	t8132_arm_stubcfg();
++	if (t8132_team_armed) {
++		t8132_disarm_el_check();
++		t8132_disarm_el_check2();
++		t8132_disarm_stubcfg();
++	} else {
++		t8132_arm_el_check();
++		t8132_arm_el_check2();
++		t8132_arm_stubcfg();
++	}
+ 	/* What this path has dirtied since the sweep. */
+ 	dcache_clean_poc((unsigned long)task_stack_page(current),
+ 			 (unsigned long)task_stack_page(current) + THREAD_SIZE);
+@@ -5235,6 +5296,10 @@ static int apple_sleep_enter(suspend_state_t state)
+ 		t8132_disarm_el_check();
+ 		t8132_disarm_el_check2();
+ 		t8132_disarm_stubcfg();
++		if (t8132_team_armed) {
++			t8132_team_marks(false);
++			t8132_team_armed = false;
++		}
+ 	}
+ 	/* A commit that returned never reached __cpu_suspend_exit(). */
+ 	if (READ_ONCE(arm64_resume_armed)) {
+-- 
+2.43.0
+

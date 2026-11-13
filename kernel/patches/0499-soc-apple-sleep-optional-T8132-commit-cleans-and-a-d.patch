@@ -1,0 +1,325 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 14:22:45 +0000
+Subject: [PATCH] soc: apple: sleep: optional T8132 commit cleans and a
+ dirty-line probe
+
+t8132_clean_ram() cleans to the PoC only the writable image, the
+per-CPU areas and the stash. Kernel text, the swapper pages and the
+rest of RAM rely on the hardware writing its caches back at the
+collapse, and text patching cleans only to the PoU.
+
+apple_sleep.t8132_commit_clean (0644, read at .prepare, default 0):
+bit 0 also cleans _stext.._etext and the swapper pages on the walks
+to _cpu_resume and sleep_save_stash; bit 1 cleans every System RAM
+range through the linear map with the other cores stopped, then
+t8132_clean_ram() again. Bit 1 is timed once at each .prepare, and
+the extra clean's time at the commit is logged at the next one.
+
+apple_sleep.t8132_dirty_probe = N (0644, default 0): with no sleep,
+compare the cached view with an uncached alias of the same page over
+the text, those swapper pages and N random pages, and log where DRAM
+differs. It runs when written and at each .prepare while non-zero;
+the text pass is timed, as the stub's elchk2 reads it uncached.
+
+In the resume stub, WD2 runs 75 s across elchk2 and 135 s once it
+passed, and a mismatch gets a window per region (115 s text, 155 s a
+table page, 165 s elchk2's own table), so the reset time tells the
+result when the PMU record does not land.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 230 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 228 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index d4b7498659..cc97bb4602 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -41,6 +41,8 @@
+ #include <linux/crc32.h>
+ #include <linux/cpumask.h>
+ #include <linux/debugfs.h>
++#include <linux/memblock.h>
++#include <linux/random.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/err.h>
+@@ -662,6 +664,9 @@ struct apple_sleep {
+ 	bool matched;
+ 	/* t8132_commit_skip as read at .prepare, for this sleep and its undo */
+ 	u32 skip;
++	/* t8132_commit_clean as read at .prepare; the extra clean's time at the last commit */
++	u32 clean;
++	u64 clean_ticks;
+ 	void __iomem *dvfm[SLEEP_CLUSTERS];
+ 	struct aura_s2r_mailbox *mbox;
+ 	/* aura's DRAM check, and the 4 KiB it checks besides the kernel's own */
+@@ -3461,7 +3466,22 @@ asm(
+ "	mov	w16, #2\n"
+ "	bl	t8132_elchk_region\n"
+ "	tbz	w17, #31, 28f\n"
+-"29:	bl	t8132_elchk2_run\n"
++"29:	str	wzr, [x9, #0x2c]\n"
++/* WD2 for 75 s (0x6b49d200 ticks) across elchk2, 135 s (0xc11e7a00) once it passed. */
++"	str	wzr, [x9, #0x20]\n"
++"	movz	w10, #0xd200\n"
++"	movk	w10, #0x6b49, lsl #16\n"
++"	str	w10, [x9, #0x28]\n"
++"	mov	w10, #1\n"
++"	str	w10, [x9, #0x2c]\n"
++"	bl	t8132_elchk2_run\n"
++"	str	wzr, [x9, #0x2c]\n"
++"	str	wzr, [x9, #0x20]\n"
++"	movz	w10, #0x7a00\n"
++"	movk	w10, #0xc11e, lsl #16\n"
++"	str	w10, [x9, #0x28]\n"
++"	mov	w10, #1\n"
++"	str	w10, [x9, #0x2c]\n"
+ /* The pet loop (bit 3): WD2 for 30 s (0x2aea5400 ticks) every second for pet_secs. */
+ "\ttbz\tw22, #3, 66f\n"
+ "\tadrp\tx10, t8132_stubcfg\n"
+@@ -3653,11 +3673,23 @@ asm(
+ "47:\tmov\tw17, w11\n"
+ "\tb\t48f\n"
+ "49:\tret\tx8\n"
+-/* A mismatch: WD2 for 115 s, the record, then stay. */
++/*
++ * A mismatch: WD2 by region, so the reset time names it even when the record below does
++ * not land: 115 s text, 155 s (0xddbab200) a table page, 165 s (0xec08ce00) this table.
++ */
+ "48:\tstr\twzr, [x9, #0x2c]\n"
+ "\tstr\twzr, [x9, #0x20]\n"
+ "\tmovz\tw10, #0x4200\n"
+ "\tmovk\tw10, #0xa482, lsl #16\n"
++"\tcmp\tw16, #2\n"
++"\tb.ne\t43f\n"
++"\tmovz\tw10, #0xb200\n"
++"\tmovk\tw10, #0xddba, lsl #16\n"
++"43:\tcmp\tw16, #3\n"
++"\tb.ne\t44f\n"
++"\tmovz\tw10, #0xce00\n"
++"\tmovk\tw10, #0xec08, lsl #16\n"
++"44:\n"
+ "\tstr\tw10, [x9, #0x28]\n"
+ "\tmov\tw10, #1\n"
+ "\tstr\tw10, [x9, #0x2c]\n"
+@@ -4462,6 +4494,182 @@ static int sleep_j713_show(struct seq_file *m, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(sleep_j713);
+ 
++/*
++ * apple_sleep.t8132_commit_clean (0644, read at .prepare, default 0 = as before):
++ * t8132_clean_ram() cleans to the PoC only the writable image, the per-CPU areas and the
++ * stash; the rest relies on the hardware writing its caches back at the collapse. Bit 0
++ * also cleans _stext.._etext and the swapper pages on the walks to _cpu_resume and
++ * sleep_save_stash. Bit 1 cleans every System RAM range
++ * through the linear map (memblock, no-map ranges left out), the other cores stopped, then
++ * t8132_clean_ram() again for what that dirtied. Bit 1 is also timed once at each .prepare.
++ */
++static unsigned int t8132_commit_clean;
++module_param(t8132_commit_clean, uint, 0644);
++MODULE_PARM_DESC(t8132_commit_clean,
++		 "T8132 bring-up: 1 = also clean text and its tables to the PoC at the commit, 2 = all System RAM");
++
++static void t8132_clean_text_tables(void)
++{
++	u64 pa[T8132_ELCHK2_TAB_MAX];
++	unsigned int n, i;
++
++	dcache_clean_poc((unsigned long)_stext, (unsigned long)_etext);
++	n = t8132_elchk2_tables((unsigned long)_cpu_resume, pa, 0);
++	n = t8132_elchk2_tables((unsigned long)&sleep_save_stash, pa, n);
++	for (i = 0; i < n; i++) {
++		unsigned long va = (unsigned long)phys_to_virt(pa[i]);
++
++		dcache_clean_poc(va, va + PAGE_SIZE);
++	}
++	dsb(sy);
++}
++
++/* Returns the bytes covered. With @resched, in 64 MiB steps that may sleep (process context). */
++static u64 t8132_clean_all_ram(bool resched)
++{
++	phys_addr_t start, end;
++	u64 i, bytes = 0;
++
++	for_each_mem_range(i, &start, &end) {
++		unsigned long va = (unsigned long)__va(start), e = (unsigned long)__va(end);
++
++		bytes += end - start;
++		while (va < e) {
++			unsigned long n = min_t(unsigned long, e - va, SZ_64M);
++
++			dcache_clean_poc(va, va + n);
++			va += n;
++			if (resched)
++				cond_resched();
++		}
++	}
++	dsb(sy);
++	return bytes;
++}
++
++static void t8132_clean_extra(struct apple_sleep *s)
++{
++	u64 t0 = __arch_counter_get_cntvct();
++
++	if (s->clean & BIT(0))
++		t8132_clean_text_tables();
++	if (s->clean & BIT(1)) {
++		t8132_clean_all_ram(false);
++		t8132_clean_ram();
++	}
++	s->clean_ticks = __arch_counter_get_cntvct() - t0;
++}
++
++/*
++ * apple_sleep.t8132_dirty_probe = N (0644, default 0 = off): with no sleep, compare the cached view
++ * with DRAM (an uncached alias of the same page) over the kernel text, the swapper pages elchk2
++ * checks and N random linear-map pages, and log the pages and bytes that differ: a difference is a
++ * line still dirty in a cache. Runs when written, and at each .prepare while non-zero. The text
++ * pass is also timed, as the stub's elchk2 reads it with the MMU off. Random pages can differ only
++ * because something writes them now.
++ */
++struct sleep_dirty {
++	unsigned int pages, differ;
++	u64 bytes;
++	phys_addr_t first;
++};
++
++static void sleep_dirty_page(phys_addr_t pa, struct sleep_dirty *d, u32 *crc)
++{
++	unsigned long pfn = PHYS_PFN(pa);
++	struct page *pg;
++	const u64 *cv, *nc;
++	unsigned int i, n = 0;
++	void *v;
++
++	if (!pfn_valid(pfn))
++		return;
++	pg = pfn_to_page(pfn);
++	if (PageHighMem(pg))
++		return;
++	v = vmap(&pg, 1, VM_MAP, pgprot_noncached(PAGE_KERNEL));
++	if (!v)
++		return;
++	cv = page_address(pg);
++	nc = v;
++	for (i = 0; i < PAGE_SIZE / sizeof(u64); i++) {
++		u64 x = READ_ONCE(cv[i]) ^ READ_ONCE(nc[i]);
++
++		while (x) {
++			if (x & 0xff)
++				n++;
++			x >>= 8;
++		}
++	}
++	if (crc)
++		*crc = crc32_le(*crc, v, PAGE_SIZE);
++	vunmap(v);
++	d->pages++;
++	if (n) {
++		if (!d->differ)
++			d->first = pa;
++		d->differ++;
++		d->bytes += n;
++	}
++}
++
++static void t8132_dirty_probe_run(struct apple_sleep *s, unsigned int nrand)
++{
++	struct sleep_dirty t = {}, g = {}, r = {};
++	phys_addr_t pa, start, end, total = 0;
++	u64 pt[T8132_ELCHK2_TAB_MAX], i;
++	unsigned int n, k;
++	u32 crc = ~0U;
++	ktime_t t0;
++
++	t0 = ktime_get();
++	for (pa = __pa_symbol(_stext); pa < __pa_symbol(_etext); pa += PAGE_SIZE) {
++		sleep_dirty_page(pa, &t, &crc);
++		cond_resched();
++	}
++	t0 = ktime_sub(ktime_get(), t0);
++	n = t8132_elchk2_tables((unsigned long)_cpu_resume, pt, 0);
++	n = t8132_elchk2_tables((unsigned long)&sleep_save_stash, pt, n);
++	for (k = 0; k < n; k++)
++		sleep_dirty_page(pt[k], &g, NULL);
++	for_each_mem_range(i, &start, &end)
++		total += end - start;
++	for (k = 0; k < nrand && total; k++) {
++		phys_addr_t off = ((phys_addr_t)get_random_u64() % total) & PAGE_MASK;
++
++		for_each_mem_range(i, &start, &end) {
++			if (off < end - start) {
++				sleep_dirty_page(start + off, &r, NULL);
++				break;
++			}
++			off -= end - start;
++		}
++		cond_resched();
++	}
++	dev_info(s->dev, "dirty-probe: text %u pages, %u differ (%llu bytes, first %pa), uncached pass %lld ms; tables %u, %u differ (%llu bytes); random %u, %u differ (%llu bytes, live writes count too)\n",
++		 t.pages, t.differ, t.bytes, &t.first, ktime_to_ms(t0), g.pages, g.differ, g.bytes,
++		 r.pages, r.differ, r.bytes);
++}
++
++static unsigned int t8132_dirty_pages;
++
++static int t8132_dirty_set(const char *val, const struct kernel_param *kp)
++{
++	int ret = param_set_uint(val, kp);
++
++	if (!ret && t8132_dirty_pages && apple_sleep && apple_sleep->soc->commit_mask)
++		t8132_dirty_probe_run(apple_sleep, t8132_dirty_pages);
++	return ret;
++}
++
++static const struct kernel_param_ops t8132_dirty_ops = {
++	.set = t8132_dirty_set,
++	.get = param_get_uint,
++};
++module_param_cb(t8132_dirty_probe, &t8132_dirty_ops, &t8132_dirty_pages, 0644);
++MODULE_PARM_DESC(t8132_dirty_probe,
++		 "T8132: N > 0 = log where DRAM differs from the cached view (text, tables, N random pages)");
++
+ static int t8132_sleep_commit(unsigned long unused)
+ {
+ 	struct apple_sleep *s = apple_sleep;
+@@ -4471,6 +4679,7 @@ static int t8132_sleep_commit(unsigned long unused)
+ 	s->cpus_stop_ret = spin_table_stop_parked();
+ 
+ 	t8132_clean_ram();
++	t8132_clean_extra(s);
+ 	t8132_sleep_lower_io(s);
+ 	apple_sleep_arm_wd2(s);
+ 	/*
+@@ -4956,6 +5165,23 @@ static int apple_sleep_prepare(void)
+ 		  READ_ONCE(t8132_commit_skip) & GENMASK(SKIP_GROUPS - 1, 0) : 0;
+ 	if (s->soc->commit_mask && READ_ONCE(t8132_commit_log))
+ 		sleep_j713_table(s, NULL);
++	if (s->soc->commit_mask) {
++		if (s->clean_ticks)
++			dev_info(s->dev, "commit-clean %#x at the last commit took %llu us\n",
++				 s->clean,
++				 div_u64(s->clean_ticks * USEC_PER_SEC, arch_timer_get_cntfrq()));
++		s->clean_ticks = 0;
++		s->clean = READ_ONCE(t8132_commit_clean) & 3;
++		if (s->clean & BIT(1)) {
++			ktime_t t0 = ktime_get();
++			u64 b = t8132_clean_all_ram(true);
++
++			dev_info(s->dev, "commit-clean: all RAM (%llu MiB) cleaned in %lld ms (timed at .prepare)\n",
++				 b >> 20, ktime_to_ms(ktime_sub(ktime_get(), t0)));
++		}
++		if (READ_ONCE(t8132_dirty_pages))
++			t8132_dirty_probe_run(s, READ_ONCE(t8132_dirty_pages));
++	}
+ 
+ 	/* With an encoder's domain linked, genpd has it off once the encoders are. */
+ 	if (s->soc->has_ave && !s->ave_pd_owned)
+-- 
+2.43.0
+

@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 12:36:44 +0000
+Subject: [PATCH] soc: apple: clpc: grade the J604's CPU floor by
+ frequency
+
+T8132 asks for its top DCS and fabric states, 5 and 3, for any busy CPU
+cluster, at any speed. On the J604 that floor is held in 44 of 100
+samples at an idle black screen, and light work pays for it.
+
+Give the J604 its own table: DCS 1, 2, 5, 5 and fabric 0, 1, 3, 3 by
+frequency quarter, the T6040 shape on the J604's own ranges (its ADT lists
+DCS 0-5 and fabric 0-3), with both clusters' quarters taken from the P
+cluster's 4464 MHz. The top quarter keeps 5 and 3. Measured on the J604
+against the T8132 table, on one boot: one thread at a 50 % duty cycle
+drew 3.23 W against 3.50 W (-275 mW), while a 512 MiB random walk (107.3
+against 108.2 ns) and a ten-thread triad (88.4 against 87.6 GB/s) were
+unchanged.
+
+floor_stock puts a machine with such a table back on its SoC's table.
+Other T8132 machines keep the T8132 table; GPU and ANE floors are not
+changed.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/clpc.c | 51 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/apple/clpc.c b/drivers/soc/apple/clpc.c
+index 9ae78d6719..4229a0a1be 100644
+--- a/drivers/soc/apple/clpc.c
++++ b/drivers/soc/apple/clpc.c
+@@ -111,6 +111,8 @@ enum apple_clpc_rail {
+  *	taken up to the next table frequency; 0 for no platform profile
+  * @low_power_machine: the machine compatible @low_power_khz was read for; SoCs
+  *	sharing this CLPC without it get no low-power profile. NULL for any
++ * @stock: the table whose CPU map and level_khz floor_stock returns to; NULL
++ *	for none
+  * @low_power_mw: package power (the SMC's PHPC key) the low-power profile
+  *	holds the CPU clusters to; 0 for none
+  * @gpu_busy: state of each rail for reported GPU work below @gpu_busy_mid,
+@@ -150,6 +152,7 @@ struct apple_clpc_hw {
+ 	unsigned int low_power_khz;
+ 	const char *low_power_machine;
+ 	unsigned int low_power_mw;
++	const struct apple_clpc_hw *stock;
+ };
+ 
+ /*
+@@ -253,11 +256,26 @@ static unsigned int apple_clpc_sustain(const struct apple_clpc_hw *hw)
+ 	return READ_ONCE(floor_sustain) ?: hw->sustain;
+ }
+ 
++/*
++ * floor_stock puts a machine with its own measured CPU map (struct
++ * apple_clpc_hw.stock) back on its SoC's table: map and quarters.
++ */
++static bool floor_stock;
++module_param(floor_stock, bool, 0644);
++MODULE_PARM_DESC(floor_stock,
++		 "Use the SoC table's CPU floor map and quarters instead of the machine's measured ones (J604: back to DCS 5 / fabric 3 for any busy cluster)");
++
++static const struct apple_clpc_hw *apple_clpc_cpu_hw(const struct apple_clpc_hw *hw)
++{
++	return READ_ONCE(floor_stock) && hw->stock ? hw->stock : hw;
++}
++
+ static unsigned int apple_clpc_map(const struct apple_clpc_hw *hw,
+ 				   unsigned int rail, unsigned int q)
+ {
+ 	u64 m = READ_ONCE(apple_clpc_map_override);
+ 
++	hw = apple_clpc_cpu_hw(hw);
+ 	if (!(m & APPLE_CLPC_MAP_SET))
+ 		return hw->map[rail][q];
+ 	return min_t(unsigned int, (m >> (4 * (rail * APPLE_CLPC_LEVELS + q))) & 0xf,
+@@ -745,7 +763,8 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
+ 	if (policy) {
+ 		if (policy->cpuinfo.max_freq)
+ 			cl->level = policy->cur * 100 /
+-				(READ_ONCE(floor_level_khz) ?: clpc->hw->level_khz ?:
++				(READ_ONCE(floor_level_khz) ?:
++				 apple_clpc_cpu_hw(clpc->hw)->level_khz ?:
+ 				 policy->cpuinfo.max_freq);
+ 		cpufreq_cpu_put(policy);
+ 	}
+@@ -1744,6 +1763,34 @@ static const struct apple_clpc_hw apple_clpc_hw_t8132 = {
+ 	.low_power_machine = "apple,j604",
+ };
+ 
++/*
++ * The J604 (MacBook Pro 14" M4): T8132 with the CPU floor graded by frequency
++ * quarter, as T6040's is, on the J604's own ranges (ADT dvfs-domain: DCS 0-5,
++ * fabric 0-3), and the quarters of both clusters taken from the P cluster's
++ * 4464 MHz, so an E cluster at its top no longer counts as the top quarter.
++ * The top quarter keeps DCS 5 / fabric 3, so heavy work gets what it got.
++ * Measured on the J604 against the T8132 table, one boot: one thread at a
++ * 50 % duty cycle drew 3.23 W against 3.50 W, and a 512 MiB random walk
++ * (107.3 against 108.2 ns) and a ten-thread triad (88.4 against 87.6 GB/s)
++ * were unchanged. floor_stock goes back to the T8132 table.
++ */
++static const struct apple_clpc_hw apple_clpc_hw_t8132_j604 = {
++	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
++	.map = {
++		[APPLE_CLPC_DCS] = { 1, 2, 5, 5 },
++		[APPLE_CLPC_SOC] = { 0, 1, 3, 3 },
++	},
++	.gpu_demand = false,
++	.gpu_input = true,
++	.gpu_busy_mid = 160,
++	.gpu_busy_high = 500,
++	.gpu_busy_top = 800,
++	.level_khz = 4464000,
++	.low_power_khz = 2088000,
++	.low_power_machine = "apple,j604",
++	.stock = &apple_clpc_hw_t8132,
++};
++
+ /*
+  * T8140: DCS states 0-4 on rail 0, fabric states 0-3 on rail 1. A busy
+  * cluster raises the DCS one state per frequency quartile and leaves the
+@@ -1889,6 +1936,8 @@ static const struct apple_clpc_hw *apple_clpc_machine_hw(const struct apple_clpc
+ {
+ 	if (hw == &apple_clpc_hw_t6040 && of_machine_is_compatible("apple,t6041"))
+ 		return &apple_clpc_hw_t6041;
++	if (hw == &apple_clpc_hw_t8132 && of_machine_is_compatible("apple,j604"))
++		return &apple_clpc_hw_t8132_j604;
+ 	return hw;
+ }
+ 
+-- 
+2.43.0
+

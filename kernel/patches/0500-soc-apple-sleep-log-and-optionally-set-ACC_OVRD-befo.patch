@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 14:44:34 +0000
+Subject: [PATCH] soc: apple: sleep: log and optionally set ACC_OVRD
+ before a T8132 commit
+
+macOS's kernel sets per-core power overrides on the last core before a
+deep sleep (XNU arm64_prepare_for_sleep): in ACC_OVRD enDeepSleep, the
+L2 flush field to its deep-sleep value, ok2PwrDnSRM, ok2TrDnLnk and
+ok2PwrDnCPM; in CPU_OVRD where it exists, force-down and
+disWfiRetn. An MMIO trace cannot show these system registers, so the
+T8132 commit tables never had them.
+
+Read ACC_OVRD, CYC_OVRD and s3_5_c15_c6_2 per CPU at probe and at
+each .prepare and log them. Each access is fault-safe through an
+exception table entry; do_el1_undef() now tries fixup_exception()
+before it dies, so an undefined IMP DEF register reads as an error.
+
+apple_sleep.t8132_commit_ovrd (0644, read at .prepare, default 0):
+bit 0 applies XNU's deep-sleep ACC_OVRD fields on the committing core
+right before the commit write, bit 1 also CYC_OVRD, bit 2 also
+disPioOnWfiCpu (XNU sets that only with a retention state).
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ arch/arm64/kernel/traps.c |   3 +
+ drivers/soc/apple/sleep.c | 125 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 128 insertions(+)
+
+diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
+index e02cc6c38b..021a5a8a56 100644
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -485,6 +485,9 @@ void do_el1_undef(struct pt_regs *regs, unsigned long esr)
+ 		return;
+ 
+ out_err:
++	/* A fault-safe access with an exception table entry (e.g. an IMP DEF sysreg probe). */
++	if (fixup_exception(regs, esr))
++		return;
+ 	die("Oops - Undefined instruction", regs, esr);
+ }
+ 
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index cc97bb4602..4993c6bae2 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -76,6 +76,7 @@
+ #include <clocksource/arm_arch_timer.h>
+ #include <dt-bindings/gpio/gpio.h>
+ #include <asm/arch_timer.h>
++#include <asm/asm-extable.h>
+ #include <asm/barrier.h>
+ #include <asm/cpu_ops.h>
+ #include <asm/cputype.h>
+@@ -667,6 +668,8 @@ struct apple_sleep {
+ 	/* t8132_commit_clean as read at .prepare; the extra clean's time at the last commit */
+ 	u32 clean;
+ 	u64 clean_ticks;
++	/* t8132_commit_ovrd as read at .prepare */
++	u32 ovrd;
+ 	void __iomem *dvfm[SLEEP_CLUSTERS];
+ 	struct aura_s2r_mailbox *mbox;
+ 	/* aura's DRAM check, and the 4 KiB it checks besides the kernel's own */
+@@ -4670,6 +4673,123 @@ module_param_cb(t8132_dirty_probe, &t8132_dirty_ops, &t8132_dirty_pages, 0644);
+ MODULE_PARM_DESC(t8132_dirty_probe,
+ 		 "T8132: N > 0 = log where DRAM differs from the cached view (text, tables, N random pages)");
+ 
++
++/*
++ * Per-core power overrides macOS's kernel sets on the last core before a deep sleep
++ * (XNU arm64_prepare_for_sleep): ACC_OVRD (s3_5_c15_c6_0) and, where it exists, CPU_OVRD/
++ * CYC_OVRD (s3_5_c15_c5_0, undefined on T8132 per #1314). #1314 itself writes only
++ * s3_5_c15_c6_2 (bits 0 and 63) on every core. Every access here is fault-safe: an
++ * undefined register reads as an error, not an oops.
++ */
++#define SLEEP_ACC_OVRD_EN_DEEP_SLEEP	BIT_ULL(34)
++#define SLEEP_ACC_OVRD_DIS_PIO_WFI	BIT_ULL(32)
++#define SLEEP_ACC_OVRD_TRDN_LNK		GENMASK_ULL(18, 17)
++#define SLEEP_ACC_OVRD_DIS_L2_FLUSH	GENMASK_ULL(16, 15)
++#define SLEEP_ACC_OVRD_PWRDN_SRM	GENMASK_ULL(14, 13)
++#define SLEEP_ACC_OVRD_PWRDN_CPM	GENMASK_ULL(26, 25)
++#define SLEEP_CYC_OVRD_FORCE_DOWN	GENMASK_ULL(25, 24)
++#define SLEEP_CYC_OVRD_DIS_WFI_RETN	BIT_ULL(0)
++
++static unsigned int t8132_commit_ovrd;
++module_param(t8132_commit_ovrd, uint, 0644);
++MODULE_PARM_DESC(t8132_commit_ovrd,
++		 "T8132 bring-up: 1 = XNU's deep-sleep ACC_OVRD fields on the last core before the commit, 2 = also CYC_OVRD, 4 = also disPioOnWfiCpu");
++
++enum { SLEEP_SR_ACC_OVRD, SLEEP_SR_CYC_OVRD, SLEEP_SR_DEEP_SLEEP };
++
++static int sleep_sr_read(int r, u64 *val)
++{
++	int err = 0;
++	u64 v = 0;
++
++	switch (r) {
++	case SLEEP_SR_ACC_OVRD:
++		asm volatile("1:	mrs	%1, s3_5_c15_c6_0\n2:\n"
++			     _ASM_EXTABLE_KACCESS_ERR_ZERO(1b, 2b, %w0, %w1)
++			     : "+r" (err), "=r" (v));
++		break;
++	case SLEEP_SR_CYC_OVRD:
++		asm volatile("1:	mrs	%1, s3_5_c15_c5_0\n2:\n"
++			     _ASM_EXTABLE_KACCESS_ERR_ZERO(1b, 2b, %w0, %w1)
++			     : "+r" (err), "=r" (v));
++		break;
++	default:
++		asm volatile("1:	mrs	%1, s3_5_c15_c6_2\n2:\n"
++			     _ASM_EXTABLE_KACCESS_ERR_ZERO(1b, 2b, %w0, %w1)
++			     : "+r" (err), "=r" (v));
++		break;
++	}
++	*val = v;
++	return err;
++}
++
++static int sleep_sr_write(int r, u64 v)
++{
++	int err = 0;
++
++	if (r == SLEEP_SR_ACC_OVRD)
++		asm volatile("1:	msr	s3_5_c15_c6_0, %1\n2:\n"
++			     _ASM_EXTABLE_KACCESS_ERR(1b, 2b, %w0)
++			     : "+r" (err) : "r" (v));
++	else
++		asm volatile("1:	msr	s3_5_c15_c5_0, %1\n2:\n"
++			     _ASM_EXTABLE_KACCESS_ERR(1b, 2b, %w0)
++			     : "+r" (err) : "r" (v));
++	isb();
++	return err;
++}
++
++struct sleep_sr_vals {
++	u64 v[3];
++	int err[3];
++};
++
++static void sleep_sr_read_cpu(void *arg)
++{
++	struct sleep_sr_vals *r = arg;
++	int i;
++
++	for (i = 0; i < 3; i++)
++		r->err[i] = sleep_sr_read(i, &r->v[i]);
++}
++
++static void sleep_ovrd_log(struct apple_sleep *s, const char *when)
++{
++	int cpu;
++
++	for_each_online_cpu(cpu) {
++		struct sleep_sr_vals r = {};
++
++		if (smp_call_function_single(cpu, sleep_sr_read_cpu, &r, 1))
++			continue;
++		dev_info(s->dev, "ovrd %s cpu%d: ACC_OVRD %s%#llx CYC_OVRD %s%#llx s3_5_c15_c6_2 %s%#llx\n",
++			 when, cpu, r.err[0] ? "fault " : "", r.v[0], r.err[1] ? "fault " : "",
++			 r.v[1], r.err[2] ? "fault " : "", r.v[2]);
++	}
++}
++
++/* On the committing core, right before the commit write, as XNU before its WFI. */
++static void t8132_ovrd_apply(u32 m)
++{
++	u64 v;
++
++	if ((m & BIT(0)) && !sleep_sr_read(SLEEP_SR_ACC_OVRD, &v)) {
++		v |= SLEEP_ACC_OVRD_EN_DEEP_SLEEP;
++		v = (v & ~SLEEP_ACC_OVRD_DIS_L2_FLUSH) | FIELD_PREP(SLEEP_ACC_OVRD_DIS_L2_FLUSH, 2);
++		v = (v & ~SLEEP_ACC_OVRD_PWRDN_SRM) | FIELD_PREP(SLEEP_ACC_OVRD_PWRDN_SRM, 3);
++		v = (v & ~SLEEP_ACC_OVRD_TRDN_LNK) | FIELD_PREP(SLEEP_ACC_OVRD_TRDN_LNK, 3);
++		v = (v & ~SLEEP_ACC_OVRD_PWRDN_CPM) | FIELD_PREP(SLEEP_ACC_OVRD_PWRDN_CPM, 3);
++		if (m & BIT(2))
++			v |= SLEEP_ACC_OVRD_DIS_PIO_WFI;
++		sleep_sr_write(SLEEP_SR_ACC_OVRD, v);
++	}
++	if ((m & BIT(1)) && !sleep_sr_read(SLEEP_SR_CYC_OVRD, &v)) {
++		v = (v & ~SLEEP_CYC_OVRD_FORCE_DOWN) | FIELD_PREP(SLEEP_CYC_OVRD_FORCE_DOWN, 3);
++		v |= SLEEP_CYC_OVRD_DIS_WFI_RETN;
++		sleep_sr_write(SLEEP_SR_CYC_OVRD, v);
++	}
++}
++
+ static int t8132_sleep_commit(unsigned long unused)
+ {
+ 	struct apple_sleep *s = apple_sleep;
+@@ -4759,6 +4879,8 @@ static int t8132_sleep_commit(unsigned long unused)
+ 	dcache_clean_poc((unsigned long)s, (unsigned long)(s + 1));
+ 	dsb(sy);
+ 
++	if (s->ovrd)
++		t8132_ovrd_apply(s->ovrd);
+ 	writel(1, s->commit);
+ 
+ 	/* As on macOS: a raised line would end the last WFI, and the engine waits for it. */
+@@ -5172,6 +5294,8 @@ static int apple_sleep_prepare(void)
+ 				 div_u64(s->clean_ticks * USEC_PER_SEC, arch_timer_get_cntfrq()));
+ 		s->clean_ticks = 0;
+ 		s->clean = READ_ONCE(t8132_commit_clean) & 3;
++		s->ovrd = READ_ONCE(t8132_commit_ovrd) & 7;
++		sleep_ovrd_log(s, "prepare");
+ 		if (s->clean & BIT(1)) {
+ 			ktime_t t0 = ktime_get();
+ 			u64 b = t8132_clean_all_ram(true);
+@@ -5794,6 +5918,7 @@ static int apple_sleep_probe(struct platform_device *pdev)
+ 		t8132_el_check_report(s);
+ 		if (s->soc->commit_mask) {
+ 			sleep_j713_table(s, NULL);
++			sleep_ovrd_log(s, "probe");
+ 			debugfs_create_file("j713-table", 0444,
+ 					    debugfs_create_dir("apple-sleep", NULL), s,
+ 					    &sleep_j713_fops);
+-- 
+2.43.0
+

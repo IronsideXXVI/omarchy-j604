@@ -1043,3 +1043,11 @@ Kernel 1.870 rebases the J604 series from `cc7696978e4c` onto aurora-silicon/lin
 | 0378 | 0374 |
 | 0379 | 0375 |
 | 0380 | 0376 |
+
+## 1.883 to 1.885
+
+1.884 takes out the two device-tree patches of 1.883, 0487 (`arm64: dts: apple: t8132-j604: write the HDMI power enables as the ADT does`) and 0489 (`arm64: dts: apple: t8132-j604: add the ATC PHY CIO calibration`), which never ran. 1.883's 0488 is 0487 since 1.884, 0490 is 0488, and 0491-0499 are 0489-0497.
+
+New in 1.884: 0498 (`soc: apple: sleep: a T8132 bitmask to leave J713 commit-time writes out`), 0499 (`soc: apple: sleep: optional T8132 commit cleans and a dirty-line probe`), 0500 (`soc: apple: sleep: log and optionally set ACC_OVRD before a T8132 commit`), 0501 (`soc: apple: clpc: grade the J604's CPU floor by frequency`), 0502 (`drm/asahi: G16: let a compute command go behind its running predecessor`).
+
+New in 1.885: 0503 (`soc: apple: sleep: prove the T8132 stub record path and add a read ladder`), 0504 (`soc: apple: sleep: let a T8132 sleep resume through #1314's own stub`), 0505 (`soc: apple: sleep: read the T8132 wake core's CTRR_D/CTXR_D, add go-hib`).

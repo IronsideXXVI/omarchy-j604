@@ -1,0 +1,433 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 15:07:58 +0000
+Subject: [PATCH] soc: apple: sleep: prove the T8132 stub record path
+ and add a read ladder
+
+The resume stub's PMU record has never landed after a wake, and two of
+today's runs reset twice, so their clocks could not be read. This adds
+the instruments to read the next runs without a clock:
+
+- t8132_rec_test: at .enter (one CPU, interrupts off), run the stub's
+  own PMU write with SCTLR_EL2.M clear, through the idmap, and read
+  each byte back. 1 clears it again and refuses the sleep; 2 leaves
+  the record set and resets by WD2, to show what survives a reset.
+  The routine now masks the reply vector as sleep_pmu_write() does.
+- The catch vectors start a page, and the boot object's DRAM check
+  covers everything from them to the end of the stub's code.
+- t8132_stub_ladder: single reads of .idmap.text, .mmuoff.data,
+  _stext and a page outside the image, each followed by its own WD2
+  window (140, 150, 87.5, 97.5 s), before elchk. Off by default.
+- At probe, log the watchdog block and the AON deadline as the boot
+  left them, and disarm WD2 if it is still armed.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 261 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 256 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 4993c6bae2..386e5fc780 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -61,6 +61,7 @@
+ #include <linux/sched/task_stack.h>
+ #include <asm/sections.h>
+ #include <asm/smp_plat.h>
++#include <asm/mmu_context.h>
+ #include <asm/suspend.h>
+ #include <linux/platform_device.h>
+ #include <linux/seq_file.h>
+@@ -3050,7 +3051,10 @@ static void apple_sleep_wait_still_on(struct apple_sleep *s)
+  * Until cpu_do_resume restores VBAR, an exception on T8132's way back lands in aura's
+  * vectors (before init_kernel_el) or the hyp stub's (after it), and both spin: the
+  * reset then reads as the stub's 60 s. These vectors are in .text, used by PA while
+- * the MMU is off and by kernel VA once _cpu_resume runs. Each restarts WD2 by class,
++ * the MMU is off and by kernel VA once _cpu_resume runs. They start a page, and the
++ * boot object's DRAM check covers everything from them to t8132_resume_end (the stub,
++ * its checks and this catch), so none of it is outside the registered range. Each
++ * restarts WD2 by class,
+  * sync 145 s, SError 160 s, IRQ 175 s, FIQ 170 s (timers and IPIs are FIQs here), then
+  * leaves a record in PMU scratch (ESR is stale for IRQ and FIQ: the window tells them)
+  * 0xf804-0xf80e, which macsmc-reboot prints on the next boot: ISS[23:0], ELR[31:0],
+@@ -3060,7 +3064,7 @@ static void apple_sleep_wait_still_on(struct apple_sleep *s)
+ u64 t8132_catch_io[4];
+ asm(
+ "\t.pushsection .text, \"ax\"\n"
+-"\t.balign\t2048\n"
++"\t.balign\t4096\n"
+ "t8132_resume_vectors:\n"
+ "\t.balign\t128\n"
+ "\tmov\tw9, #0\n"
+@@ -3184,7 +3188,16 @@ asm(
+ "9:\n"
+ "\twfe\n"
+ "\tb\t9b\n"
++/*
++ * x12 = the PMU's SPMI queue, w0 = register, w1 = value. As sleep_pmu_write(): the reply
++ * vector masked, the command, the reply polled (64Ki reads), the queue drained (64 words),
++ * acknowledged, the mask restored. Returns w2 = polls left when the reply came, 0 if none.
++ * Uses w2-w4 and w6 only: every caller keeps state in the others.
++ */
+ "t8132_catch_pmu_write:\n"
++"\tldr\tw6, [x12, #0x40]\n"
++"\tbic\tw2, w6, #1\n"
++"\tstr\tw2, [x12, #0x40]\n"
+ "\tmovz\tw2, #0x8e30\n"
+ "\torr\tw2, w2, w0, lsl #16\n"
+ "\tstr\tw2, [x12, #0x04]\n"
+@@ -3195,8 +3208,8 @@ asm(
+ "\ttbz\tw4, #24, 4f\n"
+ "\tsubs\tw3, w3, #1\n"
+ "\tb.ne\t3b\n"
+-"\tb\t6f\n"
+ "4:\n"
++"\tmov\tw2, w3\n"
+ "\tmov\tw3, #64\n"
+ "5:\n"
+ "\tldr\tw4, [x12]\n"
+@@ -3207,6 +3220,7 @@ asm(
+ "6:\n"
+ "\tmov\tw4, #1\n"
+ "\tstr\tw4, [x12, #0x80]\n"
++"\tstr\tw6, [x12, #0x40]\n"
+ "\tret\n"
+ "\t.popsection\n"
+ );
+@@ -3308,6 +3322,12 @@ MODULE_PARM_DESC(t8132_elchk2, "T8132 deep sleep: the resume stub also checks th
+  *       polled for up to 5 ms, cluster P on (+4), then the power-gate wake words
+  *       (0x380724000 and +0x60 <- 0x80000000). apple_sleep_return() writes the same
+  *       words again later, with the MMU on.
++ * bit 6 t8132_stub_ladder: right after the entry record, one read at a time, each
++ *       followed by its own WD2 window: a byte of .idmap.text by PA, then 140 s; a
++ *       byte of .mmuoff.data, 150 s; a byte of _stext (the far end of the image), 87.5 s;
++ *       a byte of a page outside the image (allocated at probe, PA logged), 97.5 s; then
++ *       elchk as before (75 s once it passed). The first window that never comes names
++ *       the first read that did not return.
+  */
+ #define T8132_STUBCFG_MAGIC	0x47464353	/* "SCFG" */
+ 
+@@ -3317,11 +3337,13 @@ struct t8132_stubcfg {
+ 	u32 pet_secs;
+ 	u32 rsvd;
+ 	u64 sctlr;		/* INIT_SCTLR_EL2_MMU_OFF */
++	u64 ladder_pa;		/* the ladder's page outside the image, 0 = skip that read */
+ };
+ 
+ static_assert(offsetof(struct t8132_stubcfg, flags) == 4);
+ static_assert(offsetof(struct t8132_stubcfg, pet_secs) == 8);
+ static_assert(offsetof(struct t8132_stubcfg, sctlr) == 16);
++static_assert(offsetof(struct t8132_stubcfg, ladder_pa) == 24);
+ 
+ struct t8132_stubcfg t8132_stubcfg __aligned(64);
+ 
+@@ -3337,6 +3359,10 @@ static bool t8132_stub_sctlr;
+ module_param(t8132_stub_sctlr, bool, 0644);
+ static bool t8132_stub_early_wake;
+ module_param(t8132_stub_early_wake, bool, 0644);
++static bool t8132_stub_ladder;
++module_param(t8132_stub_ladder, bool, 0644);
++MODULE_PARM_DESC(t8132_stub_ladder, "T8132 deep sleep: the resume stub reads .idmap.text, .mmuoff.data, _stext and a non-kernel page one at a time, each followed by its own WD2 window (default off)");
++static struct page *t8132_ladder_page;
+ 
+ /*
+  * The first thing Linux runs after a wake, MMU off and no stack. The last wake program
+@@ -3430,6 +3456,36 @@ asm(
+ "\tmov\tw1, #0x3e\n"
+ "\tbl\tt8132_catch_pmu_write\n"
+ "64:\n"
++/* The read ladder (bit 6): one read, then its own WD2 window (t8132_stub_wd2 waits for it). */
++"\ttbz\tw22, #6, 79f\n"
++"\tadrp\tx1, __idmap_text_start\n"
++"\tadd\tx1, x1, :lo12:__idmap_text_start\n"
++"\tldrb\tw3, [x1]\n"
++"\tmovz\tw10, #0x8800\n"
++"\tmovk\tw10, #0xc845, lsl #16\n"
++"\tbl\tt8132_stub_wd2\n"
++"\tadrp\tx1, __mmuoff_data_start\n"
++"\tadd\tx1, x1, :lo12:__mmuoff_data_start\n"
++"\tldrb\tw3, [x1]\n"
++"\tmovz\tw10, #0xa400\n"
++"\tmovk\tw10, #0xd693, lsl #16\n"
++"\tbl\tt8132_stub_wd2\n"
++"\tadrp\tx1, _stext\n"
++"\tadd\tx1, x1, :lo12:_stext\n"
++"\tldrb\tw3, [x1]\n"
++"\tmovz\tw10, #0x7500\n"
++"\tmovk\tw10, #0x7d2b, lsl #16\n"
++"\tbl\tt8132_stub_wd2\n"
++"\tadrp\tx10, t8132_stubcfg\n"
++"\tadd\tx10, x10, :lo12:t8132_stubcfg\n"
++"\tldr\tx1, [x10, #24]\n"
++"\tcbz\tx1, 78f\n"
++"\tldrb\tw3, [x1]\n"
++"78:\n"
++"\tmovz\tw10, #0x9100\n"
++"\tmovk\tw10, #0x8b79, lsl #16\n"
++"\tbl\tt8132_stub_wd2\n"
++"79:\n"
+ /*
+  * Before the jump: .idmap.text and .mmuoff.data against t8132_elchk, by PA. No check
+  * armed, or all chunks equal: cpu_resume as before. A mismatch stays at 28.
+@@ -3743,9 +3799,152 @@ asm(
+ "55:\tmovn\tw17, #0\n"
+ "56:\tret\n"
+ "\t.size\tt8132_elchk2_region, . - t8132_elchk2_region\n"
++/* x9 = WD2 by PA, w10 = its alarm in ticks: every access before it done, then WD2 restarted. */
++"\t.type\tt8132_stub_wd2, %function\n"
++"t8132_stub_wd2:\n"
++"\tdsb\tsy\n"
++"\tstr\twzr, [x9, #0x2c]\n"
++"\tstr\twzr, [x9, #0x20]\n"
++"\tstr\tw10, [x9, #0x28]\n"
++"\tmov\tw10, #1\n"
++"\tstr\tw10, [x9, #0x2c]\n"
++"\tret\n"
++"\t.size\tt8132_stub_wd2, . - t8132_stub_wd2\n"
++"t8132_resume_end:\n"
+ "\t.popsection\n"
+ );
+ 
++void t8132_resume_end(void);
++
++/*
++ * The record path proven on a normal boot, with the MMU off as at a wake: the caller installs
++ * the idmap, calls this by PA, and it runs the stub's own t8132_catch_pmu_write with SCTLR_EL2.M
++ * clear, the SPMI queue taken from t8132_catch_io by PA, exactly as the stub and the catch do.
++ * x0 = register, x1 = value; returns the routine's w2 (0 = no reply), or 0 with no queue.
++ * In .idmap.text (it must stay under 4 KiB: 64 bytes here).
++ */
++asm(
++"\t.pushsection\t.idmap.text, \"ax\"\n"
++"\t.type\tt8132_rec_mmuoff, %function\n"
++"t8132_rec_mmuoff:\n"
++"\thint\t#34\n"
++"\tmov\tx8, lr\n"
++"\tmrs\tx7, sctlr_el2\n"
++"\tbic\tx11, x7, #1\n"
++"\tadrp\tx10, t8132_catch_io\n"
++"\tadd\tx10, x10, :lo12:t8132_catch_io\n"
++"\tdsb\tsy\n"
++"\tmsr\tsctlr_el2, x11\n"
++"\tisb\n"
++"\tldr\tx12, [x10, #8]\n"
++"\tmov\tw2, #0\n"
++"\tcbz\tx12, 1f\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"1:\tmsr\tsctlr_el2, x7\n"
++"\tisb\n"
++"\tmov\tw0, w2\n"
++"\tret\tx8\n"
++"\t.size\tt8132_rec_mmuoff, . - t8132_rec_mmuoff\n"
++"\t.popsection\n"
++);
++void t8132_rec_mmuoff(void);
++
++static unsigned int t8132_rec_call(u16 reg, u8 val)
++{
++	unsigned int (*fn)(unsigned long, unsigned long);
++	unsigned int r;
++
++	fn = (void *)__pa_symbol(t8132_rec_mmuoff);
++	cpu_install_idmap();
++	r = fn(reg, val);
++	cpu_uninstall_idmap();
++	return r;
++}
++
++/* A PMU register read on the same queue, the reply vector masked as for a write. */
++#define SPMI_CMD_READ		(BIT(15) | (0xe << 8) | 0x38)
++
++static int sleep_pmu_read(struct apple_sleep *s, u16 reg, u32 *hdr, u32 *data)
++{
++	u32 status, enable;
++	int ret;
++
++	*hdr = *data = 0;
++	enable = readl(s->spmi + SPMI_NOTIFY_ENABLE);
++	writel(enable & ~SPMI_NOTIFY_REPLY, s->spmi + SPMI_NOTIFY_ENABLE);
++	sleep_spmi_drain(s);
++	writel(((u32)reg << 16) | SPMI_CMD_READ, s->spmi + SPMI_CMD);
++	ret = readl_poll_timeout_atomic(s->spmi + SPMI_STATUS, status,
++					!(status & SPMI_STATUS_RX_EMPTY), 1, 1000);
++	if (!ret) {
++		*hdr = readl(s->spmi + SPMI_REPLY);
++		ret = readl_poll_timeout_atomic(s->spmi + SPMI_STATUS, status,
++						!(status & SPMI_STATUS_RX_EMPTY), 1, 1000);
++		if (!ret)
++			*data = readl(s->spmi + SPMI_REPLY);
++	}
++	sleep_spmi_drain(s);
++	writel(enable, s->spmi + SPMI_NOTIFY_ENABLE);
++	return ret;
++}
++
++/*
++ * apple_sleep.t8132_rec_test, read at .enter (one CPU, interrupts off, tasks frozen: where
++ * apple_sleep_match() writes the PMU; .prepare runs with the other CPUs up and the SPMI
++ * driver's FIFO mutex out of reach). The SPMI notify mask is set to the sleep's value first,
++ * as the stub finds it at a wake. Then, MMU off through the idmap, the stub's routine writes
++ * 0xf805 <- 0x5a and 0xf804 <- 0x3f, each read back from Linux.
++ * 1: both cleared again (written 0 the same way, read back), and the sleep is refused, no commit.
++ * 2: the record is left set and WD2 is armed for 3.25 s (78000000 ticks), by the stub's own
++ *    writes, with everything masked: a WD2 reset on a normal boot. The next boot shows whether
++ *    the record (macsmc-reboot's f804.. line) and the WD2 words (the boot WDT line) survive it.
++ * What this cannot show: the SPMI controller's state after a real wake.
++ */
++static unsigned int t8132_rec_test;
++module_param(t8132_rec_test, uint, 0644);
++MODULE_PARM_DESC(t8132_rec_test, "T8132: at the next sleep, prove the stub's PMU record path with the MMU off, read it back, and refuse the sleep (1) or reset by WD2 (2)");
++
++static void t8132_rec_one(struct apple_sleep *s, u16 reg, u8 val)
++{
++	unsigned int polls = t8132_rec_call(reg, val);
++	u32 hdr, data;
++	int ret = sleep_pmu_read(s, reg, &hdr, &data);
++
++	dev_info(s->dev, "rec test: %#x <- %#04x with the MMU off: %s (%u polls left); read back %s: hdr %#010x data %#010x -> %s\n",
++		 reg, val, polls ? "replied" : "NO REPLY", polls, ret ? "timed out" : "ok", hdr, data,
++		 !ret && (data & 0xff) == val ? "MATCH" : "MISMATCH");
++}
++
++static int t8132_rec_selftest(struct apple_sleep *s, unsigned int mode)
++{
++	u32 enable;
++
++	if (!s->spmi || !t8132_catch_io[1]) {
++		dev_warn(s->dev, "rec test: no PMU queue\n");
++		return -ENODEV;
++	}
++	enable = readl(s->spmi + SPMI_NOTIFY_ENABLE);
++	sleep_spmi_drain(s);
++	writel(SPMI_NOTIFY_ENABLE_SLEEP, s->spmi + SPMI_NOTIFY_ENABLE);
++	t8132_rec_one(s, 0xf805, 0x5a);
++	t8132_rec_one(s, 0xf804, 0x3f);
++	if (mode == 2) {
++		dev_emerg(s->dev, "rec test: record left set, WD2 3.25 s, everything masked: a WD2 reset follows\n");
++		writel(0, s->wdt + WDT_WD2_CTL);
++		writel(0, s->wdt + WDT_WD2_COUNT);
++		writel(78000000, s->wdt + WDT_WD2_ALARM);
++		writel(1, s->wdt + WDT_WD2_CTL);
++		for (;;)
++			wfe();
++	}
++	t8132_rec_one(s, 0xf805, 0);
++	t8132_rec_one(s, 0xf804, 0);
++	sleep_spmi_drain(s);
++	writel(enable, s->spmi + SPMI_NOTIFY_ENABLE);
++	dev_info(s->dev, "rec test done: sleep refused, nothing committed\n");
++	return -EAGAIN;
++}
++
+ /* aura reads this with the MMU off. */
+ static void apple_sleep_arm_mailbox(struct apple_sleep *s)
+ {
+@@ -4045,7 +4244,8 @@ static void t8132_arm_dram_check(struct apple_sleep *s)
+ {
+ 	struct aura_s2r_check *c = s->mbox_check;
+ 	unsigned long stack = (unsigned long)task_stack_page(current);
+-	unsigned long stub = (unsigned long)t8132_resume_stub & ~(SZ_4K - 1UL);
++	unsigned long stub = (unsigned long)t8132_resume_vectors;
++	unsigned long stub_end = ALIGN((unsigned long)t8132_resume_end, SZ_4K);
+ 	const size_t ctx_len = sizeof(struct sleep_stack_data);
+ 	const void *va[AURA_S2R_CHECK_RANGES];
+ 	unsigned long ctx = 0;
+@@ -4060,7 +4260,13 @@ static void t8132_arm_dram_check(struct apple_sleep *s)
+ 
+ 	WRITE_ONCE(c->magic, 0);
+ 	c->nranges = 0;
+-	sleep_check_add(c, va, (void *)stub, SZ_4K);
++	/* The vectors start a page; everything the stub runs is between them and the end. */
++	if (stub & (SZ_4K - 1) || (unsigned long)t8132_resume_stub < stub ||
++	    stub_end <= (unsigned long)t8132_resume_stub || stub_end - stub > 3 * SZ_4K) {
++		stub = (unsigned long)t8132_resume_stub & ~(SZ_4K - 1UL);
++		stub_end = stub + SZ_4K;
++	}
++	sleep_check_add(c, va, (void *)stub, stub_end - stub);
+ 
+ 	for (i = 0; i < mpidr_hash_size(); i++) {
+ 		unsigned long v = sleep_save_stash[i];
+@@ -4259,6 +4465,9 @@ static void t8132_arm_stubcfg(void)
+ 		f |= BIT(4);
+ 	if (READ_ONCE(t8132_stub_early_wake))
+ 		f |= BIT(5);
++	c->ladder_pa = t8132_ladder_page ? page_to_phys(t8132_ladder_page) : 0;
++	if (READ_ONCE(t8132_stub_ladder))
++		f |= BIT(6);
+ 	c->flags = f;
+ 	dsb(ishst);
+ 	WRITE_ONCE(c->magic, f ? T8132_STUBCFG_MAGIC : 0);
+@@ -4976,6 +5185,8 @@ static int apple_sleep_enter(suspend_state_t state)
+ 	unsigned long daif;
+ 	int ret;
+ 
++	if (s->soc->commit == t8132_sleep_commit && READ_ONCE(t8132_rec_test))
++		return t8132_rec_selftest(s, READ_ONCE(t8132_rec_test));
+ 	ret = apple_sleep_refuse(s);
+ 	if (ret)
+ 		return ret;
+@@ -5834,6 +6045,16 @@ static void t8132_catch_init(struct platform_device *pdev, struct apple_sleep *s
+ 	}
+ 	dcache_clean_poc((unsigned long)t8132_catch_io,
+ 			 (unsigned long)t8132_catch_io + sizeof(t8132_catch_io));
++	t8132_ladder_page = alloc_page(GFP_KERNEL);
++	if (t8132_ladder_page) {
++		void *p = page_address(t8132_ladder_page);
++
++		memset(p, 0xa5, PAGE_SIZE);
++		dcache_clean_poc((unsigned long)p, (unsigned long)p + PAGE_SIZE);
++		dev_info(s->dev, "stub ladder page at %pa; registered range %#lx bytes from the vectors\n",
++			 &(phys_addr_t){ page_to_phys(t8132_ladder_page) },
++			 ALIGN((unsigned long)t8132_resume_end, SZ_4K) - (unsigned long)t8132_resume_vectors);
++	}
+ 	arm64_resume_vbar = __pa_symbol(t8132_resume_vectors);
+ 	arm64_resume_vbar_va = (unsigned long)t8132_resume_vectors;
+ 	/* Marks inside the resume assembly: 125 57 54 65 48 85 95 45 42 s, see WDT_SUSPEND_SECS. */
+@@ -5848,6 +6069,35 @@ static void t8132_catch_init(struct platform_device *pdev, struct apple_sleep *s
+ 			 (unsigned long)(&arm64_resume_vbar_va + 1));
+ }
+ 
++/*
++ * The watchdog block as this boot found it, before anything here writes it: after a WD2 reset
++ * it says whether the block kept its words (then WD2's alarm names the last window armed, no
++ * clock needed), and whether WD2 is still armed, which would reset a booting kernel again.
++ * Still armed: disarmed here, unless apple_sleep.wd2_boot_disarm=0.
++ */
++static bool wd2_boot_disarm = true;
++module_param(wd2_boot_disarm, bool, 0444);
++MODULE_PARM_DESC(wd2_boot_disarm, "Disarm WD2 at probe if the boot left it armed (default on)");
++
++static void sleep_wdt_boot_log(struct apple_sleep *s)
++{
++	u32 w[12], ctl;
++	int i;
++
++	for (i = 0; i < 12; i++)
++		w[i] = readl(s->wdt + i * 4);
++	dev_info(s->dev, "boot WDT: wd0 %#x/%#x/%#x ctl %#x, wd1 %#x/%#x/%#x ctl %#x, wd2 count %#x bite %#x alarm %#x (%u ms) ctl %#x; aon deadline %#x\n",
++		 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10],
++		 w[10] / (WDT_TICKS_PER_S / 1000), w[11],
++		 s->aon_misc ? readl(s->aon_misc + AON_AP_DEADLINE) : 0);
++	ctl = w[11];
++	if (!(ctl & 7) || !wd2_boot_disarm)
++		return;
++	writel(ctl & BIT(1), s->wdt + WDT_WD2_CTL);
++	dev_warn(s->dev, "boot WDT: WD2 was left armed (ctl %#x, alarm %u ms): disarmed, ctl now %#x\n",
++		 ctl, w[10] / (WDT_TICKS_PER_S / 1000), readl(s->wdt + WDT_WD2_CTL));
++}
++
+ static int apple_sleep_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -5876,6 +6126,7 @@ static int apple_sleep_probe(struct platform_device *pdev)
+ 	ret = apple_sleep_map_regs(s);
+ 	if (ret)
+ 		return ret;
++	sleep_wdt_boot_log(s);
+ 	ret = of_address_to_resource(dev->of_node,
+ 				     of_property_match_string(dev->of_node, "reg-names", "ps"),
+ 				     &s->ps_res);
+-- 
+2.43.0
+

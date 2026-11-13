@@ -1,0 +1,425 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 13:26:43 +0000
+Subject: [PATCH] soc: apple: sleep: a T8132 bitmask to leave J713
+ commit-time writes out
+
+T8132's commit path writes and checks power words, pwrgate pairs,
+clock muxes and the cluster words from J713 measurements (macOS
+25G83 under aura). None of it was measured on the J604, which commits
+and then resets on the way back.
+
+Add apple_sleep.t8132_commit_skip (0644, read at each .prepare,
+default 0 = the sleep as before): one bit per J713-derived group
+(macOS's on/off ps words, the three ps-aon groups, the stray words,
+the gate-off and coprocessor checks, the display pwrgate pairs, the
+CPM gates and voter, the clock muxes, the cluster words' 0 and the
+ps-aon 0xa0 AUTO_ENABLE). A skipped group's undo is skipped with it.
+The SEP's prepared-request check always stays.
+
+Log every word the commit path writes or checks, the J604's live
+value next to the J713 value, one line each: at probe, at each
+sleep's .prepare (apple_sleep.t8132_commit_log, default on), and in
+debugfs apple-sleep/j713-table, so a first boot gives the table with
+no sleep.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 217 +++++++++++++++++++++++++++++++++-----
+ 1 file changed, 191 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 8fe63d8804..d4b7498659 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -40,6 +40,7 @@
+ #include <linux/cpu.h>
+ #include <linux/crc32.h>
+ #include <linux/cpumask.h>
++#include <linux/debugfs.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/err.h>
+@@ -60,6 +61,7 @@
+ #include <asm/smp_plat.h>
+ #include <asm/suspend.h>
+ #include <linux/platform_device.h>
++#include <linux/seq_file.h>
+ #include <linux/panic.h>
+ #include <linux/pm_domain.h>
+ #include <linux/smp.h>
+@@ -167,6 +169,40 @@ static_assert(AURA_S2R_CHECKED_SIZE + sizeof(struct aura_s2r_slc) == AURA_S2R_SL
+ #define CLUSTER_ON		0xf
+ /* AVE: a transition still in progress, as when a lower waits for a domain it powers */
+ #define CLUSTER_PENDING		BIT(4)
++
++/*
++ * T8132 bring-up bisect: the commit-time writes taken from J713 measurements (macOS 25G83
++ * under aura, never checked on another board), one bit per group. A set bit leaves that
++ * group out of the sleep, its undo with it; 0 (the default) is the sleep as before. The
++ * mask is read once per sleep, at .prepare.
++ */
++enum sleep_skip_group {
++	SKIP_PS_MACOS_ON,	/* bit 0: ps words raised to f, as macOS has them */
++	SKIP_PS_MACOS_OFF,	/* bit 1: ps words lowered, as macOS has them off */
++	SKIP_AON_MACOS_OFF,	/* bit 2: ps-aon words lowered */
++	SKIP_AON_MACOS_NO_AUTO,	/* bit 3: ps-aon words with AUTO_ENABLE cleared */
++	SKIP_AON_MACOS_ON,	/* bit 4: ps-aon words raised to state 4 */
++	SKIP_STRAY,		/* bit 5: stray words lowered at the last step */
++	SKIP_GATE_OFF,		/* bit 6: the check that macOS's off words read off */
++	SKIP_GATE_COPROCS,	/* bit 7: the must-stop/bound check (the SEP's stays) */
++	SKIP_DISP_PWRGATE,	/* bit 8: the display pwrgate pairs (3, 0) */
++	SKIP_CPM_GATES,		/* bit 9: CPM pwrgate pairs and the fourth voter at the commit */
++	SKIP_CLK_MUX,		/* bit 10: the four clock muxes parked at the commit */
++	SKIP_CLUSTER_OFF,	/* bit 11: both cluster words written 0 at the commit */
++	SKIP_AON_A0_AUTO,	/* bit 12: ps-aon 0xa0 left to AUTO_ENABLE at the commit */
++	SKIP_GROUPS
++};
++
++static unsigned int t8132_commit_skip;
++module_param(t8132_commit_skip, uint, 0644);
++MODULE_PARM_DESC(t8132_commit_skip,
++		 "T8132 bring-up: bitmask of J713-derived commit-time groups to leave out (default 0)");
++static bool t8132_commit_log = true;
++module_param(t8132_commit_log, bool, 0644);
++MODULE_PARM_DESC(t8132_commit_log,
++		 "T8132: log every word the commit would write, J604 live value vs J713 value, at each sleep");
++
++#define sleep_skip(s, g)	((s)->skip & BIT(g))
+ /* Set when a complex's up sequence ends, and cleared by writing 1. */
+ #define CLUSTER_UP_DONE		BIT(5)
+ #define CLUSTER_E_READY		BIT(5)
+@@ -517,6 +553,8 @@ struct apple_sleep_soc {
+ 	bool wake_optional;
+ 	unsigned int ndisp;
+ 	bool lower_unbound_displays;
++	/* Honours t8132_commit_skip and logs the J713 table */
++	bool commit_mask;
+ 	/* The clock-protection slice guarding each display's CPU word, 0 if none needs clearing. */
+ 	u8 disp_prot_slice[SLEEP_DISPLAYS_MAX];
+ 	/* Which display to lower next, in macOS's order: index into ps.disp. */
+@@ -622,6 +660,8 @@ struct apple_sleep {
+ 	bool *ps_aon_done;
+ 	u32 spmi_saved[2];
+ 	bool matched;
++	/* t8132_commit_skip as read at .prepare, for this sleep and its undo */
++	u32 skip;
+ 	void __iomem *dvfm[SLEEP_CLUSTERS];
+ 	struct aura_s2r_mailbox *mbox;
+ 	/* aura's DRAM check, and the 4 KiB it checks besides the kernel's own */
+@@ -1634,6 +1674,8 @@ static int apple_sleep_lower_stray(struct apple_sleep *s)
+ 	int i, ret = 0;
+ 
+ 	s->stray_lowered = 0;
++	if (sleep_skip(s, SKIP_STRAY))
++		return 0;
+ 	for (i = 0; i < s->soc->nstray; i++) {
+ 		u32 off = stray[i].offset;
+ 
+@@ -1725,6 +1767,8 @@ static bool apple_sleep_gate_failed(struct apple_sleep *s)
+ 	for (i = 0; i < s->gate_count; i++) {
+ 		struct apple_sleep_gate *g = &s->gate[i];
+ 
++		if (!g->sep && sleep_skip(s, SKIP_GATE_COPROCS))
++			continue;
+ 		/* Even an always-on domain may read actual0: require a prepared protocol. */
+ 		if (g->sep && (!g->bound || !apple_sleep_enclave.stop)) {
+ 			dev_err(s->dev, "refused: SEP has no prepared irreversible sleep request\n");
+@@ -1759,7 +1803,7 @@ static bool apple_sleep_gate_failed(struct apple_sleep *s)
+ 		}
+ 	}
+ 
+-	for (i = 0; i < s->soc->ngate_off; i++) {
++	for (i = 0; i < s->soc->ngate_off && !sleep_skip(s, SKIP_GATE_OFF); i++) {
+ 		const struct apple_sleep_word *w = &s->soc->gate_off[i];
+ 
+ 		if (sleep_ps_on(s, w->offset)) {
+@@ -1950,7 +1994,7 @@ static int sleep_display_off(struct apple_sleep *s)
+ 
+ 		/* Reads as a count of the DCPs powered, and macOS ends at 0. */
+ 		writel(n - 1 - j, s->pmc_dcp);
+-		if (soc->pwrgate_disp[i][0]) {
++		if (soc->pwrgate_disp[i][0] && !sleep_skip(s, SKIP_DISP_PWRGATE)) {
+ 			if (readl(s->ps + domains[i][0]) & PS_AUTO_ENABLE)
+ 				writel(readl(s->ps + domains[i][0]) &
+ 				       ~(PS_AUTO_ENABLE | PS_FLAGS), s->ps + domains[i][0]);
+@@ -2780,7 +2824,7 @@ static void apple_sleep_match(struct apple_sleep *s)
+ 	writel(SPMI_NOTIFY_ENABLE_SLEEP, s->spmi + SPMI_NOTIFY_ENABLE);
+ 	writel(SPMI_NOTIFY_ENABLE_SLEEP, s->spmi_a0);
+ 
+-	for (i = 0; i < soc->ps_macos_on.count; i++) {
++	for (i = 0; i < soc->ps_macos_on.count && !sleep_skip(s, SKIP_PS_MACOS_ON); i++) {
+ 		u32 offset = soc->ps_macos_on.offset[i];
+ 
+ 		s->ps_on_saved[i] = readl(s->ps + offset);
+@@ -2792,7 +2836,7 @@ static void apple_sleep_match(struct apple_sleep *s)
+ 			failed++;
+ 		raised++;
+ 	}
+-	for (i = 0; i < soc->ps_macos_off.count; i++) {
++	for (i = 0; i < soc->ps_macos_off.count && !sleep_skip(s, SKIP_PS_MACOS_OFF); i++) {
+ 		u32 offset = soc->ps_macos_off.offset[i];
+ 
+ 		s->ps_off_saved[i] = readl(s->ps + offset);
+@@ -2801,7 +2845,7 @@ static void apple_sleep_match(struct apple_sleep *s)
+ 		sleep_ps_lower(s, offset);
+ 		lowered++;
+ 	}
+-	for (i = 0; i < soc->ps_aon_macos_off.count; i++) {
++	for (i = 0; i < soc->ps_aon_macos_off.count && !sleep_skip(s, SKIP_AON_MACOS_OFF); i++) {
+ 		void __iomem *reg = s->ps_aon + soc->ps_aon_macos_off.offset[i];
+ 		u32 val = readl(reg);
+ 
+@@ -2815,7 +2859,8 @@ static void apple_sleep_match(struct apple_sleep *s)
+ 		writel((val & ~PS_TARGET) | PS_FLAGS, reg);
+ 		lowered++;
+ 	}
+-	for (i = 0; i < soc->ps_aon_macos_no_auto.count; i++) {
++	for (i = 0; i < soc->ps_aon_macos_no_auto.count &&
++		    !sleep_skip(s, SKIP_AON_MACOS_NO_AUTO); i++) {
+ 		void __iomem *reg = s->ps_aon + soc->ps_aon_macos_no_auto.offset[i];
+ 		u32 val = readl(reg);
+ 
+@@ -2823,7 +2868,7 @@ static void apple_sleep_match(struct apple_sleep *s)
+ 		writel(val & ~(PS_AUTO_ENABLE | PS_FLAGS), reg);
+ 	}
+ 	/* T8132's audio words stand at state 4 under macOS, not at f. */
+-	for (i = 0; i < soc->ps_aon_macos_on.count; i++) {
++	for (i = 0; i < soc->ps_aon_macos_on.count && !sleep_skip(s, SKIP_AON_MACOS_ON); i++) {
+ 		void __iomem *reg = s->ps_aon + soc->ps_aon_macos_on.offset[i];
+ 		u32 val = readl(reg), now;
+ 
+@@ -2839,7 +2884,7 @@ static void apple_sleep_match(struct apple_sleep *s)
+ 	}
+ 	s->matched = true;
+ 
+-	for (i = 0; i < soc->ps_macos_off.count; i++) {
++	for (i = 0; i < soc->ps_macos_off.count && !sleep_skip(s, SKIP_PS_MACOS_OFF); i++) {
+ 		u32 offset = soc->ps_macos_off.offset[i];
+ 
+ 		if (sleep_ps_wait_off(s, offset))
+@@ -2860,20 +2905,21 @@ static void apple_sleep_match_undo(struct apple_sleep *s)
+ 		return;
+ 	s->matched = false;
+ 
+-	for (i = soc->ps_aon_macos_on.count - 1; i >= 0; i--)
++	for (i = soc->ps_aon_macos_on.count - 1; i >= 0 && !sleep_skip(s, SKIP_AON_MACOS_ON); i--)
+ 		writel(s->ps_aon_on_saved[i] & ~PS_FLAGS,
+ 		       s->ps_aon + soc->ps_aon_macos_on.offset[i]);
+-	for (i = soc->ps_aon_macos_no_auto.count - 1; i >= 0; i--)
++	for (i = soc->ps_aon_macos_no_auto.count - 1;
++	     i >= 0 && !sleep_skip(s, SKIP_AON_MACOS_NO_AUTO); i--)
+ 		writel(s->ps_aon_auto_saved[i] & ~PS_FLAGS,
+ 		       s->ps_aon + soc->ps_aon_macos_no_auto.offset[i]);
+-	for (i = soc->ps_aon_macos_off.count - 1; i >= 0; i--)
++	for (i = soc->ps_aon_macos_off.count - 1; i >= 0 && !sleep_skip(s, SKIP_AON_MACOS_OFF); i--)
+ 		if (FIELD_GET(PS_ACTUAL, s->ps_aon_saved[i]))
+ 			writel(s->ps_aon_saved[i] & ~PS_FLAGS,
+ 			       s->ps_aon + soc->ps_aon_macos_off.offset[i]);
+-	for (i = soc->ps_macos_off.count - 1; i >= 0; i--)
++	for (i = soc->ps_macos_off.count - 1; i >= 0 && !sleep_skip(s, SKIP_PS_MACOS_OFF); i--)
+ 		if (FIELD_GET(PS_ACTUAL, s->ps_off_saved[i]))
+ 			sleep_ps_raise(s, soc->ps_macos_off.offset[i]);
+-	for (i = soc->ps_macos_on.count - 1; i >= 0; i--) {
++	for (i = soc->ps_macos_on.count - 1; i >= 0 && !sleep_skip(s, SKIP_PS_MACOS_ON); i--) {
+ 		u32 val = s->ps_on_saved[i];
+ 
+ 		if (!FIELD_GET(PS_ACTUAL, val))
+@@ -4316,6 +4362,106 @@ static void j604_adt_pwrgate_write(struct apple_sleep *s)
+ 	}
+ }
+ 
++/*
++ * Every word the T8132 commit path writes or checks from a J713 measurement: the J604's
++ * live value next to the J713 value, one line each, to the log (at probe and at each
++ * sleep's .prepare) and to debugfs apple-sleep/j713-table (live, any time).
++ */
++static void sleep_j713_line(struct apple_sleep *s, struct seq_file *m, unsigned int g,
++			    const char *base, u32 off, u32 live, const char *name, const char *j713)
++{
++	static const char * const grp[SKIP_GROUPS] = {
++		"ps_macos_on", "ps_macos_off", "aon_macos_off", "aon_no_auto", "aon_macos_on",
++		"stray", "gate_off", "gate_coprocs", "disp_pwrgate", "cpm_gates", "clk_mux",
++		"cluster_off", "aon_a0_auto",
++	};
++	const char *sk = (s->skip & BIT(g)) ? " skipped" : "";
++
++	if (m)
++		seq_printf(m, "%2u %-13s %-8s %#07x live %#010x j713 %s %s%s\n", g, grp[g], base,
++			   off, live, j713, name ?: "-", sk);
++	else
++		dev_info(s->dev, "j713: %2u %-13s %-8s %#07x live %#010x j713 %s %s%s\n", g, grp[g],
++			 base, off, live, j713, name ?: "-", sk);
++}
++
++static void sleep_j713_table(struct apple_sleep *s, struct seq_file *m)
++{
++	const struct apple_sleep_soc *soc = s->soc;
++	static const u32 cpm[] = { T8132_PWRGATE_CPM_0, T8132_PWRGATE_CPM_1 };
++	static const u32 mux[] = { T8132_CLK_MUX_50, T8132_CLK_MUX_54, T8132_CLK_MUX_40,
++				   T8132_CLK_MUX_44 };
++	unsigned int i;
++
++	if (!soc->commit_mask)
++		return;
++	if (!m)
++		dev_info(s->dev, "j713: commit-time words, J604 live vs J713, t8132_commit_skip %#x\n",
++			 s->skip);
++	for (i = 0; i < soc->ps_macos_on.count; i++)
++		sleep_j713_line(s, m, SKIP_PS_MACOS_ON, "ps", soc->ps_macos_on.offset[i],
++				readl(s->ps + soc->ps_macos_on.offset[i]), NULL, "state-f");
++	for (i = 0; i < soc->ps_macos_off.count; i++)
++		sleep_j713_line(s, m, SKIP_PS_MACOS_OFF, "ps", soc->ps_macos_off.offset[i],
++				readl(s->ps + soc->ps_macos_off.offset[i]), NULL, "off");
++	for (i = 0; s->ps_aon && i < soc->ps_aon_macos_off.count; i++)
++		sleep_j713_line(s, m, SKIP_AON_MACOS_OFF, "ps-aon", soc->ps_aon_macos_off.offset[i],
++				readl(s->ps_aon + soc->ps_aon_macos_off.offset[i]), NULL, "off");
++	for (i = 0; s->ps_aon && i < soc->ps_aon_macos_no_auto.count; i++)
++		sleep_j713_line(s, m, SKIP_AON_MACOS_NO_AUTO, "ps-aon",
++				soc->ps_aon_macos_no_auto.offset[i],
++				readl(s->ps_aon + soc->ps_aon_macos_no_auto.offset[i]), NULL,
++				"auto-clear");
++	for (i = 0; s->ps_aon && i < soc->ps_aon_macos_on.count; i++)
++		sleep_j713_line(s, m, SKIP_AON_MACOS_ON, "ps-aon", soc->ps_aon_macos_on.offset[i],
++				readl(s->ps_aon + soc->ps_aon_macos_on.offset[i]), NULL, "state-4");
++	for (i = 0; i < soc->nstray; i++)
++		sleep_j713_line(s, m, SKIP_STRAY, "ps", soc->stray[i].offset,
++				readl(s->ps + soc->stray[i].offset), soc->stray[i].name, "off");
++	for (i = 0; i < soc->ngate_off; i++)
++		sleep_j713_line(s, m, SKIP_GATE_OFF, "ps", soc->gate_off[i].offset,
++				readl(s->ps + soc->gate_off[i].offset), soc->gate_off[i].name,
++				"must-read-off");
++	for (i = 0; i < soc->ngate_coprocs; i++)
++		sleep_j713_line(s, m, SKIP_GATE_COPROCS, "ps", soc->gate_coprocs[i].ps,
++				soc->gate_coprocs[i].ps ?
++				readl(s->ps + soc->gate_coprocs[i].ps) : 0,
++				soc->gate_coprocs[i].path,
++				soc->gate_coprocs[i].must_stop ? "stopped" : "bound");
++	for (i = 0; s->pwrgate && i < soc->ndisp; i++) {
++		if (!soc->pwrgate_disp[i][0])
++			continue;
++		sleep_j713_line(s, m, SKIP_DISP_PWRGATE, "pwrgate", soc->pwrgate_disp[i][0],
++				readl(s->pwrgate + soc->pwrgate_disp[i][0]), NULL, "0x3");
++		sleep_j713_line(s, m, SKIP_DISP_PWRGATE, "pwrgate", soc->pwrgate_disp[i][1],
++				readl(s->pwrgate + soc->pwrgate_disp[i][1]), NULL, "0x0");
++	}
++	for (i = 0; s->pwrgate && i < ARRAY_SIZE(cpm); i++)
++		sleep_j713_line(s, m, SKIP_CPM_GATES, "pwrgate", cpm[i], readl(s->pwrgate + cpm[i]),
++				NULL, "0x80000000");
++	/* The commit reads this voter as macOS does; the table leaves it unread. */
++	sleep_j713_line(s, m, SKIP_CPM_GATES, "voters", T8132_PMC_VOTER3, 0, "not-read", "0x0");
++	for (i = 0; s->clk_mux && i < ARRAY_SIZE(mux); i++)
++		sleep_j713_line(s, m, SKIP_CLK_MUX, "clk-mux", mux[i], readl(s->clk_mux + mux[i]),
++				NULL, "0x80100000");
++	if (s->cluster) {
++		sleep_j713_line(s, m, SKIP_CLUSTER_OFF, "cluster", CLUSTER_E,
++				readl(s->cluster + CLUSTER_E), "E", "0x0");
++		sleep_j713_line(s, m, SKIP_CLUSTER_OFF, "cluster", CLUSTER_P,
++				readl(s->cluster + CLUSTER_P), "P", "0x0");
++	}
++	if (s->ps_aon)
++		sleep_j713_line(s, m, SKIP_AON_A0_AUTO, "ps-aon", 0xa0, readl(s->ps_aon + 0xa0),
++				NULL, "auto-set");
++}
++
++static int sleep_j713_show(struct seq_file *m, void *unused)
++{
++	sleep_j713_table(m->private, m);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(sleep_j713);
++
+ static int t8132_sleep_commit(unsigned long unused)
+ {
+ 	struct apple_sleep *s = apple_sleep;
+@@ -4344,18 +4490,22 @@ static int t8132_sleep_commit(unsigned long unused)
+ 	t8132_sleep_mcc_stop(s);
+ 
+ 	/* Gates twice, the fourth voter, gates. On macOS the voter reads 0 already. */
+-	for (i = 0; i < 2; i++) {
++	if (!sleep_skip(s, SKIP_CPM_GATES)) {
++		for (i = 0; i < 2; i++) {
++			writel(PWRGATE_ON, s->pwrgate + T8132_PWRGATE_CPM_0);
++			writel(PWRGATE_ON, s->pwrgate + T8132_PWRGATE_CPM_1);
++		}
++		readl(s->pmc_voters + T8132_PMC_VOTER3);
++		writel(0, s->pmc_voters + T8132_PMC_VOTER3);
++		readl(s->pmc_voters + T8132_PMC_VOTER3_B);
+ 		writel(PWRGATE_ON, s->pwrgate + T8132_PWRGATE_CPM_0);
+ 		writel(PWRGATE_ON, s->pwrgate + T8132_PWRGATE_CPM_1);
+ 	}
+-	readl(s->pmc_voters + T8132_PMC_VOTER3);
+-	writel(0, s->pmc_voters + T8132_PMC_VOTER3);
+-	readl(s->pmc_voters + T8132_PMC_VOTER3_B);
+-	writel(PWRGATE_ON, s->pwrgate + T8132_PWRGATE_CPM_0);
+-	writel(PWRGATE_ON, s->pwrgate + T8132_PWRGATE_CPM_1);
+ 
+-	writel(0, s->cluster + CLUSTER_E);
+-	writel(0, s->cluster + CLUSTER_P);
++	if (!sleep_skip(s, SKIP_CLUSTER_OFF)) {
++		writel(0, s->cluster + CLUSTER_E);
++		writel(0, s->cluster + CLUSTER_P);
++	}
+ 
+ 	s->quiesce_still_on = 0;
+ 	for (i = 0; i < ARRAY_SIZE(t8132_quiesce_words); i++)
+@@ -4363,14 +4513,17 @@ static int t8132_sleep_commit(unsigned long unused)
+ 			s->quiesce_still_on |= BIT(i);
+ 
+ 	/* All four read back unchanged on macOS. */
+-	writel(CLK_MUX_PARKED, s->clk_mux + T8132_CLK_MUX_50);
+-	writel(CLK_MUX_PARKED, s->clk_mux + T8132_CLK_MUX_54);
+-	writel(CLK_MUX_PARKED, s->clk_mux + T8132_CLK_MUX_40);
+-	writel(CLK_MUX_PARKED, s->clk_mux + T8132_CLK_MUX_44);
++	if (!sleep_skip(s, SKIP_CLK_MUX)) {
++		writel(CLK_MUX_PARKED, s->clk_mux + T8132_CLK_MUX_50);
++		writel(CLK_MUX_PARKED, s->clk_mux + T8132_CLK_MUX_54);
++		writel(CLK_MUX_PARKED, s->clk_mux + T8132_CLK_MUX_40);
++		writel(CLK_MUX_PARKED, s->clk_mux + T8132_CLK_MUX_44);
++	}
+ 
+ 	sleep_ps_save(s);
+ 	/* macOS leaves this one to AUTO_ENABLE at the commit. */
+-	writel((readl(s->ps_aon + 0xa0) & ~PS_FLAGS) | PS_AUTO_ENABLE, s->ps_aon + 0xa0);
++	if (!sleep_skip(s, SKIP_AON_A0_AUTO))
++		writel((readl(s->ps_aon + 0xa0) & ~PS_FLAGS) | PS_AUTO_ENABLE, s->ps_aon + 0xa0);
+ 	apple_sleep_arm_mailbox(s);
+ 	/* The wake comes back through the stub, which restarts WD2 for the resume. */
+ 	WRITE_ONCE(s->mbox->resume_pa, __pa_symbol(t8132_resume_stub));
+@@ -4799,6 +4952,11 @@ static int apple_sleep_prepare(void)
+ 	struct apple_sleep *s = apple_sleep;
+ 	int i;
+ 
++	s->skip = s->soc->commit_mask ?
++		  READ_ONCE(t8132_commit_skip) & GENMASK(SKIP_GROUPS - 1, 0) : 0;
++	if (s->soc->commit_mask && READ_ONCE(t8132_commit_log))
++		sleep_j713_table(s, NULL);
++
+ 	/* With an encoder's domain linked, genpd has it off once the encoders are. */
+ 	if (s->soc->has_ave && !s->ave_pd_owned)
+ 		apple_sleep_ave_off(s);
+@@ -5408,6 +5566,12 @@ static int apple_sleep_probe(struct platform_device *pdev)
+ 	if (s->soc->commit == t8132_sleep_commit) {
+ 		t8132_catch_init(pdev, s);
+ 		t8132_el_check_report(s);
++		if (s->soc->commit_mask) {
++			sleep_j713_table(s, NULL);
++			debugfs_create_file("j713-table", 0444,
++					    debugfs_create_dir("apple-sleep", NULL), s,
++					    &sleep_j713_fops);
++		}
+ 		j604_adt_pwrgate_init(s);
+ 		j604_adt_pwrgate_print(s, "at boot");
+ 		j604_adt_pwrgate_write(s);
+@@ -5747,6 +5911,7 @@ static const struct apple_sleep_soc t8132_sleep_soc = {
+ 	/* DCP, DISPEXT0, DISPEXT1, each with its own pwrgate pair, measured in macOS's trace. */
+ 	.ndisp = 3,
+ 	.lower_unbound_displays = true,
++	.commit_mask = true,
+ 	.disp_prot_slice = { 0, 5, 30 },
+ 	.display_order = { 1, 2, 0 },
+ 	.ps = {
+-- 
+2.43.0
+

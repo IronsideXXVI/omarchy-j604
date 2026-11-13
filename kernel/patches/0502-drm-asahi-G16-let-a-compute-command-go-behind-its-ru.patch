@@ -1,0 +1,298 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 13:24:49 +0000
+Subject: [PATCH] drm/asahi: G16: let a compute command go behind its
+ running predecessor
+
+macOS keeps G16G commands in flight one per kick: each new command is
+already resident on a hardware channel when the previous one ends
+(about 12 us between compute commands at depth, against about 210 us
+here, where every command waits for the host to retire the one before).
+
+g16_horizon = 1 lets a queue's next compute command be published behind
+its running compute predecessor, into the other split UMA slot, with
+its own ring entry, channel record and doorbell. It takes effect only
+with g16_overlap set and the UMA split latched, which make the second
+compute owner reusable at once. As for render with g16_depth: only a
+job's first command goes ahead, one per queue, never behind or beside
+render, and explicit barriers and historical priors still wait for
+completion. With a compute flight behind, the oldest is proven by the
+shared stamps having reached it and by its own unit's completion
+counter and timestamp pair, since the shared stamps, cursors and
+notifier record move past it.
+
+aurora-g16/stats gains a chain line per class: the previous retired
+prefix's last stage end to the next prefix's first stage start, on the
+firmware stamps, split into prefixes published ahead of that end (the
+firmware's own gap, and how many started before it) and after it (the
+gap including the host round trip). This line is always on and reads
+the same with the parameter off.
+
+g16_horizon defaults to 0, which keeps the one-compute-at-a-time
+protocol unchanged. 2 is reserved.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/command.rs        | 10 +--
+ drivers/gpu/drm/asahi/g16/engine.rs         | 25 +++++++
+ drivers/gpu/drm/asahi/g16/job.rs            | 10 ++-
+ drivers/gpu/drm/asahi/g16/params.rs         | 24 +++++++
+ drivers/gpu/drm/asahi/g16/poll.rs           | 73 ++++++++++++++++++---
+ drivers/gpu/drm/asahi/g16/pools/lifetime.rs |  5 ++
+ 6 files changed, 132 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/command.rs b/drivers/gpu/drm/asahi/g16/command.rs
+index c82e8d9678..c9859adfbf 100644
+--- a/drivers/gpu/drm/asahi/g16/command.rs
++++ b/drivers/gpu/drm/asahi/g16/command.rs
+@@ -114,13 +114,13 @@ pub(crate) fn new(
+     /// A same-engine command cannot jump a hole in its queue's completed frontier.
+     /// Cross-engine historical dependencies end at the named prefix, even while later
+     /// commands in that older submission remain pending.
+-    /// `g16_depth` = 1: a render command whose one same-queue render predecessor is published
+-    /// but not yet retired may follow it into the engine's FIFO render ring. Its explicit
+-    /// barriers and historical priors (`wait_through`) must still have completed.
++    /// A command whose one same-queue, same-engine predecessor is published but not yet
++    /// retired may follow it into the engine's FIFO ring: render with `g16_depth` = 1, compute
++    /// with `g16_horizon` = 1 (the caller decides which engine may). Its explicit barriers and
++    /// historical priors (`wait_through`) must still have completed.
+     pub(crate) fn ready_in_flight(&self, completed: [u64; 2], published: [u64; 2]) -> bool {
+         let e = self.engine;
+-        e == RENDER
+-            && published[e].checked_add(1) == Some(self.sequence)
++        published[e].checked_add(1) == Some(self.sequence)
+             && published[e] == completed[e].saturating_add(1)
+             && self
+                 .wait_through
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index cbe37298c4..39cc776e16 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -329,6 +329,19 @@ pub(crate) struct Stats {
+     pub(crate) tsplit_wake: u64,
+     pub(crate) tsplit_lock: u64,
+     pub(crate) tsplit_pass: u64,
++    /// Hardware chain gap per class ([0] compute, [1] render and mixed): the previous retired
++    /// prefix's last stage end to this prefix's first stage start, on the firmware stamps
++    /// converted to the architectural counter (ns). `ahead`: this prefix was published before
++    /// its predecessor ended (the gap is the firmware's own); `serial`, published after (the
++    /// gap includes the host round trip). `concurrent`: an ahead prefix that started before its
++    /// predecessor ended. Diagnostic only.
++    pub(crate) chain_prev_end: [u64; 2],
++    pub(crate) chain_ahead_n: [u64; 2],
++    pub(crate) chain_ahead_ns: [u64; 2],
++    pub(crate) chain_concurrent: [u64; 2],
++    pub(crate) chain_serial_n: [u64; 2],
++    pub(crate) chain_serial_ns: [u64; 2],
++    pub(crate) chain_ahead_hist: [[u64; 32]; 2],
+     /// The last prefix that failed that check: publication, first stage start, last stage end
+     /// and retirement, raw 24 MHz ticks (to find the stamps' time base).
+     pub(crate) lat_last_bad: [u64; 4],
+@@ -855,6 +868,18 @@ pub(crate) fn enqueue(&mut self, job: Arc<Job>) -> Result {
+     /// before publication; a dependency on a running command keeps it pending.
+     fn ahead_ok(&self, job: &Job) -> bool {
+         let n = self.engine.flights.len();
++        if matches!(command(job, job.progress.sent()), Some(Command::Compute(_))) {
++            // g16_horizon = 1: one compute command behind a running healthy compute-only
++            // flight, in the other split UMA slot (Slots::claim_compute finds it free only
++            // with the overlap rule); never behind or beside render.
++            return params::horizon()
++                && n < sizes::FLIGHTS.min(sizes::COMPUTE_SLOTS)
++                && self.engine.queue_registered
++                && !self.engine.frozen
++                && self.engine.flights.iter().all(|f| {
++                    f.renders == 0 && f.computes != 0 && !f.doomed && !f.recovery_suspect
++                });
++        }
+         n < params::flights().max(1 + params::depth() as usize).min(sizes::FLIGHTS)
+             && self.engine.draw != 0
+             && !self.engine.frozen
+diff --git a/drivers/gpu/drm/asahi/g16/job.rs b/drivers/gpu/drm/asahi/g16/job.rs
+index 1724a2f7d7..43ffb04986 100644
+--- a/drivers/gpu/drm/asahi/g16/job.rs
++++ b/drivers/gpu/drm/asahi/g16/job.rs
+@@ -294,8 +294,14 @@ pub(crate) fn check_command_dependencies(&self, index: u32) -> Result {
+             return Ok(());
+         }
+         // Only a job's first command goes behind an in-flight predecessor (of an earlier
+-        // job): one job never occupies two flights.
+-        if super::params::depth() != 0 && index == 0 {
++        // job): one job never occupies two flights. Render with g16_depth, compute with
++        // g16_horizon.
++        let ahead = if order.engine == super::command::COMPUTE {
++            super::params::horizon()
++        } else {
++            super::params::depth() != 0
++        };
++        if ahead && index == 0 {
+             let published = self
+                 .queue
+                 .published
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index cb481ed94e..40e9f5b0f7 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -550,6 +550,30 @@ pub(crate) fn submit_ts() -> u32 {
+     "G16: clock of the submit record time word (default 0: architectural counter; 1: firmware stage clock, 24 MHz; runtime 0644)"
+ );
+ 
++/// Storage of `g16_horizon` (runtime 0644, default 0).
++static HORIZON: AtomicU32 = AtomicU32::new(0);
++
++/// Compute horizon, format A (per-command ahead posting): with `g16_horizon` = 1, a queue's
++/// next compute command may be published behind its running compute predecessor, into the
++/// other split UMA slot, with its own ring entry, channel record and doorbell (one kick and one
++/// completion per command, as macOS does on G16G). Takes effect only while `g16_overlap` is set
++/// and the UMA split is latched, which make the second compute owner reusable at once. Explicit
++/// barriers and historical priors still wait for completion; one job never occupies two
++/// flights. 0 (default) keeps the qualified one-compute-at-a-time protocol. 2 (format B, several
++/// commands in one prefix) is reserved and acts as 0.
++pub(crate) fn horizon() -> bool {
++    HORIZON.load(Ordering::Relaxed) == 1 && super::pools::lifetime::overlap_active()
++}
++
++live_u32_param!(
++    HORIZON_PARAM,
++    HORIZON_PARMTYPE,
++    HORIZON_PARM,
++    HORIZON,
++    "g16_horizon",
++    "G16: compute commands of one queue that may go behind its running compute predecessor (default 0: none; 1: one, needs g16_overlap=1 and g16_uma_split=1; 2 reserved; runtime 0644)"
++);
++
+ /// Storage of `g16_depth` (runtime 0644, default 0).
+ static DEPTH: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index c33ef0af66..ad8b949fae 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -461,11 +461,29 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+         };
+         rmb();
+         let mut full = true;
++        // A later flight behind the oldest (g16_flights = 2 render, g16_horizon = 1 compute)
++        // moves the shared stamps, cursors and notifier records past it: prove the oldest by
++        // "reached" then. Its own unit still has to prove completion (counter, ITS pair).
++        let behind = self.engine.flights.len() > 1;
+         if f.computes != 0 {
+             let g = &self.graph.compute;
+-            if g.fw_stamp.r32(0)? != f.target
+-                || !self.queue_receipt(Channel::Compute, &g.qstate, &g.qinfo, f.head, f.rec[2])?
+-            {
++            let e = &self.engine;
++            let passed = if behind {
++                stamp_reached(g.fw_stamp.r32(0)?, f.target, e.target)
++                    && self.queue_receipt_behind(
++                        Channel::Compute,
++                        &g.qstate,
++                        &g.qinfo,
++                        f.c_start,
++                        f.head,
++                        e.head,
++                        f.rec[2],
++                    )?
++            } else {
++                g.fw_stamp.r32(0)? == f.target
++                    && self.queue_receipt(Channel::Compute, &g.qstate, &g.qinfo, f.head, f.rec[2])?
++            };
++            if !passed {
+                 return Ok(Retirement::Pending);
+             }
+             let k = f.claims.slot[0] as usize;
+@@ -473,17 +491,21 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+             let submitted = unit.counter.r64(0)?;
+             let start = unit.its.r64(0)?;
+             let end = unit.its.r64(8)?;
+-            full &= g.notifier.r32(notifier_page::COMPUTE_STAMP)? == f.target
+-                && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot
++            let note = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
++            let noted = if behind {
++                // The record may already name the later command (same queue, same VM).
++                stamp_reached(note, f.target, e.target)
++            } else {
++                note == f.target
++                    && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot
++            };
++            full &= noted
+                 && submitted != 0
+                 && unit.work.r64(compute::DESCRIPTOR_COMPLETED)? == submitted
+                 && unit.work.r64(compute::DESCRIPTOR_COUNTER)? == unit.counter.va
+                 && start != 0
+                 && end > start;
+         }
+-        // A later render flight behind the oldest (g16_flights = 2) moves the shared stamps,
+-        // cursors and notifier records past it: prove the oldest by "reached" then.
+-        let behind = self.engine.flights.len() > 1;
+         if f.renders != 0 && behind {
+             let g = &self.graph.render;
+             let e = &self.engine;
+@@ -941,6 +963,25 @@ fn stat_retire(&mut self, f: &Flight) {
+                 } else {
+                     s.tsplit_other += 1;
+                 }
++                let c = usize::from(kind != 0);
++                let prev = s.chain_prev_end[c];
++                if prev != 0 {
++                    if f.published_ticks < prev {
++                        s.chain_ahead_n[c] += 1;
++                        if lo_c < prev {
++                            s.chain_concurrent[c] += 1;
++                            s.chain_ahead_hist[c][0] += 1;
++                        } else {
++                            let gap = ns(lo_c - prev);
++                            s.chain_ahead_ns[c] = s.chain_ahead_ns[c].saturating_add(gap);
++                            s.chain_ahead_hist[c][((gap / 10_000) as usize).min(31)] += 1;
++                        }
++                    } else if lo_c >= prev {
++                        s.chain_serial_n[c] += 1;
++                        s.chain_serial_ns[c] = s.chain_serial_ns[c].saturating_add(ns(lo_c - prev));
++                    }
++                }
++                s.chain_prev_end[c] = s.chain_prev_end[c].max(hi_c);
+                 s.lat_n += 1;
+                 s.start_hist[usize::from(kind != 0)][((start / 10_000) as usize).min(31)] += 1;
+                 let (p200, p1ms) = (hz / 5000, hz / 1000);
+@@ -1233,6 +1274,22 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.tsplit_lock / 1000,
+             s.tsplit_pass / 1000
+         )?;
++        for (c, name) in ["compute", "render"].iter().enumerate() {
++            write!(
++                f,
++                "chain {}: ahead {} ahead_us {} concurrent {} serial {} serial_us {} hist_10us",
++                name,
++                s.chain_ahead_n[c],
++                s.chain_ahead_ns[c] / 1000,
++                s.chain_concurrent[c],
++                s.chain_serial_n[c],
++                s.chain_serial_ns[c] / 1000
++            )?;
++            for n in s.chain_ahead_hist[c].iter() {
++                write!(f, " {}", n)?;
++            }
++            writeln!(f)?;
++        }
+         write!(f, "first_hist_100us:")?;
+         for n in s.first_hist.iter() {
+             write!(f, " {}", n)?;
+diff --git a/drivers/gpu/drm/asahi/g16/pools/lifetime.rs b/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
+index 7885a8c059..3ed04420d9 100644
+--- a/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
++++ b/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
+@@ -53,6 +53,11 @@ fn overlap() -> bool {
+     OVERLAP.load(Ordering::Relaxed) != 0 && uma_split()
+ }
+ 
++/// Whether [`overlap`] holds: `g16_overlap` set and the UMA split latched.
++pub(crate) fn overlap_active() -> bool {
++    overlap()
++}
++
+ #[cfg(test)]
+ fn reset_latch() {
+     SPLIT_LATCH.store(2, Ordering::Release);
+-- 
+2.43.0
+

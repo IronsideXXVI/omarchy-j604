@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 19:11:51 +0000
+Subject: [PATCH] soc: apple: sleep: read the T8132 wake core's
+ CTRR_D/CTXR_D, add go-hib
+
+A macOS sleep traced on the J604 shows the woken boot core coming back
+with CTRR_D enabled and locked (0x8000000000000001) and CTXR_D armed,
+where it read 0 before the sleep. Whether the Linux chain's wake core
+gets the same, and over which range, decides whether our wake path can
+write the kernel image or run .idmap.text at all.
+
+- t8132_stub_regs (stub bit 7, measurement only): the stub reads the
+  woken core's CTRR_D and CTXR_D, checks them against the PA of
+  .idmap.text, sets WD2 to 20 + 15 * code seconds and parks.
+- At probe, log CTRR_D (both banks), CTXR_D and ACC_CTXR_D on every
+  CPU, fault-safe, and say whether CTRR_D makes the image read-only.
+- t8132_go_hib: after the commit, send the PMU macOS's 0x200e <- 0 and
+  0x2000 <- 0x41. Off by default.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 113 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 113 insertions(+)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 2d297fd2ed..bae07019be 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -3328,6 +3328,11 @@ MODULE_PARM_DESC(t8132_elchk2, "T8132 deep sleep: the resume stub also checks th
+  *       a byte of a page outside the image (allocated at probe, PA logged), 97.5 s; then
+  *       elchk as before (75 s once it passed). The first window that never comes names
+  *       the first read that did not return.
++ * bit 7 t8132_stub_regs: right after the ladder, the woken core's own CTRR_D (CTL
++ *       s3_0_c11_c1_5, bounds s3_0_c11_c1_2/3) and CTXR_D (CTL s3_0_c11_c5_5, bounds
++ *       s3_0_c11_c3_0/1) against the PA of .idmap.text, as WD2 = 20 + 15 * code s, then
++ *       the stub parks (no resume): code bit 0 CTRR_D enabled, bit 1 CTRR_D covers it,
++ *       bit 2 CTXR_D armed with .idmap.text outside its window. A measurement run only.
+  */
+ #define T8132_STUBCFG_MAGIC	0x47464353	/* "SCFG" */
+ 
+@@ -3359,6 +3364,12 @@ static bool t8132_stub_sctlr;
+ module_param(t8132_stub_sctlr, bool, 0644);
+ static bool t8132_stub_early_wake;
+ module_param(t8132_stub_early_wake, bool, 0644);
++static bool t8132_go_hib;
++module_param(t8132_go_hib, bool, 0644);
++MODULE_PARM_DESC(t8132_go_hib, "T8132 deep sleep: after the commit, send the PMU macOS's go-hib writes (0x200e <- 0, 0x2000 <- 0x41) (default off)");
++static bool t8132_stub_regs;
++module_param(t8132_stub_regs, bool, 0644);
++MODULE_PARM_DESC(t8132_stub_regs, "T8132 deep sleep, measurement only: the resume stub encodes the woken core's CTRR_D/CTXR_D in its WD2 window and parks (default off)");
+ static bool t8132_stub_ladder;
+ module_param(t8132_stub_ladder, bool, 0644);
+ MODULE_PARM_DESC(t8132_stub_ladder, "T8132 deep sleep: the resume stub reads .idmap.text, .mmuoff.data, _stext and a non-kernel page one at a time, each followed by its own WD2 window (default off)");
+@@ -3486,6 +3497,43 @@ asm(
+ "\tmovk\tw10, #0x8b79, lsl #16\n"
+ "\tbl\tt8132_stub_wd2\n"
+ "79:\n"
++/*
++ * The confinement read (bit 7), then park: code = CTRR_D_CTL bit 0 | CTRR_D covers
++ * .idmap.text << 1 | (CTXR_D armed and .idmap.text outside it) << 2; WD2 = 20 + 15 * code s.
++ */
++"\ttbz\tw22, #7, 89f\n"
++"\tadrp\tx1, __idmap_text_start\n"
++"\tadd\tx1, x1, :lo12:__idmap_text_start\n"
++"\tmrs\tx4, s3_0_c11_c1_5\n"
++"\tand\tx3, x4, #1\n"
++"\tmrs\tx4, s3_0_c11_c1_2\n"
++"\tmrs\tx5, s3_0_c11_c1_3\n"
++"\torr\tx5, x5, #0xfff\n"
++"\tcmp\tx1, x4\n"
++"\tb.lo\t81f\n"
++"\tcmp\tx1, x5\n"
++"\tb.hi\t81f\n"
++"\torr\tx3, x3, #2\n"
++"81:\tmrs\tx4, s3_0_c11_c5_5\n"
++"\tcbz\tx4, 83f\n"
++"\tmrs\tx4, s3_0_c11_c3_0\n"
++"\tmrs\tx5, s3_0_c11_c3_1\n"
++"\torr\tx5, x5, #0xfff\n"
++"\tcmp\tx1, x4\n"
++"\tb.lo\t82f\n"
++"\tcmp\tx1, x5\n"
++"\tb.ls\t83f\n"
++"82:\torr\tx3, x3, #4\n"
++"83:\tmov\tw4, #15\n"
++"\tmul\tw3, w3, w4\n"
++"\tadd\tw3, w3, #20\n"
++"\tmovz\tw4, #0x3600\n"
++"\tmovk\tw4, #0x16e, lsl #16\n"
++"\tmul\tw10, w3, w4\n"
++"\tbl\tt8132_stub_wd2\n"
++"88:\twfe\n"
++"\tb\t88b\n"
++"89:\n"
+ /*
+  * Before the jump: .idmap.text and .mmuoff.data against t8132_elchk, by PA. No check
+  * armed, or all chunks equal: cpu_resume as before. A mismatch stays at 28.
+@@ -4517,6 +4565,8 @@ static void t8132_arm_stubcfg(void)
+ 	if (READ_ONCE(t8132_stub_early_wake))
+ 		f |= BIT(5);
+ 	c->ladder_pa = t8132_ladder_page ? page_to_phys(t8132_ladder_page) : 0;
++	if (READ_ONCE(t8132_stub_regs))
++		f |= BIT(7);
+ 	if (READ_ONCE(t8132_stub_ladder))
+ 		f |= BIT(6);
+ 	c->flags = f;
+@@ -5152,6 +5202,14 @@ static int t8132_sleep_commit(unsigned long unused)
+ 	if (s->ovrd)
+ 		t8132_ovrd_apply(s->ovrd);
+ 	writel(1, s->commit);
++	/*
++	 * macOS 26B123 on the J604, right after its commit (hv trace): PMU 0x200e <- 0 and
++	 * 0x2000 <- 0x41 ("go hib"), after its RTC alarm at 0x2008. #1314 sends neither.
++	 */
++	if (READ_ONCE(t8132_go_hib)) {
++		sleep_pmu_write(s, 0x200e, 0);
++		sleep_pmu_write(s, 0x2000, 0x41);
++	}
+ 
+ 	/* As on macOS: a raised line would end the last WFI, and the engine waits for it. */
+ 	aic_sleep_mask_all();
+@@ -6163,6 +6221,60 @@ static void sleep_wdt_boot_log(struct apple_sleep *s)
+ 		 ctl, w[10] / (WDT_TICKS_PER_S / 1000), readl(s->wdt + WDT_WD2_CTL));
+ }
+ 
++/*
++ * iBoot's confinement registers on every CPU (fault-safe): CTRR_D bounds (EL2 bank
++ * s3_0_c11_c1_2/3 and EL1 bank s3_0_c11_c0_2/3) and control (s3_0_c11_c1_5), CTXR_D bounds and
++ * control (s3_0_c11_c3_0/1, s3_0_c11_c5_5) and ACC_CTXR_D (s3_0_c11_c8_0/1/7). macOS's woken boot
++ * core comes back with CTRR_D_CTL 0x8000000000000001 and CTXR_D armed over aura's object (hv trace,
++ * J604, 26B123); this shows what a cold secondary has on the Linux chain, to compare with the
++ * stub's bit 7 reading of the woken core.
++ */
++#define SLEEP_SR_SAFE(enc, v, err)						\
++	asm volatile("1:	mrs	%1, " enc "\n2:\n"				\
++		     _ASM_EXTABLE_KACCESS_ERR_ZERO(1b, 2b, %w0, %w1)		\
++		     : "+r" (err), "=r" (v))
++
++struct sleep_conf_vals {
++	u64 v[10];
++	int err;
++};
++
++static void sleep_conf_read_cpu(void *arg)
++{
++	struct sleep_conf_vals *r = arg;
++	int e = 0;
++
++	SLEEP_SR_SAFE("s3_0_c11_c1_2", r->v[0], e); r->err |= e << 0; e = 0;
++	SLEEP_SR_SAFE("s3_0_c11_c1_3", r->v[1], e); r->err |= e << 1; e = 0;
++	SLEEP_SR_SAFE("s3_0_c11_c0_2", r->v[2], e); r->err |= e << 2; e = 0;
++	SLEEP_SR_SAFE("s3_0_c11_c0_3", r->v[3], e); r->err |= e << 3; e = 0;
++	SLEEP_SR_SAFE("s3_0_c11_c1_5", r->v[4], e); r->err |= e << 4; e = 0;
++	SLEEP_SR_SAFE("s3_0_c11_c3_0", r->v[5], e); r->err |= e << 5; e = 0;
++	SLEEP_SR_SAFE("s3_0_c11_c3_1", r->v[6], e); r->err |= e << 6; e = 0;
++	SLEEP_SR_SAFE("s3_0_c11_c5_5", r->v[7], e); r->err |= e << 7; e = 0;
++	SLEEP_SR_SAFE("s3_0_c11_c8_0", r->v[8], e); r->err |= e << 8; e = 0;
++	SLEEP_SR_SAFE("s3_0_c11_c8_7", r->v[9], e); r->err |= e << 9;
++}
++
++static void sleep_conf_log(struct apple_sleep *s)
++{
++	u64 idmap = __pa_symbol(__idmap_text_start), text = __pa_symbol(_text);
++	int cpu;
++
++	dev_info(s->dev, "conf: kernel _text PA %#llx, .idmap.text PA %#llx, _end PA %#llx\n",
++		 text, idmap, (u64)__pa_symbol(_end));
++	for_each_online_cpu(cpu) {
++		struct sleep_conf_vals r = {};
++
++		if (smp_call_function_single(cpu, sleep_conf_read_cpu, &r, 1))
++			continue;
++		dev_info(s->dev, "conf cpu%d: CTRR_D el2 [%#llx,%#llx] el1 [%#llx,%#llx] ctl %#llx (image %s); CTXR_D [%#llx,%#llx] ctl %#llx; ACC_CTXR_D lwr %#llx ctl %#llx; faults %#x\n",
++			 cpu, r.v[0], r.v[1], r.v[2], r.v[3], r.v[4],
++			 (r.v[4] & 1) && idmap >= r.v[0] && idmap <= (r.v[1] | 0xfff) ? "READ-ONLY" : "writable",
++			 r.v[5], r.v[6], r.v[7], r.v[8], r.v[9], r.err);
++	}
++}
++
+ static int apple_sleep_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -6235,6 +6347,7 @@ static int apple_sleep_probe(struct platform_device *pdev)
+ 		if (s->soc->commit_mask) {
+ 			sleep_j713_table(s, NULL);
+ 			sleep_ovrd_log(s, "probe");
++			sleep_conf_log(s);
+ 			debugfs_create_file("j713-table", 0444,
+ 					    debugfs_create_dir("apple-sleep", NULL), s,
+ 					    &sleep_j713_fops);
+-- 
+2.43.0
+
