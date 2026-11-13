@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 00:46:39 +0000
+Subject: [PATCH] drm/asahi: g16: optionally publish a render command
+ behind a running one
+
+The G16 backend publishes one command at a time: the next is built only
+after the previous one's full receipt. On the J604 every render command
+then pays about 0.86 ms that is not GPU work (the first firmware event
+arrives about 0.66 ms after publication, while the TA stage takes about
+11 us), and a desktop frame of eight or nine render passes no longer fits
+in 8.33 ms. The G15 backend keeps a second prefix queued behind a running
+one, and its firmware takes such a record within microseconds.
+
+Add g16_flights (runtime 0644, default 1). At 2 a render command may be
+published behind running render commands when every running flight is a
+healthy render-only prefix, the render allocators are past their priming
+prefix, the command's own exact prior-command dependencies are met, and
+both submit pipes have room. Its records are posted behind the unconsumed
+ones, and the pass slot lifetime keeps the two flights on different slots.
+
+The oldest flight's receipt then cannot use exact equality on the shared
+stamps, queue cursors, submit-pipe cursors and notifier records, which the
+later flight moves on: with a flight behind it, it is proven when the
+stamps reached its targets and every cursor passed its entries within the
+newest publication. Recovery notifications are matched against every
+flight. With g16_flights at 1 nothing changes.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit dc4950f48bf8f5738749c07322672f3fe50f7883)
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 103 ++++++++++++++++++++--------
+ drivers/gpu/drm/asahi/g16/hw.rs     |   6 +-
+ drivers/gpu/drm/asahi/g16/params.rs |  18 +++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  88 +++++++++++++++++++++++-
+ 4 files changed, 183 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 04565c8e85..2f4f05d372 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -17,7 +17,7 @@
+ use super::channel::Channel;
+ use super::command::{Command, ComputeCommand, RenderCommand};
+ use super::encode::{self, ComputeRefs, Geometry, RenderRefs};
+-use super::fw::channels::SubmitRecord;
++use super::fw::channels::{SubmitRecord, RING_SLOTS};
+ use super::fw::graph::{notifier_page, qstate};
+ use super::fw::work::{self, BarrierType};
+ use super::hw::sizes;
+@@ -435,10 +435,11 @@ pub(crate) struct Engine {
+ impl Engine {
+     pub(crate) fn new() -> Result<Self> {
+         // Wrapped native stamps are safe only while pending references fit within the
+-        // signed half-window. This backend publishes exactly one command at a time,
+-        // retires its full wire/owner receipt, then builds the next command/barrier.
+-        // Do not add submission-ahead without revisiting the dependency lifetime proof.
+-        if sizes::FLIGHTS != 1 {
++        // signed half-window: two flights are far inside it. By default this backend
++        // publishes exactly one command at a time, retires its full wire/owner receipt,
++        // then builds the next command/barrier; g16_flights=2 lets a render command be
++        // published behind a running render command (Firmware::ahead_ok()).
++        if sizes::FLIGHTS != 2 {
+             return Err(EINVAL);
+         }
+         Ok(Self {
+@@ -647,19 +648,22 @@ pub(crate) fn recovery_prepare(
+             // owner, not the next command that happens to occupy the flight list.
+             return Ok(());
+         }
+-        let f = self.engine.flights.first_mut().ok_or(ENOENT)?;
+-        let matches = match event {
++        // With two flights the notification may name the later one.
++        let ta_tail = self.engine.ta_target;
++        let Some(f) = self.engine.flights.iter_mut().find(|f| match event {
+             15 => f.computes != 0 && f.target == target,
+             0x70 => f.renders != 0 && f.ta_target == target,
+             0x71 => f.renders != 0 && f.fs_target == target,
+             _ => false,
++        }) else {
++            return Err(ENOENT);
+         };
+-        if !matches || flags & 1 == 0 {
++        if flags & 1 == 0 {
+             return Err(ENOENT);
+         }
+         if flags & 9 == 9
+             && f.renders != 0
+-            && !super::poll::stamp_reached(stage[0], f.ta_target, self.engine.ta_target)
++            && !super::poll::stamp_reached(stage[0], f.ta_target, ta_tail)
+         {
+             let k = f.claims.pass[0] as usize;
+             let pass = f.job.resources.render()?.passes.get(k).ok_or(EINVAL)?;
+@@ -684,19 +688,21 @@ pub(crate) fn recovery_prepare_suspects(
+         _event: u32,
+         fault_asid: Option<u32>,
+     ) -> Result {
+-        let Some(f) = self.engine.flights.first_mut() else {
+-            return Ok(());
+-        };
+         let reached = super::recovery::logic::stamp_reached;
+-        let unfinished = (f.computes != 0 && !reached(stage[2], f.target, self.engine.target))
+-            || (f.renders != 0
+-                && (!reached(stage[0], f.ta_target, self.engine.ta_target)
+-                    || !reached(stage[1], f.fs_target, self.engine.fs_target)));
+-        if unfinished {
+-            f.recovery_suspect = true;
+-            f.recovery_started_ns = now_ns();
+-            if fault_asid.is_some_and(|asid| asid >= 1 && asid == f.job.vm.slot) {
+-                f.doomed = true;
++        let (c_tail, ta_tail, fs_tail) =
++            (self.engine.target, self.engine.ta_target, self.engine.fs_target);
++        // Every flight (two with g16_flights = 2) that recovery may have caught unfinished.
++        for f in self.engine.flights.iter_mut() {
++            let unfinished = (f.computes != 0 && !reached(stage[2], f.target, c_tail))
++                || (f.renders != 0
++                    && (!reached(stage[0], f.ta_target, ta_tail)
++                        || !reached(stage[1], f.fs_target, fs_tail)));
++            if unfinished {
++                f.recovery_suspect = true;
++                f.recovery_started_ns = now_ns();
++                if fault_asid.is_some_and(|asid| asid >= 1 && asid == f.job.vm.slot) {
++                    f.doomed = true;
++                }
+             }
+         }
+         Ok(())
+@@ -734,6 +740,24 @@ pub(crate) fn enqueue(&mut self, job: Arc<Job>) -> Result {
+         Ok(())
+     }
+ 
++    /// Whether `job`'s next command may be published behind the flights now running
++    /// (`g16_flights` = 2): it is a render command, every running flight is a healthy
++    /// render-only prefix, the render allocators are past their priming prefix, and a
++    /// flight slot is free. Its own exact prior-command dependencies are still checked
++    /// before publication; a dependency on a running command keeps it pending.
++    fn ahead_ok(&self, job: &Job) -> bool {
++        let n = self.engine.flights.len();
++        n < params::flights().min(sizes::FLIGHTS)
++            && self.engine.draw != 0
++            && !self.engine.frozen
++            && matches!(command(job, job.progress.sent()), Some(Command::Render(_)))
++            && self
++                .engine
++                .flights
++                .iter()
++                .all(|f| f.computes == 0 && f.renders != 0 && !f.doomed && !f.recovery_suspect)
++    }
++
+     /// Publishes one command after the preceding command's complete wire receipt. Ordinary
+     /// preparation failures fail the affected job, including after its earlier commands
+     /// retired. A publication marked uncertain denotes potentially visible firmware state
+@@ -760,8 +784,12 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+             };
+             let job = self.engine.pending[index].clone();
+             // Even a failed job may have an earlier command in flight. An aggregate
+-            // error fence must not race that command's access to user buffers.
+-            if !self.engine.flights.is_empty() {
++            // error fence must not race that command's access to user buffers: a job of
++            // a failed VM waits until nothing is in flight. Otherwise a render command may
++            // go behind running render commands only as ahead_ok() allows.
++            if !self.engine.flights.is_empty()
++                && (job.vm.status.get() != 0 || !self.ahead_ok(&job))
++            {
+                 self.engine.stats.hold[0] += 1;
+                 break;
+             }
+@@ -956,7 +984,9 @@ fn publish_prefix_into(
+         f: &mut Flight,
+         visible: &mut bool,
+     ) -> Result {
+-        if !self.engine.flights.is_empty() {
++        // Behind a running render command only as ahead_ok() allows (g16_flights = 2).
++        let ahead = !self.engine.flights.is_empty();
++        if ahead && !self.ahead_ok(job) {
+             return Err(EAGAIN);
+         }
+         let index = job.progress.sent();
+@@ -987,10 +1017,18 @@ fn publish_prefix_into(
+         for &channel in channels {
+             let pipe = self.channels.channel(channel);
+             let producer = self.channels.producer(channel);
+-            if pipe.read()? != producer
+-                || pipe.completion()? != producer
+-                || pipe.write()? != producer
+-            {
++            // Alone: every earlier record consumed and completed. Behind a running command:
++            // the host cursor is ours and there is room behind the unconsumed records.
++            let busy = if ahead {
++                pipe.write()? != producer
++                    || producer.wrapping_add(RING_SLOTS).wrapping_sub(pipe.read()?) % RING_SLOTS
++                        >= sizes::AHEAD_RECORDS
++            } else {
++                pipe.read()? != producer
++                    || pipe.completion()? != producer
++                    || pipe.write()? != producer
++            };
++            if busy {
+                 self.engine.chan_wait = true;
+                 return Err(EAGAIN);
+             }
+@@ -1124,7 +1162,11 @@ fn publish_prefix_into(
+                     event,
+                     new_queue: u8::from(fresh),
+                 };
+-                self.channels.post(channel, &record)?;
++                if ahead {
++                    self.channels.post_ahead(channel, &record)?;
++                } else {
++                    self.channels.post(channel, &record)?;
++                }
+                 self.session.ring(channel)?;
+             }
+             Ok(())
+@@ -1155,6 +1197,9 @@ fn publish_prefix_into(
+         }
+         self.engine.events = self.events.compute_events;
+         self.engine.stage_seen = self.events.stage_events;
++        if ahead {
++            self.engine.stats.overlaps += 1;
++        }
+         self.stat_publish(f);
+         self.renew_deadlines();
+         job.progress.set_sent(index + 1);
+diff --git a/drivers/gpu/drm/asahi/g16/hw.rs b/drivers/gpu/drm/asahi/g16/hw.rs
+index 2b9c89ae92..735706c1ab 100644
+--- a/drivers/gpu/drm/asahi/g16/hw.rs
++++ b/drivers/gpu/drm/asahi/g16/hw.rs
+@@ -283,8 +283,10 @@ pub(crate) mod sizes {
+     pub(crate) const PB_BLOCKS: u32 = 2048;
+     pub(crate) const PB_LIST_RECORDS: u32 = 4096;
+     pub(crate) const PB_GROW_STEP: u32 = 10;
+-    /// The qualified M4 protocol permits only one published command at a time.
+-    pub(crate) const FLIGHTS: usize = 1;
++    /// Flight capacity. The qualified M4 protocol publishes one command at a time; a second
++    /// render command may be published behind a running render command only when
++    /// `g16_flights` is 2 (see `Firmware::ahead_ok()`).
++    pub(crate) const FLIGHTS: usize = 2;
+     /// Inherited diagnostic histogram width; M4 does not fold jobs into a compute horizon.
+     pub(crate) const HORIZON_JOBS: u32 = 1;
+     /// Two jobs may be admitted per logical queue so exact prior-command dependencies can
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 0aee9a9d57..c65a4d1b96 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -485,6 +485,24 @@ pub(crate) fn deep_sleep() -> bool {
+     "G16: stop and warm-restart the firmware across suspend-to-RAM (testing; default 0; runtime 0644)"
+ );
+ 
++/// Storage of `g16_flights` (runtime 0644): 1 publishes one command at a time (the qualified
++/// protocol, default); 2 lets one render command be published behind a running one.
++static FLIGHTS: AtomicU32 = AtomicU32::new(1);
++
++/// Render commands that may be in flight at once, 1 or 2.
++pub(crate) fn flights() -> usize {
++    FLIGHTS.load(Ordering::Relaxed).clamp(1, 2) as usize
++}
++
++live_u32_param!(
++    FLIGHTS_PARAM,
++    FLIGHTS_PARMTYPE,
++    FLIGHTS_PARM,
++    FLIGHTS,
++    "g16_flights",
++    "G16: render commands in flight at once, 1 (default, the qualified one-at-a-time protocol) or 2 (one render published behind a running render; experimental; runtime 0644)"
++);
++
+ /// Fragment-only dependency publication has not been qualified on this backend.
+ pub(crate) fn early_tiling() -> bool {
+     false
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index ff553dd5e4..5c4c956362 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -337,6 +337,48 @@ pub(crate) fn queue_receipt(
+         Ok(true)
+     }
+ 
++    /// The receipt of the oldest of two flights: the firmware cursors passed its entries
++    /// (`start`..`head`) within the newest publication (`tail`), and each submit-pipe
++    /// cursor passed its record within the newest record. The queue busy flag belongs to
++    /// the later flight then and is not part of the proof.
++    #[allow(clippy::too_many_arguments)]
++    pub(crate) fn queue_receipt_behind(
++        &self,
++        channel: Channel,
++        state: &super::object::FwObject,
++        info: &super::object::FwObject,
++        start: u32,
++        head: u32,
++        tail: u32,
++        record: u32,
++    ) -> Result<bool> {
++        let m = super::hw::sizes::QUEUE_CAP;
++        if start >= m || head >= m || tail >= m || record >= 256 {
++            return Err(EINVAL);
++        }
++        for offset in [qstate::READ, qstate::WRITE] {
++            if !ring_passed(state.r32(offset)?, start, head, tail, m) {
++                return Ok(false);
++            }
++        }
++        if !super::hw::tuning::FW_CACHED {
++            for offset in [0x20, 0x24, 0x28] {
++                if !ring_passed(info.r32(offset)?, start, head, tail, m) {
++                    return Ok(false);
++                }
++            }
++        }
++        let pipe = self.channels.channel(channel);
++        let newest = self.channels.producer(channel);
++        let first = record.wrapping_add(255) % 256;
++        for cursor in [pipe.read()?, pipe.completion()?, pipe.write()?] {
++            if !ring_passed(cursor, first, record, newest, 256) {
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    }
++
+     /// A full receipt includes stage and notifier stamps, every physical consumer,
+     /// the private allocator completion and the internal timestamp pair. An aborted
+     /// receipt omits only the writes firmware does not make for an aborted command,
+@@ -375,7 +417,51 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+                 && start != 0
+                 && end > start;
+         }
+-        if f.renders != 0 {
++        // A later render flight behind the oldest (g16_flights = 2) moves the shared stamps,
++        // cursors and notifier records past it: prove the oldest by "reached" then.
++        let behind = self.engine.flights.len() > 1;
++        if f.renders != 0 && behind {
++            let g = &self.graph.render;
++            let e = &self.engine;
++            if !stamp_reached(g.fw_stamp[0].r32(0)?, f.ta_target, e.ta_target)
++                || !stamp_reached(g.fw_stamp[1].r32(0)?, f.fs_target, e.fs_target)
++                || !self.queue_receipt_behind(
++                    Channel::Ta,
++                    &g.qstate[0],
++                    &g.qinfo[0],
++                    f.ta_start,
++                    f.ta_head,
++                    e.ta_head,
++                    f.rec[0],
++                )?
++                || !self.queue_receipt_behind(
++                    Channel::Fs,
++                    &g.qstate[1],
++                    &g.qinfo[1],
++                    f.fs_start,
++                    f.fs_head,
++                    e.fs_head,
++                    f.rec[1],
++                )?
++            {
++                return Ok(Retirement::Pending);
++            }
++            let k = f.claims.pass[0] as usize;
++            let unit = f.job.resources.render()?.passes.get(k).ok_or(EINVAL)?;
++            let ta_start = unit.scene.r64(0x600)?;
++            let ta_end = unit.scene.r64(0x608)?;
++            let fs_start = unit.scene.r64(0x620)?;
++            let fs_end = unit.scene.r64(0x628)?;
++            let ta_note = g.notifier.r32(notifier_page::TA_STAMP)?;
++            let fs_note = g.notifier.r32(notifier_page::FS_STAMP)?;
++            full &= stamp_reached(ta_note, f.ta_target, e.ta_target)
++                && stamp_reached(fs_note, f.fs_target, e.fs_target)
++                && f.job.resources.render()?.pools.retired(k)?
++                && ta_start != 0
++                && ta_end > ta_start
++                && fs_start != 0
++                && fs_end > fs_start;
++        } else if f.renders != 0 {
+             let g = &self.graph.render;
+             if g.fw_stamp[0].r32(0)? != f.ta_target
+                 || g.fw_stamp[1].r32(0)? != f.fs_target
+-- 
+2.43.0
+

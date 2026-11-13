@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 19:07:07 +0000
+Subject: [PATCH] phy: apple: atc: run DP Alt Mode on a T8132 Type-C
+ port's four lanes
+
+The T8132 driver took a Type-C port's PHY for one with no DisplayPort
+alternate mode: a partner in DP Alt Mode with pin assignment C or E only
+got the USB2 beside its lanes, and the DP PHY served tunnels alone.
+
+The SoC has the PHY. The J604 ADT describes a DP PHY on every Type-C ATC
+(atc0/1/3-dpphy, "atc-dpphy,t8132", transport-tunneled 0, port-type 2),
+as it does on ATC2 behind the HDMI port, and each atc-phyN carries the
+same calibration names as atc-phy2, whose four lanes this driver already
+runs with the T8122 DisplayPort sequence. The boot loader publishes what
+that sequence needs for a Type-C port too: the USB3 bundle, which holds
+the banks, and the AUX calibration (apple,tunable-usb3-dp, from
+tunable_AUX_TOP).
+
+Admit DisplayPort on all four lanes of a Type-C port's PHY that has its
+SuperSpeed windows, its complete USB3 bundle and the AUX calibration
+(atcphy_t8132_dp_lanes()); the DisplayPort-only PHY keeps its own rule.
+Such a port takes pin assignments C and E as DP, with the plug
+orientation from the mode table, keeps its USB2 running, runs its link
+rate and drive levels as ATC2 does, and treats DPTX Activate and
+Deactivate as no-ops while in DP mode. Without the calibration
+everything stays as before: the USB beside the lanes, and -ENODEV from
+the lane provider for a DP request.
+
+Pin assignment D is unchanged (USB3, its AUX calibration applied): the
+two DP lanes beside USB3 need lane and crossbar words that are not
+sourced for T8132 yet.
+
+KUnit (phy-apple-atc-mux, phy-apple-atc-t8132-dp): a calibrated Type-C
+port takes C and E as DP and D as USB3+DP; each missing piece (SuperSpeed
+windows, USB3 bundle, AUX calibration) takes the lanes away again; the
+lane provider admits DP, USB3 and USB3+DP and still refuses USB4 without
+CIO calibration; configure passes the DP admission and stops at the
+suspended check before any register access; DPTX Activate/Deactivate are
+no-ops in DP mode only.
+
+[j604: X2-01 C1 (BOARD-SWEEP-1838 row X2). Not run on the J604: the
+ four-lane link on a Type-C port needs the dcpext route (drm C2, and the
+ boot loader enabling the routes) and a monitor at the desk.]
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/phy/apple/atc-test.c | 81 +++++++++++++++++++++++++++++++++++-
+ drivers/phy/apple/atc.c      | 68 +++++++++++++++++++++---------
+ 2 files changed, 128 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/phy/apple/atc-test.c b/drivers/phy/apple/atc-test.c
+index 03d375b023..e3ed998f2f 100644
+--- a/drivers/phy/apple/atc-test.c
++++ b/drivers/phy/apple/atc-test.c
+@@ -104,6 +104,57 @@ static void atcphy_test_target_mode_t8132(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_OFF);
+ }
+ 
++/* A dummy calibration: these checks only test for its presence. */
++static struct apple_tunable *atcphy_test_tunable(struct kunit *test)
++{
++	struct apple_tunable *tunable = kunit_kzalloc(test, sizeof(*tunable), GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, tunable);
++	return tunable;
++}
++
++/*
++ * A T8132 Type-C port with its USB3 bundle and AUX calibration runs DP Alt
++ * Mode on four lanes (C, E); D keeps its USB3 beside the lanes it cannot run.
++ */
++static void atcphy_test_target_mode_t8132_dp_alt(struct kunit *test)
++{
++	struct typec_altmode dp = { .svid = USB_TYPEC_DP_SID };
++	struct typec_mux_state state = { .alt = &dp, .mode = TYPEC_DP_STATE_C };
++	struct apple_atcphy *atcphy = atcphy_test_alloc_dev(test, false);
++
++	atcphy->hw = &atcphy_hw_t8132;
++	atcphy->t8132_ss = true;
++	atcphy->ss_tunables = true;
++	atcphy->tunables.usb3_dp = atcphy_test_tunable(test);
++	KUNIT_EXPECT_TRUE(test, atcphy_t8132_dp_lanes(atcphy));
++	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_DP);
++	state.mode = TYPEC_DP_STATE_E;
++	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_DP);
++	state.mode = TYPEC_DP_STATE_D;
++	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state),
++			APPLE_ATCPHY_MODE_USB3_DP);
++
++	/* Each missing piece takes the four lanes away again. */
++	atcphy->ss_tunables = false;
++	KUNIT_EXPECT_FALSE(test, atcphy_t8132_dp_lanes(atcphy));
++	state.mode = TYPEC_DP_STATE_C;
++	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
++	atcphy->ss_tunables = true;
++	atcphy->t8132_ss = false;
++	KUNIT_EXPECT_FALSE(test, atcphy_t8132_dp_lanes(atcphy));
++	atcphy->t8132_ss = true;
++	atcphy->tunables.usb3_dp = NULL;
++	KUNIT_EXPECT_FALSE(test, atcphy_t8132_dp_lanes(atcphy));
++	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
++	/* The DP-only PHY's own rule is unchanged: its dp_tunables. */
++	atcphy->dp_only = true;
++	atcphy->dp_tunables = true;
++	KUNIT_EXPECT_TRUE(test, atcphy_t8132_dp_lanes(atcphy));
++	atcphy->dp_tunables = false;
++	KUNIT_EXPECT_FALSE(test, atcphy_t8132_dp_lanes(atcphy));
++}
++
+ static void atcphy_test_noop_same_mode(struct kunit *test)
+ {
+ 	struct apple_atcphy *atcphy = atcphy_test_alloc(test, true);
+@@ -1513,6 +1564,7 @@ static struct kunit_case atcphy_mux_test_cases[] = {
+ 	KUNIT_CASE(atcphy_test_target_mode),
+ 	KUNIT_CASE(atcphy_test_target_mode_fixed_hub),
+ 	KUNIT_CASE(atcphy_test_target_mode_t8132),
++	KUNIT_CASE(atcphy_test_target_mode_t8132_dp_alt),
+ 	KUNIT_CASE(atcphy_test_noop_same_mode),
+ 	KUNIT_CASE(atcphy_test_noop_needs_work),
+ 	KUNIT_CASE(atcphy_test_usb3_port_ready),
+@@ -1654,10 +1706,19 @@ static void atcphy_test_t8132_dp_mux_check(struct kunit *test)
+ 	atcphy->dp_tunables = false;
+ 	KUNIT_EXPECT_EQ(test, atcphy_mux_check(atcphy, APPLE_ATCPHY_MODE_DP), -EOPNOTSUPP);
+ 
+-	/* Nor on a Type-C port's T8132 PHY. */
++	/* Nor on a Type-C port's T8132 PHY without its USB3 bundle. */
+ 	atcphy->dp_only = false;
+ 	atcphy->dp_tunables = true;
+ 	KUNIT_EXPECT_EQ(test, atcphy_mux_check(atcphy, APPLE_ATCPHY_MODE_DP), -ENODEV);
++
++	/* With the bundle and the AUX calibration it runs four DP lanes. */
++	atcphy->ss_tunables = true;
++	atcphy->tunables.usb3_dp = atcphy_test_tunable(test);
++	KUNIT_EXPECT_EQ(test, atcphy_mux_check(atcphy, APPLE_ATCPHY_MODE_DP), 0);
++	KUNIT_EXPECT_EQ(test, atcphy_mux_check(atcphy, APPLE_ATCPHY_MODE_USB3_DP), 0);
++	KUNIT_EXPECT_EQ(test, atcphy_mux_check(atcphy, APPLE_ATCPHY_MODE_USB3), 0);
++	/* No CIO calibration: no USB4 or Thunderbolt. */
++	KUNIT_EXPECT_EQ(test, atcphy_mux_check(atcphy, APPLE_ATCPHY_MODE_USB4), -ENODEV);
+ }
+ 
+ /* Refusals return before the first register access. */
+@@ -1680,6 +1741,13 @@ static void atcphy_test_t8132_dp_configure_refused(struct kunit *test)
+ 		atcphy->dp_only = false;
+ 		KUNIT_EXPECT_EQ(test, atcphy_configure_t8132(atcphy, APPLE_ATCPHY_MODE_DP),
+ 				-EOPNOTSUPP);
++		/* Calibrated, a Type-C port's PHY is admitted to DP. */
++		atcphy->ss_tunables = true;
++		atcphy->tunables.usb3_dp = atcphy_test_tunable(test);
++		atcphy->t8132_suspended = true;
++		KUNIT_EXPECT_EQ(test, atcphy_configure_t8132(atcphy, APPLE_ATCPHY_MODE_DP),
++				-EBUSY);
++		atcphy->t8132_suspended = false;
+ 	}
+ 	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_OFF);
+ 	KUNIT_EXPECT_FALSE(test, atcphy->t8132_common_owned);
+@@ -1694,9 +1762,18 @@ static void atcphy_test_t8132_dp_set_mode(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, atcphy_dpphy_set_mode_t8132(atcphy, PHY_MODE_INVALID), 0);
+ 	KUNIT_EXPECT_EQ(test, atcphy_dpphy_set_mode_t8132(atcphy, PHY_MODE_USB_HOST),
+ 			-EOPNOTSUPP);
+-	/* A Type-C port's T8132 PHY outside a tunnel refuses DP. */
++	/* A Type-C port's T8132 PHY outside a tunnel or DP Alt Mode refuses DP. */
+ 	atcphy->dp_only = false;
+ 	KUNIT_EXPECT_EQ(test, atcphy_dpphy_set_mode_t8132(atcphy, PHY_MODE_DP), -EOPNOTSUPP);
++	atcphy->mode = APPLE_ATCPHY_MODE_USB3_DP;
++	KUNIT_EXPECT_EQ(test, atcphy_dpphy_set_mode_t8132(atcphy, PHY_MODE_DP), -EOPNOTSUPP);
++	/* In DP Alt Mode on its four lanes, Activate and Deactivate are no-ops. */
++	atcphy->mode = APPLE_ATCPHY_MODE_DP;
++	KUNIT_EXPECT_EQ(test, atcphy_dpphy_set_mode_t8132(atcphy, PHY_MODE_DP), 0);
++	KUNIT_EXPECT_EQ(test, atcphy_dpphy_set_mode_t8132(atcphy, PHY_MODE_INVALID), 0);
++	KUNIT_EXPECT_EQ(test, atcphy_dpphy_set_mode_t8132(atcphy, PHY_MODE_USB_HOST),
++			-EOPNOTSUPP);
++	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
+ }
+ 
+ static struct kunit_case atcphy_t8132_dp_test_cases[] = {
+diff --git a/drivers/phy/apple/atc.c b/drivers/phy/apple/atc.c
+index b6c4afae40..1431d6015a 100644
+--- a/drivers/phy/apple/atc.c
++++ b/drivers/phy/apple/atc.c
+@@ -1284,6 +1284,22 @@ static u32 atcphy_t8132_crossbar(const struct atcphy_mode_configuration *cfg)
+ 	       (cfg->crossbar_dp_both_pma ? ACIOPHY_CROSSBAR_DP_BOTH_PMA : 0);
+ }
+ 
++/*
++ * Can this T8132 PHY run DisplayPort on all four lanes? The DisplayPort-only
++ * PHY can with its banks and AUX calibration. A Type-C port's PHY has the same
++ * DP PHY (the ADT's atcN-dpphy, not tunnelled) and the same calibration names:
++ * it can with its complete USB3 bundle, which holds the banks the DP sequence
++ * uses, and the AUX calibration the boot loader adds to it
++ * (apple,tunable-usb3-dp). That is DP Alt Mode pin assignments C and E; the
++ * USB2 beside the lanes keeps running.
++ */
++static bool atcphy_t8132_dp_lanes(const struct apple_atcphy *atcphy)
++{
++	if (atcphy->dp_only)
++		return atcphy->dp_tunables;
++	return atcphy->t8132_ss && atcphy->ss_tunables && atcphy->tunables.usb3_dp;
++}
++
+ /* Readback only; callers hold the PHY mutex and keep the fixed host live. */
+ static inline u32 core_read32(struct apple_atcphy *atcphy, u32 reg)
+ {
+@@ -4013,7 +4029,7 @@ static int atcphy_configure_t8132(struct apple_atcphy *atcphy, enum atcphy_mode
+ 	/* A DisplayPort-only PHY runs its four lanes, or nothing. */
+ 	if (atcphy->dp_only && mode != APPLE_ATCPHY_MODE_OFF && !dp)
+ 		return -EOPNOTSUPP;
+-	if (dp && (!atcphy->dp_only || !atcphy->dp_tunables))
++	if (dp && !atcphy_t8132_dp_lanes(atcphy))
+ 		return -EOPNOTSUPP;
+ 	if (mode != APPLE_ATCPHY_MODE_OFF && mode != APPLE_ATCPHY_MODE_USB2 &&
+ 	    mode != APPLE_ATCPHY_MODE_USB3 && mode != APPLE_ATCPHY_MODE_USB3_DP && !cio && !dp)
+@@ -4837,12 +4853,12 @@ static const struct phy_ops apple_atc_usb3_phy_ops = {
+ };
+ 
+ /*
+- * The T8132 PHY has no DisplayPort alternate mode: its DP PHY only exists so
+- * that a DisplayPort tunnel can get its pixel clock, see
+- * apple_atc_dp_tunnel_rate_source(). DCP's DPTX Activate and Deactivate
+- * name a DP mode or none while a tunnel runs; that is a no-op as long as the
+- * PHY is in USB4/Thunderbolt mode. Anything else is refused, and nothing here
+- * touches a register.
++ * A T8132 Type-C port's DP PHY serves a DisplayPort tunnel, whose pixel clock
++ * it provides (see apple_atc_dp_tunnel_rate_source()), and DP Alt Mode on its
++ * four lanes (see atcphy_t8132_dp_lanes()), whose lanes the mux has set up.
++ * DCP's DPTX Activate and Deactivate name a DP mode or none: a no-op in
++ * USB4/Thunderbolt or DisplayPort mode. Anything else is refused, and nothing
++ * here touches a register.
+  */
+ static int atcphy_dpphy_set_mode_t8132(struct apple_atcphy *atcphy, enum phy_mode mode)
+ {
+@@ -4854,7 +4870,8 @@ static int atcphy_dpphy_set_mode_t8132(struct apple_atcphy *atcphy, enum phy_mod
+ 	if (atcphy->dp_only)
+ 		return mode == PHY_MODE_DP || mode == PHY_MODE_INVALID ? 0 : -EOPNOTSUPP;
+ 	if ((mode == PHY_MODE_DP || mode == PHY_MODE_INVALID) &&
+-	    (atcphy->mode == APPLE_ATCPHY_MODE_USB4 || atcphy->mode == APPLE_ATCPHY_MODE_TBT))
++	    (atcphy->mode == APPLE_ATCPHY_MODE_USB4 || atcphy->mode == APPLE_ATCPHY_MODE_TBT ||
++	     atcphy->mode == APPLE_ATCPHY_MODE_DP))
+ 		return 0;
+ 	return -EOPNOTSUPP;
+ }
+@@ -4904,6 +4921,10 @@ static int atcphy_dpphy_configure_t8122(struct apple_atcphy *atcphy,
+ 	guard(mutex)(&atcphy->lock);
+ 	atcphy_restore_after_pd_off(atcphy);
+ 
++	/* A T8132 Type-C port in a tunnel sets its rate through its own call. */
++	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && !atcphy->dp_only &&
++	    atcphy->mode != APPLE_ATCPHY_MODE_DP)
++		return -EOPNOTSUPP;
+ 	if (opts->set_lanes)
+ 		return -EINVAL;
+ 	if (opts->set_rate) {
+@@ -4923,11 +4944,13 @@ static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opt
+ 	enum atcphy_dp_link_rate link_rate;
+ 
+ 	/*
+-	 * No DP alternate mode: a tunnel sets its rate through its own call. A
+-	 * DisplayPort-only PHY runs its link as on T8122.
++	 * A tunnel sets its rate through its own call. Four DP lanes, on the
++	 * DisplayPort-only PHY or a Type-C port's in DP Alt Mode, run their
++	 * link as on T8122.
+ 	 */
+ 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
+-		return atcphy->dp_only ? atcphy_dpphy_configure_t8122(atcphy, opts) : -EOPNOTSUPP;
++		return atcphy_t8132_dp_lanes(atcphy) ?
++			atcphy_dpphy_configure_t8122(atcphy, opts) : -EOPNOTSUPP;
+ 	if (atcphy->hw->has_t8140_dp)
+ 		return j700_dp_configure(atcphy, opts);
+ 
+@@ -5201,8 +5224,9 @@ static int atcphy_probe_phy(struct apple_atcphy *atcphy)
+ 
+ 	/*
+ 	 * A T8132 PHY with its USB3/USB4 banks gets a DP PHY for DisplayPort
+-	 * tunnels only (see atcphy_dpphy_set_mode_t8132()); creating it does
+-	 * not touch the hardware.
++	 * tunnels and, with its AUX calibration, DP Alt Mode on four lanes (see
++	 * atcphy_dpphy_set_mode_t8132()); creating it does not touch the
++	 * hardware.
+ 	 */
+ 	for (int i = 0; i < ARRAY_SIZE(phys); i++) {
+ 		if ((atcphy->dp_only && phys[i].phy != &atcphy->phys.dp) ||
+@@ -5745,16 +5769,19 @@ static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
+ 		target_mode = APPLE_ATCPHY_MODE_USB2;
+ 
+ 	/*
+-	 * A T8132 Type-C port runs no DisplayPort-only lanes, and DisplayPort
+-	 * beside USB3 only with its calibration. A partner in DP Alt Mode keeps
+-	 * its USB on the other wires: USB2 next to four DP lanes (pin
+-	 * assignments C and E), USB3 next to two (D). Serve that USB rather
+-	 * than refuse the mode, which would leave the port without USB at all.
++	 * A T8132 Type-C port runs four DisplayPort lanes only with its
++	 * complete calibration (atcphy_t8132_dp_lanes()), and DisplayPort
++	 * beside USB3 only with its AUX calibration. A partner in DP Alt Mode
++	 * keeps its USB on the other wires: USB2 next to four DP lanes (pin
++	 * assignments C and E), USB3 next to two (D). Without the calibration,
++	 * serve that USB rather than refuse the mode, which would leave the
++	 * port without USB at all.
+ 	 */
+ 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132) {
+ 		enum atcphy_mode usb_mode = target_mode;
+ 
+-		if (target_mode == APPLE_ATCPHY_MODE_DP && !atcphy->dp_only)
++		if (target_mode == APPLE_ATCPHY_MODE_DP && !atcphy->dp_only &&
++		    !atcphy_t8132_dp_lanes(atcphy))
+ 			usb_mode = APPLE_ATCPHY_MODE_USB2;
+ 		else if (target_mode == APPLE_ATCPHY_MODE_USB3_DP && !atcphy->tunables.usb3_dp)
+ 			usb_mode = APPLE_ATCPHY_MODE_USB3;
+@@ -5812,6 +5839,9 @@ static int atcphy_mux_check(const struct apple_atcphy *atcphy, enum atcphy_mode
+ 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && atcphy->dp_only &&
+ 	    mode == APPLE_ATCPHY_MODE_DP)
+ 		return atcphy->dp_tunables ? 0 : -EOPNOTSUPP;
++	/* A Type-C port's lane provider, as below: refused with -ENODEV. */
++	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && mode == APPLE_ATCPHY_MODE_DP)
++		return atcphy_t8132_dp_lanes(atcphy) ? 0 : -ENODEV;
+ 
+ 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 &&
+ 	    mode != APPLE_ATCPHY_MODE_OFF && mode != APPLE_ATCPHY_MODE_USB2 &&
+-- 
+2.43.0
+

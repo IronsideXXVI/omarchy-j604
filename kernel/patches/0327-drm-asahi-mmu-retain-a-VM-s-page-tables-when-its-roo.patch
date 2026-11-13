@@ -1,0 +1,279 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 06:23:11 +0000
+Subject: [PATCH] drm/asahi: mmu: retain a VM's page tables when its
+ root lease was taken over
+
+A VM's page tables are freed only when the whole tree drops, and the
+application context's root lease is returned before its VM: the return
+clears the TTBAT slot and invalidates the context's ASID, so no walk of the
+tree can remain cached in the GPU MMU when its table pages go back to the
+page allocator. The firmware's device tree asks for that guarantee
+explicitly (issue-gmmu-tlbis-at-retype).
+
+When the return finds another root in the slot, it must not clear the slot
+or invalidate on that owner's behalf. It only logged that case, and the
+VM's tables were then still freed with nothing having invalidated their
+walks.
+
+Classify the slot at return as owned, already cleared, or taken over
+(mmu/release.rs, core-only). A taken-over lease marks itself, and the
+execution context retains the VM's page tables for good, on its explicit
+release and on drop, before its VM can drop. The owned and cleared cases
+behave exactly as before; the host test checks that the new classification
+invalidates in every case the old rule did, and that a taken-over lease
+leads to no free_table call.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/mmu.rs         |  38 +++++++-
+ drivers/gpu/drm/asahi/mmu/release.rs | 132 +++++++++++++++++++++++++++
+ 2 files changed, 165 insertions(+), 5 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/mmu/release.rs
+
+diff --git a/drivers/gpu/drm/asahi/mmu.rs b/drivers/gpu/drm/asahi/mmu.rs
+index 3ac6e589a6..432204ccaf 100644
+--- a/drivers/gpu/drm/asahi/mmu.rs
++++ b/drivers/gpu/drm/asahi/mmu.rs
+@@ -118,6 +118,7 @@
+ #[cfg(CONFIG_DRM_ASAHI_M5)]
+ mod m5_context;
+ mod ppl;
++mod release;
+ #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+ mod m3;
+ mod residency;
+@@ -1223,6 +1224,8 @@ pub(crate) struct ContextPin {
+ 
+ struct ExecutionRoot {
+     released: AtomicBool,
++    /// Set when the return found another root in the slot: the VM's tables are then retained.
++    violated: AtomicBool,
+     inner: Arc<UatInner>,
+     id: u8,
+     generation: u8,
+@@ -1256,6 +1259,15 @@ pub(crate) fn vm(&self) -> &Vm {
+     /// its commands retired. Installed storage may outlive this root lease.
+     pub(crate) fn release(&self) {
+         self.root.release();
++        self.retain_on_violation();
++    }
++
++    /// A lease that found another root in its slot invalidated nothing, so this VM's walks
++    /// may still be cached: keep its page tables for good instead of freeing them.
++    fn retain_on_violation(&self) {
++        if self.root.violated.load(Ordering::Acquire) {
++            self.vm.retain_tables();
++        }
+     }
+ 
+     /// Takes a hold on this context's identity for a firmware-visible record that names
+@@ -1297,16 +1309,16 @@ fn release(&self) {
+             let roots = &inner.ttbs()[id];
+             let low = roots.ttb0.load(Ordering::Acquire);
+             let high = roots.ttb1.load(Ordering::Acquire);
+-            let owned = low == self.low && high == self.high;
+-            if owned {
++            let outcome = release::RootRelease::classify((low, high), (self.low, self.high));
++            if outcome.clears_slot() {
+                 roots.ttb0.store(0, Ordering::Release);
+                 roots.ttb1.store(0, Ordering::Release);
+                 inner.publish_slot(id);
+             }
+             inner.handoff_unlock();
+-            owned || (low == 0 && high == 0)
++            outcome
+         };
+-        if release {
++        if release.invalidates() {
+             mem::sync();
+             mem::tlbi_asid(self.id);
+             mem::sync();
+@@ -1315,14 +1327,23 @@ fn release(&self) {
+             inner.context_returns[id] = inner.context_clock;
+             inner.execution_contexts &= !(1u64 << id);
+         } else {
++            self.violated.store(true, Ordering::Release);
+             pr_err!(
+-                "MMU: application context {} changed owners while leased\n",
++                "MMU: application context {} changed owners while leased; retaining its page tables\n",
+                 id
+             );
+         }
+     }
+ }
+ 
++impl Drop for ExecutionContext {
++    fn drop(&mut self) {
++        // The root is returned before the `vm` field drops (and with it, possibly, the tables).
++        self.root.release();
++        self.retain_on_violation();
++    }
++}
++
+ impl Drop for ExecutionRoot {
+     fn drop(&mut self) {
+         self.release();
+@@ -2717,6 +2738,12 @@ fn ttb(&self) -> u64 {
+         self.binding.lock().ttb
+     }
+ 
++    /// Keeps every page table of this Vm allocated for good (an ownership violation left its
++    /// walks possibly cached). The tree is leaked when the Vm drops.
++    fn retain_tables(&self) {
++        self.gpuvm.lock_inner().page_table.retain();
++    }
++
+     /// Map a GEM object (using its `SGTable`) into this Vm at a free address in a given range.
+     #[allow(clippy::too_many_arguments)]
+     pub(crate) fn map_in_range(
+@@ -3912,6 +3939,7 @@ pub(crate) fn new_execution_context(
+             ExecutionContext {
+                 root: ExecutionRoot {
+                     released: AtomicBool::new(false),
++                    violated: AtomicBool::new(false),
+                     inner: self.inner.clone(),
+                     id: id as u8,
+                     generation,
+diff --git a/drivers/gpu/drm/asahi/mmu/release.rs b/drivers/gpu/drm/asahi/mmu/release.rs
+new file mode 100644
+index 0000000000..4421e1196d
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/mmu/release.rs
+@@ -0,0 +1,132 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! What returning an application context's root lease may do. Core-only, so the host tests
++//! build it with `rustc --test`.
++//!
++//! The ADT asks the GPU MMU for a TLB invalidation before a page that held translations is
++//! reused (`issue-gmmu-tlbis-at-retype`). Page tables are freed only when a whole tree drops,
++//! and the root lease is returned before its VM: the return invalidates the context's ASID, so
++//! the tree's walks are gone before its pages are. That holds when the lease still owns its
++//! TTBAT slot, or the slot is already empty. If another root sits in the slot, the lease must
++//! not clear it or invalidate on that owner's behalf, and nothing then guarantees that this
++//! tree's walks are gone: the tree is retained (leaked) instead of freed.
++
++/// The TTBAT slot as the lease finds it when it is returned.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum RootRelease {
++    /// The slot holds this lease's root: clear it, then invalidate the ASID.
++    Owned,
++    /// The slot is already empty: invalidate the ASID.
++    Cleared,
++    /// Another root holds the slot: no invalidation, and the tree must never be freed.
++    Violation,
++}
++
++impl RootRelease {
++    /// Classifies the slot's `(ttb0, ttb1)` against the lease's own pair.
++    pub(crate) fn classify(slot: (u64, u64), lease: (u64, u64)) -> Self {
++        if slot == lease {
++            Self::Owned
++        } else if slot == (0, 0) {
++            Self::Cleared
++        } else {
++            Self::Violation
++        }
++    }
++
++    /// Whether the return clears the slot.
++    pub(crate) fn clears_slot(self) -> bool {
++        self == Self::Owned
++    }
++
++    /// Whether the return invalidates the ASID and returns the identity.
++    pub(crate) fn invalidates(self) -> bool {
++        self != Self::Violation
++    }
++
++    /// Whether the VM's page tables must be retained instead of freed.
++    pub(crate) fn retains_tables(self) -> bool {
++        self == Self::Violation
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::RootRelease;
++
++    /// A page-table tree as `UatPageTable` treats it: `drop` frees every table unless retained.
++    struct Tree {
++        tables: u32,
++        retained: bool,
++        freed: u32,
++    }
++
++    impl Tree {
++        fn new(tables: u32) -> Self {
++            Self { tables, retained: false, freed: 0 }
++        }
++        fn drop_tree(&mut self) {
++            if !self.retained {
++                self.freed += self.tables; // one free_table call per table
++            }
++        }
++    }
++
++    /// The ExecutionContext sequence: return the lease, retain on a violation, then the VM drops.
++    fn release_then_drop(slot: (u64, u64), lease: (u64, u64), tree: &mut Tree) -> (bool, bool) {
++        let outcome = RootRelease::classify(slot, lease);
++        if outcome.retains_tables() {
++            tree.retained = true;
++        }
++        tree.drop_tree();
++        (outcome.clears_slot(), outcome.invalidates())
++    }
++
++    #[test]
++    fn owned_slot_is_cleared_invalidated_and_freed() {
++        let mut t = Tree::new(5);
++        assert_eq!(release_then_drop((0x1000, 0x2000), (0x1000, 0x2000), &mut t), (true, true));
++        assert_eq!(t.freed, 5);
++    }
++
++    #[test]
++    fn empty_slot_is_invalidated_and_freed() {
++        let mut t = Tree::new(3);
++        assert_eq!(release_then_drop((0, 0), (0x1000, 0x2000), &mut t), (false, true));
++        assert_eq!(t.freed, 3);
++    }
++
++    #[test]
++    fn foreign_root_retains_the_tree_no_free_table_call() {
++        for slot in [(0x9000, 0x2000), (0x1000, 0x9000), (0x9000, 0), (0, 0x9000)] {
++            let mut t = Tree::new(4);
++            assert_eq!(release_then_drop(slot, (0x1000, 0x2000), &mut t), (false, false));
++            assert_eq!(t.freed, 0, "free_table called after a foreign root in {slot:x?}");
++            assert!(t.retained);
++        }
++    }
++
++    #[test]
++    fn a_zero_lease_on_a_zero_slot_counts_as_owned() {
++        // The pre-fix rule (`owned || slot empty`) invalidated here; the classification must agree.
++        assert_eq!(RootRelease::classify((0, 0), (0, 0)), RootRelease::Owned);
++        assert!(RootRelease::classify((0, 0), (0, 0)).invalidates());
++    }
++
++    #[test]
++    fn invalidation_matches_the_previous_rule_everywhere() {
++        let vals = [0u64, 0x1000, 0x2000, 0x9000];
++        for &a in &vals {
++            for &b in &vals {
++                for &c in &vals {
++                    for &d in &vals {
++                        let old = (a, b) == (c, d) || (a == 0 && b == 0);
++                        let new = RootRelease::classify((a, b), (c, d));
++                        assert_eq!(new.invalidates(), old);
++                        assert_eq!(new.retains_tables(), !old);
++                    }
++                }
++            }
++        }
++    }
++}
+-- 
+2.43.0
+

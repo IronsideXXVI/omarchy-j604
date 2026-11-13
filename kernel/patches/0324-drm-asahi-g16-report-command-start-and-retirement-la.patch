@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 9 Nov 2026 23:59:41 +0000
+Subject: [PATCH] drm/asahi: g16: report command start and retirement
+ latency
+
+aurora-g16/stats reports, per retired command, the time from publication to
+retirement and to the first and last firmware event, and the stage
+durations from the firmware's internal stamps. It does not say how long a
+command waits before its first stage starts, or how long retirement takes
+after its last stage ends.
+
+On the J604 a render command under desktop load spent about 1.22 ms from
+publication to retirement but only 0.36 ms in its stages. The stage stamps
+use the same 24 MHz timebase as the architectural counter that the submit
+records already carry, so both delays can be measured directly.
+
+Record the counter at publication and add a "latency:" line with the number
+of retired commands measured, the number whose stamps fall outside
+publication..retirement (not summed), and the sums of start and tail delay
+plus the largest start delay, in microseconds.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit d2b3bfc3a0b06852bca4f375284a242c441b0a11)
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 14 +++++++++++++-
+ drivers/gpu/drm/asahi/g16/poll.rs   | 23 ++++++++++++++++++++++-
+ 2 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 5ee33d7143..54094898cd 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -55,7 +55,7 @@ pub(crate) fn now_ns() -> u64 {
+ }
+ 
+ /// Counter value carried by a native 25G83 submit-pipe record.
+-fn counter_ticks() -> u64 {
++pub(crate) fn counter_ticks() -> u64 {
+     #[cfg(target_arch = "aarch64")]
+     {
+         let value: u64;
+@@ -180,6 +180,8 @@ pub(crate) struct Flight {
+     pub(crate) recovery_started_ns: u64,
+     /// Publication time, ns.
+     pub(crate) published_ns: u64,
++    /// Publication time in architectural counter ticks (24 MHz), for the latency statistics.
++    pub(crate) published_ticks: u64,
+ }
+ 
+ impl Flight {
+@@ -209,6 +211,7 @@ fn new(job: Arc<Job>) -> Self {
+             recovery_suspect: false,
+             recovery_started_ns: 0,
+             published_ns: 0,
++            published_ticks: 0,
+         }
+     }
+ }
+@@ -256,6 +259,14 @@ pub(crate) struct Stats {
+     pub(crate) fs_ticks: u64,
+     pub(crate) cdm_ticks: u64,
+     pub(crate) span_ticks: u64,
++    /// Retired prefixes whose stage stamps lie between publication and retirement on the
++    /// architectural counter, and those that did not; publication to first stage start and
++    /// last stage end to retirement (sums and maximum start, 24 MHz ticks).
++    pub(crate) lat_n: u64,
++    pub(crate) lat_bad: u64,
++    pub(crate) start_ticks: u64,
++    pub(crate) start_max_ticks: u64,
++    pub(crate) tail_ticks: u64,
+     /// [0] compute, [1] render, [2] mixed.
+     pub(crate) count: [u64; 3],
+     /// Commands whose first queue WRITE advanced, compute then render. These counters are
+@@ -1356,6 +1367,7 @@ fn stat_publish(&mut self, f: &mut Flight) {
+         let s = &mut self.engine.stats;
+         s.pub_ns = now_ns();
+         f.published_ns = s.pub_ns;
++        f.published_ticks = counter_ticks();
+         s.prep_ns += s.pub_ns.wrapping_sub(s.prep_from_ns);
+         if s.idle_from_ns != 0 {
+             s.gap_ns += s.pub_ns.wrapping_sub(s.idle_from_ns);
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index ba17a4484f..7f83f2626e 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -30,7 +30,7 @@
+ };
+ 
+ use super::channel::Channel;
+-use super::engine::{complete, now_ns, rmb, Flight, Lap};
++use super::engine::{complete, counter_ticks, now_ns, rmb, Flight, Lap};
+ use super::fw::graph::{notifier, notifier_page, qstate};
+ use super::fw::work::compute;
+ use super::job::{self, Completions, Job};
+@@ -758,6 +758,18 @@ fn stat_retire(&mut self, f: &Flight) {
+         }
+         if hi > lo {
+             s.span_ticks = s.span_ticks.saturating_add(hi - lo);
++            // Stage stamps and the publication time share the 24 MHz counter when they fall
++            // between publication and now; anything else is counted, not summed.
++            let now_ticks = counter_ticks();
++            if f.published_ticks != 0 && lo >= f.published_ticks && hi <= now_ticks {
++                let start = lo - f.published_ticks;
++                s.start_ticks = s.start_ticks.saturating_add(start);
++                s.start_max_ticks = s.start_max_ticks.max(start);
++                s.tail_ticks = s.tail_ticks.saturating_add(now_ticks - hi);
++                s.lat_n += 1;
++            } else {
++                s.lat_bad += 1;
++            }
+         }
+         for b in 0..3 {
+             let t = self.events.event_ns[b];
+@@ -997,6 +1009,15 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.cdm_ticks / 24,
+             s.span_ticks / 24
+         )?;
++        writeln!(
++            f,
++            "latency: n {} bad {} start_us {} start_max_us {} tail_us {}",
++            s.lat_n,
++            s.lat_bad,
++            s.start_ticks / 24,
++            s.start_max_ticks / 24,
++            s.tail_ticks / 24
++        )?;
+         // The phase timers of debug_flags bit 49, and the scrub flush waits.
+         let p = &self.engine.prof;
+         writeln!(
+-- 
+2.43.0
+

@@ -1,0 +1,336 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 02:01:06 +0000
+Subject: [PATCH] arm64: apple: optionally ack the AIC in the T8132
+ last WFI, as macOS does
+
+After the T8132 sleep commit each core takes a last WFI, and the sleep
+engine waits until every core is in it. With interrupts masked, an
+event the AIC latched before its lines were masked keeps the core's IRQ
+input raised, so each WFI returns at once and the boot core never
+reaches its deep WFI. The engine then waits until WD2 resets the SoC
+5 s later, which is what a first real T8132 sleep on the J604 did
+(counted reset about 5 s after the commit point).
+
+macOS reads the AIC event register around its last WFI, and Aurora's
+port does the same (sleep_boot_wfi(): wfi, aic_sleep_ack(), clear the
+IPI). Do it in apple_cpu_t8132_last_wfi() behind apple_cpu.t8132_aic_ack
+(default off, so that one kernel shows the sleep with and without it):
+after each WFI, read the event register until it reads 0 (at most 256
+events), which acks each event and leaves its line masked, then clear
+the fast IPI as before. Off, the loop is the same as before.
+
+The register is looked up once before the commit, so from the commit
+on the loop reads no memory but its own registers. irq-apple-aic gives
+it through aic_sleep_event_reg().
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ MAINTAINERS                         |   2 +
+ arch/arm64/kernel/apple_cpu.c       |  36 ++++++-
+ drivers/irqchip/irq-apple-aic.c     |  19 ++++
+ include/linux/irqchip/apple-aic.h   |  13 +++
+ tools/asahi/t8132-last-wfi-tests.py | 144 ++++++++++++++++++++++++++++
+ 5 files changed, 212 insertions(+), 2 deletions(-)
+ create mode 100644 include/linux/irqchip/apple-aic.h
+ create mode 100755 tools/asahi/t8132-last-wfi-tests.py
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 4d4a430736..b26df35cd5 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2786,6 +2786,8 @@ F:	drivers/iommu/apple-dart-test.c
+ F:	drivers/iommu/apple-dart.c
+ F:	drivers/iommu/io-pgtable-dart.c
+ F:	drivers/irqchip/irq-apple-aic.c
++F:	include/linux/irqchip/apple-aic.h
++F:	tools/asahi/t8132-last-wfi-tests.py
+ F:	drivers/mfd/macsmc*.c
+ F:	drivers/nfc/.kunitconfig
+ F:	drivers/nfc/apple-stockholm*.c
+diff --git a/arch/arm64/kernel/apple_cpu.c b/arch/arm64/kernel/apple_cpu.c
+index 6f86066222..14295f5558 100644
+--- a/arch/arm64/kernel/apple_cpu.c
++++ b/arch/arm64/kernel/apple_cpu.c
+@@ -60,6 +60,7 @@
+ #include <linux/init.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
++#include <linux/irqchip/apple-aic.h>
+ #include <linux/ioport.h>
+ #include <linux/kexec.h>
+ #include <linux/log2.h>
+@@ -1255,8 +1256,23 @@ static void apple_l1_clean_sw(const struct apple_l1_sw *sw)
+  * written: a sleep abandoned after the stop takes the core down as the PMGR
+  * stop alone does (apple_cpu_park_power_down()), its cluster left powered.
+  */
++/* Events read off the AIC per wake of a last WFI, at most */
++#define T8132_AIC_ACK_MAX	256
++
++static bool t8132_aic_ack;
++module_param(t8132_aic_ack, bool, 0644);
++MODULE_PARM_DESC(t8132_aic_ack,
++		 "For bring-up: in the last WFI after a T8132 sleep commit, read the AIC's event register until it is empty after each wake of the WFI, as macOS does, so that an event latched before the lines were masked cannot keep the core out of its deep WFI (default: off)");
++
++/*
++ * The AIC's event register for the last WFI, read before the commit: from the
++ * commit on, a core touches no memory it has not already got in its caches.
++ */
++static void __iomem *apple_cpu_t8132_aic_event;
++
+ static void __noreturn apple_cpu_t8132_last_wfi(bool deep_sleep)
+ {
++	void __iomem *ev = READ_ONCE(apple_cpu_t8132_aic_event);
+ 	u64 deep;
+ 
+ 	write_sysreg(0, cntv_ctl_el0);
+@@ -1271,14 +1287,25 @@ static void __noreturn apple_cpu_t8132_last_wfi(bool deep_sleep)
+ 		isb();
+ 	}
+ 
++	/*
++	 * What ends a WFI here with every line masked: an event the AIC latched
++	 * before the mask, or an IPI. Ack both and wait again (Aurora's
++	 * sleep_boot_wfi(), from macOS's trace), so the engine gets the deep WFI.
++	 */
+ 	asm volatile(
+ 	"1:	dsb	sy\n"
+ 	"	isb\n"
+ 	"	wfi\n"
+-	"	mov	x10, #1\n"
++	"	cbz	%0, 3f\n"
++	"	mov	x11, #%1\n"
++	"2:	ldr	w10, [%0]\n"
++	"	cbz	w10, 3f\n"
++	"	subs	x11, x11, #1\n"
++	"	b.ne	2b\n"
++	"3:	mov	x10, #1\n"
+ 	"	msr	s3_5_c15_c1_1, x10\n"
+ 	"	b	1b\n"
+-	: : : "x10", "memory");
++	: : "r" (ev), "i" (T8132_AIC_ACK_MAX) : "x10", "x11", "memory");
+ 
+ 	unreachable();
+ }
+@@ -1562,6 +1589,11 @@ int apple_cpu_t8132_stop_parked(void)
+ 
+ 	WRITE_ONCE(apple_cpu_t8132_released, false);
+ 	WRITE_ONCE(apple_cpu_t8132_deep, false);
++	WRITE_ONCE(apple_cpu_t8132_aic_event,
++		   READ_ONCE(t8132_aic_ack) ? aic_sleep_event_reg() : NULL);
++	/* Before any parked core reads it in apple_cpu_t8132_stop_hold() */
++	dcache_clean_poc((unsigned long)&apple_cpu_t8132_aic_event,
++			 (unsigned long)(&apple_cpu_t8132_aic_event + 1));
+ 	for_each_possible_cpu(cpu) {
+ 		struct apple_cpu *ac = apple_cpus[cpu];
+ 
+diff --git a/drivers/irqchip/irq-apple-aic.c b/drivers/irqchip/irq-apple-aic.c
+index 8f31e4a806..48f13f640c 100644
+--- a/drivers/irqchip/irq-apple-aic.c
++++ b/drivers/irqchip/irq-apple-aic.c
+@@ -51,6 +51,7 @@
+ #include <linux/io.h>
+ #include <linux/irqchip.h>
+ #include <linux/irqchip/arm-vgic-info.h>
++#include <linux/irqchip/apple-aic.h>
+ #include <linux/irqdomain.h>
+ #include <linux/jump_label.h>
+ #include <linux/limits.h>
+@@ -408,6 +409,24 @@ static DEFINE_PER_CPU(uint32_t, aic_fiq_unmasked);
+ 
+ static struct aic_irq_chip *aic_irqc;
+ 
++/**
++ * aic_sleep_event_reg() - the event register, for the last WFI of a suspend-to-RAM
++ *
++ * With interrupts masked, an event the AIC latched before its lines were masked
++ * keeps the core's IRQ input raised: each WFI returns at once, and a sleep engine
++ * that waits for the core's deep WFI never gets it. Reading this register acks the
++ * event and the line stays masked; the caller reads it until it reads 0, as macOS
++ * does around its last WFI.
++ *
++ * Return: the register, or NULL without an AIC.
++ */
++void __iomem *aic_sleep_event_reg(void)
++{
++	struct aic_irq_chip *ic = aic_irqc;
++
++	return ic ? ic->event + ic->info.event : NULL;
++}
++
+ /* CPUs that accept hardware IRQs, read from SIQ_CFG where siq_cfg_routing is set */
+ static struct cpumask aic_irq_cpus;
+ 
+diff --git a/include/linux/irqchip/apple-aic.h b/include/linux/irqchip/apple-aic.h
+new file mode 100644
+index 0000000000..75cbc36cb6
+--- /dev/null
++++ b/include/linux/irqchip/apple-aic.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_IRQCHIP_APPLE_AIC_H
++#define _LINUX_IRQCHIP_APPLE_AIC_H
++
++#include <linux/compiler_types.h>
++
++#ifdef CONFIG_APPLE_AIC
++void __iomem *aic_sleep_event_reg(void);
++#else
++static inline void __iomem *aic_sleep_event_reg(void) { return NULL; }
++#endif
++
++#endif /* _LINUX_IRQCHIP_APPLE_AIC_H */
+diff --git a/tools/asahi/t8132-last-wfi-tests.py b/tools/asahi/t8132-last-wfi-tests.py
+new file mode 100755
+index 0000000000..54abd82a50
+--- /dev/null
++++ b/tools/asahi/t8132-last-wfi-tests.py
+@@ -0,0 +1,144 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only
++"""Run apple_cpu_t8132_last_wfi()'s loop against a model of the AIC.
++
++The inline assembly of the T8132 last-WFI loop is extracted from
++arch/arm64/kernel/apple_cpu.c and run by a small interpreter for the
++instructions it uses, one pass from the WFI back to the loop label, against a
++model AIC event register (each read returns and acks one latched event). It
++checks that with t8132_aic_ack off the loop reads nothing and only clears the
++fast IPI, as before; that with it on every latched event is read off before the
++IPI is cleared; that the drain stops at T8132_AIC_ACK_MAX; and that the
++parameter defaults to off and gates the event register.
++"""
++import argparse
++from pathlib import Path
++import re
++
++ROOT = Path(__file__).resolve().parents[2]
++MUTATIONS = {
++    'no-null-skip': ('\t"\tcbz\t%0, 3f\\n"\n', ''),
++    'no-bound': ('"\tb.ne\t2b\\n"', '"\tb\t2b\\n"'),
++    'no-drain': ('"\tcbz\tw10, 3f\\n"', '"\tb\t3f\\n"'),
++    'no-ipi': ('\t"\tmsr\ts3_5_c15_c1_1, x10\\n"\n', ''),
++    'param-on': ('static bool t8132_aic_ack;', 'static bool t8132_aic_ack = true;'),
++    'ungated': ('READ_ONCE(t8132_aic_ack) ? aic_sleep_event_reg() : NULL', 'aic_sleep_event_reg()'),
++}
++
++
++class Done(Exception):
++    pass
++
++
++def program(src):
++    fn = src[src.index('static void __noreturn apple_cpu_t8132_last_wfi('):]
++    block = re.search(r'asm volatile\((.*?)\n\t:', fn, re.S).group(1)
++    lines = [bytes(m, 'utf-8').decode('unicode_escape') for m in re.findall(r'"((?:[^"\\]|\\.)*)"', block)]
++    prog, labels = [], {}
++    for raw in ''.join(lines).split('\n'):
++        raw = raw.strip()
++        if not raw:
++            continue
++        m = re.match(r'(\d+):\s*(.*)', raw)
++        if m:
++            labels[m.group(1)] = len(prog)
++            raw = m.group(2)
++        prog.append(raw.split(None, 1) + [''] if len(raw.split(None, 1)) == 1 else raw.split(None, 1))
++    return prog, labels
++
++
++def run(prog, labels, ev, events, ack_max):
++    """One pass from label 1 to the jump back. Returns (reads, ipi_cleared_after_reads)."""
++    regs = {'%0': ev, 'x10': 0, 'x11': 0, 'w10': 0}
++    state = {'reads': 0, 'ipi_at': None, 'events': events, 'z': False}
++    pc = labels['1']
++    steps = 0
++    while True:
++        steps += 1
++        if steps > 100000:
++            raise AssertionError('loop does not end')
++        op, args = prog[pc][0], [a.strip() for a in prog[pc][1].split(',')] if prog[pc][1] else []
++        pc += 1
++        if op in ('dsb', 'isb', 'wfi'):
++            continue
++        if op == 'cbz':
++            val = regs[args[0]]
++            if not val:
++                pc = labels[args[1].rstrip('fb')]
++        elif op == 'mov':
++            regs[args[0]] = ack_max if args[1] == '#%1' else int(args[1].lstrip('#'), 0)
++        elif op == 'ldr':
++            assert args[1] == '[%0]', args
++            state['reads'] += 1
++            if state['events'] > 0:
++                state['events'] -= 1
++                regs[args[0]] = 0x10000 | state['events']   # IRQ type, nonzero
++            else:
++                regs[args[0]] = 0
++        elif op == 'subs':
++            regs[args[0]] = regs[args[1]] - int(args[2].lstrip('#'))
++            state['z'] = regs[args[0]] == 0
++        elif op == 'b.ne':
++            if not state['z']:
++                pc = labels[args[0].rstrip('fb')]
++        elif op == 'msr':
++            assert args == ['s3_5_c15_c1_1', 'x10'] and regs['x10'] == 1, args
++            state['ipi_at'] = state['reads']
++        elif op == 'b':
++            target = args[0].rstrip('fb')
++            if target == '1':
++                return state
++            pc = labels[target]
++        else:
++            raise AssertionError(f'unknown instruction {op}')
++
++
++def check(src, aic):
++    assert re.search(r'^static bool t8132_aic_ack;$', src, re.M), 'Assertion failed: t8132_aic_ack must default to off'
++    assert 'READ_ONCE(t8132_aic_ack) ? aic_sleep_event_reg() : NULL' in src, \
++        'Assertion failed: the event register must be gated by t8132_aic_ack'
++    ack_max = int(re.search(r'#define T8132_AIC_ACK_MAX\s+(\d+)', src).group(1))
++    assert 0 < ack_max <= 4096, 'Assertion failed: ack bound'
++    assert 'return ic ? ic->event + ic->info.event : NULL;' in aic, \
++        'Assertion failed: aic_sleep_event_reg must return the register aic_handle_irq reads'
++    assert 'event = readl(ic->event + ic->info.event);' in aic
++    prog, labels = program(src)
++    # off: no read, IPI cleared
++    st = run(prog, labels, 0, 5, ack_max)
++    assert st['reads'] == 0 and st['ipi_at'] == 0, f'Assertion failed: off {st}'
++    # on, nothing latched: one read (0), then the IPI
++    st = run(prog, labels, 0x1000, 0, ack_max)
++    assert st['reads'] == 1 and st['ipi_at'] == 1, f'Assertion failed: empty {st}'
++    # on, 3 latched: all read off, the empty read, then the IPI
++    st = run(prog, labels, 0x1000, 3, ack_max)
++    assert st['reads'] == 4 and st['events'] == 0 and st['ipi_at'] == 4, f'Assertion failed: drain {st}'
++    # on, an event storm: bounded
++    st = run(prog, labels, 0x1000, 10 ** 6, ack_max)
++    assert st['reads'] == ack_max and st['ipi_at'] == ack_max, f'Assertion failed: bound {st}'
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--out', type=Path)
++    parser.add_argument('--mutation', choices=MUTATIONS)
++    args = parser.parse_args()
++    src = (ROOT / 'arch/arm64/kernel/apple_cpu.c').read_text()
++    aic = (ROOT / 'drivers/irqchip/irq-apple-aic.c').read_text()
++    if args.mutation:
++        old, new = MUTATIONS[args.mutation]
++        at = src.index('static void __noreturn apple_cpu_t8132_last_wfi(')
++        if old in src[at:]:
++            src = src[:at] + src[at:].replace(old, new, 1)
++        else:
++            assert old in src, f'missing mutation site: {old}'
++            src = src.replace(old, new, 1)
++    try:
++        check(src, aic)
++    except (AssertionError, KeyError) as e:
++        print(f'Assertion failed: {e}')
++        raise SystemExit(1)
++    print('t8132 last WFI: off reads nothing; on drains every latched event, bounded, before the IPI')
++
++
++if __name__ == '__main__':
++    main()
+-- 
+2.43.0
+

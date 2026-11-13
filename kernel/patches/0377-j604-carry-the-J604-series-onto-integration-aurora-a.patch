@@ -1,0 +1,684 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 01:52:26 +0000
+Subject: [PATCH] j604: carry the J604 series onto integration/aurora
+ abd6d4a09f
+
+The J604 series was rebased from integration/aurora cc7696978e4c onto
+abd6d4a09ffe, our side kept in every conflicting hunk. This commit
+brings the result to the tree of the series merged with Aurora's tip,
+where both sides changed the same code:
+
+- Aurora's J604 pieces are carried and ours dropped: the Touch ID SPI
+  mode, the SIO window at its mailbox and the AOP sensor services are
+  Aurora's commits now. DisplayPort alt mode on the USB-C ports follows
+  Aurora's design: the board marks the PHYs wired for it
+  (apple,dp-alt-mode; ATC0, ATC1 and ATC3 on the J604), the display
+  fabric routes alt mode only to those, a Type-C port's DP link rate
+  runs Aurora's T8132 sequence with its T8132 lane start, and USB3+DP
+  powers AUX up after the calibration. A Type-C port runs four DP lanes
+  only where it is marked and calibrated.
+- The HDMI port keeps the J604 series' DisplayPort-only PHY on ATC2 and
+  its link rate path; it now takes Aurora's T8132 lane start too.
+- The J604's speakers keep the J616s configuration (brought up, under
+  speakersafetyd); Aurora's J604 entry kept them off.
+- The video encoder takes Aurora's M4 Max and T6050 firmware
+  identification next to the T8132 CRC; its MCTF and CMP420 code stays
+  out, as in the series before.
+- brcmfmac's reset keeps the J713 sleep ownership check and takes
+  Aurora's link state.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ arch/arm64/boot/dts/apple/t8132-j604.dts      |  13 +++
+ drivers/gpu/drm/apple/audio.c                 |   1 +
+ drivers/gpu/drm/apple/dcp-fabric.c            |  21 ++--
+ drivers/media/platform/apple/ave/ave-fw.c     | 101 +++++++++++++++++-
+ drivers/media/platform/apple/ave/ave-layout.c |   6 +-
+ drivers/media/platform/apple/ave/ave.h        |  29 +++++
+ .../broadcom/brcm80211/brcmfmac/pcie.c        |   1 +
+ drivers/phy/apple/atc.c                       |  65 ++++++++---
+ drivers/soc/apple/mailbox.c                   |  59 ++++++++++
+ sound/soc/apple/macaudio.c                    |  11 +-
+ tools/asahi/atc-usb3-tests.py                 |   3 +-
+ tools/asahi/brcmf-suspend-tests.py            |   2 +-
+ .../drivers/gpu/apple-dcp/dwc3/mocks.c        |   2 +-
+ .../selftests/drivers/gpu/apple-dcp/phy.py    |   8 +-
+ .../drivers/gpu/apple-dcp/quiesce.py          |   2 +-
+ 15 files changed, 285 insertions(+), 39 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/t8132-j604.dts b/arch/arm64/boot/dts/apple/t8132-j604.dts
+index 7825827170..0dbb38584d 100644
+--- a/arch/arm64/boot/dts/apple/t8132-j604.dts
++++ b/arch/arm64/boot/dts/apple/t8132-j604.dts
+@@ -406,3 +406,16 @@ &avd {
+ };
+ 
+ #include "t8132-j604-lab.dtsi"
++
++/*
++ * The left USB-C ports' PHYs (ATC0/ATC1) are wired for DisplayPort alt mode,
++ * as the right port's (ATC3, above). The external display pipes, their
++ * Type-C routes and the HDMI port (ATC2) are described in t8132-j604-lab.dtsi.
++ */
++&atcphy0 {
++	apple,dp-alt-mode;
++};
++
++&atcphy1 {
++	apple,dp-alt-mode;
++};
+diff --git a/drivers/gpu/drm/apple/audio.c b/drivers/gpu/drm/apple/audio.c
+index eaa12f0267..f54ff026da 100644
+--- a/drivers/gpu/drm/apple/audio.c
++++ b/drivers/gpu/drm/apple/audio.c
+@@ -1813,6 +1813,7 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
+ 	ret = devm_pm_runtime_enable(dev);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Failed to enable runtime PM: %d\n", ret);
++	dcpaud->rpm_enabled = true;
+ 
+ 	/* find linked DCP instance */
+ 	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
+diff --git a/drivers/gpu/drm/apple/dcp-fabric.c b/drivers/gpu/drm/apple/dcp-fabric.c
+index f7952747f1..e00de74092 100644
+--- a/drivers/gpu/drm/apple/dcp-fabric.c
++++ b/drivers/gpu/drm/apple/dcp-fabric.c
+@@ -192,8 +192,9 @@ bool dcp_hdmi_port_attached(struct apple_dcp *dcp)
+ }
+ 
+ /*
+- * A route of an adopted T8132 dcpext. Its PHY has no DP alt mode, so the
+- * crossbar's DP PHY output has nothing behind it, and the dcpext is no
++ * A route of an adopted T8132 dcpext whose PHY has no DP alt mode: the
++ * crossbar's DP PHY output has nothing behind it. The board marks the PHYs
++ * wired for DP alt mode (apple,dp-alt-mode). Either way the dcpext is no
+  * apple_crtc pipeline: its DRM objects are its own (t8132_ext_drm.c).
+  */
+ static bool dcp_typec_route_no_dp_alt(const struct apple_dcp_typec_route *route)
+@@ -1972,14 +1973,14 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
+ 	}
+ 
+ 	/*
+-	 * No DP alt mode on T8132. The state is taken as applied and
++	 * No DP alt mode on this T8132 port. The state is taken as applied and
+ 	 * nothing is routed, as before these routes existed, so the port
+ 	 * controller's mode change goes on. USB, USB4/TBT and safe states are
+ 	 * handled above as on every other SoC.
+ 	 */
+ 	if (dcp_typec_route_no_dp_alt(route)) {
+ 		dev_info_once(route->dcp->dev,
+-			      "DP alt mode display not routed: no DP alt mode PHY on this SoC\n");
++			      "DP alt mode display not routed: no DP alt mode PHY on this port\n");
+ 		port->applied_valid = true;
+ 		return 0;
+ 	}
+@@ -2048,8 +2049,16 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
+ 		struct apple_dcp *dcp = port->owner->dcp;
+ 
+ 		WRITE_ONCE(dcp->typec_cable_connected, true);
+-		if (dcp->typec_connector)
++		if (dcp->typec_connector) {
+ 			dcp_dptx_connect_oob(to_platform_device(dcp->dev), 0);
++		} else if (dcp_is_t8132_ext(dcp)) {
++			/*
++			 * A T8132 dcpext has no connector of its own: it connects
++			 * from the Type-C reconnect work, as for a tunnel.
++			 */
++			dcp->typec_reconnect_tries = 0;
++			dcp_queue_typec_reconnect(dcp, 0);
++		}
+ 	} else if (hpd && dp_data && (dp_data->status & DP_STATUS_IRQ_HPD)) {
+ 		struct apple_dcp *dcp = port->owner->dcp;
+ 
+@@ -4237,7 +4246,7 @@ bool dcp_typec_port_unusable(unsigned int idx)
+ 		return false;
+ 
+ 	list_for_each_entry(route, &port->routes, port_link)
+-		if (!READ_ONCE(route->dcp->ext_dead) && !dcp_typec_route_no_dp_alt(route))
++		if (!READ_ONCE(route->dcp->ext_dead) && !dcp_is_t8132_ext(route->dcp))
+ 			return false;
+ 
+ 	return true;
+diff --git a/drivers/media/platform/apple/ave/ave-fw.c b/drivers/media/platform/apple/ave/ave-fw.c
+index 417801e66d..86f018b777 100644
+--- a/drivers/media/platform/apple/ave/ave-fw.c
++++ b/drivers/media/platform/apple/ave/ave-fw.c
+@@ -24,6 +24,7 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/sizes.h>
+ #include <linux/slab.h>
++#include <linux/unaligned.h>
+ #include <linux/vmalloc.h>
+ 
+ #include "ave.h"
+@@ -38,6 +39,8 @@ static const u32 ave_known_text_crc[] = {
+ 	0x69c54454, /* AppleAVE2FW 9003.78.0 (macOS 26.0.x) */
+ 	AVE_FW_TEXT_CRC_T6040_25G83, /* AppleAVE2FW 9003.78.0 / T6040 */
+ 	AVE_FW_TEXT_CRC_T8132_25G83, /* AppleAVE2FW 9003.78.0 / T8132 */
++	AVE_FW_TEXT_CRC_T6041_25G83, /* AppleAVE2FW 9003.78.0 / M4 Max */
++	AVE_FW_TEXT_CRC_T6050_26A428, /* AppleAVE2FW, macOS 27.0 26A428 / T6050 */
+ 	0x460c7a7c, /* AppleAVE2FW 6070.11.1 / T6000 */
+ 	0x25bfd039, /* AppleAVE2FW 6070.11.1 / T8112 */
+ };
+@@ -121,6 +124,97 @@ static int ave_fw_crc(const struct ave_fw_segment *seg, u32 *crc, void *copy)
+ 	return 0;
+ }
+ 
++/*
++ * The firmware build is identified by its image CRC. The loader links TEXT
++ * to DATA by writing the DATA address into one cell that is zero in the
++ * image, so hash TEXT with that cell as the image has it. Any other value
++ * in the cell means TEXT is not the build this variant expects.
++ */
++int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
++		       u64 data_iova, u32 *crc)
++{
++	static const u8 zero[sizeof(u64)];
++	u64 cell;
++
++	if (cell_off > size || size - cell_off < sizeof(zero))
++		return -EINVAL;
++	/*
++	 * The cell holds the firmware's own alias of DATA, which has the low
++	 * 32 bits of DATA's DART address.
++	 */
++	cell = get_unaligned_le64(text + cell_off);
++	if (cell && lower_32_bits(cell) != lower_32_bits(data_iova))
++		return -ENODEV;
++	*crc = crc32_le(~0U, text, cell_off);
++	*crc = crc32_le(*crc, zero, sizeof(zero));
++	*crc = crc32_le(*crc, text + cell_off + sizeof(zero),
++			size - cell_off - sizeof(zero));
++	*crc ^= ~0U;
++	return 0;
++}
++
++static bool ave_fw_known_crc(u32 crc)
++{
++	for (unsigned int i = 0; i < ARRAY_SIZE(ave_known_text_crc); i++)
++		if (crc == ave_known_text_crc[i])
++			return true;
++	return false;
++}
++
++/* The TEXT CRC with the loader's per-boot word at @word_off zeroed. */
++int ave_fw_text_boot_crc(const void *text, size_t size, u32 word_off,
++			 u32 *crc)
++{
++	static const u8 zero[sizeof(u32)];
++
++	if (word_off > size || size - word_off < sizeof(zero))
++		return -EINVAL;
++	*crc = crc32_le(~0U, text, word_off);
++	*crc = crc32_le(*crc, zero, sizeof(zero));
++	*crc = crc32_le(*crc, text + word_off + sizeof(zero),
++			size - word_off - sizeof(zero));
++	*crc ^= ~0U;
++	return 0;
++}
++
++/*
++ * A known TEXT CRC (the M4 Pro build) stays as it is; any other is retried
++ * with the per-boot word zeroed (the M4 Max build).
++ */
++static int ave_fw_text_boot_id(struct ave_dev *ave, u32 *crc)
++{
++	void *va;
++	int ret;
++
++	if (ave_fw_known_crc(*crc))
++		return 0;
++	va = memremap(ave->text.phys, ave->text.size, MEMREMAP_WB);
++	if (!va)
++		return -ENOMEM;
++	ret = ave_fw_text_boot_crc(va, ave->text.size,
++				   ave->variant->text_boot_word, crc);
++	memunmap(va);
++	return ret;
++}
++
++static int ave_fw_text_id(struct ave_dev *ave, u32 *crc)
++{
++	void *va;
++	int ret;
++
++	if (!ave->variant->text_link_cell)
++		return ave->variant->text_boot_word ?
++			       ave_fw_text_boot_id(ave, crc) : 0;
++	va = memremap(ave->text.phys, ave->text.size, MEMREMAP_WB);
++	if (!va)
++		return -ENOMEM;
++	ret = ave_fw_text_id_crc(va, ave->text.size,
++				 ave->variant->text_link_cell, ave->data.iova,
++				 crc);
++	memunmap(va);
++	return ret;
++}
++
+ /*
+  * Find the firmware, check that it is a build we speak to and that DATA is
+  * still as the bootloader left it, and keep a copy of DATA for restarts.
+@@ -168,8 +262,11 @@ int ave_fw_probe(struct ave_dev *ave)
+ 	if (ret || text_crc != want)
+ 		return dev_err_probe(dev, -ENODEV,
+ 				     "firmware text differs from loader CRC\n");
+-	for (unsigned int i = 0; i < ARRAY_SIZE(ave_known_text_crc); i++)
+-		known |= text_crc == ave_known_text_crc[i];
++	ret = ave_fw_text_id(ave, &text_crc);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "firmware text link cell is not the DATA address\n");
++	known |= ave_fw_known_crc(text_crc);
+ 	if (!known ||
+ 	    (ave->variant->text_crc && text_crc != ave->variant->text_crc))
+ 		return dev_err_probe(dev, -ENODEV,
+diff --git a/drivers/media/platform/apple/ave/ave-layout.c b/drivers/media/platform/apple/ave/ave-layout.c
+index 23f9dc71c2..e6b0352e5e 100644
+--- a/drivers/media/platform/apple/ave/ave-layout.c
++++ b/drivers/media/platform/apple/ave/ave-layout.c
+@@ -530,11 +530,11 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
+ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
+ {
+ 	/*
+-	 * The M4 Pro and the M4 get the same 25G83 firmware build as the A18
+-	 * Pro, built for their own chips, and speak the same command layout.
++	 * The M4, M4 Pro and M4 Max get the same 25G83 firmware build as the
++	 * A18 Pro, built for their own chips, and speak the same command layout.
+ 	 */
+ 	if (crc == AVE_FW_TEXT_CRC_9003_78_0 || crc == AVE_FW_TEXT_CRC_T6040_25G83 ||
+-	    crc == AVE_FW_TEXT_CRC_T8132_25G83)
++	    crc == AVE_FW_TEXT_CRC_T6041_25G83 || crc == AVE_FW_TEXT_CRC_T8132_25G83)
+ 		return &ave_layout_9003_78_0;
+ 	if (crc == 0x460c7a7c || crc == 0x25bfd039)
+ 		return &ave_layout_6070_11_1;
+diff --git a/drivers/media/platform/apple/ave/ave.h b/drivers/media/platform/apple/ave/ave.h
+index 4439321382..d05750b9dd 100644
+--- a/drivers/media/platform/apple/ave/ave.h
++++ b/drivers/media/platform/apple/ave/ave.h
+@@ -144,6 +144,13 @@ enum ave_opcode {
+ #define AVE_FW_TEXT_CRC_T6040_25G83 0x68d5f9f6
+ /* H16G (T8132) AppleAVE2FW 9003.78.0 from 25G83: start-up values not known yet. */
+ #define AVE_FW_TEXT_CRC_T8132_25G83 0x9308d2ab
++/*
++ * The M4 Max (J575c) build of AppleAVE2FW 9003.78.0, as iBoot 25G83 loads it:
++ * DATA is 0x130000, and the loader writes a per-boot word at TEXT 0x4224, so
++ * this is the TEXT CRC with that word zeroed.
++ */
++#define AVE_FW_TEXT_CRC_T6041_25G83 0x9a080cad
++#define AVE_FW_TEXT_CRC_T6050_26A428 0x87279429
+ 
+ struct ave_ctx;
+ 
+@@ -172,6 +179,24 @@ struct ave_variant {
+ 	u32 timebase_multiplier;
+ 	u64 vcbar_mask;
+ 	u64 vcbar_flags;
++	/*
++	 * TEXT offset of the 64-bit cell the loader fills with the DATA
++	 * address; it is zero in the firmware image. 0 when there is none.
++	 */
++	u32 text_link_cell;
++	/*
++	 * TEXT offset of a 32-bit word the loader sets differently on every
++	 * boot; a TEXT CRC that is not a known build is retried with it zeroed.
++	 * 0 when there is none.
++	 */
++	u32 text_boot_word;
++	/*
++	 * Mailbox offset of the SVE idle (clock gating) word that must read 0
++	 * before the firmware starts, or 0 when the variant has none.
++	 */
++	u32 mbox_idle;
++	/* Restore DATA from the boot snapshot before every start, the first included. */
++	bool restore_data_first;
+ 
+ 	size_t extra0_size;
+ 	/* Register sequence and boot/hello configuration have been qualified. */
+@@ -400,6 +425,10 @@ extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112;
+ u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
+ void ave_fw_trial_snapshot(struct ave_dev *ave);
+ int ave_fw_probe(struct ave_dev *ave);
++int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
++		       u64 data_iova, u32 *crc);
++int ave_fw_text_boot_crc(const void *text, size_t size, u32 word_off,
++			 u32 *crc);
+ void ave_fw_remove(struct ave_dev *ave);
+ int ave_fw_ensure_running(struct ave_dev *ave);
+ void ave_fw_halt(struct ave_dev *ave);
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+index f8d0d2efab..337bc48fe1 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -1913,6 +1913,7 @@ static int brcmf_pcie_reset(struct device *dev)
+ 		return -EBUSY;
+ 
+ 	WRITE_ONCE(devinfo->setup_complete, false);
++	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
+ 	brcmf_pcie_intr_disable(devinfo);
+ 	if (devinfo->irq_allocated)
+ 		synchronize_irq(devinfo->pdev->irq);
+diff --git a/drivers/phy/apple/atc.c b/drivers/phy/apple/atc.c
+index 3c71663a68..6a4f8493df 100644
+--- a/drivers/phy/apple/atc.c
++++ b/drivers/phy/apple/atc.c
+@@ -884,6 +884,8 @@ struct apple_atcphy {
+ 	struct atcphy_cio_sleep cio_sleep;
+ 	unsigned int usb3_refusals;
+ 	int usb3_refusal;
++	/* T8132: the board wires this port for DisplayPort alt mode */
++	bool t8132_dp_alt;
+ 	struct {
+ 		void __iomem *regs;
+ 		struct resource *resource;
+@@ -1290,14 +1292,16 @@ static u32 atcphy_t8132_crossbar(const struct atcphy_mode_configuration *cfg)
+  * DP PHY (the ADT's atcN-dpphy, not tunnelled) and the same calibration names:
+  * it can with its complete USB3 bundle, which holds the banks the DP sequence
+  * uses, and the AUX calibration the boot loader adds to it
+- * (apple,tunable-usb3-dp). That is DP Alt Mode pin assignments C and E; the
++ * (apple,tunable-usb3-dp), on a port the board wires for DP alt mode
++ * (apple,dp-alt-mode). That is DP Alt Mode pin assignments C and E; the
+  * USB2 beside the lanes keeps running.
+  */
+ static bool atcphy_t8132_dp_lanes(const struct apple_atcphy *atcphy)
+ {
+ 	if (atcphy->dp_only)
+ 		return atcphy->dp_tunables;
+-	return atcphy->t8132_ss && atcphy->ss_tunables && atcphy->tunables.usb3_dp;
++	return atcphy->t8132_dp_alt && atcphy->t8132_ss && atcphy->ss_tunables &&
++	       atcphy->tunables.usb3_dp;
+ }
+ 
+ /* Readback only; callers hold the PHY mutex and keep the fixed host live. */
+@@ -4068,10 +4072,10 @@ static int atcphy_configure_t8132(struct apple_atcphy *atcphy, enum atcphy_mode
+ 		return -EOPNOTSUPP;
+ 	if (cio && !atcphy->cio_tunables)
+ 		return -EOPNOTSUPP;
+-	if ((mode == APPLE_ATCPHY_MODE_USB3 || mode == APPLE_ATCPHY_MODE_USB3_DP || dp_only) &&
++	if ((mode == APPLE_ATCPHY_MODE_USB3 || mode == APPLE_ATCPHY_MODE_USB3_DP) &&
+ 	    !atcphy->ss_tunables)
+ 		return -EOPNOTSUPP;
+-	if ((mode == APPLE_ATCPHY_MODE_USB3_DP || dp_only) && !atcphy->tunables.usb3_dp)
++	if (mode == APPLE_ATCPHY_MODE_USB3_DP && !atcphy->tunables.usb3_dp)
+ 		return -ENODEV;
+ 	if (atcphy->t8132_failed)
+ 		return -EIO;
+@@ -4092,10 +4096,9 @@ static int atcphy_configure_t8132(struct apple_atcphy *atcphy, enum atcphy_mode
+ 	atcphy_dp_stop_t8122(atcphy);
+ 	if (atcphy->t8132_common_owned) {
+ 		/* DisplayPort ran no USB PIPE: no BIST step, as after CIO. */
+-		if (atcphy->mode == APPLE_ATCPHY_MODE_DP) {
+-			atcphy_dp_stop_t8122(atcphy);
++		if (atcphy->mode == APPLE_ATCPHY_MODE_DP)
+ 			ret = atcphy_t8132_phy_stop(atcphy);
+-		} else if (atcphy->mode == APPLE_ATCPHY_MODE_USB3_DP)
++		else if (atcphy->mode == APPLE_ATCPHY_MODE_USB3_DP)
+ 			ret = atcphy_t8132_full_stop(atcphy);
+ 		else if (atcphy_mode_is_cio(atcphy->mode))
+ 			ret = atcphy_t8132_phy_stop(atcphy);
+@@ -4229,7 +4232,7 @@ static int atcphy_configure_t8132(struct apple_atcphy *atcphy, enum atcphy_mode
+ 			goto failed;
+ 	}
+ 	/* AUX comes up after RCAL; the DCP's link rate starts the main link. */
+-	if ((mode == APPLE_ATCPHY_MODE_USB3_DP || dp_only) && atcphy_t8132_dp_on(atcphy)) {
++	if (mode == APPLE_ATCPHY_MODE_USB3_DP && atcphy_t8132_dp_on(atcphy)) {
+ 		atcphy->mode = mode;
+ 		atcphy_dp_aux_on_t8122(atcphy);
+ 	}
+@@ -4909,6 +4912,14 @@ static int atcphy_dpphy_set_mode_t8132(struct apple_atcphy *atcphy, enum phy_mod
+ 	if ((mode == PHY_MODE_DP || mode == PHY_MODE_INVALID) &&
+ 	    atcphy->mode == APPLE_ATCPHY_MODE_USB3_DP && atcphy_t8132_dp_alt_d(atcphy))
+ 		return 0;
++	/*
++	 * DP alt mode. The submode is the DCP index; on an ATC the display
++	 * crossbar selects the DCP, so any submode is fine. The DCP's ACTIVATE
++	 * is answered only once this succeeds.
++	 */
++	if ((mode == PHY_MODE_DP || mode == PHY_MODE_INVALID) && atcphy_t8132_dp_on(atcphy) &&
++	    (atcphy->mode == APPLE_ATCPHY_MODE_DP || atcphy->mode == APPLE_ATCPHY_MODE_USB3_DP))
++		return 0;
+ 	return -EOPNOTSUPP;
+ }
+ 
+@@ -4981,13 +4992,39 @@ static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opt
+ 	enum atcphy_dp_link_rate link_rate;
+ 
+ 	/*
+-	 * A tunnel sets its rate through its own call. Four DP lanes, on the
+-	 * DisplayPort-only PHY or a Type-C port's in DP Alt Mode, run their
+-	 * link as on T8122.
++	 * T8132: the DisplayPort-only PHY runs its link as on T8122. In DP alt
++	 * mode the link rate runs the T8122 main link sequence. The lanes keep
++	 * their start drive level: these PHYs have no dp-training-table to map a
++	 * drive request to. Without DP alt mode a tunnel sets its rate through
++	 * its own call.
+ 	 */
+-	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
+-		return atcphy_t8132_dp_lanes(atcphy) ?
+-			atcphy_dpphy_configure_t8122(atcphy, opts) : -EOPNOTSUPP;
++	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132) {
++		if (atcphy->dp_only)
++			return atcphy->dp_tunables ?
++				atcphy_dpphy_configure_t8122(atcphy, opts) : -EOPNOTSUPP;
++		if (!atcphy_t8132_dp_lanes(atcphy))
++			return -EOPNOTSUPP;
++		if (opts->set_voltages && !opts->set_rate) {
++			dev_dbg(atcphy->dev, "DP drive request ignored (lane 0 swing %u pre %u)\n",
++				opts->voltage[0], opts->pre[0]);
++			return 0;
++		}
++		if (opts->set_rate) {
++			int ret;
++
++			guard(mutex)(&atcphy->lock);
++			if (atcphy->mode != APPLE_ATCPHY_MODE_DP &&
++			    atcphy->mode != APPLE_ATCPHY_MODE_USB3_DP)
++				return -EOPNOTSUPP;
++			atcphy_restore_after_pd_off(atcphy);
++			ret = atcphy_dp_set_rate_t8122(atcphy, opts->link_rate);
++			if (ret)
++				dev_err(atcphy->dev, "DP link rate %u failed: %d\n",
++					opts->link_rate, ret);
++			return ret;
++		}
++		return opts->set_lanes ? -EINVAL : 0;
++	}
+ 	if (atcphy->hw->has_t8140_dp)
+ 		return j700_dp_configure(atcphy, opts);
+ 
+diff --git a/drivers/soc/apple/mailbox.c b/drivers/soc/apple/mailbox.c
+index 999c6ba3ef..b73e7da0b2 100644
+--- a/drivers/soc/apple/mailbox.c
++++ b/drivers/soc/apple/mailbox.c
+@@ -663,6 +663,65 @@ static struct apple_mbox_msg apple_mbox_read_msg(struct apple_mbox *mbox)
+ 	return msg;
+ }
+ 
++static int apple_mbox_poll_locked(struct apple_mbox *mbox);
++
++/*
++ * Fast receive tick for rx_poll_only mailboxes (T6050): the same receive
++ * step apple_mbox_v8_rx_poll_work() runs, under the same rx_lock, with
++ * apple_mbox_poll_locked() doing the same PSD and removal checks. The v8
++ * storm guard does not apply: it guards the recv-not-empty IRQ line, which
++ * rx_poll_only hardware never enables. Runs in hardirq context.
++ */
++static enum hrtimer_restart apple_mbox_fast_rx_poll(struct hrtimer *timer)
++{
++	struct apple_mbox_priv *priv = container_of(timer, struct apple_mbox_priv,
++						    rx_fast_timer);
++	struct apple_mbox *mbox = &priv->mbox;
++	unsigned long flags;
++	ktime_t now;
++	int consumed = 0;
++
++	if (!READ_ONCE(mbox->active) || READ_ONCE(mbox->removing))
++		return HRTIMER_NORESTART;
++
++	spin_lock_irqsave(&mbox->rx_lock, flags);
++	if (likely(!READ_ONCE(mbox->removing)))
++		consumed = apple_mbox_poll_locked(mbox);
++	spin_unlock_irqrestore(&mbox->rx_lock, flags);
++
++	now = ktime_get();
++	if (consumed > 0) {
++		/* Traffic arrived: keep polling as if a send just happened. */
++		WRITE_ONCE(priv->rx_fast_until,
++			   ktime_add_us(now, APPLE_MBOX_RX_FAST_GRACE_US));
++	} else if (!ktime_before(now, READ_ONCE(priv->rx_fast_until))) {
++		return HRTIMER_NORESTART;
++	}
++
++	hrtimer_forward_now(timer, us_to_ktime(APPLE_MBOX_RX_FAST_POLL_US));
++	return HRTIMER_RESTART;
++}
++
++/*
++ * tx_lock held. Lock-free on purpose: apple_mbox_poll_locked() invokes the
++ * rx callback with rx_lock held, and a callback that sends would then take
++ * tx_lock under rx_lock. Kick never touches rx_lock, so no ordering exists
++ * to invert. A kick that loses a race with the timer's final no-restart
++ * decision leaves the fast poller disarmed once; the next jiffy poll or
++ * send recovers it.
++ */
++static void apple_mbox_fast_rx_kick(struct apple_mbox_priv *priv)
++{
++	WRITE_ONCE(priv->rx_fast_until,
++		   ktime_add_us(ktime_get(), APPLE_MBOX_RX_FAST_GRACE_US));
++	/* Publish the deadline before deciding to arm. */
++	smp_mb();
++	if (!hrtimer_active(&priv->rx_fast_timer))
++		hrtimer_start(&priv->rx_fast_timer,
++			      us_to_ktime(APPLE_MBOX_RX_FAST_POLL_US),
++			      HRTIMER_MODE_REL);
++}
++
+ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
+ 		    bool atomic)
+ {
+diff --git a/sound/soc/apple/macaudio.c b/sound/soc/apple/macaudio.c
+index c8ba0c090d..4f9c8eeaab 100644
+--- a/sound/soc/apple/macaudio.c
++++ b/sound/soc/apple/macaudio.c
+@@ -4185,12 +4185,11 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
+ };
+ 
+ /*
+- * J614s: the same amps and frame as the J616s, but its speakers have not
+- * been brought up and have no protection profile. Keep them off entirely
+- * until they get their own bring-up: the speaker link is not bound, so no
+- * stream ever reaches the amps. (The J604, T8132 MacBook Pro 14" M4, has
+- * the same amps and frame and has been brought up: it takes the J616s
+- * configuration, under speakersafetyd.)
++ * J614s: the same amps and frame as the J616s. Its speakers are bound like
++ * the J616s's; playback still waits for a protection lease (see
++ * macaudio_spk_admitted()), which speakerguardd v2 takes only once it has
++ * compiled and self-checked this Mac's own tuning (AID34). The legacy
++ * protection has no J614 profile, so without v2 the amps stay at the floor.
+  */
+ struct macaudio_platform_cfg macaudio_j614_cfg = {
+ 	.enable_speakers = true,
+diff --git a/tools/asahi/atc-usb3-tests.py b/tools/asahi/atc-usb3-tests.py
+index 307af85ab7..6d92c105c4 100644
+--- a/tools/asahi/atc-usb3-tests.py
++++ b/tools/asahi/atc-usb3-tests.py
+@@ -99,7 +99,7 @@ struct apple_atcphy {
+     bool pipe_pending, t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround, mode_dirty, usb_off_pending;
+     bool host_active, usb3_port_off, dp_only, ss_tunables, fixed_usb2, t8140_dp_tunables, dp_tunables;
+     /* T8132 ownership is tested without entering its lane-setup backend. */
+-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
++    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+     struct { void *usb3_dp; } tunables;
+ };
+ struct phy { struct apple_atcphy *data; };
+@@ -715,6 +715,7 @@ def harness(source):
+     scope_c = "static const enum atcphy_generation scope_generations[] = {" + ",".join(r["generation"] for r in scope) + "};\n"
+     # The PIPE backend of a mode, which T8132 CIO keeps on the dummy one.
+     helpers = [block(source, "static bool atcphy_mode_is_cio("),
++               block(source, "static bool atcphy_t8132_dp_on("),
+                block(source, "static enum atcphy_pipehandler_state\natcphy_pipe_state_for(")]
+     functions = "\n".join(helpers + [block(source, "static " + kind + " " + name + "(")
+                                       for kind, name in function_specs])
+diff --git a/tools/asahi/brcmf-suspend-tests.py b/tools/asahi/brcmf-suspend-tests.py
+index b4922da2a7..41957747d2 100644
+--- a/tools/asahi/brcmf-suspend-tests.py
++++ b/tools/asahi/brcmf-suspend-tests.py
+@@ -64,7 +64,7 @@ struct brcmf_if { struct brcmf_cfg80211_vif *vif; struct brcmf_pub *drvr; struct
+ struct device { void *data; };
+ struct pci_dev { struct device dev; int irq; bool state_saved; };
+ struct brcmf_pciedev_info { bool mbdata_completed, intr, ready, timer, sleep_reset_blocked, setup_complete;
+- bool wowl_irq, wowl_enabled, irq_wake_enabled, wowl_sleeping;
++ bool wowl_irq, wowl_enabled, irq_wake_enabled, wowl_sleeping, fwseed, s2idle_d0;
+  int state, mbdata_resp_wait; void *ci; struct pci_dev *pdev;
+  struct { int intmask, mailboxmask; } *reginfo; };
+ struct pcie_priv { struct brcmf_pciedev_info *devinfo; };
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c b/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c
+index 58e51b03af..5db71a2f04 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/dwc3/mocks.c
+@@ -3,7 +3,7 @@
+ #define of_device_is_compatible(...) false
+ struct apple_atcphy {
+     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
+-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
++    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+ 	/* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
+ 	struct {
+ 		bool prepared;
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/phy.py b/tools/testing/selftests/drivers/gpu/apple-dcp/phy.py
+index 06e1f280e3..7998abe4b8 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/phy.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/phy.py
+@@ -34,7 +34,7 @@ def parking(root):
+     parts.append(r'''
+ struct apple_atcphy {
+     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
+-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
++    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
+     struct { bool prepared; } cio_sleep;
+     struct { void *usb3_dp; } tunables;
+@@ -1930,7 +1930,7 @@ def pipe(root):
+     parts.append(r'''
+ struct apple_atcphy {
+     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
+-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
++    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
+     struct { bool prepared; } cio_sleep;
+     struct { void *usb3_dp; } tunables;
+@@ -2330,7 +2330,7 @@ def unwind(root):
+     parts.append(r'''
+ struct apple_atcphy {
+     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
+-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
++    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
+     struct { bool prepared; } cio_sleep;
+     struct { void *usb3_dp; } tunables;
+@@ -2652,7 +2652,7 @@ typedef uint32_t u32;
+ #define BIT(n) (1U << (n))
+ struct apple_atcphy {
+     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
+-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
++    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+     /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
+     struct { bool prepared; } cio_sleep;
+     struct { void *usb3_dp; } tunables;
+diff --git a/tools/testing/selftests/drivers/gpu/apple-dcp/quiesce.py b/tools/testing/selftests/drivers/gpu/apple-dcp/quiesce.py
+index c0e0f9a773..60fa2ab90d 100644
+--- a/tools/testing/selftests/drivers/gpu/apple-dcp/quiesce.py
++++ b/tools/testing/selftests/drivers/gpu/apple-dcp/quiesce.py
+@@ -149,7 +149,7 @@ struct apple_atcphy {
+  void *dev; int lock;
+  const struct atcphy_hw *hw;
+  struct { void *usb2phy; } regs;
+- bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables,cio_tunables;
++ bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables,cio_tunables,t8132_dp_alt;
+  bool usb3_port_off,park_owed,dp_only,pd_was_off,t8132_ss;
+  bool t8103_dummy_pending,t8103_usb3_retry,t8103_usb3_workaround;
+  enum atcphy_mode mode,typec_mode;
+-- 
+2.43.0
+

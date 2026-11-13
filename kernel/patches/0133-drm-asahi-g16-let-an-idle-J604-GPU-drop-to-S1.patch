@@ -1,0 +1,234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 00:23:19 +0000
+Subject: [PATCH] drm/asahi: g16: let an idle J604 GPU drop to S1
+
+The firmware runs at the published performance state, busy or not, and
+the governor's floor is S3, so an idle GPU sits at S3. On the J604 that
+is most of the idle GPU rail: 0.336 W at S3, 0.226 W at S2 and 0.034 W
+at S1 (idle desktop, 20 s per state). S1 as a plain floor costs frame
+pacing under load, though: a full-window animation had about 20 more
+frames over 20 ms per 12 s than at S3, at the same frame rate.
+
+So keep S3 as the floor while work runs and go below it only after
+IDLE_WINDOWS (five 20 ms windows) without any work; the first
+publication after that raises the state back to S3 at once instead of a
+window later. asahi.g16_idle_floor now names that idle floor, 0 meaning
+the board's default: S1 on the J604, S3 elsewhere, where nothing changes.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit 156380ff0cdda25135fa2e30372864b35052583c)
+---
+ drivers/gpu/drm/asahi/g16/params.rs       | 41 ++++++++++++----
+ drivers/gpu/drm/asahi/g16/power.rs        |  3 ++
+ drivers/gpu/drm/asahi/g16/power/policy.rs | 57 +++++++++++++++++++----
+ 3 files changed, 83 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index c6b52da980..0aee9a9d57 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -200,20 +200,41 @@ pub(crate) fn idle_power_off() -> u32 {
+ #[used(compiler)]
+ static IDLE_POWER_OFF_PARM: [u8; BUILTIN_PARM.len()] = modinfo(BUILTIN_PARM);
+ 
+-/// Storage of `asahi.g16_idle_floor`, always in 1..=[`PSTATE_MAX`].
+-static IDLE_FLOOR: AtomicU32 = AtomicU32::new(FLOOR);
++/// Storage of `asahi.g16_idle_floor`: 0 (the board's default, see [`set_board_floor`]) or a
++/// state in 1..=[`PSTATE_MAX`].
++static IDLE_FLOOR: AtomicU32 = AtomicU32::new(0);
++
++/// The board's default floor: [`FLOOR`] (S3, from J713 measurements) unless the probe set
++/// another one.
++static BOARD_FLOOR: AtomicU32 = AtomicU32::new(FLOOR);
++
++/// J604 idle floor: S1. Measured on the J604 (idle desktop, 20 s per state), the idle GPU rail
++/// reads 0.336 W at S3, 0.226 W at S2 and 0.034 W at S1. As a plain floor S1 also cost frame
++/// pacing under a full-window animation (more frames over 20 ms than at S3), so the governor
++/// only goes below S3 after a stretch without any work (`policy::IDLE_WINDOWS`) and comes back
++/// to S3 with the first publication.
++pub(crate) const J604_FLOOR: u32 = 1;
++
++/// Sets the board's default floor (at probe, before the governor runs).
++pub(crate) fn set_board_floor(floor: u32) {
++    BOARD_FLOOR.store(floor.clamp(1, PSTATE_MAX), Ordering::Relaxed);
++}
+ 
+ /// Lowest performance state the utilization governor publishes, idle or lightly loaded.
+ ///
+ /// The firmware runs at the published state, busy or not, so this is the state an idle GPU
+-/// sits in. The default, [`FLOOR`] (S3), comes from J713 measurements; on the J604 the idle
+-/// GPU rail has not been measured per state yet. Writable by root at run time; the governor
+-/// takes a new value at its next window, and an idle engine is polled down to it.
++/// sits in. Unless set, it is the board's default ([`set_board_floor`]). Writable by root at
++/// run time; the governor takes a new value at its next window, and an idle engine is polled
++/// down to it. Writing 0 goes back to the board's default.
+ pub(crate) fn idle_floor() -> u32 {
+-    IDLE_FLOOR.load(Ordering::Relaxed).clamp(1, PSTATE_MAX)
++    match IDLE_FLOOR.load(Ordering::Relaxed) {
++        0 => BOARD_FLOOR.load(Ordering::Relaxed).clamp(1, PSTATE_MAX),
++        floor => floor.clamp(1, PSTATE_MAX),
++    }
+ }
+ 
+-/// `set` of `asahi.g16_idle_floor`: a decimal state, clamped to 1..=[`PSTATE_MAX`].
++/// `set` of `asahi.g16_idle_floor`: 0 for the board's default, else a decimal state clamped to
++/// 1..=[`PSTATE_MAX`].
+ ///
+ /// # Safety
+ ///
+@@ -232,7 +253,7 @@ pub(crate) fn idle_floor() -> u32 {
+     let Ok(state) = text.trim().parse::<u32>() else {
+         return EINVAL.to_errno();
+     };
+-    IDLE_FLOOR.store(state.clamp(1, PSTATE_MAX), Ordering::Relaxed);
++    IDLE_FLOOR.store(state.min(PSTATE_MAX), Ordering::Relaxed);
+     0
+ }
+ 
+@@ -287,11 +308,11 @@ pub(crate) fn idle_floor() -> u32 {
+ #[cfg(MODULE)]
+ const FLOOR_PARMTYPE: &[u8] = b"parmtype=g16_idle_floor:u32\0";
+ #[cfg(MODULE)]
+-const FLOOR_PARM: &[u8] = b"parm=g16_idle_floor:G16: lowest governed performance state, 1-9 (default 3; runtime 0644)\0";
++const FLOOR_PARM: &[u8] = b"parm=g16_idle_floor:G16: lowest governed performance state, 1-9; 0 = board default (J604 1, others 3); runtime 0644\0";
+ #[cfg(not(MODULE))]
+ const FLOOR_PARMTYPE: &[u8] = b"asahi.parmtype=g16_idle_floor:u32\0";
+ #[cfg(not(MODULE))]
+-const FLOOR_PARM: &[u8] = b"asahi.parm=g16_idle_floor:G16: lowest governed performance state, 1-9 (default 3; runtime 0644)\0";
++const FLOOR_PARM: &[u8] = b"asahi.parm=g16_idle_floor:G16: lowest governed performance state, 1-9; 0 = board default (J604 1, others 3); runtime 0644\0";
+ 
+ #[link_section = ".modinfo"]
+ #[used(compiler)]
+diff --git a/drivers/gpu/drm/asahi/g16/power.rs b/drivers/gpu/drm/asahi/g16/power.rs
+index e40692ccf0..fa9eeb7062 100644
+--- a/drivers/gpu/drm/asahi/g16/power.rs
++++ b/drivers/gpu/drm/asahi/g16/power.rs
+@@ -185,6 +185,9 @@ impl Power {
+     /// The Main image initializes all nine active states. Initdata publishes
+     /// startup S1 before INIT; this object starts with that same effective state.
+     pub(crate) fn new(dev: &device::Device) -> Result<Self> {
++        if super::boot::glue::j604_board() {
++            params::set_board_floor(params::J604_FLOOR);
++        }
+         Ok(Self {
+             // First: a CLPC that has not probed yet defers before the PMP vote.
+             clpc: Demand::new(dev)?,
+diff --git a/drivers/gpu/drm/asahi/g16/power/policy.rs b/drivers/gpu/drm/asahi/g16/power/policy.rs
+index d7f18479d3..95be1be6e5 100644
+--- a/drivers/gpu/drm/asahi/g16/power/policy.rs
++++ b/drivers/gpu/drm/asahi/g16/power/policy.rs
+@@ -14,6 +14,8 @@
+ /// Lowest governed state. On the J713 S1-S3 draw under 0.1 W for a desktop
+ /// load and S4 several times that; S3 runs at 2.4 times the clock of S1.
+ pub(crate) const FLOOR: u32 = 3;
++/// Windows without any work before the governor goes below [`FLOOR`] to its idle floor (100 ms).
++pub(crate) const IDLE_WINDOWS: u32 = 5;
+ 
+ /// Completion polling must not turn into a PMP MMIO read on every pass.
+ pub(crate) fn read_due(last: Option<u64>, now: u64) -> bool {
+@@ -84,8 +86,10 @@ pub(crate) struct Governor {
+     window_ns: u64,
+     busy_since: Option<u64>,
+     busy_ns: u64,
+-    /// The lowest state to request (`asahi.g16_idle_floor`).
++    /// The lowest state to request once idle (`asahi.g16_idle_floor`).
+     floor: u32,
++    /// Consecutive windows that saw no work.
++    idle_windows: u32,
+ }
+ 
+ impl Governor {
+@@ -97,10 +101,17 @@ pub(crate) const fn new() -> Self {
+             busy_since: None,
+             busy_ns: 0,
+             floor: FLOOR,
++            idle_windows: 0,
+         }
+     }
+ 
+-    /// Sets the lowest state to request, clamped to 1..=[`PSTATE_MAX`].
++    /// The lowest state while work runs or ran within [`IDLE_WINDOWS`] windows: [`FLOOR`], or
++    /// the idle floor if that is set higher.
++    fn active_floor(&self) -> u32 {
++        FLOOR.max(self.floor)
++    }
++
++    /// Sets the lowest state to request once idle, clamped to 1..=[`PSTATE_MAX`].
+     pub(crate) fn set_floor(&mut self, floor: u32) {
+         self.floor = floor.clamp(1, PSTATE_MAX);
+     }
+@@ -129,6 +140,10 @@ pub(crate) fn govern(&mut self, now: u64, limit: u32, busy: bool) -> u32 {
+         // Recovery can drop flights without a drain.
+         if !busy {
+             self.idle(now);
++        } else if self.demand < self.active_floor() {
++            // Work after an idle stretch: back to the active floor at once, not a window later.
++            self.demand = self.active_floor();
++            self.idle_windows = 0;
+         }
+         let window = now.wrapping_sub(self.window_ns);
+         if window >= WINDOW_NS {
+@@ -138,7 +153,17 @@ pub(crate) fn govern(&mut self, now: u64, limit: u32, busy: bool) -> u32 {
+             }
+             let util = utilization(self.busy_ns, window);
+             self.average = smooth(self.average, util, window);
+-            self.demand = demand_floor(self.demand.min(limit), util, self.average, self.floor);
++            if self.busy_ns == 0 && self.busy_since.is_none() {
++                self.idle_windows = self.idle_windows.saturating_add(1);
++            } else {
++                self.idle_windows = 0;
++            }
++            let floor = if self.idle_windows >= IDLE_WINDOWS {
++                self.floor
++            } else {
++                self.active_floor()
++            };
++            self.demand = demand_floor(self.demand.min(limit), util, self.average, floor);
+             self.window_ns = now;
+             self.busy_ns = 0;
+         }
+@@ -157,18 +182,34 @@ fn a_lower_idle_floor_is_reached_and_kept_in_range() {
+         assert_eq!(demand_floor(1, 100, 0, 1), PSTATE_MAX);
+         assert_eq!(demand_floor(5, 0, 0, 0), 1);
+         assert_eq!(demand_floor(5, 0, 0, 42), PSTATE_MAX);
++    }
++
++    #[test]
++    fn the_idle_floor_waits_for_an_idle_stretch_and_work_lifts_it_at_once() {
+         let mut g = Governor::new();
+         g.set_floor(1);
+         let w = WINDOW_NS;
+         let mut now = 1_000_000_000;
+-        for _ in 0..8 {
++        // Fewer than IDLE_WINDOWS idle windows: still at the active floor.
++        for _ in 0..(IDLE_WINDOWS - 1) {
+             now += w;
+-            g.govern(now, PSTATE_MAX, false);
++            assert_eq!(g.govern(now, PSTATE_MAX, false), FLOOR);
+         }
+-        assert_eq!(g.govern(now + w, PSTATE_MAX, false), 1);
++        assert!(g.decaying());
++        now += w;
++        assert_eq!(g.govern(now, PSTATE_MAX, false), 1);
+         assert!(!g.decaying());
+-        g.set_floor(3);
+-        assert_eq!(g.govern(now + 2 * w, PSTATE_MAX, false), 3);
++        // Work arrives: the active floor at once, before any window closes.
++        g.busy(now + 1);
++        assert_eq!(g.govern(now + 2, PSTATE_MAX, true), FLOOR);
++        // A busy window resets the idle stretch.
++        g.idle(now + w / 2);
++        now += w;
++        assert!(g.govern(now, PSTATE_MAX, false) >= FLOOR);
++        // An idle floor set at or above FLOOR behaves as a plain floor.
++        g.set_floor(4);
++        now += w;
++        assert!(g.govern(now, PSTATE_MAX, false) >= 4);
+     }
+ 
+     #[test]
+-- 
+2.43.0
+

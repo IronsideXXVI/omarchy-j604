@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 10 Nov 2026 05:26:11 +0000
+Subject: [PATCH] media: apple: ave: code a visible picture inside a
+ larger buffer
+
+Buffers that GPUs and decoders hand out are often rounded up: the M4
+MacBook Pro's 3024x1964 screen arrives in a 3072x1968 buffer from the
+VA-API surface allocator. The encoder only knew the buffer size, so it
+coded the padding too (a 3072x1968 recording with garbage edges).
+
+Implement the OUTPUT crop selection: the visible picture is the top
+left crop of the buffer. The encoder codes that size and signals the
+crop in the parameter sets, as it already does for heights that are not
+a multiple of 16, and finds the chroma plane after the buffer's luma
+lines rather than the visible ones. S_FMT(OUTPUT) resets the crop to
+the whole buffer, so existing clients are unaffected.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit 985d712944e5d6b8d04f4c3299d52f790ec5ab7e)
+---
+ drivers/media/platform/apple/ave/ave-sess.c   |  7 ++---
+ drivers/media/platform/apple/ave/ave-v4l2.c   | 27 ++++++++++++++++---
+ drivers/media/platform/apple/ave/ave-writer.c |  5 +++-
+ drivers/media/platform/apple/ave/ave.h        |  3 +++
+ 4 files changed, 35 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/media/platform/apple/ave/ave-sess.c b/drivers/media/platform/apple/ave/ave-sess.c
+index eaba6791ad..b0edfff468 100644
+--- a/drivers/media/platform/apple/ave/ave-sess.c
++++ b/drivers/media/platform/apple/ave/ave-sess.c
+@@ -130,8 +130,9 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
+ 	int level;
+ 
+ 	p->codec = ave_ctx_codec(ctx);
+-	p->width = ctx->src_fmt.width;
+-	p->height = ctx->src_fmt.height;
++	p->width = ctx->crop_w ?: ctx->src_fmt.width;
++	p->height = ctx->crop_h ?: ctx->src_fmt.height;
++	p->rows = ctx->src_fmt.height;
+ 	p->cw = ALIGN(p->width, 16);
+ 	p->ch = ALIGN(p->height, 16);
+ 	p->stride = ctx->src_fmt.plane_fmt[0].bytesperline;
+@@ -768,7 +769,7 @@ int ave_sess_input(struct ave_ctx *ctx, unsigned int slot, struct vb2_v4l2_buffe
+ 	struct vb2_buffer *vb = &src->vb2_buf;
+ 	u32 off = vb->planes[0].data_offset;
+ 	u32 used = vb2_get_plane_payload(vb, 0) - min(off, vb2_get_plane_payload(vb, 0));
+-	u32 crows = DIV_ROUND_UP(p->height, 2), rows = p->height + crows;
++	u32 crows = DIV_ROUND_UP(p->rows, 2), rows = p->rows + crows;
+ 	u32 width = ALIGN(p->width, 2) * p->sample_bytes, stride;
+ 	struct ave_buf *b = &sess->slot[slot].bounce;
+ 	const u8 *from;
+diff --git a/drivers/media/platform/apple/ave/ave-v4l2.c b/drivers/media/platform/apple/ave/ave-v4l2.c
+index f6ef087a8f..60a64367e4 100644
+--- a/drivers/media/platform/apple/ave/ave-v4l2.c
++++ b/drivers/media/platform/apple/ave/ave-v4l2.c
+@@ -270,8 +270,10 @@ static int ave_s_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
+ 	if (ret)
+ 		return ret;
+ 	ctx->src_fmt = *pix;
++	ctx->crop_w = 0;
++	ctx->crop_h = 0;
+ 
+-	/* The coded size follows the raw size (crop is the whole frame). */
++	/* The coded size follows the raw size until a crop is set. */
+ 	ctx->dst_fmt.width = pix->width;
+ 	ctx->dst_fmt.height = pix->height;
+ 	ctx->dst_fmt.colorspace = pix->colorspace;
+@@ -290,6 +292,9 @@ static int ave_g_selection(struct file *file, void *priv, struct v4l2_selection
+ 		return -EINVAL;
+ 	switch (s->target) {
+ 	case V4L2_SEL_TGT_CROP:
++		s->r = (struct v4l2_rect){ 0, 0, ctx->crop_w ?: ctx->src_fmt.width,
++					   ctx->crop_h ?: ctx->src_fmt.height };
++		return 0;
+ 	case V4L2_SEL_TGT_CROP_DEFAULT:
+ 	case V4L2_SEL_TGT_CROP_BOUNDS:
+ 		s->r = (struct v4l2_rect){ 0, 0, ctx->src_fmt.width, ctx->src_fmt.height };
+@@ -299,14 +304,30 @@ static int ave_g_selection(struct file *file, void *priv, struct v4l2_selection
+ 	}
+ }
+ 
++/*
++ * The visible picture may be smaller than the OUTPUT buffer, as with
++ * buffers whose size is rounded up for a GPU or decoder (a 3024x1964
++ * screen in a 3072x1968 buffer). The encoder codes the top left part and
++ * signals the crop in the parameter sets; other origins are not offered.
++ */
+ static int ave_s_selection(struct file *file, void *priv, struct v4l2_selection *s)
+ {
+ 	struct ave_ctx *ctx = ave_file_to_ctx(file);
++	struct vb2_queue *vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
++	u32 w, h;
+ 
+ 	if (s->type != V4L2_BUF_TYPE_VIDEO_OUTPUT || s->target != V4L2_SEL_TGT_CROP)
+ 		return -EINVAL;
+-	/* Only full-frame encoding for now. */
+-	s->r = (struct v4l2_rect){ 0, 0, ctx->src_fmt.width, ctx->src_fmt.height };
++	if (vb2_is_streaming(vq))
++		return -EBUSY;
++	w = clamp_t(u32, ALIGN(s->r.width, 2), AVE_MIN_W, ctx->src_fmt.width);
++	h = clamp_t(u32, ALIGN(s->r.height, 2), AVE_MIN_H, ctx->src_fmt.height);
++	ctx->crop_w = w;
++	ctx->crop_h = h;
++	ctx->dst_fmt.width = w;
++	ctx->dst_fmt.height = h;
++	ave_fill_coded(&ctx->dst_fmt);
++	s->r = (struct v4l2_rect){ 0, 0, w, h };
+ 	return 0;
+ }
+ 
+diff --git a/drivers/media/platform/apple/ave/ave-writer.c b/drivers/media/platform/apple/ave/ave-writer.c
+index 4e99050738..8699f78c6f 100644
+--- a/drivers/media/platform/apple/ave/ave-writer.c
++++ b/drivers/media/platform/apple/ave/ave-writer.c
+@@ -1213,7 +1213,10 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
+ 	}
+ 	ave_write_header(ctx, cmd, AVE_OP_PROCESS, fw->process_subtype + slot,
+ 			 0, ave_session_arg2(ctx));
+-	/* Input picture: NV12, chroma right after p->height luma lines. */
++	/*
++	 * Input picture: NV12, chroma right after the buffer's luma lines
++	 * (p->rows); the visible picture is its top left p->width x p->height.
++	 */
+ 	ave_put64(cmd, l->y, y);
+ 	ave_put32(cmd, l->y + 8,
+ 		  fw->kind == AVE_LAYOUT_6070 ? p->stride : p->stride * p->height);
+diff --git a/drivers/media/platform/apple/ave/ave.h b/drivers/media/platform/apple/ave/ave.h
+index 8307df504b..cc67d60f8b 100644
+--- a/drivers/media/platform/apple/ave/ave.h
++++ b/drivers/media/platform/apple/ave/ave.h
+@@ -365,6 +365,7 @@ struct ave_params {
+ 	u32 width, height; /* visible picture */
+ 	u32 cw, ch; /* coded size, multiples of 16 */
+ 	u32 stride; /* NV12 or P010 line stride in bytes, both planes */
++	u32 rows; /* luma lines in the input buffer; chroma follows them */
+ 	u32 sample_bytes; /* 1 for NV12, 2 for P010 */
+ 	u32 mbs; /* 16x16 macroblocks */
+ 	u32 fps_num, fps_den; /* frames per second = num / den */
+@@ -496,6 +497,8 @@ struct ave_ctx {
+ 	struct v4l2_ctrl_handler hdl;
+ 	struct v4l2_pix_format_mplane src_fmt;
+ 	struct v4l2_pix_format_mplane dst_fmt;
++	/* Visible picture inside the OUTPUT buffer, at its top left corner. */
++	u32 crop_w, crop_h;
+ 	struct v4l2_fract timeperframe;
+ 	struct work_struct run_work;
+ 	struct delayed_work poll_work;
+-- 
+2.43.0
+

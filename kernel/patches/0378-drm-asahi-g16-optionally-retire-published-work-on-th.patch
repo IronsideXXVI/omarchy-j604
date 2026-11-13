@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 01:15:34 +0000
+Subject: [PATCH] drm/asahi: g16: optionally retire published work on
+ the firmware's event alone
+
+While commands are in flight the G16 poll is woken by the firmware's
+EP 0x20 ring-service event, and is also re-armed every 100 us
+(g16_resnap_us); each event pass ends with up to four 5 us busy-wait
+polls.
+
+Add g16_irq_only (runtime 0644, default 0): at 1, while commands are in
+flight, the completion timer becomes a watchdog (g16_watchdog_us,
+default 2000 us, runtime 0644) and no trailing polls follow an event.
+The short re-poll while a ready prefix waits for record consumption
+stays, as that consumption raises no event.
+
+It is off by default. On the J604 the event alone retires most work: with
+the completion re-poll at 1 ms a light compute command at depth 1 took
+266 us instead of 302 us and light render was within 3 %, but light
+compute at depth 64 took 229 us instead of 200 us, so some compute
+receipts are still found by the re-poll rather than by an event.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 37 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  9 +++++--
+ 2 files changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 5a3d2b20c0..34926061bb 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -474,6 +474,43 @@ macro_rules! live_u32_param {
+     "G16: runtime completion repoll interval, us (default 0 = g16_resnap_us; 10..1000; runtime 0644)"
+ );
+ 
++/// Storage of `g16_irq_only` (runtime 0644, default 0).
++static IRQ_ONLY: AtomicU32 = AtomicU32::new(0);
++
++/// Whether, while commands are in flight, the firmware's EP 0x20 ring-service event is the
++/// wake that retires them: the completion timer then runs only as a watchdog
++/// ([`watchdog_us`]) and no trailing 5 us polls follow an event. 0 restores the 100 us
++/// completion re-poll (`g16_resnap_us`) and the trailing polls.
++pub(crate) fn irq_only() -> bool {
++    IRQ_ONLY.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    IRQ_ONLY_PARAM,
++    IRQ_ONLY_PARMTYPE,
++    IRQ_ONLY_PARM,
++    IRQ_ONLY,
++    "g16_irq_only",
++    "G16: while commands are in flight, retire on the firmware's ring-service event and keep the completion timer as a watchdog only (default 0: 100 us completion re-poll; 1: event only; runtime 0644)"
++);
++
++/// Storage of `g16_watchdog_us` (runtime 0644, default 2000).
++static WATCHDOG_US: AtomicU32 = AtomicU32::new(2000);
++
++/// The completion watchdog while [`irq_only`]: 100..=20000 us.
++pub(crate) fn watchdog_us() -> u32 {
++    WATCHDOG_US.load(Ordering::Relaxed).clamp(100, 20_000)
++}
++
++live_u32_param!(
++    WATCHDOG_PARAM,
++    WATCHDOG_PARMTYPE,
++    WATCHDOG_PARM,
++    WATCHDOG_US,
++    "g16_watchdog_us",
++    "G16: completion watchdog with g16_irq_only, us (default 2000; 100..20000; runtime 0644)"
++);
++
+ /// Storage of `g16_flights` (runtime 0644): 1 publishes one command at a time (the qualified
+ /// protocol, default); 2 lets one render command be published behind a running one.
+ static FLIGHTS: AtomicU32 = AtomicU32::new(1);
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index a5141783fd..708a0f2ef4 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -11,7 +11,8 @@
+ //! and complete the retired jobs ([`super::job::complete_all`]). Wakeups: the EP 0x20 event
+ //! kick, then an hrtimer re-poll every `g16_resnap_us` (100) while anything is published, or
+ //! `g16_repoll_us` (15) while a ready prefix waits for record consumption, with a 1-jiffy
+-//! delayed-work backup.
++//! delayed-work backup. With `g16_irq_only` (off by default) the event alone retires published work:
++//! the re-poll becomes a `g16_watchdog_us` (2000) watchdog and no trailing polls follow.
+ 
+ use core::sync::atomic::Ordering;
+ 
+@@ -179,7 +180,11 @@ fn mod_poll(self: &Arc<Self>, delay: Jiffies) {
+     pub(crate) fn rearm(self: &Arc<Self>, chan_wait: bool) {
+         let mut us = params::resnap_us();
+         if chan_wait && module_parameters::g16_repoll_us.value() != 0 {
++            // Record consumption raises no event: this one stays a short re-poll.
+             us = params::repoll_us();
++        } else if params::irq_only() {
++            // The ring-service event retires the flights; this only catches a lost one.
++            us = params::watchdog_us();
+         }
+         {
+             let mut handle = self.resnap_handle.lock();
+@@ -269,7 +274,7 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+     /// checks.
+     pub(crate) fn retire(&mut self, evented: bool, done: &mut Completions) -> Result {
+         // After an event, a few short trailing polls catch the final receipts.
+-        let mut tail = if evented { 4 } else { 0 };
++        let mut tail = if evented && !params::irq_only() { 4 } else { 0 };
+         let mut ret;
+ 
+         loop {
+-- 
+2.43.0
+

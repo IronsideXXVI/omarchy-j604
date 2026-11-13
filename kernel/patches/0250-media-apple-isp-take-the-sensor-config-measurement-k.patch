@@ -1,0 +1,362 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 01:56:45 +0000
+Subject: [PATCH] media: apple: isp: take the sensor config measurement
+ knobs from debugfs
+
+Two module parameters let a boot measure firmware sensor configs the
+device tree presets do not use: one replaced the first preset with
+another config, crop and output, the other offered one frame rate above
+30. Both were read at probe, so each measurement cost a reboot, and as
+module parameters they looked like a supported interface.
+
+Move both to debugfs, under the device's directory and for root only,
+and read them at stream start like the wide view. stream_config takes
+the same "config,in_w,in_h,crop_x,crop_y,crop_w,crop_h,out_w,out_h"
+with the same checks, and serves the streams of that output size from
+it; an empty write removes it. extra_frame_rate offers one rate of
+31..120 first in the list. The firmware still decides what it delivers.
+One line is logged for every stream an override serves.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/isp/isp-cam.c  |  17 +++
+ drivers/media/platform/apple/isp/isp-drv.c  | 156 +++++++++++++-------
+ drivers/media/platform/apple/isp/isp-drv.h  |   5 +
+ drivers/media/platform/apple/isp/isp-v4l2.c |  45 +++---
+ 4 files changed, 146 insertions(+), 77 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 324e17ec4f..3e5b1b4070 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -628,6 +628,23 @@ static void isp_resolve_stream_preset(struct apple_isp *isp,
+ 	struct isp_preset wide;
+ 	bool use_wide = preset->wide_only;
+ 
++	if (isp->stream_config_set &&
++	    isp->stream_config.output_dim.x == preset->output_dim.x &&
++	    isp->stream_config.output_dim.y == preset->output_dim.y) {
++		isp->stream_preset = isp->stream_config;
++		dev_info(isp->dev,
++			 "stream config override: config %u, input %ux%u, crop %u,%u %ux%u, output %ux%u\n",
++			 isp->stream_preset.index, isp->stream_preset.input_dim.x,
++			 isp->stream_preset.input_dim.y,
++			 isp->stream_preset.crop_offset.x,
++			 isp->stream_preset.crop_offset.y,
++			 isp->stream_preset.crop_size.x,
++			 isp->stream_preset.crop_size.y,
++			 isp->stream_preset.output_dim.x,
++			 isp->stream_preset.output_dim.y);
++		return;
++	}
++
+ 	isp->stream_preset = *preset;
+ 	if (apple_isp_wide_view(isp) && isp_preset_narrow(preset) &&
+ 	    isp_size_from_crop(&isp_wide_source, preset->output_dim, &wide)) {
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index 4e1784669b..a83d44af1a 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -5,6 +5,7 @@
+  * Copyright (C) 2023 The Asahi Linux Contributors
+  */
+ 
++#include <linux/debugfs.h>
+ #include <linux/io.h>
+ #include <linux/iommu.h>
+ #include <linux/module.h>
+@@ -517,62 +518,113 @@ static int isp_of_read_coord(struct device *dev, struct device_node *np,
+ }
+ 
+ /*
+- * The first preset can be replaced for a lab measurement of another firmware
+- * sensor configuration, without a new device tree:
+- * "config,in_w,in_h,crop_x,crop_y,crop_w,crop_h,out_w,out_h". The crop lies
+- * inside the input (whose height may stack exposures), every value is even,
+- * and the output keeps the crop's aspect ratio without enlarging it, as for
+- * the device tree presets. Anything else is refused and the device tree
+- * preset is kept. Empty, the default, changes nothing.
++ * Measurement overrides in debugfs (root only), applied from the next
++ * stream start:
++ * - stream_config: serve the streams of one output size from another
++ *   firmware sensor config, "config,in_w,in_h,crop_x,crop_y,crop_w,crop_h,
++ *   out_w,out_h". The crop lies inside the input (whose height may stack
++ *   exposures), every value is even, and the output keeps the crop's aspect
++ *   ratio without enlarging it, as for the device tree presets. Anything
++ *   else is refused. An empty write removes the override.
++ * - extra_frame_rate: offer one rate above the standard list (31..120;
++ *   0, the default, offers none). The firmware decides what it delivers.
+  */
+-static char *lab_preset = "";
+-module_param(lab_preset, charp, 0444);
+-MODULE_PARM_DESC(lab_preset,
+-		 "Lab: replace the first sensor preset, \"config,in_w,in_h,crop_x,crop_y,crop_w,crop_h,out_w,out_h\" (default: empty)");
++static int isp_parse_stream_config(const char *buf, struct isp_preset *p)
++{
++	u32 v[9];
++
++	if (sscanf(buf, "%u,%u,%u,%u,%u,%u,%u,%u,%u", &v[0], &v[1], &v[2],
++		   &v[3], &v[4], &v[5], &v[6], &v[7], &v[8]) != 9)
++		return -EINVAL;
++
++	*p = (struct isp_preset){};
++	p->index = v[0];
++	p->input_dim = (struct coord){ v[1], v[2] };
++	p->crop_offset = (struct coord){ v[3], v[4] };
++	p->crop_size = (struct coord){ v[5], v[6] };
++	p->output_dim = (struct coord){ v[7], v[8] };
++
++	if (p->index >= ISP_MAX_SENSOR_CONFIGS ||
++	    (p->input_dim.x | p->input_dim.y | p->crop_offset.x | p->crop_offset.y |
++	     p->crop_size.x | p->crop_size.y | p->output_dim.x | p->output_dim.y) & 1 ||
++	    !p->crop_size.x || !p->crop_size.y || !p->output_dim.x || !p->output_dim.y ||
++	    p->input_dim.x > 16384 || p->input_dim.y > 16384 ||
++	    p->crop_offset.x > p->input_dim.x ||
++	    p->crop_size.x > p->input_dim.x - p->crop_offset.x ||
++	    p->crop_offset.y > p->input_dim.y ||
++	    p->crop_size.y > p->input_dim.y - p->crop_offset.y ||
++	    p->crop_size.x < p->output_dim.x || p->crop_size.y < p->output_dim.y ||
++	    (u64)p->crop_size.x * p->output_dim.y !=
++	    (u64)p->crop_size.y * p->output_dim.x)
++		return -EINVAL;
++
++	return 0;
++}
+ 
+-static void apple_isp_lab_preset(struct apple_isp *isp)
++static ssize_t isp_stream_config_write(struct file *file,
++				       const char __user *ubuf, size_t len,
++				       loff_t *ppos)
+ {
++	struct apple_isp *isp = file->private_data;
+ 	struct isp_preset p = {};
+-	u32 v[9];
++	char buf[96], *s;
++	int err;
+ 
+-	if (!lab_preset || !lab_preset[0])
+-		return;
++	if (len >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, len))
++		return -EFAULT;
++	buf[len] = '\0';
++	s = strim(buf);
++	if (s[0]) {
++		err = isp_parse_stream_config(s, &p);
++		if (err)
++			return err;
++	}
+ 
+-	if (sscanf(lab_preset, "%u,%u,%u,%u,%u,%u,%u,%u,%u", &v[0], &v[1], &v[2],
+-		   &v[3], &v[4], &v[5], &v[6], &v[7], &v[8]) != 9)
+-		goto refuse;
+-
+-	p.index = v[0];
+-	p.input_dim = (struct coord){ v[1], v[2] };
+-	p.crop_offset = (struct coord){ v[3], v[4] };
+-	p.crop_size = (struct coord){ v[5], v[6] };
+-	p.output_dim = (struct coord){ v[7], v[8] };
+-
+-	if (p.index >= ISP_MAX_SENSOR_CONFIGS ||
+-	    (p.input_dim.x | p.input_dim.y | p.crop_offset.x | p.crop_offset.y |
+-	     p.crop_size.x | p.crop_size.y | p.output_dim.x | p.output_dim.y) & 1 ||
+-	    !p.crop_size.x || !p.crop_size.y || !p.output_dim.x || !p.output_dim.y ||
+-	    p.input_dim.x > 16384 || p.input_dim.y > 16384 ||
+-	    p.crop_offset.x > p.input_dim.x ||
+-	    p.crop_size.x > p.input_dim.x - p.crop_offset.x ||
+-	    p.crop_offset.y > p.input_dim.y ||
+-	    p.crop_size.y > p.input_dim.y - p.crop_offset.y ||
+-	    p.crop_size.x < p.output_dim.x || p.crop_size.y < p.output_dim.y ||
+-	    (u64)p.crop_size.x * p.output_dim.y !=
+-	    (u64)p.crop_size.y * p.output_dim.x)
+-		goto refuse;
+-
+-	dev_warn(isp->dev,
+-		 "lab preset: config %u, input %ux%u, crop %u,%u %ux%u, output %ux%u replaces %ux%u\n",
+-		 p.index, p.input_dim.x, p.input_dim.y, p.crop_offset.x,
+-		 p.crop_offset.y, p.crop_size.x, p.crop_size.y, p.output_dim.x,
+-		 p.output_dim.y, isp->presets[0].output_dim.x,
+-		 isp->presets[0].output_dim.y);
+-	isp->presets[0] = p;
+-	return;
++	mutex_lock(&isp->video_lock);
++	isp->stream_config = p;
++	isp->stream_config_set = s[0];
++	mutex_unlock(&isp->video_lock);
++
++	return len;
++}
++
++static ssize_t isp_stream_config_read(struct file *file, char __user *ubuf,
++				      size_t len, loff_t *ppos)
++{
++	struct apple_isp *isp = file->private_data;
++	const struct isp_preset *p = &isp->stream_config;
++	char buf[96];
++	int n = 0;
++
++	mutex_lock(&isp->video_lock);
++	if (isp->stream_config_set)
++		n = scnprintf(buf, sizeof(buf), "%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
++			      p->index, p->input_dim.x, p->input_dim.y,
++			      p->crop_offset.x, p->crop_offset.y,
++			      p->crop_size.x, p->crop_size.y,
++			      p->output_dim.x, p->output_dim.y);
++	mutex_unlock(&isp->video_lock);
+ 
+-refuse:
+-	dev_warn(isp->dev, "lab preset refused, device tree presets kept\n");
++	return simple_read_from_buffer(ubuf, len, ppos, buf, n);
++}
++
++static const struct file_operations isp_stream_config_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = isp_stream_config_read,
++	.write = isp_stream_config_write,
++	.llseek = default_llseek,
++};
++
++static void apple_isp_debugfs_init(struct apple_isp *isp)
++{
++	isp->debugfs = debugfs_create_dir(dev_name(isp->dev), NULL);
++	debugfs_create_file("stream_config", 0600, isp->debugfs, isp,
++			    &isp_stream_config_fops);
++	debugfs_create_u32("extra_frame_rate", 0600, isp->debugfs,
++			   &isp->extra_frame_rate);
+ }
+ 
+ static int apple_isp_init_presets(struct apple_isp *isp)
+@@ -632,11 +684,7 @@ static int apple_isp_init_presets(struct apple_isp *isp)
+ 		preset++;
+ 	}
+ 
+-	err = apple_isp_add_wide_presets(isp);
+-	if (err)
+-		return err;
+-	apple_isp_lab_preset(isp);
+-	return 0;
++	return apple_isp_add_wide_presets(isp);
+ }
+ 
+ /* Preview only; processing and image quality need separate qualification. */
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 4145da7794..22c2633bd7 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -458,6 +458,11 @@ struct apple_isp {
+ 	struct isp_preset stream_preset;
+ 	/* the previous stream ran from the wide sensor config */
+ 	bool streamed_wide;
++	/* measurement overrides set in debugfs, read at stream start */
++	struct isp_preset stream_config;
++	bool stream_config_set;
++	u32 extra_frame_rate;
++	struct dentry *debugfs;
+ 	/* configurations the firmware has, once a deferred start detected them */
+ 	u32 num_fw_presets;
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index 32641c973d..2e8272ef18 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -32,31 +32,28 @@ static void isp_vb2_set_min_buffers(struct apple_isp *isp);
+ static const unsigned int isp_frame_rates[] = { 30, 25, 24, 20, 15 };
+ 
+ /*
+- * Lab: one extra rate above the standard list, offered first, for measuring
+- * the sensor configurations that run faster than 30 frames per second. The
+- * firmware decides what it delivers; this only lets the request reach it.
+- * 0, the default, or a value outside 31..120 changes nothing.
++ * One extra rate above the standard list, offered first, set in debugfs for
++ * measuring the sensor configurations that run faster than 30 frames per
++ * second (see apple_isp_debugfs_init()). 0 or a value outside 31..120
++ * offers none.
+  */
+-static unsigned int lab_fps;
+-module_param(lab_fps, uint, 0444);
+-MODULE_PARM_DESC(lab_fps,
+-		 "Lab: offer this frame rate (31..120) in addition to the standard ones (default: 0 = off)");
+-
+-static bool isp_lab_fps(void)
++static unsigned int isp_extra_rate(struct apple_isp *isp)
+ {
+-	return lab_fps > ISP_FRAME_RATE_DEFAULT && lab_fps <= 120;
++	unsigned int rate = READ_ONCE(isp->extra_frame_rate);
++
++	return rate > ISP_FRAME_RATE_DEFAULT && rate <= 120 ? rate : 0;
+ }
+ 
+-static unsigned int isp_num_rates(void)
++static unsigned int isp_num_rates(unsigned int extra)
+ {
+-	return ARRAY_SIZE(isp_frame_rates) + isp_lab_fps();
++	return ARRAY_SIZE(isp_frame_rates) + !!extra;
+ }
+ 
+-static unsigned int isp_rate(unsigned int index)
++static unsigned int isp_rate(unsigned int extra, unsigned int index)
+ {
+-	if (isp_lab_fps()) {
++	if (extra) {
+ 		if (!index)
+-			return lab_fps;
++			return extra;
+ 		index--;
+ 	}
+ 	return isp_frame_rates[index];
+@@ -885,9 +882,10 @@ static int isp_vidioc_enum_frameintervals(struct file *file, void *fh,
+ 					  struct v4l2_frmivalenum *interval)
+ {
+ 	struct apple_isp *isp = video_drvdata(file);
++	unsigned int extra = isp_extra_rate(isp);
+ 	int i;
+ 
+-	if (interval->index >= isp_num_rates())
++	if (interval->index >= isp_num_rates(extra))
+ 		return -EINVAL;
+ 
+ 	if (interval->pixel_format != V4L2_PIX_FMT_NV12 &&
+@@ -908,21 +906,22 @@ static int isp_vidioc_enum_frameintervals(struct file *file, void *fh,
+ 
+ 	interval->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+ 	interval->discrete.numerator = 1;
+-	interval->discrete.denominator = isp_rate(interval->index);
++	interval->discrete.denominator = isp_rate(extra, interval->index);
+ 	return 0;
+ }
+ 
+ /* Returns the supported rate whose frame interval is closest to @tpf. */
+-static unsigned int isp_closest_frame_rate(const struct v4l2_fract *tpf)
++static unsigned int isp_closest_frame_rate(const struct v4l2_fract *tpf,
++					   unsigned int extra)
+ {
+-	unsigned int best = isp_rate(0);
++	unsigned int best = isp_rate(extra, 0);
+ 
+ 	/*
+ 	 * |n/d - 1/r| = |n * r - d| / (d * r), so the closest rate has the
+ 	 * smallest |n * r - d| / r; compare those by cross-multiplying.
+ 	 */
+-	for (unsigned int i = 1; i < isp_num_rates(); i++) {
+-		unsigned int rate = isp_rate(i);
++	for (unsigned int i = 1; i < isp_num_rates(extra); i++) {
++		unsigned int rate = isp_rate(extra, i);
+ 		u64 err = abs_diff((u64)tpf->numerator * rate,
+ 				   (u64)tpf->denominator);
+ 		u64 best_err = abs_diff((u64)tpf->numerator * best,
+@@ -1068,7 +1067,7 @@ static int isp_vidioc_set_param(struct file *file, void *fh,
+ 	if (!tpf->numerator || !tpf->denominator)
+ 		isp->frame_rate = ISP_FRAME_RATE_DEFAULT;
+ 	else
+-		isp->frame_rate = isp_closest_frame_rate(tpf);
++		isp->frame_rate = isp_closest_frame_rate(tpf, isp_extra_rate(isp));
+ 
+ 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
+ 	a->parm.capture.readbuffers = 0;
+-- 
+2.43.0
+

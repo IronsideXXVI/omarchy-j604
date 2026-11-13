@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 23:27:03 +0000
+Subject: [PATCH] PCI: apple: run the J604's radio link with L1
+ substates while the system runs
+
+macOS runs the J604's radio link with all four L1 PM substates: the
+ADT's /arm-io/apcie/pci-bridge0 carries pci-l1pm-control 0x4055190f,
+which as an L1 PM Substates Control 1 word enables ASPM and PCI-PM L1.1
+and L1.2, and the associated idle link sits in L1.2 two thirds of the
+time under macOS. Both ends of the link advertise them, CLKREQ# is
+muxed for the port and LTR is enabled, but on a devicetree platform the
+ASPM core leaves the L1 substates out of a link's default, so the link
+only ever goes to L1.
+
+Allow them on that link once the host has scanned it, with
+pci_enable_link_state() on the radio's function 0; the ASPM core still
+enables only what both ends support and computes the timings itself.
+
+With the substates on, the radio firmware once stopped answering
+commands about 9 s after a suspend-to-idle cycle, while they worked at
+runtime. So they are on only while the system runs: a PM notifier takes
+them off before any device suspends and gives them back once every
+device has resumed, and only to a radio that is back in D0. The PCI
+core saves and restores the link without them, so every system sleep
+sees the same link as without this change.
+
+On by default for J604 machines; pcie_apple.radio_l1ss=0 turns it off.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/pci/controller/pcie-apple.c | 101 ++++++++++++++++++++++++++++
+ 1 file changed, 101 insertions(+)
+
+diff --git a/drivers/pci/controller/pcie-apple.c b/drivers/pci/controller/pcie-apple.c
+index 4938ad8acc..46533981da 100644
+--- a/drivers/pci/controller/pcie-apple.c
++++ b/drivers/pci/controller/pcie-apple.c
+@@ -70,6 +70,11 @@ static bool s2idle_keep_link = true;
+ module_param(s2idle_keep_link, bool, 0644);
+ MODULE_PARM_DESC(s2idle_keep_link, "Keep tunneled links up through suspend-to-idle");
+ 
++static bool radio_l1ss = true;
++module_param(radio_l1ss, bool, 0444);
++MODULE_PARM_DESC(radio_l1ss,
++		 "J604: allow the L1.1 and L1.2 substates on the radio's link while the system runs, as the ADT has macOS run them (default on)");
++
+ /* Opt-in until the NHI, PHY and DART power cycle is qualified together. */
+ static bool cio_s2r;
+ module_param(cio_s2r, bool, 0400);
+@@ -4851,6 +4856,100 @@ static void apple_pcie_neo_sleep_probe(struct platform_device *pdev, struct appl
+ 
+ #include "pcie-apple-radio.c"
+ 
++/*
++ * The J604 ADT's /arm-io/apcie/pci-bridge0 has pci-l1pm-control 0x4055190f: as an
++ * L1 PM Substates Control 1 word, all four enables (ASPM and PCI-PM L1.1 and L1.2),
++ * so macOS runs the radio's link (root port 0) with them. Both ends advertise them,
++ * CLKREQ# is muxed and LTR is on, but the ASPM core leaves L1 substates out of a
++ * devicetree platform's default. Allow them on that one link; the ASPM core still
++ * enables only what both ends support and works out the timings itself.
++ *
++ * Only while the system runs. With them on, the radio firmware stopped answering
++ * commands about 9 s after a suspend-to-idle cycle on 1.735, though they worked at
++ * runtime. So they are taken off before any device suspends and given back once
++ * every device has resumed: the PCI core saves and restores the link without them,
++ * and a system sleep sees exactly the link it saw without this.
++ */
++#define APPLE_PCIE_RADIO_ASPM_RUN	PCIE_LINK_STATE_ASPM_ALL
++#define APPLE_PCIE_RADIO_ASPM_SLEEP	(PCIE_LINK_STATE_L0S | PCIE_LINK_STATE_L1)
++
++static struct pci_host_bridge *apple_pcie_radio_bridge;
++
++static struct pci_dev *apple_pcie_radio_get(void)
++{
++	struct pci_host_bridge *bridge = READ_ONCE(apple_pcie_radio_bridge);
++	struct pci_dev *root, *ep = NULL;
++
++	if (!bridge)
++		return NULL;
++	root = pci_get_slot(bridge->bus, PCI_DEVFN(0, 0));
++	if (root && root->subordinate)
++		ep = pci_get_slot(root->subordinate, PCI_DEVFN(0, 0));
++	pci_dev_put(root);
++	return ep;
++}
++
++static void apple_pcie_radio_l1ss_set(bool run)
++{
++	struct pci_dev *ep = apple_pcie_radio_get();
++	int ret;
++
++	if (!ep)
++		return;
++	/* A radio that did not come back from a sleep keeps the sleep setting. */
++	if (!run || (ep->current_state == PCI_D0 && !pci_dev_is_disconnected(ep))) {
++		ret = pci_enable_link_state(ep, run ? APPLE_PCIE_RADIO_ASPM_RUN :
++						      APPLE_PCIE_RADIO_ASPM_SLEEP);
++		pci_dbg(ep, "radio link: L1 substates %s: %d\n", run ? "allowed" : "off for the sleep",
++			ret);
++	}
++	pci_dev_put(ep);
++}
++
++static int apple_pcie_radio_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
++{
++	switch (action) {
++	case PM_SUSPEND_PREPARE:
++	case PM_HIBERNATION_PREPARE:
++	case PM_RESTORE_PREPARE:
++		apple_pcie_radio_l1ss_set(false);
++		break;
++	case PM_POST_SUSPEND:
++	case PM_POST_HIBERNATION:
++	case PM_POST_RESTORE:
++		apple_pcie_radio_l1ss_set(true);
++		break;
++	}
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block apple_pcie_radio_pm_nb = {
++	.notifier_call = apple_pcie_radio_pm_notify,
++};
++
++static void apple_pcie_radio_l1ss(struct pci_host_bridge *bridge)
++{
++	struct pci_dev *ep;
++
++	/* One radio link per Mac: the built-in host's port 0. */
++	if (cmpxchg(&apple_pcie_radio_bridge, NULL, bridge))
++		return;
++	ep = apple_pcie_radio_get();
++	if (!ep) {
++		WRITE_ONCE(apple_pcie_radio_bridge, NULL);
++		return;
++	}
++	if (register_pm_notifier(&apple_pcie_radio_pm_nb)) {
++		pci_warn(ep, "radio link: no sleep notifier, L1 substates left off\n");
++		WRITE_ONCE(apple_pcie_radio_bridge, NULL);
++		pci_dev_put(ep);
++		return;
++	}
++	pci_info(ep, "radio link: L1 substates allowed while running, as the ADT has them: %d\n",
++		 pci_enable_link_state(ep, APPLE_PCIE_RADIO_ASPM_RUN));
++	pci_dev_put(ep);
++}
++
+ static int apple_pcie_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -5072,6 +5171,8 @@ static int apple_pcie_probe(struct platform_device *pdev)
+ 
+ 	if (pcie->hw->tunneled)
+ 		pci_walk_bus(bridge->bus, apple_pcie_tunnel_keep_d0, NULL);
++	else if (READ_ONCE(radio_l1ss) && of_machine_is_compatible("apple,j604"))
++		apple_pcie_radio_l1ss(bridge);
+ 
+ 	apple_radio_register(pdev, pcie);
+ 	return 0;
+-- 
+2.43.0
+

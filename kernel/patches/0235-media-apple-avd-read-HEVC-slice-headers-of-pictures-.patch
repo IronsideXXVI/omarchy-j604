@@ -1,0 +1,1265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 11 Nov 2026 16:51:27 +0000
+Subject: [PATCH] media: apple: avd: read HEVC slice headers of
+ pictures sent without them
+
+Chromium's V4L2 stateless HEVC decoder sends each picture as Annex-B NAL
+units in one OUTPUT buffer with the SPS, PPS, scaling matrix and decode
+parameters, and no SLICE_PARAMS or entry points. The instruction builder
+programs the hardware only from SLICE_PARAMS, so it used whatever an
+earlier request left in that control: the decoder never raised its
+interrupt, every picture timed out, and the resets that followed made
+the storm guard rest the decoder for every client.
+
+Select by what the request carries:
+
+- A request with SLICE_PARAMS (VA-API) takes the present path unchanged.
+- A request without them has its slice segment headers read from the
+  picture (H.265 7.3.6.1-7.3.6.3) when the new hevc_frame_parse
+  parameter is set: reference lists as DPB indices built from the decode
+  parameters (8.3.4) with the slice's list modification, chroma offsets
+  derived (7-56), the short-term and long-term set parts skipped by the
+  sizes the decode parameters give. Each slice's region runs from the
+  end of the previous one, so start codes and other NAL units count as
+  header bytes and the regions stay contiguous as the builder expects.
+- Anything else (no SLICE_PARAMS and the parameter off, or a picture
+  that is not Annex-B or cannot be read) is refused before it reaches
+  the hardware, with one warning per boot when the parameter is off.
+
+hevc_frame_parse defaults to off and is writable at runtime; the
+START_CODE control offers ANNEX_B only in contexts opened while it is
+set (its default stays NONE, which is what VA-API reads).
+
+A KUnit suite covers the Annex-B detector, I/P/B headers with list
+modification, weights and entry points, the region layout across
+3- and 4-byte start codes and a non-slice NAL unit, and refusals.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/avd/Kconfig      |   3 +-
+ drivers/media/platform/apple/avd/Makefile     |   4 +-
+ .../media/platform/apple/avd/avd-hevc-parse.c | 549 ++++++++++++++++++
+ .../media/platform/apple/avd/avd-hevc-parse.h |  34 ++
+ .../media/platform/apple/avd/avd-hevc-test.c  | 385 ++++++++++++
+ drivers/media/platform/apple/avd/avd-hevc.c   | 112 +++-
+ drivers/media/platform/apple/avd/avd-v4l2.c   |   9 +
+ drivers/media/platform/apple/avd/avd.h        |   1 +
+ 8 files changed, 1088 insertions(+), 9 deletions(-)
+ create mode 100644 drivers/media/platform/apple/avd/avd-hevc-parse.c
+ create mode 100644 drivers/media/platform/apple/avd/avd-hevc-parse.h
+ create mode 100644 drivers/media/platform/apple/avd/avd-hevc-test.c
+
+diff --git a/drivers/media/platform/apple/avd/Kconfig b/drivers/media/platform/apple/avd/Kconfig
+index d3bb9763b6..39b76019a8 100644
+--- a/drivers/media/platform/apple/avd/Kconfig
++++ b/drivers/media/platform/apple/avd/Kconfig
+@@ -24,7 +24,8 @@ config VIDEO_APPLE_AVD_KUNIT_TEST
+ 	default KUNIT_ALL_TESTS
+ 	help
+ 	  Build KUnit tests for the Apple video decoder. They exercise the
+-	  H.264 slice bounds, frame-slot ownership, and runtime power management,
++	  H.264 slice bounds, the HEVC slice header reader, frame-slot ownership,
++	  and runtime power management,
+ 	  including suspend gating and resubmission after firmware resume.
+ 
+ 	  If unsure, say N.
+diff --git a/drivers/media/platform/apple/avd/Makefile b/drivers/media/platform/apple/avd/Makefile
+index e8f0b9e769..fe4ab4c6c7 100644
+--- a/drivers/media/platform/apple/avd/Makefile
++++ b/drivers/media/platform/apple/avd/Makefile
+@@ -2,7 +2,7 @@
+ 
+ apple-avd-y := avd-drv.o avd-v4l2.o avd-hw.o avd-pm.o avd-h264.o avd-vp9.o \
+ 	avd-hevc.o avd-av1.o avd-av1-entropymode.o avd-queue.o avd-backend-open.o \
+-	avd-backend-apple.o avd-backend-queue.o
++	avd-backend-apple.o avd-backend-queue.o avd-hevc-parse.o
+ apple-avd-$(CONFIG_VIDEO_APPLE_AVD_KUNIT_TEST) += avd-h264-test.o avd-queue-test.o \
+-	avd-pm-test.o avd-variant-test.o
++	avd-pm-test.o avd-variant-test.o avd-hevc-test.o
+ obj-$(CONFIG_VIDEO_APPLE_AVD) += apple-avd.o
+diff --git a/drivers/media/platform/apple/avd/avd-hevc-parse.c b/drivers/media/platform/apple/avd/avd-hevc-parse.c
+new file mode 100644
+index 0000000000..4decfd273e
+--- /dev/null
++++ b/drivers/media/platform/apple/avd/avd-hevc-parse.c
+@@ -0,0 +1,549 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Apple AVD: HEVC slice segment headers for frame-based decoding.
++ *
++ * A client such as Chromium sends each picture as Annex-B slice NAL units
++ * (three-byte start codes) in one OUTPUT buffer with the SPS, PPS and decode
++ * parameters, but no slice parameters. The instruction builder needs them, so
++ * they are read here from each slice segment header (H.265 7.3.6.1-7.3.6.3)
++ * and filled the way a slice-based client fills them: reference lists as DPB
++ * indices built from the decode parameters (8.3.4), chroma offsets derived
++ * (7-56), the picture order count of the picture. The parts of the header the
++ * decode parameters already describe in bits (the short-term and long-term
++ * reference picture sets) are skipped by those sizes.
++ *
++ * Each slice's region of the buffer starts at its start code (or at the end of
++ * the previous slice, so NAL units in between belong to it): data_byte_offset
++ * counts from there to the first slice data byte and bit_size covers the whole
++ * region, so the regions are contiguous as the instruction builder expects.
++ *
++ * Copyright The Aurora Silicon Contributors
++ */
++#include <linux/errno.h>
++#include <linux/kernel.h>
++#include <linux/log2.h>
++#include <linux/string.h>
++
++#include "avd-hevc-parse.h"
++
++#define SL_LF_ACROSS	V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_LOOP_FILTER_ACROSS_SLICES_ENABLED
++#define PPS_LF_ACROSS	V4L2_HEVC_PPS_FLAG_PPS_LOOP_FILTER_ACROSS_SLICES_ENABLED
++#define SL_COL_FROM_L0	V4L2_HEVC_SLICE_PARAMS_FLAG_COLLOCATED_FROM_L0
++
++#define NAL_IDR_W_RADL	19
++#define NAL_IDR_N_LP	20
++#define NAL_BLA_W_LP	16
++#define NAL_RSV_IRAP_23	23
++
++struct hevc_rbsp {
++	const u8 *data;
++	u32 len;
++	u32 pos;	/* byte of data[] that holds the next bit */
++	u8 bit;		/* next bit of that byte, 0 is the MSB */
++	u8 zeros;	/* zero bytes just read */
++	u8 cur;
++	bool err;
++};
++
++static u32 rbsp_bit(struct hevc_rbsp *r)
++{
++	u32 v;
++
++	if (r->err)
++		return 0;
++	if (!r->bit) {
++		/* in 00 00 03 the 03 is emulation prevention, not data */
++		if (r->zeros >= 2 && r->pos < r->len && r->data[r->pos] == 0x03) {
++			r->pos++;
++			r->zeros = 0;
++		}
++		if (r->pos >= r->len) {
++			r->err = true;
++			return 0;
++		}
++		r->cur = r->data[r->pos];
++		r->zeros = r->cur ? 0 : r->zeros + 1;
++	}
++	v = (r->cur >> (7 - r->bit)) & 1;
++	if (++r->bit == 8) {
++		r->bit = 0;
++		r->pos++;
++	}
++	return v;
++}
++
++static u32 rbsp_u(struct hevc_rbsp *r, unsigned int n)
++{
++	u32 v = 0;
++
++	while (n--)
++		v = (v << 1) | rbsp_bit(r);
++	return v;
++}
++
++static void rbsp_skip(struct hevc_rbsp *r, u32 n)
++{
++	while (n-- && !r->err)
++		rbsp_bit(r);
++}
++
++static u32 rbsp_ue(struct hevc_rbsp *r)
++{
++	unsigned int zeros = 0;
++
++	while (!rbsp_bit(r) && !r->err)
++		if (++zeros > 31) {
++			r->err = true;
++			return 0;
++		}
++	return ((1U << zeros) - 1) + rbsp_u(r, zeros);
++}
++
++static s32 rbsp_se(struct hevc_rbsp *r)
++{
++	u32 k = rbsp_ue(r);
++
++	return k & 1 ? (s32)((k + 1) / 2) : -(s32)(k / 2);
++}
++
++/* Ceil(Log2(n)) for n >= 1 */
++static unsigned int ceil_log2(u32 n)
++{
++	return n > 1 ? order_base_2(n) : 0;
++}
++
++bool avd_hevc_annexb(const u8 *buf, u32 len)
++{
++	/*
++	 * A NAL header's second byte is never 0 (nuh_temporal_id_plus1), so a
++	 * buffer that starts with 00 00 01 holds start codes.
++	 */
++	return len >= 4 && !buf[0] && !buf[1] &&
++	       (buf[2] == 1 || (!buf[2] && buf[3] == 1));
++}
++
++static int parse_pred_weights(struct hevc_rbsp *r, bool chroma, bool b_slice,
++			      u8 n0, u8 n1, struct v4l2_hevc_pred_weight_table *pw)
++{
++	u8 luma_flags[2][V4L2_HEVC_DPB_ENTRIES_NUM_MAX] = {};
++	u8 chroma_flags[2][V4L2_HEVC_DPB_ENTRIES_NUM_MAX] = {};
++	u32 denom = rbsp_ue(r);
++	s32 cdenom = 0;
++	int list, i, j;
++
++	if (denom > 7)
++		return -EINVAL;
++	pw->luma_log2_weight_denom = denom;
++	if (chroma) {
++		cdenom = rbsp_se(r);
++		if ((s32)denom + cdenom < 0 || (s32)denom + cdenom > 7)
++			return -EINVAL;
++		pw->delta_chroma_log2_weight_denom = cdenom;
++	}
++	for (list = 0; list < (b_slice ? 2 : 1); list++) {
++		u8 n = list ? n1 : n0;
++		s8 *dlw = list ? pw->delta_luma_weight_l1 : pw->delta_luma_weight_l0;
++		s8 *lo = list ? pw->luma_offset_l1 : pw->luma_offset_l0;
++		s8 (*dcw)[2] = list ? pw->delta_chroma_weight_l1 : pw->delta_chroma_weight_l0;
++		s8 (*co)[2] = list ? pw->chroma_offset_l1 : pw->chroma_offset_l0;
++
++		for (i = 0; i <= n; i++)
++			luma_flags[list][i] = rbsp_bit(r);
++		if (chroma)
++			for (i = 0; i <= n; i++)
++				chroma_flags[list][i] = rbsp_bit(r);
++		for (i = 0; i <= n; i++) {
++			if (luma_flags[list][i]) {
++				s32 dw = rbsp_se(r), off = rbsp_se(r);
++
++				if (dw < -128 || dw > 127 || off < -128 || off > 127)
++					return -EINVAL;
++				dlw[i] = dw;
++				lo[i] = off;
++			}
++			if (!chroma_flags[list][i])
++				continue;
++			for (j = 0; j < 2; j++) {
++				s32 dw = rbsp_se(r), doff = rbsp_se(r);
++				s32 cl2 = (s32)denom + cdenom;
++				s32 w = (1 << cl2) + dw, off;
++
++				if (dw < -128 || dw > 127 || doff < -512 || doff > 511)
++					return -EINVAL;
++				dcw[i][j] = dw;
++				/* 7-56, 8-bit offsets (no high_precision_offsets) */
++				off = 128 - ((128 * w) >> cl2) + doff;
++				co[i][j] = clamp(off, -128, 127);
++			}
++		}
++	}
++	return r->err ? -EINVAL : 0;
++}
++
++/* RefPicListX as DPB indices (8.3.4), with list_entry_lX if modified. */
++static int build_list(const struct v4l2_ctrl_hevc_decode_params *dec, bool l1,
++		      u8 num_active, const u8 *entries, bool modified, u8 *out)
++{
++	u8 temp[V4L2_HEVC_DPB_ENTRIES_NUM_MAX];
++	u32 total = dec->num_poc_st_curr_before + dec->num_poc_st_curr_after +
++		    dec->num_poc_lt_curr;
++	u32 n = max_t(u32, num_active, total), r = 0, i;
++
++	if (!total || n > V4L2_HEVC_DPB_ENTRIES_NUM_MAX)
++		return -EINVAL;
++	while (r < n) {
++		const u8 *first = l1 ? dec->poc_st_curr_after : dec->poc_st_curr_before;
++		const u8 *second = l1 ? dec->poc_st_curr_before : dec->poc_st_curr_after;
++		u8 nfirst = l1 ? dec->num_poc_st_curr_after : dec->num_poc_st_curr_before;
++		u8 nsecond = l1 ? dec->num_poc_st_curr_before : dec->num_poc_st_curr_after;
++
++		for (i = 0; i < nfirst && r < n; i++)
++			temp[r++] = first[i];
++		for (i = 0; i < nsecond && r < n; i++)
++			temp[r++] = second[i];
++		for (i = 0; i < dec->num_poc_lt_curr && r < n; i++)
++			temp[r++] = dec->poc_lt_curr[i];
++	}
++	for (i = 0; i < num_active; i++) {
++		u8 idx = modified ? entries[i] : i;
++
++		if (idx >= n || temp[idx] >= V4L2_HEVC_DPB_ENTRIES_NUM_MAX)
++			return -EINVAL;
++		out[i] = temp[idx];
++	}
++	return 0;
++}
++
++/**
++ * avd_hevc_parse_slice() - read one slice segment header
++ * @nal: the NAL unit, from its two-byte header, no start code
++ * @len: bytes of @nal
++ * @sps, @pps, @dec: the picture's parameters
++ * @prev: the previous slice segment of the picture, or NULL for the first one
++ *	  (a dependent slice segment takes its header fields from it)
++ * @sl: filled; bit_size and data_byte_offset relative to @nal
++ * @entry_points: receives entry_point_offset_minus1 + 1 of each entry point
++ * @max_entry_points: room in @entry_points
++ * @header_bytes: bytes of @nal before the slice data (header + alignment)
++ *
++ * Return: 0, or -EINVAL for a header this driver cannot describe.
++ */
++int avd_hevc_parse_slice(const u8 *nal, u32 len,
++			 const struct v4l2_ctrl_hevc_sps *sps,
++			 const struct v4l2_ctrl_hevc_pps *pps,
++			 const struct v4l2_ctrl_hevc_decode_params *dec,
++			 const struct v4l2_ctrl_hevc_slice_params *prev,
++			 struct v4l2_ctrl_hevc_slice_params *sl,
++			 u32 *entry_points, u32 max_entry_points,
++			 u32 *header_bytes)
++{
++	struct hevc_rbsp r = { .data = nal, .len = len };
++	u32 ctb_log2, w_ctbs, h_ctbs, nut, v, i;
++	bool first, dependent = false, sao_luma = false, sao_chroma = false;
++	bool chroma = !(sps->flags & V4L2_HEVC_SPS_FLAG_SEPARATE_COLOUR_PLANE) &&
++		      sps->chroma_format_idc;
++	u64 pf = pps->flags;
++
++	if (len < 3 || (nal[0] & 0x80))
++		return -EINVAL;
++	nut = (nal[0] >> 1) & 0x3f;
++	if (nut > 21 || (nut > 9 && nut < 16))
++		return -EINVAL;
++	r.pos = 2;
++	memset(sl, 0, sizeof(*sl));
++	sl->nal_unit_type = nut;
++	sl->nuh_temporal_id_plus1 = nal[1] & 7;
++	sl->slice_pic_order_cnt = dec->pic_order_cnt_val;
++	sl->short_term_ref_pic_set_size = dec->short_term_ref_pic_set_size;
++	sl->long_term_ref_pic_set_size = dec->long_term_ref_pic_set_size;
++
++	ctb_log2 = sps->log2_min_luma_coding_block_size_minus3 + 3 +
++		   sps->log2_diff_max_min_luma_coding_block_size;
++	w_ctbs = DIV_ROUND_UP(sps->pic_width_in_luma_samples, 1U << ctb_log2);
++	h_ctbs = DIV_ROUND_UP(sps->pic_height_in_luma_samples, 1U << ctb_log2);
++
++	first = rbsp_bit(&r);
++	if (nut >= NAL_BLA_W_LP && nut <= NAL_RSV_IRAP_23)
++		rbsp_bit(&r);			/* no_output_of_prior_pics_flag */
++	if (rbsp_ue(&r) != pps->pic_parameter_set_id)
++		return -EINVAL;
++	if (!first) {
++		if (pf & V4L2_HEVC_PPS_FLAG_DEPENDENT_SLICE_SEGMENT_ENABLED)
++			dependent = rbsp_bit(&r);
++		sl->slice_segment_addr = rbsp_u(&r, ceil_log2(w_ctbs * h_ctbs));
++		if (sl->slice_segment_addr >= w_ctbs * h_ctbs)
++			return -EINVAL;
++	}
++	if (dependent) {
++		if (!prev)
++			return -EINVAL;
++		/* 7.4.7.1: a dependent segment's header is the previous one's */
++		*sl = (struct v4l2_ctrl_hevc_slice_params) {
++			.nal_unit_type = nut,
++			.nuh_temporal_id_plus1 = nal[1] & 7,
++			.slice_segment_addr = sl->slice_segment_addr,
++		};
++		memcpy(&sl->slice_type, &prev->slice_type,
++		       offsetof(struct v4l2_ctrl_hevc_slice_params, reserved0) -
++		       offsetof(struct v4l2_ctrl_hevc_slice_params, slice_type));
++		memcpy(sl->ref_idx_l0, prev->ref_idx_l0, sizeof(sl->ref_idx_l0));
++		memcpy(sl->ref_idx_l1, prev->ref_idx_l1, sizeof(sl->ref_idx_l1));
++		sl->short_term_ref_pic_set_size = prev->short_term_ref_pic_set_size;
++		sl->long_term_ref_pic_set_size = prev->long_term_ref_pic_set_size;
++		sl->pred_weight_table = prev->pred_weight_table;
++		sl->flags = prev->flags | V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT;
++	} else {
++		bool p_or_b, b, tmvp = false, deblock_off, override = false;
++		u8 n0 = pps->num_ref_idx_l0_default_active_minus1;
++		u8 n1 = pps->num_ref_idx_l1_default_active_minus1;
++		u8 entries[2][V4L2_HEVC_DPB_ENTRIES_NUM_MAX] = {};
++		bool modified[2] = {};
++		u32 total = dec->num_poc_st_curr_before + dec->num_poc_st_curr_after +
++			    dec->num_poc_lt_curr;
++		int ret;
++
++		/* collocated_from_l0_flag is inferred to be 1 when absent (7.4.7.1) */
++		sl->flags |= SL_COL_FROM_L0;
++		rbsp_skip(&r, pps->num_extra_slice_header_bits);
++		v = rbsp_ue(&r);
++		if (v > V4L2_HEVC_SLICE_TYPE_I)
++			return -EINVAL;
++		sl->slice_type = v;
++		p_or_b = v != V4L2_HEVC_SLICE_TYPE_I;
++		b = v == V4L2_HEVC_SLICE_TYPE_B;
++		if (pf & V4L2_HEVC_PPS_FLAG_OUTPUT_FLAG_PRESENT)
++			rbsp_bit(&r);		/* pic_output_flag */
++		if (sps->flags & V4L2_HEVC_SPS_FLAG_SEPARATE_COLOUR_PLANE)
++			sl->colour_plane_id = rbsp_u(&r, 2);
++		if (nut != NAL_IDR_W_RADL && nut != NAL_IDR_N_LP) {
++			rbsp_skip(&r, sps->log2_max_pic_order_cnt_lsb_minus4 + 4);
++			if (!rbsp_bit(&r))	/* short_term_ref_pic_set_sps_flag */
++				rbsp_skip(&r, dec->short_term_ref_pic_set_size);
++			else if (sps->num_short_term_ref_pic_sets > 1)
++				rbsp_skip(&r, ceil_log2(sps->num_short_term_ref_pic_sets));
++			if (sps->flags & V4L2_HEVC_SPS_FLAG_LONG_TERM_REF_PICS_PRESENT)
++				rbsp_skip(&r, dec->long_term_ref_pic_set_size);
++			if (sps->flags & V4L2_HEVC_SPS_FLAG_SPS_TEMPORAL_MVP_ENABLED)
++				tmvp = rbsp_bit(&r);
++		}
++		if (tmvp)
++			sl->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_TEMPORAL_MVP_ENABLED;
++		if (sps->flags & V4L2_HEVC_SPS_FLAG_SAMPLE_ADAPTIVE_OFFSET) {
++			sao_luma = rbsp_bit(&r);
++			if (chroma)
++				sao_chroma = rbsp_bit(&r);
++		}
++		if (sao_luma)
++			sl->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_SAO_LUMA;
++		if (sao_chroma)
++			sl->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_SAO_CHROMA;
++		if (p_or_b) {
++			if (rbsp_bit(&r)) {	/* num_ref_idx_active_override_flag */
++				v = rbsp_ue(&r);
++				if (v > 14)
++					return -EINVAL;
++				n0 = v;
++				if (b) {
++					v = rbsp_ue(&r);
++					if (v > 14)
++						return -EINVAL;
++					n1 = v;
++				}
++			}
++			if ((pf & V4L2_HEVC_PPS_FLAG_LISTS_MODIFICATION_PRESENT) && total > 1) {
++				unsigned int bits = ceil_log2(total);
++				int l;
++
++				for (l = 0; l < (b ? 2 : 1); l++) {
++					modified[l] = rbsp_bit(&r);
++					if (!modified[l])
++						continue;
++					for (i = 0; i <= (l ? n1 : n0); i++)
++						entries[l][i] = rbsp_u(&r, bits);
++				}
++			}
++			if (b && rbsp_bit(&r))
++				sl->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_MVD_L1_ZERO;
++			if ((pf & V4L2_HEVC_PPS_FLAG_CABAC_INIT_PRESENT) && rbsp_bit(&r))
++				sl->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_CABAC_INIT;
++			if (tmvp) {
++				bool from_l0 = true;
++
++				if (b)
++					from_l0 = rbsp_bit(&r);
++				if (!from_l0)
++					sl->flags &= ~SL_COL_FROM_L0;
++				if ((from_l0 && n0 > 0) || (!from_l0 && n1 > 0)) {
++					v = rbsp_ue(&r);
++					if (v > (from_l0 ? n0 : n1))
++						return -EINVAL;
++					sl->collocated_ref_idx = v;
++				}
++			}
++			if (((pf & V4L2_HEVC_PPS_FLAG_WEIGHTED_PRED) && !b) ||
++			    ((pf & V4L2_HEVC_PPS_FLAG_WEIGHTED_BIPRED) && b)) {
++				ret = parse_pred_weights(&r, chroma, b, n0, n1,
++							 &sl->pred_weight_table);
++				if (ret)
++					return ret;
++			}
++			v = rbsp_ue(&r);
++			if (v > 4)
++				return -EINVAL;
++			sl->five_minus_max_num_merge_cand = v;
++			sl->num_ref_idx_l0_active_minus1 = n0;
++			sl->num_ref_idx_l1_active_minus1 = b ? n1 : 0;
++			ret = build_list(dec, false, n0 + 1, entries[0], modified[0],
++					 sl->ref_idx_l0);
++			if (!ret && b)
++				ret = build_list(dec, true, n1 + 1, entries[1], modified[1],
++						 sl->ref_idx_l1);
++			if (ret)
++				return ret;
++		}
++		v = rbsp_se(&r);
++		if ((s32)v < -128 || (s32)v > 127)
++			return -EINVAL;
++		sl->slice_qp_delta = (s32)v;
++		if (pf & V4L2_HEVC_PPS_FLAG_PPS_SLICE_CHROMA_QP_OFFSETS_PRESENT) {
++			s32 cb = rbsp_se(&r), cr = rbsp_se(&r);
++
++			if (cb < -12 || cb > 12 || cr < -12 || cr > 12)
++				return -EINVAL;
++			sl->slice_cb_qp_offset = cb;
++			sl->slice_cr_qp_offset = cr;
++		}
++		deblock_off = !!(pf & V4L2_HEVC_PPS_FLAG_PPS_DISABLE_DEBLOCKING_FILTER);
++		sl->slice_beta_offset_div2 = pps->pps_beta_offset_div2;
++		sl->slice_tc_offset_div2 = pps->pps_tc_offset_div2;
++		if (pf & V4L2_HEVC_PPS_FLAG_DEBLOCKING_FILTER_OVERRIDE_ENABLED)
++			override = rbsp_bit(&r);
++		if (override) {
++			deblock_off = rbsp_bit(&r);
++			if (!deblock_off) {
++				s32 beta = rbsp_se(&r), tc = rbsp_se(&r);
++
++				if (beta < -6 || beta > 6 || tc < -6 || tc > 6)
++					return -EINVAL;
++				sl->slice_beta_offset_div2 = beta;
++				sl->slice_tc_offset_div2 = tc;
++			}
++		}
++		if (deblock_off)
++			sl->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_DEBLOCKING_FILTER_DISABLED;
++		/* inferred equal to the PPS flag when absent */
++		if ((pf & PPS_LF_ACROSS) && (sao_luma || sao_chroma || !deblock_off)) {
++			if (rbsp_bit(&r))
++				sl->flags |= SL_LF_ACROSS;
++		} else if (pf & PPS_LF_ACROSS) {
++			sl->flags |= SL_LF_ACROSS;
++		}
++	}
++	if (pf & (V4L2_HEVC_PPS_FLAG_TILES_ENABLED |
++		  V4L2_HEVC_PPS_FLAG_ENTROPY_CODING_SYNC_ENABLED)) {
++		u32 n = rbsp_ue(&r), bits;
++
++		if (n > max_entry_points || n >= AVD_HEVC_MAX_ENTRY_POINTS)
++			return -EINVAL;
++		sl->num_entry_point_offsets = n;
++		if (n) {
++			bits = rbsp_ue(&r) + 1;
++			if (bits > 32)
++				return -EINVAL;
++			for (i = 0; i < n; i++)
++				entry_points[i] = rbsp_u(&r, bits) + 1;
++		}
++	}
++	if (pf & V4L2_HEVC_PPS_FLAG_SLICE_SEGMENT_HEADER_EXTENSION_PRESENT)
++		rbsp_skip(&r, 8 * rbsp_ue(&r));
++	/* byte_alignment(): one bit equal to 1, then zero bits */
++	if (!rbsp_bit(&r))
++		return -EINVAL;
++	while (r.bit && !r.err)
++		if (rbsp_bit(&r))
++			return -EINVAL;
++	if (r.err || r.pos >= len)
++		return -EINVAL;
++	*header_bytes = r.pos;
++	sl->data_byte_offset = r.pos;
++	sl->bit_size = len * 8;
++	return 0;
++}
++
++/* Next start code at or after *pos; returns its length (3 or 4) or 0. */
++static u32 next_start_code(const u8 *buf, u32 len, u32 *pos)
++{
++	u32 i;
++
++	for (i = *pos; i + 3 <= len; i++) {
++		if (buf[i] || buf[i + 1])
++			continue;
++		if (buf[i + 2] == 1) {
++			*pos = i;
++			return 3;
++		}
++		if (i + 4 <= len && !buf[i + 2] && buf[i + 3] == 1) {
++			*pos = i;
++			return 4;
++		}
++	}
++	*pos = len;
++	return 0;
++}
++
++/**
++ * avd_hevc_parse_picture() - slice parameters of an Annex-B picture
++ *
++ * Fills one entry of @sl per slice segment NAL unit and the picture's entry
++ * points in slice order. Each slice's region runs from the end of the previous
++ * slice (the buffer start for the first) to the end of its own NAL unit, so
++ * start codes and non-slice NAL units count as header bytes of the next slice.
++ *
++ * Return: 0, or -EINVAL if any slice header cannot be described.
++ */
++int avd_hevc_parse_picture(const u8 *buf, u32 len,
++			   const struct v4l2_ctrl_hevc_sps *sps,
++			   const struct v4l2_ctrl_hevc_pps *pps,
++			   const struct v4l2_ctrl_hevc_decode_params *dec,
++			   struct v4l2_ctrl_hevc_slice_params *sl, u32 max_slices,
++			   u32 *entry_points, u32 max_entry_points,
++			   u32 *num_slices, u32 *num_entry_points)
++{
++	u32 pos = 0, region = 0, ns = 0, nep = 0;
++	u32 sc = next_start_code(buf, len, &pos);
++
++	if (!sc || pos)
++		return -EINVAL;
++	while (sc) {
++		u32 nal = pos + sc, end = nal, hdr, nut;
++		int ret;
++
++		sc = next_start_code(buf, len, &end);
++		/* trailing zero bytes belong to the next start code (B.2) */
++		pos = end;
++		while (end > nal && !buf[end - 1])
++			end--;
++		if (end - nal < 2)
++			return -EINVAL;
++		nut = (buf[nal] >> 1) & 0x3f;
++		if (nut > 21 || (nut > 9 && nut < 16))
++			continue;	/* not a slice: header bytes of the next one */
++		if (ns == max_slices)
++			return -EINVAL;
++		ret = avd_hevc_parse_slice(buf + nal, end - nal, sps, pps, dec,
++					   ns ? &sl[ns - 1] : NULL, &sl[ns],
++					   entry_points + nep, max_entry_points - nep, &hdr);
++		if (ret)
++			return ret;
++		sl[ns].data_byte_offset = nal - region + hdr;
++		sl[ns].bit_size = (end - region) * 8;
++		nep += sl[ns].num_entry_point_offsets;
++		region = end;
++		ns++;
++	}
++	if (!ns)
++		return -EINVAL;
++	*num_slices = ns;
++	*num_entry_points = nep;
++	return 0;
++}
+diff --git a/drivers/media/platform/apple/avd/avd-hevc-parse.h b/drivers/media/platform/apple/avd/avd-hevc-parse.h
+new file mode 100644
+index 0000000000..110ca0b170
+--- /dev/null
++++ b/drivers/media/platform/apple/avd/avd-hevc-parse.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Apple AVD: HEVC slice segment headers for frame-based decoding.
++ *
++ * Copyright The Aurora Silicon Contributors
++ */
++#ifndef _AVD_HEVC_PARSE_H
++#define _AVD_HEVC_PARSE_H
++
++#include <linux/types.h>
++#include <media/v4l2-ctrls.h>
++
++/* Most slice segments and entry points one picture may describe. */
++#define AVD_HEVC_MAX_SLICES	600
++#define AVD_HEVC_MAX_ENTRY_POINTS	256
++
++bool avd_hevc_annexb(const u8 *buf, u32 len);
++int avd_hevc_parse_slice(const u8 *nal, u32 len,
++			 const struct v4l2_ctrl_hevc_sps *sps,
++			 const struct v4l2_ctrl_hevc_pps *pps,
++			 const struct v4l2_ctrl_hevc_decode_params *dec,
++			 const struct v4l2_ctrl_hevc_slice_params *prev,
++			 struct v4l2_ctrl_hevc_slice_params *sl,
++			 u32 *entry_points, u32 max_entry_points,
++			 u32 *header_bytes);
++int avd_hevc_parse_picture(const u8 *buf, u32 len,
++			   const struct v4l2_ctrl_hevc_sps *sps,
++			   const struct v4l2_ctrl_hevc_pps *pps,
++			   const struct v4l2_ctrl_hevc_decode_params *dec,
++			   struct v4l2_ctrl_hevc_slice_params *sl, u32 max_slices,
++			   u32 *entry_points, u32 max_entry_points,
++			   u32 *num_slices, u32 *num_entry_points);
++
++#endif /* _AVD_HEVC_PARSE_H */
+diff --git a/drivers/media/platform/apple/avd/avd-hevc-test.c b/drivers/media/platform/apple/avd/avd-hevc-test.c
+new file mode 100644
+index 0000000000..e4ea282341
+--- /dev/null
++++ b/drivers/media/platform/apple/avd/avd-hevc-test.c
+@@ -0,0 +1,385 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * KUnit tests for the AVD HEVC frame-based slice header reader.
++ *
++ * Every slice header here is written field by field from H.265 7.3.6.1 with a
++ * bit writer that inserts emulation prevention bytes, then read back.
++ *
++ * Copyright The Aurora Silicon Contributors
++ */
++#include <kunit/test.h>
++#include <linux/string.h>
++
++#include "avd-hevc-parse.h"
++
++struct bw {
++	u8 buf[256];
++	u32 bytes;	/* RBSP bytes completed */
++	u32 acc, nacc;
++};
++
++static void put(struct bw *w, u32 v, unsigned int n)
++{
++	while (n--) {
++		w->acc = (w->acc << 1) | ((v >> n) & 1);
++		if (++w->nacc == 8) {
++			w->buf[w->bytes++] = w->acc;
++			w->acc = 0;
++			w->nacc = 0;
++		}
++	}
++}
++
++static void ue(struct bw *w, u32 v)
++{
++	u32 x = v + 1;
++	unsigned int len = fls(x);
++
++	put(w, 0, len - 1);
++	put(w, x, len);
++}
++
++static void se(struct bw *w, s32 v)
++{
++	ue(w, v > 0 ? 2 * v - 1 : -2 * v);
++}
++
++/* byte_alignment(), then 'data' bytes of slice data (0xa5) */
++static void finish(struct bw *w, unsigned int data)
++{
++	put(w, 1, 1);
++	while (w->nacc)
++		put(w, 0, 1);
++	while (data--)
++		w->buf[w->bytes++] = 0xa5;
++}
++
++/* NAL bytes with emulation prevention: returns length written to out */
++static u32 escape(const struct bw *w, u8 *out)
++{
++	u32 i, n = 0, zeros = 0;
++
++	for (i = 0; i < w->bytes; i++) {
++		if (zeros >= 2 && w->buf[i] <= 3) {
++			out[n++] = 3;
++			zeros = 0;
++		}
++		out[n++] = w->buf[i];
++		zeros = w->buf[i] ? 0 : zeros + 1;
++	}
++	return n;
++}
++
++static void nal_header(struct bw *w, u8 type)
++{
++	put(w, 0, 1);		/* forbidden_zero_bit */
++	put(w, type, 6);
++	put(w, 0, 6);		/* nuh_layer_id */
++	put(w, 1, 3);		/* nuh_temporal_id_plus1 */
++}
++
++static void params(struct v4l2_ctrl_hevc_sps *sps, struct v4l2_ctrl_hevc_pps *pps,
++		   struct v4l2_ctrl_hevc_decode_params *dec)
++{
++	memset(sps, 0, sizeof(*sps));
++	memset(pps, 0, sizeof(*pps));
++	memset(dec, 0, sizeof(*dec));
++	sps->pic_width_in_luma_samples = 1920;
++	sps->pic_height_in_luma_samples = 1088;
++	sps->chroma_format_idc = 1;
++	sps->log2_min_luma_coding_block_size_minus3 = 0;
++	sps->log2_diff_max_min_luma_coding_block_size = 3;	/* 64x64 CTBs: 30x17 */
++	sps->log2_max_pic_order_cnt_lsb_minus4 = 4;		/* 8-bit POC lsb */
++	sps->num_short_term_ref_pic_sets = 3;
++	sps->flags = V4L2_HEVC_SPS_FLAG_SAMPLE_ADAPTIVE_OFFSET |
++		     V4L2_HEVC_SPS_FLAG_SPS_TEMPORAL_MVP_ENABLED;
++	pps->pic_parameter_set_id = 0;
++	pps->num_ref_idx_l0_default_active_minus1 = 1;
++	pps->num_ref_idx_l1_default_active_minus1 = 0;
++	pps->pps_beta_offset_div2 = 1;
++	pps->pps_tc_offset_div2 = -1;
++	pps->flags = V4L2_HEVC_PPS_FLAG_PPS_SLICE_CHROMA_QP_OFFSETS_PRESENT |
++		     V4L2_HEVC_PPS_FLAG_DEBLOCKING_FILTER_OVERRIDE_ENABLED |
++		     V4L2_HEVC_PPS_FLAG_PPS_LOOP_FILTER_ACROSS_SLICES_ENABLED |
++		     V4L2_HEVC_PPS_FLAG_CABAC_INIT_PRESENT;
++	dec->pic_order_cnt_val = 8;
++	dec->num_poc_st_curr_before = 2;
++	dec->poc_st_curr_before[0] = 3;
++	dec->poc_st_curr_before[1] = 1;
++	dec->num_poc_st_curr_after = 1;
++	dec->poc_st_curr_after[0] = 5;
++}
++
++static void hevc_idr_i_slice(struct kunit *test)
++{
++	struct v4l2_ctrl_hevc_sps sps;
++	struct v4l2_ctrl_hevc_pps pps;
++	struct v4l2_ctrl_hevc_decode_params dec;
++	struct v4l2_ctrl_hevc_slice_params sl;
++	struct bw w = {};
++	u8 nal[300];
++	u32 ep[4], hdr, n;
++
++	params(&sps, &pps, &dec);
++	nal_header(&w, 19);	/* IDR_W_RADL */
++	put(&w, 1, 1);		/* first_slice_segment_in_pic_flag */
++	put(&w, 0, 1);		/* no_output_of_prior_pics_flag */
++	ue(&w, 0);		/* slice_pic_parameter_set_id */
++	ue(&w, 2);		/* slice_type I */
++	put(&w, 1, 1);		/* slice_sao_luma_flag */
++	put(&w, 0, 1);		/* slice_sao_chroma_flag */
++	se(&w, -3);		/* slice_qp_delta */
++	se(&w, 2);		/* slice_cb_qp_offset */
++	se(&w, -1);		/* slice_cr_qp_offset */
++	put(&w, 1, 1);		/* deblocking_filter_override_flag */
++	put(&w, 0, 1);		/* slice_deblocking_filter_disabled_flag */
++	se(&w, -2);		/* slice_beta_offset_div2 */
++	se(&w, 3);		/* slice_tc_offset_div2 */
++	put(&w, 1, 1);		/* slice_loop_filter_across_slices_enabled_flag */
++	n = w.bytes;
++	finish(&w, 10);
++	n = escape(&w, nal);
++
++	KUNIT_ASSERT_EQ(test, avd_hevc_parse_slice(nal, n, &sps, &pps, &dec, NULL, &sl,
++						   ep, 4, &hdr), 0);
++	KUNIT_EXPECT_EQ(test, sl.nal_unit_type, 19);
++	KUNIT_EXPECT_EQ(test, sl.slice_type, V4L2_HEVC_SLICE_TYPE_I);
++	/* inferred when absent (7.4.7.1), as libva sets it */
++	KUNIT_EXPECT_TRUE(test, sl.flags &
++			  V4L2_HEVC_SLICE_PARAMS_FLAG_COLLOCATED_FROM_L0);
++	KUNIT_EXPECT_EQ(test, sl.slice_qp_delta, -3);
++	KUNIT_EXPECT_EQ(test, sl.slice_cb_qp_offset, 2);
++	KUNIT_EXPECT_EQ(test, sl.slice_cr_qp_offset, -1);
++	KUNIT_EXPECT_EQ(test, sl.slice_beta_offset_div2, -2);
++	KUNIT_EXPECT_EQ(test, sl.slice_tc_offset_div2, 3);
++	KUNIT_EXPECT_EQ(test, sl.slice_pic_order_cnt, 8);
++	KUNIT_EXPECT_EQ(test, sl.slice_segment_addr, 0);
++	KUNIT_EXPECT_TRUE(test, sl.flags & V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_SAO_LUMA);
++	KUNIT_EXPECT_FALSE(test, sl.flags & V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_SAO_CHROMA);
++	KUNIT_EXPECT_TRUE(test, sl.flags &
++			  V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_LOOP_FILTER_ACROSS_SLICES_ENABLED);
++	KUNIT_EXPECT_EQ(test, hdr, n - 10);
++	KUNIT_EXPECT_EQ(test, sl.data_byte_offset, n - 10);
++	KUNIT_EXPECT_EQ(test, sl.bit_size, n * 8);
++}
++
++static void hevc_b_slice_lists(struct kunit *test)
++{
++	struct v4l2_ctrl_hevc_sps sps;
++	struct v4l2_ctrl_hevc_pps pps;
++	struct v4l2_ctrl_hevc_decode_params dec;
++	struct v4l2_ctrl_hevc_slice_params sl;
++	struct bw w = {};
++	u8 nal[300];
++	u32 ep[4], hdr, n;
++
++	params(&sps, &pps, &dec);
++	pps.flags |= V4L2_HEVC_PPS_FLAG_LISTS_MODIFICATION_PRESENT |
++		     V4L2_HEVC_PPS_FLAG_WEIGHTED_BIPRED | V4L2_HEVC_PPS_FLAG_TILES_ENABLED;
++	nal_header(&w, 1);	/* TRAIL_R */
++	put(&w, 0, 1);		/* first_slice_segment_in_pic_flag */
++	ue(&w, 0);		/* pps id */
++	put(&w, 37, 9);		/* slice_segment_address, Ceil(Log2(510)) = 9 bits */
++	ue(&w, 0);		/* slice_type B */
++	put(&w, 0x5a, 8);	/* slice_pic_order_cnt_lsb */
++	put(&w, 1, 1);		/* short_term_ref_pic_set_sps_flag */
++	put(&w, 2, 2);		/* short_term_ref_pic_set_idx */
++	put(&w, 1, 1);		/* slice_temporal_mvp_enabled_flag */
++	put(&w, 0, 1);		/* sao luma */
++	put(&w, 1, 1);		/* sao chroma */
++	put(&w, 1, 1);		/* num_ref_idx_active_override_flag */
++	ue(&w, 1);		/* num_ref_idx_l0_active_minus1 */
++	ue(&w, 1);		/* num_ref_idx_l1_active_minus1 */
++	put(&w, 1, 1);		/* ref_pic_list_modification_flag_l0 */
++	put(&w, 2, 2);		/* list_entry_l0[0]: Ceil(Log2(3)) = 2 bits */
++	put(&w, 0, 2);		/* list_entry_l0[1] */
++	put(&w, 0, 1);		/* ref_pic_list_modification_flag_l1 */
++	put(&w, 1, 1);		/* mvd_l1_zero_flag */
++	put(&w, 1, 1);		/* cabac_init_flag */
++	put(&w, 0, 1);		/* collocated_from_l0_flag */
++	ue(&w, 1);		/* collocated_ref_idx */
++	/* pred_weight_table */
++	ue(&w, 6);		/* luma_log2_weight_denom */
++	se(&w, -1);		/* delta_chroma_log2_weight_denom */
++	put(&w, 0x2, 2);	/* luma_weight_l0_flag[0..1] */
++	put(&w, 0x1, 2);	/* chroma_weight_l0_flag[0..1] */
++	se(&w, 4); se(&w, -7);	/* l0[0]: luma weight/offset (flag 1 on [0]) */
++	se(&w, 3); se(&w, 10);	/* l0[1] chroma 0: delta weight, delta offset */
++	se(&w, -2); se(&w, -4);	/* l0[1] chroma 1 */
++	put(&w, 0, 2);		/* luma_weight_l1_flag[0..1] */
++	put(&w, 0, 2);		/* chroma_weight_l1_flag[0..1] */
++	ue(&w, 1);		/* five_minus_max_num_merge_cand */
++	se(&w, 4);		/* slice_qp_delta */
++	se(&w, 0); se(&w, 0);	/* chroma qp offsets */
++	put(&w, 0, 1);		/* deblocking_filter_override_flag */
++	put(&w, 0, 1);		/* slice_loop_filter_across_slices_enabled_flag */
++	ue(&w, 2);		/* num_entry_point_offsets */
++	ue(&w, 11);		/* offset_len_minus1: 12 bits */
++	put(&w, 99, 12);
++	put(&w, 1999, 12);
++	finish(&w, 8);
++	n = escape(&w, nal);
++
++	KUNIT_ASSERT_EQ(test, avd_hevc_parse_slice(nal, n, &sps, &pps, &dec, NULL, &sl,
++						   ep, 4, &hdr), 0);
++	KUNIT_EXPECT_EQ(test, sl.slice_type, V4L2_HEVC_SLICE_TYPE_B);
++	KUNIT_EXPECT_EQ(test, sl.slice_segment_addr, 37);
++	KUNIT_EXPECT_EQ(test, sl.num_ref_idx_l0_active_minus1, 1);
++	KUNIT_EXPECT_EQ(test, sl.num_ref_idx_l1_active_minus1, 1);
++	/* RefPicListTemp0 = {3, 1, 5}; modified: [2] -> 5, [0] -> 3 */
++	KUNIT_EXPECT_EQ(test, sl.ref_idx_l0[0], 5);
++	KUNIT_EXPECT_EQ(test, sl.ref_idx_l0[1], 3);
++	/* RefPicListTemp1 = {5, 3, 1} */
++	KUNIT_EXPECT_EQ(test, sl.ref_idx_l1[0], 5);
++	KUNIT_EXPECT_EQ(test, sl.ref_idx_l1[1], 3);
++	KUNIT_EXPECT_EQ(test, sl.collocated_ref_idx, 1);
++	KUNIT_EXPECT_FALSE(test, sl.flags & V4L2_HEVC_SLICE_PARAMS_FLAG_COLLOCATED_FROM_L0);
++	KUNIT_EXPECT_TRUE(test, sl.flags & V4L2_HEVC_SLICE_PARAMS_FLAG_MVD_L1_ZERO);
++	KUNIT_EXPECT_TRUE(test, sl.flags & V4L2_HEVC_SLICE_PARAMS_FLAG_CABAC_INIT);
++	KUNIT_EXPECT_TRUE(test, sl.flags & V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_TEMPORAL_MVP_ENABLED);
++	KUNIT_EXPECT_TRUE(test, sl.flags & V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_SAO_CHROMA);
++	KUNIT_EXPECT_EQ(test, sl.pred_weight_table.luma_log2_weight_denom, 6);
++	KUNIT_EXPECT_EQ(test, sl.pred_weight_table.delta_chroma_log2_weight_denom, -1);
++	KUNIT_EXPECT_EQ(test, sl.pred_weight_table.delta_luma_weight_l0[0], 4);
++	KUNIT_EXPECT_EQ(test, sl.pred_weight_table.luma_offset_l0[0], -7);
++	KUNIT_EXPECT_EQ(test, sl.pred_weight_table.delta_chroma_weight_l0[1][0], 3);
++	/* ChromaWeight = 32 + 3 = 35: 128 - (128 * 35 >> 5) + 10 = -2 */
++	KUNIT_EXPECT_EQ(test, sl.pred_weight_table.chroma_offset_l0[1][0], -2);
++	/* ChromaWeight = 30: 128 - 120 - 4 = 4 */
++	KUNIT_EXPECT_EQ(test, sl.pred_weight_table.chroma_offset_l0[1][1], 4);
++	KUNIT_EXPECT_EQ(test, sl.five_minus_max_num_merge_cand, 1);
++	KUNIT_EXPECT_EQ(test, sl.slice_qp_delta, 4);
++	KUNIT_EXPECT_EQ(test, sl.num_entry_point_offsets, 2);
++	KUNIT_EXPECT_EQ(test, ep[0], 100);
++	KUNIT_EXPECT_EQ(test, ep[1], 2000);
++	KUNIT_EXPECT_EQ(test, hdr, n - 8);
++}
++
++static void hevc_dependent_segment(struct kunit *test)
++{
++	struct v4l2_ctrl_hevc_sps sps;
++	struct v4l2_ctrl_hevc_pps pps;
++	struct v4l2_ctrl_hevc_decode_params dec;
++	struct v4l2_ctrl_hevc_slice_params prev = {}, sl;
++	struct bw w = {};
++	u8 nal[64];
++	u32 ep[4], hdr, n;
++
++	params(&sps, &pps, &dec);
++	pps.flags |= V4L2_HEVC_PPS_FLAG_DEPENDENT_SLICE_SEGMENT_ENABLED;
++	prev.slice_type = V4L2_HEVC_SLICE_TYPE_P;
++	prev.slice_qp_delta = 5;
++	prev.ref_idx_l0[0] = 3;
++	prev.flags = V4L2_HEVC_SLICE_PARAMS_FLAG_CABAC_INIT;
++	nal_header(&w, 1);
++	put(&w, 0, 1);		/* not the first segment */
++	ue(&w, 0);
++	put(&w, 1, 1);		/* dependent_slice_segment_flag */
++	put(&w, 100, 9);	/* slice_segment_address */
++	finish(&w, 4);
++	n = escape(&w, nal);
++
++	KUNIT_ASSERT_EQ(test, avd_hevc_parse_slice(nal, n, &sps, &pps, &dec, &prev, &sl,
++						   ep, 4, &hdr), 0);
++	KUNIT_EXPECT_EQ(test, sl.slice_segment_addr, 100);
++	KUNIT_EXPECT_EQ(test, sl.slice_type, V4L2_HEVC_SLICE_TYPE_P);
++	KUNIT_EXPECT_EQ(test, sl.slice_qp_delta, 5);
++	KUNIT_EXPECT_EQ(test, sl.ref_idx_l0[0], 3);
++	KUNIT_EXPECT_TRUE(test, sl.flags & V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT);
++	KUNIT_EXPECT_TRUE(test, sl.flags & V4L2_HEVC_SLICE_PARAMS_FLAG_CABAC_INIT);
++	/* a dependent segment needs a previous one */
++	KUNIT_EXPECT_EQ(test, avd_hevc_parse_slice(nal, n, &sps, &pps, &dec, NULL, &sl,
++						   ep, 4, &hdr), -EINVAL);
++}
++
++static void hevc_picture_regions(struct kunit *test)
++{
++	struct v4l2_ctrl_hevc_sps sps;
++	struct v4l2_ctrl_hevc_pps pps;
++	struct v4l2_ctrl_hevc_decode_params dec;
++	struct v4l2_ctrl_hevc_slice_params *sl;
++	struct bw a = {}, b = {};
++	u8 buf[256], na[64], nb[64];
++	u32 ep[4], ns = 0, nep = 0, la, lb, pos = 0;
++
++	sl = kunit_kcalloc(test, 4, sizeof(*sl), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, sl);
++	params(&sps, &pps, &dec);
++	nal_header(&a, 19);
++	put(&a, 1, 1); put(&a, 0, 1); ue(&a, 0); ue(&a, 2);
++	put(&a, 0, 1); put(&a, 0, 1);		/* sao */
++	se(&a, 0); se(&a, 0); se(&a, 0);	/* qp delta, chroma offsets */
++	put(&a, 0, 1);				/* no deblocking override */
++	put(&a, 0, 1);				/* loop filter across slices */
++	finish(&a, 6);
++	la = escape(&a, na);
++	nal_header(&b, 19);
++	put(&b, 0, 1); put(&b, 0, 1); ue(&b, 0); put(&b, 255, 9); ue(&b, 2);
++	put(&b, 0, 1); put(&b, 0, 1);
++	se(&b, 0); se(&b, 0); se(&b, 0);
++	put(&b, 0, 1); put(&b, 0, 1);
++	finish(&b, 5);
++	lb = escape(&b, nb);
++
++	/*
++	 * 3-byte start code, slice A, an AUD (type 35) with a 4-byte start
++	 * code, slice B with a 4-byte start code
++	 */
++	buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 1;
++	memcpy(buf + pos, na, la); pos += la;
++	buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 1;
++	buf[pos++] = 35 << 1; buf[pos++] = 1; buf[pos++] = 0x50;
++	buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 1;
++	memcpy(buf + pos, nb, lb); pos += lb;
++
++	KUNIT_EXPECT_TRUE(test, avd_hevc_annexb(buf, pos));
++	KUNIT_EXPECT_FALSE(test, avd_hevc_annexb(na, la));
++	KUNIT_ASSERT_EQ(test, avd_hevc_parse_picture(buf, pos, &sps, &pps, &dec, sl, 4,
++						     ep, 4, &ns, &nep), 0);
++	KUNIT_ASSERT_EQ(test, ns, 2);
++	/* slice A: start code + NAL; its data after the header */
++	KUNIT_EXPECT_EQ(test, sl[0].bit_size, (3 + la) * 8);
++	KUNIT_EXPECT_EQ(test, sl[0].bit_size / 8 - sl[0].data_byte_offset, 6);
++	/* slice B's region: the AUD and both start codes are its prefix */
++	KUNIT_EXPECT_EQ(test, sl[1].bit_size, (pos - 3 - la) * 8);
++	KUNIT_EXPECT_EQ(test, sl[1].bit_size / 8 - sl[1].data_byte_offset, 5);
++	KUNIT_EXPECT_EQ(test, sl[1].slice_segment_addr, 255);
++	/* the regions cover the buffer contiguously */
++	KUNIT_EXPECT_EQ(test, (sl[0].bit_size + sl[1].bit_size) / 8, pos);
++}
++
++static void hevc_refusals(struct kunit *test)
++{
++	struct v4l2_ctrl_hevc_sps sps;
++	struct v4l2_ctrl_hevc_pps pps;
++	struct v4l2_ctrl_hevc_decode_params dec;
++	struct v4l2_ctrl_hevc_slice_params *sl;
++	u8 junk[8] = { 0, 0, 1, 0x40, 1, 0, 0, 0 };	/* VPS only */
++	u32 ep[4], ns, nep;
++
++	sl = kunit_kcalloc(test, 2, sizeof(*sl), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, sl);
++	params(&sps, &pps, &dec);
++	/* no slice in the picture */
++	KUNIT_EXPECT_EQ(test, avd_hevc_parse_picture(junk, 8, &sps, &pps, &dec, sl, 2,
++						     ep, 4, &ns, &nep), -EINVAL);
++	/* does not start with a start code */
++	KUNIT_EXPECT_EQ(test, avd_hevc_parse_picture(junk + 3, 5, &sps, &pps, &dec, sl, 2,
++						     ep, 4, &ns, &nep), -EINVAL);
++}
++
++static struct kunit_case avd_hevc_cases[] = {
++	KUNIT_CASE(hevc_idr_i_slice),
++	KUNIT_CASE(hevc_b_slice_lists),
++	KUNIT_CASE(hevc_dependent_segment),
++	KUNIT_CASE(hevc_picture_regions),
++	KUNIT_CASE(hevc_refusals),
++	{}
++};
++
++static struct kunit_suite avd_hevc_suite = {
++	.name = "avd-hevc-frame",
++	.test_cases = avd_hevc_cases,
++};
++
++kunit_test_suite(avd_hevc_suite);
+diff --git a/drivers/media/platform/apple/avd/avd-hevc.c b/drivers/media/platform/apple/avd/avd-hevc.c
+index 009ff9821c..cfb847dbec 100644
+--- a/drivers/media/platform/apple/avd/avd-hevc.c
++++ b/drivers/media/platform/apple/avd/avd-hevc.c
+@@ -13,11 +13,29 @@
+  *	Tomasz Figa <tfiga@chromium.org>
+  */
+ 
++#include <linux/mm.h>
+ #include <media/videobuf2-dma-contig.h>
+ 
+ #include "avd.h"
++#include "avd-hevc-parse.h"
+ #include "avd-inst.h"
+ 
++/*
++ * Chromium sends each HEVC picture as Annex-B NAL units with no slice
++ * parameters (frame-based decoding). With this set the slice headers are read
++ * from the picture; without it such a picture is refused before it reaches the
++ * hardware.
++ */
++static bool hevc_frame_parse;
++module_param(hevc_frame_parse, bool, 0644);
++MODULE_PARM_DESC(hevc_frame_parse,
++		 "Read HEVC slice headers from Annex-B pictures sent without slice parameters (default: off)");
++
++bool avd_hevc_frame_parse_enabled(void)
++{
++	return READ_ONCE(hevc_frame_parse);
++}
++
+ #define NEW_TILE_ID	BIT(0)
+ #define NEW_SLICE	BIT(1)
+ 
+@@ -71,6 +89,8 @@ struct avd_hevc_run {
+ 
+ 	int num_entry_point_offsets;
+ 	int num_slices;
++	/* the slice parameters were read from the picture */
++	bool parsed;
+ 
+ 	struct run_addr {
+ 		dma_addr_t mv_color;
+@@ -1436,8 +1456,8 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
+ 		kmemdup(ep->p_cur.p, ep->elems * ep->elem_size, GFP_KERNEL);
+ 	v4l2_ctrl_unlock(sl);
+ 	if (!run->sl || !run->entry_point_offsets) {
+-		kfree(run->sl);
+-		kfree(run->entry_point_offsets);
++		kvfree(run->sl);
++		kvfree(run->entry_point_offsets);
+ 		avd_run_postamble(ctx, &run->base);
+ 		return -ENOMEM;
+ 	}
+@@ -1451,6 +1471,82 @@ static int avd_hevc_run_preamble(struct avd_ctx *ctx, struct avd_hevc_run *run)
+ 	return 0;
+ }
+ 
++/*
++ * A request that carries SLICE_PARAMS (VA-API) is described by them and takes
++ * the slice-parameter path unchanged. A request without them (Chromium) gets
++ * them read from its picture, which must then be Annex-B (a slice NAL unit
++ * never starts with two zero bytes, so a start code at the start of the buffer
++ * is unambiguous), and only with hevc_frame_parse on. Anything else is
++ * refused before it reaches the hardware: the stale SLICE_PARAMS of an
++ * earlier request never describe this picture.
++ */
++static bool avd_hevc_req_has_slices(struct avd_ctx *ctx,
++				    struct avd_hevc_run *run)
++{
++	struct media_request *req = run->base.bufs.src->vb2_buf.req_obj.req;
++	struct v4l2_ctrl_handler *hdl;
++	bool has;
++
++	if (!req)
++		return true;
++	hdl = v4l2_ctrl_request_hdl_find(req, &ctx->ctrl_hdl);
++	if (!hdl)
++		return false;
++	has = v4l2_ctrl_request_hdl_ctrl_find(hdl,
++					      V4L2_CID_STATELESS_HEVC_SLICE_PARAMS);
++	v4l2_ctrl_request_hdl_put(hdl);
++	return has;
++}
++
++static int avd_hevc_frame_slices(struct avd_ctx *ctx, struct avd_hevc_run *run)
++{
++	struct vb2_buffer *src = &run->base.bufs.src->vb2_buf;
++	struct v4l2_ctrl_hevc_slice_params *sl;
++	u32 len = vb2_get_plane_payload(src, 0), ns, nep;
++	const u8 *data = vb2_plane_vaddr(src, 0);
++	u32 *ep;
++	int ret;
++
++	if (avd_hevc_req_has_slices(ctx, run))
++		return run->num_slices && run->sl[0].bit_size ? 0 : -EINVAL;
++	if (!data || !avd_hevc_annexb(data, len))
++		return -EINVAL;
++	if (!avd_hevc_frame_parse_enabled()) {
++		dev_warn_once(ctx->dev->dev,
++			      "HEVC picture without slice parameters refused; hevc_frame_parse=1 reads them\n");
++		return -EINVAL;
++	}
++	if (!run->decode || !run->sps || !run->pps)
++		return -EINVAL;
++
++	sl = kvcalloc(AVD_HEVC_MAX_SLICES, sizeof(*sl), GFP_KERNEL);
++	ep = kvcalloc(AVD_HEVC_MAX_ENTRY_POINTS, sizeof(*ep), GFP_KERNEL);
++	if (!sl || !ep) {
++		ret = -ENOMEM;
++		goto err;
++	}
++	ret = avd_hevc_parse_picture(data, len, run->sps, run->pps, run->decode,
++				     sl, AVD_HEVC_MAX_SLICES, ep,
++				     AVD_HEVC_MAX_ENTRY_POINTS, &ns, &nep);
++	if (ret) {
++		dev_dbg(ctx->dev->dev, "HEVC picture slice headers unreadable: %d\n", ret);
++		goto err;
++	}
++	kvfree(run->sl);
++	kvfree(run->entry_point_offsets);
++	run->sl = sl;
++	run->num_slices = ns;
++	run->entry_point_offsets = ep;
++	run->num_entry_point_offsets = nep;
++	run->parsed = true;
++	return 0;
++
++err:
++	kvfree(sl);
++	kvfree(ep);
++	return ret;
++}
++
+ static int avd_hevc_run(struct avd_ctx *ctx)
+ {
+ 	struct avd_hevc_ctx *hevc_ctx = ctx->priv;
+@@ -1467,8 +1563,12 @@ static int avd_hevc_run(struct avd_ctx *ctx)
+ 	if (ret)
+ 		goto complete;
+ 
+-	avd_hevc_normalize_slices(&run,
+-				  vb2_get_plane_payload(&run.base.bufs.src->vb2_buf, 0));
++	ret = avd_hevc_frame_slices(ctx, &run);
++	if (ret)
++		goto complete;
++	if (!run.parsed)
++		avd_hevc_normalize_slices(&run,
++					  vb2_get_plane_payload(&run.base.bufs.src->vb2_buf, 0));
+ 	dst = vb2_to_avd_decoded_buf(&run.base.bufs.dst->vb2_buf);
+ 	update_dec_buf_info(dst, &run.sl[0]);
+ 
+@@ -1504,8 +1604,8 @@ static int avd_hevc_run(struct avd_ctx *ctx)
+ done:
+ 	kfree(run.tile_info.ctb_addr_rs_to_ts);
+ 	kfree(run.tile_info.tile_ids);
+-	kfree(run.sl);
+-	kfree(run.entry_point_offsets);
++	kvfree(run.sl);
++	kvfree(run.entry_point_offsets);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/media/platform/apple/avd/avd-v4l2.c b/drivers/media/platform/apple/avd/avd-v4l2.c
+index 1bafee0ee3..4481917e94 100644
+--- a/drivers/media/platform/apple/avd/avd-v4l2.c
++++ b/drivers/media/platform/apple/avd/avd-v4l2.c
+@@ -1074,6 +1074,15 @@ static int avd_add_ctrls(struct avd_ctx *ctx, const struct avd_ctrls *ctrls)
+ 
+ 	for (i = 0; i < ctrls->num_ctrls; i++) {
+ 		const struct v4l2_ctrl_config *cfg = &ctrls->ctrls[i].cfg;
++		struct v4l2_ctrl_config start_code;
++
++		/* Annex-B pictures are only read with the slice header reader on. */
++		if (cfg->id == V4L2_CID_STATELESS_HEVC_START_CODE &&
++		    avd_hevc_frame_parse_enabled()) {
++			start_code = *cfg;
++			start_code.max = V4L2_STATELESS_HEVC_START_CODE_ANNEX_B;
++			cfg = &start_code;
++		}
+ 
+ 		v4l2_ctrl_new_custom(&ctx->ctrl_hdl, cfg, ctx);
+ 		if (ctx->ctrl_hdl.error)
+diff --git a/drivers/media/platform/apple/avd/avd.h b/drivers/media/platform/apple/avd/avd.h
+index fdd9f34ae5..6686301a56 100644
+--- a/drivers/media/platform/apple/avd/avd.h
++++ b/drivers/media/platform/apple/avd/avd.h
+@@ -389,6 +389,7 @@ bool avd_h264_next_nal(const u8 *buf, u32 len, u32 *pos, u32 *start,
+ 
+ extern const struct avd_coded_fmt_ops avd_h264_fmt_ops;
+ extern const struct avd_coded_fmt_ops avd_hevc_fmt_ops;
++bool avd_hevc_frame_parse_enabled(void);
+ extern const struct avd_coded_fmt_ops avd_vp9_fmt_ops;
+ extern const struct avd_coded_fmt_ops avd_av1_fmt_ops;
+ 
+-- 
+2.43.0
+

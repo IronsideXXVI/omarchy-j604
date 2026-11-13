@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 8 Nov 2026 18:03:24 +0000
+Subject: [PATCH] phy: apple: atc: say whether a port can run
+ SuperSpeed
+
+On the Type-C ports the dwc3 glue starts the controller, and with it
+both xHCI root hubs, only once a cable is attached, so an idle port has
+no root hub of any kind. Nothing then tells whether the port would run
+SuperSpeed: the PHY warns when its calibration is incomplete and is
+silent when it is complete, and the only trace of the USB3 route is a
+debug line that reads PIPE handler registers.
+
+Say it once at probe ("SuperSpeed: ready" or the reason it is not:
+no SuperSpeed banks in the device tree, calibration incomplete, a
+DisplayPort-only PHY), and add a debugfs file atcphy-<device>/state
+with the PHY's own view of the port: SuperSpeed and CIO availability,
+the current and the requested mode, the PIPE backend, the host role,
+the T8132 common-block ownership, failure and suspend flags, and the
+USB3 refusals. Every line comes from driver fields; reading the file
+never touches the hardware, so it is safe in any power state.
+
+KUnit: the state string for each probe outcome and the mode names.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/phy/apple/atc-test.c | 30 +++++++++++++
+ drivers/phy/apple/atc.c      | 87 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 117 insertions(+)
+
+diff --git a/drivers/phy/apple/atc-test.c b/drivers/phy/apple/atc-test.c
+index e3c1454691..03d375b023 100644
+--- a/drivers/phy/apple/atc-test.c
++++ b/drivers/phy/apple/atc-test.c
+@@ -1444,6 +1444,35 @@ static void atcphy_test_t8132_usb3_cold(struct kunit *test)
+ 	KUNIT_EXPECT_NE(test, atcphy->mode, APPLE_ATCPHY_MODE_USB2);
+ }
+ 
++/* The state the debugfs file and the probe line give for each probe outcome. */
++static void atcphy_test_ss_state(struct kunit *test)
++{
++	struct apple_atcphy *atcphy = atcphy_test_alloc_powered_off(test);
++
++	atcphy->hw = &atcphy_hw_t8132;
++	KUNIT_EXPECT_STREQ(test, atcphy_ss_state(atcphy),
++			   "usb2-only (no SuperSpeed banks in the device tree)");
++	atcphy->t8132_ss = true;
++	KUNIT_EXPECT_STREQ(test, atcphy_ss_state(atcphy), "usb2-only (calibration incomplete)");
++	atcphy->ss_tunables = true;
++	KUNIT_EXPECT_STREQ(test, atcphy_ss_state(atcphy), "ready");
++	atcphy->t8132_failed = true;
++	KUNIT_EXPECT_STREQ(test, atcphy_ss_state(atcphy),
++			   "failed (a PHY transition failed, no retry until reset)");
++	atcphy->dp_only = true;
++	KUNIT_EXPECT_STREQ(test, atcphy_ss_state(atcphy), "none (DisplayPort-only PHY)");
++
++	/* Other generations have no banks to describe. */
++	atcphy->hw = &atcphy_hw_t8103;
++	atcphy->dp_only = false;
++	atcphy->t8132_ss = false;
++	KUNIT_EXPECT_STREQ(test, atcphy_ss_state(atcphy), "ready");
++
++	KUNIT_EXPECT_STREQ(test, atcphy_mode_name(APPLE_ATCPHY_MODE_USB3_DP), "usb3-dp");
++	KUNIT_EXPECT_STREQ(test, atcphy_mode_name(APPLE_ATCPHY_MODE_DP), "dp");
++	KUNIT_EXPECT_STREQ(test, atcphy_mode_name((enum atcphy_mode)42), "?");
++}
++
+ static void atcphy_test_t8103_usb3_machine_scope(struct kunit *test)
+ {
+ 	static const struct {
+@@ -1535,6 +1564,7 @@ static struct kunit_case atcphy_t8132_pm_test_cases[] = {
+ 	KUNIT_CASE(atcphy_test_t8132_usb3_dp_not_cold),
+ 	KUNIT_CASE(atcphy_test_t8132_cio_not_cold),
+ 	KUNIT_CASE(atcphy_test_t8132_usb3_cold),
++	KUNIT_CASE(atcphy_test_ss_state),
+ #ifdef CONFIG_SUSPEND
+ 	KUNIT_CASE(atcphy_test_t8132_system_suspend),
+ #endif
+diff --git a/drivers/phy/apple/atc.c b/drivers/phy/apple/atc.c
+index 74745565d3..b6c4afae40 100644
+--- a/drivers/phy/apple/atc.c
++++ b/drivers/phy/apple/atc.c
+@@ -21,6 +21,7 @@
+ #include <kunit/static_stub.h>
+ #include <linux/bitfield.h>
+ #include <linux/cleanup.h>
++#include <linux/debugfs.h>
+ #include <linux/delay.h>
+ #include <linux/devm-helpers.h>
+ #include <linux/iopoll.h>
+@@ -40,6 +41,7 @@
+ #include <linux/pm_domain.h>
+ #include <linux/reset-controller.h>
+ #include <linux/soc/apple/dart.h>
++#include <linux/seq_file.h>
+ #include <linux/soc/apple/dp-tunnel.h>
+ #include <linux/soc/apple/sleep.h>
+ #include <linux/soc/apple/tunable.h>
+@@ -6805,6 +6807,90 @@ static bool atcphy_has_t8103_usb3_workaround(const struct atcphy_hw *hw,
+ }
+ 
+ static void atcphy_sleep_finish_work(struct work_struct *work);
++static const char *const atcphy_mode_names[] = {
++	[APPLE_ATCPHY_MODE_OFF] = "off",
++	[APPLE_ATCPHY_MODE_USB2] = "usb2",
++	[APPLE_ATCPHY_MODE_USB3] = "usb3",
++	[APPLE_ATCPHY_MODE_USB3_DP] = "usb3-dp",
++	[APPLE_ATCPHY_MODE_TBT] = "tbt",
++	[APPLE_ATCPHY_MODE_USB4] = "usb4",
++	[APPLE_ATCPHY_MODE_DP] = "dp",
++};
++
++static const char *atcphy_mode_name(enum atcphy_mode mode)
++{
++	if ((unsigned int)mode >= ARRAY_SIZE(atcphy_mode_names) || !atcphy_mode_names[mode])
++		return "?";
++	return atcphy_mode_names[mode];
++}
++
++/* Whether this PHY can run SuperSpeed, and why not, from what probe found. */
++static const char *atcphy_ss_state(const struct apple_atcphy *atcphy)
++{
++	if (atcphy->dp_only)
++		return "none (DisplayPort-only PHY)";
++	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && !atcphy->t8132_ss)
++		return "usb2-only (no SuperSpeed banks in the device tree)";
++	if (!atcphy->ss_tunables)
++		return "usb2-only (calibration incomplete)";
++	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && atcphy->t8132_failed)
++		return "failed (a PHY transition failed, no retry until reset)";
++	return "ready";
++}
++
++static const char *const atcphy_pipe_names[] = {
++	[ATCPHY_PIPEHANDLER_STATE_DUMMY] = "dummy",
++	[ATCPHY_PIPEHANDLER_STATE_USB3] = "usb3",
++	[ATCPHY_PIPEHANDLER_STATE_USB4] = "usb4",
++};
++
++/*
++ * debugfs atcphy-<device>/state: the driver's own view of the port. Every line
++ * comes from driver fields; nothing reads the hardware, so it can be read in any
++ * power state.
++ */
++static int atcphy_state_show(struct seq_file *s, void *unused)
++{
++	struct apple_atcphy *atcphy = s->private;
++
++	guard(mutex)(&atcphy->lock);
++	seq_printf(s, "superspeed: %s\n", atcphy_ss_state(atcphy));
++	seq_printf(s, "cio: %s\n", atcphy->cio_tunables ? "calibrated" : "no");
++	seq_printf(s, "mode: %s%s\n", atcphy_mode_name(atcphy->mode),
++		   atcphy->mode_dirty ? " (dirty)" : "");
++	seq_printf(s, "typec_mode: %s\n", atcphy_mode_name(atcphy->typec_mode));
++	seq_printf(s, "pipe: %s%s\n",
++		   (unsigned int)atcphy->pipe_state < ARRAY_SIZE(atcphy_pipe_names) ?
++		   atcphy_pipe_names[atcphy->pipe_state] : "?",
++		   atcphy->pipe_pending ? " (pending)" : "");
++	seq_printf(s, "host: %u\n", atcphy->host_active);
++	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
++		seq_printf(s, "t8132: common_owned=%u failed=%u suspended=%u\n",
++			   atcphy->t8132_common_owned, atcphy->t8132_failed,
++			   atcphy->t8132_suspended);
++	seq_printf(s, "usb3_refusals: %u last=%d\n", atcphy->usb3_refusals,
++		   atcphy->usb3_refusal);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(atcphy_state);
++
++static void atcphy_debugfs_remove(void *data)
++{
++	debugfs_remove_recursive(data);
++}
++
++/* Errors are ignored, as everywhere with debugfs: the PHY works without it. */
++static void atcphy_debugfs_init(struct apple_atcphy *atcphy)
++{
++	struct dentry *dir;
++	char name[64];
++
++	dev_info(atcphy->dev, "SuperSpeed: %s\n", atcphy_ss_state(atcphy));
++	snprintf(name, sizeof(name), "atcphy-%s", dev_name(atcphy->dev));
++	dir = debugfs_create_dir(name, NULL);
++	debugfs_create_file("state", 0400, dir, atcphy, &atcphy_state_fops);
++	devm_add_action_or_reset(atcphy->dev, atcphy_debugfs_remove, dir);
++}
+ 
+ static int atcphy_probe(struct platform_device *pdev)
+ {
+@@ -6866,6 +6952,7 @@ static int atcphy_probe(struct platform_device *pdev)
+ 		if (ret)
+ 			return ret;
+ 	}
++	atcphy_debugfs_init(atcphy);
+ 	followed = atcphy_probe_pd_notifier(atcphy);
+ 
+ 	/*
+-- 
+2.43.0
+

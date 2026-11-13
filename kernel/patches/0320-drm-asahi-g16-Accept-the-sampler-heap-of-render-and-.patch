@@ -1,0 +1,288 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 5 Nov 2026 23:43:47 +0000
+Subject: [PATCH] drm/asahi: g16: Accept the sampler heap of render and
+ compute commands
+
+The G16 SUBMIT check refused every render and compute command that named
+a sampler heap. Mesa names one whenever a shader uses a bindless sampler:
+honeykrisp lowers every descriptor-set sampler on native AGX3 to
+bindless_sampler_agx, and gallium names its batch heap whenever it has
+one. So nearly every textured draw or dispatch was refused with EINVAL.
+
+Admit the heap the way the G17 backend does (command::sampler and the
+descriptor sampler fields): at most 1024 samplers, the address and count
+both zero or both nonzero, an eight-byte aligned address, and readable
+user memory for count * 8 bytes. Write the address, the count and the
+count plus one (zero without samplers) into the firmware records.
+
+The 25G83 G16 records have no captured sampler fields, so their offsets
+are taken from the G17 descriptors by alignment:
+
+  - compute: the G16 compute record is the G17 ComputeDescriptor shifted
+    down by 0x740. Its 0x1a440 value (0x7c8), u32::MAX word (0x7e8),
+    preempt/end addresses (0x798/0x7a0) and stamp, auxiliary stamp and
+    stamp value (0x800/0x808/0x810) sit at the G17 offsets minus 0x740,
+    which places sampler_heap_va (G17 0xf2c) at 0x7ec, the count at
+    0x7f4 and the bound at 0x7f8.
+
+  - render: the TA record tail is the G17 TaDescriptor shifted down by
+    0x2e. Stamp, auxiliary stamp, stamp value, qid (0x70) and the
+    first-kick word (1) sit at the G17 offsets minus 0x2e, and the
+    timestamp context cell sits four bytes before the predecessor ID in
+    both records, as in compute. That places sampler_heap_va (G17 0x87a)
+    at 0x84c, the count at 0x854 and the bound at 0x858. The fragment
+    record, as on G17, has none.
+
+None of these words is written by the existing encoders. Because the
+offsets are inferred, the new g16_sampler_heap module parameter (default
+1) restores the old refusal without a rebuild.
+
+Based on the G17 sampler-heap admission and descriptor fields from
+859a5d9632 ("drm/asahi: add the T8140 firmware interface") by
+DjDeveloperr <hey@djdev.me>.
+
+Build-tested only. The record offsets are not yet qualified on hardware.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit f6fca84553c649e344fea7c049702300fd0fd59d)
+---
+ drivers/gpu/drm/asahi/asahi_core.rs          |  4 +++
+ drivers/gpu/drm/asahi/g16/command.rs         | 30 ++++++++++++++++----
+ drivers/gpu/drm/asahi/g16/encode.rs          | 10 +++++++
+ drivers/gpu/drm/asahi/g16/encode/compute.rs  | 17 ++++++++++-
+ drivers/gpu/drm/asahi/g16/encode/render.rs   |  4 +++
+ drivers/gpu/drm/asahi/g16/fw/work.rs         |  7 +++++
+ drivers/gpu/drm/asahi/g16/fw/work/compute.rs | 11 +++++++
+ drivers/gpu/drm/asahi/g16/params.rs          |  5 ++++
+ 8 files changed, 81 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index 8dcfc3ad8c..c3e62a34c6 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -271,5 +271,9 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 1,
+             description: "G16: validate CDM/VDM stream records",
+         },
++        g16_sampler_heap: u32 {
++            default: 1,
++            description: "G16: accept render/compute sampler heaps (0 refuses them)",
++        },
+     },
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/command.rs b/drivers/gpu/drm/asahi/g16/command.rs
+index a2b3297894..b326701955 100644
+--- a/drivers/gpu/drm/asahi/g16/command.rs
++++ b/drivers/gpu/drm/asahi/g16/command.rs
+@@ -9,12 +9,14 @@
+ //! Render/compute attachments are retained with the immutable command; the whole
+ //! VM job guard protects indirect and bindless accesses through retirement.
+ //! Exact historical prefixes become immutable per-command dependencies. Ray-query state
+-//! remains disabled.
++//! remains disabled. A sampler heap is admitted as on G17: at most 1024 samplers, eight-byte
++//! aligned, both fields zero or both nonzero, and readable user memory.
+ 
+ use core::mem::{offset_of, size_of};
+ use core::ops::Range;
+ use kernel::{prelude::*, uapi, xarray};
+ 
++use super::fw::work::compute;
+ use super::{gate, hw};
+ use crate::{file, mmu, util::AnyBitPattern, util::Reader};
+ 
+@@ -542,8 +544,6 @@ fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Resu
+         || !matches!(cmd.utile_width_px, 16 | 32)
+         || !matches!(cmd.utile_height_px, 16 | 32)
+         || tile_buffer > MAX_TILE_BUFFER
+-        || cmd.sampler_heap != 0
+-        || cmd.sampler_count != 0
+         || cmd.ppp_ctrl & !0x203 != 0
+         || cmd.zls_ctrl & !0x00000000060cc0aa != 0
+         || cmd.isp_zls_pixels & 0xc0000000 != 0
+@@ -609,7 +609,7 @@ fn check_render(context: &Context<'_>, cmd: &uapi::drm_asahi_cmd_render) -> Resu
+     }
+     check_zls_plane(context, cmd, false)?;
+     check_zls_plane(context, cmd, true)?;
+-    Ok(())
++    check_sampler(vm, cmd.sampler_heap, cmd.sampler_count.into())
+ }
+ 
+ /// Per-command compute admission.
+@@ -621,8 +621,6 @@ fn check_compute(
+     let vm = context.vm;
+     let (base, end) = (cmd.cdm_ctrl_stream_base, cmd.cdm_ctrl_stream_end);
+     if cmd.flags != 0
+-        || cmd.sampler_count != 0
+-        || cmd.sampler_heap != 0
+         || !helper_is_empty(&cmd.helper)
+         || base & 3 != 0
+         || end & 3 != 0
+@@ -633,9 +631,29 @@ fn check_compute(
+     }
+     cover(vm, base, end, true, false)?;
+     gate::cdm(vm, context.usc_base, base, end)?;
++    check_sampler(vm, cmd.sampler_heap, cmd.sampler_count)?;
+     check_attachments(vm, attachments, true)
+ }
+ 
++/// Sampler heap admission (G17 `command::sampler`): at most `MAX_SAMPLERS`, both fields zero
++/// or both nonzero, eight-byte aligned, and readable user memory for the checked span.
++fn check_sampler(vm: &mmu::Vm, heap: u64, count: u32) -> Result {
++    if heap == 0 && count == 0 {
++        return Ok(());
++    }
++    if !super::params::sampler_heap()
++        || count > compute::MAX_SAMPLERS
++        || (heap == 0) != (count == 0)
++        || heap & (compute::SAMPLER_SIZE - 1) != 0
++    {
++        return Err(EINVAL);
++    }
++    let end = heap
++        .checked_add(u64::from(count) * compute::SAMPLER_SIZE)
++        .ok_or(EINVAL)?;
++    cover(vm, heap, end, true, false)
++}
++
+ /// Resolves timestamps and exact historical-prefix dependencies of a valid stream
+ /// ([`check_stream`]) for a queue that accepted `accepted` render and compute commands before
+ /// this ioctl.
+diff --git a/drivers/gpu/drm/asahi/g16/encode.rs b/drivers/gpu/drm/asahi/g16/encode.rs
+index a9bf84943b..50e4f5d00d 100644
+--- a/drivers/gpu/drm/asahi/g16/encode.rs
++++ b/drivers/gpu/drm/asahi/g16/encode.rs
+@@ -37,6 +37,16 @@ fn put32(b: &mut [u8], off: usize, v: u32) {
+ }
+ 
+ #[inline(always)]
++/// The sampler bound stored next to the sampler count: the count plus one, or zero without
++/// samplers (G17 `fw::sampler_max`). Counts are at most `compute::MAX_SAMPLERS`.
++fn sampler_max(count: u32) -> u32 {
++    if count == 0 {
++        0
++    } else {
++        count + 1
++    }
++}
++
+ fn put64(b: &mut [u8], off: usize, v: u64) {
+     put(b, off, &v.to_le_bytes());
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/encode/compute.rs b/drivers/gpu/drm/asahi/g16/encode/compute.rs
+index 08a4f9ee9c..a80225c1a3 100644
+--- a/drivers/gpu/drm/asahi/g16/encode/compute.rs
++++ b/drivers/gpu/drm/asahi/g16/encode/compute.rs
+@@ -2,7 +2,7 @@
+ 
+ //! Pure G16G/25G83 compute encoding. Publication and lifetime proofs belong to the engine.
+ 
+-use super::{compute, manager, put16, put32, put64, put8, uapi};
++use super::{compute, manager, put16, put32, put64, put8, sampler_max, uapi};
+ 
+ /// A rejected detached image is never publishable; all validation precedes writes.
+ #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+@@ -208,6 +208,18 @@ pub(crate) fn encode_compute(
+     {
+         return Err(ComputeEncodeError::Command);
+     }
++    if c.sampler_count > compute::MAX_SAMPLERS
++        || (c.sampler_heap == 0) != (c.sampler_count == 0)
++        || c.sampler_heap & (compute::SAMPLER_SIZE - 1) != 0
++        || (c.sampler_heap != 0
++            && !gpu(
++                c.sampler_heap,
++                u64::from(c.sampler_count) * compute::SAMPLER_SIZE,
++                compute::SAMPLER_SIZE,
++            ))
++    {
++        return Err(ComputeEncodeError::Command);
++    }
+     if att.len() > compute::MAX_ATTACHMENTS {
+         return Err(ComputeEncodeError::Attachment);
+     }
+@@ -291,6 +303,9 @@ pub(crate) fn encode_compute(
+     put64(w, 0x7a0, end - 4);
+     put64(w, 0x7c8, 0x154024201);
+     put32(w, 0x7e8, u32::MAX);
++    put64(w, compute::SAMPLER_HEAP, c.sampler_heap);
++    put32(w, compute::SAMPLER_COUNT, c.sampler_count);
++    put32(w, compute::SAMPLER_MAX, sampler_max(c.sampler_count));
+     put64(w, 0x800, r.user_stamp);
+     put64(w, 0x808, r.fw_stamp);
+     put32(w, 0x810, r.target_stamp);
+diff --git a/drivers/gpu/drm/asahi/g16/encode/render.rs b/drivers/gpu/drm/asahi/g16/encode/render.rs
+index b054ec0819..088f343127 100644
+--- a/drivers/gpu/drm/asahi/g16/encode/render.rs
++++ b/drivers/gpu/drm/asahi/g16/encode/render.rs
+@@ -237,6 +237,10 @@ pub(crate) fn encode_ta(
+     put32(w, 0x77c, 0x71);
+     put32(w, 0x780, target);
+     put64(w, 0x7a8, compact(p.pre_gva[0]));
++    // Validated by the command check: at most `compute::MAX_SAMPLERS`, aligned and mapped.
++    put64(w, ta::SAMPLER_HEAP, u.sampler_heap);
++    put32(w, ta::SAMPLER_COUNT, u.sampler_count.into());
++    put32(w, ta::SAMPLER_MAX, sampler_max(u.sampler_count.into()));
+     metadata(w, 0x878, r, 0, target);
+     internal_pair(w, p, 0, ts_va);
+     put64(w, 0x8fe, r.uma_mgr[0]);
+diff --git a/drivers/gpu/drm/asahi/g16/fw/work.rs b/drivers/gpu/drm/asahi/g16/fw/work.rs
+index ef54552540..f903c7024c 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/work.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/work.rs
+@@ -66,6 +66,13 @@ pub(crate) mod ta {
+     pub(crate) const TAIL: usize = 0x8c0;
+     /// TPC byte span the firmware may write for this render geometry.
+     pub(crate) const TPC_BYTES: usize = 0x768;
++    /// Sampler heap GPU VA (u64), sampler count (u32) and count plus one (u32). The 25G83 TA
++    /// record tail is the G17 `TaDescriptor` shifted down by 0x2e (stamp, auxiliary stamp,
++    /// stamp value, qid and first-kick words), which places the G17 `sampler_heap_va` (0x87a)
++    /// here. The fragment record has no sampler heap.
++    pub(crate) const SAMPLER_HEAP: usize = 0x84c;
++    pub(crate) const SAMPLER_COUNT: usize = 0x854;
++    pub(crate) const SAMPLER_MAX: usize = 0x858;
+     pub(crate) const TS_START: usize = 0x1cc;
+     pub(crate) const TS_END: usize = 0x21c;
+     pub(crate) const FINALIZE: usize = 0x268;
+diff --git a/drivers/gpu/drm/asahi/g16/fw/work/compute.rs b/drivers/gpu/drm/asahi/g16/fw/work/compute.rs
+index d7d9b40438..af960d415e 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/work/compute.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/work/compute.rs
+@@ -17,6 +17,17 @@
+ pub(crate) const FINALIZE: usize = 0x258;
+ pub(crate) const END: usize = 0x2d4;
+ pub(crate) const DESCRIPTOR: usize = 0xe00;
++/// Sampler heap GPU VA (u64), sampler count (u32) and count plus one (u32, zero without
++/// samplers). The 25G83 compute record is the G17 `ComputeDescriptor` shifted down by 0x740
++/// (its 0x1a440 value, u32::MAX word, preempt/end and stamp fields sit at the same relative
++/// offsets), which places the G17 `sampler_heap_va` (0xf2c) here.
++pub(crate) const SAMPLER_HEAP: usize = 0x7ec;
++pub(crate) const SAMPLER_COUNT: usize = 0x7f4;
++pub(crate) const SAMPLER_MAX: usize = 0x7f8;
++/// Most samplers a command may name, as on G17.
++pub(crate) const MAX_SAMPLERS: u32 = 1024;
++/// Sampler heap alignment and the per-sampler span checked against the VM, as on G17.
++pub(crate) const SAMPLER_SIZE: u64 = 8;
+ pub(crate) const DESCRIPTOR_SIZE: usize = 0xa0;
+ pub(crate) const DESCRIPTOR_COUNTER: usize = DESCRIPTOR + super::super::graph::manager::COUNTER;
+ pub(crate) const DESCRIPTOR_COMPLETED: usize = DESCRIPTOR + super::super::graph::manager::COMPLETED;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index d2ef01e26b..2f2953585f 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -48,6 +48,11 @@ pub(crate) fn stream_gate() -> bool {
+     module_parameters::g16_stream_gate.value() != 0
+ }
+ 
++/// Whether render and compute commands may name a sampler heap.
++pub(crate) fn sampler_heap() -> bool {
++    *module_parameters::g16_sampler_heap.value() != 0
++}
++
+ /// Fragment-only dependency publication has not been qualified on this backend.
+ pub(crate) fn early_tiling() -> bool {
+     false
+-- 
+2.43.0
+

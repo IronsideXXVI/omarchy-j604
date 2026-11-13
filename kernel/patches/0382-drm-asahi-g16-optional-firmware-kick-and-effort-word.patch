@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 01:50:26 +0000
+Subject: [PATCH] drm/asahi: g16: optional firmware kick and effort
+ word per publication
+
+On G13/G14 every job starts with start_op: the host raises the Globals
+pending-submission count and sends the firmware kick (EP 0x21
+0x83 << 48 | 0x10) before it builds and rings the work. G17 publishes
+its region C performance-floor word (+0xe4, 0x10000 while work streams)
+with every submission. The g16 backend sends the kick only once, at
+boot, and never writes +0xe4, while M4 commands wait 100-300 us
+between publication and their first firmware stage.
+
+Add two runtime parameters, both off by default, so the effect can be
+measured before either becomes policy:
+
+  g16_kickfw  0: boot only (unchanged); 1: kick before the publication's
+              counter and producer stores; 2: kick after its channel
+              doorbells.
+  g16_effort  0: +0xe4 published as zero (unchanged); 1: +0xe4 asserted
+              to 0x10000, zero stored to +0xe8 first, ordered before
+              the publication's stores.
+
+Both values are read on every publication. The effort word is written
+only when it differs from the requested one.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/engine.rs      | 34 +++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs |  6 ++++
+ drivers/gpu/drm/asahi/g16/params.rs      | 38 ++++++++++++++++++++++++
+ 3 files changed, 78 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index f15c201c5b..1b9a4a551b 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -548,7 +548,34 @@ pub(crate) fn complete(done: &mut Completions, job: &Arc<Job>, result: Result) {
+     done.push(job, result);
+ }
+ 
++/// The firmware-kick doorbell index (G13/G14 `DOORBELL_KICKFW`).
++const KICKFW_DOORBELL: u64 = 0x10;
++
+ impl Firmware {
++    /// Sends the firmware kick, EP 0x21 `0x83 << 48 | 0x10` (`g16_kickfw`).
++    fn kick_firmware(&mut self) -> Result {
++        self.session.send(
++            super::hw::ep::DOORBELL,
++            super::hw::engine::DOORBELL | KICKFW_DOORBELL,
++        )
++    }
++
++    /// Publishes the Globals performance-floor word when `g16_effort` changed it: zero to
++    /// +0xe8, then the effort to +0xe4, ordered before the publication's stores.
++    fn publish_effort(&mut self) -> Result {
++        use super::fw::initdata::globals;
++        let want = if super::params::effort() { globals::FULL_EFFORT } else { 0 };
++        let g = self.init.globals.as_ref().ok_or(ENODEV)?;
++        if g.r32(globals::EFFORT)? == want {
++            return Ok(());
++        }
++        g.w32(globals::EFFORT_SEQ, 0)?;
++        wmb();
++        g.w32(globals::EFFORT, want)?;
++        wmb();
++        Ok(())
++    }
++
+     /// Registers the one shared scheduling context using the proven queue-0 zero-stamp
+     /// barrier before any shader work or user ASID is published (exec-runtime.h contract).
+     pub(crate) fn register_context(&mut self) -> Result {
+@@ -1139,6 +1166,10 @@ fn publish_prefix_into(
+         // every owner and return explicit uncertainty rather than guessing from errno.
+         *visible = true;
+         let publication = (|| -> Result {
++            self.publish_effort()?;
++            if super::params::kickfw() == 1 {
++                self.kick_firmware()?;
++            }
+             if render {
+                 let k = f.claims.pass[0] as usize;
+                 f.pb_used.as_ref().ok_or(EINVAL)?.expose();
+@@ -1206,6 +1237,9 @@ fn publish_prefix_into(
+                 }
+                 self.session.ring(channel)?;
+             }
++            if super::params::kickfw() == 2 {
++                self.kick_firmware()?;
++            }
+             Ok(())
+         })();
+         if publication.is_ok() {
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index b575d59560..375c4b3ac8 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -86,6 +86,12 @@ pub(crate) mod globals {
+     /// Globals leaves it zero; the G17 region C values around it (+0x24, +0x998..+0x9cc,
+     /// including the power-off delay at +0x9bc) are written by [`super::encode`] on both.
+     pub(crate) const IDLE_POWER_OFF: usize = 0x30;
++    /// The G17 region C performance-floor request (`effort`, 16.16) and the word the host
++    /// zeroes before storing it, at the same offsets ([`super::super::params::effort`]).
++    pub(crate) const EFFORT: usize = 0xe4;
++    pub(crate) const EFFORT_SEQ: usize = 0xe8;
++    /// Full effort, 1.0 in 16.16.
++    pub(crate) const FULL_EFFORT: u32 = 0x10000;
+     /// The qualified Globals policy words (offset, value): the subset of G17 region C that
+     /// the working M4 encoder writes.
+     pub(crate) const POLICY: [(usize, u32); 11] = [
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 34926061bb..4c74f068fe 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -511,6 +511,44 @@ pub(crate) fn watchdog_us() -> u32 {
+     "G16: completion watchdog with g16_irq_only, us (default 2000; 100..20000; runtime 0644)"
+ );
+ 
++/// Storage of `g16_kickfw` (runtime 0644, default 0).
++static KICKFW: AtomicU32 = AtomicU32::new(0);
++
++/// When the host sends the firmware kick (EP 0x21 `0x83 << 48 | 0x10`, the G13/G14
++/// `DOORBELL_KICKFW` their `start_op` sends before every job) with a publication: 0 never
++/// (only once at boot), 1 before the publication's counter and producer stores, 2 after
++/// its channel doorbells.
++pub(crate) fn kickfw() -> u32 {
++    KICKFW.load(Ordering::Relaxed).min(2)
++}
++
++live_u32_param!(
++    KICKFW_PARAM,
++    KICKFW_PARMTYPE,
++    KICKFW_PARM,
++    KICKFW,
++    "g16_kickfw",
++    "G16: send the firmware kick with each publication (default 0: boot only; 1: before the stores; 2: after the channel doorbells; runtime 0644)"
++);
++
++/// Storage of `g16_effort` (runtime 0644, default 0).
++static EFFORT: AtomicU32 = AtomicU32::new(0);
++
++/// Whether each publication asserts the Globals performance-floor word at +0xe4 (0x10000,
++/// 1.0 in 16.16), the G17 region C `effort` word at the same offset. 0 publishes zero there.
++pub(crate) fn effort() -> bool {
++    EFFORT.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    EFFORT_PARAM,
++    EFFORT_PARMTYPE,
++    EFFORT_PARM,
++    EFFORT,
++    "g16_effort",
++    "G16: assert the Globals +0xe4 performance-floor word (0x10000) with each publication (default 0: zero; 1: asserted; runtime 0644)"
++);
++
+ /// Storage of `g16_flights` (runtime 0644): 1 publishes one command at a time (the qualified
+ /// protocol, default); 2 lets one render command be published behind a running one.
+ static FLIGHTS: AtomicU32 = AtomicU32::new(1);
+-- 
+2.43.0
+

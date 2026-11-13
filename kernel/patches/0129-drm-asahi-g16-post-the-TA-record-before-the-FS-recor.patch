@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 9 Nov 2026 23:59:41 +0000
+Subject: [PATCH] drm/asahi: g16: post the TA record before the FS
+ record
+
+The G16 backend publishes one command at a time. For a render command it
+posts the FS record (a stamp barrier on the TA target, then the fragment
+work) and rings the FS doorbell before it posts the TA record and rings the
+TA doorbell. The G15 backend posts TA, then FS.
+
+On the J604 (T8132, firmware 26.6.2 / 25G83) a desktop under load spends
+most of each command waiting before any GPU work starts. During a
+full-window browser animation at 3024x1964@120 the engine statistics showed
+6275 render commands in 8 s, 96% of the time with a command in flight, but
+only 363 us of TA plus FS hardware time per command; the first firmware
+event arrived 659 us after publication on average, and the TA stage itself
+takes about 11 us. Since commands are serialized, that delay is paid by
+every command and caps the desktop at about 90 frames per second.
+
+Post the TA record and ring its doorbell first once both render queues are
+registered, so the firmware meets the TA work before the FS barrier that
+waits on it. The first render publication keeps the original order, since
+it also registers the queues.
+
+The order is a runtime parameter, g16_ta_first (0644, default 1); writing 0
+restores the FS-first order without a reboot.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit a9cda50f5161324270f1e551ae3b0ac86d2aa880)
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |   9 +-
+ drivers/gpu/drm/asahi/g16/params.rs | 137 ++++++++++++++++++++++++++++
+ 2 files changed, 145 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index dee03ab92f..b6e3c3f478 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -956,8 +956,15 @@ fn publish_prefix_into(
+         } {
+             return Err(EIO);
+         }
++        // Render: TA first once both render queues are registered (g16_ta_first), so the
++        // firmware meets the TA work before the FS barrier that waits for it. The first
++        // render publication keeps the registration order of the initial backend.
+         let channels: &[Channel] = if render {
+-            &[Channel::Fs, Channel::Ta]
++            if params::ta_first() && self.engine.ta_registered && self.engine.render_registered {
++                &[Channel::Ta, Channel::Fs]
++            } else {
++                &[Channel::Fs, Channel::Ta]
++            }
+         } else {
+             &[Channel::Compute]
+         };
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index a71a611b72..f658599125 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -293,6 +293,143 @@ pub(crate) fn idle_floor() -> u32 {
+ #[used(compiler)]
+ static IDLE_FLOOR_PARM: [u8; FLOOR_PARM.len()] = modinfo(FLOOR_PARM);
+ 
++/// Default of `g16_ta_first`: 1. Once both render queues are registered, a render command's TA
++/// record is posted and its doorbell rung before the FS record, the order the G15 backend
++/// uses. 0 restores the FS-then-TA order of the initial backend.
++pub(crate) const TA_FIRST_DEFAULT: u32 = 1;
++
++/// Storage of `g16_ta_first` (runtime 0644, any nonzero value means TA first).
++static TA_FIRST: AtomicU32 = AtomicU32::new(TA_FIRST_DEFAULT);
++
++/// Whether a render command posts its TA record before its FS record.
++pub(crate) fn ta_first() -> bool {
++    TA_FIRST.load(Ordering::Relaxed) != 0
++}
++
++/// `set` of a runtime u32 parameter whose `arg` points at a static [`AtomicU32`].
++///
++/// # Safety
++///
++/// Called by the module-parameter core with `val` NULL or a NUL-terminated string and `kp`
++/// one of this file's parameters, whose `arg` is a static [`AtomicU32`].
++unsafe extern "C" fn live_u32_set(
++    val: *const c_char,
++    kp: *const kernel::bindings::kernel_param,
++) -> c_int {
++    if val.is_null() || kp.is_null() {
++        return EINVAL.to_errno();
++    }
++    // SAFETY: `val` is a NUL-terminated string per the function contract.
++    let Ok(text) = unsafe { core::ffi::CStr::from_ptr(val) }.to_str() else {
++        return EINVAL.to_errno();
++    };
++    let Ok(value) = text.trim().parse::<u32>() else {
++        return EINVAL.to_errno();
++    };
++    // SAFETY: per the function contract `arg` points at a static AtomicU32.
++    let cell = unsafe { &*(*kp).__bindgen_anon_1.arg.cast::<AtomicU32>() };
++    cell.store(value, Ordering::Relaxed);
++    0
++}
++
++/// `get` of a runtime u32 parameter whose `arg` points at a static [`AtomicU32`].
++///
++/// # Safety
++///
++/// `buffer` is the module-parameter core's PAGE_SIZE output buffer and `kp` one of this file's
++/// parameters, whose `arg` is a static [`AtomicU32`].
++unsafe extern "C" fn live_u32_get(
++    buffer: *mut c_char,
++    kp: *const kernel::bindings::kernel_param,
++) -> c_int {
++    // SAFETY: per the function contract `arg` points at a static AtomicU32.
++    let cell = unsafe { &*(*kp).__bindgen_anon_1.arg.cast::<AtomicU32>() };
++    let mut value = cell.load(Ordering::Relaxed);
++    let mut digits = [0u8; 10];
++    let mut n = 0;
++    loop {
++        digits[n] = b'0' + (value % 10) as u8;
++        n += 1;
++        value /= 10;
++        if value == 0 {
++            break;
++        }
++    }
++    for (i, digit) in digits[..n].iter().rev().enumerate() {
++        // SAFETY: the buffer holds PAGE_SIZE bytes; at most 11 are written.
++        unsafe { *buffer.cast::<u8>().add(i) = *digit };
++    }
++    // SAFETY: as above. The core appends the newline.
++    unsafe { *buffer.cast::<u8>().add(n) = 0 };
++    n as c_int
++}
++
++static LIVE_U32_OPS: kernel::bindings::kernel_param_ops = kernel::bindings::kernel_param_ops {
++    flags: 0,
++    set: Some(live_u32_set),
++    get: Some(live_u32_get),
++    free: None,
++};
++
++/// Declares a runtime (0644) u32 module parameter backed by a static [`AtomicU32`], with its
++/// modinfo strings, in the same form as `g16_idle_power_off` above.
++macro_rules! live_u32_param {
++    ($param:ident, $parmtype:ident, $parm:ident, $cell:ident, $name:literal, $desc:literal) => {
++        #[link_section = "__param"]
++        #[used(compiler)]
++        static $param: kernel::module_param::KernelParam =
++            kernel::module_param::KernelParam::new(kernel::bindings::kernel_param {
++                name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
++                    kernel::c_str!($name)
++                } else {
++                    kernel::c_str!(concat!("asahi.", $name))
++                }),
++                // See IDLE_POWER_OFF_PARAM.
++                #[cfg(MODULE)]
++                mod_: (&raw const kernel::bindings::__this_module).cast_mut(),
++                #[cfg(not(MODULE))]
++                mod_: core::ptr::null_mut(),
++                ops: core::ptr::from_ref(&LIVE_U32_OPS),
++                perm: 0o644,
++                level: -1,
++                flags: 0,
++                __bindgen_anon_1: kernel::bindings::kernel_param__bindgen_ty_1 {
++                    arg: core::ptr::from_ref(&$cell).cast_mut().cast(),
++                },
++            });
++
++        #[cfg(MODULE)]
++        #[link_section = ".modinfo"]
++        #[used(compiler)]
++        static $parmtype: [u8; concat!("parmtype=", $name, ":u32\0").len()] =
++            modinfo(concat!("parmtype=", $name, ":u32\0").as_bytes());
++        #[cfg(MODULE)]
++        #[link_section = ".modinfo"]
++        #[used(compiler)]
++        static $parm: [u8; concat!("parm=", $name, ":", $desc, "\0").len()] =
++            modinfo(concat!("parm=", $name, ":", $desc, "\0").as_bytes());
++        #[cfg(not(MODULE))]
++        #[link_section = ".modinfo"]
++        #[used(compiler)]
++        static $parmtype: [u8; concat!("asahi.parmtype=", $name, ":u32\0").len()] =
++            modinfo(concat!("asahi.parmtype=", $name, ":u32\0").as_bytes());
++        #[cfg(not(MODULE))]
++        #[link_section = ".modinfo"]
++        #[used(compiler)]
++        static $parm: [u8; concat!("asahi.parm=", $name, ":", $desc, "\0").len()] =
++            modinfo(concat!("asahi.parm=", $name, ":", $desc, "\0").as_bytes());
++    };
++}
++
++live_u32_param!(
++    TA_FIRST_PARAM,
++    TA_FIRST_PARMTYPE,
++    TA_FIRST_PARM,
++    TA_FIRST,
++    "g16_ta_first",
++    "G16: post a render command's TA record before its FS record (default 1; runtime 0644; 0: FS first)"
++);
++
+ /// Fragment-only dependency publication has not been qualified on this backend.
+ pub(crate) fn early_tiling() -> bool {
+     false
+-- 
+2.43.0
+

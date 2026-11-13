@@ -1,0 +1,476 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 23:30:20 +0000
+Subject: [PATCH] PCI: apple: power a card reader port down while its
+ slot is empty
+
+On the MacBook Pro 14-inch (M4, J604) macOS keeps the SD reader's link
+off while no card is in: its root port and endpoint read all ones and the
+reader reports its link as off. The Apple device tree routes the slot's
+card detect to an SMC input (the reader's interrupt-parent is the SMC
+PMU, line 9), so the card is seen while the reader has no power. Linux
+keeps the reader powered and its link up with the slot empty.
+
+Add that behind pcie_apple.t8132_sd_port_off, off by default, for a port
+whose node has card-detect-gpios:
+
+- An empty slot removes the reader from the bus, blocks the port's
+  downstream access, holds the endpoint in reset and cuts its rail
+  (pwren-gpios).
+- A card (the card-detect interrupt, both edges, 200 ms debounce) brings
+  the rail back, resets the endpoint, trains the link as probe does with
+  probe's endpoint-reset retries, and rescans, so the reader's driver
+  probes it as a new device. A link that does not come up leaves the port
+  off and is retried at the next card event.
+- The APCIe block, the port's registers and its DART stay powered, as on
+  macOS: only the endpoint loses power.
+- Before a system sleep the port is powered up, and the slot is checked
+  again after it, so the sleep and resume paths only see a port as probe
+  left it.
+- The first look at the slot waits 10 s after probe; writing the
+  parameter applies it at once. Without the line or its interrupt the
+  port is left as it is.
+
+The default stays off until a card inserted with the port down is shown
+to come back every time on the J604, and the idle saving is measured.
+
+tools/asahi/pcie-sd-off-tests.py runs the decision (card, parameter,
+state) over every combination and kills three mutations: the parameter
+ignored, the card detect inverted, an unreadable line taken as empty.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/pci/controller/pcie-apple.c | 245 ++++++++++++++++++++++++++++
+ tools/asahi/pcie-sd-off-tests.py    | 121 ++++++++++++++
+ tools/asahi/run-host-tests.py       |   2 +
+ 3 files changed, 368 insertions(+)
+ create mode 100644 tools/asahi/pcie-sd-off-tests.py
+
+diff --git a/drivers/pci/controller/pcie-apple.c b/drivers/pci/controller/pcie-apple.c
+index 46533981da..28cbcbb0c6 100644
+--- a/drivers/pci/controller/pcie-apple.c
++++ b/drivers/pci/controller/pcie-apple.c
+@@ -47,6 +47,8 @@
+ #include <linux/soc/apple/t8132.h>
+ #include <linux/soc/apple/tunable.h>
+ #include <linux/suspend.h>
++#include <linux/workqueue.h>
++#include <linux/interrupt.h>
+ 
+ #include "../pci.h"
+ #include "pci-host-common.h"
+@@ -75,6 +77,21 @@ module_param(radio_l1ss, bool, 0444);
+ MODULE_PARM_DESC(radio_l1ss,
+ 		 "J604: allow the L1.1 and L1.2 substates on the radio's link while the system runs, as the ADT has macOS run them (default on)");
+ 
++/* The card reader ports whose slot can power them down (apple_pcie_sd_init()). */
++static LIST_HEAD(apple_pcie_sd_ports);
++static DEFINE_MUTEX(apple_pcie_sd_lock);
++static bool t8132_sd_port_off;
++static int apple_pcie_sd_param_set(const char *val, const struct kernel_param *kp);
++static const struct kernel_param_ops apple_pcie_sd_param_ops = {
++	.set = apple_pcie_sd_param_set,
++	.get = param_get_bool,
++};
++module_param_cb(t8132_sd_port_off, &apple_pcie_sd_param_ops, &t8132_sd_port_off, 0644);
++MODULE_PARM_DESC(t8132_sd_port_off,
++		 "J604: power the SD card reader's port down while the slot is empty and up again when a card is inserted, as macOS does (default off)");
++
++#define APPLE_PCIE_T8132_EXP		0x70	/* the root port's PCIe capability */
++
+ /* Opt-in until the NHI, PHY and DART power cycle is qualified together. */
+ static bool cio_s2r;
+ module_param(cio_s2r, bool, 0400);
+@@ -597,6 +614,11 @@ struct apple_pcie_port {
+ 	unsigned long		adopted_slots;	/* adopt_link: RID2SID slots routed (slot == SID) */
+ 	struct gpio_desc	*pwren;		/* adopt_link: endpoint power, if Linux trained */
+ 	bool			powered;	/* cold train: pwren raised, port not parked yet */
++	/* A card reader port with a card-detect line (apple_pcie_sd_init()) */
++	struct gpio_desc	*card_detect;
++	struct delayed_work	sd_work;
++	struct list_head	sd_entry;
++	bool			sd_off;		/* powered down for an empty slot */
+ };
+ 
+ static bool apple_radio_writer_closed(struct apple_pcie *pcie);
+@@ -2918,6 +2940,228 @@ static int apple_pcie_port_reset_endpoint(struct apple_pcie *pcie,
+ 					  stat & PORT_STATUS_READY, 100, 250000);
+ }
+ 
++/*
++ * A card reader port powered down while its slot is empty (pcie_apple.t8132_sd_port_off, off by
++ * default). On the J604 macOS keeps the SD reader's link off with no card in: its root port and
++ * endpoint read all ones, and the Apple device tree routes the slot's card detect to an SMC
++ * input, so the card is seen while the reader itself has no power. With the parameter on, an
++ * empty slot takes the reader off the bus, holds it in reset and cuts its rail; a card brings
++ * the rail back, resets the endpoint, trains the link as probe does and rescans, so the reader's
++ * driver probes it as new. The APCIe block and the port's registers stay powered throughout, as
++ * on macOS. Around a system sleep the port is powered up first, so the sleep and resume paths
++ * only ever see a port as probe left it.
++ */
++#define APPLE_PCIE_SD_DEBOUNCE_MS	200
++#define APPLE_PCIE_SD_BOOT_DELAY_MS	10000
++
++static void apple_pcie_sd_power_down(struct apple_pcie *pcie, struct apple_pcie_port *port)
++{
++	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
++	struct pci_dev *rp, *dev, *tmp;
++
++	pci_lock_rescan_remove();
++	rp = bridge->bus ? pci_get_slot(bridge->bus, PCI_DEVFN(port->idx, 0)) : NULL;
++	if (rp && rp->subordinate)
++		list_for_each_entry_safe_reverse(dev, tmp, &rp->subordinate->devices, bus_list)
++			pci_stop_and_remove_bus_device(dev);
++
++	mutex_lock(&pcie->lock);
++	WRITE_ONCE(port->link_failed, true);
++	apple_pcie_port_rmw_clear(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
++	rmw_clear(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
++	gpiod_set_value_cansleep(port->perst, 1);
++	if (port->pwren_gpio)
++		gpiod_set_value_cansleep(port->pwren_gpio, 0);
++	port->sd_off = true;
++	mutex_unlock(&pcie->lock);
++
++	pci_dev_put(rp);
++	pci_unlock_rescan_remove();
++	dev_info(pcie->dev, "port %pOF: slot empty, reader powered down\n", port->np);
++}
++
++static int apple_pcie_sd_power_up(struct apple_pcie *pcie, struct apple_pcie_port *port)
++{
++	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
++	void __iomem *dbi = pcie->cfg->win + (port->idx << 15);
++	int attempt, ret;
++	u32 stat;
++
++	mutex_lock(&pcie->lock);
++	if (port->pwren_gpio) {
++		ret = gpiod_set_value_cansleep(port->pwren_gpio, 1);
++		if (ret)
++			goto out;
++		msleep(pcie->hw->pwren_on_ms ?: 100);
++	}
++	/* As probe does: the endpoint reset, then training with its endpoint-reset retries. */
++	ret = apple_pcie_port_reset_endpoint(pcie, port);
++	for (attempt = 0; !ret; attempt++) {
++		apple_pcie_port_writel(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
++		ret = readl_relaxed_poll_timeout(port->base + PORT_LINKSTS, stat,
++						 stat & PORT_LINKSTS_UP, 1000,
++						 link_up_timeout * USEC_PER_MSEC);
++		if (!ret || attempt == LINK_RESET_RETRIES)
++			break;
++		ret = apple_pcie_port_reset_endpoint(pcie, port);
++	}
++	if (ret)
++		goto out;
++
++	/* The link-up event of the training is not one to report. */
++	apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
++	WRITE_ONCE(port->link_failed, false);
++	port->sd_off = false;
++	stat = readw_relaxed(dbi + APPLE_PCIE_T8132_EXP + PCI_EXP_LNKSTA);
++	dev_info(pcie->dev, "port %pOF: card in, reader up: gen %u x%u, %d endpoint resets\n",
++		 port->np, (u32)FIELD_GET(PCI_EXP_LNKSTA_CLS, stat),
++		 (u32)FIELD_GET(PCI_EXP_LNKSTA_NLW, stat), attempt);
++out:
++	mutex_unlock(&pcie->lock);
++	if (ret) {
++		/* Still off: the next card event tries again. */
++		dev_err(pcie->dev, "port %pOF: reader did not come up: %d\n", port->np, ret);
++		return ret;
++	}
++
++	pci_lock_rescan_remove();
++	if (bridge->bus)
++		pci_rescan_bus(bridge->bus);
++	pci_unlock_rescan_remove();
++	return 0;
++}
++
++static void apple_pcie_sd_work(struct work_struct *work)
++{
++	struct apple_pcie_port *port = container_of(to_delayed_work(work), struct apple_pcie_port,
++						    sd_work);
++	int present = gpiod_get_value_cansleep(port->card_detect);
++	bool off;
++
++	if (present < 0)
++		return;
++	off = READ_ONCE(t8132_sd_port_off) && !present;
++	if (off == port->sd_off)
++		return;
++	if (off)
++		apple_pcie_sd_power_down(port->pcie, port);
++	else
++		apple_pcie_sd_power_up(port->pcie, port);
++}
++
++static irqreturn_t apple_pcie_sd_cd_irq(int irq, void *data)
++{
++	struct apple_pcie_port *port = data;
++
++	mod_delayed_work(system_freezable_wq, &port->sd_work,
++			 msecs_to_jiffies(APPLE_PCIE_SD_DEBOUNCE_MS));
++	return IRQ_HANDLED;
++}
++
++static void apple_pcie_sd_kick_all(unsigned long delay_ms)
++{
++	struct apple_pcie_port *port;
++
++	mutex_lock(&apple_pcie_sd_lock);
++	list_for_each_entry(port, &apple_pcie_sd_ports, sd_entry)
++		mod_delayed_work(system_freezable_wq, &port->sd_work, msecs_to_jiffies(delay_ms));
++	mutex_unlock(&apple_pcie_sd_lock);
++}
++
++static int apple_pcie_sd_param_set(const char *val, const struct kernel_param *kp)
++{
++	int ret = param_set_bool(val, kp);
++
++	if (!ret)
++		apple_pcie_sd_kick_all(0);
++	return ret;
++}
++
++/* A port powered down for an empty slot is powered up before a system sleep and checked after. */
++static int apple_pcie_sd_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
++{
++	struct apple_pcie_port *port;
++
++	switch (action) {
++	case PM_SUSPEND_PREPARE:
++	case PM_HIBERNATION_PREPARE:
++		mutex_lock(&apple_pcie_sd_lock);
++		list_for_each_entry(port, &apple_pcie_sd_ports, sd_entry) {
++			cancel_delayed_work_sync(&port->sd_work);
++			if (port->sd_off)
++				apple_pcie_sd_power_up(port->pcie, port);
++		}
++		mutex_unlock(&apple_pcie_sd_lock);
++		break;
++	case PM_POST_SUSPEND:
++	case PM_POST_HIBERNATION:
++		apple_pcie_sd_kick_all(APPLE_PCIE_SD_DEBOUNCE_MS);
++		break;
++	}
++	return NOTIFY_OK;
++}
++
++static struct notifier_block apple_pcie_sd_pm_nb = {
++	.notifier_call = apple_pcie_sd_pm_notify,
++};
++
++static void apple_pcie_sd_remove(void *data)
++{
++	struct apple_pcie_port *port = data;
++
++	mutex_lock(&apple_pcie_sd_lock);
++	list_del(&port->sd_entry);
++	if (list_empty(&apple_pcie_sd_ports))
++		unregister_pm_notifier(&apple_pcie_sd_pm_nb);
++	mutex_unlock(&apple_pcie_sd_lock);
++	cancel_delayed_work_sync(&port->sd_work);
++}
++
++/*
++ * A port node with card-detect-gpios gets the card-detect interrupt. Without the line, or without
++ * an interrupt for it, the port stays as it is: the feature is absent, the port is not affected.
++ */
++static void apple_pcie_sd_init(struct apple_pcie *pcie, struct apple_pcie_port *port)
++{
++	struct gpio_desc *cd;
++	int irq, ret;
++
++	if (!port->perst || !of_property_present(port->np, "card-detect-gpios"))
++		return;
++	cd = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(port->np), "card-detect",
++				   GPIOD_IN, "SD card detect");
++	irq = IS_ERR(cd) ? PTR_ERR(cd) : gpiod_to_irq(cd);
++	if (irq < 0) {
++		dev_info(pcie->dev, "port %pOF: no card-detect interrupt (%d), reader stays powered\n",
++			 port->np, irq);
++		return;
++	}
++
++	port->card_detect = cd;
++	INIT_DELAYED_WORK(&port->sd_work, apple_pcie_sd_work);
++	ret = devm_request_threaded_irq(pcie->dev, irq, NULL, apple_pcie_sd_cd_irq,
++					IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
++					"apple-pcie-sd-cd", port);
++	if (ret) {
++		dev_info(pcie->dev, "port %pOF: card-detect interrupt refused (%d), reader stays powered\n",
++			 port->np, ret);
++		port->card_detect = NULL;
++		return;
++	}
++
++	mutex_lock(&apple_pcie_sd_lock);
++	if (list_empty(&apple_pcie_sd_ports))
++		register_pm_notifier(&apple_pcie_sd_pm_nb);
++	list_add_tail(&port->sd_entry, &apple_pcie_sd_ports);
++	mutex_unlock(&apple_pcie_sd_lock);
++	if (devm_add_action_or_reset(pcie->dev, apple_pcie_sd_remove, port))
++		return;
++
++	/* Leave the boot's first look at the slot until the reader's driver has settled. */
++	mod_delayed_work(system_freezable_wq, &port->sd_work,
++			 msecs_to_jiffies(APPLE_PCIE_SD_BOOT_DELAY_MS));
++}
++
+ static int apple_pcie_setup_port(struct apple_pcie *pcie,
+ 				 struct device_node *np)
+ {
+@@ -3205,6 +3449,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
+ 			apple_pcie_port_readl(port, PORT_LINKSTS),
+ 			pcie->piodma_supplier ? "waits for the bootstrap" : "blocked");
+ 
++	apple_pcie_sd_init(pcie, port);
+ 	return 0;
+ 
+ err_teardown:
+diff --git a/tools/asahi/pcie-sd-off-tests.py b/tools/asahi/pcie-sd-off-tests.py
+new file mode 100644
+index 0000000000..795812a661
+--- /dev/null
++++ b/tools/asahi/pcie-sd-off-tests.py
+@@ -0,0 +1,121 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0-only OR MIT
++"""Run the card-reader port decision of drivers/pci/controller/pcie-apple.c on the host.
++
++apple_pcie_sd_work() is cut out of the driver and built against a fixture with the card-detect
++level, pcie_apple.t8132_sd_port_off and the port's state, and counters for the power-down and
++power-up paths. Every combination is checked: the port goes down only with the parameter on and
++the slot empty, comes up for a card or when the parameter is turned off, and is left alone when
++it is already where it should be or when the card-detect line cannot be read.
++
++--mutation NAME rebuilds with one known defect, and the run must then fail:
++  param-ignored   the parameter is not consulted
++  cd-inverted     the card-detect level is read the wrong way round
++  read-error      a failed card-detect read counts as an empty slot
++"""
++
++import argparse
++import re
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[2]
++DRIVER = ROOT / "drivers/pci/controller/pcie-apple.c"
++MUTATIONS = {
++    "param-ignored": ("\toff = READ_ONCE(t8132_sd_port_off) && !present;\n", "\toff = !present;\n"),
++    "cd-inverted": ("\toff = READ_ONCE(t8132_sd_port_off) && !present;\n",
++                    "\toff = READ_ONCE(t8132_sd_port_off) && present;\n"),
++    "read-error": ("\tif (present < 0)\n\t\treturn;\n", "\tif (present < 0)\n\t\tpresent = 0;\n"),
++}
++
++FIXTURE = r"""
++#include <assert.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdio.h>
++#define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
++#define READ_ONCE(x) (x)
++struct work_struct { int unused; };
++struct delayed_work { struct work_struct work; };
++static struct delayed_work *to_delayed_work(struct work_struct *w) { return container_of(w, struct delayed_work, work); }
++struct gpio_desc { int level; };
++struct apple_pcie { int unused; };
++struct apple_pcie_port { struct apple_pcie *pcie; struct gpio_desc *card_detect; struct delayed_work sd_work; bool sd_off; };
++static bool t8132_sd_port_off;
++static int downs, ups;
++static int gpiod_get_value_cansleep(struct gpio_desc *d) { return d->level; }
++static void apple_pcie_sd_power_down(struct apple_pcie *pcie, struct apple_pcie_port *port) { downs++; port->sd_off = true; }
++static int apple_pcie_sd_power_up(struct apple_pcie *pcie, struct apple_pcie_port *port) { ups++; port->sd_off = false; return 0; }
++"""
++
++TESTS = r"""
++int main(void)
++{
++	static struct apple_pcie pcie; static struct gpio_desc cd; static struct apple_pcie_port port;
++	/* level: 1 card, 0 empty, -5 read error; param; state -> expected downs, ups */
++	const struct { int level; bool param, off; int down, up; } c[] = {
++		{ 0, true, false, 1, 0 },	/* empty, on, up -> down */
++		{ 0, true, true, 0, 0 },	/* already down */
++		{ 1, true, true, 0, 1 },	/* card in while down -> up */
++		{ 1, true, false, 0, 0 },	/* card, up: nothing */
++		{ 0, false, false, 0, 0 },	/* parameter off: never down */
++		{ 0, false, true, 0, 1 },	/* parameter turned off while down -> up */
++		{ 1, false, true, 0, 1 },
++		{ 1, false, false, 0, 0 },
++		{ -5, true, false, 0, 0 },	/* unreadable line: leave it */
++		{ -5, true, true, 0, 0 },
++	};
++	port.pcie = &pcie; port.card_detect = &cd;
++	for (unsigned int i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
++		downs = ups = 0; cd.level = c[i].level; t8132_sd_port_off = c[i].param; port.sd_off = c[i].off;
++		apple_pcie_sd_work(&port.sd_work.work);
++		if (downs != c[i].down || ups != c[i].up) {
++			printf("case %u: level %d param %d off %d -> down %d up %d\n", i, c[i].level, c[i].param,
++			       c[i].off, downs, ups);
++			assert(0);
++		}
++	}
++	puts("pcie sd-off decision: 10 cases passed");
++	return 0;
++}
++"""
++
++
++def cut(text, name):
++    m = re.search(r"\n(static[^\n;]*\b%s\(.*?\n\}\n)" % re.escape(name), text, re.S)
++    assert m, name
++    return m.group(1)
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--out", default=None)
++    ap.add_argument("--mutation", choices=sorted(MUTATIONS))
++    args = ap.parse_args()
++    body = cut(DRIVER.read_text(), "apple_pcie_sd_work")
++    if args.mutation:
++        a, b = MUTATIONS[args.mutation]
++        assert body.count(a) == 1, args.mutation
++        body = body.replace(a, b)
++    with tempfile.TemporaryDirectory(prefix="pcie-sd-off-") as tmp:
++        out = Path(args.out) if args.out else Path(tmp)
++        out.mkdir(parents=True, exist_ok=True)
++        src = out / "sd-off.c"
++        src.write_text(FIXTURE + body + TESTS)
++        exe = out / "sd-off"
++        subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
++                        str(src), "-o", str(exe)], check=True)
++        rc = subprocess.run([str(exe)]).returncode
++    if args.mutation:
++        if rc == 0:
++            print("mutation %s survived" % args.mutation)
++            return 1
++        print("mutation %s killed" % args.mutation)
++        return 0
++    return rc
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/asahi/run-host-tests.py b/tools/asahi/run-host-tests.py
+index 170cba2837..2f6db3b67a 100755
+--- a/tools/asahi/run-host-tests.py
++++ b/tools/asahi/run-host-tests.py
+@@ -101,6 +101,8 @@ ASAHI_TESTS = {
+                                   'always-reboot', 'no-reopen', 'param-gate'), out(), PASS),
+     'bcm4377-sleep-config-tests.py': [([], PASS)],
+     # The mutations are caught inside the test, which then exits 0.
++    'pcie-sd-off-tests.py': [(out(), PASS)]
++        + mutations('--mutation', ('param-ignored', 'cd-inverted', 'read-error'), out(), PASS),
+     'macsmc-gpio-irq-tests.py': [(out(), PASS)]
+         + mutations('--mutation', ('no-ack', 'stale-mode', 'any-event'), out(), PASS),
+     'brcmf-assoc-tests.py': [(out('--output'), PASS)]
+-- 
+2.43.0
+
