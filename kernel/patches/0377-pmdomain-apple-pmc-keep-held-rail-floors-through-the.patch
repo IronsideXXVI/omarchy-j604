@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 00:43:04 +0000
+Subject: [PATCH] pmdomain: apple: pmc: keep held rail floors through
+ the AP agent's other votes
+
+A rail floor domain holds a rail through the AP agent's floor word.
+On T8132 the CLPC votes through the same agent (its node is
+performance-controller@3, the AP agent), and it writes the whole word
+on every sample. A floor held on the SoC rail would last only until
+the CLPC's next sample, and releasing it would drop whatever the CLPC
+had asked for on that rail.
+
+Remember what callers of apple_pmc_floor_update() ask of the AP agent,
+and write the higher of that and the held floor on each rail other than
+DCS, which keeps its own vote. A floor change and a CLPC sample now
+leave the same word whichever comes last. SoCs whose AP agent has no
+other user see no change: with no request the word carries the floor,
+as before.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/pmdomain/apple/pmc-test.c | 29 ++++++++++++++++++++++
+ drivers/pmdomain/apple/pmc.c      | 41 ++++++++++++++++++++++++++++++-
+ 2 files changed, 69 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/pmdomain/apple/pmc-test.c b/drivers/pmdomain/apple/pmc-test.c
+index d0e9633628..01c130fcc2 100644
+--- a/drivers/pmdomain/apple/pmc-test.c
++++ b/drivers/pmdomain/apple/pmc-test.c
+@@ -560,6 +560,34 @@ static void apple_pmc_test_t8132_floor_update(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, readl(reg) & 0xff, 0x35);
+ }
+ 
++/*
++ * T8132: the CLPC votes through the AP agent too. A floor held on the SoC
++ * rail survives the CLPC's whole-word updates, a higher CLPC vote wins, and
++ * releasing the floor leaves the CLPC's vote.
++ */
++static void apple_pmc_test_t8132_floor_and_clpc(struct kunit *test)
++{
++	struct apple_pmc *pmc = apple_pmc_test_alloc_hw(test, &apple_pmc_hw_t8132);
++	unsigned int agent = pmc->hw->ap_agent;
++	void __iomem *reg = pmc->voters + agent * pmc->hw->agent_stride;
++	struct apple_pmc_domain *soc;
++
++	INIT_LIST_HEAD(&pmc->domains);
++	soc = apple_pmc_test_floor(test, pmc, 1, 3);
++	KUNIT_ASSERT_EQ(test, apple_pmc_floor_update(pmc->dev, agent, 0xff, 0x05), 0);
++	KUNIT_EXPECT_EQ(test, readl(reg) & 0xff, 0x05);
++	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(soc, true), 0);
++	KUNIT_EXPECT_EQ(test, readl(reg) & 0xff, 0x35);
++	KUNIT_ASSERT_EQ(test, apple_pmc_floor_update(pmc->dev, agent, 0xff, 0x00), 0);
++	KUNIT_EXPECT_EQ(test, readl(reg) & 0xff, 0x30);
++	KUNIT_ASSERT_EQ(test, apple_pmc_floor_update(pmc->dev, agent, 0xff, 0x45), 0);
++	KUNIT_EXPECT_EQ(test, readl(reg) & 0xff, 0x45);
++	KUNIT_ASSERT_EQ(test, apple_pmc_floor_set(soc, false), 0);
++	KUNIT_EXPECT_EQ(test, readl(reg) & 0xff, 0x45);
++	KUNIT_ASSERT_EQ(test, apple_pmc_floor_update(pmc->dev, agent, 0xff, 0x05), 0);
++	KUNIT_EXPECT_EQ(test, readl(reg) & 0xff, 0x05);
++}
++
+ /*
+  * T8132: while the PMC has not taken up the agent's previous floor, the
+  * update times out and leaves the floor word alone.
+@@ -598,6 +626,7 @@ static struct kunit_case apple_pmc_test_cases[] = {
+ 	KUNIT_CASE(apple_pmc_test_agent_rails),
+ 	KUNIT_CASE(apple_pmc_test_dcs_limit_restores_ap_vote),
+ 	KUNIT_CASE(apple_pmc_test_floor_aggregate),
++	KUNIT_CASE(apple_pmc_test_t8132_floor_and_clpc),
+ 	KUNIT_CASE(apple_pmc_test_floor_pending_timeout),
+ 	KUNIT_CASE(apple_pmc_test_interface),
+ 	KUNIT_CASE(apple_pmc_test_interface_stuck),
+diff --git a/drivers/pmdomain/apple/pmc.c b/drivers/pmdomain/apple/pmc.c
+index 586e3f675d..72a4de75ba 100644
+--- a/drivers/pmdomain/apple/pmc.c
++++ b/drivers/pmdomain/apple/pmc.c
+@@ -136,6 +136,15 @@ struct apple_pmc {
+ 	unsigned int ap_dcs_vote;
+ 	/* Highest DCS floor held by a floor domain; protected by @lock. */
+ 	unsigned int dcs_floor;
++	/*
++	 * The AP agent's floor word as last asked for through
++	 * apple_pmc_floor_update(), and the highest floor held on each other
++	 * rail; protected by @lock. On T8132 the AP agent is also the CLPC's,
++	 * which rewrites the whole word on every sample: the word carries the
++	 * higher of the two on each rail, so neither undoes the other.
++	 */
++	u32 ap_request;
++	unsigned int floor_level[APPLE_PMC_MAX_RAILS];
+ 	/* Power cost of each DCS state in mW, if a model is described. */
+ 	u32 dcs_power[APPLE_PMC_MAX_STATES];
+ 	struct delayed_work dcs_work;
+@@ -359,6 +368,27 @@ static int __apple_pmc_floor_update(struct apple_pmc *pmc, unsigned int agent,
+ 	return ret;
+ }
+ 
++/*
++ * Caller holds pmc->lock. Raise the rails of an AP agent floor value to the
++ * floors held on them (the DCS rail has its own vote, apple_pmc_dcs_vote()).
++ */
++static u32 apple_pmc_ap_raise(struct apple_pmc *pmc, u32 mask, u32 value)
++{
++	unsigned int rail;
++
++	for (rail = 0; rail < pmc->hw->rails; rail++) {
++		u32 m = APPLE_PMC_RAIL_MASK(rail);
++		unsigned int level = pmc->floor_level[rail];
++
++		if (rail == pmc->hw->dcs_rail || !(mask & m) ||
++		    ((value & m) >> APPLE_PMC_RAIL_SHIFT(rail)) >= level)
++			continue;
++		value = (value & ~m) | (level << APPLE_PMC_RAIL_SHIFT(rail));
++	}
++
++	return value;
++}
++
+ /**
+  * apple_pmc_floor_update() - update the perf-state floor of an agent
+  * @dev: the PMC device
+@@ -367,7 +397,8 @@ static int __apple_pmc_floor_update(struct apple_pmc *pmc, unsigned int agent,
+  * @value: new value of the bits in @mask
+  *
+  * The floor only takes effect on rails where the agent's interface is
+- * enabled.
++ * enabled. For the AP agent, a rail floor domain held on a rail keeps that
++ * rail at least at its level.
+  *
+  * Context: Any context.
+  * Return: 0 on success, -EINVAL if @agent is out of range, or -EIO if the
+@@ -384,6 +415,10 @@ int apple_pmc_floor_update(struct device *dev, unsigned int agent, u32 mask,
+ 		return -EINVAL;
+ 
+ 	raw_spin_lock_irqsave(&pmc->lock, flags);
++	if (agent == pmc->hw->ap_agent) {
++		pmc->ap_request = (pmc->ap_request & ~mask) | (value & mask);
++		value = apple_pmc_ap_raise(pmc, mask, value);
++	}
+ 	ret = __apple_pmc_floor_update(pmc, agent, mask, value);
+ 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
+ 
+@@ -663,6 +698,10 @@ static int apple_pmc_floor_apply(struct apple_pmc *pmc, unsigned int rail)
+ 		return 0;
+ 	}
+ 
++	/* What the AP agent's other user asked for on this rail stays if higher. */
++	pmc->floor_level[rail] = level;
++	level = max(level, (pmc->ap_request & APPLE_PMC_RAIL_MASK(rail)) >>
++			   APPLE_PMC_RAIL_SHIFT(rail));
+ 	return __apple_pmc_floor_update(pmc, pmc->hw->ap_agent,
+ 					APPLE_PMC_RAIL_MASK(rail),
+ 					level << APPLE_PMC_RAIL_SHIFT(rail));
+-- 
+2.43.0
+

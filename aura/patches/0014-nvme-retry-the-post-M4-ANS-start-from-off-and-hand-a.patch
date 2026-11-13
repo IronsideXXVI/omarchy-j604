@@ -1,0 +1,489 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 00:40:17 +0000
+Subject: [PATCH] nvme: retry the post-M4 ANS start from off, and hand a
+ running one over
+
+A J604 (T8132) Stage 2 that Stage 1 handed a powered-off ANS found the
+controller fatal after a warm reboot, with its CPU stopped (entry RUN=0
+BOOT_STATUS=0x0 CC=0x470000 CSTS=0x2). The warm start got no HELLO and
+left ANS down, so the inline payload had no disk and the boot stopped in
+the proxy until a power cycle. The same image had started ANS on the
+boot before.
+
+Retry the start from off. A failed try is undone completely (CPU
+stopped, its mail dropped, ANS and its PCIe block powered off), then ANS
+is started warm again with 3 s for HELLO and BOOT_STATUS. On the T8132
+the last of three tries also resets ANS through PMGR and boots it cold,
+as Linux's apple,t8132-nvme-ans2 entry (cold_reset) does with a stopped
+ANS. The first try is the warm start good boots took, unchanged.
+
+If an inline payload's session still cannot be set up while ANS runs
+with its firmware up and no fatal status, disable the controller, the
+one fence for this stage's queues, and hand the session over: the
+payload's U-Boot adopts a running post-M4 ANS. Only otherwise does the
+boot stop in the proxy.
+
+Assisted-by: LLM
+---
+ src/nvme.c                              | 101 ++++++++++--
+ src/nvme.h                              |   2 +
+ src/payload.c                           |   4 +-
+ src/rtkit.c                             |  24 ++-
+ src/rtkit.h                             |   1 +
+ tests/python/test_m3_defaults_optout.py |   1 +
+ tests/python/test_nvme_adoption.py      |   1 +
+ tests/python/test_nvme_ans_restart.py   | 194 ++++++++++++++++++++++++
+ 8 files changed, 313 insertions(+), 15 deletions(-)
+ create mode 100644 tests/python/test_nvme_ans_restart.py
+
+diff --git a/src/nvme.c b/src/nvme.c
+index 0a34ef10..d873a37c 100644
+--- a/src/nvme.c
++++ b/src/nvme.c
+@@ -470,18 +470,74 @@ static bool nvme_ans_power_off(void)
+     return true;
+ }
+ 
+-/* Post-M4, ANS off: power, the SART entries back, then the firmware's start after a power loss. */
+-static bool nvme_ans_power_on(void)
++/*
++ * Post-M4, ANS off: power, the SART entries back, then the firmware's start after a power loss.
++ * The first try is that warm start with the 1 s HELLO wait every good start met. It depends on
++ * the state the last owner left: a J604 Stage 2 after a warm reboot found the controller fatal
++ * (CSTS.CFS) with the CPU stopped, got no HELLO, and ANS stayed down until a power cycle. So a
++ * failed try is undone completely (CPU stopped, its mail dropped, power off) and tried again
++ * with longer waits; the last try on the T8132 also resets ANS through PMGR and boots it cold,
++ * as Linux's apple,t8132-nvme-ans2 entry (cold_reset) does with a stopped ANS.
++ */
++#define NVME_ANS_START_TRIES     3
++#define NVME_ANS_RETRY_WAIT_USEC (3 * USEC_PER_SEC)
++
++static void nvme_ans_log_state(const char *when)
+ {
+-    if (pcie_ans_power_on() || !sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt) ||
+-        !rtkit_boot_warm(nvme_rtkit, BIT(0)) ||
+-        poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, USEC_PER_SEC) < 0) {
+-        printf("nvme: ANS didn't start from off; it stays down until a reboot\n");
++    printf("nvme: %s: RUN=%d CC=0x%x CSTS=0x%x BOOT_STATUS=0x%x\n", when, asc_cpu_running(nvme_asc),
++           read32(nvme_base + NVME_CC), read32(nvme_base + NVME_CSTS),
++           read32(nvme_base + NVME_BOOT_STATUS));
++}
++
++static bool nvme_ans_start(int try)
++{
++    bool cold = try == NVME_ANS_START_TRIES - 1 && chip_id == T8132;
++    u32 wait = try ? NVME_ANS_RETRY_WAIT_USEC : USEC_PER_SEC;
++
++    if (try) {
++        nvme_ans_log_state("start failed");
++        if (nvme_rtkit) {
++            /* A failed handshake can own buffers: rtkit_free() keeps those, and they stay. */
++            rtkit_stop(nvme_rtkit);
++            rtkit_free(nvme_rtkit);
++            nvme_rtkit = NULL;
++        } else {
++            asc_cpu_stop(nvme_asc);
++        }
++        if (pcie_ans_power_off())
++            printf("nvme: couldn't power ANS off before try %d\n", try + 1);
++        printf("nvme: ANS start try %d of %d%s\n", try + 1, NVME_ANS_START_TRIES,
++               cold ? ", cold after a reset" : "");
++    }
++    if (pcie_ans_power_on())
+         return false;
++    if (cold) {
++        /* Linux's ps_ans; the ADT may call the device ANS2. */
++        pmgr_reset(nvme_die, "ANS");
++        pmgr_reset(nvme_die, "ANS2");
+     }
+-    nvme_boot_ticks = get_ticks();
+-    printf("nvme: ANS started from off\n");
+-    return true;
++    if (!sart_set_entries(nvme_sart, nvme_sart_saved, nvme_sart_saved_cnt))
++        return false;
++    if (!nvme_rtkit && !(nvme_rtkit = rtkit_init("nvme", nvme_asc, NULL, NULL, nvme_sart, false)))
++        return false;
++    if (!(try ? rtkit_boot_wait(nvme_rtkit, !cold, BIT(0), wait)
++              : rtkit_boot_warm(nvme_rtkit, BIT(0))))
++        return false;
++    return poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, wait) >= 0;
++}
++
++static bool nvme_ans_power_on(void)
++{
++    for (int try = 0; try < NVME_ANS_START_TRIES; try++) {
++        if (nvme_ans_start(try)) {
++            nvme_boot_ticks = get_ticks();
++            printf("nvme: ANS started from off%s\n", try ? " on a retry" : "");
++            return true;
++        }
++    }
++    nvme_ans_log_state("start failed");
++    printf("nvme: ANS didn't start from off; it stays down until a reboot\n");
++    return false;
+ }
+ 
+ /* A write or flush, timed: the Stage 1 log then shows how close a marker spend came. */
+@@ -814,6 +870,33 @@ out_preserve:
+     return false;
+ }
+ 
++/*
++ * After a failed nvme_init() on a post-M4 ANS: whether the payload can still adopt the session
++ * as U-Boot's driver does (apple_nvme_adopt(): CPU running, BOOT_STATUS ok, no CFS). Only a
++ * completed controller disable fences this stage's queues, so it is done here first; then
++ * nothing of this stage's is left for ANS to reach and the session is the payload's.
++ */
++bool nvme_hand_over_for_adoption(void)
++{
++    if (nvme_initialized || nvme_type != NVME_T8132 || nvme_secure_regs || !nvme_asc ||
++        !nvme_base || !asc_cpu_running(nvme_asc) ||
++        read32(nvme_base + NVME_BOOT_STATUS) != NVME_BOOT_STATUS_OK ||
++        (read32(nvme_base + NVME_CSTS) & NVME_CSTS_CFS)) {
++        printf("nvme: no running ANS session to hand over\n");
++        return false;
++    }
++    write64_lo_hi(nvme_qreg(NVME_IOQ_CMDS), 0);
++    write64_lo_hi(nvme_qreg(NVME_IOQ_CQES), 0);
++    if (!nvme_ctrl_disable()) {
++        printf("nvme: controller didn't disable; not handing ANS over\n");
++        return false;
++    }
++    /* The queues stay allocated: ANS no longer reaches them, and the heap is reserved anyway. */
++    nvme_reboot_required = false;
++    printf("nvme: controller disabled; the payload adopts the running ANS session\n");
++    return true;
++}
++
+ void nvme_ensure_shutdown(void)
+ {
+     if (nvme_post_m4()) {
+diff --git a/src/nvme.h b/src/nvme.h
+index f7dd38be..abdd3f50 100644
+--- a/src/nvme.h
++++ b/src/nvme.h
+@@ -10,6 +10,8 @@ struct sart_entry;
+ bool nvme_init(void);
+ extern bool nvme_keep_running_for_linux;
+ bool nvme_shutdown(void);
++/* After a failed nvme_init(): hand a running post-M4 session over for the payload to adopt. */
++bool nvme_hand_over_for_adoption(void);
+ /* Post-M4: how a stage that powered ANS off tells the next one to start it again. */
+ bool nvme_post_m4(void);
+ int nvme_sart_entries(struct sart_entry *entries, int max, bool *off);
+diff --git a/src/payload.c b/src/payload.c
+index 52fee20d..aa9d5db9 100644
+--- a/src/payload.c
++++ b/src/payload.c
+@@ -537,7 +537,9 @@ int payload_run(void)
+         if (!boot_spec && chip_id == T8132) {
+             if (!nvme_init()) {
+                 printf("Payload: cannot prepare the T8132 ANS session for the payload\n");
+-                goto boot_failed;
++                if (!nvme_hand_over_for_adoption())
++                    goto boot_failed;
++                printf("Payload: the payload adopts ANS as it runs\n");
+             }
+             nvme_keep_running_for_linux = true;
+         }
+diff --git a/src/rtkit.c b/src/rtkit.c
+index e4009b48..49b94a6a 100644
+--- a/src/rtkit.c
++++ b/src/rtkit.c
+@@ -674,7 +674,8 @@ static bool rtkit_wait_for_power(rtkit_dev_t *rtk, enum rtkit_power_state *state
+  * endpoint map is answered as macOS does after a wake (bit 1 added to every part but the last,
+  * the last masked by warm_last_mask) and no endpoint is started again.
+  */
+-static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u32 warm_last_mask)
++static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u32 warm_last_mask,
++                                u32 hello_usec)
+ {
+     struct asc_message msg;
+ 
+@@ -694,7 +695,7 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
+         return false;
+     }
+ 
+-    if (!asc_recv_timeout(rtk->asc, &msg, USEC_PER_SEC)) {
++    if (!asc_recv_timeout(rtk->asc, &msg, hello_usec)) {
+         rtkit_printf("did not receive HELLO\n");
+         rtk->no_hello = true;
+         return false;
+@@ -840,13 +841,26 @@ static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec, bool warm, u
+ 
+ bool rtkit_boot(rtkit_dev_t *rtk)
+ {
+-    return rtkit_boot_internal(rtk, 0, false, 0);
++    return rtkit_boot_internal(rtk, 0, false, 0, USEC_PER_SEC);
+ }
+ 
+ bool rtkit_boot_warm(rtkit_dev_t *rtk, u32 last_mask)
+ {
+     rtk->inherited = true;
+-    return rtkit_boot_internal(rtk, 2 * USEC_PER_SEC, true, last_mask);
++    return rtkit_boot_internal(rtk, 2 * USEC_PER_SEC, true, last_mask, USEC_PER_SEC);
++}
++
++/*
++ * A retried start: warm as rtkit_boot_warm() or cold as rtkit_boot(), the HELLO waited for up
++ * to hello_usec and the power states for a bounded time. A cold start follows a reset of an
++ * IOP that an idle may have left with its receive side off, so that is turned on as well.
++ */
++bool rtkit_boot_wait(rtkit_dev_t *rtk, bool warm, u32 last_mask, u32 hello_usec)
++{
++    rtk->inherited = warm;
++    if (!warm)
++        asc_i2a_enable(rtk->asc, true);
++    return rtkit_boot_internal(rtk, RTKIT_IOP_POWER_TIMEOUT, warm, last_mask, hello_usec);
+ }
+ 
+ /* Boot the IOP, or adopt the session of one a previous stage left running. Such
+@@ -877,7 +891,7 @@ bool rtkit_boot_timed(rtkit_dev_t *rtk, u32 timeout_usec)
+     }
+ 
+     rtk->timeout_usec = timeout_usec;
+-    return rtkit_boot_internal(rtk, timeout_usec, false, 0);
++    return rtkit_boot_internal(rtk, timeout_usec, false, 0, USEC_PER_SEC);
+ }
+ 
+ u32 rtkit_get_timeout(rtkit_dev_t *rtk)
+diff --git a/src/rtkit.h b/src/rtkit.h
+index 8a6c8567..8b5b2279 100644
+--- a/src/rtkit.h
++++ b/src/rtkit.h
+@@ -30,6 +30,7 @@ bool rtkit_quiesce_ap(rtkit_dev_t *rtk);
+ bool rtkit_sleep(rtkit_dev_t *rtk);
+ bool rtkit_idle(rtkit_dev_t *rtk);
+ bool rtkit_boot_warm(rtkit_dev_t *rtk, u32 last_mask);
++bool rtkit_boot_wait(rtkit_dev_t *rtk, bool warm, u32 last_mask, u32 hello_usec);
+ void rtkit_stop(rtkit_dev_t *rtk);
+ void rtkit_free(rtkit_dev_t *rtk);
+ bool rtkit_has_owned_buffers(const rtkit_dev_t *rtk);
+diff --git a/tests/python/test_m3_defaults_optout.py b/tests/python/test_m3_defaults_optout.py
+index c4db3be6..00cd06a7 100644
+--- a/tests/python/test_m3_defaults_optout.py
++++ b/tests/python/test_m3_defaults_optout.py
+@@ -241,6 +241,7 @@ static int smp_call_sync0(int cpu, void (*fn)(void)) { return 0; }
+ static void do_enable_tso(void) {}
+ static bool nvme_shutdown(void) { return true; }
+ static bool nvme_init(void) { return true; }
++static bool nvme_hand_over_for_adoption(void) { return false; }
+ static bool nvme_keep_running_for_linux;
+ static bool nvme_set_sart_var(const char *v) { return true; }
+ static int display_configure(const char *s) { printf("DISPLAY %s\n", s); return 0; }
+diff --git a/tests/python/test_nvme_adoption.py b/tests/python/test_nvme_adoption.py
+index 52e5eff4..e28e967d 100644
+--- a/tests/python/test_nvme_adoption.py
++++ b/tests/python/test_nvme_adoption.py
+@@ -138,6 +138,7 @@ static int pcie_ans_power_on(void) { assert(chip_id != T6050); return pcie_init(
+ static int pcie_ans_power_off(void) { return shutdown_fault == 3 || shutdown_fault == 4 ? -1 : 0; }
+ static bool rtkit_idle(rtkit_dev_t *r) { return true; }
+ static bool rtkit_boot_warm(rtkit_dev_t *r, u32 mask) { return true; }
++static bool rtkit_boot_wait(rtkit_dev_t *r, bool warm, u32 mask, u32 hello) { return true; }
+ static int sart_get_entries(sart_dev_t *s, struct sart_entry *e, int max) { return 1; }
+ static bool sart_set_entries(sart_dev_t *s, const struct sart_entry *e, int n) { return true; }
+ static sart_dev_t *sart_init(const char *path) { return &sart; }
+diff --git a/tests/python/test_nvme_ans_restart.py b/tests/python/test_nvme_ans_restart.py
+new file mode 100644
+index 00000000..11a07deb
+--- /dev/null
++++ b/tests/python/test_nvme_ans_restart.py
+@@ -0,0 +1,194 @@
++# SPDX-License-Identifier: GPL-2.0-only
++"""The post-M4 ANS start from off: retried after a full power cycle, cold after a reset on the
++T8132, and a running session handed over for adoption when a stage cannot use it."""
++
++from pathlib import Path
++import os
++import subprocess
++
++from host_compiler import host_cc
++
++
++def test_ans_start_retries_and_hand_over(tmp_path):
++    source = Path(os.environ.get("NVME_SOURCE", Path(__file__).resolve().parents[2] / "src/nvme.c")).read_text()
++    declarations = source[source.index("#define NVME_TIMEOUT"):source.index("static u64 nvme_read64_lo_hi")]
++    qregs = source[source.index("static u64 nvme_qreg(u32 reg)"):source.index("static void nvme_log_entry_state")]
++    power = source[source.index("/* The ADT describes a post-M4 ANS"):source.index("/* A write or flush, timed:")]
++    hand_over = source[source.index("bool nvme_hand_over_for_adoption(void)"):
++                       source.index("void nvme_ensure_shutdown(void)")]
++    harness = r'''
++#include <assert.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++typedef uint8_t u8;
++typedef uint16_t u16;
++typedef uint32_t u32;
++typedef uint64_t u64;
++typedef int asc_dev_t;
++typedef int rtkit_dev_t;
++typedef int sart_dev_t;
++struct sart_entry { u8 index, flags; u64 paddr, size; };
++#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
++#define static_assert _Static_assert
++#define BIT(n) (1ULL << (n))
++#define GENMASK(h, l) ((BIT((h) + 1) - 1) & ~(BIT(l) - 1))
++#define FIELD_GET(mask, value) (((value) & (mask)) >> __builtin_ctzll(mask))
++#define FIELD_PREP(mask, value) (((u64)(value) << __builtin_ctzll(mask)) & (mask))
++#define USEC_PER_SEC 1000000
++#define T8140 0x8140
++#define T8132 0x8132
++#define T6050 0x6050
++static u32 chip_id = T8132;
++static void *adt;
++static u64 get_ticks(void) { return 0; }
++''' + declarations + r'''
++static int asc, rtkit, sart;
++static char events[128];
++static u32 hello[8];
++static int hellos;
++/* Which tries the firmware starts on, one bit per try; the hand-over state. */
++static unsigned starts_on;
++static int try_no, resets_ans, resets_ans2, disables;
++static bool running, booted, cfs, disable_fails;
++static u64 cleared;
++static void event(char c) { size_t n = strlen(events); assert(n + 1 < sizeof(events)); events[n] = c; }
++static u32 read32(u64 addr)
++{
++    if (addr == nvme_base + NVME_BOOT_STATUS)
++        return booted ? NVME_BOOT_STATUS_OK : 0;
++    if (addr == nvme_base + NVME_CSTS)
++        return cfs ? NVME_CSTS_CFS : 0;
++    return 0;
++}
++static void write64_lo_hi(u64 addr, u64 value) { if (!value) cleared |= addr; }
++static int poll32(u64 a, u32 mask, u32 value, u32 timeout) { return booted ? 0 : -1; }
++static int adt_path_offset(void *a, const char *p) { return 1; }
++static const void *adt_get_property(void *a, int n, const char *p) { return NULL; }
++static bool asc_cpu_running(asc_dev_t *a) { return running; }
++static void asc_cpu_stop(asc_dev_t *a) { event('X'); running = false; }
++static int pcie_ans_power_off(void) { event('O'); booted = false; return 0; }
++static int pcie_ans_power_on(void) { event('P'); return 0; }
++static void pmgr_reset(int die, const char *name)
++{
++    event('R');
++    if (!strcmp(name, "ANS"))
++        resets_ans++;
++    else if (!strcmp(name, "ANS2"))
++        resets_ans2++;
++}
++static bool sart_set_entries(sart_dev_t *s, const struct sart_entry *e, int n) { event('E'); return true; }
++static int sart_get_entries(sart_dev_t *s, struct sart_entry *e, int max) { return 0; }
++static rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *a, void *d, void *i, sart_dev_t *s, bool sram)
++{ event('I'); return &rtkit; }
++static void rtkit_stop(rtkit_dev_t *r) { event('S'); running = false; }
++static void rtkit_free(rtkit_dev_t *r) { event('F'); }
++static bool rtkit_idle(rtkit_dev_t *r) { return true; }
++static bool rtkit_boot_attempt(char c, u32 wait)
++{
++    event(c);
++    hello[hellos++] = wait;
++    running = true;
++    booted = starts_on & (1u << try_no++);
++    return booted;
++}
++static bool rtkit_boot_warm(rtkit_dev_t *r, u32 mask) { assert(mask == 1); return rtkit_boot_attempt('W', USEC_PER_SEC); }
++static bool rtkit_boot_wait(rtkit_dev_t *r, bool warm, u32 mask, u32 wait)
++{ assert(mask == 1); return rtkit_boot_attempt(warm ? 'W' : 'C', wait); }
++static bool nvme_ctrl_disable(void) { disables++; return !disable_fails; }
++static bool nvme_ctrl_shutdown(void) { return true; }
++static bool nvme_ctrl_suspend(void) { abort(); }
++''' + qregs + power + hand_over + r'''
++static void reset(u32 chip, unsigned on)
++{
++    memset(events, 0, sizeof(events));
++    memset(hello, 0, sizeof(hello));
++    hellos = try_no = resets_ans = resets_ans2 = disables = 0;
++    chip_id = chip;
++    starts_on = on;
++    running = booted = cfs = disable_fails = false;
++    cleared = 0;
++    nvme_type = NVME_T8132;
++    nvme_secure_regs = false;
++    nvme_initialized = false;
++    nvme_reboot_required = false;
++    nvme_asc = &asc;
++    nvme_rtkit = &rtkit;
++    nvme_sart = &sart;
++    nvme_base = 0x4c5cc0000;
++    nvmmu_base = 0x485cc0000;
++}
++
++int main(void)
++{
++    /* A good start: the one warm start every good boot took, unchanged. */
++    reset(T8132, 1);
++    assert(nvme_ans_power_on());
++    assert(!strcmp(events, "PEW") && hellos == 1 && hello[0] == USEC_PER_SEC);
++
++    /* No HELLO once: everything undone, power off, then warm again with the longer wait. */
++    reset(T8132, 2);
++    assert(nvme_ans_power_on());
++    assert(!strcmp(events, "PEW" "SFOPEIW"));
++    assert(hello[1] == 3 * USEC_PER_SEC && !resets_ans);
++
++    /* Twice: the last try resets ANS through PMGR and boots it cold. */
++    reset(T8132, 4);
++    assert(nvme_ans_power_on());
++    assert(!strcmp(events, "PEW" "SFOPEIW" "SFOPRREIC"));
++    assert(resets_ans == 1 && resets_ans2 == 1 && hello[2] == 3 * USEC_PER_SEC);
++
++    /* Never: three tries, then down, and the CPU of the last one is left as it was. */
++    reset(T8132, 0);
++    assert(!nvme_ans_power_on());
++    assert(!strcmp(events, "PEW" "SFOPEIW" "SFOPRREIC") && hellos == 3);
++
++    /* Elsewhere no PMGR reset of ANS: three warm tries. */
++    reset(T8140, 0);
++    assert(!nvme_ans_power_on());
++    assert(!strcmp(events, "PEW" "SFOPEIW" "SFOPEIW") && !resets_ans && !resets_ans2);
++
++    /* Hand-over: a running, healthy session is disabled and given to the payload. */
++    reset(T8132, 0);
++    running = booted = true;
++    nvme_reboot_required = true;
++    assert(nvme_hand_over_for_adoption());
++    assert(!nvme_reboot_required && disables == 1);
++    assert(cleared & nvme_qreg(NVME_IOQ_CMDS) && cleared & nvme_qreg(NVME_IOQ_CQES));
++
++    /* Not when the controller is fatal, the CPU stopped, the firmware not up or the disable fails. */
++    for (int c = 0; c < 5; c++) {
++        reset(T8132, 0);
++        running = booted = true;
++        nvme_reboot_required = true;
++        if (c == 0)
++            cfs = true;
++        if (c == 1)
++            running = false;
++        if (c == 2)
++            booted = false;
++        if (c == 3)
++            disable_fails = true;
++        if (c == 4)
++            nvme_asc = NULL;
++        assert(!nvme_hand_over_for_adoption());
++        assert(nvme_reboot_required);
++        assert(disables == (c == 3));
++    }
++    /* Nor for this stage's own initialized session. */
++    reset(T8132, 0);
++    running = booted = nvme_initialized = true;
++    assert(!nvme_hand_over_for_adoption() && !disables);
++    return 0;
++}
++'''
++    binary = tmp_path / "nvme-ans-restart"
++    subprocess.run(
++        [*host_cc(), "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
++         "-Wno-unused-variable", "-Wno-unused-function", "-Wno-format", "-x", "c", "-", "-o",
++         str(binary)],
++        input=harness, text=True, check=True,
++    )
++    subprocess.run([str(binary)], check=True)
+-- 
+2.43.0
+

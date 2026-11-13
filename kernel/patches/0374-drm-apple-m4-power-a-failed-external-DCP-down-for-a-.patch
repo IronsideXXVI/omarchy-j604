@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 00:37:44 +0000
+Subject: [PATCH] drm/apple: m4: power a failed external DCP down for a
+ deep sleep
+
+An external DCP whose restart after a sleep failed is left gated with
+its session failed. The next deep sleep then reached iomfb_m4_ext_stop()
+with the DCP gated and was refused with -EALREADY, so one failed restart
+blocked every deep sleep until a reboot.
+
+Such a DCP has nothing to idle or save, but its domains and DARTs are on
+and a deep sleep needs them down. Power it down without RTKit: clear the
+CPU's run bit, power both DARTs and the CPU domain off. After the sleep,
+power them on again and leave the session failed. A failure while
+powering it down is undone and refuses the sleep, as before.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/iomfb_m4.c | 73 ++++++++++++++++++++++++++++++--
+ 1 file changed, 69 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 3aac98685f..149be02275 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -7863,6 +7863,62 @@ static int iomfb_m4_ext_dart_off(struct apple_dart_cio *dart)
+ 	return ret;
+ }
+ 
++/*
++ * An external DCP whose restart failed is left gated, its session failed,
++ * with its domains and DARTs on: nothing to idle and nothing to save, but a
++ * deep sleep still takes its domains down. Do what a stop does after RTKit:
++ * clear the CPU's run bit (the failed start may have left it set; the domain
++ * goes off next, so no idle wait), power both DARTs and the CPU domain off.
++ * iomfb_m4_ext_start() powers them on again after the sleep and leaves the
++ * session failed. A failure here is undone and refuses the sleep.
++ */
++static int iomfb_m4_ext_park(struct iomfb_m4 *dcp)
++{
++	bool prepared[2] = {}, cpu_off = false;
++	const char *step = "DART owner";
++	int ret, recover;
++	u32 control;
++
++	ret = dcp->ext_darts[0] && dcp->ext_darts[1] ? 0 : -ENODEV;
++	for (unsigned int i = 0; !ret && i < 2; i++) {
++		ret = apple_dart_cio_prepare(dcp->ext_darts[i]);
++		prepared[i] = !ret;
++	}
++	if (ret)
++		goto unprepare;
++	control = readl(dcp->coproc + DCP_M4_CPU_CONTROL);
++	if (control & DCP_M4_CPU_RUN)
++		writel(control & ~DCP_M4_CPU_RUN, dcp->coproc + DCP_M4_CPU_CONTROL);
++	step = "display DART";
++	ret = iomfb_m4_ext_dart_off(dcp->ext_darts[1]);
++	if (!ret) {
++		step = "firmware DART";
++		ret = iomfb_m4_ext_dart_off(dcp->ext_darts[0]);
++	}
++	if (!ret) {
++		step = "CPU domain";
++		cpu_off = true;
++		ret = apple_pmgr_ps_consumer_off(dcp->dev);
++	}
++	if (!ret) {
++		dcp->ext_stopped = true;
++		dev_info(dcp->dev, "failed external DCP powered down for sleep\n");
++		return 0;
++	}
++	recover = cpu_off ? apple_pmgr_ps_consumer_on(dcp->dev) : 0;
++	recover = recover ?: apple_dart_cio_on(dcp->ext_darts[0]) ?:
++		  apple_dart_cio_on(dcp->ext_darts[1]);
++	if (recover)
++		dev_err(dcp->dev, "failed external DCP power-up after %s: %d\n", step, recover);
++unprepare:
++	dev_warn(dcp->dev, "failed external DCP not powered down for sleep at %s: %d\n",
++		 step, ret);
++	for (unsigned int i = 0; i < 2; i++)
++		if (prepared[i])
++			apple_dart_cio_finish(dcp->ext_darts[i]);
++	return -EBUSY;
++}
++
+ /*
+  * A deep sleep takes an external DCP down whole, as its display has gone
+  * already: the AP link is released, RTKit idles, the CPU stops, then its
+@@ -7882,6 +7938,9 @@ static int iomfb_m4_ext_stop(struct iomfb_m4 *dcp)
+ 	int ret, recover;
+ 
+ 	lockdep_assert_held(&dcp->lock);
++	/* Its restart failed: down for the sleep without RTKit. */
++	if (!dcp->ext_stopped && dcp->gated && READ_ONCE(dcp->error))
++		return iomfb_m4_ext_park(dcp);
+ 	if (dcp->ext_stopped || dcp->gated)
+ 		return -EALREADY;
+ 	if (!r || r->ext_qn || dcp->transaction.calls || !READ_ONCE(dcp->ext_dart_down))
+@@ -8006,14 +8065,15 @@ static int iomfb_m4_ext_stop(struct iomfb_m4 *dcp)
+ static int iomfb_m4_ext_start(struct iomfb_m4 *dcp)
+ {
+ 	const char *step = "CPU domain";
++	bool failed;
+ 	int ret, finish;
+ 
+ 	lockdep_assert_held(&dcp->lock);
+ 	if (!dcp->ext_stopped)
+ 		return 0;
+-	ret = READ_ONCE(dcp->error);
+-	if (!ret)
+-		ret = apple_pmgr_ps_consumer_on(dcp->dev);
++	/* Parked with its session failed: power only, no RTKit (iomfb_m4_ext_park()). */
++	failed = READ_ONCE(dcp->error);
++	ret = apple_pmgr_ps_consumer_on(dcp->dev);
+ 	if (!ret) {
+ 		step = "firmware DART";
+ 		ret = apple_dart_cio_on(dcp->ext_darts[0]);
+@@ -8022,7 +8082,7 @@ static int iomfb_m4_ext_start(struct iomfb_m4 *dcp)
+ 		step = "display DART";
+ 		ret = apple_dart_cio_on(dcp->ext_darts[1]);
+ 	}
+-	if (!ret) {
++	if (!ret && !failed) {
+ 		step = "RTKit wake";
+ 		ret = apple_rtkit_wake_retained(dcp->rtkit, iomfb_m4_cpu_start, dcp);
+ 	}
+@@ -8039,6 +8099,11 @@ static int iomfb_m4_ext_start(struct iomfb_m4 *dcp)
+ 		dcp_m4_failed(dcp, ret);
+ 		return ret;
+ 	}
++	if (failed) {
++		/* Powered as before the sleep; still gated and failed. */
++		dev_info(dcp->dev, "failed external DCP powered up after sleep\n");
++		return 0;
++	}
+ 	WRITE_ONCE(dcp->gated, false);
+ 	dev_info(dcp->dev, "external DCP restarted after sleep\n");
+ 	return 0;
+-- 
+2.43.0
+
