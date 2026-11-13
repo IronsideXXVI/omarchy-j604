@@ -1,0 +1,286 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 08:52:40 +0000
+Subject: [PATCH] soc: apple: sleep: check init_kernel_el's bytes
+ before a T8132 resume
+
+A J604 deep sleep commits, wakes and then stops between the resume
+stub and resume mark 57, inside init_kernel_el, with no exception
+taken. aura's DRAM check covers the stub's page, the saved context, a
+pattern and the stash. It does not cover .idmap.text, which
+init_kernel_el runs from with the MMU off, nor .mmuoff.data, where it
+reads ctxr_stay_el2 and the resume marks' watchdog by physical address.
+
+At the commit, store a CRC-32 of each 256-byte chunk of both ranges,
+and have the resume stub recompute them by physical address before it
+branches to cpu_resume. A match changes nothing. On a mismatch the stub
+does not branch: it restarts WD2 for 46 s, which no other step of the
+way back uses, and leaves a record in PMU scratch that macsmc-reboot
+reads on the next boot: the region in 0xf805 (1 .idmap.text,
+2 .mmuoff.data, 3 the table itself), the first chunk that differs in
+0xf806 and log2 of the chunk size in 0xf807, then 0x3c in 0xf804.
+
+Nothing is cleaned for the check, so the wake runs as before. A
+mismatch means DRAM at the wake is not what the kernel saw at the
+commit, whether the bytes changed across the collapse or a line never
+reached DRAM.
+
+On the J604 the ranges are 3848 and 2100 bytes, 25 chunks in all.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 201 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 200 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 5a8ac80be9..5df42d7c3a 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -3150,6 +3150,39 @@ asm(
+ );
+ void t8132_resume_vectors(void);
+ 
++/*
++ * What init_kernel_el runs, and reads by PA, on T8132's way back: .idmap.text and
++ * .mmuoff.data. aura's DRAM check (t8132_arm_dram_check()) covers neither. The commit
++ * leaves a CRC-32 per 256-byte chunk of each here, and the resume stub recomputes them
++ * with the MMU off before it branches to cpu_resume. A match changes nothing. On a
++ * mismatch the stub stays: it restarts WD2 for 46 s, which no other step of the way
++ * back uses, and leaves a record in PMU scratch, read by macsmc-reboot on the next
++ * boot: the region in 0xf805 (1 .idmap.text, 2 .mmuoff.data, 3 this table), the first
++ * chunk that differs in 0xf806, log2 of the chunk size in 0xf807, then 0x3c in 0xf804.
++ * Nothing is cleaned for the check, so a mismatch means DRAM at the wake is not what the
++ * kernel saw at the commit, whether the bytes changed across the collapse or a line
++ * never reached DRAM.
++ */
++#define T8132_ELCHK_MAGIC	0x4b434c45	/* "ELCK" */
++#define T8132_ELCHK_CHUNK	256
++#define T8132_ELCHK_MAX		32
++
++struct t8132_elchk {
++	u32 magic;		/* last at the commit, cleared after cpu_suspend() returns */
++	u32 n[2];		/* chunks of .idmap.text, .mmuoff.data */
++	u32 len[2];		/* bytes checked, a multiple of 4 */
++	u32 crc[T8132_ELCHK_MAX];	/* crc32_le(~0, chunk), .idmap.text's first */
++	u32 self;		/* crc32_le(~0) over everything above, magic set */
++};
++
++/* The stub's offsets. */
++static_assert(offsetof(struct t8132_elchk, n) == 4);
++static_assert(offsetof(struct t8132_elchk, len) == 12);
++static_assert(offsetof(struct t8132_elchk, crc) == 20);
++static_assert(offsetof(struct t8132_elchk, self) == 148);
++
++struct t8132_elchk t8132_elchk __aligned(64);
++
+ /*
+  * The first thing Linux runs after a wake, MMU off and no stack. The last wake program
+  * leaves WD2 running for 5 s: restart it for 60 s, in the order apple_sleep_set_wd2() uses. No
+@@ -3181,8 +3214,100 @@ asm(
+ "	str	w10, [x9, #0x28]\n"
+ "	mov	w10, #1\n"
+ "	str	w10, [x9, #0x2c]\n"
+-"	b	cpu_resume\n"
++/*
++ * Before the jump: .idmap.text and .mmuoff.data against t8132_elchk, by PA. No check
++ * armed, or all chunks equal: cpu_resume as before. A mismatch stays at 28.
++ */
++"	.arch_extension crc\n"
++"	adrp	x13, t8132_elchk\n"
++"	add	x13, x13, :lo12:t8132_elchk\n"
++"	ldr	w14, [x13]\n"
++"	movz	w15, #0x4c45\n"
++"	movk	w15, #0x4b43, lsl #16\n"
++"	cmp	w14, w15\n"
++"	b.ne	29f\n"
++"	mov	x1, x13\n"
++"	mov	w2, #148\n"
++"	movn	w0, #0\n"
++"21:	ldr	w3, [x1], #4\n"
++"	crc32w	w0, w0, w3\n"
++"	subs	w2, w2, #4\n"
++"	b.ne	21b\n"
++"	ldr	w3, [x1]\n"
++"	mov	w16, #3\n"
++"	mov	w17, #0\n"
++"	cmp	w0, w3\n"
++"	b.ne	28f\n"
++"	adrp	x1, __idmap_text_start\n"
++"	add	x1, x1, :lo12:__idmap_text_start\n"
++"	ldr	w2, [x13, #12]\n"
++"	ldr	w4, [x13, #4]\n"
++"	add	x5, x13, #20\n"
++"	mov	w16, #1\n"
++"	bl	t8132_elchk_region\n"
++"	tbz	w17, #31, 28f\n"
++"	adrp	x1, __mmuoff_data_start\n"
++"	add	x1, x1, :lo12:__mmuoff_data_start\n"
++"	ldr	w2, [x13, #16]\n"
++"	ldr	w4, [x13, #8]\n"
++"	mov	w16, #2\n"
++"	bl	t8132_elchk_region\n"
++"	tbz	w17, #31, 28f\n"
++"29:	b	cpu_resume\n"
++/* A mismatch: WD2 for 46 s (0x41cdb400 ticks), the record, then stay. */
++"28:	str	wzr, [x9, #0x2c]\n"
++"	str	wzr, [x9, #0x20]\n"
++"	movz	w10, #0xb400\n"
++"	movk	w10, #0x41cd, lsl #16\n"
++"	str	w10, [x9, #0x28]\n"
++"	mov	w10, #1\n"
++"	str	w10, [x9, #0x2c]\n"
++"	adrp	x10, t8132_catch_io\n"
++"	add	x10, x10, :lo12:t8132_catch_io\n"
++"	ldr	x12, [x10, #8]\n"
++"	cbz	x12, 27f\n"
++"	mov	w0, #0xf805\n"
++"	mov	w1, w16\n"
++"	bl	t8132_catch_pmu_write\n"
++"	mov	w0, #0xf806\n"
++"	and	w1, w17, #0xff\n"
++"	bl	t8132_catch_pmu_write\n"
++"	mov	w0, #0xf807\n"
++"	mov	w1, #8\n"
++"	bl	t8132_catch_pmu_write\n"
++"	mov	w0, #0xf804\n"
++"	mov	w1, #0x3c\n"
++"	bl	t8132_catch_pmu_write\n"
++"27:	wfe\n"
++"	b	27b\n"
+ "	.size	t8132_resume_stub, . - t8132_resume_stub\n"
++/*
++ * x1 = start, w2 = bytes, w4 = chunks, x5 = their CRCs. Returns w17 = the first chunk
++ * that differs, or -1 with x5 past the region's CRCs. Uses x0 x3 x6.
++ */
++"	.type	t8132_elchk_region, %function\n"
++"t8132_elchk_region:\n"
++"	mov	w17, #0\n"
++"31:	cbz	w4, 35f\n"
++"	mov	w6, #256\n"
++"	cmp	w2, w6\n"
++"	csel	w6, w2, w6, lo\n"
++"	sub	w2, w2, w6\n"
++"	movn	w0, #0\n"
++"32:	cbz	w6, 33f\n"
++"	ldr	w3, [x1], #4\n"
++"	crc32w	w0, w0, w3\n"
++"	sub	w6, w6, #4\n"
++"	b	32b\n"
++"33:	ldr	w3, [x5], #4\n"
++"	cmp	w0, w3\n"
++"	b.ne	36f\n"
++"	add	w17, w17, #1\n"
++"	sub	w4, w4, #1\n"
++"	b	31b\n"
++"35:	movn	w17, #0\n"
++"36:	ret\n"
++"	.size	t8132_elchk_region, . - t8132_elchk_region\n"
+ "	.popsection\n"
+ );
+ void t8132_resume_stub(void);
+@@ -3541,6 +3666,76 @@ static void t8132_arm_dram_check(struct apple_sleep *s)
+ 	s->check_ranges = c->nranges;
+ }
+ 
++/* The two ranges as the stub reads them: whole words, from each start. */
++static void t8132_el_ranges(const u8 **base, u32 *len)
++{
++	base[0] = (const u8 *)__idmap_text_start;
++	len[0] = (__idmap_text_end - __idmap_text_start) & ~3UL;
++	base[1] = (const u8 *)__mmuoff_data_start;
++	len[1] = (__mmuoff_data_end - __mmuoff_data_start) & ~3UL;
++}
++
++static bool t8132_el_check_fits(const u32 *len)
++{
++	return len[0] && len[1] &&
++	       DIV_ROUND_UP(len[0], T8132_ELCHK_CHUNK) + DIV_ROUND_UP(len[1], T8132_ELCHK_CHUNK) <=
++	       T8132_ELCHK_MAX;
++}
++
++/*
++ * After arm64_resume_armed, last before the commit: nothing writes either range from
++ * here to the stub. Read through the kernel's mapping; nothing is cleaned for it.
++ */
++static void t8132_arm_el_check(void)
++{
++	struct t8132_elchk *e = &t8132_elchk;
++	struct t8132_elchk t = { .magic = T8132_ELCHK_MAGIC };
++	const u8 *base[2];
++	unsigned int r, i, k = 0;
++	u32 len[2];
++
++	WRITE_ONCE(e->magic, 0);
++	t8132_el_ranges(base, len);
++	if (t8132_el_check_fits(len)) {
++		for (r = 0; r < 2; r++) {
++			t.len[r] = len[r];
++			t.n[r] = DIV_ROUND_UP(len[r], T8132_ELCHK_CHUNK);
++			for (i = 0; i < t.n[r]; i++) {
++				u32 off = i * T8132_ELCHK_CHUNK;
++
++				t.crc[k++] = crc32_le(~0U, base[r] + off,
++						      min_t(u32, T8132_ELCHK_CHUNK, len[r] - off));
++			}
++		}
++		t.self = crc32_le(~0U, (const u8 *)&t, offsetof(struct t8132_elchk, self));
++		memcpy(e->n, t.n, sizeof(*e) - offsetof(struct t8132_elchk, n));
++		dsb(ishst);
++		WRITE_ONCE(e->magic, T8132_ELCHK_MAGIC);
++	}
++	dcache_clean_poc((unsigned long)e, (unsigned long)(e + 1));
++	dsb(sy);
++}
++
++static void t8132_disarm_el_check(void)
++{
++	WRITE_ONCE(t8132_elchk.magic, 0);
++	dcache_clean_poc((unsigned long)&t8132_elchk, (unsigned long)(&t8132_elchk + 1));
++}
++
++static void t8132_el_check_report(struct apple_sleep *s)
++{
++	const u8 *base[2];
++	u32 len[2];
++
++	t8132_el_ranges(base, len);
++	if (t8132_el_check_fits(len))
++		dev_info(s->dev, "resume stub checks .idmap.text (%u bytes) and .mmuoff.data (%u bytes) in %u-byte chunks\n",
++			 len[0], len[1], T8132_ELCHK_CHUNK);
++	else
++		dev_warn(s->dev, "no resume stub check: .idmap.text %u and .mmuoff.data %u bytes exceed %u chunks\n",
++			 len[0], len[1], T8132_ELCHK_MAX);
++}
++
+ static bool t8132_cpu_perf_down = true;
+ module_param(t8132_cpu_perf_down, bool, 0644);
+ MODULE_PARM_DESC(t8132_cpu_perf_down,
+@@ -3641,6 +3836,7 @@ static int t8132_sleep_commit(unsigned long unused)
+ 	dcache_clean_poc((unsigned long)&arm64_resume_armed,
+ 			 (unsigned long)(&arm64_resume_armed + 1));
+ 	t8132_arm_dram_check(s);
++	t8132_arm_el_check();
+ 	/* What this path has dirtied since the sweep. */
+ 	dcache_clean_poc((unsigned long)task_stack_page(current),
+ 			 (unsigned long)task_stack_page(current) + THREAD_SIZE);
+@@ -3786,6 +3982,8 @@ static int apple_sleep_enter(suspend_state_t state)
+ 	 */
+ 	daif = local_daif_save();
+ 	ret = cpu_suspend(0, s->soc->commit);
++	if (s->soc->commit == t8132_sleep_commit)
++		t8132_disarm_el_check();
+ 	/* A commit that returned never reached __cpu_suspend_exit(). */
+ 	if (READ_ONCE(arm64_resume_armed)) {
+ 		WRITE_ONCE(arm64_resume_armed, 0);
+@@ -4650,6 +4848,7 @@ static int apple_sleep_probe(struct platform_device *pdev)
+ 	apple_sleep = s;
+ 	if (s->soc->commit == t8132_sleep_commit) {
+ 		t8132_catch_init(pdev, s);
++		t8132_el_check_report(s);
+ 		j604_adt_pwrgate_init(s);
+ 		j604_adt_pwrgate_print(s, "at boot");
+ 	}
+-- 
+2.43.0
+

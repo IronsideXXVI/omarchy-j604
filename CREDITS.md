@@ -4,7 +4,7 @@ Patches in this repository by author (from each patch's `From:` line). Many are 
 carried unchanged with their authorship from Aurora Silicon, the Asahi Linux project, Omarchy and the
 Omarchy for Apple Silicon contributors. Thank you.
 
-Since kernel 7.3 (local 1.703) the kernel series is 163 patches instead of 766 (164 since 1.704, 175 since 1.705, 176 since 1.706, 188 since 1.710, 194 since 1.711, 195 since 1.712, 197 since 1.713, 199 since 1.714, 200 since 1.715, 203 since 1.716, 204 since 1.717, 206 since 1.718, 207 since 1.719, 212 since 1.720, 215 since 1.721, 218 since 1.722, 219 since 1.723, 220 since 1.724, 221 since 1.725, 222 since 1.726, 225 since 1.727, 228 since 1.728, 229 since 1.729, 230 since 1.730, 231 since 1.731, 232 since 1.732, 236 since 1.733, 239 since 1.734, 245 since 1.736, 227 since 1.800, 228 since 1.802, 231 since 1.803, 233 since 1.804, 236 since 1.805, 237 since 1.807, 240 since 1.808, 245 since 1.809, 246 since 1.810, 247 since 1.811, 249 since 1.813, 252 since 1.816, 264 since 1.820, 276 since 1.821, 279 since 1.823, 283 since 1.826, 289 since 1.829, 295 since 1.832, 297 since 1.833, 303 since 1.836, 311 since 1.841, 320 since 1.843, 323 since 1.844, 329 since 1.845, 330 since 1.846, 336 since 1.847, 337 since 1.848, 338 since 1.850, 353 since 1.854, 358 since 1.856, 368 since 1.858, 353 since 1.862, 355 since 1.863, 357 since 1.864, 362 since 1.865, 370 since 1.867, 378 since 1.868, 380 since 1.869, 382 since 1.870, 388 since 1.871, 393 since 1.872, 402 since 1.873, 404 since 1.874, 422 since 1.875, 448 since 1.878, 457 since 1.879, 460 since 1.880): Aurora's 7.3 base already
+Since kernel 7.3 (local 1.703) the kernel series is 163 patches instead of 766 (164 since 1.704, 175 since 1.705, 176 since 1.706, 188 since 1.710, 194 since 1.711, 195 since 1.712, 197 since 1.713, 199 since 1.714, 200 since 1.715, 203 since 1.716, 204 since 1.717, 206 since 1.718, 207 since 1.719, 212 since 1.720, 215 since 1.721, 218 since 1.722, 219 since 1.723, 220 since 1.724, 221 since 1.725, 222 since 1.726, 225 since 1.727, 228 since 1.728, 229 since 1.729, 230 since 1.730, 231 since 1.731, 232 since 1.732, 236 since 1.733, 239 since 1.734, 245 since 1.736, 227 since 1.800, 228 since 1.802, 231 since 1.803, 233 since 1.804, 236 since 1.805, 237 since 1.807, 240 since 1.808, 245 since 1.809, 246 since 1.810, 247 since 1.811, 249 since 1.813, 252 since 1.816, 264 since 1.820, 276 since 1.821, 279 since 1.823, 283 since 1.826, 289 since 1.829, 295 since 1.832, 297 since 1.833, 303 since 1.836, 311 since 1.841, 320 since 1.843, 323 since 1.844, 329 since 1.845, 330 since 1.846, 336 since 1.847, 337 since 1.848, 338 since 1.850, 353 since 1.854, 358 since 1.856, 368 since 1.858, 353 since 1.862, 355 since 1.863, 357 since 1.864, 362 since 1.865, 370 since 1.867, 378 since 1.868, 380 since 1.869, 382 since 1.870, 388 since 1.871, 393 since 1.872, 402 since 1.873, 404 since 1.874, 422 since 1.875, 448 since 1.878, 457 since 1.879, 460 since 1.880, 476 since 1.881): Aurora's 7.3 base already
 contains much of what we carried before, under its authors' names there. Kernel patch 0157 folds the rest
 of the 1.617 J604 series into one integration commit; its authors are those of the 1.617 series, which
 the history of `kernel/` keeps (kernel 1.617 was added in commit 4407a2a). With 1.800 the series moved to a newer
@@ -13,9 +13,9 @@ their authors' names.
 
 | Author | Patches |
 | --- | --- |
-| Dylan Ironside | 330 |
-| Ryan Murray | 21 |
-| Diljit Singh | 2 |
+| Dylan Ironside | 337 |
+| Ryan Murray | 23 |
+| Diljit Singh | 3 |
 | RJ Skerry-Ryan | 8 |
 | Bartosz Nitka | 29 |
 | Erik Bourget | 27 |
@@ -33,6 +33,8 @@ their authors' names.
 | ewb | 1 |
 | Akhil | 1 |
 | nekolyanich | 1 |
+| AxxzyWasTaken | 2 |
+| twobip | 1 |
 
 Also credited in a patch message: the built-in panel defaults (`omarchy-settings-dev/patches/disp-0201`) follow omacom/omarchy#10549 by j-c-m, which set `cm = "dp3"` for the Dell XPS OLED panel.
 

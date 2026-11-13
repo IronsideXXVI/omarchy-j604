@@ -1,0 +1,368 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 02:32:46 +0000
+Subject: [PATCH 15/15] smp: check that DRAM was kept before a T8132 S2R wake
+ resumes the OS
+
+Two J604 (T8132) deep sleeps reset about 78 s after the wake: inside
+the resume stub's 60 s window, before the OS's next mark. Whether DRAM
+was kept through the sleep is the first thing to settle there, and only
+aura runs on the wake path before the OS touches its saved state.
+
+Let the OS have aura check it. The mailbox grows from 32 to 112 bytes,
+and /chosen/aurora,s2r-mailbox-size says so, so an OS writes the new
+fields only into a mailbox that has them. Before its commit the OS names
+up to four ranges (by physical address, 64 KiB each, 256 KiB in all,
+cleaned to PoC), their CRC-32 (zlib's, one stream over the ranges in
+order) and, last, check_magic "AURACRC1". Before taking resume_pa, aura
+recomputes the CRC with the MMU off, so it reads DRAM itself, and clears
+check_magic. A match resumes as before, with WD2 at 40 s. A mismatch
+stops with WD2 at 20 s, and ranges outside those limits stop it at 30 s,
+so the reset says which. Without check_magic (an older OS) nothing
+changes. The magic stays "AURAS2R1", so an older OS finds the mailbox as
+before. T8132 only.
+
+Assisted-by: LLM
+---
+ src/kboot.c                         |  3 +
+ src/smp.c                           | 86 +++++++++++++++++++++++++--
+ src/smp.h                           |  8 +++
+ src/wdt.c                           |  4 +-
+ src/wdt.h                           |  5 +-
+ tests/python/test_s2r_dram_check.py | 92 +++++++++++++++++++++++++++++
+ tests/python/test_wdt_s2r_mark.py   |  6 +-
+ 7 files changed, 194 insertions(+), 10 deletions(-)
+ create mode 100644 tests/python/test_s2r_dram_check.py
+
+diff --git a/src/kboot.c b/src/kboot.c
+index 9f8b758d..27553862 100644
+--- a/src/kboot.c
++++ b/src/kboot.c
+@@ -711,6 +711,9 @@ static int dt_set_s2r_mailbox(int node)
+     u64 mailbox = smp_s2r_publish();
+     if (fdt_setprop_u64(dt, node, "aurora,s2r-mailbox", mailbox))
+         bail("FDT: couldn't set aurora,s2r-mailbox\n");
++    /* An OS that knows the DRAM check writes it only into a mailbox this big. */
++    if (fdt_setprop_u32(dt, node, "aurora,s2r-mailbox-size", smp_s2r_mailbox_size()))
++        bail("FDT: couldn't set aurora,s2r-mailbox-size\n");
+     printf("FDT: S2R mailbox at 0x%lx\n", mailbox);
+     return 0;
+ }
+diff --git a/src/smp.c b/src/smp.c
+index cb66c8ee..8cc1bdb8 100644
+--- a/src/smp.c
++++ b/src/smp.c
+@@ -4,6 +4,7 @@
+ #include "adt.h"
+ #include "aic.h"
+ #include "aic_regs.h"
++#include "assert.h"
+ #include "cpu_regs.h"
+ #include "dockchannel_uart.h"
+ #include "malloc.h"
+@@ -416,29 +417,89 @@ bool smp_resets_return_here(void)
+  * OS's release target. The boot core takes resume_pa. Linux reads this layout in
+  * drivers/soc/apple/t8140-sleep.c.
+  */
+-#define AURA_S2R_MAGIC 0x3152325341525541ULL /* "AURAS2R1" */
++#define AURA_S2R_MAGIC     0x3152325341525541ULL /* "AURAS2R1" */
++#define AURA_S2R_CHECK     0x3143524341525541ULL /* "AURACRC1" */
++#define AURA_S2R_RANGES    4
++#define AURA_S2R_RANGE_MAX (4 * SZ_16K)
++#define AURA_S2R_TOTAL_MAX (16 * SZ_16K)
+ 
+ struct aura_s2r_mailbox {
+     u64 magic;      /* aura, before the OS starts */
+     u64 boot_mpidr; /* aura: the only core that may take resume_pa */
+     u64 resume_pa;  /* OS, cleaned to PoC before it sleeps; aura clears it */
+     u64 resumes;    /* aura: resume_pa taken this many times */
++    /*
++     * T8132: DRAM kept through the sleep, as the OS can have aura check it. Present when
++     * /chosen/aurora,s2r-mailbox-size says so; the OS arms it before each sleep, last, with
++     * check_magic, and aura clears check_magic as it takes resume_pa.
++     */
++    u64 check_magic;
++    u32 nranges;
++    u32 crc32; /* CRC-32/ISO-HDLC (zlib's) over the ranges in order, as one stream */
++    struct {
++        u64 pa;
++        u64 len;
++    } range[AURA_S2R_RANGES];
+ };
+ 
++static_assert(sizeof(struct aura_s2r_mailbox) == 0x70, "the OS's layout of the mailbox");
++
+ static struct aura_s2r_mailbox s2r_mailbox SMP_SHARED ALIGNED(64);
+ 
+ /* Returns the mailbox's physical address: aura's mapping is the identity. */
+ u64 smp_s2r_publish(void)
+ {
++    memset(&s2r_mailbox, 0, sizeof(s2r_mailbox));
+     s2r_mailbox.magic = AURA_S2R_MAGIC;
+     s2r_mailbox.boot_mpidr = mrs(MPIDR_EL1) & 0xFFFFFF;
+-    s2r_mailbox.resume_pa = 0;
+-    s2r_mailbox.resumes = 0;
+     dc_cvac_range(&s2r_mailbox, sizeof(s2r_mailbox));
+     sysop("dsb sy");
+     return (u64)&s2r_mailbox;
+ }
+ 
++u32 smp_s2r_mailbox_size(void)
++{
++    return sizeof(s2r_mailbox);
++}
++
++static u32 s2r_crc32(u32 crc, const volatile u8 *p, u64 len)
++{
++    while (len--) {
++        crc ^= *p++;
++        for (int k = 0; k < 8; k++)
++            crc = (crc >> 1) ^ (0xedb88320 & -(crc & 1));
++    }
++    return crc;
++}
++
++/*
++ * Whether the ranges the OS named before its sleep read back as it left them. MMU off: the
++ * reads are Device accesses, so they see DRAM itself (the OS cleaned the ranges to PoC).
++ */
++static enum s2r_dram s2r_dram_check(const struct aura_s2r_mailbox *m, u64 ram_lo, u64 ram_hi)
++{
++    if (m->check_magic != AURA_S2R_CHECK)
++        return S2R_DRAM_UNCHECKED;
++    if (!m->nranges || m->nranges > AURA_S2R_RANGES)
++        return S2R_DRAM_MALFORMED;
++
++    u64 total = 0;
++    u32 crc = 0xffffffff;
++    for (u32 i = 0; i < m->nranges; i++) {
++        u64 pa = m->range[i].pa, len = m->range[i].len;
++
++        if (!len || len > AURA_S2R_RANGE_MAX || ((pa | len) & 3) || pa < ram_lo || pa >= ram_hi ||
++            len > ram_hi - pa)
++            return S2R_DRAM_MALFORMED;
++        total += len;
++        if (total > AURA_S2R_TOTAL_MAX)
++            return S2R_DRAM_MALFORMED;
++    }
++    for (u32 i = 0; i < m->nranges; i++)
++        crc = s2r_crc32(crc, (const volatile u8 *)m->range[i].pa, m->range[i].len);
++    return ~crc == m->crc32 ? S2R_DRAM_KEPT : S2R_DRAM_LOST;
++}
++
+ /* Once it is, the OS owns the UART and the display: reset paths must not print. */
+ bool smp_s2r_published(void)
+ {
+@@ -470,12 +531,29 @@ void smp_s2r_return_to_os(void)
+     if (!armed)
+         reboot();
+ 
++    /*
++     * T8132: before the jump, whether DRAM was kept. Lost or unreadable, stop with WD2 at its
++     * own period instead: the OS's state can't be trusted, and the reset after it says why.
++     */
++    if (chip_id == T8132) {
++        enum s2r_dram dram = s2r_dram_check(&s2r_mailbox, cur_boot_args.phys_base,
++                                            cur_boot_args.phys_base + cur_boot_args.mem_size);
++
++        s2r_mailbox.check_magic = 0;
++        if (dram == S2R_DRAM_LOST || dram == S2R_DRAM_MALFORMED) {
++            wdt_s2r_wake_mark(dram == S2R_DRAM_LOST ? WDT_S2R_DRAM_LOST_SECONDS
++                                                    : WDT_S2R_MALFORMED_SECONDS);
++            while (1)
++                sysop("wfe");
++        }
++    }
++
+     s2r_mailbox.resume_pa = 0;
+     s2r_mailbox.resumes++;
+     sysop("dsb sy");
+ 
+     /* Last, as close to the jump as it can be: a reset at this period means aura got here. */
+-    wdt_s2r_wake_mark();
++    wdt_s2r_wake_mark(WDT_S2R_SECONDS);
+     ((void (*)(void))entry)();
+     reboot();
+ }
+diff --git a/src/smp.h b/src/smp.h
+index 8b555f64..e4a585b8 100644
+--- a/src/smp.h
++++ b/src/smp.h
+@@ -53,6 +53,14 @@ int smp_park_for_kernel(void);
+ bool smp_resets_return_here(void);
+ u64 smp_s2r_publish(void);
+ bool smp_s2r_published(void);
++/* /chosen/aurora,s2r-mailbox-size: how much of the mailbox the OS may write */
++u32 smp_s2r_mailbox_size(void);
++enum s2r_dram {
++    S2R_DRAM_UNCHECKED, /* the OS armed no check: an older kernel */
++    S2R_DRAM_KEPT,
++    S2R_DRAM_LOST,
++    S2R_DRAM_MALFORMED, /* the OS's ranges are outside what aura checks */
++};
+ void smp_s2r_return_to_os(void) __attribute__((noreturn));
+ void smp_set_wfe_mode(bool new_mode);
+ void smp_send_ipi(int cpu);
+diff --git a/src/wdt.c b/src/wdt.c
+index 9e0d4908..798c3914 100644
+--- a/src/wdt.c
++++ b/src/wdt.c
+@@ -76,13 +76,13 @@ void wdt_reboot(void)
+ #define WDT_WD2_ALARM 0x28
+ #define WDT_WD2_CTL   0x2c
+ 
+-void wdt_s2r_wake_mark(void)
++void wdt_s2r_wake_mark(unsigned seconds)
+ {
+     if (chip_id != T8132 || !wdt_base)
+         return;
+     write32(wdt_base + WDT_WD2_CTL, 0);
+     write32(wdt_base + WDT_WD2_COUNT, 0);
+-    write32(wdt_base + WDT_WD2_ALARM, WDT_S2R_SECONDS * 24000000u);
++    write32(wdt_base + WDT_WD2_ALARM, seconds * 24000000u);
+     write32(wdt_base + WDT_WD2_CTL, 1);
+     sysop("dsb sy");
+ }
+diff --git a/src/wdt.h b/src/wdt.h
+index 81eff5af..ffa9a0d7 100644
+--- a/src/wdt.h
++++ b/src/wdt.h
+@@ -20,7 +20,10 @@ void wdt_host_attached(void);
+  * stop inside aura from one in the wake firmware before it (the wake program's 5 s).
+  */
+ #define WDT_S2R_SECONDS 40
+-void wdt_s2r_wake_mark(void);
++/* The same mark when aura stops instead: DRAM not kept, or the OS's check malformed. */
++#define WDT_S2R_DRAM_LOST_SECONDS 20
++#define WDT_S2R_MALFORMED_SECONDS 30
++void wdt_s2r_wake_mark(unsigned seconds);
+ bool wdt_boot_watchdog_armed(void);
+ 
+ #endif
+diff --git a/tests/python/test_s2r_dram_check.py b/tests/python/test_s2r_dram_check.py
+new file mode 100644
+index 00000000..f4d23b9c
+--- /dev/null
++++ b/tests/python/test_s2r_dram_check.py
+@@ -0,0 +1,92 @@
++"""The T8132 S2R wake checks that DRAM was kept, from the CRC the OS left in the mailbox."""
++from pathlib import Path
++import subprocess
++import zlib
++
++
++def test_s2r_dram_check(tmp_path):
++    repo = Path(__file__).resolve().parents[2]
++    smp = (repo / 'src/smp.c').read_text()
++    header = (repo / 'src/smp.h').read_text()
++    defines = smp[smp.index('#define AURA_S2R_MAGIC'):smp.index('static struct aura_s2r_mailbox s2r_mailbox')]
++    check = smp[smp.index('static u32 s2r_crc32('):smp.index('/* Once it is, the OS owns the UART')]
++    enum = header[header.index('enum s2r_dram {'):]
++    enum = enum[:enum.index('};') + 2]
++    data = bytes((i * 7 + 3) & 0xff for i in range(65536))
++    expect = zlib.crc32(data[:4096] + data[8192:12288])
++    harness = r"""
++#include <assert.h>
++#include <stdint.h>
++#include <string.h>
++typedef uint8_t u8;
++typedef uint32_t u32;
++typedef uint64_t u64;
++#define SZ_16K (1 << 14)
++""" + enum + "\n" + defines + "\n" + check + r"""
++static u8 ram[4 * SZ_16K];
++int main(void)
++{
++    struct aura_s2r_mailbox m;
++    u64 lo = (u64)ram, hi = lo + sizeof(ram);
++    for (int i = 0; i < (int)sizeof(ram); i++)
++        ram[i] = (u8)(i * 7 + 3);
++
++    /* No check armed: an older kernel, r6 behaviour. */
++    memset(&m, 0, sizeof(m));
++    assert(s2r_dram_check(&m, lo, hi) == S2R_DRAM_UNCHECKED);
++
++    /* Two ranges, one stream: the zlib CRC of their concatenation. */
++    m.check_magic = AURA_S2R_CHECK;
++    m.nranges = 2;
++    m.range[0].pa = lo;
++    m.range[0].len = 4096;
++    m.range[1].pa = lo + 8192;
++    m.range[1].len = 4096;
++    m.crc32 = """ + str(expect) + r"""u;
++    assert(s2r_dram_check(&m, lo, hi) == S2R_DRAM_KEPT);
++
++    /* One byte changed: lost. */
++    ram[9000] ^= 1;
++    assert(s2r_dram_check(&m, lo, hi) == S2R_DRAM_LOST);
++    ram[9000] ^= 1;
++
++    /* Malformed: no ranges, too many, unaligned, empty, too long, outside RAM, over the total. */
++    m.nranges = 0;
++    assert(s2r_dram_check(&m, lo, hi) == S2R_DRAM_MALFORMED);
++    m.nranges = 5;
++    assert(s2r_dram_check(&m, lo, hi) == S2R_DRAM_MALFORMED);
++    m.nranges = 2;
++    m.range[1].pa = lo + 8193;
++    assert(s2r_dram_check(&m, lo, hi) == S2R_DRAM_MALFORMED);
++    m.range[1].pa = lo + 8192;
++    m.range[1].len = 0;
++    assert(s2r_dram_check(&m, lo, hi) == S2R_DRAM_MALFORMED);
++    m.range[1].len = 4 * SZ_16K + 4;
++    assert(s2r_dram_check(&m, lo, hi) == S2R_DRAM_MALFORMED);
++    /* Past the end of RAM. */
++    m.range[1].len = 4 * SZ_16K - 4096;
++    assert(s2r_dram_check(&m, lo, hi) == S2R_DRAM_MALFORMED);
++    m.range[1].len = 4096;
++    m.range[1].pa = hi;
++    assert(s2r_dram_check(&m, lo, hi) == S2R_DRAM_MALFORMED);
++    m.range[1].pa = lo - 4096;
++    assert(s2r_dram_check(&m, lo, hi) == S2R_DRAM_MALFORMED);
++    m.nranges = 4;
++    for (int i = 0; i < 4; i++) {
++        m.range[i].pa = lo;
++        m.range[i].len = 4 * SZ_16K;
++    }
++    assert(s2r_dram_check(&m, lo, hi) != S2R_DRAM_MALFORMED);
++    m.range[3].len += 4;
++    assert(s2r_dram_check(&m, lo, hi) == S2R_DRAM_MALFORMED);
++    /* The magic alone arms it. */
++    m.check_magic ^= 1;
++    assert(s2r_dram_check(&m, lo, hi) == S2R_DRAM_UNCHECKED);
++    return 0;
++}
++"""
++    binary = tmp_path / 's2r-dram-check'
++    subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function',
++                    '-fsanitize=address,undefined', '-x', 'c', '-', '-o', str(binary)],
++                   input=harness, text=True, check=True)
++    subprocess.run([str(binary)], check=True)
+diff --git a/tests/python/test_wdt_s2r_mark.py b/tests/python/test_wdt_s2r_mark.py
+index 76725cbb..ecafc246 100644
+--- a/tests/python/test_wdt_s2r_mark.py
++++ b/tests/python/test_wdt_s2r_mark.py
+@@ -33,7 +33,7 @@ static void write32(u64 addr, u32 value)
+ """ + mark + r"""
+ int main(void)
+ {
+-    wdt_s2r_wake_mark();
++    wdt_s2r_wake_mark(WDT_S2R_SECONDS);
+     /* As the T8132 resume stub: CTL 0, COUNT 0, ALARM, CTL 1. */
+     assert(writes == 4);
+     assert(order[0] == 0x2c && values[0] == 0);
+@@ -45,10 +45,10 @@ int main(void)
+     /* Nothing elsewhere, and nothing without the base. */
+     writes = 0;
+     chip_id = T8140;
+-    wdt_s2r_wake_mark();
++    wdt_s2r_wake_mark(WDT_S2R_SECONDS);
+     chip_id = T8132;
+     wdt_base = 0;
+-    wdt_s2r_wake_mark();
++    wdt_s2r_wake_mark(WDT_S2R_SECONDS);
+     assert(writes == 0);
+     return 0;
+ }
+-- 
+2.43.0
+

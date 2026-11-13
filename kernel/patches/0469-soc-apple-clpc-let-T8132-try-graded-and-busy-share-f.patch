@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 07:32:48 +0000
+Subject: [PATCH] soc: apple: clpc: let T8132 try graded and busy-share
+ floors at runtime
+
+T8132 asks for its top DCS and fabric states, 5 and 3, for any busy CPU
+cluster and any reported GPU work. The T6041 table grades both: the CPU
+map takes its quarters from one frequency for both clusters, so a fast E
+cluster no longer counts as the top quarter, and GPU work gets its states
+from the busy share the GPU driver reports, split at 160, 500 and 800
+permille with a 400 ms hold before a step down. Which lower states the
+J604 can use without losing latency or bandwidth is not measured yet.
+
+Make both tryable on one boot, as floor_map already is for the CPU map:
+
+- gpu_busy_map, "d0,d1,d2,d3/s0,s1,s2,s3", replaces the states of the
+  four busy-share columns, capped at the top of the CPU map;
+- floor_level_khz sets the frequency the CPU map's quarters are taken
+  from, for every cluster.
+
+T8132 gets T6041's busy-share split but no gpu_busy table, so nothing
+changes until gpu_busy_map is written; the J604's ADT lists DCS states
+0-5 and fabric states 0-3, the ranges the caps keep to. A GPU driver
+that reports no share keeps the top column, as on T6041.
+
+Based on the T6041 busy-share floor by AxxzyWasTaken (aurora #1369).
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/clpc.c | 60 ++++++++++++++++++++++++++++++++++------
+ 1 file changed, 52 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/soc/apple/clpc.c b/drivers/soc/apple/clpc.c
+index 82ae411308..2ae2f7ff20 100644
+--- a/drivers/soc/apple/clpc.c
++++ b/drivers/soc/apple/clpc.c
+@@ -165,12 +165,13 @@ static u64 apple_clpc_map_override;
+ 
+ static int apple_clpc_floor_map_set(const char *val, const struct kernel_param *kp)
+ {
++	u64 *map = kp->arg;
+ 	unsigned int v[APPLE_CLPC_RAILS * APPLE_CLPC_LEVELS];
+ 	u64 packed = 0;
+ 	int i;
+ 
+ 	if (sysfs_streq(val, "")) {
+-		WRITE_ONCE(apple_clpc_map_override, 0);
++		WRITE_ONCE(*map, 0);
+ 		return 0;
+ 	}
+ 	if (sscanf(val, "%u,%u,%u,%u/%u,%u,%u,%u", &v[0], &v[1], &v[2], &v[3],
+@@ -181,13 +182,13 @@ static int apple_clpc_floor_map_set(const char *val, const struct kernel_param *
+ 			return -EINVAL;
+ 		packed |= (u64)v[i] << (4 * i);
+ 	}
+-	WRITE_ONCE(apple_clpc_map_override, packed | APPLE_CLPC_MAP_SET);
++	WRITE_ONCE(*map, packed | APPLE_CLPC_MAP_SET);
+ 	return 0;
+ }
+ 
+ static int apple_clpc_floor_map_get(char *buf, const struct kernel_param *kp)
+ {
+-	u64 m = READ_ONCE(apple_clpc_map_override);
++	u64 m = READ_ONCE(*(u64 *)kp->arg);
+ 
+ 	if (!(m & APPLE_CLPC_MAP_SET))
+ 		return sysfs_emit(buf, "\n");
+@@ -203,10 +204,28 @@ static const struct kernel_param_ops apple_clpc_floor_map_ops = {
+ 	.get = apple_clpc_floor_map_get,
+ };
+ 
+-module_param_cb(floor_map, &apple_clpc_floor_map_ops, NULL, 0644);
++module_param_cb(floor_map, &apple_clpc_floor_map_ops, &apple_clpc_map_override, 0644);
+ MODULE_PARM_DESC(floor_map,
+ 		 "CPU floor map \"d0,d1,d2,d3/s0,s1,s2,s3\" (DCS/fabric state per frequency quarter, capped at the SoC table's top; empty: the table)");
+ 
++/*
++ * gpu_busy_map does the same for the states reported GPU work gets by its
++ * busy share (gpu_busy below): column 0 below gpu_busy_mid, 1 and 2 up to
++ * gpu_busy_high and gpu_busy_top, 3 at or above it and while the GPU reports
++ * no share. Each value is capped at the top of the CPU map. Empty (the
++ * default) uses the SoC's gpu_busy table, or the top of the map without one.
++ */
++static u64 apple_clpc_gpu_busy_override;
++module_param_cb(gpu_busy_map, &apple_clpc_floor_map_ops, &apple_clpc_gpu_busy_override, 0644);
++MODULE_PARM_DESC(gpu_busy_map,
++		 "GPU busy-share floor map \"d0,d1,d2,d3/s0,s1,s2,s3\" (DCS/fabric state per busy-share column, capped at the CPU map's top; empty: the SoC table)");
++
++/* The frequency the CPU map's quarters are taken from; 0: the SoC's level_khz. */
++static unsigned int floor_level_khz;
++module_param(floor_level_khz, uint, 0644);
++MODULE_PARM_DESC(floor_level_khz,
++		 "Frequency in kHz the CPU floor map's quarters are taken from, for every cluster (0: the SoC table's, else each cluster's own maximum)");
++
+ static unsigned int apple_clpc_map(const struct apple_clpc_hw *hw,
+ 				   unsigned int rail, unsigned int q)
+ {
+@@ -477,6 +496,21 @@ static unsigned int apple_clpc_gpu_level(const struct apple_clpc_hw *hw,
+ 	return level;
+ }
+ 
++/* The state of @rail for reported GPU work at busy-share column @level. */
++static unsigned int apple_clpc_gpu_busy_state(const struct apple_clpc_hw *hw,
++					      unsigned int rail, unsigned int level)
++{
++	u64 m = READ_ONCE(apple_clpc_gpu_busy_override);
++	unsigned int top = hw->map[rail][APPLE_CLPC_LEVELS - 1];
++
++	if (m & APPLE_CLPC_MAP_SET)
++		return min_t(unsigned int,
++			     (m >> (4 * (rail * APPLE_CLPC_LEVELS + level))) & 0xf, top);
++	if (hw->gpu_busy[APPLE_CLPC_DCS][APPLE_CLPC_LEVELS - 1])
++		return hw->gpu_busy[rail][level];
++	return top;
++}
++
+ static bool apple_clpc_gpu_active(struct apple_clpc_gpu *gpu, u64 *updated, u64 *sequence)
+ {
+ 	unsigned long flags;
+@@ -684,7 +718,8 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
+ 	if (policy) {
+ 		if (policy->cpuinfo.max_freq)
+ 			cl->level = policy->cur * 100 /
+-				(clpc->hw->level_khz ?: policy->cpuinfo.max_freq);
++				(READ_ONCE(floor_level_khz) ?: clpc->hw->level_khz ?:
++				 policy->cpuinfo.max_freq);
+ 		cpufreq_cpu_put(policy);
+ 	}
+ 
+@@ -878,9 +913,7 @@ static bool apple_clpc_gpu_input_demand(const struct apple_clpc_hw *hw,
+ 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+ 		demand[rail] = max_t(unsigned int, demand[rail],
+ 				     max_t(unsigned int, hw->gpu[rail],
+-					   hw->gpu_busy[APPLE_CLPC_DCS][APPLE_CLPC_LEVELS - 1] ?
+-					   hw->gpu_busy[rail][level] :
+-					   hw->map[rail][APPLE_CLPC_LEVELS - 1]));
++					   apple_clpc_gpu_busy_state(hw, rail, level)));
+ 	return true;
+ }
+ 
+@@ -1661,6 +1694,17 @@ static const struct apple_clpc_hw apple_clpc_hw_t8132 = {
+ 	},
+ 	.gpu_demand = false,
+ 	.gpu_input = true,
++	/*
++	 * The J604's ADT (26B123, pmp dvfs-domain) lists DCS states 0-5 and
++	 * fabric states 0-3, so the map above asks for the top of both. No
++	 * lower state is qualified yet: gpu_busy stays empty and the top of the
++	 * map applies, and floor_map / gpu_busy_map try others at runtime. The
++	 * busy-share split is T6041's, used only once a gpu_busy_map is given
++	 * and the GPU driver reports a share.
++	 */
++	.gpu_busy_mid = 160,
++	.gpu_busy_high = 500,
++	.gpu_busy_top = 800,
+ 	/*
+ 	 * The J604's ADT (25G83 and 26B123) has macOS's Low Power mode CPU
+ 	 * ceiling, clpc cpu-low-power-frequency-max = 2088 MHz, a P cluster
+-- 
+2.43.0
+

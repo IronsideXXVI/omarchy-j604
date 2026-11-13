@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Fri, 13 Nov 2026 17:14:59 +1100
+Subject: [PATCH] drm/apple: report a vblank sequence in flip-complete
+ events
+
+dcp_crtc_send_page_flip_event() always sent sequence 0. DCP has no
+vblank interrupt or hardware counter, so the driver never registers
+DRM vblank support and nothing else fills the field in.
+
+Userspace reads the sequence. mutter checks it for wp_presentation
+feedback, logs "Invalid sequence for VSYNC frame info" once per
+gnome-shell, and then reports every presented frame to clients without
+a valid sequence (seen on M4 Pro and M2).
+
+Keep a per-CRTC sequence and advance it on each completed flip by the
+number of refresh periods since the previous flip, rounded, at least
+one, from the flip timestamp and the current mode's refresh rate. If
+the refresh rate is unknown, each flip counts as one. The sequence
+starts at 1 after the first flip and is updated under event_lock.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp.c | 26 +++++++++++++++++++++++++-
+ drivers/gpu/drm/apple/dcp.h |  8 ++++++++
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index add068d168..3153915c2c 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -675,6 +675,30 @@ static void send_vblank_event(struct drm_device *dev,
+  * outputs.
+  * This might be a difference between dcp and dcpext.
+  */
++/*
++ * Advance the CRTC's flip sequence by the number of refresh periods since the
++ * previous flip (at least one), so that userspace sees a non-zero, increasing
++ * vblank sequence. Without a known refresh rate every flip counts as one.
++ */
++static u64 dcp_crtc_next_flip_seq(struct apple_crtc *crtc, ktime_t flip)
++{
++	int hz = drm_mode_vrefresh(&crtc->base.mode);
++	u64 frames = 1;
++
++	if (hz > 0 && crtc->flip_seq_time) {
++		s64 ns = ktime_to_ns(ktime_sub(flip, crtc->flip_seq_time));
++		u64 frame_ns = div_u64(NSEC_PER_SEC, hz);
++
++		if (ns > 0)
++			frames = max_t(u64, 1,
++				       div64_u64(ns + frame_ns / 2, frame_ns));
++	}
++	crtc->flip_seq += frames;
++	crtc->flip_seq_time = flip;
++
++	return crtc->flip_seq;
++}
++
+ static void dcp_crtc_send_page_flip_event(struct apple_crtc *crtc,
+ 					  struct drm_pending_vblank_event *e,
+ 					  ktime_t now, ktime_t start)
+@@ -684,7 +708,6 @@ static void dcp_crtc_send_page_flip_event(struct apple_crtc *crtc,
+ 	unsigned int pipe = drm_crtc_index(&crtc->base);
+ 	ktime_t flip;
+ 
+-	seq = 0;
+ 	if (start != KTIME_MIN) {
+ 		s64 delta = ktime_us_delta(now, start);
+ 		if (delta <= 500)
+@@ -696,6 +719,7 @@ static void dcp_crtc_send_page_flip_event(struct apple_crtc *crtc,
+ 	} else {
+ 		flip = now;
+ 	}
++	seq = dcp_crtc_next_flip_seq(crtc, flip);
+ 	e->pipe = pipe;
+ 	send_vblank_event(dev, e, seq, flip);
+ }
+diff --git a/drivers/gpu/drm/apple/dcp.h b/drivers/gpu/drm/apple/dcp.h
+index 942a0adfa3..ac4f4c3d19 100644
+--- a/drivers/gpu/drm/apple/dcp.h
++++ b/drivers/gpu/drm/apple/dcp.h
+@@ -33,6 +33,14 @@ struct apple_crtc {
+ 
+ 	/* External scanout keeps the fabric up while the CRTC is active. */
+ 	bool fabric_held;
++
++	/*
++	 * DCP has no vblank interrupt or counter. Flip-complete events carry
++	 * a sequence estimated from the flip time and the mode's refresh
++	 * rate. Protected by the DRM event_lock.
++	 */
++	u64 flip_seq;
++	ktime_t flip_seq_time;
+ };
+ 
+ #define to_apple_crtc(x) container_of(x, struct apple_crtc, base)
+-- 
+2.43.0
+

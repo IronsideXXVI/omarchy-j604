@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 07:00:12 +0000
+Subject: [PATCH] drm/asahi: g16: Retire before draining the report
+ rings
+
+Each retirement pass drained every receive ring before it read the
+receipts: the event ring, the nine log sub-rings, ktrace and the
+statistics. After an event it does so again before each of up to four
+trailing polls. None of the report rings gates a receipt, so every
+report the firmware queued ahead of a completion delayed it.
+
+Read the event ring in the retirement loop, retire what completed, and
+drain the log, ktrace and statistics rings once afterwards, in the same
+locked pass. Every other caller keeps draining all rings at once.
+Fences are already signalled outside the device lock.
+
+Based on 47f115535c ("drm/asahi: g17: Reduce M5 job completion
+latency") from aurora-silicon/linux.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/channel.rs | 25 ++++++++++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/poll.rs    |  7 ++++++-
+ 2 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/channel.rs b/drivers/gpu/drm/asahi/g16/channel.rs
+index 7e67501a4c..d4c58a5880 100644
+--- a/drivers/gpu/drm/asahi/g16/channel.rs
++++ b/drivers/gpu/drm/asahi/g16/channel.rs
+@@ -220,7 +220,18 @@ fn drain_one(ring: &Ring, offset: usize, capacity: u32) -> Result {
+     /// Drains every receive ring: events (decoded into `events`), the nine log sub-rings, trace
+     /// and stats.
+     pub(crate) fn drain_rings(&self, dev: &kernel::device::Device, events: &mut Events) -> Result {
+-        events.drain(dev, &self.event)?;
++        self.drain_events(dev, events)?;
++        self.drain_reports(dev, events)
++    }
++
++    /// Drains the event ring only: the stage and recovery events that retirement reads.
++    pub(crate) fn drain_events(&self, dev: &kernel::device::Device, events: &mut Events) -> Result {
++        events.drain(dev, &self.event)
++    }
++
++    /// Drains the report rings: the nine log sub-rings, ktrace and the statistics (recovery
++    /// statistics are kept in `events`). None of them gates a receipt.
++    pub(crate) fn drain_reports(&self, dev: &kernel::device::Device, events: &mut Events) -> Result {
+         for i in 0..rings::LOG_RINGS {
+             Self::drain_one(&self.log, i * 0x30, 256)?;
+         }
+@@ -343,4 +354,16 @@ pub(crate) fn drain_rings(&mut self) -> Result {
+         let dev = self.session.dev.clone();
+         self.channels.drain_rings(&dev, &mut self.events)
+     }
++
++    /// Drains the event ring only (retirement's loop).
++    pub(crate) fn drain_events(&mut self) -> Result {
++        let dev = self.session.dev.clone();
++        self.channels.drain_events(&dev, &mut self.events)
++    }
++
++    /// Drains log, ktrace and statistics (after retirement).
++    pub(crate) fn drain_reports(&mut self) -> Result {
++        let dev = self.session.dev.clone();
++        self.channels.drain_reports(&dev, &mut self.events)
++    }
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 2cf681c56c..05c6e19317 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -326,7 +326,9 @@ pub(crate) fn retire(&mut self, evented: bool, done: &mut Completions) -> Result
+ 
+         loop {
+             let mut lap = Lap::start();
+-            self.drain_rings()?;
++            // Events only: the reports the firmware queued ahead of a completion do not gate a
++            // receipt, so they are drained once, after retirement (below).
++            self.drain_events()?;
+             lap.lap(&mut self.engine.prof.drain_ns);
+             // Recovery may force stage progress: authenticate it before any receipt.
+             self.check_hangs(done)?;
+@@ -347,6 +349,9 @@ pub(crate) fn retire(&mut self, evented: bool, done: &mut Completions) -> Result
+             delay::udelay(Delta::from_micros(5));
+         }
+         self.recovery.receipt_fault = ret.is_err();
++        let mut lap = Lap::start();
++        self.drain_reports()?;
++        lap.lap(&mut self.engine.prof.drain_ns);
+         Ok(())
+     }
+ 
+-- 
+2.43.0
+

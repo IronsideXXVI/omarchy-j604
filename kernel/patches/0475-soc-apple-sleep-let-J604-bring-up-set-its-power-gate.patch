@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 08:54:22 +0000
+Subject: [PATCH] soc: apple: sleep: let J604 bring-up set its
+ power-gate enables
+
+A J604 deep sleep stops inside init_kernel_el on the way back. The
+J713 resumes through the same code, so one difference left is
+power-gate state that survives the collapse.
+
+The four words of the J604 ADT's pmgr pwrgate-regs, which macOS's PMGR
+driver is given as 0x80000000 each, read 0 under Linux. None of them
+is a CPU cluster's: the first is the first display's gate word, the
+last an always-on PMGR word. The cluster enables are "pwrgate" + 0x0
+(E) and + 0x60 (P). iBoot sets only E's, the J604 boots on a P core,
+and this driver writes P's only on the way back from a sleep, so the
+first sleep enters with it clear. On T6050 the boot loader leaves the
+boot core's word clear too, and apple-cluster-pwrgate sets it at boot.
+
+Add t8132_pwrgate_adt, default 0, for bring-up. At probe, bit 0 writes
+the four ADT words as m1n1 applies the ADT's tables (the mask's bits
+cleared, the value's set), and bit 1 sets the P cluster's enable. Each
+write is printed with its read-back. The read at boot and just before
+the commit now also prints the P cluster's word. With the default
+nothing is written, and that line is the only change.
+
+Based on f79b1081f7 from aurora-silicon/linux#1774.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 76 ++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 67 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 5df42d7c3a..df517a6f79 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -3742,16 +3742,39 @@ MODULE_PARM_DESC(t8132_cpu_perf_down,
+ 		 "T8132: step the SoC perf state and DCS down from the CPU at the commit if the firmware has not (default: on)");
+ 
+ /*
+- * J604, read only: the four power-gate enable words that the J604 ADT's pmgr
+- * pwrgate-regs gives macOS's PMGR driver, 0x80000000 each (the first with
+- * field 0x00402001). Nothing here writes them; the first is also "pwrgate" +
+- * 0x104c, which the commit writes for the first display. All four read 0
+- * through /dev/mem with no fault on 1.850.
++ * J604: the four power-gate words that the J604 ADT's pmgr pwrgate-regs gives macOS's
++ * PMGR driver as {window, offset, mask, value}: pmgr0 + 0x2504c (mask 0x00402001),
++ * + 0x2604c, + 0x2704c and pmgr1 + 0x1c01c, value 0x80000000 each. The first is
++ * "pwrgate" + 0x104c, the first display's word, which the commit writes. All four read
++ * 0 at boot on 1.850 and 1.879. None of them is a CPU cluster's: those are "pwrgate"
++ * + 0x0 (E) and + 0x60 (P), the SoC's pwrgate_wake, which iBoot sets for E only and
++ * which this driver writes only on the way back from a sleep. The J604 boots on P.
++ *
++ * t8132_pwrgate_adt, for bring-up (default 0): bit 0 writes the four at probe the way
++ * m1n1 applies the ADT's tables (the mask's bits cleared, the value's set); bit 1 sets
++ * the P cluster's enable at probe, as apple-cluster-pwrgate sets the boot core's word
++ * at boot on T6050. Each write is read back at once, and every word again just before
++ * the commit.
+  */
+-static const phys_addr_t j604_adt_pwrgate[] = {
+-	0x38072504c, 0x38072604c, 0x38072704c, 0x38829c01c,
++static const struct {
++	phys_addr_t pa;
++	u32 mask;
++} j604_adt_pwrgate[] = {
++	{ 0x38072504c, 0x00402001 },
++	{ 0x38072604c, 0 },
++	{ 0x38072704c, 0 },
++	{ 0x38829c01c, 0 },
+ };
+ 
++#define J604_ADT_PWRGATE_VALUE	0x80000000
++#define J604_PWRGATE_ADT_WORDS	BIT(0)
++#define J604_PWRGATE_P_CLUSTER	BIT(1)
++
++static unsigned int t8132_pwrgate_adt;
++module_param(t8132_pwrgate_adt, uint, 0444);
++MODULE_PARM_DESC(t8132_pwrgate_adt,
++		 "J604 bring-up, at probe: bit 0 writes the ADT's four pmgr pwrgate-regs words, bit 1 sets the P cluster's power-gate enable; each is read back (default: 0)");
++
+ static void j604_adt_pwrgate_init(struct apple_sleep *s)
+ {
+ 	int i;
+@@ -3759,7 +3782,12 @@ static void j604_adt_pwrgate_init(struct apple_sleep *s)
+ 	if (!of_machine_is_compatible("apple,j604"))
+ 		return;
+ 	for (i = 0; i < ARRAY_SIZE(j604_adt_pwrgate); i++)
+-		s->adt_pg[i] = devm_ioremap(s->dev, j604_adt_pwrgate[i], sizeof(u32));
++		s->adt_pg[i] = devm_ioremap(s->dev, j604_adt_pwrgate[i].pa, sizeof(u32));
++}
++
++static void __iomem *j604_p_cluster_pwrgate(struct apple_sleep *s)
++{
++	return s->pwrgate + s->soc->pwrgate_wake[1];
+ }
+ 
+ static void j604_adt_pwrgate_print(struct apple_sleep *s, const char *when)
+@@ -3769,7 +3797,36 @@ static void j604_adt_pwrgate_print(struct apple_sleep *s, const char *when)
+ 	for (i = 0; i < ARRAY_SIZE(j604_adt_pwrgate); i++)
+ 		if (s->adt_pg[i])
+ 			dev_info(s->dev, "ADT pwrgate word %d at %pa, %s: %#010x (macOS: 0x80000000)\n",
+-				 i + 1, &j604_adt_pwrgate[i], when, readl(s->adt_pg[i]));
++				 i + 1, &j604_adt_pwrgate[i].pa, when, readl(s->adt_pg[i]));
++	if (s->adt_pg[0])
++		dev_info(s->dev, "P cluster power-gate enable at pwrgate + %#x, %s: %#010x\n",
++			 s->soc->pwrgate_wake[1], when, readl(j604_p_cluster_pwrgate(s)));
++}
++
++/* With t8132_pwrgate_adt, at probe: each write, then its read-back. */
++static void j604_adt_pwrgate_write(struct apple_sleep *s)
++{
++	unsigned int set = READ_ONCE(t8132_pwrgate_adt);
++	void __iomem *p;
++	u32 was, val;
++	int i;
++
++	if (!s->adt_pg[0] || !set)
++		return;
++	for (i = 0; (set & J604_PWRGATE_ADT_WORDS) && i < ARRAY_SIZE(j604_adt_pwrgate); i++) {
++		was = readl(s->adt_pg[i]);
++		val = (was & ~j604_adt_pwrgate[i].mask) | J604_ADT_PWRGATE_VALUE;
++		writel(val, s->adt_pg[i]);
++		dev_info(s->dev, "ADT pwrgate word %d at %pa: %#010x, wrote %#010x, reads %#010x\n",
++			 i + 1, &j604_adt_pwrgate[i].pa, was, val, readl(s->adt_pg[i]));
++	}
++	if (set & J604_PWRGATE_P_CLUSTER) {
++		p = j604_p_cluster_pwrgate(s);
++		was = readl(p);
++		writel(was | PWRGATE_ON, p);
++		dev_info(s->dev, "P cluster power-gate enable at pwrgate + %#x: %#010x, wrote %#010x, reads %#010x\n",
++			 s->soc->pwrgate_wake[1], was, was | PWRGATE_ON, readl(p));
++	}
+ }
+ 
+ static int t8132_sleep_commit(unsigned long unused)
+@@ -4851,6 +4908,7 @@ static int apple_sleep_probe(struct platform_device *pdev)
+ 		t8132_el_check_report(s);
+ 		j604_adt_pwrgate_init(s);
+ 		j604_adt_pwrgate_print(s, "at boot");
++		j604_adt_pwrgate_write(s);
+ 	}
+ 	/* Deep becomes the default sleep state, unless mem_sleep_default= chose another. */
+ 	suspend_set_ops(&apple_sleep_ops);
+-- 
+2.43.0
+

@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 07:04:07 +0000
+Subject: [PATCH] soc: apple: clpc: let the CPU floor map be replaced
+ at runtime
+
+Only T8132's top DCS and fabric states, 5 and 3, are qualified as its CPU
+floor, so a busy cluster at any frequency asks for both. The other tables
+grade the floor by frequency quarter, but which lower states the J604 can
+use without losing bandwidth or latency is not measured, and finding out
+takes a reboot per table.
+
+Add a floor_map parameter, "d0,d1,d2,d3/s0,s1,s2,s3", that replaces the
+table's CPU map from the next sample on. Each value is capped at the
+table's top state for its rail, so the parameter can only lower what a
+busy cluster asks for. Empty, the default, keeps the table, so nothing
+changes until it is written. The status file shows the map in use. GPU
+and ANE floors keep their own states.
+
+The J604's ADT (26B123, pmp dvfs-domain) lists six DCS states (0-5) and
+four fabric states (0-3), which is the range T8132's PMC table already
+uses.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/clpc.c | 73 ++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 70 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/soc/apple/clpc.c b/drivers/soc/apple/clpc.c
+index 3c937be3bb..c0544ea658 100644
+--- a/drivers/soc/apple/clpc.c
++++ b/drivers/soc/apple/clpc.c
+@@ -40,6 +40,7 @@
+ #include <linux/regmap.h>
+ #include <linux/seq_file.h>
+ #include <linux/soc/apple/pmc.h>
++#include <linux/sysfs.h>
+ #include <linux/uaccess.h>
+ #include <linux/workqueue.h>
+ 
+@@ -131,6 +132,72 @@ struct apple_clpc_hw {
+ 	unsigned int low_power_mw;
+ };
+ 
++/*
++ * floor_map replaces the SoC table's CPU floor map at runtime, so that the
++ * DCS and fabric states can be compared on one boot: "d0,d1,d2,d3/s0,s1,s2,s3"
++ * gives the DCS and fabric state a busy cluster asks for in each quarter of
++ * its frequency range. Each value is capped at the table's top state for its
++ * rail, so nothing above what the table already asks for can be requested.
++ * Empty (the default) uses the table. GPU and ANE floors are not affected.
++ */
++#define APPLE_CLPC_MAP_SET	BIT_ULL(32)
++static u64 apple_clpc_map_override;
++
++static int apple_clpc_floor_map_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int v[APPLE_CLPC_RAILS * APPLE_CLPC_LEVELS];
++	u64 packed = 0;
++	int i;
++
++	if (sysfs_streq(val, "")) {
++		WRITE_ONCE(apple_clpc_map_override, 0);
++		return 0;
++	}
++	if (sscanf(val, "%u,%u,%u,%u/%u,%u,%u,%u", &v[0], &v[1], &v[2], &v[3],
++		   &v[4], &v[5], &v[6], &v[7]) != ARRAY_SIZE(v))
++		return -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(v); i++) {
++		if (v[i] > 15)
++			return -EINVAL;
++		packed |= (u64)v[i] << (4 * i);
++	}
++	WRITE_ONCE(apple_clpc_map_override, packed | APPLE_CLPC_MAP_SET);
++	return 0;
++}
++
++static int apple_clpc_floor_map_get(char *buf, const struct kernel_param *kp)
++{
++	u64 m = READ_ONCE(apple_clpc_map_override);
++
++	if (!(m & APPLE_CLPC_MAP_SET))
++		return sysfs_emit(buf, "\n");
++	return sysfs_emit(buf, "%u,%u,%u,%u/%u,%u,%u,%u\n",
++			  (u32)(m & 0xf), (u32)(m >> 4) & 0xf, (u32)(m >> 8) & 0xf,
++			  (u32)(m >> 12) & 0xf, (u32)(m >> 16) & 0xf,
++			  (u32)(m >> 20) & 0xf, (u32)(m >> 24) & 0xf,
++			  (u32)(m >> 28) & 0xf);
++}
++
++static const struct kernel_param_ops apple_clpc_floor_map_ops = {
++	.set = apple_clpc_floor_map_set,
++	.get = apple_clpc_floor_map_get,
++};
++
++module_param_cb(floor_map, &apple_clpc_floor_map_ops, NULL, 0644);
++MODULE_PARM_DESC(floor_map,
++		 "CPU floor map \"d0,d1,d2,d3/s0,s1,s2,s3\" (DCS/fabric state per frequency quarter, capped at the SoC table's top; empty: the table)");
++
++static unsigned int apple_clpc_map(const struct apple_clpc_hw *hw,
++				   unsigned int rail, unsigned int q)
++{
++	u64 m = READ_ONCE(apple_clpc_map_override);
++
++	if (!(m & APPLE_CLPC_MAP_SET))
++		return hw->map[rail][q];
++	return min_t(unsigned int, (m >> (4 * (rail * APPLE_CLPC_LEVELS + q))) & 0xf,
++		     hw->map[rail][APPLE_CLPC_LEVELS - 1]);
++}
++
+ struct apple_clpc_cluster {
+ 	unsigned int policy_cpu;
+ 	cpumask_var_t cpus;
+@@ -554,7 +621,7 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
+ 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+ 		cl->request[rail] = busy >= APPLE_CLPC_BUSY_PCT &&
+ 				    cl->streak >= clpc->hw->sustain ?
+-				   clpc->hw->map[rail][q] : 0;
++				   apple_clpc_map(clpc->hw, rail, q) : 0;
+ }
+ 
+ static unsigned int apple_clpc_vote(struct apple_clpc_vote *vote,
+@@ -1013,8 +1080,8 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
+ 			   clpc->hw->rail[rail], clpc->vote[rail].state,
+ 			   apple_pmc_voter_enabled(clpc->pmc, clpc->agent,
+ 						   clpc->hw->rail[rail]),
+-			   clpc->hw->map[rail][0], clpc->hw->map[rail][1],
+-			   clpc->hw->map[rail][2], clpc->hw->map[rail][3]);
++			   apple_clpc_map(clpc->hw, rail, 0), apple_clpc_map(clpc->hw, rail, 1),
++			   apple_clpc_map(clpc->hw, rail, 2), apple_clpc_map(clpc->hw, rail, 3));
+ 	seq_printf(s, "last_vote: %#x reason_bits %#x sampled_ns %llu (cpu=1 host_gpu=2 streaming_gpu=4 dense_gpu=8 hold=16 ane=32)\n",
+ 		   READ_ONCE(clpc->last_floor), READ_ONCE(clpc->last_reason),
+ 		   READ_ONCE(clpc->last_vote_ns));
+-- 
+2.43.0
+

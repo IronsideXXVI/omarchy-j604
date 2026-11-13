@@ -58,19 +58,19 @@ The J604 builds carried here, as installed on the machine on 2026-11-12 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`da8e1acf3656`, Aurora's tip), 460 patches | `1.880` |
-| `aura` | 1.0.0b12.1, aurora-silicon/aura (`54678354b7`), aurora-silicon/alarm-aurora recipe, 18 patches (0018 reverts 0017) | `1.610` (replaced `m1n1-aurora` on 2026-11-12) |
+| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`da8e1acf3656`, Aurora's tip), 476 patches | `1.881` |
+| `aura` | 1.0.0b13, aurora-silicon/aura (`f0f180afe5`), aurora-silicon/alarm-aurora recipe, 15 patches | `1.612` (replaced `m1n1-aurora` on 2026-11-12) |
 | `uboot-aurora` | 2026.07.aurora11, aurora-silicon/u-boot (`250385f8c8`, the version Aurora packages), 1 patch | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261112, aurora-silicon/mesa (`33cf8cfc668`) | `1.8143` |
 | `alsa-ucm-conf-aurora` | 10.aurora3, aurora-silicon/alsa-ucm-conf-asahi (`b9b2d0c82c`) | `1.605` |
 | `aurora-audio` | 4.1.aurora3, aurora-silicon/asahi-audio (`06aec67a8a`) | `3.609` |
 | `speakersafetyd` | 2.0.1, AsahiLinux/speakersafetyd | `1.605` |
 | `asahi-fwextract` | 0.9.2, asahi-alarm/asahi-alarm-installer | `1.609` |
-| `asahi-scripts` | 20261023, asahi-alarm/asahi-scripts, aurora-silicon/alarm-aurora recipe | `9.604` |
+| `asahi-scripts` | 20261023, asahi-alarm/asahi-scripts, aurora-silicon/alarm-aurora recipe | `9.605` (the Stage 2 trial's guard timer counts from unlock) |
 | `plymouth` | 26.134.222, Plymouth (Arch Linux recipe) | `3.604` |
 | `libfprint-git` | 1:1.94.100.r10.g6f9479c, libfprint (`6f9479c3d5`), omacom recipe | `5.604` (accepts Secure Enclave interface v4 and v5) |
 | `libva-v4l2_request-avd` | 1.3.r11.r169.gc653eaa, omacom/libva-v4l2_request (`c653eaa623`), omacom recipe | `1.607` (adds the `aurora_drv_video.so` alias, VA-API H.264/HEVC encoding on the Apple video encoder, AV1 10-bit decoding up to 7680x4320 and the VP9 maximum frame size from the kernel; the alias is open as [omacom/omarchy-pkgs#2375](https://github.com/omacom/omarchy-pkgs/pull/2375), and its official `-2` will replace this build) |
-| `chromium` | 156.0.8078.79, Arch Linux ARM recipe (`6227c4d28b`) | `1.607` (patches for hardware video on the Apple decoder: 10-bit P010 frames, BT.709 colours, decoder errors reported, HEVC only with Annex-B, frame errors, HDR metadata, capture buffers sized for the renderer; with `omarchy-mac` 2.19 Chromium decodes 10-bit VP9, AV1 and HEVC on the decoder) |
+| `chromium` | 156.0.8078.79, Arch Linux ARM recipe (`6227c4d28b`) | `1.608` (patches for hardware video on the Apple decoder: 10-bit P010 frames, BT.709 colours, decoder errors reported, HEVC only with Annex-B, frame errors, HDR metadata, capture buffers sized for the renderer; with `omarchy-mac` 2.19 Chromium decodes 10-bit VP9, AV1 and HEVC on the decoder; since 1.608 also the V4L2 video encoder, used only with Chromium's AcceleratedVideoEncoder feature, off by default) |
 | `avd-fw` | 0.1, AsahiLinux/avd-fw (`v0.1`), omacom recipe (`c1fcff4dec`), 15 patches | `1.604` (aurora-silicon/avd-fw's queue transport and the T8132 SRAM aperture) |
 | `gpu-screen-recorder` | 6.1.7, gpu-screen-recorder (Arch Linux recipe, built for aarch64) | `1.604` (captures monitors on the Apple display controller) |
 | `omarchy-mac-boot` | 20261104, omacom/omarchy-mac-pkgs (`7e50e937b5`) | `1.616` |
@@ -81,7 +81,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-12 (checked
 
 Also installed, unchanged from the official repositories: the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
-Since 2026-11-12 the Mac boots through Aurora's aura boot loader: the Stage 2 on the ESP (`m1n1/boot-ctxr.bin`) holds aura, the J604 device tree and U-Boot, and `asahi-scripts`' `update-m1n1` writes it as a trial and commits it after a good boot. Kernel 1.880 is on Aurora's tip (`da8e1acf3656`); `STATUS.md` lists what 1.703 to 1.880 changed over 1.617.
+Since 2026-11-12 the Mac boots through Aurora's aura boot loader: the Stage 2 on the ESP (`m1n1/boot-ctxr.bin`) holds aura, the J604 device tree and U-Boot, and `asahi-scripts`' `update-m1n1` writes it as a trial and commits it after a good boot. Kernel 1.881 is on Aurora's tip (`da8e1acf3656`); `STATUS.md` lists what 1.703 to 1.881 changed over 1.617.
 
 ## Layout
 

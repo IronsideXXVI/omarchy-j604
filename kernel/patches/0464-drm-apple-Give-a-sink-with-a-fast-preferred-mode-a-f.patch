@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Diljit Singh <hey@djdev.me>
+Date: Thu, 12 Nov 2026 00:36:21 -0500
+Subject: [PATCH] drm/apple: Give a sink with a fast preferred mode a
+ firmware-derived EDID
+
+The firmware-derived EDID's detailed timing is the sink's preferred
+mode, or its best-scored IsPreferred timing. An EDID detailed timing
+holds at most 655.35 MHz, so a sink whose preferred mode is faster got
+no EDID at all: dcp_metadata_timing() refused the mode, and the
+connector had none. On the M5 Pro that is the Odyssey G81SF, preferred
+3840x2160@120 at 1188 MHz, whose DisplayAttributes parse fine (PQ
+included). Without an EDID, compositors keep it in sRGB and offer no
+HDR.
+
+Pick the detailed timing only among the timings it can hold, the
+preferred one first and then the best-scored. A sink's own EDID does
+the same, listing faster modes in extensions. DRM's modes come from the
+firmware's timing catalog either way.
+
+Signed-off-by: Diljit Singh <hey@djdev.me>
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp-display-metadata.c | 35 +++++++++++++++-----
+ drivers/gpu/drm/apple/dcp-display-metadata.h |  1 +
+ drivers/gpu/drm/apple/dcp.c                  |  9 ++++-
+ 3 files changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-display-metadata.c b/drivers/gpu/drm/apple/dcp-display-metadata.c
+index a84a2bd9ab..e5748d4b50 100644
+--- a/drivers/gpu/drm/apple/dcp-display-metadata.c
++++ b/drivers/gpu/drm/apple/dcp-display-metadata.c
+@@ -10,13 +10,13 @@
+ #include "dcp-display-metadata.h"
+ #include "parser.h"
+ 
+-static int dcp_metadata_timing(struct detailed_timing *timing,
+-			       const struct drm_display_mode *mode,
+-			       const struct dcp_display_metadata *metadata)
++/*
++ * Whether @mode fits an EDID detailed timing, the image size aside: at most
++ * 655.35 MHz, 4095 active pixels and the field widths of the blanking and
++ * sync.  A sink's faster modes go in extensions, never here.
++ */
++bool dcp_metadata_timing_fits(const struct drm_display_mode *mode)
+ {
+-	struct detailed_pixel_timing *pixel = &timing->data.pixel_data;
+-	u32 hblank, vblank, hoff, voff, hsync, vsync;
+-	u32 width = metadata->width_cm * 10, height = metadata->height_cm * 10;
+ 	u32 hflags = mode->flags & (DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NHSYNC);
+ 	u32 vflags = mode->flags & (DRM_MODE_FLAG_PVSYNC | DRM_MODE_FLAG_NVSYNC);
+ 
+@@ -31,6 +31,26 @@ static int dcp_metadata_timing(struct detailed_timing *timing,
+ 	    (vflags != DRM_MODE_FLAG_PVSYNC && vflags != DRM_MODE_FLAG_NVSYNC) ||
+ 	    (mode->flags & ~(DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NHSYNC |
+ 			     DRM_MODE_FLAG_PVSYNC | DRM_MODE_FLAG_NVSYNC)))
++		return false;
++	return mode->htotal - mode->hdisplay <= 4095 &&
++	       mode->vtotal - mode->vdisplay <= 4095 &&
++	       mode->hsync_start - mode->hdisplay <= 1023 &&
++	       mode->hsync_end - mode->hsync_start <= 1023 &&
++	       mode->vsync_start - mode->vdisplay <= 63 &&
++	       mode->vsync_end - mode->vsync_start <= 63;
++}
++
++static int dcp_metadata_timing(struct detailed_timing *timing,
++			       const struct drm_display_mode *mode,
++			       const struct dcp_display_metadata *metadata)
++{
++	struct detailed_pixel_timing *pixel = &timing->data.pixel_data;
++	u32 hblank, vblank, hoff, voff, hsync, vsync;
++	u32 width = metadata->width_cm * 10, height = metadata->height_cm * 10;
++	u32 hflags = mode->flags & (DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NHSYNC);
++	u32 vflags = mode->flags & (DRM_MODE_FLAG_PVSYNC | DRM_MODE_FLAG_NVSYNC);
++
++	if (!dcp_metadata_timing_fits(mode) || width > 4095 || height > 4095)
+ 		return -EINVAL;
+ 	hblank = mode->htotal - mode->hdisplay;
+ 	vblank = mode->vtotal - mode->vdisplay;
+@@ -38,9 +58,6 @@ static int dcp_metadata_timing(struct detailed_timing *timing,
+ 	voff = mode->vsync_start - mode->vdisplay;
+ 	hsync = mode->hsync_end - mode->hsync_start;
+ 	vsync = mode->vsync_end - mode->vsync_start;
+-	if (hblank > 4095 || vblank > 4095 || hoff > 1023 || hsync > 1023 ||
+-	    voff > 63 || vsync > 63 || width > 4095 || height > 4095)
+-		return -EINVAL;
+ 
+ 	timing->pixel_clock = cpu_to_le16(mode->clock / 10);
+ 	pixel->hactive_lo = mode->hdisplay;
+diff --git a/drivers/gpu/drm/apple/dcp-display-metadata.h b/drivers/gpu/drm/apple/dcp-display-metadata.h
+index 66c28c1bc7..6a59f27991 100644
+--- a/drivers/gpu/drm/apple/dcp-display-metadata.h
++++ b/drivers/gpu/drm/apple/dcp-display-metadata.h
+@@ -44,6 +44,7 @@ const struct dcp_color_space *dcp_panel_gamut_color_space(enum dcp_panel_gamut g
+ struct drm_edid;
+ struct drm_display_mode;
+ struct dcp_display_mode;
++bool dcp_metadata_timing_fits(const struct drm_display_mode *mode);
+ const struct drm_edid *dcp_metadata_edid(const struct dcp_display_metadata *metadata,
+ 					 const struct drm_display_mode *mode);
+ 
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index 22c3718764..b5949f6e14 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -1087,13 +1087,20 @@ void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
+ 	 * The EDID's detailed timing: the preferred mode when the firmware
+ 	 * describes it fully, otherwise the highest-scored timing it marks
+ 	 * IsPreferred, the one the sink's own EDID lists first.  An external
+-	 * display's preferred mode need not be one of those.
++	 * display's preferred mode need not be one of those.  Only a timing an
++	 * EDID detailed timing can hold: a sink whose preferred mode is faster
++	 * (3840x2160@120, 1188 MHz) lists it in an extension, and without this
++	 * it got no EDID at all.  DRM's modes come from the catalog either way.
+ 	 */
+ 	for (i = 0; i < dcp->nr_modes; i++) {
+ 		const struct dcp_display_mode *m = &dcp->modes[i];
++		struct drm_display_mode fit = m->mode;
+ 
+ 		if (!m->metadata_timing_valid)
+ 			continue;
++		fit.flags |= m->metadata_sync_flags;
++		if (!dcp_metadata_timing_fits(&fit))
++			continue;
+ 		if (best == UINT_MAX || (m->mode.type & DRM_MODE_TYPE_PREFERRED) ||
+ 		    (!(dcp->modes[best].mode.type & DRM_MODE_TYPE_PREFERRED) &&
+ 		     m->score > dcp->modes[best].score))
+-- 
+2.43.0
+
