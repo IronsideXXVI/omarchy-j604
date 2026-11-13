@@ -1,0 +1,354 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 12:29:30 +0000
+Subject: [PATCH] soc: apple: sleep: check the kernel text and its
+ tables on a T8132 wake
+
+The 1.882 deep sleep's way back now stops at the first memory it uses
+outside the 5788 bytes the stub's CRC check covers: the jump into
+kernel text through swapper. Whether that DRAM survived the sleep was
+never measured on the J604.
+
+At the commit, take one CRC-32 per 1 MiB of _stext.._etext and one
+per swapper table page on the walks to _cpu_resume and
+sleep_save_stash. The stub checks them by PA after the existing check,
+before cpu_resume. A mismatch restarts WD2 for 115 s and leaves the
+region, the first chunk that differs and log2 of its size in PMU
+scratch with 0x3d in 0xf804, as the existing check does with 0x3c.
+apple_sleep.t8132_elchk2 (default on, read at each commit) turns it
+off.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 264 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 262 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 45a3885d31..1e1d1aabf0 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -67,6 +67,7 @@
+ #include <linux/soc/apple/sleep.h>
+ #include <linux/soc/apple/tunable.h>
+ #include <linux/spinlock.h>
++#include <linux/stringify.h>
+ #include <linux/suspend.h>
+ #include <clocksource/arm_arch_timer.h>
+ #include <dt-bindings/gpio/gpio.h>
+@@ -3183,6 +3184,49 @@ static_assert(offsetof(struct t8132_elchk, self) == 148);
+ 
+ struct t8132_elchk t8132_elchk __aligned(64);
+ 
++/*
++ * elchk2, for the first memory the way back uses past those 5788 bytes: the kernel
++ * text (_stext.._etext, 1 MiB chunks) and the swapper table pages that map _cpu_resume
++ * and sleep_save_stash, each CRC-32 taken at the commit through the kernel's mapping
++ * and checked by the stub by PA, after elchk. A mismatch restarts WD2 for 115 s
++ * (0xa4824200 ticks) and leaves the region in 0xf805 (1 text, 2 table page, 3 this
++ * table), the first chunk or page that differs in 0xf806, log2 of its size in 0xf807,
++ * then 0x3d in 0xf804. Off with apple_sleep.t8132_elchk2=0 (read at each commit).
++ */
++#define T8132_ELCHK2_MAGIC	0x324b4345	/* "ECK2" */
++#define T8132_ELCHK2_TEXT_SHIFT	20
++#define T8132_ELCHK2_TEXT_MAX	32
++#define T8132_ELCHK2_TAB_MAX	8
++
++struct t8132_elchk2 {
++	u32 magic;		/* last at the commit, cleared after cpu_suspend() returns */
++	u32 n_text;		/* 1 MiB chunks of text */
++	u32 n_tab;		/* table pages */
++	u32 rsvd;
++	u64 text_pa;
++	u64 text_len;		/* bytes checked, a multiple of 16 */
++	u64 tab_pa[T8132_ELCHK2_TAB_MAX];
++	u32 crc_text[T8132_ELCHK2_TEXT_MAX];
++	u32 crc_tab[T8132_ELCHK2_TAB_MAX];
++	u32 self;		/* crc32_le(~0) over everything above, magic set */
++};
++
++/* The stub's offsets. */
++static_assert(offsetof(struct t8132_elchk2, n_text) == 4);
++static_assert(offsetof(struct t8132_elchk2, n_tab) == 8);
++static_assert(offsetof(struct t8132_elchk2, text_pa) == 16);
++static_assert(offsetof(struct t8132_elchk2, text_len) == 24);
++static_assert(offsetof(struct t8132_elchk2, tab_pa) == 32);
++static_assert(offsetof(struct t8132_elchk2, crc_text) == 96);
++static_assert(offsetof(struct t8132_elchk2, crc_tab) == 224);
++static_assert(offsetof(struct t8132_elchk2, self) == 256);
++
++struct t8132_elchk2 t8132_elchk2_tab __aligned(64);
++
++static bool t8132_elchk2 = true;
++module_param(t8132_elchk2, bool, 0644);
++MODULE_PARM_DESC(t8132_elchk2, "T8132 deep sleep: the resume stub also checks the kernel text and the swapper pages for _cpu_resume and sleep_save_stash (default on)");
++
+ /*
+  * The first thing Linux runs after a wake, MMU off and no stack. The last wake program
+  * leaves WD2 running for 5 s: restart it for 60 s, in the order apple_sleep_set_wd2() uses. No
+@@ -3253,7 +3297,8 @@ asm(
+ "	mov	w16, #2\n"
+ "	bl	t8132_elchk_region\n"
+ "	tbz	w17, #31, 28f\n"
+-"29:	b	cpu_resume\n"
++"29:	bl	t8132_elchk2_run\n"
++"	b	cpu_resume\n"
+ /* A mismatch: WD2 for 46 s (0x41cdb400 ticks), the record, then stay. */
+ "28:	str	wzr, [x9, #0x2c]\n"
+ "	str	wzr, [x9, #0x20]\n"
+@@ -3312,6 +3357,125 @@ asm(
+ );
+ void t8132_resume_stub(void);
+ 
++/*
++ * Called by the stub with lr, MMU off, x9 = WD2 by PA. Returns with no check armed or
++ * all equal; a mismatch stays. Uses x0-x8, x10-x17.
++ */
++asm(
++"\t.pushsection .text, \"ax\"\n"
++"\t.arch_extension crc\n"
++"\t.type\tt8132_elchk2_run, %function\n"
++"t8132_elchk2_run:\n"
++"\tmov\tx8, lr\n"
++"\tadrp\tx13, t8132_elchk2_tab\n"
++"\tadd\tx13, x13, :lo12:t8132_elchk2_tab\n"
++"\tldr\tw14, [x13]\n"
++"\tmovz\tw15, #0x4345\n"
++"\tmovk\tw15, #0x324b, lsl #16\n"
++"\tcmp\tw14, w15\n"
++"\tb.ne\t49f\n"
++"\tmov\tx1, x13\n"
++"\tmov\tw2, #256\n"
++"\tmovn\tw0, #0\n"
++"41:\tldr\tw3, [x1], #4\n"
++"\tcrc32w\tw0, w0, w3\n"
++"\tsubs\tw2, w2, #4\n"
++"\tb.ne\t41b\n"
++"\tldr\tw3, [x1]\n"
++"\tmov\tw16, #3\n"
++"\tmov\tw17, #0\n"
++"\tmov\tw7, #8\n"
++"\tcmp\tw0, w3\n"
++"\tb.ne\t48f\n"
++/* the text */
++"\tldr\tx1, [x13, #16]\n"
++"\tldr\tx2, [x13, #24]\n"
++"\tldr\tw4, [x13, #4]\n"
++"\tadd\tx5, x13, #96\n"
++"\tmov\tx6, #(1 << " __stringify(T8132_ELCHK2_TEXT_SHIFT) ")\n"
++"\tmov\tw16, #1\n"
++"\tmov\tw7, #" __stringify(T8132_ELCHK2_TEXT_SHIFT) "\n"
++"\tbl\tt8132_elchk2_region\n"
++"\ttbz\tw17, #31, 48f\n"
++/* the table pages, one chunk each */
++"\tldr\tw12, [x13, #8]\n"
++"\tadd\tx10, x13, #32\n"
++"\tadd\tx5, x13, #224\n"
++"\tmov\tw16, #2\n"
++"\tmov\tw7, #" __stringify(PAGE_SHIFT) "\n"
++"\tmov\tw11, #0\n"
++"42:\tcbz\tw12, 49f\n"
++"\tldr\tx1, [x10], #8\n"
++"\tmov\tx6, #1\n"
++"\tlsl\tx6, x6, #" __stringify(PAGE_SHIFT) "\n"
++"\tmov\tx2, x6\n"
++"\tmov\tw4, #1\n"
++"\tbl\tt8132_elchk2_region\n"
++"\ttbz\tw17, #31, 47f\n"
++"\tadd\tw11, w11, #1\n"
++"\tsub\tw12, w12, #1\n"
++"\tb\t42b\n"
++"47:\tmov\tw17, w11\n"
++"\tb\t48f\n"
++"49:\tret\tx8\n"
++/* A mismatch: WD2 for 115 s, the record, then stay. */
++"48:\tstr\twzr, [x9, #0x2c]\n"
++"\tstr\twzr, [x9, #0x20]\n"
++"\tmovz\tw10, #0x4200\n"
++"\tmovk\tw10, #0xa482, lsl #16\n"
++"\tstr\tw10, [x9, #0x28]\n"
++"\tmov\tw10, #1\n"
++"\tstr\tw10, [x9, #0x2c]\n"
++"\tadrp\tx10, t8132_catch_io\n"
++"\tadd\tx10, x10, :lo12:t8132_catch_io\n"
++"\tldr\tx12, [x10, #8]\n"
++"\tcbz\tx12, 46f\n"
++"\tmov\tw0, #0xf805\n"
++"\tmov\tw1, w16\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf806\n"
++"\tand\tw1, w17, #0xff\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf807\n"
++"\tmov\tw1, w7\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf804\n"
++"\tmov\tw1, #0x3d\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"46:\twfe\n"
++"\tb\t46b\n"
++"\t.size\tt8132_elchk2_run, . - t8132_elchk2_run\n"
++/*
++ * x1 = start, x2 = bytes (a multiple of 16), w4 = chunks, x5 = their CRCs, x6 = chunk
++ * bytes. Returns w17 = the first chunk that differs, or -1 with x5 past the CRCs.
++ * Uses x0 x3 x14 x15.
++ */
++"\t.type\tt8132_elchk2_region, %function\n"
++"t8132_elchk2_region:\n"
++"\tmov\tw17, #0\n"
++"51:\tcbz\tw4, 55f\n"
++"\tcmp\tx2, x6\n"
++"\tcsel\tx15, x2, x6, lo\n"
++"\tsub\tx2, x2, x15\n"
++"\tmovn\tw0, #0\n"
++"52:\tcbz\tx15, 53f\n"
++"\tldp\tx3, x14, [x1], #16\n"
++"\tcrc32x\tw0, w0, x3\n"
++"\tcrc32x\tw0, w0, x14\n"
++"\tsub\tx15, x15, #16\n"
++"\tb\t52b\n"
++"53:\tldr\tw3, [x5], #4\n"
++"\tcmp\tw0, w3\n"
++"\tb.ne\t56f\n"
++"\tadd\tw17, w17, #1\n"
++"\tsub\tw4, w4, #1\n"
++"\tb\t51b\n"
++"55:\tmovn\tw17, #0\n"
++"56:\tret\n"
++"\t.size\tt8132_elchk2_region, . - t8132_elchk2_region\n"
++"\t.popsection\n"
++);
++
+ /* aura reads this with the MMU off. */
+ static void apple_sleep_arm_mailbox(struct apple_sleep *s)
+ {
+@@ -3722,6 +3886,97 @@ static void t8132_disarm_el_check(void)
+ 	dcache_clean_poc((unsigned long)&t8132_elchk, (unsigned long)(&t8132_elchk + 1));
+ }
+ 
++/* PA of a table entry pointer: swapper_pg_dir is in the image, the rest in the linear map. */
++static u64 t8132_elchk2_pa(const void *p)
++{
++	unsigned long v = (unsigned long)p;
++
++	return __is_lm_address(v) ? __pa(v) : __pa_symbol(v);
++}
++
++/* The table pages on swapper's walk to va, added to pa[0..n) once each. */
++static unsigned int t8132_elchk2_tables(unsigned long va, u64 *pa, unsigned int n)
++{
++	pgd_t *pgdp = pgd_offset_k(va);
++	u64 page[4];
++	unsigned int k = 0, i, j;
++	p4d_t *p4dp;
++	pud_t *pudp;
++	pmd_t *pmdp;
++
++	page[k++] = t8132_elchk2_pa(pgdp);
++	if (pgd_none(READ_ONCE(*pgdp)))
++		goto out;
++	p4dp = p4d_offset(pgdp, va);
++	if (p4d_none(READ_ONCE(*p4dp)))
++		goto out;
++	pudp = pud_offset(p4dp, va);
++	page[k++] = t8132_elchk2_pa(pudp);
++	if (pud_none(READ_ONCE(*pudp)) || pud_leaf(READ_ONCE(*pudp)))
++		goto out;
++	pmdp = pmd_offset(pudp, va);
++	page[k++] = t8132_elchk2_pa(pmdp);
++	if (pmd_none(READ_ONCE(*pmdp)) || pmd_leaf(READ_ONCE(*pmdp)))
++		goto out;
++	page[k++] = t8132_elchk2_pa(pte_offset_kernel(pmdp, va));
++out:
++	for (i = 0; i < k; i++) {
++		u64 p = page[i] & PAGE_MASK;
++
++		for (j = 0; j < n && pa[j] != p; j++)
++			;
++		if (j == n && n < T8132_ELCHK2_TAB_MAX)
++			pa[n++] = p;
++	}
++	return n;
++}
++
++static u64 t8132_elchk2_text_len(void)
++{
++	return ((unsigned long)_etext - (unsigned long)_stext) & ~15UL;
++}
++
++/* Next to t8132_arm_el_check(): nothing writes the text or these tables until the stub. */
++static void t8132_arm_el_check2(void)
++{
++	struct t8132_elchk2 *e = &t8132_elchk2_tab;
++	struct t8132_elchk2 t = { .magic = T8132_ELCHK2_MAGIC };
++	const u8 *text = (const u8 *)_stext;
++	u64 len = t8132_elchk2_text_len();
++	unsigned int i;
++
++	WRITE_ONCE(e->magic, 0);
++	if (READ_ONCE(t8132_elchk2) && len &&
++	    DIV_ROUND_UP(len, 1UL << T8132_ELCHK2_TEXT_SHIFT) <= T8132_ELCHK2_TEXT_MAX) {
++		t.text_pa = __pa_symbol(_stext);
++		t.text_len = len;
++		t.n_text = DIV_ROUND_UP(len, 1UL << T8132_ELCHK2_TEXT_SHIFT);
++		for (i = 0; i < t.n_text; i++) {
++			const u64 chunk = 1UL << T8132_ELCHK2_TEXT_SHIFT;
++			u64 off = (u64)i * chunk;
++
++			t.crc_text[i] = crc32_le(~0U, text + off, min_t(u64, chunk, len - off));
++		}
++		t.n_tab = t8132_elchk2_tables((unsigned long)_cpu_resume, t.tab_pa, 0);
++		t.n_tab = t8132_elchk2_tables((unsigned long)&sleep_save_stash, t.tab_pa, t.n_tab);
++		for (i = 0; i < t.n_tab; i++)
++			t.crc_tab[i] = crc32_le(~0U, phys_to_virt(t.tab_pa[i]), PAGE_SIZE);
++		t.self = crc32_le(~0U, (const u8 *)&t, offsetof(struct t8132_elchk2, self));
++		memcpy(&e->n_text, &t.n_text, sizeof(*e) - offsetof(struct t8132_elchk2, n_text));
++		dsb(ishst);
++		WRITE_ONCE(e->magic, T8132_ELCHK2_MAGIC);
++	}
++	dcache_clean_poc((unsigned long)e, (unsigned long)(e + 1));
++	dsb(sy);
++}
++
++static void t8132_disarm_el_check2(void)
++{
++	WRITE_ONCE(t8132_elchk2_tab.magic, 0);
++	dcache_clean_poc((unsigned long)&t8132_elchk2_tab,
++			 (unsigned long)(&t8132_elchk2_tab + 1));
++}
++
+ static void t8132_el_check_report(struct apple_sleep *s)
+ {
+ 	const u8 *base[2];
+@@ -3734,6 +3989,8 @@ static void t8132_el_check_report(struct apple_sleep *s)
+ 	else
+ 		dev_warn(s->dev, "no resume stub check: .idmap.text %u and .mmuoff.data %u bytes exceed %u chunks\n",
+ 			 len[0], len[1], T8132_ELCHK_MAX);
++	dev_info(s->dev, "resume stub also checks the kernel text (%llu bytes, 1 MiB chunks) and swapper's pages for _cpu_resume and sleep_save_stash: %s\n",
++		 t8132_elchk2_text_len(), t8132_elchk2 ? "on" : "off");
+ }
+ 
+ static bool t8132_cpu_perf_down = true;
+@@ -3894,6 +4151,7 @@ static int t8132_sleep_commit(unsigned long unused)
+ 			 (unsigned long)(&arm64_resume_armed + 1));
+ 	t8132_arm_dram_check(s);
+ 	t8132_arm_el_check();
++	t8132_arm_el_check2();
+ 	/* What this path has dirtied since the sweep. */
+ 	dcache_clean_poc((unsigned long)task_stack_page(current),
+ 			 (unsigned long)task_stack_page(current) + THREAD_SIZE);
+@@ -4039,8 +4297,10 @@ static int apple_sleep_enter(suspend_state_t state)
+ 	 */
+ 	daif = local_daif_save();
+ 	ret = cpu_suspend(0, s->soc->commit);
+-	if (s->soc->commit == t8132_sleep_commit)
++	if (s->soc->commit == t8132_sleep_commit) {
+ 		t8132_disarm_el_check();
++		t8132_disarm_el_check2();
++	}
+ 	/* A commit that returned never reached __cpu_suspend_exit(). */
+ 	if (READ_ONCE(arm64_resume_armed)) {
+ 		WRITE_ONCE(arm64_resume_armed, 0);
+-- 
+2.43.0
+

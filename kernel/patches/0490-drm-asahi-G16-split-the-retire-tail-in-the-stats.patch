@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 12:18:28 +0000
+Subject: [PATCH] drm/asahi: G16: split the retire tail in the stats
+
+The latency line gives the tail from a prefix's last stage end to its
+host retirement (about 90 us per command on the J604), but not where
+that time goes. Stamp the architectural counter at the EP 0x20 event,
+at the start of the poll work it queues, and once the device lock is
+taken. For prefixes retired by such an event pass whose event follows
+their last stage end, add four parts: stage end to the event (firmware
+and mailbox), event to the work's start (worker wake), work start to
+the lock, and lock to retirement. Other retirements are counted only.
+
+aurora-g16/stats gains one line:
+  tailsplit: n N other M fw_us A wake_us B lock_us C pass_us D
+
+Diagnostic only: no publication, retirement or timing change.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 12 ++++++++++
+ drivers/gpu/drm/asahi/g16/mod.rs    |  7 ++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 34 +++++++++++++++++++++++++++++
+ 3 files changed, 53 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 4cddabc751..cbe37298c4 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -317,6 +317,18 @@ pub(crate) struct Stats {
+     pub(crate) start_ticks: u64,
+     pub(crate) start_max_ticks: u64,
+     pub(crate) tail_ticks: u64,
++    /// Split of the tail of prefixes retired by an EP 0x20 event pass whose event came after
++    /// their last stage end (sums, ns): stage end to the event (firmware and mailbox), event
++    /// to the poll work's start (worker wake), work start to the device lock, lock to
++    /// retirement (the pass). `tsplit_other`: retired otherwise (timer pass, or an event that
++    /// predates the stage end). Diagnostic only.
++    pub(crate) locked_ticks: u64,
++    pub(crate) tsplit_n: u64,
++    pub(crate) tsplit_other: u64,
++    pub(crate) tsplit_fw: u64,
++    pub(crate) tsplit_wake: u64,
++    pub(crate) tsplit_lock: u64,
++    pub(crate) tsplit_pass: u64,
+     /// The last prefix that failed that check: publication, first stage start, last stage end
+     /// and retirement, raw 24 MHz ticks (to find the stamps' time base).
+     pub(crate) lat_last_bad: [u64; 4],
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 72774fbaa6..d8d725bea8 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -203,6 +203,10 @@ pub(crate) struct Shared {
+     pub(crate) crashed: AtomicBool,
+     /// Set by the firmware's EP 0x20 event message; consumed by the poll work.
+     pub(crate) evented: AtomicBool,
++    /// Architectural counter at the last EP 0x20 event (`kick`) and at the start of the poll
++    /// work that followed it, for the retire-tail split in `aurora-g16/stats` (diagnostic).
++    pub(crate) event_ticks: AtomicU64,
++    pub(crate) work_ticks: AtomicU64,
+     /// The CPU wake-latency bound held now, us, 0 for none (`g16_lat_qos_us`).
+     pub(crate) lat_us: AtomicU32,
+     /// When the last pass saw commands in flight, `now_ns()`.
+@@ -258,6 +262,7 @@ fn run(this: Arc<Shared>) {
+ impl Shared {
+     /// Queues the poll work immediately. Callable from any context.
+     pub(crate) fn kick(self: &Arc<Self>) {
++        self.event_ticks.store(engine::counter_ticks(), Ordering::Relaxed);
+         self.evented.store(true, Ordering::Release);
+         // `mod_delayed_work(.., 0)` so that a kick also runs a poll whose 1-jiffy backup is
+         // pending (a plain enqueue is refused then).
+@@ -401,6 +406,8 @@ pub(crate) fn new(
+                 wedged_notified: AtomicBool::new(false),
+                 crashed: AtomicBool::new(false),
+                 evented: AtomicBool::new(false),
++                event_ticks: AtomicU64::new(0),
++                work_ticks: AtomicU64::new(0),
+                 lat_us: AtomicU32::new(0),
+                 lat_busy_ns: AtomicU64::new(0),
+                 error: AtomicI32::new(0),
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 05c6e19317..c33ef0af66 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -78,11 +78,13 @@ pub(crate) fn run_poll(self: Arc<Self>) {
+         if self.sleeping.load(Ordering::Acquire) {
+             return;
+         }
++        self.work_ticks.store(counter_ticks(), Ordering::Relaxed);
+         let signalling = kernel::dma_fence::SignallingGuard::new();
+         let mut done = Completions::new();
+         {
+             let mut state = self.state.lock();
+             if let Some(firmware) = state.as_deref_mut() {
++                firmware.engine.stats.locked_ticks = counter_ticks();
+                 if firmware.engine.shared.is_none() {
+                     firmware.engine.shared = Some(self.clone());
+                 }
+@@ -917,6 +919,28 @@ fn stat_retire(&mut self, f: &Flight) {
+                 s.start_ticks = s.start_ticks.saturating_add(start);
+                 s.start_max_ticks = s.start_max_ticks.max(start);
+                 s.tail_ticks = s.tail_ticks.saturating_add(ns(now_ticks - hi_c));
++                let (ev, work) = match self.engine.shared.as_ref() {
++                    Some(sh) => (
++                        sh.event_ticks.load(Ordering::Relaxed),
++                        sh.work_ticks.load(Ordering::Relaxed),
++                    ),
++                    None => (0, 0),
++                };
++                let locked = s.locked_ticks;
++                if s.retire_src != 2
++                    && hi_c <= ev
++                    && ev <= work
++                    && work <= locked
++                    && locked <= now_ticks
++                {
++                    s.tsplit_n += 1;
++                    s.tsplit_fw = s.tsplit_fw.saturating_add(ns(ev - hi_c));
++                    s.tsplit_wake = s.tsplit_wake.saturating_add(ns(work - ev));
++                    s.tsplit_lock = s.tsplit_lock.saturating_add(ns(locked - work));
++                    s.tsplit_pass = s.tsplit_pass.saturating_add(ns(now_ticks - locked));
++                } else {
++                    s.tsplit_other += 1;
++                }
+                 s.lat_n += 1;
+                 s.start_hist[usize::from(kind != 0)][((start / 10_000) as usize).min(31)] += 1;
+                 let (p200, p1ms) = (hz / 5000, hz / 1000);
+@@ -1199,6 +1223,16 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.lat_last_bad[2],
+             s.lat_last_bad[3]
+         )?;
++        writeln!(
++            f,
++            "tailsplit: n {} other {} fw_us {} wake_us {} lock_us {} pass_us {}",
++            s.tsplit_n,
++            s.tsplit_other,
++            s.tsplit_fw / 1000,
++            s.tsplit_wake / 1000,
++            s.tsplit_lock / 1000,
++            s.tsplit_pass / 1000
++        )?;
+         write!(f, "first_hist_100us:")?;
+         for n in s.first_hist.iter() {
+             write!(f, " {}", n)?;
+-- 
+2.43.0
+

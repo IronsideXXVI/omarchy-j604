@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 08:21:04 +0000
+Subject: [PATCH] phy: apple: atc: Serve USB2 for USB4/TBT on T8132
+ without CIO calibration
+
+Based on 4f9b5df487 ("phy: apple: atc: Serve USB2 for USB4/TBT on T8132
+without CIO calibration") by Sean Dolbec, aurora-silicon/linux#1702,
+ported onto a tree that already carries the T8132 DP Alt Mode lane rules
+(atcphy_t8132_dp_lanes() and its KUnit case). The code and the KUnit
+case are the same; only their context differs.
+
+atcphy_configure_t8132() refuses the USB4 and TBT modes with -EOPNOTSUPP
+on a T8132 PHY without the apple,tunable-cio-* calibration. The
+MacBook Pro (J604) device tree carries none, like the Mac mini (J773g),
+so a USB4 dock, a Thunderbolt 3 dock or another Mac would leave the port
+without USB at all. Serve the partner's USB2 instead, ahead of the
+DisplayPort fallback so that it starts from the mode actually served.
+
+Ports with the CIO calibration are unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/phy/apple/atc-test.c | 35 +++++++++++++++++++++++++++++++++++
+ drivers/phy/apple/atc.c      | 16 +++++++++++++++-
+ 2 files changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/phy/apple/atc-test.c b/drivers/phy/apple/atc-test.c
+index e3ed998f2f..b74e39254b 100644
+--- a/drivers/phy/apple/atc-test.c
++++ b/drivers/phy/apple/atc-test.c
+@@ -155,6 +155,40 @@ static void atcphy_test_target_mode_t8132_dp_alt(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, atcphy_t8132_dp_lanes(atcphy));
+ }
+ 
++/* Without the CIO calibration, a T8132 port serves a USB4 or TBT partner's USB2 */
++static void atcphy_test_target_mode_t8132_cio(struct kunit *test)
++{
++	struct typec_altmode tbt = { .svid = USB_TYPEC_TBT_SID };
++	struct enter_usb_data eusb = {
++		.eudo = FIELD_PREP(EUDO_USB_MODE_MASK, EUDO_USB_MODE_USB4),
++	};
++	struct typec_mux_state state = { .mode = TYPEC_MODE_USB4, .data = &eusb };
++	struct apple_atcphy *atcphy = atcphy_test_alloc_dev(test, false);
++
++	atcphy->hw = &atcphy_hw_t8132;
++	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
++	state.alt = &tbt;
++	state.mode = TYPEC_TBT_MODE;
++	state.data = NULL;
++	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
++	/* The same on a SuperSpeed port. */
++	atcphy->t8132_ss = true;
++	atcphy->ss_tunables = true;
++	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
++	state.alt = NULL;
++	state.mode = TYPEC_MODE_USB4;
++	state.data = &eusb;
++	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
++
++	/* With the calibration, the link itself is served. */
++	atcphy->cio_tunables = true;
++	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB4);
++	state.alt = &tbt;
++	state.mode = TYPEC_TBT_MODE;
++	state.data = NULL;
++	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_TBT);
++}
++
+ static void atcphy_test_noop_same_mode(struct kunit *test)
+ {
+ 	struct apple_atcphy *atcphy = atcphy_test_alloc(test, true);
+@@ -1565,6 +1599,7 @@ static struct kunit_case atcphy_mux_test_cases[] = {
+ 	KUNIT_CASE(atcphy_test_target_mode_fixed_hub),
+ 	KUNIT_CASE(atcphy_test_target_mode_t8132),
+ 	KUNIT_CASE(atcphy_test_target_mode_t8132_dp_alt),
++	KUNIT_CASE(atcphy_test_target_mode_t8132_cio),
+ 	KUNIT_CASE(atcphy_test_noop_same_mode),
+ 	KUNIT_CASE(atcphy_test_noop_needs_work),
+ 	KUNIT_CASE(atcphy_test_usb3_port_ready),
+diff --git a/drivers/phy/apple/atc.c b/drivers/phy/apple/atc.c
+index dc282a824e..008abcf219 100644
+--- a/drivers/phy/apple/atc.c
++++ b/drivers/phy/apple/atc.c
+@@ -5877,10 +5877,24 @@ static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
+ 	 * assignments C and E), USB3 next to two (D). Without the calibration,
+ 	 * serve that USB rather than refuse the mode, which would leave the
+ 	 * port without USB at all.
++	 *
++	 * The same goes for USB4 and Thunderbolt on a port without the CIO
++	 * calibration, such as those of the Mac mini (J773g). Its port
++	 * controller enters USB4 or Thunderbolt 3 by itself with a USB4 dock
++	 * or another Mac, and USB 2.0 on D+/D- does not depend on that link.
++	 * Do this first, so that the DisplayPort fallback below starts from
++	 * the mode actually served rather than putting USB4 back.
+ 	 */
+ 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132) {
+-		enum atcphy_mode usb_mode = target_mode;
++		enum atcphy_mode usb_mode;
++
++		if (atcphy_mode_is_cio(target_mode) && !atcphy->cio_tunables) {
++			dev_warn(atcphy->dev,
++				 "USB4/Thunderbolt is not available on this port: serving its USB2 only\n");
++			target_mode = APPLE_ATCPHY_MODE_USB2;
++		}
+ 
++		usb_mode = target_mode;
+ 		if (target_mode == APPLE_ATCPHY_MODE_DP && !atcphy->dp_only &&
+ 		    !atcphy_t8132_dp_lanes(atcphy))
+ 			usb_mode = APPLE_ATCPHY_MODE_USB2;
+-- 
+2.43.0
+

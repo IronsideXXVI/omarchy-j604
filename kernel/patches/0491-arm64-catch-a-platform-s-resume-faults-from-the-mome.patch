@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 12:26:54 +0000
+Subject: [PATCH] arm64: catch a platform's resume faults from the
+ moment the MMU is on
+
+On a T8132 deep sleep's way back, cpu_resume points VBAR_EL2 at the
+platform's catch vectors by PA and only _cpu_resume moves them to
+their kernel VA. Between __enable_mmu and _cpu_resume the PA vectors
+are not in idmap_pg_dir, so a fault on the first kernel-VA access
+spins without a record and reads as the last watchdog mark. The 1.882
+run reset there: 54 or 51 by the clock, no record.
+
+Read arm64_resume_vbar_va by PA before __enable_mmu (it moves to
+.mmuoff.data.read and the platform cleans it) and install it at EL2
+the moment the MMU is on. The mark after MMU-on becomes 65 s, eleven
+from 54, so the two stops no longer read alike.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ arch/arm64/include/asm/suspend.h |  3 ++-
+ arch/arm64/kernel/sleep.S        | 16 +++++++++++++++-
+ arch/arm64/kernel/suspend.c      |  3 ++-
+ drivers/soc/apple/sleep.c        |  4 +++-
+ 4 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm64/include/asm/suspend.h b/arch/arm64/include/asm/suspend.h
+index c9d8fad057..b1744adf3f 100644
+--- a/arch/arm64/include/asm/suspend.h
++++ b/arch/arm64/include/asm/suspend.h
+@@ -55,7 +55,8 @@ extern void (*arm64_suspend_mark_hook)(enum arm64_suspend_mark mark);
+ /*
+  * Vectors a platform wants for the way back from a firmware resume, until cpu_do_resume
+  * restores VBAR: their PA, installed at EL2 by cpu_resume right after init_kernel_el
+- * (MMU off), and their kernel VA, installed by _cpu_resume (MMU on). 0: none.
++ * (MMU off), and their kernel VA, installed by cpu_resume as soon as the MMU is on.
++ * 0: none. The setter cleans both to the PoC.
+  */
+ extern u64 arm64_resume_vbar;
+ /*
+diff --git a/arch/arm64/kernel/sleep.S b/arch/arm64/kernel/sleep.S
+index 153aa603db..7d6e93f651 100644
+--- a/arch/arm64/kernel/sleep.S
++++ b/arch/arm64/kernel/sleep.S
+@@ -146,11 +146,25 @@ SYM_CODE_START(cpu_resume)
+ 	resume_mark 57, 0
+ 	bl	__cpu_setup
+ 	resume_mark 54, 0		// x0 holds the SCTLR for __enable_mmu
++	/*
++	 * The platform's vectors by their kernel VA, read now by PA: the ID map does
++	 * not cover the PA ones, so from MMU-on until _cpu_resume an exception would
++	 * spin unrecorded. x20 survives __enable_mmu.
++	 */
++	adr_l	x20, arm64_resume_vbar_va
++	ldr	x20, [x20]
+ 	/* enable the MMU early - so we can access sleep_save_stash by va */
+ 	adrp	x1, swapper_pg_dir
+ 	adrp	x2, idmap_pg_dir
+ 	bl	__enable_mmu
+-	resume_mark 51, 1
++	cbz	x20, 1f
++	mrs	x2, CurrentEL
++	cmp	x2, #CurrentEL_EL2
++	b.ne	1f
++	msr	vbar_el2, x20
++	isb
++1:
++	resume_mark 65, 1		// MMU on, VA vectors live: the first kernel-VA access
+ 	ldr	x8, =_cpu_resume
+ 	br	x8
+ SYM_CODE_END(cpu_resume)
+diff --git a/arch/arm64/kernel/suspend.c b/arch/arm64/kernel/suspend.c
+index 7164ac3f4c..d1f5a5e097 100644
+--- a/arch/arm64/kernel/suspend.c
++++ b/arch/arm64/kernel/suspend.c
+@@ -49,7 +49,8 @@ u64 arm64_resume_vbar __section(".mmuoff.data.read");
+ u64 arm64_resume_wdt[3] __section(".mmuoff.data.read");
+ /* Non-zero from a platform's commit until the way back: init_kernel_el marks only then. */
+ u32 arm64_resume_armed __section(".mmuoff.data.read");
+-unsigned long arm64_resume_vbar_va;
++/* Read by cpu_resume with the MMU off too, before it turns the MMU on. */
++unsigned long arm64_resume_vbar_va __section(".mmuoff.data.read");
+ 
+ static __always_inline void arm64_suspend_mark(enum arm64_suspend_mark mark)
+ {
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index df517a6f79..628a054be7 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -4828,7 +4828,7 @@ static void t8132_catch_init(struct platform_device *pdev, struct apple_sleep *s
+ 			 (unsigned long)t8132_catch_io + sizeof(t8132_catch_io));
+ 	arm64_resume_vbar = __pa_symbol(t8132_resume_vectors);
+ 	arm64_resume_vbar_va = (unsigned long)t8132_resume_vectors;
+-	/* Marks inside the resume assembly: 57 54 51 48 45 42 s, see WDT_SUSPEND_SECS. */
++	/* Marks inside the resume assembly: 57 54 65 48 45 42 s, see WDT_SUSPEND_SECS. */
+ 	arm64_resume_wdt[0] = wdt->start;
+ 	arm64_resume_wdt[1] = (unsigned long)s->wdt;
+ 	arm64_resume_wdt[2] = WDT_TICKS_PER_S;
+@@ -4836,6 +4836,8 @@ static void t8132_catch_init(struct platform_device *pdev, struct apple_sleep *s
+ 			 (unsigned long)arm64_resume_wdt + sizeof(arm64_resume_wdt));
+ 	dcache_clean_poc((unsigned long)&arm64_resume_vbar,
+ 			 (unsigned long)(&arm64_resume_vbar + 1));
++	dcache_clean_poc((unsigned long)&arm64_resume_vbar_va,
++			 (unsigned long)(&arm64_resume_vbar_va + 1));
+ }
+ 
+ static int apple_sleep_probe(struct platform_device *pdev)
+-- 
+2.43.0
+

@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 12:59:53 +0000
+Subject: [PATCH] soc: apple: sleep: optionally do macOS's first wake
+ writes in the T8132 resume stub
+
+macOS's own wake on T8132 starts with about 88 writes on the boot core
+in 22 ms: both clusters on, the power gates, 15 domains to their targets
+with AUTO_ENABLE, unused domains lowered, then WD2 stopped (J713 trace,
+aura#109). Linux does the same words only in apple_sleep_return(),
+after cpu_resume, __cpu_setup and the MMU are on, so the wake core runs
+the whole way back with the cluster words still armed off and the
+power-gate wake words as the commit left them.
+
+Behind t8132_stub_early_wake (stub flag bit 5, default off), do the first
+of those words in the stub, by PA, just before the SCTLR step and the
+jump: cluster E on (0x380780000 <- 0xf), its READY bit polled for up to
+5 ms, cluster P on (+4), then the power-gate wake words (0x380724000 and
++0x60 <- 0x80000000). These are the words, values and order
+apple_sleep_return() already uses, which came from that J713 trace; the
+J604's own macOS wake has not been traced. The domains and the WD2 stop
+stay in C. apple_sleep_return() writes the same words again, unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 38 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 9cb5cce6dd..8fe63d8804 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -3248,7 +3248,12 @@ MODULE_PARM_DESC(t8132_elchk2, "T8132 deep sleep: the resume stub also checks th
+  *       for 30 s every second, then go on;
+  * bit 4 t8132_stub_sctlr: right before the jump, SCTLR_EL2 = INIT_SCTLR_EL2_MMU_OFF and
+  *       isb (aura never writes it on a wake, and cpu_resume's x0 = 0 makes init_el2
+- *       skip it too, so the wake core otherwise runs on the reset value).
++ *       skip it too, so the wake core otherwise runs on the reset value);
++ * bit 5 t8132_stub_early_wake: before the SCTLR step, the first writes of macOS's own
++ *       wake (J713 trace, aura#109) by PA: cluster E on (0x380780000 <- 0xf), its READY
++ *       polled for up to 5 ms, cluster P on (+4), then the power-gate wake words
++ *       (0x380724000 and +0x60 <- 0x80000000). apple_sleep_return() writes the same
++ *       words again later, with the MMU on.
+  */
+ #define T8132_STUBCFG_MAGIC	0x47464353	/* "SCFG" */
+ 
+@@ -3276,6 +3281,8 @@ static unsigned int t8132_stub_pet_secs;
+ module_param(t8132_stub_pet_secs, uint, 0644);
+ static bool t8132_stub_sctlr;
+ module_param(t8132_stub_sctlr, bool, 0644);
++static bool t8132_stub_early_wake;
++module_param(t8132_stub_early_wake, bool, 0644);
+ 
+ /*
+  * The first thing Linux runs after a wake, MMU off and no stack. The last wake program
+@@ -3437,6 +3444,33 @@ asm(
+ "\tb.lo\t67b\n"
+ "\tb\t65b\n"
+ "66:\n"
++/* Early wake writes (bit 5): clusters on, E first, then the power-gate wake words. */
++"\ttbz\tw22, #5, 69f\n"
++"\tmovz\tx12, #0x8078, lsl #16\n"
++"\tmovk\tx12, #0x3, lsl #32\n"
++"\tmov\tw13, #0xf\n"
++"\tstr\tw13, [x12]\n"
++"\tmrs\tx14, cntfrq_el0\n"
++"\tmov\tx15, #200\n"
++"\tudiv\tx14, x14, x15\n"
++"\tisb\n"
++"\tmrs\tx15, cntpct_el0\n"
++"\tadd\tx14, x14, x15\n"
++"70:\tldr\tw15, [x12]\n"
++"\ttbnz\tw15, #5, 71f\n"
++"\tisb\n"
++"\tmrs\tx15, cntpct_el0\n"
++"\tcmp\tx15, x14\n"
++"\tb.lo\t70b\n"
++"71:\tstr\tw13, [x12, #4]\n"
++"\tmovz\tx12, #0x8072, lsl #16\n"
++"\tmovk\tx12, #0x4000\n"
++"\tmovk\tx12, #0x3, lsl #32\n"
++"\tmovz\tw13, #0x8000, lsl #16\n"
++"\tstr\tw13, [x12]\n"
++"\tstr\tw13, [x12, #0x60]\n"
++"\tdsb\tsy\n"
++"69:\n"
+ /* SCTLR_EL2 (bit 4), last before the jump. */
+ "\ttbz\tw22, #4, 68f\n"
+ "\tadrp\tx10, t8132_stubcfg\n"
+@@ -4142,6 +4176,8 @@ static void t8132_arm_stubcfg(void)
+ 	c->sctlr = INIT_SCTLR_EL2_MMU_OFF;
+ 	if (READ_ONCE(t8132_stub_sctlr))
+ 		f |= BIT(4);
++	if (READ_ONCE(t8132_stub_early_wake))
++		f |= BIT(5);
+ 	c->flags = f;
+ 	dsb(ishst);
+ 	WRITE_ONCE(c->magic, f ? T8132_STUBCFG_MAGIC : 0);
+-- 
+2.43.0
+

@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 11:46:08 +0000
+Subject: [PATCH] soc: apple: clpc: let the busy streak before a CPU
+ floor be set at runtime
+
+T8132's table has no sustain, so a single 4 ms sample in which a cluster
+is half busy asks for DCS 5 and fabric 3, the top states, held for the
+32 ms vote hold. On the J604 at a near-idle desktop the CLPC agent's PMC
+floor read 0x35 (DCS 5, fabric 3) in both reads taken. On T6040, waiting
+for three busy samples in a row cut idle floor raises from about 60 % of
+samples to about 11 %.
+
+Add floor_sustain: the number of busy samples in a row before a cluster
+asks for a floor, at most 50; 0, the default, keeps the SoC table's value,
+so nothing changes until it is written.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/clpc.c | 34 +++++++++++++++++++++++++++++++---
+ 1 file changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/soc/apple/clpc.c b/drivers/soc/apple/clpc.c
+index 2ae2f7ff20..9ae78d6719 100644
+--- a/drivers/soc/apple/clpc.c
++++ b/drivers/soc/apple/clpc.c
+@@ -226,6 +226,33 @@ module_param(floor_level_khz, uint, 0644);
+ MODULE_PARM_DESC(floor_level_khz,
+ 		 "Frequency in kHz the CPU floor map's quarters are taken from, for every cluster (0: the SoC table's, else each cluster's own maximum)");
+ 
++/*
++ * Consecutive busy samples before a cluster asks for a floor; 0: the SoC
++ * table's sustain. T8132's table has none, so one busy 4 ms sample raises
++ * DCS and fabric to their top states; T6040 waits for three (12 ms), which
++ * there cut idle floor raises from about 60 % of samples to about 11 %.
++ */
++static unsigned int floor_sustain;
++
++static int floor_sustain_set(const char *val, const struct kernel_param *kp)
++{
++	return param_set_uint_minmax(val, kp, 0, 50);
++}
++
++static const struct kernel_param_ops floor_sustain_ops = {
++	.set = floor_sustain_set,
++	.get = param_get_uint,
++};
++
++module_param_cb(floor_sustain, &floor_sustain_ops, &floor_sustain, 0644);
++MODULE_PARM_DESC(floor_sustain,
++		 "Consecutive busy 4 ms samples before a CPU cluster asks for a DCS/fabric floor (0: the SoC table's, at most 50)");
++
++static unsigned int apple_clpc_sustain(const struct apple_clpc_hw *hw)
++{
++	return READ_ONCE(floor_sustain) ?: hw->sustain;
++}
++
+ static unsigned int apple_clpc_map(const struct apple_clpc_hw *hw,
+ 				   unsigned int rail, unsigned int q)
+ {
+@@ -685,7 +712,7 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
+ 				      struct apple_clpc_cluster *cl)
+ {
+ 	struct cpufreq_policy *policy;
+-	unsigned int cpu, busy = 0, q, rail;
++	unsigned int cpu, busy = 0, q, rail, sustain;
+ 
+ 	for_each_cpu(cpu, cl->cpus) {
+ 		u64 wall, idle, dw, di;
+@@ -725,13 +752,14 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
+ 
+ 	q = min_t(unsigned int, cl->level / (100 / APPLE_CLPC_LEVELS),
+ 		  APPLE_CLPC_LEVELS - 1);
++	sustain = apple_clpc_sustain(clpc->hw);
+ 	if (busy < APPLE_CLPC_BUSY_PCT)
+ 		cl->streak = 0;
+-	else if (cl->streak < clpc->hw->sustain)
++	else if (cl->streak < sustain)
+ 		cl->streak++;
+ 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+ 		cl->request[rail] = busy >= APPLE_CLPC_BUSY_PCT &&
+-				    cl->streak >= clpc->hw->sustain ?
++				    cl->streak >= sustain ?
+ 				   apple_clpc_map(clpc->hw, rail, q) : 0;
+ }
+ 
+-- 
+2.43.0
+

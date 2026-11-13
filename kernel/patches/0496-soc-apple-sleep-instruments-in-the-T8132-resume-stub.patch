@@ -1,0 +1,243 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 12:43:08 +0000
+Subject: [PATCH] soc: apple: sleep: instruments in the T8132 resume
+ stub
+
+Four of five deep sleeps on 1.878 to 1.882 stopped between the
+resume stub's jump and init_el2's first mark. Add four instruments to
+the stub, each off unless its apple_sleep parameter is set (0644, read
+at each commit):
+
+- t8132_stub_mask_daif: mask DAIF right after reading it.
+- t8132_stub_entry_rec: once WD2 runs, write the entry DAIF, CurrentEL,
+  SCTLR_EL2 and CNTPCT[39:0] to PMU scratch, marked 0x3e, for the
+  next boot.
+- t8132_stub_selftest: udf right after the catch vectors go in, so a
+  real wake proves the catch (145 s window, sync record, EC 0).
+- t8132_stub_pet_secs: before the jump, stay that many seconds
+  restarting WD2 for 30 s every second, then go on, so the reset time
+  says whether the stop is driven by time or by the code after it.
+
+The stub reads them by PA from a table the commit writes and cleans.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 154 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 154 insertions(+)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 2ec411c6ef..81bd0ee637 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -3234,6 +3234,42 @@ static bool t8132_elchk2 = true;
+ module_param(t8132_elchk2, bool, 0644);
+ MODULE_PARM_DESC(t8132_elchk2, "T8132 deep sleep: the resume stub also checks the kernel text and the swapper pages for _cpu_resume and sleep_save_stash (default on)");
+ 
++/*
++ * Stub instruments, each off unless its apple_sleep param is set (0644, read at each
++ * commit, written here and cleaned to the PoC for the stub to read by PA):
++ * bit 0 t8132_stub_mask_daif: mask DAIF right after reading it;
++ * bit 1 t8132_stub_entry_rec: write the entry state to PMU scratch once WD2 runs:
++ *       0xf805 = DAIF[9:6] | CurrentEL << 4, 0xf806-0xf809 = SCTLR_EL2[31:0],
++ *       0xf80a-0xf80e = CNTPCT[39:0], then 0x3e in 0xf804 (a later catch or check
++ *       record overwrites it);
++ * bit 2 t8132_stub_selftest: udf right after the catch vectors go in (a sync record,
++ *       EC 0, and the 145 s window prove the catch on a real wake);
++ * bit 3 t8132_stub_pet_secs (1-120): before the jump, stay that long restarting WD2
++ *       for 30 s every second, then go on.
++ */
++#define T8132_STUBCFG_MAGIC	0x47464353	/* "SCFG" */
++
++struct t8132_stubcfg {
++	u32 magic;
++	u32 flags;
++	u32 pet_secs;
++	u32 rsvd;
++};
++
++static_assert(offsetof(struct t8132_stubcfg, flags) == 4);
++static_assert(offsetof(struct t8132_stubcfg, pet_secs) == 8);
++
++struct t8132_stubcfg t8132_stubcfg __aligned(64);
++
++static bool t8132_stub_mask_daif;
++module_param(t8132_stub_mask_daif, bool, 0644);
++static bool t8132_stub_entry_rec;
++module_param(t8132_stub_entry_rec, bool, 0644);
++static bool t8132_stub_selftest;
++module_param(t8132_stub_selftest, bool, 0644);
++static unsigned int t8132_stub_pet_secs;
++module_param(t8132_stub_pet_secs, uint, 0644);
++
+ /*
+  * The first thing Linux runs after a wake, MMU off and no stack. The last wake program
+  * leaves WD2 running for 5 s: restart it for 60 s, in the order apple_sleep_set_wd2() uses. No
+@@ -3243,10 +3279,29 @@ asm(
+ "	.pushsection .text, \"ax\"\n"
+ "	.type	t8132_resume_stub, %function\n"
+ "t8132_resume_stub:\n"
++"\tmrs\tx18, daif\n"
++"\tmrs\tx19, sctlr_el2\n"
++"\tmrs\tx20, CurrentEL\n"
++"\tmrs\tx21, cntpct_el0\n"
++"\tadrp\tx10, t8132_stubcfg\n"
++"\tadd\tx10, x10, :lo12:t8132_stubcfg\n"
++"\tldr\tw11, [x10]\n"
++"\tmovz\tw13, #0x4353\n"
++"\tmovk\tw13, #0x4746, lsl #16\n"
++"\tmov\tw22, #0\n"
++"\tcmp\tw11, w13\n"
++"\tb.ne\t61f\n"
++"\tldr\tw22, [x10, #4]\n"
++"61:\ttbz\tw22, #0, 62f\n"
++"\tmsr\tdaifset, #0xf\n"
++"62:\n"
+ "\tadrp\tx9, t8132_resume_vectors\n"
+ "\tadd\tx9, x9, :lo12:t8132_resume_vectors\n"
+ "\tmsr\tvbar_el2, x9\n"
+ "\tisb\n"
++"\ttbz\tw22, #2, 63f\n"
++"\tudf\t#0\n"
++"63:\n"
+ "	movz	x9, #0x882b, lsl #16\n"
+ "	movk	x9, #0x3, lsl #32\n"
+ "	str	wzr, [x9, #0x2c]\n"
+@@ -3265,6 +3320,48 @@ asm(
+ "	str	w10, [x9, #0x28]\n"
+ "	mov	w10, #1\n"
+ "	str	w10, [x9, #0x2c]\n"
++/* The entry record (bit 1), now that WD2 runs. */
++"\ttbz\tw22, #1, 64f\n"
++"\tadrp\tx10, t8132_catch_io\n"
++"\tadd\tx10, x10, :lo12:t8132_catch_io\n"
++"\tldr\tx12, [x10, #8]\n"
++"\tcbz\tx12, 64f\n"
++"\tubfx\tx1, x18, #6, #4\n"
++"\tubfx\tx3, x20, #2, #2\n"
++"\torr\tw1, w1, w3, lsl #4\n"
++"\tmov\tw0, #0xf805\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf806\n"
++"\tubfx\tx1, x19, #0, #8\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf807\n"
++"\tubfx\tx1, x19, #8, #8\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf808\n"
++"\tubfx\tx1, x19, #16, #8\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf809\n"
++"\tubfx\tx1, x19, #24, #8\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf80a\n"
++"\tubfx\tx1, x21, #0, #8\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf80b\n"
++"\tubfx\tx1, x21, #8, #8\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf80c\n"
++"\tubfx\tx1, x21, #16, #8\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf80d\n"
++"\tubfx\tx1, x21, #24, #8\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf80e\n"
++"\tubfx\tx1, x21, #32, #8\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"\tmov\tw0, #0xf804\n"
++"\tmov\tw1, #0x3e\n"
++"\tbl\tt8132_catch_pmu_write\n"
++"64:\n"
+ /*
+  * Before the jump: .idmap.text and .mmuoff.data against t8132_elchk, by PA. No check
+  * armed, or all chunks equal: cpu_resume as before. A mismatch stays at 28.
+@@ -3305,6 +3402,34 @@ asm(
+ "	bl	t8132_elchk_region\n"
+ "	tbz	w17, #31, 28f\n"
+ "29:	bl	t8132_elchk2_run\n"
++/* The pet loop (bit 3): WD2 for 30 s (0x2aea5400 ticks) every second for pet_secs. */
++"\ttbz\tw22, #3, 66f\n"
++"\tadrp\tx10, t8132_stubcfg\n"
++"\tadd\tx10, x10, :lo12:t8132_stubcfg\n"
++"\tldr\tw11, [x10, #8]\n"
++"\tcbz\tw11, 66f\n"
++"\tmrs\tx14, cntfrq_el0\n"
++"\tisb\n"
++"\tmrs\tx15, cntpct_el0\n"
++"\tmadd\tx16, x14, x11, x15\n"
++"65:\tstr\twzr, [x9, #0x2c]\n"
++"\tstr\twzr, [x9, #0x20]\n"
++"\tmovz\tw10, #0x5400\n"
++"\tmovk\tw10, #0x2aea, lsl #16\n"
++"\tstr\tw10, [x9, #0x28]\n"
++"\tmov\tw10, #1\n"
++"\tstr\tw10, [x9, #0x2c]\n"
++"\tisb\n"
++"\tmrs\tx15, cntpct_el0\n"
++"\tadd\tx17, x15, x14\n"
++"67:\tisb\n"
++"\tmrs\tx15, cntpct_el0\n"
++"\tcmp\tx15, x16\n"
++"\tb.hs\t66f\n"
++"\tcmp\tx15, x17\n"
++"\tb.lo\t67b\n"
++"\tb\t65b\n"
++"66:\n"
+ /* Both checks passed or none armed: WD2 for 105 s (0x96342600 ticks), then the jump. */
+ "	str	wzr, [x9, #0x2c]\n"
+ "	str	wzr, [x9, #0x20]\n"
+@@ -3985,6 +4110,33 @@ static void t8132_arm_el_check2(void)
+ 	dsb(sy);
+ }
+ 
++static void t8132_arm_stubcfg(void)
++{
++	struct t8132_stubcfg *c = &t8132_stubcfg;
++	u32 f = 0;
++
++	if (READ_ONCE(t8132_stub_mask_daif))
++		f |= BIT(0);
++	if (READ_ONCE(t8132_stub_entry_rec))
++		f |= BIT(1);
++	if (READ_ONCE(t8132_stub_selftest))
++		f |= BIT(2);
++	c->pet_secs = min(READ_ONCE(t8132_stub_pet_secs), 120U);
++	if (c->pet_secs)
++		f |= BIT(3);
++	c->flags = f;
++	dsb(ishst);
++	WRITE_ONCE(c->magic, f ? T8132_STUBCFG_MAGIC : 0);
++	dcache_clean_poc((unsigned long)c, (unsigned long)(c + 1));
++	dsb(sy);
++}
++
++static void t8132_disarm_stubcfg(void)
++{
++	WRITE_ONCE(t8132_stubcfg.magic, 0);
++	dcache_clean_poc((unsigned long)&t8132_stubcfg, (unsigned long)(&t8132_stubcfg + 1));
++}
++
+ static void t8132_disarm_el_check2(void)
+ {
+ 	WRITE_ONCE(t8132_elchk2_tab.magic, 0);
+@@ -4167,6 +4319,7 @@ static int t8132_sleep_commit(unsigned long unused)
+ 	t8132_arm_dram_check(s);
+ 	t8132_arm_el_check();
+ 	t8132_arm_el_check2();
++	t8132_arm_stubcfg();
+ 	/* What this path has dirtied since the sweep. */
+ 	dcache_clean_poc((unsigned long)task_stack_page(current),
+ 			 (unsigned long)task_stack_page(current) + THREAD_SIZE);
+@@ -4315,6 +4468,7 @@ static int apple_sleep_enter(suspend_state_t state)
+ 	if (s->soc->commit == t8132_sleep_commit) {
+ 		t8132_disarm_el_check();
+ 		t8132_disarm_el_check2();
++		t8132_disarm_stubcfg();
+ 	}
+ 	/* A commit that returned never reached __cpu_suspend_exit(). */
+ 	if (READ_ONCE(arm64_resume_armed)) {
+-- 
+2.43.0
+
