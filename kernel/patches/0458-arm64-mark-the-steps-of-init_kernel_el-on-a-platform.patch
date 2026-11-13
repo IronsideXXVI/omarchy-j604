@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 06:44:03 +0000
+Subject: [PATCH] arm64: mark the steps of init_kernel_el on a
+ platform's way back
+
+On the T8132 a deep sleep's resume stops inside init_kernel_el: past
+the resume stub's 60 s watchdog window, before cpu_resume's first mark,
+with no exception recorded (init_el2 points VBAR_EL2 back at the hyp
+stub, whose vectors spin).
+
+On that way back only, restart the platform's resume watchdog at three
+more points: 59 s after init_el2_state (and catch exceptions from there
+until the exception level is chosen), 58 s at the direct VHE path's
+eret, 56 s at the eret through EL1 (the hyp stub's vectors back first,
+for its HVCs). The T8132 stub arms 60 s if it reads ctxr_stay_el2 set
+and 62 s if clear.
+
+A new arm64_resume_armed, set in the commit and cleared in
+__cpu_suspend_exit() or when the commit returns, gates all of them, so
+a cold boot or a CPU coming online never touches the watchdog.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ arch/arm64/include/asm/suspend.h |  1 +
+ arch/arm64/kernel/head.S         | 58 ++++++++++++++++++++++++++++++++
+ arch/arm64/kernel/suspend.c      |  8 +++++
+ drivers/soc/apple/sleep.c        | 19 +++++++++++
+ 4 files changed, 86 insertions(+)
+
+diff --git a/arch/arm64/include/asm/suspend.h b/arch/arm64/include/asm/suspend.h
+index 8f5c798807..c9d8fad057 100644
+--- a/arch/arm64/include/asm/suspend.h
++++ b/arch/arm64/include/asm/suspend.h
+@@ -65,6 +65,7 @@ extern u64 arm64_resume_vbar;
+  * 0, the default, writes nothing.
+  */
+ extern u64 arm64_resume_wdt[3];
++extern u32 arm64_resume_armed;
+ extern unsigned long arm64_resume_vbar_va;
+ extern void cpu_resume(void);
+ int __cpu_suspend_enter(struct sleep_stack_data *state);
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index a596a8d347..85552fb383 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -270,6 +270,52 @@ SYM_FUNC_END(__primary_switched)
+  *
+  * x0: whether we are being called from the primary boot path with the MMU on
+  */
++#if defined(CONFIG_ARM64_CTXR_EXECMEM) && defined(CONFIG_CPU_PM)
++	/*
++	 * Only on the way back from a platform's deep sleep (x22 set by cpu_resume and
++	 * arm64_resume_armed set by the commit): restart the platform's resume watchdog
++	 * for \secs seconds by PA (see cpu_resume's resume_mark), and with \catch also
++	 * point VBAR_EL2 at the platform's catch vectors. Uses x1-x3 only.
++	 */
++	.macro	el_resume_mark, secs, catch
++	cbz	x22, .Lel_resume_mark_\@
++	adr_l	x1, arm64_resume_armed
++	ldr	w1, [x1]
++	cbz	w1, .Lel_resume_mark_\@
++	adr_l	x1, arm64_resume_wdt
++	ldr	x2, [x1]
++	cbz	x2, .Lel_resume_mark_\@
++	ldr	w3, [x1, #16]
++	mov	w1, #\secs
++	mul	w3, w3, w1
++	str	wzr, [x2, #0x2c]
++	str	wzr, [x2, #0x20]
++	str	w3, [x2, #0x28]
++	mov	w3, #1
++	str	w3, [x2, #0x2c]
++	.if	\catch
++	adr_l	x1, arm64_resume_vbar
++	ldr	x1, [x1]
++	cbz	x1, .Lel_resume_mark_\@
++	msr	vbar_el2, x1
++	isb
++	.endif
++.Lel_resume_mark_\@:
++	.endm
++
++	/* The same gate: the hyp stub's vectors back before a trip through EL1 (its HVCs). */
++	.macro	el_resume_stub_vectors
++	cbz	x22, .Lel_resume_vec_\@
++	adr_l	x1, arm64_resume_armed
++	ldr	w1, [x1]
++	cbz	w1, .Lel_resume_vec_\@
++	adr_l	x1, __hyp_stub_vectors
++	msr	vbar_el2, x1
++	isb
++.Lel_resume_vec_\@:
++	.endm
++#endif
++
+ SYM_FUNC_START(init_kernel_el)
+ 	mrs	x1, CurrentEL
+ 	cmp	x1, #CurrentEL_EL2
+@@ -309,6 +355,9 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
+ 	adr_l	x0, __hyp_stub_vectors
+ 	msr	vbar_el2, x0
+ 	isb
++#if defined(CONFIG_ARM64_CTXR_EXECMEM) && defined(CONFIG_CPU_PM)
++	el_resume_mark 59, 1		// resuming: init_el2_state done; catch until the EL is set
++#endif
+ 
+ #ifdef CONFIG_ARM64_CTXR_EXECMEM
+ 	/*
+@@ -367,8 +416,14 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
+ 
+ 	mov	w0, #BOOT_CPU_MODE_EL2
+ 	orr	x0, x0, #BOOT_CPU_FLAG_E2H
++#ifdef CONFIG_CPU_PM
++	el_resume_mark 58, 0		// resuming: the direct VHE path, at its eret
++#endif
+ 	eret
+ .Lctxr_no_direct_vhe:
++#ifdef CONFIG_CPU_PM
++	el_resume_stub_vectors
++#endif
+ #endif
+ 
+ 	mov_q	x1, INIT_SCTLR_EL1_MMU_OFF
+@@ -391,6 +446,9 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
+ 
+ 	mov	w0, #BOOT_CPU_MODE_EL2
+ 	orr	x0, x0, x2
++#if defined(CONFIG_ARM64_CTXR_EXECMEM) && defined(CONFIG_CPU_PM)
++	el_resume_mark 56, 0		// resuming: the trip through EL1, at its eret
++#endif
+ 	eret
+ SYM_FUNC_END(init_kernel_el)
+ 
+diff --git a/arch/arm64/kernel/suspend.c b/arch/arm64/kernel/suspend.c
+index 1c08ed25f0..7164ac3f4c 100644
+--- a/arch/arm64/kernel/suspend.c
++++ b/arch/arm64/kernel/suspend.c
+@@ -47,6 +47,8 @@ void (*arm64_suspend_mark_hook)(enum arm64_suspend_mark mark);
+ /* Read by cpu_resume with the MMU off: the setter cleans it to the PoC. */
+ u64 arm64_resume_vbar __section(".mmuoff.data.read");
+ u64 arm64_resume_wdt[3] __section(".mmuoff.data.read");
++/* Non-zero from a platform's commit until the way back: init_kernel_el marks only then. */
++u32 arm64_resume_armed __section(".mmuoff.data.read");
+ unsigned long arm64_resume_vbar_va;
+ 
+ static __always_inline void arm64_suspend_mark(enum arm64_suspend_mark mark)
+@@ -61,6 +63,12 @@ void notrace __cpu_suspend_exit(void)
+ {
+ 	unsigned int cpu = smp_processor_id();
+ 
++	/* Secondaries read it with the MMU off when they come up again. */
++	if (READ_ONCE(arm64_resume_armed)) {
++		WRITE_ONCE(arm64_resume_armed, 0);
++		dcache_clean_poc((unsigned long)&arm64_resume_armed,
++				 (unsigned long)(&arm64_resume_armed + 1));
++	}
+ 	if (pm_resume_via_firmware())
+ 		arm64_suspend_mark(ARM64_SUSPEND_EXIT_FIRST);
+ 
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 99c351eecd..5a8ac80be9 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -3169,6 +3169,15 @@ asm(
+ "	str	wzr, [x9, #0x20]\n"
+ "	movz	w10, #0xa800\n"
+ "	movk	w10, #0x55d4, lsl #16\n"
++#ifdef CONFIG_ARM64_CTXR_EXECMEM
++/* ctxr_stay_el2 as read here, by PA: 60 s if set, 62 s (0x58b11c00 ticks) if clear. */
++"	adrp	x11, ctxr_stay_el2\n"
++"	ldr	w11, [x11, :lo12:ctxr_stay_el2]\n"
++"	movz	w12, #0x1c00\n"
++"	movk	w12, #0x58b1, lsl #16\n"
++"	cmp	w11, #0\n"
++"	csel	w10, w10, w12, ne\n"
++#endif
+ "	str	w10, [x9, #0x28]\n"
+ "	mov	w10, #1\n"
+ "	str	w10, [x9, #0x2c]\n"
+@@ -3627,6 +3636,10 @@ static int t8132_sleep_commit(unsigned long unused)
+ 	/* The wake comes back through the stub, which restarts WD2 for the resume. */
+ 	WRITE_ONCE(s->mbox->resume_pa, __pa_symbol(t8132_resume_stub));
+ 	dcache_clean_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
++	/* init_kernel_el's marks (59 58 56 s), on this way back only. */
++	WRITE_ONCE(arm64_resume_armed, 1);
++	dcache_clean_poc((unsigned long)&arm64_resume_armed,
++			 (unsigned long)(&arm64_resume_armed + 1));
+ 	t8132_arm_dram_check(s);
+ 	/* What this path has dirtied since the sweep. */
+ 	dcache_clean_poc((unsigned long)task_stack_page(current),
+@@ -3773,6 +3786,12 @@ static int apple_sleep_enter(suspend_state_t state)
+ 	 */
+ 	daif = local_daif_save();
+ 	ret = cpu_suspend(0, s->soc->commit);
++	/* A commit that returned never reached __cpu_suspend_exit(). */
++	if (READ_ONCE(arm64_resume_armed)) {
++		WRITE_ONCE(arm64_resume_armed, 0);
++		dcache_clean_poc((unsigned long)&arm64_resume_armed,
++				 (unsigned long)(&arm64_resume_armed + 1));
++	}
+ 	if (ret)
+ 		panic("Apple committed sleep returned without physical wake: %d", ret);
+ 	apple_sleep_return(s);
+-- 
+2.43.0
+
