@@ -1,0 +1,247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 05:44:46 +0000
+Subject: [PATCH] drm: apple: audio: ask for up to 256 KiB of audio
+ elements, as macOS
+
+When the audio elements do not fit the buffer of the get_elements
+call, DCP returns them cut off at the buffer's end and reports a used
+size of 0. A Samsung TV behind a USB-C to HDMI adapter has 17312 bytes
+of elements, so with the 16 KiB the legacy path asked for, everything
+past 16 KiB was lost. macOS 13 asks for up to 256 KiB, as the native
+14.7 path already does: use that capacity on every firmware. The
+native path no longer needs a second buffer of its own.
+
+Allocate the elements buffer and the call buffers with kvzalloc(),
+including the ones in afk_service_call_timeout_len() and
+afk_service_call_with_reply_len(), which every AFK service call goes
+through; they are only copied into the DMA buffers.
+
+On this tree the native-link branch of dcpaud_attach_dcp() and the T8132
+external DCP functions sit where the original changes its context: the
+native branch takes the one 256 KiB catalog, and the external DCP code is
+kept as it is.
+
+Based on 217ad61304 from aurora-silicon/linux#1697
+
+Fixes: cb24343242a7 ("gpu: drm: apple: Add DCP audio driver")
+Link: https://github.com/aurora-silicon/linux/pull/276
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/afk.c   |  8 ++---
+ drivers/gpu/drm/apple/audio.c | 55 ++++++++++++++++++-----------------
+ drivers/gpu/drm/apple/av.c    |  4 +--
+ 3 files changed, 34 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/afk.c b/drivers/gpu/drm/apple/afk.c
+index f98f0f49fb..46361bd92b 100644
+--- a/drivers/gpu/drm/apple/afk.c
++++ b/drivers/gpu/drm/apple/afk.c
+@@ -3191,7 +3191,7 @@ int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
+ 	if (!service)
+ 		return -ENODEV;
+ 
+-	bfr = kzalloc(bfr_len, GFP_KERNEL);
++	bfr = kvzalloc(bfr_len, GFP_KERNEL);
+ 	if (!bfr)
+ 		return -ENOMEM;
+ 
+@@ -3261,7 +3261,7 @@ int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
+ 	}
+ 
+ out:
+-	kfree(bfr);
++	kvfree(bfr);
+ 	return ret;
+ }
+ 
+@@ -3299,7 +3299,7 @@ int afk_service_call_with_reply_len(struct apple_epic_service *service,
+ 			       &bfr_len) || bfr_len > U32_MAX)
+ 		return -EOVERFLOW;
+ 
+-	bfr = kzalloc(bfr_len, GFP_KERNEL);
++	bfr = kvzalloc(bfr_len, GFP_KERNEL);
+ 	if (!bfr)
+ 		return -ENOMEM;
+ 
+@@ -3344,7 +3344,7 @@ int afk_service_call_with_reply_len(struct apple_epic_service *service,
+ 	}
+ 
+ out:
+-	kfree(bfr);
++	kvfree(bfr);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/apple/audio.c b/drivers/gpu/drm/apple/audio.c
+index 4a685a66da..9e185a358e 100644
+--- a/drivers/gpu/drm/apple/audio.c
++++ b/drivers/gpu/drm/apple/audio.c
+@@ -21,6 +21,8 @@
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
+ #include <linux/suspend.h>
+ #include <drm/drm_connector.h>
+ #include <drm/drm_eld.h>
+@@ -37,11 +39,15 @@
+ #include "audio.h"
+ #include "parser.h"
+ 
+-#define DCPAUD_ELEMENTS_MAXSIZE		16384
++/*
++ * The element catalog capacity, on every firmware. Elements that do not
++ * fit come back cut off at the buffer's end with a used size of 0: a TV
++ * behind a USB-C to HDMI adapter has 17312 bytes of them. macOS 13 asks
++ * for up to 256 KiB.
++ */
++#define DCPAUD_ELEMENTS_MAXSIZE		SZ_256K
+ #define DCPAUD_PRODUCTATTRS_MAXSIZE	1024
+ #define DCPAUD_ELD_SIZE			MAX_ELD_BYTES
+-/* The native element catalog capacity (14.7 external role). */
+-#define DCPAUD_ELEMENTS_V14_7		SZ_256K
+ 
+ /*
+  * SIO takes one of its 64 descriptor slots per period, shared by all its
+@@ -149,11 +155,6 @@ static inline bool dcpaud_native_link(struct dcp_audio *dcpaud)
+ #endif
+ }
+ 
+-static inline size_t dcpaud_elements_size(struct dcp_audio *dcpaud)
+-{
+-	return dcpaud_native_link(dcpaud) ? DCPAUD_ELEMENTS_V14_7 : DCPAUD_ELEMENTS_MAXSIZE;
+-}
+-
+ static const struct snd_pcm_hardware dcp_pcm_hw = {
+ 	.info	 = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
+ 		   SNDRV_PCM_INFO_INTERLEAVED,
+@@ -202,7 +203,7 @@ static int dcpaud_read_remote_info(struct dcp_audio *dcpaud)
+ 	int ret;
+ 
+ 	ret = dcp_audiosrv_get_elements(dcpaud->dcp_dev, dcpaud->elements,
+-					dcpaud_elements_size(dcpaud));
++					DCPAUD_ELEMENTS_MAXSIZE);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -259,7 +260,7 @@ static void dcpaud_consult_elements(struct dcp_audio *dcpaud,
+ 	struct dcp_parse_ctx elements = {
+ 		.dcp = dev_get_drvdata(dcpaud->dcp_dev),
+ 		.blob = dcpaud->elements + 4,
+-		.len = dcpaud_elements_size(dcpaud) - 4,
++		.len = DCPAUD_ELEMENTS_MAXSIZE - 4,
+ 		.pos = 0,
+ #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+ 		.v14_7_audio = dcpaud->native_link,
+@@ -308,7 +309,7 @@ static int dcpaud_select_cookie(struct dcp_audio *dcpaud,
+ 	struct dcp_parse_ctx elements = {
+ 		.dcp = dev_get_drvdata(dcpaud->dcp_dev),
+ 		.blob = dcpaud->elements + 4,
+-		.len = dcpaud_elements_size(dcpaud) - 4,
++		.len = DCPAUD_ELEMENTS_MAXSIZE - 4,
+ 		.pos = 0,
+ #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+ 		.v14_7_audio = dcpaud->native_link,
+@@ -821,7 +822,7 @@ static int dcpaud_pin_rate_format(struct dcp_audio *dcpaud,
+ 	struct dcp_parse_ctx elements = {
+ 		.dcp = dev_get_drvdata(dcpaud->dcp_dev),
+ 		.blob = dcpaud->elements + 4,
+-		.len = dcpaud_elements_size(dcpaud) - 4,
++		.len = DCPAUD_ELEMENTS_MAXSIZE - 4,
+ 		.pos = 0,
+ 		.v14_7_audio = dcpaud->native_link,
+ 	};
+@@ -1344,7 +1345,7 @@ static int dcpaud_select_default_cookie(struct dcp_audio *dcpaud)
+ 	struct dcp_parse_ctx elements = {
+ 		.dcp = dev_get_drvdata(dcpaud->dcp_dev),
+ 		.blob = dcpaud->elements + 4,
+-		.len = dcpaud_elements_size(dcpaud) - 4,
++		.len = DCPAUD_ELEMENTS_MAXSIZE - 4,
+ 		.pos = 0,
+ 		.v14_7_audio = dcpaud->native_link,
+ 	};
+@@ -1894,18 +1895,9 @@ static int dcpaud_attach_dcp(struct dcp_audio *dcpaud, struct device *dcp_dev)
+ 	dcpaud->dcp_dev = dcp_dev;
+ 
+ #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+-	/* Native external roles share the link lifecycle and element catalog. */
+-	if (dcp_audiosrv_native_link(dcpaud->dcp_dev)) {
+-		void *elements = devm_kzalloc(dev, DCPAUD_ELEMENTS_V14_7, GFP_KERNEL);
+-
+-		if (!elements) {
+-			of_node_put(dma_spec.np);
+-			return 0;
+-		}
+-		devm_kfree(dev, dcpaud->elements);
+-		dcpaud->elements = elements;
++	/* Native external roles share the link lifecycle. */
++	if (dcp_audiosrv_native_link(dcpaud->dcp_dev))
+ 		dcpaud->native_link = true;
+-	}
+ #endif
+ 
+ 	dma_pdev = of_find_device_by_node(dma_spec.np);
+@@ -1928,7 +1920,7 @@ static int dcpaud_attach_dcp(struct dcp_audio *dcpaud, struct device *dcp_dev)
+ 		dcpaud_expose_debugfs_blob(dcpaud, "selected_cookie", &dcpaud->selected_cookie,
+ 					sizeof(dcpaud->selected_cookie));
+ 		dcpaud_expose_debugfs_blob(dcpaud, "elements", dcpaud->elements,
+-					dcpaud_elements_size(dcpaud));
++					DCPAUD_ELEMENTS_MAXSIZE);
+ 		dcpaud_expose_debugfs_blob(dcpaud, "product_attrs", dcpaud->productattrs,
+ 					DCPAUD_PRODUCTATTRS_MAXSIZE);
+ 	}
+@@ -2124,18 +2116,27 @@ static void dcpaud_ext_remove(struct dcp_audio *dcpaud)
+ 	dcpaud->dcp_dev = NULL;
+ }
+ 
++static void dcpaud_free_elements(void *elements)
++{
++	kvfree(elements);
++}
++
+ static int dcpaud_probe(struct platform_device *pdev)
+ {
+ 	struct dcp_audio *dcpaud;
++	int ret;
+ 
+ 	dcpaud = devm_kzalloc(&pdev->dev, sizeof(*dcpaud), GFP_KERNEL);
+ 	if (!dcpaud)
+ 		return -ENOMEM;
+ 
+-	dcpaud->elements = devm_kzalloc(&pdev->dev, DCPAUD_ELEMENTS_MAXSIZE,
+-					GFP_KERNEL);
++	dcpaud->elements = kvzalloc(DCPAUD_ELEMENTS_MAXSIZE, GFP_KERNEL);
+ 	if (!dcpaud->elements)
+ 		return -ENOMEM;
++	ret = devm_add_action_or_reset(&pdev->dev, dcpaud_free_elements,
++				       dcpaud->elements);
++	if (ret)
++		return ret;
+ 
+ 	dcpaud->productattrs = devm_kzalloc(&pdev->dev, DCPAUD_PRODUCTATTRS_MAXSIZE,
+ 					    GFP_KERNEL);
+diff --git a/drivers/gpu/drm/apple/av.c b/drivers/gpu/drm/apple/av.c
+index 4c1c87bdde..910ea0ea2d 100644
+--- a/drivers/gpu/drm/apple/av.c
++++ b/drivers/gpu/drm/apple/av.c
+@@ -624,12 +624,12 @@ dcp_audiosrv_osobject_call(struct apple_epic_service *service, u16 group,
+ 	static_assert(sizeof(*hdr) == 48);
+ 	size_t received = 0, used;
+ 	size_t bfr_len = output_maxsize + sizeof(*hdr);
+-	void *bfr __free(kfree) = NULL;
++	void *bfr __free(kvfree) = NULL;
+ 	int ret;
+ 
+ 	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_osobject_call, service, group, command, output,
+ 				   output_maxsize, output_size);
+-	bfr = kzalloc(bfr_len, GFP_KERNEL);
++	bfr = kvzalloc(bfr_len, GFP_KERNEL);
+ 	if (!bfr)
+ 		return -ENOMEM;
+ 
+-- 
+2.43.0
+

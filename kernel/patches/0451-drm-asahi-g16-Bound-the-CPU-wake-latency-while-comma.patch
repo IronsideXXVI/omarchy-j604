@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 06:03:51 +0000
+Subject: [PATCH] drm/asahi: g16: Bound the CPU wake latency while
+ commands are in flight
+
+The T8132 CPUs have two idle states: WFI (1 us exit) and the cluster
+state WFI-CL (75 us exit, 1 ms target residency). A light command's
+completion event lands while the CPUs idle between submissions, so the
+mailbox interrupt and the retiring work can first wait for a cluster to
+wake, which adds to the host retire tail of every command.
+
+Add g16_lat_qos_us (runtime 0644, default 0 = none). With a value, the
+driver holds a CPU latency QoS request of that many microseconds while
+commands are in flight, and for one power window after the last one,
+since a pass always follows within it. The final idle pass of a busy
+period, and a fail-stop, drop it. The request is allocated once and
+never freed, so it stays valid however the driver goes.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/boot.rs   |  8 ++++++
+ drivers/gpu/drm/asahi/g16/glue.c    | 28 +++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/mod.rs    |  6 +++++
+ drivers/gpu/drm/asahi/g16/params.rs | 19 ++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 39 ++++++++++++++++++++++++++---
+ 5 files changed, 97 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 59a55df99a..718da2213b 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -48,6 +48,7 @@ pub(crate) mod glue {
+ 
+         fn asahi_g16_perf_rows() -> core::ffi::c_uint;
+         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
++        fn asahi_g16_lat_qos(us: core::ffi::c_int) -> core::ffi::c_int;
+         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
+         fn asahi_g16_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
+         fn asahi_g16_dma_unsupported(dev: *mut core::ffi::c_void) -> bool;
+@@ -64,6 +65,13 @@ fn asahi_g16_reserved_region(
+         ) -> core::ffi::c_int;
+     }
+ 
++    /// Sets the CPU wake-latency bound to `us`, or drops it for `None`. Process context.
++    pub(crate) fn lat_qos(us: Option<u32>) -> Result {
++        let us = us.map_or(-1, |us| us.min(i32::MAX as u32) as core::ffi::c_int);
++        // SAFETY: Updates the driver's own CPU latency request only.
++        kernel::error::to_result(unsafe { asahi_g16_lat_qos(us) })
++    }
++
+     /// A qualified T8132 board (J713, J773g).
+     pub(crate) fn board() -> bool {
+         // SAFETY: Reads the machine compatible strings only.
+diff --git a/drivers/gpu/drm/asahi/g16/glue.c b/drivers/gpu/drm/asahi/g16/glue.c
+index 6084e88223..47512608e8 100644
+--- a/drivers/gpu/drm/asahi/g16/glue.c
++++ b/drivers/gpu/drm/asahi/g16/glue.c
+@@ -16,6 +16,7 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/of_reserved_mem.h>
++#include <linux/pm_qos.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/slab.h>
+ #include <linux/soc/apple/clpc.h>
+@@ -32,6 +33,7 @@ bool asahi_g16_identify_board(void);
+ bool asahi_g16_j604_board(void);
+ int asahi_g16_display_prepare(struct device *dev);
+ int asahi_g16_hold_power(struct device *dev);
++int asahi_g16_lat_qos(int us);
+ bool asahi_g16_ram_disjoint(u64 start, u64 size);
+ void __iomem *asahi_g16_ioremap_wc(u64 start, size_t size);
+ bool asahi_g16_dma_unsupported(struct device *dev);
+@@ -394,3 +396,29 @@ void asahi_g16_clpc_gpu_put(struct apple_clpc_gpu *gpu)
+ {
+ 	apple_clpc_gpu_put(gpu);
+ }
++
++/*
++ * A CPU wake-latency bound while G16 commands are in flight (g16_lat_qos_us): the
++ * cluster idle state's 75 us exit is then kept off the event -> retire path. @us < 0
++ * drops it. Called under the G16 state lock, in process context. The request is
++ * allocated once and never freed, so it stays valid however the driver goes.
++ */
++int asahi_g16_lat_qos(int us)
++{
++	static struct pm_qos_request *req;
++
++	if (!req) {
++		if (us < 0)
++			return 0;
++		req = kzalloc(sizeof(*req), GFP_KERNEL);
++		if (!req)
++			return -ENOMEM;
++	}
++	if (!cpu_latency_qos_request_active(req)) {
++		if (us >= 0)
++			cpu_latency_qos_add_request(req, us);
++		return 0;
++	}
++	cpu_latency_qos_update_request(req, us < 0 ? PM_QOS_DEFAULT_VALUE : us);
++	return 0;
++}
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index e0eccf6db6..72774fbaa6 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -203,6 +203,10 @@ pub(crate) struct Shared {
+     pub(crate) crashed: AtomicBool,
+     /// Set by the firmware's EP 0x20 event message; consumed by the poll work.
+     pub(crate) evented: AtomicBool,
++    /// The CPU wake-latency bound held now, us, 0 for none (`g16_lat_qos_us`).
++    pub(crate) lat_us: AtomicU32,
++    /// When the last pass saw commands in flight, `now_ns()`.
++    pub(crate) lat_busy_ns: AtomicU64,
+     // --- RTKit callback state and a retained failed session. ---
+     /// The first latched error, as a negative errno.
+     pub(crate) error: AtomicI32,
+@@ -397,6 +401,8 @@ pub(crate) fn new(
+                 wedged_notified: AtomicBool::new(false),
+                 crashed: AtomicBool::new(false),
+                 evented: AtomicBool::new(false),
++                lat_us: AtomicU32::new(0),
++                lat_busy_ns: AtomicU64::new(0),
+                 error: AtomicI32::new(0),
+                 started: AtomicBool::new(false),
+                 data,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index a6696e058c..5015dbfbe2 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -610,6 +610,25 @@ pub(crate) fn prof() -> bool {
+     "G16: run the host phase timers of the aurora-g16/stats prof: line (default 0: only with debug_flags bit 49; 1: on; runtime 0644)"
+ );
+ 
++/// Storage of `g16_lat_qos_us` (runtime 0644, default 0).
++static LAT_QOS_US: AtomicU32 = AtomicU32::new(0);
++
++/// CPU wake-latency bound while commands are in flight, us (1..=1000), or 0 for none: below
++/// the cluster idle state's 75 us exit latency it keeps the CPUs out of that state, so the
++/// event interrupt and the retiring work do not first wait for a cluster to wake.
++pub(crate) fn lat_qos_us() -> u32 {
++    LAT_QOS_US.load(Ordering::Relaxed).min(1000)
++}
++
++live_u32_param!(
++    LAT_QOS_US_PARAM,
++    LAT_QOS_US_PARMTYPE,
++    LAT_QOS_US_PARM,
++    LAT_QOS_US,
++    "g16_lat_qos_us",
++    "G16: CPU wake-latency bound while commands are in flight, us (default 0: none; 1..1000; runtime 0644)"
++);
++
+ /// Storage of `g16_effort` (runtime 0644, default 0).
+ static EFFORT: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index c4e66599c1..2cf681c56c 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -87,20 +87,29 @@ pub(crate) fn run_poll(self: Arc<Self>) {
+                     firmware.engine.shared = Some(self.clone());
+                 }
+                 let evented = self.evented.swap(false, Ordering::AcqRel);
+-                match firmware.poll(evented, &mut done) {
+-                    Ok(true) => self.rearm(firmware.engine.chan_wait),
++                let result = firmware.poll(evented, &mut done);
++                let busy = !firmware.engine.flights.is_empty();
++                match result {
++                    Ok(true) => {
++                        self.lat_qos(busy, false);
++                        self.rearm(firmware.engine.chan_wait)
++                    }
+                     // Idle: one more pass after a window gives the state back. A failed
+                     // engine's poll no longer services power, so it has nothing to give back.
+                     Ok(false)
+                         if firmware.recovery.failed().is_none()
+                             && firmware.power.utilization.decaying() =>
+                     {
++                        // A pass follows after the window: the bound may stay until then.
++                        self.lat_qos(busy, false);
+                         self.mod_poll(kernel::time::msecs_to_jiffies(
+                             (super::power::policy::WINDOW_NS / 1_000_000) as u32,
+                         ))
+                     }
+-                    Ok(false) => {}
++                    // The last pass of this busy period: nothing comes back to drop it later.
++                    Ok(false) => self.lat_qos(false, true),
+                     Err(error) => {
++                        self.lat_qos(false, true);
+                         firmware.fail_stop(error, &mut done);
+                         self.fail_stop(error);
+                     }
+@@ -131,6 +140,7 @@ pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+                     self.fail_stop(error);
+                 }
+                 if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
++                    self.lat_qos(!firmware.engine.flights.is_empty(), false);
+                     self.rearm(firmware.engine.chan_wait);
+                 }
+             }
+@@ -142,6 +152,29 @@ pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+         accepted
+     }
+ 
++    /// Holds `g16_lat_qos_us` while commands are in flight and for a power window after the
++    /// last one (a pass always follows within it), so the bound does not flap per command;
++    /// `last` drops it at the final pass of a busy period. Under the state lock.
++    fn lat_qos(&self, busy: bool, last: bool) {
++        let want = params::lat_qos_us();
++        let held = self.lat_us.load(Ordering::Relaxed);
++        let now = now_ns();
++        if busy && want != 0 {
++            self.lat_busy_ns.store(now, Ordering::Relaxed);
++            if held != want && super::boot::glue::lat_qos(Some(want)).is_ok() {
++                self.lat_us.store(want, Ordering::Relaxed);
++            }
++        } else if held != 0
++            && (last
++                || want == 0
++                || now.saturating_sub(self.lat_busy_ns.load(Ordering::Relaxed))
++                    >= super::power::policy::WINDOW_NS)
++            && super::boot::glue::lat_qos(None).is_ok()
++        {
++            self.lat_us.store(0, Ordering::Relaxed);
++        }
++    }
++
+     /// Deliver userspace notification outside the device mutex and fence completion path.
+     fn notify_wedged(&self) {
+         if self.wedged.load(Ordering::Acquire) && !self.wedged_notified.swap(true, Ordering::AcqRel)
+-- 
+2.43.0
+

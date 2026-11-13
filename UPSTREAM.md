@@ -68,8 +68,8 @@ These aurora-silicon/linux changes are in our kernel series under their authors'
 ## Direction we follow (SOURCE: Omarchy M team decisions and chat, Sep–Nov 2026)
 
 - Integrate into the main omacom repositories wherever practical: omacom/omarchy, omacom/omarchy-pkgs, omacom/omarchy-mac-pkgs, omacom/linux-aurora, omacom/m1n1.
-- **The kernel work for M4, M5 and M6 is merged together with Linux 7.3.** Our kernel series now applies to aurora-silicon/linux `integration/aurora` 7.3.0 (local 1.878, installed 2026-11-13; rebased onto Aurora's tip `abd6d4a09ffe` in 1.870, on Aurora's newer tip `da8e1acf3656` since 1.877) for that merge, rather than being sent as a separate J604 tree.
-- **CPU power profiles come from stock Omarchy.** Since 1.877 the kernel registers the CLPC's platform profile; the stock `omarchy-power-profiles-daemon` 0.30-8 (omacom/omarchy-pkgs#2381) drives it, and the next kernel install takes it unchanged from the edge channel. Nothing is carried for it.
+- **The kernel work for M4, M5 and M6 is merged together with Linux 7.3.** Our kernel series now applies to aurora-silicon/linux `integration/aurora` 7.3.0 (local 1.879, installed 2026-11-13; rebased onto Aurora's tip `abd6d4a09ffe` in 1.870, on Aurora's newer tip `da8e1acf3656` since 1.877) for that merge, rather than being sent as a separate J604 tree.
+- **CPU power profiles come from stock Omarchy.** Since 1.877 the kernel registers the CLPC's platform profile; the stock `omarchy-power-profiles-daemon` 0.30-8 (omacom/omarchy-pkgs#2381) drives it, installed unchanged from the edge channel with kernel 1.879. Nothing is carried for it.
 - Results are reported through [omarchy-m-testing.org](https://omarchy-m-testing.org), one result per check. "Not tested" is the default; an implementation alone is not a pass.
 
 ## How we work

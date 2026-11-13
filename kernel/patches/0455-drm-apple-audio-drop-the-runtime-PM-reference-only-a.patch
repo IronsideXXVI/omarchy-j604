@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nekolyanich <me@nekolyanich.com>
+Date: Sun, 11 Oct 2026 18:01:42 +0300
+Subject: [PATCH] drm: apple: audio: drop the runtime PM reference only
+ after the DMA stopped
+
+Trigger STOP put the runtime PM reference right after starting the
+asynchronous DMA terminate. Without autosuspend that suspends the
+device at once and powers its domain (ps_dpa1/ps_dpa2) down while SIO
+may still run DMA towards the DPA. SIO then crashed with "Shim DMA
+unavailable" and the TERMINATE timed out after it, taking DP audio on
+all outputs down until a reboot. On an M2 Pro with two DP sinks an
+earlier version of this change on a downstream tree took it from 4 of
+4 boots to none in 11.
+
+Put the reference in sync_stop, after snd_dmaengine_pcm_sync_stop()
+waited for the terminate. ALSA calls sync_stop at the next hw_params,
+prepare or hw_free, at close, at system suspend and at disconnect, not
+right after the STOP, so after a drain, an xrun or a stop with the
+stream left open the DPA stays powered until then. Waiting inside
+trigger would also work (the PCM is nonatomic), but sync_stop is the
+hook ALSA has for it, as in the AOP audio driver.
+
+The stream remembers whether it holds the reference. sync_stop runs
+outside the stream lock: test and clear it under the lock. START takes
+the reference only once, since a START can follow a failed one before
+sync_stop ran. A stream that plays into the void without a sink holds
+none, as before.
+
+Fixes: f25cb501c5fc ("drm: apple: audio: Implement runtime PM support")
+Link: https://github.com/aurora-silicon/linux/pull/276
+Signed-off-by: nekolyanich <me@nekolyanich.com>
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/audio.c | 33 ++++++++++++++++++++++++++++-----
+ 1 file changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/audio.c b/drivers/gpu/drm/apple/audio.c
+index 9e185a358e..d4e1c10a6d 100644
+--- a/drivers/gpu/drm/apple/audio.c
++++ b/drivers/gpu/drm/apple/audio.c
+@@ -103,6 +103,8 @@ struct dcp_audio {
+ 	ktime_t void_start;
+ 	u64 void_periods;
+ 	struct delayed_work void_work;
++	/* The stream holds a runtime PM reference, put in sync_stop; stream lock */
++	bool pm_held;
+ 	void *elements;
+ 	void *productattrs;
+ 
+@@ -690,7 +692,11 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+ 		if (dcpaud->open_unplugged || !dcpaud_connection_up(dcpaud))
+ 			return dcpaud_void_start(substream);
+ 
+-		WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
++		/* A START can follow a failed one before sync_stop ran */
++		if (!dcpaud->pm_held) {
++			WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
++			dcpaud->pm_held = true;
++		}
+ 		ret = dcp_audiosrv_startlink(dcpaud->dcp_dev,
+ 					     &dcpaud->selected_cookie);
+ 		if (ret < 0)
+@@ -723,9 +729,8 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+ 
+ 	case SNDRV_PCM_TRIGGER_STOP:
+ 	case SNDRV_PCM_TRIGGER_SUSPEND:
++		/* The runtime PM reference goes in sync_stop */
+ 		ret = dcp_audiosrv_stoplink(dcpaud->dcp_dev);
+-		pm_runtime_mark_last_busy(dcpaud->dev);
+-		__pm_runtime_put_autosuspend(dcpaud->dev);
+ 		if (ret < 0)
+ 			return ret;
+ 		break;
+@@ -735,14 +740,32 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+ }
+ 
+ /*
+- * ALSA calls this once a stream has stopped, outside the stream lock, before
+- * the next hw_params, prepare or hw_free and at close.
++ * ALSA calls this once a stream has stopped (STOP, SUSPEND, or the STOP that
++ * undoes a failed START), outside the stream lock, before the next
++ * hw_params, prepare or hw_free, at close, at system suspend and at
++ * disconnect. The DMA terminate STOP started is asynchronous: putting the
++ * runtime PM reference in STOP powered the DPA's domain (ps_dpa*) down while
++ * SIO still ran DMA towards it, and SIO crashed ("Shim DMA unavailable", the
++ * TERMINATE timing out after it), taking DP audio down on every output until
++ * a reboot. Wait for the terminate first.
+  */
+ static int dcp_pcm_sync_stop(struct snd_pcm_substream *substream)
+ {
+ 	struct dcp_audio *dcpaud = substream->pcm->private_data;
++	bool held;
+ 
+ 	cancel_delayed_work_sync(&dcpaud->void_work);
++	snd_dmaengine_pcm_sync_stop(substream);
++
++	snd_pcm_stream_lock_irq(substream);
++	held = dcpaud->pm_held;
++	dcpaud->pm_held = false;
++	snd_pcm_stream_unlock_irq(substream);
++
++	if (held) {
++		pm_runtime_mark_last_busy(dcpaud->dev);
++		__pm_runtime_put_autosuspend(dcpaud->dev);
++	}
+ 
+ 	return 0;
+ }
+-- 
+2.43.0
+
