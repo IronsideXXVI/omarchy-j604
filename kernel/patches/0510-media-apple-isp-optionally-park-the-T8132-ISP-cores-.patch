@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 20:39:06 +0000
+Subject: [PATCH] media: apple: isp: optionally park the T8132 ISP
+ cores as macOS does
+
+macOS 26B123 on the J604, traced under a hypervisor, powers the ISP
+down by clearing bits 24-25 of coprocessor word 0xc00 and the four
+fabric words, quiescing the coprocessor, and then setting two words
+past the coprocessor window to 2 (0x2c7c008 and 0x2c80008 from its
+base, one per ISP CPU core by the look of it; they read back 6),
+before the power domains go off. The driver only quiesces.
+
+Add that sequence for T8132 behind the core_park module parameter,
+off by default: the camera stops and starts again without it, and
+whether parked cores also come back without the firmware data
+restore is not measured yet.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/isp/isp-drv.c  | 17 ++++++++
+ drivers/media/platform/apple/isp/isp-drv.h  |  7 ++++
+ drivers/media/platform/apple/isp/isp-fw.c   | 43 +++++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-regs.h | 10 +++++
+ 4 files changed, 77 insertions(+)
+
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index 22245b6671..7c2e04cced 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -784,6 +784,22 @@ static int apple_isp_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	if (isp->hw->core_park[0]) {
++		struct resource *co = platform_get_resource_byname(pdev,
++								 IORESOURCE_MEM, "coproc");
++
++		for (unsigned int i = 0; i < ARRAY_SIZE(isp->core_park); i++) {
++			if (!isp->hw->core_park[i])
++				continue;
++			isp->core_park[i] = devm_ioremap(dev,
++				co->start + isp->hw->core_park[i], sizeof(u32));
++			if (!isp->core_park[i]) {
++				err = -ENOMEM;
++				goto detach_genpd;
++			}
++		}
++	}
++
+ 	if (isp->hw->num_dapf) {
+ 		err = apple_isp_map_dapf(isp);
+ 		if (err)
+@@ -1242,6 +1258,7 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
+ 	.coproc_control = ISP_COPROC_CONTROL_T8140,
+ 	.coproc_status = ISP_COPROC_STATUS_T8140,
+ 	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
++	.core_park = { 0x2c7c008, 0x2c80008 },
+ 	.boot_mode = 1,
+ 	.shared_size = 0xdec00000,
+ 	.fw_restore = true,
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index ed3a45e59e..6931c43adf 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -211,6 +211,12 @@ struct apple_isp_hw {
+ 	 * quiesced; otherwise they stay busy and never run again.
+ 	 */
+ 	u32 coproc_quiesce;
++	/*
++	 * Offsets from the coprocessor window of the ISP CPU core power
++	 * words macOS sets before the power-down, 0 for none (T8132); used
++	 * with the core_park module parameter.
++	 */
++	u32 core_park[2];
+ 
+ 	/* windows mapped 1:1 for the firmware */
+ 	const struct isp_mmio_window *fw_mmio;
+@@ -414,6 +420,7 @@ struct apple_isp {
+ 	void __iomem *mbox2;
+ 	void __iomem *wdt;
+ 	void __iomem *dapf;
++	void __iomem *core_park[2];
+ 	struct device *dapf_dart;
+ 	struct hrtimer wdt_timer;
+ 	bool wdt_running;
+diff --git a/drivers/media/platform/apple/isp/isp-fw.c b/drivers/media/platform/apple/isp/isp-fw.c
+index a7dd424d6b..ebd125c03f 100644
+--- a/drivers/media/platform/apple/isp/isp-fw.c
++++ b/drivers/media/platform/apple/isp/isp-fw.c
+@@ -33,6 +33,16 @@
+ 
+ #define ISP_COPROC_IN_WFI      0x3
+ 
++/*
++ * Park the ISP CPU cores at power-down in macOS's order where that is
++ * known (T8132). The camera stops and starts again without it; off until
++ * measured.
++ */
++static bool core_park;
++module_param(core_park, bool, 0644);
++MODULE_PARM_DESC(core_park,
++		 "Park the ISP CPU cores before power-down as macOS does, e.g. T8132 (default: off)");
++
+ /* the waits for firmware that has been told to power down */
+ #define ISP_STOP_KEY_TRIES     20
+ #define ISP_STOP_KEY_MS	       10
+@@ -460,11 +470,37 @@ static int isp_coproc_entry(struct apple_isp *isp)
+ 		       0 : -EIO;
+ }
+ 
++/* before the quiesce: bits 24-25 of the park word, then the fabric words */
++static void isp_park_fabric(struct apple_isp *isp)
++{
++	u32 val = isp_coproc_read32(isp, ISP_COPROC_PARK_T8132);
++
++	isp_coproc_write32(isp, ISP_COPROC_PARK_T8132,
++			   val & ~ISP_COPROC_PARK_CLR_T8132);
++	isp_coproc_write32(isp, ISP_COPROC_FABRIC_0_T8140, 0x0);
++	isp_coproc_write32(isp, ISP_COPROC_FABRIC_1_T8140, 0x0);
++	isp_coproc_write32(isp, ISP_COPROC_FABRIC_2_T8140, 0x0);
++	isp_coproc_write32(isp, ISP_COPROC_FABRIC_3_T8140, 0x0);
++}
++
++/* after the quiesce, before the power domains: each core's power word */
++static void isp_park_cores(struct apple_isp *isp)
++{
++	for (unsigned int i = 0; i < ARRAY_SIZE(isp->core_park); i++) {
++		if (!isp->core_park[i])
++			continue;
++		writel(ISP_CORE_PARK_VAL_T8132, isp->core_park[i]);
++		dev_dbg(isp->dev, "core %u park word reads 0x%x\n", i,
++			readl(isp->core_park[i]));
++	}
++}
++
+ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
+ {
+ 	/* Only a coprocessor that was started has to settle and quiesce */
+ 	bool started = isp->hw->coproc_quiesce &&
+ 		       isp_coproc_read32(isp, isp_coproc_control(isp));
++	bool park;
+ 	u32 val;
+ 
+ 	/* A coprocessor that powered down waits in WFI */
+@@ -476,6 +512,10 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
+ 
+ 	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
+ 
++	park = started && core_park && isp->core_park[0];
++	if (park)
++		isp_park_fabric(isp);
++
+ 	if (started) {
+ 		/* The request bit alone asks for it, and reads back once done */
+ 		isp_coproc_write32(isp, isp->hw->coproc_quiesce, ISP_COPROC_QUIESCED);
+@@ -484,6 +524,9 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
+ 			dev_warn(isp->dev, "coproc did not quiesce (0x%x)\n", val);
+ 	}
+ 
++	if (park)
++		isp_park_cores(isp);
++
+ 	apple_isp_power_down_domains(isp);
+ }
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-regs.h b/drivers/media/platform/apple/isp/isp-regs.h
+index b7f9b2fb87..d0d59c1cdb 100644
+--- a/drivers/media/platform/apple/isp/isp-regs.h
++++ b/drivers/media/platform/apple/isp/isp-regs.h
+@@ -29,6 +29,16 @@
+ /* Requests the quiesce when set, and reads back once it has happened */
+ #define ISP_COPROC_QUIESCED	 BIT(25)
+ 
++/*
++ * T8132 power-down as macOS 26B123 runs it on the J604 (traced under a
++ * hypervisor): bits 24-25 of a coprocessor word cleared, the fabric words
++ * cleared, the quiesce, then two words past the coprocessor window, one
++ * per ISP CPU core by the look of it, set to 2 (they read back 6).
++ */
++#define ISP_COPROC_PARK_T8132	  0xc00
++#define ISP_COPROC_PARK_CLR_T8132 GENMASK(25, 24)
++#define ISP_CORE_PARK_VAL_T8132	  0x2
++
+ /*
+  * ISP17a (T8140) reset. The fourth fabric word is at 0xa50, off the 0x100
+  * stride of the other three, in the observed sequence.
+-- 
+2.43.0
+

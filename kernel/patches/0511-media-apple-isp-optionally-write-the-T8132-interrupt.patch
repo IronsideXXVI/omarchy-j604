@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 20:40:24 +0000
+Subject: [PATCH] media: apple: isp: optionally write the T8132
+ interrupt enables macOS writes
+
+macOS 26B123 on the J604, traced under a hypervisor, enables the ISP
+interrupts with ISP_MBOX_IRQ_ENABLE_T6031 = 0xf as the driver does,
+and also writes 0x70000000 to mbox +0x18, 0x2c00000 to mbox +0x38 and
+0x8 to mbox +0x95c, clearing them again when it stops the firmware.
+The first and last are T8140's values; +0x95c is past the "mbox"
+window, so it gets its own mapping.
+
+Add these for T8132 behind the macos_irq_enables module parameter,
+off by default: the camera streams on the one enable word, and what
+the others change is not measured yet.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/isp/isp-drv.c  | 13 ++++++++++++
+ drivers/media/platform/apple/isp/isp-drv.h  |  7 +++++++
+ drivers/media/platform/apple/isp/isp-fw.c   | 22 +++++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-regs.h |  8 ++++++++
+ 4 files changed, 50 insertions(+)
+
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index 7c2e04cced..febbda6b91 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -800,6 +800,18 @@ static int apple_isp_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	if (isp->hw->mbox_irq_route_t8132) {
++		struct resource *mb = platform_get_resource_byname(pdev,
++								 IORESOURCE_MEM, "mbox");
++
++		isp->mbox_route = devm_ioremap(dev,
++			mb->start + isp->hw->mbox_irq_route_t8132, sizeof(u32));
++		if (!isp->mbox_route) {
++			err = -ENOMEM;
++			goto detach_genpd;
++		}
++	}
++
+ 	if (isp->hw->num_dapf) {
+ 		err = apple_isp_map_dapf(isp);
+ 		if (err)
+@@ -1247,6 +1259,7 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
+ 	.dsid_clr_range0 = 0x2fc,
+ 
+ 	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
++	.mbox_irq_route_t8132 = ISP_MBOX_IRQ_ROUTE_T8132,
+ 
+ 	.scl1 = true,
+ 	.lpdp = false,
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 6931c43adf..54ab0b231e 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -201,6 +201,12 @@ struct apple_isp_hw {
+ 	/* further interrupt enable and routing words (ISP17a) */
+ 	bool mbox_irq_route;
+ 	bool mbox_extra_enables;
++	/*
++	 * offset from the "mbox" window of the routing word of the enables
++	 * macOS writes on T8132, 0 for none; used with the macos_irq_enables
++	 * module parameter
++	 */
++	u32 mbox_irq_route_t8132;
+ 	/* coprocessor control register, 0 for ISP_COPROC_CONTROL */
+ 	u32 coproc_control;
+ 	/* coprocessor status register, 0 for ISP_COPROC_STATUS */
+@@ -420,6 +426,7 @@ struct apple_isp {
+ 	void __iomem *mbox2;
+ 	void __iomem *wdt;
+ 	void __iomem *dapf;
++	void __iomem *mbox_route;
+ 	void __iomem *core_park[2];
+ 	struct device *dapf_dart;
+ 	struct hrtimer wdt_timer;
+diff --git a/drivers/media/platform/apple/isp/isp-fw.c b/drivers/media/platform/apple/isp/isp-fw.c
+index ebd125c03f..58a8b87b0d 100644
+--- a/drivers/media/platform/apple/isp/isp-fw.c
++++ b/drivers/media/platform/apple/isp/isp-fw.c
+@@ -33,6 +33,16 @@
+ 
+ #define ISP_COPROC_IN_WFI      0x3
+ 
++/*
++ * Write the further interrupt enables macOS writes where they are known
++ * (T8132). The camera streams on the one enable word; off until measured.
++ * Read when the firmware starts.
++ */
++static bool macos_irq_enables;
++module_param(macos_irq_enables, bool, 0444);
++MODULE_PARM_DESC(macos_irq_enables,
++		 "Write the further ISP interrupt enables macOS writes, e.g. T8132 (default: off)");
++
+ /*
+  * Park the ISP CPU cores at power-down in macOS's order where that is
+  * known (T8132). The camera stops and starts again without it; off until
+@@ -276,6 +286,11 @@ static void isp_disable_irq(struct apple_isp *isp)
+ 		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE2_T8140, 0x0);
+ 		isp_mbox_write32(isp, ISP_MBOX_IRQ_ROUTE_T8140, 0x0);
+ 	}
++	if (macos_irq_enables && isp->mbox_route) {
++		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE1_T8140, 0x0);
++		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE2_T8140, 0x0);
++		writel(0x0, isp->mbox_route);
++	}
+ 	free_irq(isp->irq, isp);
+ 	isp_gpio_write32(isp, ISP_GPIO_1, 0xfeedbabe); /* real funny */
+ 	fsleep(10);
+@@ -304,6 +319,13 @@ static int isp_enable_irq(struct apple_isp *isp)
+ 			isp_mbox_write32(isp, ISP_MBOX_IRQ_ROUTE_T8140,
+ 					 ISP_MBOX_IRQ_ROUTE_T8140_VAL);
+ 	}
++	if (macos_irq_enables && isp->mbox_route) {
++		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE1_T8140,
++				 ISP_MBOX_IRQ_ENABLE1_T8140_VAL);
++		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE2_T8140,
++				 ISP_MBOX_IRQ_ENABLE2_T8132_VAL);
++		writel(ISP_MBOX_IRQ_ROUTE_T8140_VAL, isp->mbox_route);
++	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/media/platform/apple/isp/isp-regs.h b/drivers/media/platform/apple/isp/isp-regs.h
+index d0d59c1cdb..26c74a7010 100644
+--- a/drivers/media/platform/apple/isp/isp-regs.h
++++ b/drivers/media/platform/apple/isp/isp-regs.h
+@@ -87,6 +87,14 @@
+ #define ISP_MBOX_IRQ_ENABLE2_T8140_VAL 0x700000
+ #define ISP_MBOX_IRQ_ROUTE_T8140_VAL   0x8
+ 
++/*
++ * T8132: the enables macOS 26B123 writes on the J604 next to
++ * ISP_MBOX_IRQ_ENABLE_T6031 (traced under a hypervisor). The first is
++ * T8140's value; the routing word sits at 0x95c, past the "mbox" window.
++ */
++#define ISP_MBOX_IRQ_ENABLE2_T8132_VAL 0x2c00000
++#define ISP_MBOX_IRQ_ROUTE_T8132       0x95c
++
+ /* capture watchdog ("wdt") */
+ #define ISP_WDT_KICK	   0x00
+ #define ISP_WDT_RELOAD	   0x08
+-- 
+2.43.0
+

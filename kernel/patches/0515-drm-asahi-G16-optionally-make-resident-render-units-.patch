@@ -1,0 +1,538 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 20:43:17 +0000
+Subject: [PATCH] drm/asahi: G16: optionally make resident render units
+ compact
+
+g16_resident keeps at most four render commands resident, one render
+unit each. A unit's size is fixed by the qualified firmware images: the
+UMA manager describes a 32 MiB pool (8192 x 4 KiB), the PB manager a
+256 MiB heap (8192 x 32 KiB pages, 2048 blocks), and a pass slot has a
+16 MiB TPC and an 8 MiB tilemap. All of it is backed in full: about
+315 MiB per unit per VM. The extra units must sit in the one free GiB of
+the client aperture (0x7080000000..0x70c0000000), at 512 MiB each.
+macOS 26B123 keeps about 20 render commands resident (35 at most) at
+depth 64, J604-MEASURED as a hypervisor guest with its own AGX firmware,
+not the 25G83 firmware this driver runs.
+
+Add g16_resident_compact (default 0: unchanged). Set at module load
+with g16_resident, it makes resident units 2.. compact: one 64 MiB
+window each, so g16_resident may reach 18 (16 compact units). A compact
+unit keeps the qualified pass objects and the qualified 32 MiB UMA pool
+and image, and has:
+- a 1 MiB TPC and a 1 MiB tilemap. A single-layer 3024x1964 render needs
+  48 KiB / 32 KiB with 32-pixel utiles, 192 KiB / 120 KiB with 16. Larger
+  geometry still goes to units 0/1, since pick_pass checks the capacity.
+- a 16 MiB PB heap of 128 blocks (MIN_BLOCKS is 64). Its PB managers and
+  InitBM are seeded with that count: pb_manager_image() and
+  PbEpoch::prepare() now take the page and block counts, and the
+  qualified units pass MAX_PAGES/MAX_BLOCKS, so their bytes are the same.
+A compact unit is about 51 MiB per VM; g16_resident=18 adds about
+820 MiB per render VM.
+
+Unprobed on 25G83: PB managers with fewer than 2048 blocks, render UMA
+slots 35..50, PB slot and parameter ids 2..17. M4 has no PB growth
+protocol in this driver (answer_growth() refuses a growth request), so
+a command that outgrows a 16 MiB heap shows up as "pb: ... bad" and a
+recovery. That is why it is off by default.
+
+The lifetime ledger holds 18 owners (a host test publishes 18 and
+retires them in order). The "resident:" stats line also reports compact.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/engine.rs         |  2 +-
+ drivers/gpu/drm/asahi/g16/fw/buffer.rs      | 14 ++--
+ drivers/gpu/drm/asahi/g16/hw.rs             | 40 +++++++++--
+ drivers/gpu/drm/asahi/g16/params.rs         | 41 +++++++++--
+ drivers/gpu/drm/asahi/g16/poll.rs           |  3 +-
+ drivers/gpu/drm/asahi/g16/pools.rs          | 77 +++++++++++++++------
+ drivers/gpu/drm/asahi/g16/pools/lifetime.rs | 11 ++-
+ drivers/gpu/drm/asahi/g16/resources.rs      |  5 +-
+ drivers/gpu/drm/asahi/g16/slots.rs          | 39 ++++++++---
+ 9 files changed, 180 insertions(+), 52 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 1e5ceb9d13..881582f8a0 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1116,7 +1116,7 @@ fn render_refs(
+             }
+             None => {
+                 let epoch = job.resources.pb(job.progress.sent() as usize)?;
+-                epoch.prepare(k, arena.pools.heap_gva(k)?)?;
++                epoch.prepare(k, arena.pools.heap_gva(k)?, arena.pools.heap_blocks(k)?)?;
+                 epoch.clone()
+             }
+         };
+diff --git a/drivers/gpu/drm/asahi/g16/fw/buffer.rs b/drivers/gpu/drm/asahi/g16/fw/buffer.rs
+index 813e52d886..8c340e93ec 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/buffer.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/buffer.rs
+@@ -91,6 +91,8 @@ pub(crate) fn pb_manager_image(
+     blocks_fw: u64,
+     ring_fw: u64,
+     count_fw: u64,
++    pages: u32,
++    blocks: u32,
+ ) -> [u8; pb_manager::SIZE] {
+     let mut m = [0; pb_manager::SIZE];
+     put32(&mut m, 0xc, id);
+@@ -98,16 +100,16 @@ pub(crate) fn pb_manager_image(
+     put64(&mut m, 0x20, pages_fw);
+     put64(&mut m, 0x28, pages_gpu);
+     put32(&mut m, 0x30, PAGE_LIST_SIZE as u32);
+-    put32(&mut m, 0x34, MAX_PAGES);
++    put32(&mut m, 0x34, pages);
+     put32(&mut m, 0x38, BLOCK_LIST_RECORDS);
+-    put32(&mut m, 0x3c, MAX_BLOCKS);
++    put32(&mut m, 0x3c, blocks);
+     put64(&mut m, 0x44, blocks_fw);
+     put64(&mut m, 0x4c, ring_fw);
+-    put32(&mut m, 0x54, MAX_PAGES - 1);
++    put32(&mut m, 0x54, pages - 1);
+     put32(&mut m, 0x58, BLOCK_BYTES as u32);
+     put64(&mut m, 0x64, count_fw);
+-    put32(&mut m, 0x7c, MAX_PAGES);
+-    put32(&mut m, 0x80, MAX_PAGES);
++    put32(&mut m, 0x7c, pages);
++    put32(&mut m, 0x80, pages);
+     m
+ }
+ 
+@@ -156,6 +158,8 @@ fn exact_m4_pb_fields() {
+             0xfffffc2000500000,
+             0xfffffc2000600000,
+             0xfffffc2000700000,
++            MAX_PAGES,
++            MAX_BLOCKS,
+         );
+         assert_eq!(m.len(), 0xc0);
+         assert_eq!((r32(&m, 0xc), r32(&m, 0x10)), (1, 1));
+diff --git a/drivers/gpu/drm/asahi/g16/hw.rs b/drivers/gpu/drm/asahi/g16/hw.rs
+index 4ff61352ce..e9d3ecb178 100644
+--- a/drivers/gpu/drm/asahi/g16/hw.rs
++++ b/drivers/gpu/drm/asahi/g16/hw.rs
+@@ -246,6 +246,34 @@ pub(crate) const fn render_base(k: u64) -> u64 {
+     pub(crate) const fn resident_window(k: u64) -> u64 {
+         RESIDENT_BASE + (k - 2) * RESIDENT_WINDOW
+     }
++    /// Compact resident units (k >= 2, `g16_resident_compact`): one 64 MiB window each in the
++    /// same interval. Pass objects at the qualified offsets from the base (they end at
++    /// +1.5 MiB), a 1 MiB TPC at +2 MiB, a 1 MiB tilemap at +4 MiB (a single-layer
++    /// 3024x1964 render needs 48 KiB / 32 KiB with 32-pixel utiles, 192 KiB / 120 KiB with
++    /// 16), the allocator (the qualified 32 MiB pool and its lists) at +8 MiB, a 16 MiB PB
++    /// heap (128 blocks) at +44 MiB.
++    pub(crate) const COMPACT_UNIT_WINDOW: u64 = 0x4000000;
++    pub(crate) const COMPACT_TPC_OFF: u64 = 0x200000;
++    pub(crate) const COMPACT_TPC_SIZE: u64 = 0x100000;
++    pub(crate) const COMPACT_TILEMAP_OFF: u64 = 0x400000;
++    pub(crate) const COMPACT_TILEMAP_SIZE: u64 = 0x100000;
++    pub(crate) const COMPACT_ALLOC_OFF: u64 = 0x800000;
++    pub(crate) const COMPACT_PB_HEAP_OFF: u64 = 0x2c00000;
++    pub(crate) const COMPACT_PB_HEAP_SIZE: u64 = 0x1000000;
++    pub(crate) const fn compact_window(k: u64) -> u64 {
++        RESIDENT_BASE + (k - 2) * COMPACT_UNIT_WINDOW
++    }
++    // Both resident layouts end below the qualified PB heaps; compact parts do not overlap
++    // (the allocator spans 0x2074000: pool, state, list, descriptor, PB pages, scene list).
++    const _: () = assert!(
++        resident_window(super::sizes::FULL_RESIDENT_UNITS as u64 - 1) + RESIDENT_WINDOW <= PB_HEAP
++            && compact_window(super::sizes::RENDER_UNITS as u64 - 1) + COMPACT_UNIT_WINDOW <= PB_HEAP
++            && AUX + 0x20000 - FS_WORK_PAGE <= COMPACT_TPC_OFF
++            && COMPACT_TPC_OFF + COMPACT_TPC_SIZE <= COMPACT_TILEMAP_OFF
++            && COMPACT_TILEMAP_OFF + COMPACT_TILEMAP_SIZE <= COMPACT_ALLOC_OFF
++            && COMPACT_ALLOC_OFF + 0x2074000 <= COMPACT_PB_HEAP_OFF
++            && COMPACT_PB_HEAP_OFF + COMPACT_PB_HEAP_SIZE <= COMPACT_UNIT_WINDOW
++    );
+     /// The shift of pass slot `k`'s objects from slot 0's: `k` 256 MiB strides for the two
+     /// qualified slots, the unit's resident window for k >= 2.
+     // pass_shift() moves every pass object by one shift: the qualified strides agree.
+@@ -336,12 +364,16 @@ pub(crate) mod sizes {
+     /// (see `Firmware::ahead_ok()`). Compute stays bounded by [`COMPUTE_SLOTS`].
+     pub(crate) const FLIGHTS: usize = RENDER_UNITS;
+     /// Render pass units (pass slot, UMA/heap allocator, PB slot) a VM may hold: the two
+-    /// qualified units, plus two resident units allocated only when `g16_resident` >= 3 is
++    /// qualified units, plus resident units allocated only when `g16_resident` >= 3 is
+     /// latched (one render command in flight per unit; each binds its own split UMA slot,
+     /// render 33 + k of the 32 per class of the 25G83 layout). Bounded by the free client
+-    /// aperture: an extra unit takes a 512 MiB window (its 256 MiB PB heap and 32 MiB pool
+-    /// are backed in full) and only [`client::RESIDENT_BASE`].. 0x70c0000000 is free.
+-    pub(crate) const RENDER_UNITS: usize = 4;
++    /// aperture, [`client::RESIDENT_BASE`]..0x70c0000000 (1 GiB): a full-size resident unit
++    /// takes a 512 MiB window (its 256 MiB PB heap and 32 MiB pool are backed in full), so
++    /// [`FULL_RESIDENT_UNITS`] in all; a compact one (`g16_resident_compact`) takes 64 MiB
++    /// (1 MiB TPC, 1 MiB tilemap, the same 32 MiB pool, a 16 MiB PB heap), so 2 + 16.
++    pub(crate) const RENDER_UNITS: usize = 18;
++    /// Units with full-size resident units only (`g16_resident_compact` = 0).
++    pub(crate) const FULL_RESIDENT_UNITS: usize = 4;
+     /// Inherited diagnostic histogram width; M4 does not fold jobs into a compute horizon.
+     pub(crate) const HORIZON_JOBS: u32 = 1;
+     /// Two jobs may be admitted per logical queue so exact prior-command dependencies can
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index d64c45412d..63339f9b80 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -931,20 +931,47 @@ pub(crate) fn flights() -> usize {
+ /// (module option in the initramfs). Latched once; later changes of `g16_resident` only
+ /// lower the depth ([`resident`]).
+ pub(crate) fn resident_units() -> usize {
++    (resident_latch() & 0xff) as usize
++}
++
++/// Whether the latched resident units (k >= 2) are compact ones (`g16_resident_compact`).
++pub(crate) fn resident_compact() -> bool {
++    resident_latch() & 0x100 != 0
++}
++
++/// The latch word: units | compact << 8, set once from `g16_resident` and
++/// `g16_resident_compact` (full-size units: at most [`hw::sizes::FULL_RESIDENT_UNITS`];
++/// compact: at most [`hw::sizes::RENDER_UNITS`]).
++fn resident_latch() -> u32 {
+     let l = RESIDENT_LATCH.load(Ordering::Acquire);
+     if l != 0 {
+-        return l as usize;
++        return l;
+     }
+     let v = RESIDENT.load(Ordering::Relaxed);
+-    let units = if v >= 3 {
+-        v.min(hw::sizes::RENDER_UNITS as u32)
++    let compact = RESIDENT_COMPACT.load(Ordering::Relaxed) != 0;
++    let max = if compact {
++        hw::sizes::RENDER_UNITS
+     } else {
+-        2
++        hw::sizes::FULL_RESIDENT_UNITS
+     };
+-    let _ = RESIDENT_LATCH.compare_exchange(0, units, Ordering::AcqRel, Ordering::Acquire);
+-    RESIDENT_LATCH.load(Ordering::Acquire) as usize
++    let units = if v >= 3 { v.min(max as u32) } else { 2 };
++    let word = units | u32::from(compact && units > 2) << 8;
++    let _ = RESIDENT_LATCH.compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire);
++    RESIDENT_LATCH.load(Ordering::Acquire)
+ }
+ 
++/// Storage of `g16_resident_compact` (0644, default 0; read with `g16_resident` at the latch).
++static RESIDENT_COMPACT: AtomicU32 = AtomicU32::new(0);
++
++live_u32_param!(
++    RESIDENT_COMPACT_PARAM,
++    RESIDENT_COMPACT_PARMTYPE,
++    RESIDENT_COMPACT_PARM,
++    RESIDENT_COMPACT,
++    "g16_resident_compact",
++    "G16: resident render units 2.. are compact (1 MiB TPC/tilemap, 16 MiB PB heap of 128 blocks; about 51 MiB each) so g16_resident may reach 18; set at module load with g16_resident (default 0: full-size units, at most 4; latched)"
++);
++
+ /// Resident render depth: how many render commands may sit in the firmware's TA/FS rings at
+ /// once, each in its own render pass unit, retired in order as their receipts complete (one
+ /// ring-service event may retire several). 0 (`g16_resident` < 2, or `g16_overlap` /
+@@ -973,7 +1000,7 @@ pub(crate) fn resident_credits() -> u32 {
+     RESIDENT_PARM,
+     RESIDENT,
+     "g16_resident",
+-    "G16: render commands that may be resident in the firmware rings at once, each in its own render unit (default 0: off; 2..4; >= 3 must be set at module load to allocate the extra units; needs g16_overlap=1 and g16_uma_split=1; runtime 0644)"
++    "G16: render commands that may be resident in the firmware rings at once, each in its own render unit (default 0: off; 2..4, 2..18 with g16_resident_compact=1; >= 3 must be set at module load to allocate the extra units; needs g16_overlap=1 and g16_uma_split=1; runtime 0644)"
+ );
+ 
+ /// Storage of `g16_submit_ahead` (runtime 0644, default 0).
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index f2f23504e3..bd10084c27 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1304,9 +1304,10 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         )?;
+         writeln!(
+             f,
+-            "resident: depth {} units {} max {} deep {}",
++            "resident: depth {} units {} compact {} max {} deep {}",
+             super::params::resident(),
+             super::params::resident_units(),
++            u8::from(super::params::resident_compact()),
+             s.resident_max,
+             s.resident_deep
+         )?;
+diff --git a/drivers/gpu/drm/asahi/g16/pools.rs b/drivers/gpu/drm/asahi/g16/pools.rs
+index 698460f735..fd87682e5e 100644
+--- a/drivers/gpu/drm/asahi/g16/pools.rs
++++ b/drivers/gpu/drm/asahi/g16/pools.rs
+@@ -59,6 +59,8 @@ struct Allocator {
+     id: u32,
+     /// The firmware UMA slot this allocator's descriptor binds (lifetime::uma_slot).
+     uma_slot: u32,
++    /// PB heap blocks: buffer::MAX_BLOCKS, or 128 for a compact resident unit.
++    blocks: u32,
+ }
+ 
+ #[derive(Default)]
+@@ -130,8 +132,24 @@ fn write_records<const N: usize>(
+     Ok(())
+ }
+ impl Allocator {
+-    fn new(o: &mut Objects, k: u64) -> Result<Self> {
+-        let base = client::render_base(k);
++    fn new(o: &mut Objects, k: u64, compact: bool) -> Result<Self> {
++        // A compact resident unit (g16_resident_compact, k >= 2) keeps the qualified pool and
++        // lists at +8 MiB of its window and a 16 MiB PB heap at +44 MiB.
++        let compact = compact && k >= 2;
++        let base = if compact {
++            client::compact_window(k) + client::COMPACT_ALLOC_OFF
++        } else {
++            client::render_base(k)
++        };
++        let at = |qualified: u64, offset: u64| if compact { base + offset } else { qualified };
++        let (heap_va, heap_size) = if compact {
++            (
++                client::compact_window(k) + client::COMPACT_PB_HEAP_OFF,
++                client::COMPACT_PB_HEAP_SIZE,
++            )
++        } else {
++            (client::pb_heap(k), client::PB_HEAP_SIZE)
++        };
+         let nc = |va| Some((va, pte::LEAF_NC));
+         // Native UMA software metadata is ASC-owned and never needs a client GPU alias.
+         // In particular its firmware pointers, +0x54 completion and +0x5c exclusion flag
+@@ -141,26 +159,32 @@ fn new(o: &mut Objects, k: u64) -> Result<Self> {
+             o,
+             0x4000,
+             Class::Shared,
+-            nc(client::render_descriptor(k)),
++            nc(at(client::render_descriptor(k), 0x2030000)),
+             false,
+         )?;
+         let pool = alloc(
+             o,
+             0x2000000,
+             Class::Shared,
+-            nc(client::render_pool(k)),
++            nc(at(client::render_pool(k), 0)),
+             false,
+         )?;
+-        let state = alloc(o, 0x20000, Class::Shared, nc(client::render_state(k)), true)?;
+-        let list = alloc(o, 0x4000, Class::Shared, nc(client::render_list(k)), true)?;
+-        let submitted = alloc(o, 0x40, Class::Fw, None, true)?;
+-        let heap = alloc(
++        let state = alloc(
+             o,
+-            client::PB_HEAP_SIZE as usize,
++            0x20000,
+             Class::Shared,
+-            nc(client::pb_heap(k)),
+-            false,
++            nc(at(client::render_state(k), 0x2000000)),
++            true,
+         )?;
++        let list = alloc(
++            o,
++            0x4000,
++            Class::Shared,
++            nc(at(client::render_list(k), 0x2020000)),
++            true,
++        )?;
++        let submitted = alloc(o, 0x40, Class::Fw, None, true)?;
++        let heap = alloc(o, heap_size as usize, Class::Shared, nc(heap_va), false)?;
+         let scene_list = alloc(
+             o,
+             buffer::SCENE_LIST_SIZE,
+@@ -192,6 +216,7 @@ fn new(o: &mut Objects, k: u64) -> Result<Self> {
+             published: AtomicBool::new(false),
+             id: k as u32,
+             uma_slot,
++            blocks: (heap_size / buffer::BLOCK_BYTES) as u32,
+         })
+     }
+     fn refs(&self) -> Result<AllocatorRefs> {
+@@ -207,7 +232,7 @@ fn refs(&self) -> Result<AllocatorRefs> {
+             pb_mgr: 0,
+             scene_list: gva(&self.scene_list)?,
+             mgr_misc: 0,
+-            init_blocks: buffer::MAX_BLOCKS,
++            init_blocks: self.blocks,
+             parameter_id: self.id,
+             submitted_fw: self.submitted.va,
+             counter_completed_fw: self.descriptor.va + 0x54,
+@@ -222,11 +247,11 @@ fn retired(&self) -> Result<bool> {
+     }
+ }
+ impl PoolSet {
+-    pub(crate) fn new(o: &mut Objects, count: usize) -> Result<Self> {
++    pub(crate) fn new(o: &mut Objects, count: usize, compact: bool) -> Result<Self> {
+         let count = count.clamp(2, super::hw::sizes::RENDER_UNITS);
+         let mut units = KVec::with_capacity(count, GFP_KERNEL)?;
+         for k in 0..count as u64 {
+-            units.push(Allocator::new(o, k)?, GFP_KERNEL)?;
++            units.push(Allocator::new(o, k, compact)?, GFP_KERNEL)?;
+         }
+         Ok(Self { units })
+     }
+@@ -263,6 +288,10 @@ pub(crate) fn retired(&self, k: usize) -> Result<bool> {
+     pub(crate) fn heap_gva(&self, k: usize) -> Result<u64> {
+         gva(&self.units.get(k).ok_or(EINVAL)?.heap)
+     }
++    /// Blocks of unit `k`'s PB heap (the count its PB managers and InitBM are seeded with).
++    pub(crate) fn heap_blocks(&self, k: usize) -> Result<u32> {
++        Ok(self.units.get(k).ok_or(EINVAL)?.blocks)
++    }
+ }
+ 
+ /// Device-wide physical PB-slot leases. Replacement requires a complete normal receipt.
+@@ -382,18 +411,24 @@ pub(crate) fn new(
+ 
+     /// Seed only unpublished storage. A retry may choose another physical slot; after
+     /// exposure neither the manager nor any of its firmware-mutated lists is reset.
+-    pub(crate) fn prepare(&self, k: usize, heap: u64) -> Result {
+-        if k >= super::hw::sizes::RENDER_UNITS || self.exposed.load(Ordering::Acquire) {
++    /// `blocks` is the heap's block count: buffer::MAX_BLOCKS (the qualified manager), or
++    /// fewer (a compact resident unit; at least buffer::MIN_BLOCKS).
++    pub(crate) fn prepare(&self, k: usize, heap: u64, blocks: u32) -> Result {
++        if k >= super::hw::sizes::RENDER_UNITS
++            || !(buffer::MIN_BLOCKS..=buffer::MAX_BLOCKS).contains(&blocks)
++            || self.exposed.load(Ordering::Acquire)
++        {
+             return Err(EINVAL);
+         }
+-        write_records(&self.pages, buffer::MAX_PAGES as usize, |i| {
++        let pages = blocks * buffer::PAGES_PER_BLOCK;
++        write_records(&self.pages, pages as usize, |i| {
+             buffer::page_record(heap, i as u32).to_le_bytes()
+         })?;
+-        write_records(&self.blocks, buffer::MAX_BLOCKS as usize, |i| {
++        write_records(&self.blocks, blocks as usize, |i| {
+             u64::from(buffer::block_record(heap, i as u32)).to_le_bytes()
+         })?;
+-        self.ring.w32(0, buffer::MAX_BLOCKS)?;
+-        self.ring.w32(4, buffer::MAX_BLOCKS)?;
++        self.ring.w32(0, blocks)?;
++        self.ring.w32(4, blocks)?;
+         self.counter.w64(0, 1)?;
+         self.manager.write(
+             0,
+@@ -404,6 +439,8 @@ pub(crate) fn prepare(&self, k: usize, heap: u64) -> Result {
+                 self.blocks.va,
+                 self.ring.va,
+                 self.counter.va,
++                pages,
++                blocks,
+             ),
+         )?;
+         self.assigned.store(k as u32, Ordering::Release);
+diff --git a/drivers/gpu/drm/asahi/g16/pools/lifetime.rs b/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
+index 6020391736..23c3c001f3 100644
+--- a/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
++++ b/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
+@@ -93,7 +93,7 @@ pub(crate) struct Counts {
+ 
+ /// Owners a ledger can hold: the two qualified ones plus the resident render units
+ /// (`g16_resident`; hw::sizes::RENDER_UNITS).
+-pub(crate) const MAX_UNITS: usize = 4;
++pub(crate) const MAX_UNITS: usize = 18;
+ 
+ #[derive(Clone)]
+ pub(crate) struct Lifetime {
+@@ -283,6 +283,15 @@ fn resident_four_owners_retire_oldest_first() {
+         let c = l.counts();
+         assert_eq!((c.retired, c.reusable), (4, 4));
+         assert!((33..=64).contains(&uma_slot(33, 3)));
++        let mut deep = Lifetime::with_units(18);
++        assert_eq!((deep.units(), Lifetime::with_units(40).units()), (18, 18));
++        for k in 0..18 {
++            assert!(deep.claim(k) && deep.publish(k));
++        }
++        assert!(!deep.retire(17));
++        for k in 0..18 {
++            assert!(deep.retire(k)); // In publication order.
++        }
+         let two = Lifetime::new();
+         assert_eq!(two.units(), 2);
+         assert!(!two.available(2));
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index fcce4ee0e5..43895ed0cd 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -85,11 +85,12 @@ fn new(
+         let mut objects = factory.objects(vm);
+         // Two pass units, or the latched resident units (g16_resident >= 3 at load).
+         let units = super::params::resident_units();
++        let compact = super::params::resident_compact();
+         let mut passes = KVec::with_capacity(units, GFP_KERNEL)?;
+         for k in 0..units {
+-            passes.push(PassSlot::new(&mut objects, k as u64, 1)?, GFP_KERNEL)?;
++            passes.push(PassSlot::new(&mut objects, k as u64, 1, compact)?, GFP_KERNEL)?;
+         }
+-        let pools = PoolSet::new(&mut objects, units)?;
++        let pools = PoolSet::new(&mut objects, units, compact)?;
+         objects.finish_private()?;
+         Ok(Arc::new(
+             Self(crate::cleanup::Deferred::new(RenderInner {
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index 1dfdbbd7f8..b0bb87b581 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -141,19 +141,36 @@ pub(crate) struct PassSlot {
+ 
+ impl PassSlot {
+     /// Allocates pass slot `i`'s objects, with their client leaf classes.
+-    pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32) -> Result<Self> {
++    pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32, compact: bool) -> Result<Self> {
+         let sh = Class::Shared;
+-        // Qualified slots 0/1 at i strides; resident slots (i >= 2) in their own window.
+-        let (ps, ws) = (client::pass_shift(i), client::pass_shift(i));
+-        let tpc = if i != 0 {
+-            client::TPC_SLOT_SIZE
++        // Qualified slots 0/1 at i strides; resident slots (i >= 2) in their own window, a
++        // compact one (g16_resident_compact) with a 1 MiB TPC and a 1 MiB tilemap.
++        let compact = compact && i >= 2;
++        let shift = if compact {
++            client::compact_window(i) - client::FS_WORK_PAGE
+         } else {
+-            client::TPC_SIZE
++            client::pass_shift(i)
+         };
+-        let tilemap = if i != 0 {
+-            client::TILEMAP_SLOT_SIZE
++        let (ps, ws) = (shift, shift);
++        let (tpc_va, tpc) = if compact {
++            (
++                client::compact_window(i) + client::COMPACT_TPC_OFF,
++                client::COMPACT_TPC_SIZE,
++            )
++        } else if i != 0 {
++            (client::TPC + ps, client::TPC_SLOT_SIZE)
+         } else {
+-            client::TILEMAP_SIZE
++            (client::TPC + ps, client::TPC_SIZE)
++        };
++        let (tilemap_va, tilemap) = if compact {
++            (
++                client::compact_window(i) + client::COMPACT_TILEMAP_OFF,
++                client::COMPACT_TILEMAP_SIZE,
++            )
++        } else if i != 0 {
++            (client::TILEMAP + ps, client::TILEMAP_SLOT_SIZE)
++        } else {
++            (client::TILEMAP + ps, client::TILEMAP_SIZE)
+         };
+         let _ = pre_records;
+ 
+@@ -182,7 +199,7 @@ pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32) -> Result<Self> {
+             o,
+             tpc as usize,
+             sh,
+-            Client::nc(client::TPC + ps),
++            Client::nc(tpc_va),
+             0,
+             false,
+         )?;
+@@ -190,7 +207,7 @@ pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32) -> Result<Self> {
+             o,
+             tilemap as usize,
+             sh,
+-            Client::nc(client::TILEMAP + ps),
++            Client::nc(tilemap_va),
+             0,
+             false,
+         )?;
+-- 
+2.43.0
+

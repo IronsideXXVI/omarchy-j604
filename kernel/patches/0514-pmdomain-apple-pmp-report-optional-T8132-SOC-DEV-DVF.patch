@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 21:48:39 +0000
+Subject: [PATCH] pmdomain: apple: pmp-report: optional T8132
+ SOC-DEV-DVFS hold for a trial
+
+On the J604 nothing asks the PMP for AVD performance: during a 4K
+HEVC10 decode the report's request word stays 0 and the avd_sys domain
+stays at performance state 0, while the decoder takes 6.76 ms per frame
+in hardware and reaches 73% of macOS's rate on the same clip.
+
+Give T8132 its update aperture and SOC-DEV-DVFS range (entries 408-431
+at +0x10000; the request write side is entry 392 of the same aperture),
+and add two read-only parameters that hold one entry at a fixed main
+level once the PMP runs, for example the AVD's entry 418 (0x1a2 in the
+ADT). The word is kept in the DVFS shadow, so the wake after a system
+sleep writes it again.
+
+Both parameters default to 0, which writes nothing, and the J604 device
+tree has no apple,dvfs entry, so the default behaviour is unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/pmdomain/apple/pmp-report.c | 45 +++++++++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+
+diff --git a/drivers/pmdomain/apple/pmp-report.c b/drivers/pmdomain/apple/pmp-report.c
+index 5558f2c122..95246ad2a5 100644
+--- a/drivers/pmdomain/apple/pmp-report.c
++++ b/drivers/pmdomain/apple/pmp-report.c
+@@ -182,6 +182,8 @@ static const struct attribute_group apple_pmp_dram_group = {
+ 
+ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030;
+ static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x;
++static const struct apple_pmp_report_offsets apple_pmp_offsets_t8132;
++static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry, u64 val);
+ 
+ /* T6001 AGX request (see the engine below set_state): AGX is soc-device record 9 on the T6001. */
+ #define APPLE_PMP_T6001_AGX_ID 9
+@@ -448,6 +450,40 @@ static void apple_pmp_report_release(void *data)
+ 	debugfs_remove(rep->debugfs);
+ }
+ 
++/*
++ * T8132 trial (default off): hold one SOC-DEV-DVFS entry at a fixed main level
++ * once the PMP runs, e.g. entry 418 (0x1a2, the AVD's entry in the ADT) to
++ * test whether the decoder's per-frame time follows its performance level.
++ * The word is kept in the DVFS shadow, so a system sleep's wake writes it
++ * again. Nothing on the J604 asks for AVD performance otherwise.
++ */
++static unsigned int t8132_dvfs_entry;
++module_param(t8132_dvfs_entry, uint, 0444);
++MODULE_PARM_DESC(t8132_dvfs_entry,
++		 "T8132 trial: SOC-DEV-DVFS entry (408-431) to hold at t8132_dvfs_level once the PMP runs, e.g. 418 for the AVD; 0 = off (default)");
++static unsigned int t8132_dvfs_level;
++module_param(t8132_dvfs_level, uint, 0444);
++MODULE_PARM_DESC(t8132_dvfs_level, "T8132 trial: main level for t8132_dvfs_entry (default 0)");
++
++static void apple_pmp_report_t8132_dvfs_trial(struct apple_pmp_report *rep)
++{
++	const struct apple_pmp_report_offsets *offs = rep->offsets;
++	u64 word;
++
++	if (offs != &apple_pmp_offsets_t8132 || !t8132_dvfs_entry)
++		return;
++	if (!rep->dvfs_shadow || t8132_dvfs_entry < offs->dvfs_first ||
++	    t8132_dvfs_entry >= offs->dvfs_first + offs->dvfs_count ||
++	    !apple_pmp_dvfs_word(t8132_dvfs_level, NULL, 0, &word)) {
++		dev_warn(rep->dev, "t8132 DVFS trial: entry %u level %u refused\n",
++			 t8132_dvfs_entry, t8132_dvfs_level);
++		return;
++	}
++	apple_pmp_report_dvfs_write(rep, t8132_dvfs_entry, word);
++	dev_info(rep->dev, "t8132 DVFS trial: entry %u (%#x) held at %#llx\n",
++		 t8132_dvfs_entry, t8132_dvfs_entry, word);
++}
++
+ /*
+  * Wait for the PMP to run, then hand it every request made so far, as macOS
+  * does for each PMP-notified device that is already powered on.
+@@ -484,6 +520,7 @@ static void apple_pmp_report_ready_work(struct work_struct *work)
+ 			 want, val);
+ 	dev_info(rep->dev, "PMP running (status %#llx), requests %#llx\n",
+ 		 readq(rep->base + offs->status), want);
++	apple_pmp_report_t8132_dvfs_trial(rep);
+ }
+ 
+ /* A report names its PMP where a SoC has more than one kind of link to it. */
+@@ -2380,6 +2417,10 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
+ 	if (rep->defer)
+ 		queue_delayed_work(system_freezable_power_efficient_wq,
+ 				   &rep->ready_work, 0);
++	else if (t8132_dvfs_entry && apple_pmp_report_running(rep))
++		apple_pmp_report_t8132_dvfs_trial(rep);
++	else if (t8132_dvfs_entry && rep->offsets == &apple_pmp_offsets_t8132)
++		dev_warn(dev, "t8132 DVFS trial: PMP not running at probe, not applied\n");
+ 
+ 	return 0;
+ }
+@@ -2500,6 +2541,10 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8132 = {
+ 	.tgt_write = 0x10c40,
+ 	.actual = 0x1900,
+ 	.status = 0x10,
++	/* tgt_write is entry 392 of this aperture; SOC-DEV-DVFS is 408..431. */
++	.update = 0x10000,
++	.dvfs_first = 408,
++	.dvfs_count = 24,
+ 	.show_requests = true,
+ 	/* No qualified fast-die effort on this generation. */
+ };
+-- 
+2.43.0
+

@@ -1,0 +1,375 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 21:53:06 +0000
+Subject: [PATCH] soc: apple: sleep: t8132: probe stub and a second
+ stub config copy
+
+Measured on 1.885: the stub never acts on its t8132_stubcfg flags,
+while commit-time stores to kmalloc, stack and memremap memory reach
+DRAM (aura's check passes on them). Only the commit-time store to the
+kernel-image word looks missing. Add two measurements, both off or
+inert by default:
+
+- t8132_probe_entry (default N) resumes through t8132_probe_stub,
+  which reads nothing set at suspend to decide what to do. It builds
+  a code: bit 0 = its own adr equals the link PA patched into its
+  movz/movk at probe, bit 1 = a link-time canary ("STATIC01") at
+  t8132_stubcfg+32, bit 2 = the commit-time magic. It arms WD2 for
+  20 + 15 * code seconds and parks. t8132_stubcfg moves to .data so
+  the canary shares the magic's 64-byte block.
+
+- The DRAM-check pattern page now carries a copy of the stub config
+  when the magic is set, and the config is armed before that check.
+  The normal stub reads the image copy first, else scans the check
+  ranges named by the mailbox (its PA kept in .mmuoff.data, written
+  at probe) for the magic. The first WD2 window says which route was
+  taken: 58 s image copy, 57 s pattern-page copy, 60/62 none.
+
+Bit 9 of the stub flags, t8132_stub_wake_first (default off), does
+the cluster-on and power-gate wake writes first in the stub.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 193 +++++++++++++++++++++++++++++++++-----
+ 1 file changed, 172 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 7443777eb3..d2f3b805a2 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -61,7 +61,9 @@
+ #include <linux/sched/task_stack.h>
+ #include <asm/sections.h>
+ #include <asm/smp_plat.h>
++#include <asm/insn.h>
+ #include <asm/mmu_context.h>
++#include <asm/text-patching.h>
+ #include <asm/suspend.h>
+ #include <linux/platform_device.h>
+ #include <linux/seq_file.h>
+@@ -3328,6 +3330,9 @@ MODULE_PARM_DESC(t8132_elchk2, "T8132 deep sleep: the resume stub also checks th
+  *       a byte of a page outside the image (allocated at probe, PA logged), 97.5 s; then
+  *       elchk as before (75 s once it passed). The first window that never comes names
+  *       the first read that did not return.
++ * bit 9 t8132_stub_wake_first: the bit 5 writes (CLUSTER_E on and polled, CLUSTER_P on, both
++ *       pwrgate wake words) as the stub's first action, before the vectors and the 60 s WD2
++ *       write: macOS raises the clusters first on every J604 wake (hv trace).
+  * bit 8 t8132_stub_harden: first, before the vectors go in: DAIF all masked again, the VM
+  *       timer FIQ enable (s3_5_c15_c1_3) cleared, tlbi alle2, ic iallu, dsb sy, isb: what
+  *       SPTM's warm entry does before its MMU-on on the J604 (macOS 26B123, TB).
+@@ -3346,14 +3351,24 @@ struct t8132_stubcfg {
+ 	u32 rsvd;
+ 	u64 sctlr;		/* INIT_SCTLR_EL2_MMU_OFF */
+ 	u64 ladder_pa;		/* the ladder's page outside the image, 0 = skip that read */
++	u64 canary;		/* link time, never written: T8132_STUBCFG_CANARY */
+ };
+ 
+ static_assert(offsetof(struct t8132_stubcfg, flags) == 4);
+ static_assert(offsetof(struct t8132_stubcfg, pet_secs) == 8);
+ static_assert(offsetof(struct t8132_stubcfg, sctlr) == 16);
+ static_assert(offsetof(struct t8132_stubcfg, ladder_pa) == 24);
++static_assert(offsetof(struct t8132_stubcfg, canary) == 32);
+ 
+-struct t8132_stubcfg t8132_stubcfg __aligned(64);
++#define T8132_STUBCFG_CANARY	0x5354415449433031ULL	/* "STATIC01" */
++/* In .data, with a link-time canary next to the commit-time magic (the probe reads both). */
++struct t8132_stubcfg t8132_stubcfg __aligned(64) = { .canary = T8132_STUBCFG_CANARY };
++/*
++ * The mailbox PA, written once at probe into .mmuoff.data like ctxr_stay_el2 (boot-written
++ * words there read correctly at a wake). The stub follows it to the DRAM-check ranges and
++ * takes the config copy from the pattern page, whose arrival aura's check proves.
++ */
++u64 t8132_mbox_pa __section(".mmuoff.data.read");
+ 
+ static bool t8132_stub_mask_daif;
+ module_param(t8132_stub_mask_daif, bool, 0644);
+@@ -3367,6 +3382,14 @@ static bool t8132_stub_sctlr;
+ module_param(t8132_stub_sctlr, bool, 0644);
+ static bool t8132_stub_early_wake;
+ module_param(t8132_stub_early_wake, bool, 0644);
++static bool t8132_stub_wake_first;
++module_param(t8132_stub_wake_first, bool, 0644);
++MODULE_PARM_DESC(t8132_stub_wake_first, "T8132 deep sleep: the resume stub raises both clusters and the pwrgate wake words first (default off)");
++static bool t8132_probe_entry;
++module_param(t8132_probe_entry, bool, 0644);
++MODULE_PARM_DESC(t8132_probe_entry, "T8132 deep sleep, measurement only: resume through the flag-free probe stub, which encodes PC/canary/magic in its WD2 window and parks (default off)");
++void t8132_probe_stub(void);
++void t8132_probe_pa(void);
+ static bool t8132_stub_harden;
+ module_param(t8132_stub_harden, bool, 0644);
+ MODULE_PARM_DESC(t8132_stub_harden, "T8132 deep sleep: the resume stub first masks DAIF, clears the VM timer FIQ enable and invalidates the TLB and I-cache (default off)");
+@@ -3394,16 +3417,41 @@ asm(
+ "\tmrs\tx19, sctlr_el2\n"
+ "\tmrs\tx20, CurrentEL\n"
+ "\tmrs\tx21, cntpct_el0\n"
++/*
++ * The config: t8132_stubcfg (x24 = 1), else the copy at the start of the DRAM-check pattern
++ * page (x24 = 2), found by scanning the mailbox's check ranges for the magic. x23 = the base.
++ */
+ "\tadrp\tx10, t8132_stubcfg\n"
+ "\tadd\tx10, x10, :lo12:t8132_stubcfg\n"
+ "\tldr\tw11, [x10]\n"
+ "\tmovz\tw13, #0x4353\n"
+ "\tmovk\tw13, #0x4746, lsl #16\n"
+ "\tmov\tw22, #0\n"
++"\tmov\tx24, #1\n"
+ "\tcmp\tw11, w13\n"
+-"\tb.ne\t61f\n"
+-"\tldr\tw22, [x10, #4]\n"
+-"61:\ttbz\tw22, #0, 62f\n"
++"\tb.eq\t93f\n"
++"\tmov\tx24, #0\n"
++"\tadrp\tx12, t8132_mbox_pa\n"
++"\tldr\tx12, [x12, :lo12:t8132_mbox_pa]\n"
++"\tcbz\tx12, 94f\n"
++"\tldr\tw14, [x12, #0x28]\n"
++"\tmov\tw15, #0\n"
++"90:\tcmp\tw15, w14\n"
++"\tb.hs\t94f\n"
++"\tcmp\tw15, #4\n"
++"\tb.hs\t94f\n"
++"\tadd\tx16, x12, x15, lsl #4\n"
++"\tldr\tx10, [x16, #0x30]\n"
++"\tcbz\tx10, 91f\n"
++"\tldr\tw11, [x10]\n"
++"\tcmp\tw11, w13\n"
++"\tb.eq\t92f\n"
++"91:\tadd\tw15, w15, #1\n"
++"\tb\t90b\n"
++"92:\tmov\tx24, #2\n"
++"93:\tldr\tw22, [x10, #4]\n"
++"94:\tmov\tx23, x10\n"
++"\ttbz\tw22, #0, 62f\n"
+ "\tmsr\tdaifset, #0xf\n"
+ "62:\n"
+ /* Bit 8: as SPTM's warm entry, all masked, the VM timer FIQ off, TLB and I-cache clean. */
+@@ -3415,6 +3463,33 @@ asm(
+ "\tdsb\tsy\n"
+ "\tisb\n"
+ "72:\n"
++/* Bit 9: macOS's first wake writes, first: CLUSTER_E on (READY polled up to 5 ms), CLUSTER_P on, pwrgate wake words. */
++"\ttbz\tw22, #9, 73f\n"
++"\tmovz\tx12, #0x8078, lsl #16\n"
++"\tmovk\tx12, #0x3, lsl #32\n"
++"\tmov\tw13, #0xf\n"
++"\tstr\tw13, [x12]\n"
++"\tmrs\tx14, cntfrq_el0\n"
++"\tmov\tx15, #200\n"
++"\tudiv\tx14, x14, x15\n"
++"\tisb\n"
++"\tmrs\tx15, cntpct_el0\n"
++"\tadd\tx14, x14, x15\n"
++"74:\tldr\tw15, [x12]\n"
++"\ttbnz\tw15, #5, 75f\n"
++"\tisb\n"
++"\tmrs\tx15, cntpct_el0\n"
++"\tcmp\tx15, x14\n"
++"\tb.lo\t74b\n"
++"75:\tstr\tw13, [x12, #4]\n"
++"\tmovz\tx12, #0x8072, lsl #16\n"
++"\tmovk\tx12, #0x4000\n"
++"\tmovk\tx12, #0x3, lsl #32\n"
++"\tmovz\tw13, #0x8000, lsl #16\n"
++"\tstr\tw13, [x12]\n"
++"\tstr\tw13, [x12, #0x60]\n"
++"\tdsb\tsy\n"
++"73:\n"
+ "\tadrp\tx9, t8132_resume_vectors\n"
+ "\tadd\tx9, x9, :lo12:t8132_resume_vectors\n"
+ "\tmsr\tvbar_el2, x9\n"
+@@ -3437,6 +3512,14 @@ asm(
+ "	cmp	w11, #0\n"
+ "	csel	w10, w10, w12, ne\n"
+ #endif
++/* A config found: 58 s by the image copy, 57 s by the pattern-page copy (60/62 = none). */
++"	cbz	x24, 95f\n"
++"	add	w12, w24, #1\n"
++"	movz	w14, #0x3600\n"
++"	movk	w14, #0x16e, lsl #16\n"
++"	mul	w12, w12, w14\n"
++"	sub	w10, w10, w12\n"
++"95:\n"
+ "	str	w10, [x9, #0x28]\n"
+ "	mov	w10, #1\n"
+ "	str	w10, [x9, #0x2c]\n"
+@@ -3502,8 +3585,7 @@ asm(
+ "\tmovz\tw10, #0x7500\n"
+ "\tmovk\tw10, #0x7d2b, lsl #16\n"
+ "\tbl\tt8132_stub_wd2\n"
+-"\tadrp\tx10, t8132_stubcfg\n"
+-"\tadd\tx10, x10, :lo12:t8132_stubcfg\n"
++"\tmov\tx10, x23\n"
+ "\tldr\tx1, [x10, #24]\n"
+ "\tcbz\tx1, 78f\n"
+ "\tldrb\tw3, [x1]\n"
+@@ -3606,8 +3688,7 @@ asm(
+ "	str	w10, [x9, #0x2c]\n"
+ /* The pet loop (bit 3): WD2 for 30 s (0x2aea5400 ticks) every second for pet_secs. */
+ "\ttbz\tw22, #3, 66f\n"
+-"\tadrp\tx10, t8132_stubcfg\n"
+-"\tadd\tx10, x10, :lo12:t8132_stubcfg\n"
++"\tmov\tx10, x23\n"
+ "\tldr\tw11, [x10, #8]\n"
+ "\tcbz\tw11, 66f\n"
+ "\tmrs\tx14, cntfrq_el0\n"
+@@ -3661,8 +3742,7 @@ asm(
+ "69:\n"
+ /* SCTLR_EL2 (bit 4), last before the jump. */
+ "\ttbz\tw22, #4, 68f\n"
+-"\tadrp\tx10, t8132_stubcfg\n"
+-"\tadd\tx10, x10, :lo12:t8132_stubcfg\n"
++"\tmov\tx10, x23\n"
+ "\tldr\tx11, [x10, #16]\n"
+ "\tmsr\tsctlr_el2, x11\n"
+ "\tisb\n"
+@@ -3887,6 +3967,51 @@ asm(
+ "\tstr\tw10, [x9, #0x2c]\n"
+ "\tb\tcpu_resume\n"
+ "\t.size\tt8132_team_stub, . - t8132_team_stub\n"
++/*
++ * t8132_probe_entry: a flag-free probe (TB). Reads nothing written at suspend time to decide;
++ * code bit 0 = its own adr equals the link PA patched into the movz/movk at boot, bit 1 = the
++ * link-time canary at t8132_stubcfg+32, bit 2 = the commit-time magic. WD2 = 20 + 15 * code s,
++ * then park.
++ */
++"\t.type\tt8132_probe_stub, %function\n"
++"t8132_probe_stub:\n"
++"\tmsr\tdaifset, #0xf\n"
++"\tmovz\tx9, #0x882b, lsl #16\n"
++"\tmovk\tx9, #0x3, lsl #32\n"
++"\tadr\tx1, t8132_probe_stub\n"
++"t8132_probe_pa:\n"
++"\tmovz\tx2, #0\n"
++"\tmovk\tx2, #0, lsl #16\n"
++"\tmovk\tx2, #0, lsl #32\n"
++"\tmovk\tx2, #0, lsl #48\n"
++"\tcmp\tx1, x2\n"
++"\tcset\tw5, eq\n"
++"\tadrp\tx10, t8132_stubcfg\n"
++"\tadd\tx10, x10, :lo12:t8132_stubcfg\n"
++"\tldr\tx3, [x10, #32]\n"
++"\tmovz\tx4, #0x3031\n"
++"\tmovk\tx4, #0x4943, lsl #16\n"
++"\tmovk\tx4, #0x5441, lsl #32\n"
++"\tmovk\tx4, #0x5354, lsl #48\n"
++"\tcmp\tx3, x4\n"
++"\tb.ne\t96f\n"
++"\torr\tw5, w5, #2\n"
++"96:\tldr\tw4, [x10]\n"
++"\tmovz\tw6, #0x4353\n"
++"\tmovk\tw6, #0x4746, lsl #16\n"
++"\tcmp\tw4, w6\n"
++"\tb.ne\t97f\n"
++"\torr\tw5, w5, #4\n"
++"97:\tmov\tw4, #15\n"
++"\tmul\tw5, w5, w4\n"
++"\tadd\tw5, w5, #20\n"
++"\tmovz\tw4, #0x3600\n"
++"\tmovk\tw4, #0x16e, lsl #16\n"
++"\tmul\tw10, w5, w4\n"
++"\tbl\tt8132_stub_wd2\n"
++"98:\twfe\n"
++"\tb\t98b\n"
++"\t.size\tt8132_probe_stub, . - t8132_probe_stub\n"
+ "t8132_resume_end:\n"
+ "\t.popsection\n"
+ );
+@@ -4403,6 +4528,9 @@ static void t8132_arm_dram_check(struct apple_sleep *s)
+ 		x ^= x << 17;
+ 		word[i] = x;
+ 	}
++	/* A second copy of the stub config, where the check proves it arrives. */
++	if (READ_ONCE(t8132_stubcfg.magic))
++		memcpy(word, &t8132_stubcfg, sizeof(t8132_stubcfg));
+ 	sleep_check_add(c, va, word, SZ_4K);
+ 	sleep_check_add(c, va, sleep_save_stash, mpidr_hash_size() * sizeof(*sleep_save_stash));
+ 
+@@ -4584,6 +4712,8 @@ static void t8132_arm_stubcfg(void)
+ 		f |= BIT(7);
+ 	if (READ_ONCE(t8132_stub_harden))
+ 		f |= BIT(8);
++	if (READ_ONCE(t8132_stub_wake_first))
++		f |= BIT(9);
+ 	if (READ_ONCE(t8132_stub_ladder))
+ 		f |= BIT(6);
+ 	c->flags = f;
+@@ -5185,22 +5315,15 @@ static int t8132_sleep_commit(unsigned long unused)
+ 	t8132_team_armed = READ_ONCE(t8132_team_entry);
+ 	if (t8132_team_armed)
+ 		t8132_team_marks(true);
+-	WRITE_ONCE(s->mbox->resume_pa, t8132_team_armed ? __pa_symbol(t8132_team_stub) :
+-							 __pa_symbol(t8132_resume_stub));
++	WRITE_ONCE(s->mbox->resume_pa, READ_ONCE(t8132_probe_entry) ? __pa_symbol(t8132_probe_stub) :
++						t8132_team_armed ? __pa_symbol(t8132_team_stub) :
++						__pa_symbol(t8132_resume_stub));
+ 	dcache_clean_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
+ 	/* init_kernel_el's marks (59 58 56 s), on this way back only. */
+ 	WRITE_ONCE(arm64_resume_armed, 1);
+ 	dcache_clean_poc((unsigned long)&arm64_resume_armed,
+ 			 (unsigned long)(&arm64_resume_armed + 1));
+-	if (READ_ONCE(t8132_dram_check)) {
+-		t8132_arm_dram_check(s);
+-	} else if (s->mbox_check) {
+-		/* One armed for an earlier, aborted sleep must not survive into this wake. */
+-		WRITE_ONCE(s->mbox_check->magic, 0);
+-		dcache_clean_poc((unsigned long)s->mbox,
+-				 (unsigned long)s->mbox + AURA_S2R_CHECKED_SIZE);
+-		s->check_ranges = 0;
+-	}
++	/* The stub config first: the DRAM check copies it into its pattern page. */
+ 	if (t8132_team_armed) {
+ 		t8132_disarm_el_check();
+ 		t8132_disarm_el_check2();
+@@ -5210,6 +5333,15 @@ static int t8132_sleep_commit(unsigned long unused)
+ 		t8132_arm_el_check2();
+ 		t8132_arm_stubcfg();
+ 	}
++	if (READ_ONCE(t8132_dram_check)) {
++		t8132_arm_dram_check(s);
++	} else if (s->mbox_check) {
++		/* One armed for an earlier, aborted sleep must not survive into this wake. */
++		WRITE_ONCE(s->mbox_check->magic, 0);
++		dcache_clean_poc((unsigned long)s->mbox,
++				 (unsigned long)s->mbox + AURA_S2R_CHECKED_SIZE);
++		s->check_ranges = 0;
++	}
+ 	/* What this path has dirtied since the sweep. */
+ 	dcache_clean_poc((unsigned long)task_stack_page(current),
+ 			 (unsigned long)task_stack_page(current) + THREAD_SIZE);
+@@ -5959,6 +6091,8 @@ static int apple_sleep_map_mailbox(struct apple_sleep *s)
+ 	else
+ 		size = sizeof(*s->mbox);
+ 	s->mbox = devm_memremap(s->dev, pa, size, MEMREMAP_WB);
++	t8132_mbox_pa = s->mbox ? pa : 0;
++	dcache_clean_poc((unsigned long)&t8132_mbox_pa, (unsigned long)(&t8132_mbox_pa + 1));
+ 	if (IS_ERR(s->mbox))
+ 		return PTR_ERR(s->mbox);
+ 
+@@ -6195,6 +6329,23 @@ static void t8132_catch_init(struct platform_device *pdev, struct apple_sleep *s
+ 			 &(phys_addr_t){ page_to_phys(t8132_ladder_page) },
+ 			 ALIGN((unsigned long)t8132_resume_end, SZ_4K) - (unsigned long)t8132_resume_vectors);
+ 	}
++	/* The probe compares its own adr with this, patched into the instruction stream now. */
++	{
++		u64 pa = __pa_symbol(t8132_probe_stub);
++		u32 *at = (u32 *)t8132_probe_pa;
++		int k;
++
++		for (k = 0; k < 4; k++) {
++			u32 insn = aarch64_insn_gen_movewide(AARCH64_INSN_REG_2, (pa >> (16 * k)) & 0xffff,
++							      16 * k, AARCH64_INSN_VARIANT_64BIT,
++							      k ? AARCH64_INSN_MOVEWIDE_KEEP :
++								  AARCH64_INSN_MOVEWIDE_ZERO);
++
++			if (insn == AARCH64_BREAK_FAULT || aarch64_insn_patch_text_nosync(at + k, insn))
++				dev_warn(s->dev, "probe stub: link PA not patched\n");
++		}
++		dcache_clean_poc((unsigned long)at, (unsigned long)(at + 4));
++	}
+ 	arm64_resume_vbar = __pa_symbol(t8132_resume_vectors);
+ 	arm64_resume_vbar_va = (unsigned long)t8132_resume_vectors;
+ 	/* Marks inside the resume assembly: 125 57 54 65 48 85 95 45 42 s, see WDT_SUSPEND_SECS. */
+-- 
+2.43.0
+

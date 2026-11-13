@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 21:24:36 +0000
+Subject: [PATCH] drm: apple: backlight: make the fade length and step
+ period parameters
+
+A brightness change fades over 250 ms with one brightness-only present
+per 16 ms at most. macOS 26B123 on the J604 ramps the same change over
+about 2 s, one swap per 120 Hz frame (233 swaps in 1.98 s per step, hv
+trace). Make both values appledrm parameters, bl_fade_ms (1-10000) and
+bl_fade_step_ms (1-1000), so a longer, frame-paced fade can be compared
+on the panel.
+
+The defaults are the values used so far, so the fade is unchanged unless
+a parameter is set. Finishing a fade (before system sleep) no longer
+depends on the length.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp_backlight.c | 42 ++++++++++++++++++++-------
+ 1 file changed, 31 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp_backlight.c b/drivers/gpu/drm/apple/dcp_backlight.c
+index 47cbfb6384..d1070cf876 100644
+--- a/drivers/gpu/drm/apple/dcp_backlight.c
++++ b/drivers/gpu/drm/apple/dcp_backlight.c
+@@ -87,12 +87,30 @@ static u32 brightness_part2[] = {
+ 
+ 
+ /*
+- * A new level fades in over DCP_BL_FADE_MS, one brightness-only present per
++ * A new level fades in over bl_fade_ms, one brightness-only present per
+  * step at most.  Steps that come faster than presents complete merge, so the
+  * step only bounds how smooth the fade can be.
++ *
++ * Both are parameters so a longer, frame-paced fade can be compared on the
++ * panel: macOS 26B123 on the J604 ramps a brightness change over about 2 s
++ * with one swap per 120 Hz frame.  The defaults are the fade as before.
+  */
+-#define DCP_BL_FADE_MS		250U
+-#define DCP_BL_FADE_STEP_MS	16U
++static unsigned int bl_fade_ms = 250;
++module_param(bl_fade_ms, uint, 0644);
++MODULE_PARM_DESC(bl_fade_ms, "Backlight fade length in ms, 1-10000 (default 250)");
++static unsigned int bl_fade_step_ms = 16;
++module_param(bl_fade_step_ms, uint, 0644);
++MODULE_PARM_DESC(bl_fade_step_ms, "Backlight fade step period in ms, 1-1000 (default 16)");
++
++static u32 dcp_bl_fade_ms(void)
++{
++	return clamp_t(u32, READ_ONCE(bl_fade_ms), 1, 10000);
++}
++
++static u32 dcp_bl_fade_step_ms(void)
++{
++	return clamp_t(u32, READ_ONCE(bl_fade_step_ms), 1, 1000);
++}
+ 
+ static bool dcp_backlight_presents_nits(struct apple_dcp *dcp)
+ {
+@@ -351,7 +369,7 @@ static void dcp_backlight_fade_work(struct work_struct *work)
+ 	spin_lock_irqsave(&dcp->backlight.lock, flags);
+ 	elapsed = jiffies_to_msecs(jiffies - dcp->backlight.fade_start);
+ 	running = dcp_bl_fade_step(&dcp->backlight.state, elapsed,
+-				   DCP_BL_FADE_MS);
++				   dcp_bl_fade_ms());
+ 	/* A rejected present is retried with backoff, carrying the new level. */
+ 	kick = dcp->backlight.state.dirty && !dcp->backlight.state.retries;
+ 	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+@@ -360,7 +378,7 @@ static void dcp_backlight_fade_work(struct work_struct *work)
+ 		dcp_backlight_kick(dcp);
+ 	if (running)
+ 		queue_delayed_work(system_dfl_wq, &dcp->backlight.fade_work,
+-				   msecs_to_jiffies(DCP_BL_FADE_STEP_MS));
++				   msecs_to_jiffies(dcp_bl_fade_step_ms()));
+ }
+ 
+ static void dcp_backlight_retry_work(struct work_struct *work)
+@@ -411,7 +429,7 @@ void dcp_backlight_finish_fade(struct apple_dcp *dcp)
+ 
+ 	cancel_delayed_work_sync(&dcp->backlight.fade_work);
+ 	spin_lock_irqsave(&dcp->backlight.lock, flags);
+-	dcp_bl_fade_step(&dcp->backlight.state, DCP_BL_FADE_MS, DCP_BL_FADE_MS);
++	dcp_bl_fade_step(&dcp->backlight.state, 1, 1);
+ 	kick = dcp->backlight.state.dirty;
+ 	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+ 	if (kick)
+@@ -739,16 +757,18 @@ static void dcp_dac_fade_work(struct work_struct *work)
+ 	if (b->fading) {
+ 		u32 level;
+ 
++		u32 fade_ms = dcp_bl_fade_ms();
++
+ 		elapsed = jiffies_to_msecs(jiffies - b->fade_start);
+-		if (elapsed >= DCP_BL_FADE_MS) {
++		if (elapsed >= fade_ms) {
+ 			level = b->fade_to;
+ 			b->fading = false;
+ 		} else if (b->fade_to >= b->fade_from) {
+ 			level = b->fade_from +
+-				mult_frac(b->fade_to - b->fade_from, elapsed, DCP_BL_FADE_MS);
++				mult_frac(b->fade_to - b->fade_from, elapsed, fade_ms);
+ 		} else {
+ 			level = b->fade_from -
+-				mult_frac(b->fade_from - b->fade_to, elapsed, DCP_BL_FADE_MS);
++				mult_frac(b->fade_from - b->fade_to, elapsed, fade_ms);
+ 		}
+ 		if (level != b->level) {
+ 			b->level = level;
+@@ -761,7 +781,7 @@ static void dcp_dac_fade_work(struct work_struct *work)
+ 	drm_modeset_unlock(&dcp->crtc->base.mutex);
+ 	if (again)
+ 		queue_delayed_work(system_freezable_wq, &b->fade_work,
+-				   msecs_to_jiffies(DCP_BL_FADE_STEP_MS));
++				   msecs_to_jiffies(dcp_bl_fade_step_ms()));
+ }
+ 
+ /* A lit panel with a mode fades to a new lit level; anything else jumps. */
+@@ -801,7 +821,7 @@ static int dcp_set_brightness(struct backlight_device *bd)
+ 		spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+ 		if (fade)
+ 			queue_delayed_work(system_dfl_wq, &dcp->backlight.fade_work,
+-					   msecs_to_jiffies(DCP_BL_FADE_STEP_MS));
++					   msecs_to_jiffies(dcp_bl_fade_step_ms()));
+ 		else if (!ret)
+ 			dcp_backlight_kick(dcp);
+ 		return ret;
+-- 
+2.43.0
+

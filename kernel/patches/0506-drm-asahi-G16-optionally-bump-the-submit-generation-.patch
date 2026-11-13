@@ -1,0 +1,360 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 19:35:42 +0000
+Subject: [PATCH] drm/asahi: G16: optionally bump the submit generation
+ cells before a doorbell
+
+On the J604, macOS 26B123 (with its own GPU firmware) was traced as a
+guest under aura's hypervisor, recording every access to the GPU's
+register window and mailbox. Before each submit doorbell the host
+reads the firmware's mirror at SGX +0xd64000 + 2 * cell, reads an
+8-bit generation cell on the host-owned page SGX +0xd60000 and writes
+it back plus one, then rings. The cells, J604-measured in that trace:
+pipe 0 bumps +0x20 then +0x00, pipe 1 +0x20, pipe 2 +0x40, pipe 8
++0x30 then +0x10, pipe 9 +0x30, pipe 0xa +0x50. This driver bumps none
+of them; it uses cell +0x00 only for the device-control generation.
+
+g16_subgen = 1 bumps the cells listed in g16_subgen_cells, in order,
+right before that pipe's doorbell. The list is "pipe:cell[+cell],..."
+for our pipes 0 (TA), 1 (FS) and 2 (compute), e.g. "2:0x40,1:0x20".
+Cells must be 4-aligned and below 0x2000, and cell 0 is refused
+because it is the device-control generation of the protocol this
+driver speaks. A failed access is counted and the doorbell still goes
+out. aurora-g16/stats gains a subgen line: bumps and how many found
+the firmware's mirror caught up, per pipe.
+
+The trace came from macOS's firmware, not the one this driver loads,
+so the map is a candidate to test, not a qualified protocol.
+g16_subgen defaults to 0 and the list to none, which keeps the
+doorbell path unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |  32 +++++
+ drivers/gpu/drm/asahi/g16/params.rs | 186 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  12 ++
+ drivers/gpu/drm/asahi/g16/regs.rs   |  16 +++
+ 4 files changed, 246 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 39cc776e16..b0bcac4c3c 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -342,6 +342,11 @@ pub(crate) struct Stats {
+     pub(crate) chain_serial_n: [u64; 2],
+     pub(crate) chain_serial_ns: [u64; 2],
+     pub(crate) chain_ahead_hist: [[u64; 32]; 2],
++    /// `g16_subgen`, per submit pipe (TA, FS, compute): cells bumped, bumps that found the
++    /// firmware's mirror equal to the cell (caught up), and failed accesses.
++    pub(crate) subgen_bumps: [u64; 3],
++    pub(crate) subgen_caught: [u64; 3],
++    pub(crate) subgen_err: u64,
+     /// The last prefix that failed that check: publication, first stage start, last stage end
+     /// and retirement, raw 24 MHz ticks (to find the stamps' time base).
+     pub(crate) lat_last_bad: [u64; 4],
+@@ -637,6 +642,30 @@ pub(crate) fn complete(done: &mut Completions, job: &Arc<Job>, result: Result) {
+ const KICKFW_DOORBELL: u64 = 0x10;
+ 
+ impl Firmware {
++    /// `g16_subgen`: bumps the generation cells listed for submit pipe `pipe`, in order, right
++    /// before its doorbell. A failed access is counted, never fatal: the doorbell still goes out.
++    fn subgen_bump(&mut self, pipe: usize) {
++        for cell in super::params::subgen_cells(pipe) {
++            if cell == 0 {
++                continue;
++            }
++            let s = &mut self.engine.stats;
++            match self.session.regs.bump_generation_cell(cell) {
++                Ok((before, mirror)) => {
++                    if let Some(n) = s.subgen_bumps.get_mut(pipe) {
++                        *n += 1;
++                    }
++                    if mirror == before {
++                        if let Some(n) = s.subgen_caught.get_mut(pipe) {
++                            *n += 1;
++                        }
++                    }
++                }
++                Err(_) => s.subgen_err += 1,
++            }
++        }
++    }
++
+     /// Sends the firmware kick, EP 0x21 `0x83 << 48 | 0x10` (`g16_kickfw`).
+     fn kick_firmware(&mut self) -> Result {
+         self.session.send(
+@@ -1332,6 +1361,9 @@ fn publish_prefix_into(
+                 } else {
+                     self.channels.post(channel, &record)?;
+                 }
++                if super::params::subgen() {
++                    self.subgen_bump(channel as usize);
++                }
+                 self.session.ring(channel)?;
+             }
+             if super::params::kickfw() == 2 {
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 40e9f5b0f7..f3d9e22e8a 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -594,6 +594,192 @@ pub(crate) fn depth() -> u32 {
+     "G16: render commands of one queue that may stay in flight behind the next publication (default 0: publish after retirement; 1: one in flight; runtime 0644)"
+ );
+ 
++/// Storage of `g16_subgen` (runtime 0644, default 0).
++static SUBGEN: AtomicU32 = AtomicU32::new(0);
++
++/// The per-submission kick J604-MEASURED from macOS 26B123 (its own GPU firmware) as a guest
++/// under aura's hypervisor (aura GPU trace, 2026-11-13): before each doorbell the host reads the
++/// firmware's mirror (SGX +0xd64000 + 2 * cell), reads the 8-bit generation cell on the
++/// host-owned page SGX +0xd60000 and writes it back plus one, per cell, then rings. macOS pipe 0
++/// bumps +0x20 then +0x00, pipe 1 +0x20, pipe 2 +0x40 (pipes 8/9/0xa: +0x30+0x10 / +0x30 /
++/// +0x50). With `g16_subgen` = 1 the cells in `g16_subgen_cells` are bumped, in order, right
++/// before that pipe's doorbell. 0 (default) bumps nothing: today's protocol.
++pub(crate) fn subgen() -> bool {
++    SUBGEN.load(Ordering::Relaxed) == 1
++}
++
++live_u32_param!(
++    SUBGEN_PARAM,
++    SUBGEN_PARMTYPE,
++    SUBGEN_PARM,
++    SUBGEN,
++    "g16_subgen",
++    "G16: bump the SGX +0xd60000 generation cells in g16_subgen_cells before each doorbell, as macOS does (default 0: off; 1: on; runtime 0644)"
++);
++
++/// Per submit pipe 0 (TA), 1 (FS), 2 (compute): the first cell in the low 16 bits, the second in
++/// the high 16 bits, 0 for none. Cell 0 is the device-control generation of the 25G83 protocol
++/// this driver speaks (regs.rs `set_generation`) and is refused.
++static SUBGEN_CELLS: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
++
++/// The cells to bump, in order, before pipe `pipe`'s doorbell (0 = none).
++pub(crate) fn subgen_cells(pipe: usize) -> [usize; 2] {
++    let v = SUBGEN_CELLS.get(pipe).map_or(0, |a| a.load(Ordering::Relaxed));
++    [(v & 0xffff) as usize, (v >> 16) as usize]
++}
++
++/// A cell offset: hex (0x..) or decimal, 4-aligned, nonzero, below 0x2000 (its mirror then lies in
++/// the 0x4000 window at SGX +0xd64000).
++fn subgen_parse_cell(text: &str) -> Option<u32> {
++    let text = text.trim();
++    let v = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
++        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
++        None => text.parse::<u32>().ok()?,
++    };
++    (v != 0 && v % 4 == 0 && v < 0x2000).then_some(v)
++}
++
++/// `set` of `g16_subgen_cells`: "pipe:cell[+cell],..." (e.g. "2:0x40,1:0x20"), or empty / "none".
++/// The whole list is checked before any of it takes effect.
++///
++/// # Safety
++///
++/// Called by the module-parameter core with `val` NULL or a NUL-terminated string.
++unsafe extern "C" fn subgen_cells_set(
++    val: *const c_char,
++    _kp: *const kernel::bindings::kernel_param,
++) -> c_int {
++    if val.is_null() {
++        return EINVAL.to_errno();
++    }
++    // SAFETY: `val` is a NUL-terminated string per the function contract.
++    let Ok(text) = unsafe { core::ffi::CStr::from_ptr(val) }.to_str() else {
++        return EINVAL.to_errno();
++    };
++    let text = text.trim();
++    let mut table = [0u32; 3];
++    if !text.is_empty() && text != "none" {
++        for item in text.split(',') {
++            let Some((pipe, cells)) = item.split_once(':') else {
++                return EINVAL.to_errno();
++            };
++            let Ok(pipe) = pipe.trim().parse::<usize>() else {
++                return EINVAL.to_errno();
++            };
++            if pipe >= table.len() {
++                return EINVAL.to_errno();
++            }
++            let mut packed = 0u32;
++            for (n, cell) in cells.split('+').enumerate() {
++                let Some(cell) = subgen_parse_cell(cell) else {
++                    return EINVAL.to_errno();
++                };
++                if n >= 2 {
++                    return EINVAL.to_errno();
++                }
++                packed |= cell << (16 * n);
++            }
++            table[pipe] = packed;
++        }
++    }
++    for (slot, v) in SUBGEN_CELLS.iter().zip(table) {
++        slot.store(v, Ordering::Relaxed);
++    }
++    0
++}
++
++fn subgen_push(out: &mut [u8], len: &mut usize, b: u8) {
++    if *len < out.len() {
++        out[*len] = b;
++        *len += 1;
++    }
++}
++
++fn subgen_push_hex(out: &mut [u8], len: &mut usize, v: u32) {
++    subgen_push(out, len, b'0');
++    subgen_push(out, len, b'x');
++    let mut started = false;
++    for shift in (0..8).rev() {
++        let d = ((v >> (shift * 4)) & 0xf) as u8;
++        if d != 0 || started || shift == 0 {
++            started = true;
++            subgen_push(out, len, if d < 10 { b'0' + d } else { b'a' + d - 10 });
++        }
++    }
++}
++
++/// `get` of `g16_subgen_cells`: the list as `set` takes it, or "none".
++///
++/// # Safety
++///
++/// `buffer` is the module-parameter core's PAGE_SIZE output buffer.
++unsafe extern "C" fn subgen_cells_get(
++    buffer: *mut c_char,
++    _kp: *const kernel::bindings::kernel_param,
++) -> c_int {
++    let mut out = [0u8; 96];
++    let mut len = 0;
++    for pipe in 0..SUBGEN_CELLS.len() {
++        let [a, b] = subgen_cells(pipe);
++        if a == 0 {
++            continue;
++        }
++        if len != 0 {
++            subgen_push(&mut out, &mut len, b',');
++        }
++        subgen_push(&mut out, &mut len, b'0' + pipe as u8);
++        subgen_push(&mut out, &mut len, b':');
++        subgen_push_hex(&mut out, &mut len, a as u32);
++        if b != 0 {
++            subgen_push(&mut out, &mut len, b'+');
++            subgen_push_hex(&mut out, &mut len, b as u32);
++        }
++    }
++    if len == 0 {
++        for &c in b"none" {
++            subgen_push(&mut out, &mut len, c);
++        }
++    }
++    subgen_push(&mut out, &mut len, b'\n');
++    // SAFETY: the buffer holds PAGE_SIZE bytes; at most 97 are written.
++    unsafe {
++        core::ptr::copy_nonoverlapping(out.as_ptr(), buffer.cast::<u8>(), len);
++        *buffer.cast::<u8>().add(len) = 0;
++    }
++    len as c_int
++}
++
++static SUBGEN_CELLS_OPS: kernel::bindings::kernel_param_ops = kernel::bindings::kernel_param_ops {
++    flags: 0,
++    set: Some(subgen_cells_set),
++    get: Some(subgen_cells_get),
++    free: None,
++};
++
++#[link_section = "__param"]
++#[used(compiler)]
++static SUBGEN_CELLS_PARAM: kernel::module_param::KernelParam =
++    kernel::module_param::KernelParam::new(kernel::bindings::kernel_param {
++        name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
++            kernel::c_str!("g16_subgen_cells")
++        } else {
++            kernel::c_str!("asahi.g16_subgen_cells")
++        }),
++        // `__this_module` is constructed by the kernel at load time and is not freed until the
++        // module is unloaded. Take its address without a reference to the mutable static.
++        #[cfg(MODULE)]
++        mod_: (&raw const kernel::bindings::__this_module).cast_mut(),
++        #[cfg(not(MODULE))]
++        mod_: core::ptr::null_mut(),
++        ops: core::ptr::from_ref(&SUBGEN_CELLS_OPS),
++        perm: 0o644,
++        level: -1,
++        flags: 0,
++        __bindgen_anon_1: kernel::bindings::kernel_param__bindgen_ty_1 {
++            arg: core::ptr::from_ref(&SUBGEN_CELLS).cast_mut().cast(),
++        },
++    });
++
+ /// Storage of `g16_tail_us` (runtime 0644, default 0).
+ static TAIL_US: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index ad8b949fae..4039c348bf 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1290,6 +1290,18 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             }
+             writeln!(f)?;
+         }
++        writeln!(
++            f,
++            "subgen: on {} bumps {}/{}/{} caught {}/{}/{} err {}",
++            u8::from(super::params::subgen()),
++            s.subgen_bumps[0],
++            s.subgen_bumps[1],
++            s.subgen_bumps[2],
++            s.subgen_caught[0],
++            s.subgen_caught[1],
++            s.subgen_caught[2],
++            s.subgen_err
++        )?;
+         write!(f, "first_hist_100us:")?;
+         for n in s.first_hist.iter() {
+             write!(f, " {}", n)?;
+diff --git a/drivers/gpu/drm/asahi/g16/regs.rs b/drivers/gpu/drm/asahi/g16/regs.rs
+index 15a17e61f5..79439e692c 100644
+--- a/drivers/gpu/drm/asahi/g16/regs.rs
++++ b/drivers/gpu/drm/asahi/g16/regs.rs
+@@ -179,6 +179,9 @@ pub(crate) struct Regs {
+     status: Mapping,
+     /// Host-owned generation register page (SGX +0xd60000).
+     generation: Mapping,
++    /// The firmware's mirror of the generation cells (SGX +0xd64000, cell c at +2 * c;
++    /// J604-measured under macOS 26B123). Read only, for `g16_subgen`.
++    generation_mirror: Mapping,
+ }
+ 
+ impl Regs {
+@@ -198,6 +201,7 @@ pub(crate) fn new(pdev: &platform::Device<Core<'_>>, res: G16Resources) -> Resul
+             asc: window(c_str!("asc"), 0)?,
+             status: window(c_str!("sgx"), SGX_STATUS as u64)?,
+             generation: window(c_str!("sgx"), 0xd60000)?,
++            generation_mirror: window(c_str!("sgx"), 0xd64000)?,
+             res,
+         })
+     }
+@@ -226,6 +230,18 @@ pub(crate) fn pstate(&self) -> Result<u32> {
+         }
+     }
+ 
++    /// One `g16_subgen` cell bump, as macOS does it before a doorbell: the firmware's mirror,
++    /// then the 8-bit cell, written back plus one. Returns (cell before, mirror). `cell` is
++    /// checked by the parameter's parser (4-aligned, 0 < cell < 0x2000).
++    pub(crate) fn bump_generation_cell(&self, cell: usize) -> Result<(u32, u32)> {
++        let mirror = self.generation_mirror.io().try_read32(2 * cell)?;
++        let before = self.generation.io().try_read32(cell)?;
++        self.generation
++            .io()
++            .try_write32(before.wrapping_add(1) & 0xff, cell)?;
++        Ok((before, mirror))
++    }
++
+     /// Publishes the host-owned device-control generation and verifies the receipt.
+     pub(crate) fn set_generation(&self, value: u32) -> Result {
+         self.generation.io().try_write32(value, 0)?;
+-- 
+2.43.0
+

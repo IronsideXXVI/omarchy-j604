@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 20:13:17 +0000
+Subject: [PATCH] drm/asahi: G16: optionally ring one doorbell per
+ render publication
+
+macOS 26B123 rings one doorbell per render command on its render pipe (8)
+and bumps two generation cells with it (+0x30, then +0x10), so one
+doorbell serves both the TA and the FS ring. It does 1.07 doorbells per
+command at depth 64. This was J604-MEASURED from a hypervisor trace of
+the macOS guest, which ran its own AGX firmware, not the 25G83 firmware
+this driver runs. This driver posts the TA record on pipe 0 and the FS
+record on pipe 1, and rings each pipe right after its record: two
+doorbells per render command.
+
+Add g16_onebell (default 0: unchanged). Once both render queues are
+registered, a render publication posts both records first, then:
+1 rings the TA pipe only, 2 rings the FS pipe only, and 3 rings both
+pipes (the ordering control). The first registrations keep the per-pipe
+doorbells. With g16_subgen the cells of both records are still bumped
+before the doorbell.
+
+Our initdata allocates 12 submit pipes, so a pipe 8 ring exists, but
+this driver submits on pipes 0..2 only. Whether 25G83 numbers its render
+pipe 8 as 26B123 does, and whether it services a pipe it was not rung
+for, is unprobed. That is why this is off by default, and why modes 1/2
+may leave a record unconsumed until the next doorbell, which the hang
+checks report.
+
+An "onebell:" stats line counts the publications rung once and the ones
+rung on both pipes after both records.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 30 ++++++++++++++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/params.rs | 25 ++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  7 +++++++
+ 3 files changed, 61 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index fa742233d8..1e5ceb9d13 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -351,6 +351,9 @@ pub(crate) struct Stats {
+     /// more running flights.
+     pub(crate) resident_max: u64,
+     pub(crate) resident_deep: u64,
++    /// `g16_onebell`: render publications rung once (1, 2), and rung on both pipes after
++    /// both records (3).
++    pub(crate) onebell: [u64; 2],
+     /// The last prefix that failed that check: publication, first stage start, last stage end
+     /// and retirement, raw 24 MHz ticks (to find the stamps' time base).
+     pub(crate) lat_last_bad: [u64; 4],
+@@ -1338,6 +1341,15 @@ fn publish_prefix_into(
+                 )?;
+             }
+             wmb();
++            // g16_onebell: once both render queues are registered, post both render records
++            // first and ring as the parameter says (the first registrations keep the
++            // per-pipe doorbells).
++            let onebell = if render && self.engine.ta_registered && self.engine.render_registered
++            {
++                params::onebell()
++            } else {
++                0
++            };
+             for &channel in channels {
+                 let (qinfo, head, event, fresh) = match channel {
+                     Channel::Compute => (
+@@ -1375,7 +1387,23 @@ fn publish_prefix_into(
+                 if super::params::subgen() {
+                     self.subgen_bump(channel as usize);
+                 }
+-                self.session.ring(channel)?;
++                if onebell == 0 {
++                    self.session.ring(channel)?;
++                }
++            }
++            match onebell {
++                0 => {}
++                1 | 2 => {
++                    self.session
++                        .ring(if onebell == 1 { Channel::Ta } else { Channel::Fs })?;
++                    self.engine.stats.onebell[0] += 1;
++                }
++                _ => {
++                    for &channel in channels {
++                        self.session.ring(channel)?;
++                    }
++                    self.engine.stats.onebell[1] += 1;
++                }
+             }
+             if super::params::kickfw() == 2 {
+                 self.kick_firmware()?;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index acb51b4c3d..d64c45412d 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -465,6 +465,31 @@ macro_rules! live_u32_param {
+     "G16: post a render command's TA record before its FS record (default 1; runtime 0644; 0: FS first)"
+ );
+ 
++/// Storage of `g16_onebell` (runtime 0644, default 0).
++static ONEBELL: AtomicU32 = AtomicU32::new(0);
++
++/// Doorbells of a render publication, once both render queues are registered. macOS 26B123
++/// (its own GPU firmware, J604-MEASURED as a guest) rings ONE doorbell per render command,
++/// on its render pipe (8), and bumps two generation cells with it (+0x30 then +0x10), so
++/// the one doorbell serves both the TA and the FS ring. This driver posts the TA record on
++/// pipe 0 and the FS record on pipe 1 and rings each pipe after its record. 0: that.
++/// 1: post both records, then ring the TA pipe only; 2: then ring the FS pipe only; 3: then
++/// ring both (two doorbells after both records, the ordering control). Whether the 25G83
++/// firmware services a pipe it was not rung for is unprobed: 1 and 2 may leave a record
++/// unconsumed until the next doorbell (the hang checks catch a stall).
++pub(crate) fn onebell() -> u32 {
++    ONEBELL.load(Ordering::Relaxed).min(3)
++}
++
++live_u32_param!(
++    ONEBELL_PARAM,
++    ONEBELL_PARMTYPE,
++    ONEBELL_PARM,
++    ONEBELL,
++    "g16_onebell",
++    "G16: doorbells of a render publication (default 0: one per pipe after its record; 1: both records, then the TA pipe only; 2: then the FS pipe only; 3: then both; runtime 0644)"
++);
++
+ live_u32_param!(
+     RESNAP_LIVE_PARAM,
+     RESNAP_LIVE_PARMTYPE,
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index b5576afc03..f2f23504e3 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1310,6 +1310,13 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.resident_max,
+             s.resident_deep
+         )?;
++        writeln!(
++            f,
++            "onebell: mode {} one {} both {}",
++            super::params::onebell(),
++            s.onebell[0],
++            s.onebell[1]
++        )?;
+         write!(f, "first_hist_100us:")?;
+         for n in s.first_hist.iter() {
+             write!(f, " {}", n)?;
+-- 
+2.43.0
+
