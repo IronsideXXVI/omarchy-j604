@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 10:44:16 +0000
+Subject: [PATCH] drm/asahi: G16: refuse a deep sleep the commit cannot
+ stop
+
+aurora-silicon/linux#1314's rewrite of "drm/asahi: G16: stop the
+firmware for a deep sleep and restart it warm": when the commit can't
+take the firmware stop, .prepare refuses the sleep, as the PMP and SIO
+drivers do, instead of stopping the firmware itself. A stop in .prepare
+followed by a refused sleep lost the GPU until reboot. The fallback
+stop and the RTKit helpers only it used go.
+
+This applies the rewrite's change to the revision k881 carries.
+
+Based on 43fcb69a47 from aurora-silicon/linux#1314.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/boot.rs  | 12 ----------
+ drivers/gpu/drm/asahi/g16/sleep.rs | 36 ++++++------------------------
+ 2 files changed, 7 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 718da2213b..73c1a20f04 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -365,18 +365,6 @@ pub(crate) fn as_raw(&self) -> *mut bindings::apple_rtkit {
+         self.rtk
+     }
+ 
+-    /// RTKit AP and IOP idle, each acknowledged.
+-    pub(crate) fn idle(&mut self) -> Result {
+-        // SAFETY: `rtk` is live by the type invariant.
+-        to_result(unsafe { bindings::apple_rtkit_idle(self.rtk) })
+-    }
+-
+-    /// Mailbox receive off, for firmware that acknowledged idle.
+-    pub(crate) fn mailbox_off(&mut self) {
+-        // SAFETY: `rtk` is live by the type invariant.
+-        unsafe { bindings::apple_rtkit_mailbox_off(self.rtk) };
+-    }
+-
+     /// Prepares for HELLO from firmware restarting warm, which keeps its buffers and rings.
+     pub(crate) fn warm_restart(&mut self) -> Result {
+         // SAFETY: `rtk` is live by the type invariant.
+diff --git a/drivers/gpu/drm/asahi/g16/sleep.rs b/drivers/gpu/drm/asahi/g16/sleep.rs
+index 375ff723cc..72e1694a43 100644
+--- a/drivers/gpu/drm/asahi/g16/sleep.rs
++++ b/drivers/gpu/drm/asahi/g16/sleep.rs
+@@ -57,25 +57,6 @@ fn sleep_quiet(&mut self) -> Result<bool> {
+             && self.recovery_idle()?)
+     }
+ 
+-    /// RTKit idle, the mailbox off, then the run bit, where the commit can't do it. An error
+-    /// leaves it running.
+-    fn sleep_stop(&mut self) -> Result {
+-        if let Err(error) = self.session.rtkit.idle() {
+-            // EINVAL: it never left the on state.
+-            if let Err(wake) = self.session.rtkit.wake() {
+-                if wake != EINVAL {
+-                    self.session.shared.fail_stop(wake);
+-                }
+-            }
+-            return Err(error);
+-        }
+-        self.session.rtkit.mailbox_off();
+-        let control = self.session.regs.asc_control()?;
+-        self.session.regs.set_asc_control(control & !ASC_RUN)?;
+-        regs::mb();
+-        Ok(())
+-    }
+-
+     /// The run bit and the RTKit handshake, with the firmware's state as it was left.
+     fn sleep_restart(&mut self) -> Result {
+         self.session.rtkit.warm_restart()?;
+@@ -168,7 +149,7 @@ fn leave_for_commit(&self, firmware: &mut Firmware) -> bool {
+             Err(error) => {
+                 dev_warn!(
+                     self.dev.as_ref(),
+-                    "no GPU stop at the commit ({:?}): stopping it now\n",
++                    "no GPU stop at the commit ({:?}): refusing the sleep\n",
+                     error
+                 );
+                 false
+@@ -189,8 +170,9 @@ fn sleep_commit_finish(&self) -> Option<bool> {
+         Some(stopped)
+     }
+ 
+-    /// Waits for quiet, closes publication and leaves the stop to the commit, or stops the
+-    /// firmware if it can't be. A refusal changes nothing.
++    /// Waits for quiet, closes publication and leaves the stop to the commit. Refuses if the
++    /// commit can't take it: a stop here loses the GPU after a refused sleep. A refusal
++    /// changes nothing.
+     fn sleep_down(self: &Arc<Self>) -> Result {
+         if self.sleeping.load(Ordering::Acquire) {
+             // After a sleep refused past the stop, only the domain is left to lower.
+@@ -215,20 +197,16 @@ fn sleep_down(self: &Arc<Self>) -> Result {
+                     .and_then(|quiet| if quiet { Ok(()) } else { Err(EBUSY) })
+                     .and_then(|_| {
+                         if self.leave_for_commit(firmware) {
+-                            Ok(true)
++                            Ok(())
+                         } else {
+-                            firmware.sleep_stop().map(|_| false)
++                            Err(EBUSY)
+                         }
+                     }),
+                 None => Err(ENODEV),
+             }
+         };
+         match left {
+-            Ok(true) => Ok(()),
+-            Ok(false) => {
+-                self.lower_domain();
+-                Ok(())
+-            }
++            Ok(()) => Ok(()),
+             Err(error) => {
+                 self.sleeping.store(false, Ordering::Release);
+                 self.poll_now();
+-- 
+2.43.0
+

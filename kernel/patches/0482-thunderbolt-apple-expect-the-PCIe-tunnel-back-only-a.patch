@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 10:44:16 +0000
+Subject: [PATCH] thunderbolt: apple: expect the PCIe tunnel back only
+ after a power cycle
+
+aurora-silicon/linux#1314's rewrite of "thunderbolt: apple:
+power-cycle the J713 host router for a deep sleep": only a sleep that
+may power-cycle the router, one with resume recovery or the native
+deep sleep, expects the PCIe tunnel back, and a failed CIO prepare
+restores the expectation it had. The host test covers both.
+
+This applies the rewrite's change to the revision k881 carries.
+
+Based on 1e81e8c620 from aurora-silicon/linux#1314.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/thunderbolt/apple.c     | 19 ++++++++++++++---
+ tools/asahi/tb-dock-pm-tests.py | 37 +++++++++++++++++++++++++++------
+ 2 files changed, 47 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/thunderbolt/apple.c b/drivers/thunderbolt/apple.c
+index e6b9d84eeb..587754abb9 100644
+--- a/drivers/thunderbolt/apple.c
++++ b/drivers/thunderbolt/apple.c
+@@ -2717,11 +2717,20 @@ static int apple_nhi_prepare(struct device *dev)
+ {
+ 	struct apple_nhi *anhi = dev_get_drvdata(dev);
+ 	struct apple_cio *acio = anhi->acio;
++	bool recovery = READ_ONCE(resume_recovery);
++	/*
++	 * Only a sleep that may cost the router its tunnels expects them back:
++	 * one with resume recovery, as before, and the J713's native deep sleep,
++	 * which power-cycles the router.
++	 */
++	bool cycles = recovery ||
++		      (anhi->cio_dart && pm_suspend_target_state == PM_SUSPEND_MEM);
++	bool expected;
+ 	int ret;
+ 
+ 	acio->resume_had_peer = false;
+ 	/* Only resume recovery reads it: don't take the domain lock otherwise. */
+-	if (READ_ONCE(resume_recovery)) {
++	if (recovery) {
+ 		scoped_guard(mutex, &anhi->tb->lock) {
+ 			struct tb_port *port;
+ 
+@@ -2738,15 +2747,19 @@ static int apple_nhi_prepare(struct device *dev)
+ 	apple_dpin_pause_retries(acio);
+ 
+ 	scoped_guard(mutex, &acio->pcie_tunnel_lock) {
++		expected = acio->pcie_resume_expected;
+ 		/* Keep an unresolved expectation until cable revalidation. */
+-		acio->pcie_resume_expected |= READ_ONCE(acio->pcie_tunnel_requested);
++		if (cycles)
++			acio->pcie_resume_expected |= READ_ONCE(acio->pcie_tunnel_requested);
+ 		acio->pcie_pm_prepared = true;
+ 	}
+ 	ret = apple_nhi_cio_prepare(anhi);
+ 	if (ret) {
+ 		apple_dpin_resume_retries(acio);
+-		scoped_guard(mutex, &acio->pcie_tunnel_lock)
++		scoped_guard(mutex, &acio->pcie_tunnel_lock) {
+ 			acio->pcie_pm_prepared = false;
++			acio->pcie_resume_expected = expected;
++		}
+ 	}
+ 	return ret;
+ }
+diff --git a/tools/asahi/tb-dock-pm-tests.py b/tools/asahi/tb-dock-pm-tests.py
+index bcd5fc0863..63fb770d3c 100644
+--- a/tools/asahi/tb-dock-pm-tests.py
++++ b/tools/asahi/tb-dock-pm-tests.py
+@@ -4,7 +4,8 @@
+ 
+ Hardware and the control channel are modeled; this does not qualify ACIO power
+ loss. Assertions detect a changed stock resume, routes a native CIO wake lost
+-that are not retired at complete, repeated cleanup and skipped NHI preparation.
++that are not retired at complete, repeated cleanup, skipped NHI preparation and
++a PCIe resume expectation from a sleep that keeps the router powered.
+ """
+ import argparse
+ import hashlib
+@@ -37,6 +38,9 @@ HEADER = r'''
+ #include <string.h>
+ #define BIT(n) (1U << (n))
+ #define READ_ONCE(x) (x)
++#define EBUSY 16
++#define PM_SUSPEND_TO_IDLE 1
++#define PM_SUSPEND_MEM 3
+ #define QUIRK_KEEP_TUNNELS BIT(0)
+ #define QUIRK_NO_SYSTEM_SLEEP BIT(1)
+ #define TB_HOST_DP_NOTIFY BIT(0)
+@@ -56,7 +60,7 @@ struct tb_tunnel { int unused; };
+ struct device { void *data; };
+ struct apple_cio { bool resume_had_peer, pcie_resume_expected, pcie_tunnel_requested,
+  pcie_pm_prepared; int pcie_tunnel_lock; };
+-struct apple_nhi { struct tb *tb; struct apple_cio *acio; };
++struct apple_nhi { struct tb *tb; struct apple_cio *acio; void *cio_dart; };
+ static struct tb_cm cm;
+ static struct tb tb;
+ static struct tb_nhi nhi;
+@@ -66,6 +70,7 @@ static struct apple_cio acio;
+ static struct apple_nhi anhi;
+ static struct device dev;
+ static bool resume_recovery, client_awake, tunnel_alive, child_alive, lost;
++static int pm_suspend_target_state, cio_prepare_ret;
+ static unsigned stage, cleanup_calls, scans, queues, pauses, unregistered, probes;
+ static unsigned locks, tb_locks, pc_locks, discovery, activations;
+ static void lock(int *p)
+@@ -87,7 +92,7 @@ static void *dev_get_drvdata(struct device *d) { return d->data; }
+ static bool tb_port_is_null(struct tb_port *p) { return p != NULL; }
+ static void apple_dpin_pause_retries(struct apple_cio *a)
+ { assert(a==&acio && !locks); pauses++; }
+-static int apple_nhi_cio_prepare(struct apple_nhi *a) { return 0; }
++static int apple_nhi_cio_prepare(struct apple_nhi *a) { return cio_prepare_ret; }
+ static void apple_dpin_resume_retries(struct apple_cio *a) { assert(!locks); }
+ static struct tb_cm *tb_priv(struct tb *t) { assert(t==&tb); return &cm; }
+ static bool tb_switch_is_usb4(struct tb_switch *s) { return true; }
+@@ -137,6 +142,7 @@ static void setup(void)
+  child_port=(struct tb_port){.sw=&child};
+  anhi=(struct apple_nhi){.tb=&tb,.acio=&acio}; dev.data=&anhi;
+  nhi=(struct tb_nhi){};
++ resume_recovery=false; pm_suspend_target_state=PM_SUSPEND_TO_IDLE; cio_prepare_ret=0;
+  client_awake=true; tunnel_alive=child_alive=true; lost=false;
+  stage=cleanup_calls=scans=queues=pauses=unregistered=probes=0;
+  locks=tb_locks=pc_locks=discovery=activations=0;
+@@ -150,12 +156,27 @@ int main(void)
+    setup(); resume_recovery=optional; acio.pcie_tunnel_requested=requested;
+    assert(!apple_nhi_prepare(&dev));
+    assert(pauses==1 && acio.pcie_pm_prepared && !locks);
+-   assert(acio.pcie_resume_expected==!!requested && acio.resume_had_peer==!!optional);
++   assert(acio.pcie_resume_expected==(optional && requested));
++   assert(acio.resume_had_peer==!!optional);
+    assert(tb_locks==optional && pc_locks==1); cases++;
+   }
+  }
+- setup(); resume_recovery=false; acio.pcie_resume_expected=true;
+- assert(!apple_nhi_prepare(&dev) && acio.pcie_resume_expected); cases++;
++ /* The J713's native deep sleep power-cycles the router: it expects the tunnel back. */
++ for (unsigned deep=0;deep<2;deep++) {
++  setup(); anhi.cio_dart=&anhi; acio.pcie_tunnel_requested=true;
++  pm_suspend_target_state=deep ? PM_SUSPEND_MEM : PM_SUSPEND_TO_IDLE;
++  assert(!apple_nhi_prepare(&dev) && acio.pcie_pm_prepared);
++  assert(acio.pcie_resume_expected==!!deep); cases++;
++ }
++ /* No sleep drops an expectation an earlier one left unresolved. */
++ for (unsigned optional=0;optional<2;optional++) {
++  setup(); resume_recovery=optional; acio.pcie_resume_expected=true;
++  assert(!apple_nhi_prepare(&dev) && acio.pcie_resume_expected); cases++;
++ }
++ /* A failed CIO prepare undoes the bookkeeping, the expectation included. */
++ setup(); resume_recovery=true; acio.pcie_tunnel_requested=true; cio_prepare_ret=-EBUSY;
++ assert(apple_nhi_prepare(&dev)==-EBUSY && !acio.pcie_pm_prepared);
++ assert(!acio.pcie_resume_expected && !locks); cases++;
+  /* The stock resume is unchanged: it retires lost routes at once. */
+  for (unsigned quirks=0;quirks<4;quirks++) {
+   setup(); lost=quirks&1;
+@@ -196,6 +217,10 @@ MUTATIONS = {
+     'skip-pause': ('apple_dpin_pause_retries(acio);', '(void)apple_dpin_pause_retries;'),
+     'skip-pcie-prepare': ('acio->pcie_pm_prepared = true;', 'acio->pcie_pm_prepared = false;'),
+     'lose-prior-pcie-expectation': ('acio->pcie_resume_expected |=', 'acio->pcie_resume_expected ='),
++    'expect-from-every-sleep': ('if (cycles)', 'if (cycles || true)'),
++    'native-sleep-unexpected': ('(anhi->cio_dart && pm_suspend_target_state == PM_SUSPEND_MEM)',
++                                'false'),
++    'keep-expectation-on-failure': ('acio->pcie_resume_expected = expected;', '(void)expected;'),
+     'stock-resume-defers': ('tb_resume_cleanup(tb);\n\ttb_restore_children(tb->root_switch);',
+                             'tcm->resume_cleanup_pending = true;\n\ttb_restore_children(tb->root_switch);'),
+     'repeat-cleanup': ('tcm->resume_cleanup_pending = false;', '/* leave pending */'),
+-- 
+2.43.0
+
