@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 02:08:04 +0000
+Subject: [PATCH] smp: restart WD2 for its own period as a T8132 S2R wake
+ leaves aura
+
+A J604 (T8132) deep sleep committed and reset about 78 s after its RTC
+alarm, with nothing to say where the wake stopped. Linux's T8132 sleep
+driver gives WD2 its own period at each step it owns (the resume stub
+60 s, then longer), and the last wake program leaves it running for
+5 s. aura takes the boot core in between and set none, so a stop inside
+aura could not be told from one in the wake firmware before it.
+
+Restart WD2 for 40 s on the T8132, in the order the resume stub uses,
+right before the boot core takes resume_pa. A reset 5 s after the wake
+then means aura never ran, 40 s that it ran and the OS's entry did not
+take over, and the OS's own periods name the later steps. The watchdog
+stays the OS's: it armed it for the sleep and stops it.
+
+Assisted-by: LLM
+---
+ src/smp.c                         |  3 ++
+ src/wdt.c                         | 21 +++++++++++
+ src/wdt.h                         |  6 ++++
+ tests/python/test_wdt_s2r_mark.py | 59 +++++++++++++++++++++++++++++++
+ 4 files changed, 89 insertions(+)
+ create mode 100644 tests/python/test_wdt_s2r_mark.py
+
+diff --git a/src/smp.c b/src/smp.c
+index a764bd5f..cb66c8ee 100644
+--- a/src/smp.c
++++ b/src/smp.c
+@@ -13,6 +13,7 @@
+ #include "string.h"
+ #include "types.h"
+ #include "utils.h"
++#include "wdt.h"
+ #include "xnuboot.h"
+ 
+ #define CPU_START_OFF_S5L8960X 0x30000
+@@ -473,6 +474,8 @@ void smp_s2r_return_to_os(void)
+     s2r_mailbox.resumes++;
+     sysop("dsb sy");
+ 
++    /* Last, as close to the jump as it can be: a reset at this period means aura got here. */
++    wdt_s2r_wake_mark();
+     ((void (*)(void))entry)();
+     reboot();
+ }
+diff --git a/src/wdt.c b/src/wdt.c
+index e6b63a8b..9e0d4908 100644
+--- a/src/wdt.c
++++ b/src/wdt.c
+@@ -66,6 +66,27 @@ void wdt_reboot(void)
+     write32(wdt_base + WDT_CTL, 4);
+ }
+ 
++/*
++ * WD2, as Linux's T8132 sleep driver and its resume stub use it: the last wake program leaves it
++ * running for 5 s, the stub restarts it for 60 s and the kernel for longer. aura takes the boot
++ * core in between and gets its own period, so the time from the wake to the reset says how far
++ * the wake got. The OS armed this watchdog for its sleep; it stays the OS's.
++ */
++#define WDT_WD2_COUNT 0x20
++#define WDT_WD2_ALARM 0x28
++#define WDT_WD2_CTL   0x2c
++
++void wdt_s2r_wake_mark(void)
++{
++    if (chip_id != T8132 || !wdt_base)
++        return;
++    write32(wdt_base + WDT_WD2_CTL, 0);
++    write32(wdt_base + WDT_WD2_COUNT, 0);
++    write32(wdt_base + WDT_WD2_ALARM, WDT_S2R_SECONDS * 24000000u);
++    write32(wdt_base + WDT_WD2_CTL, 1);
++    sysop("dsb sy");
++}
++
+ static int wdt_arm(unsigned seconds)
+ {
+     int path[8];
+diff --git a/src/wdt.h b/src/wdt.h
+index 01863517..81eff5af 100644
+--- a/src/wdt.h
++++ b/src/wdt.h
+@@ -15,6 +15,12 @@ int wdt_arm_trial(void);
+ #define WDT_BOOT_SECONDS 178
+ int wdt_arm_boot(void);
+ void wdt_host_attached(void);
++/*
++ * T8132 S2R wake: WD2 restarted for a period of aura's own, so a reset after the wake tells a
++ * stop inside aura from one in the wake firmware before it (the wake program's 5 s).
++ */
++#define WDT_S2R_SECONDS 40
++void wdt_s2r_wake_mark(void);
+ bool wdt_boot_watchdog_armed(void);
+ 
+ #endif
+diff --git a/tests/python/test_wdt_s2r_mark.py b/tests/python/test_wdt_s2r_mark.py
+new file mode 100644
+index 00000000..76725cbb
+--- /dev/null
++++ b/tests/python/test_wdt_s2r_mark.py
+@@ -0,0 +1,59 @@
++"""The T8132 S2R wake mark: WD2 restarted for aura's own period, in the order Linux uses."""
++from pathlib import Path
++import subprocess
++
++
++def test_wdt_s2r_wake_mark(tmp_path):
++    repo = Path(__file__).resolve().parents[2]
++    source = (repo / 'src/wdt.c').read_text()
++    mark = source[source.index('#define WDT_WD2_COUNT'):
++                  source.index('static int wdt_arm(unsigned seconds)')]
++    seconds = (repo / 'src/wdt.h').read_text()
++    seconds = seconds[seconds.index('#define WDT_S2R_SECONDS'):].splitlines()[0]
++    harness = r"""
++#include <assert.h>
++#include <stdint.h>
++typedef uint32_t u32;
++typedef uint64_t u64;
++#define T8132 0x8132
++#define T8140 0x8140
++#define sysop(x) ((void)0)
++""" + seconds + r"""
++static u32 chip_id = T8132;
++static u64 wdt_base = 0x3882b0000;
++static u64 order[8];
++static u32 values[8];
++static unsigned writes;
++static void write32(u64 addr, u32 value)
++{
++    assert(writes < 8);
++    order[writes] = addr - wdt_base;
++    values[writes++] = value;
++}
++""" + mark + r"""
++int main(void)
++{
++    wdt_s2r_wake_mark();
++    /* As the T8132 resume stub: CTL 0, COUNT 0, ALARM, CTL 1. */
++    assert(writes == 4);
++    assert(order[0] == 0x2c && values[0] == 0);
++    assert(order[1] == 0x20 && values[1] == 0);
++    assert(order[2] == 0x28 && values[2] == WDT_S2R_SECONDS * 24000000u);
++    assert(order[3] == 0x2c && values[3] == 1);
++    /* Shorter than the stub's 60 s, longer than the wake program's 5 s. */
++    assert(WDT_S2R_SECONDS > 5 && WDT_S2R_SECONDS < 60);
++    /* Nothing elsewhere, and nothing without the base. */
++    writes = 0;
++    chip_id = T8140;
++    wdt_s2r_wake_mark();
++    chip_id = T8132;
++    wdt_base = 0;
++    wdt_s2r_wake_mark();
++    assert(writes == 0);
++    return 0;
++}
++"""
++    binary = tmp_path / 'wdt-s2r-mark'
++    subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
++                    '-x', 'c', '-', '-o', str(binary)], input=harness, text=True, check=True)
++    subprocess.run([str(binary)], check=True)
+-- 
+2.43.0
+

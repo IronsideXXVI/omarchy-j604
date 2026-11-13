@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 02:08:13 +0000
+Subject: [PATCH] media: apple: isp: let the J604 camera slow down in
+ low light, as macOS
+
+The J604 ADT's camera node declares auto-low-light-video, and macOS lists
+every format of this camera from 15 to 30 frames per second. Our auto
+exposure held 30 fps unless an application set exposure priority, so in
+a dim room the exposure stopped at 1/30 s and the picture was about half
+as bright as macOS's (mean luma 28 against 52.6) with the gain at 12x.
+
+Make exposure priority the default on T8132: auto exposure may then lower
+the frame rate to 15 fps in low light and expose up to 1/15 s. An
+application that needs a fixed rate still clears the control.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/isp/isp-drv.c  | 2 ++
+ drivers/media/platform/apple/isp/isp-drv.h  | 2 ++
+ drivers/media/platform/apple/isp/isp-v4l2.c | 5 ++++-
+ tools/asahi/isp-camera-sizes-tests.py       | 8 ++++++++
+ tools/asahi/run-host-tests.py               | 3 ++-
+ 5 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index d048448492..22245b6671 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -1251,6 +1251,8 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
+ 	/* As macOS sets up this camera's IMX958 (appleh16camerad) */
+ 	.setfile_radial_gain = true,
+ 	.lsc_ideal_percent = 84,
++	/* The ADT's camera node declares auto-low-light-video, as macOS runs it */
++	.auto_low_light = true,
+ };
+ 
+ /*
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 2fe091c88d..ed3a45e59e 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -286,6 +286,8 @@ struct apple_isp_hw {
+ 	bool setfile_stride_fixup;
+ 	/* Compute the setfile's noise reduction radial gains from its lens shading */
+ 	bool setfile_radial_gain;
++	/* Auto exposure may lower the frame rate in low light by default */
++	bool auto_low_light;
+ 	/* The lens shading falloff to correct to, in percent at the corner (0: unset) */
+ 	u16 lsc_ideal_percent;
+ 	/* H17 firmware that takes the face-detection scene metering setup */
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index e484b94e46..594802d977 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -1280,11 +1280,14 @@ int apple_isp_setup_video(struct apple_isp *isp)
+ 	/*
+ 	 * Auto exposure is always on. By default it holds the frame rate, as
+ 	 * V4L2 specifies; with exposure priority it may slow down in low light.
++	 * Where macOS runs its camera with auto low-light video, exposure
++	 * priority is the default, so a dark room gets up to 1/15 s as there.
+ 	 */
+ 	v4l2_ctrl_handler_init(&isp->ctrl_handler, 4);
+ 	isp->exposure_priority =
+ 		v4l2_ctrl_new_std(&isp->ctrl_handler, NULL,
+-				  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1, 0);
++				  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1,
++				  isp->hw->auto_low_light);
+ 	/*
+ 	 * The H17 firmware's auto exposure avoids mains flicker at the given
+ 	 * frequency. 50 Hz is the default, as on macOS when it does not know
+diff --git a/tools/asahi/isp-camera-sizes-tests.py b/tools/asahi/isp-camera-sizes-tests.py
+index b5e87c5cec..debd2ca559 100755
+--- a/tools/asahi/isp-camera-sizes-tests.py
++++ b/tools/asahi/isp-camera-sizes-tests.py
+@@ -25,6 +25,7 @@ import tempfile
+ ROOT = Path(__file__).resolve().parents[2]
+ ISP = 'drivers/media/platform/apple/isp/'
+ FILES = ('isp-cam.c', 'isp-drv.c', 'isp-drv.h', 'isp-v4l2.c')
++T8132 = 'static const struct apple_isp_hw apple_isp_hw_t8132 = {'
+ 
+ MUTATIONS = {
+     'view-off': ('isp-cam.c', 'static bool wide_view = true;', 'static bool wide_view;'),
+@@ -35,6 +36,7 @@ MUTATIONS = {
+     'tall-offset': ('isp-cam.c', '\t.crop_offset = { 176, 400 },', '\t.crop_offset = { 176, 494 },'),
+     'offered-always': ('isp-cam.c', '\treturn !preset->wide_only || apple_isp_wide_view(isp);', '\treturn true;'),
+     'refactor-odd': ('isp-cam.c', '\t       !((source->crop_offset.x | source->crop_offset.y) & 1) &&\n', ''),
++    'low-light-off': ('isp-drv.c', '\t.auto_low_light = true,\n', ''),
+     'early-off': ('isp-cam.c', '\t    !(early_call_sizes || isp->hw->imx958_wide_cfg6))', '\t    !early_call_sizes)'),
+     'refactor-bound': ('isp-cam.c', '\t       source->crop_size.y <= source->input_dim.y - source->crop_offset.y;', '\t       true;'),
+ }
+@@ -183,6 +185,12 @@ PORTRAIT = {(1080, 1920): (980, 400, 1080, 1920), (1328, 1760): (856, 480, 1328,
+ 
+ def run(src, work):
+     cam, hdr = src['isp-cam.c'], src['isp-drv.h']
++    drv = src['isp-drv.c']
++    t8132 = drv[drv.index(T8132):drv.index('\n};\n', drv.index(T8132))]
++    if '\t.auto_low_light = true,' not in t8132:
++        fail('the T8132 camera must default to auto low-light video (exposure priority), as macOS')
++    if 'V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1,\n\t\t\t\t  isp->hw->auto_low_light);' not in src['isp-v4l2.c']:
++        fail('the exposure priority default must follow auto_low_light')
+     if '!(early_call_sizes || isp->hw->imx958_wide_cfg6)' not in func(cam, 'apple_isp_add_early_call_sizes'):
+         fail('the T8132 camera must list its call sizes (640x480) from probe')
+     for f in FILES:
+diff --git a/tools/asahi/run-host-tests.py b/tools/asahi/run-host-tests.py
+index 2f6db3b67a..7da377cb2e 100755
+--- a/tools/asahi/run-host-tests.py
++++ b/tools/asahi/run-host-tests.py
+@@ -240,7 +240,8 @@ ASAHI_TESTS = {
+         + mutations('--mutant', ('refill-count', 'no-retry', 'no-cancel', 'worker-allocation'), out()),
+     'isp-camera-sizes-tests.py': [(out(), PASS)]
+         + mutations('--mutation', ('view-off', 'window-0', 'tall-from-window', 'tall-unflagged', 'tall-offset',
+-                                   'offered-always', 'refactor-odd', 'refactor-bound', 'early-off'), out()),
++                                   'offered-always', 'refactor-odd', 'refactor-bound', 'early-off',
++                                   'low-light-off'), out()),
+     'tiled-split-tests.py': [(out(), PASS), (out() + ['--mutations'], PASS)],
+     'tunnel-route-tests.py': [(out(), PASS)],
+ }
+-- 
+2.43.0
+
