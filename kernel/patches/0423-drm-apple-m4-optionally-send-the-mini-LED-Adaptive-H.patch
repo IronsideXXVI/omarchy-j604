@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 04:14:38 +0000
+Subject: [PATCH] drm/apple: m4: optionally send the mini-LED Adaptive
+ Headroom mode
+
+On the J604's mini-LED panel any lit zone runs close to the SDR white
+level: a full-screen gray at code 64 (about 5 % of white's light) draws
+69 % of full white's backlight power, 50 % gray 73 %, while a black
+screen draws 4 % and a white box over a tenth of a black screen 17 %.
+Zones turn off for black, but their level hardly follows the content.
+
+macOS on the J604 holds BLMAHMode = 2 (Adaptive Headroom, the
+content-dependent backlight scaling) among the IOMFB runtime properties
+it publishes. In the 25G83 DCP firmware this is RuntimeProperty 171 of
+the property table whose id 126, IdleCachingMethod, this driver already
+sets through applyProperty (A467 {id, value}). Nothing in the tree sets
+or reads any BLM property.
+
+Add appledrm.blm_ah_mode. -1, the default, sends nothing. A value is sent
+to the internal panel's DCP with applyProperty from a work queued after
+the next swap, once, and again each time it is written; the reply is
+logged. This lets one boot compare the backlight power of the current
+behaviour and macOS's value before the default changes.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/iomfb_m4.c | 74 ++++++++++++++++++++++++++++++++
+ 1 file changed, 74 insertions(+)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 3441f005c2..678b74dae7 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -106,6 +106,42 @@ module_param_cb(idle_cache_ms, &idle_cache_ms_ops, &idle_cache_ms, 0644);
+ MODULE_PARM_DESC(idle_cache_ms,
+ 		 "J713: cache a static frame after this many ms without a flip (0: never, at most 60000; applies from the next swap)");
+ 
++/*
++ * The mini-LED backlight's Adaptive Headroom mode: DCP RuntimeProperty 171
++ * ("BLMAHMode" in the 25G83 firmware's property table), set from the AP with
++ * applyProperty (A467 {id, value}) like IdleCachingMethod (id 126). macOS on
++ * the J604 holds 2 (IOMobileFramebuffer "BLMAHMode" = 2, 26B123). -1 sends
++ * nothing; a value is sent once to the internal panel's DCP after the next
++ * swap, and again whenever it is written.
++ */
++#define DCP_M4_PROP_BLM_AH_MODE 171
++static int blm_ah_mode = -1;
++static atomic_t blm_ah_gen = ATOMIC_INIT(0);
++
++static int blm_ah_mode_set(const char *val, const struct kernel_param *kp)
++{
++	int v, ret = kstrtoint(val, 0, &v);
++
++	if (ret)
++		return ret;
++	if (v < -1 || v > 15)
++		return -EINVAL;
++	WRITE_ONCE(blm_ah_mode, v);
++	atomic_inc(&blm_ah_gen);
++	return 0;
++}
++
++static const struct kernel_param_ops blm_ah_mode_ops = {
++	.set = blm_ah_mode_set,
++	.get = param_get_int,
++};
++
++module_param_cb(blm_ah_mode, &blm_ah_mode_ops, &blm_ah_mode, 0644);
++static void iomfb_m4_blm_work(struct work_struct *work);
++
++MODULE_PARM_DESC(blm_ah_mode,
++		 "Internal mini-LED panel: BLM Adaptive Headroom mode sent to the DCP (RuntimeProperty 171; macOS on the J604: 2; -1: send nothing, the default; applies after the next swap)");
++
+ static unsigned int power_gate_ms;
+ /* Given on the command line or written: the machine default stays out. */
+ static bool power_gate_ms_given;
+@@ -501,6 +537,9 @@ struct iomfb_m4 {
+ 	struct thermal_cooling_device *xdr_cdev;
+ 	u32 xdr_asked, xdr_last_us;
+ 	struct delayed_work idle_cache;
++	/* Sends blm_ah_mode; blm_gen is the blm_ah_gen it last handled. */
++	struct delayed_work blm_work;
++	int blm_gen;
+ 	/*
+ 	 * Framebuffer references a window let go of, put
+ 	 * by ext_put_work outside the session lock
+@@ -3909,6 +3948,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
+ 	INIT_WORK(&dcp->ext_put_work, iomfb_m4_ext_put_work);
+ 	init_waitqueue_head(&dcp->ext_settle_wq);
+ 	INIT_DELAYED_WORK(&dcp->idle_cache, iomfb_m4_idle_cache_work);
++	INIT_DELAYED_WORK(&dcp->blm_work, iomfb_m4_blm_work);
+ 	INIT_DELAYED_WORK(&dcp->gate_work, iomfb_m4_gate_work);
+ 	spin_lock_init(&dcp->retire_lock);
+ 	INIT_WORK(&dcp->retire_work, iomfb_m4_retire_work);
+@@ -5293,6 +5333,39 @@ static void iomfb_m4_idle_cache_kick(struct iomfb_m4 *dcp)
+ 
+ 	if (ms && !READ_ONCE(dcp->owner->quiescing))
+ 		mod_delayed_work(dcp->runtime->wq, &dcp->idle_cache, msecs_to_jiffies(ms));
++	/* A new blm_ah_mode goes out from the work, outside the swap. */
++	if (!dcp->external && atomic_read(&blm_ah_gen) != dcp->blm_gen &&
++	    !READ_ONCE(dcp->owner->quiescing))
++		mod_delayed_work(dcp->runtime->wq, &dcp->blm_work, 0);
++}
++
++static void iomfb_m4_blm_work(struct work_struct *work)
++{
++	struct iomfb_m4 *dcp = container_of(to_delayed_work(work), struct iomfb_m4, blm_work);
++	struct { __le32 id, value; } method;
++	int gen, mode, ret;
++	__le32 out = 0;
++
++	mutex_lock(&dcp->lock);
++	gen = atomic_read(&blm_ah_gen);
++	mode = READ_ONCE(blm_ah_mode);
++	/* An RPC failure has already failed the session. */
++	if (READ_ONCE(dcp->owner->quiescing) || !dcp->runtime || dcp->external ||
++	    dcp->powered_off || gen == dcp->blm_gen)
++		goto out;
++	dcp->blm_gen = gen;
++	if (mode < 0)
++		goto out;
++	method.id = cpu_to_le32(DCP_M4_PROP_BLM_AH_MODE);
++	method.value = cpu_to_le32(mode);
++	ret = dcp_m4_runtime_live(dcp->runtime);
++	if (!ret)
++		ret = dcp_m4_runtime_call_stream(dcp->runtime, 467, 0, false, &method,
++						 sizeof(method), &out, sizeof(out));
++	dev_info(dcp->dev, "BLMAHMode %d sent: rpc %d, applyProperty status %#x\n",
++		 mode, ret, le32_to_cpu(out));
++out:
++	mutex_unlock(&dcp->lock);
+ }
+ 
+ static void iomfb_m4_idle_cache_work(struct work_struct *work)
+@@ -8478,6 +8551,7 @@ void iomfb_m4_quiesce(struct apple_dcp *owner)
+ 	flush_work(&dcp->retire_work);
+ 	/* After the flush, as drained callbacks can queue it. */
+ 	cancel_delayed_work_sync(&dcp->idle_cache);
++	cancel_delayed_work_sync(&dcp->blm_work);
+ 	cancel_delayed_work_sync(&dcp->gate_work);
+ }
+ 
+-- 
+2.43.0
+

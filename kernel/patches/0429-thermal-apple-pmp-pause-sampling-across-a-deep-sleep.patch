@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bartosz Nitka <niteria@gmail.com>
+Date: Thu, 12 Nov 2026 18:24:13 +0100
+Subject: [PATCH] thermal: apple-pmp: pause sampling across a deep
+ sleep
+
+A deep sleep stops the PMP. Sampling on through it, the 5 ms poll reads
+the stopped PMP's sensors and holds the CPUs at their minimum frequency,
+and the power worker, which needs a fresh die sample, fails and puts the
+P and E clusters and the GPU at their lowest power level. After every
+wake on the J713 the CPU caps took about a second to clear, and the GPU
+about 15 s to get back to full speed.
+
+Stop both samplers when a deep sleep's devices start to suspend, and
+start them again once every device has resumed. The power budget's
+clock restarts at the wake, so the sleep counts as neither a telemetry
+gap nor cool time that refills the bucket, and the GPU's published
+level is renewed until the next rail read.
+
+Assisted-by: LLM
+Signed-off-by: Bartosz Nitka <niteria@gmail.com>
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/thermal/apple-pmp-thermal.c | 49 +++++++++++++++++++++++++++++
+ 1 file changed, 49 insertions(+)
+
+diff --git a/drivers/thermal/apple-pmp-thermal.c b/drivers/thermal/apple-pmp-thermal.c
+index 5d8caf1502..56e949ef7d 100644
+--- a/drivers/thermal/apple-pmp-thermal.c
++++ b/drivers/thermal/apple-pmp-thermal.c
+@@ -30,6 +30,7 @@
+ #include <linux/soc/apple/pmp-cooling.h>
+ #include <linux/soc/apple/pmp-power-policy.h>
+ #include <linux/soc/apple/t8132.h>
++#include <linux/suspend.h>
+ #include <linux/thermal.h>
+ #include <linux/workqueue.h>
+ 
+@@ -117,6 +118,7 @@ static struct {
+ 	bool owner; /* apple-soc-cpufreq's unmanaged cap is released */
+ 	bool critical_dumped;
+ 	bool ready;
++	bool sleep_paused;
+ } pmp_thermal = {
+ 	.lock = __MUTEX_INITIALIZER(pmp_thermal.lock),
+ };
+@@ -904,6 +906,52 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++/*
++ * A deep sleep stops the PMP: sampling on through it would read its sensors stopped and
++ * restrict the CPUs and the GPU for seconds after the wake. Nothing runs to heat the die
++ * from the first device callback to the last, so neither sampler runs in between.
++ */
++static int apple_pmp_thermal_prepare(struct device *dev)
++{
++	if (!pm_suspend_via_firmware())
++		return 0;
++	if (pmp_thermal.polling) {
++		hrtimer_cancel(&pmp_thermal.poll_timer);
++		cancel_work_sync(&pmp_thermal.poll_work);
++	}
++	if (pmp_thermal.power_polling)
++		cancel_delayed_work_sync(&pmp_thermal.power_work);
++	pmp_thermal.sleep_paused = true;
++	return 0;
++}
++
++static void apple_pmp_thermal_complete(struct device *dev)
++{
++	struct apple_pmp_power_policy *p = &pmp_thermal.power;
++
++	if (!pmp_thermal.sleep_paused)
++		return;
++	pmp_thermal.sleep_paused = false;
++	scoped_guard(mutex, &pmp_thermal.lock) {
++		/* The sleep is no telemetry gap, nor cool time to refill the bucket. */
++		if (p->last_ns)
++			p->last_ns = ktime_get_ns();
++		if (p->active & BIT(2))
++			apple_pmp_gpu_publish(pmp_thermal.sensors, pmp_thermal.gpu_epoch,
++					      p->level[2], p->last_ns);
++	}
++	if (pmp_thermal.power_polling)
++		schedule_delayed_work(&pmp_thermal.power_work, msecs_to_jiffies(500));
++	if (pmp_thermal.polling)
++		hrtimer_start(&pmp_thermal.poll_timer, ms_to_ktime(APPLE_PMP_POLL_MS),
++			      HRTIMER_MODE_REL);
++}
++
++static const struct dev_pm_ops apple_pmp_thermal_pm_ops = {
++	.prepare = apple_pmp_thermal_prepare,
++	.complete = apple_pmp_thermal_complete,
++};
++
+ static void apple_pmp_thermal_remove(struct platform_device *pdev)
+ {
+ 	cancel_delayed_work_sync(&pmp_thermal.setup_work);
+@@ -915,6 +963,7 @@ static struct platform_driver apple_pmp_thermal_driver = {
+ 	.remove = apple_pmp_thermal_remove,
+ 	.driver = {
+ 		.name = "apple-pmp-thermal",
++		.pm = pm_sleep_ptr(&apple_pmp_thermal_pm_ops),
+ 	},
+ };
+ module_platform_driver(apple_pmp_thermal_driver);
+-- 
+2.43.0
+

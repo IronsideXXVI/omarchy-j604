@@ -1,0 +1,606 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sean Dolbec <sdolbec1@gmail.com>
+Date: Wed, 4 Nov 2026 14:56:03 -0500
+Subject: [PATCH] drm/asahi: g16: Select the J773g DVFS table from its
+ ADT
+
+The G16 driver builds its firmware DVFS table from the sixteen
+performance states of the original ADT, using a list of qualified
+ten-row index layouts: J713's (four single states, then six
+equal-voltage pairs) and J604's. The M4 Mac mini (J773g) has the J604
+shape: five single states, five equal-voltage pairs and a single top
+state at 1578 MHz. That is eleven distinct rows, and the J604 layout
+drops the fifth low state to fit in ten.
+
+Keep every state on J773g. Add an eleven-row J773g layout and give each
+layout its row count. The board pins the row count it is qualified
+for, ten on J713 and J604 and eleven on J773g, and only layouts with
+that count are tried, so the J604 and J773g layouts of the same shape
+cannot be confused. The table holds up to eleven rows with a count,
+Main 0xfc0 carries that count instead of a constant 10, and the
+encoder's ceiling is the last row.
+
+Nothing changes on J713 or J604: their layouts and order are kept, the
+host tests' measured J713 ADT gives the same ten rows, the J604-shaped
+case still selects the J604 layout on a ten-row board, and the
+qualified initdata goldens still match at ceilings 1, 4 and 9. The
+host tests use synthetic voltage bins rather than a measured chip's,
+and substitute them into those goldens before comparing; every other
+byte is compared unchanged.
+
+The runtime ceiling policy is unchanged: it publishes at most S9, and
+the hardware performance state is still refused above 9. On J773g the
+top row (S10, 1578 MHz) is in the tables but never requested; using it
+needs evidence of its own. The reported maximum frequency is the top
+row's.
+
+Tested on a J773g, on an earlier integration/aurora (19f71a142419), with
+a voltage-grouping selection that gives the same rows as the J773g
+layout: the live ADT gave eleven rows, main/auxiliary 0/0, 338/338,
+618/618, 796/796, 928/928, 1056/952, 1170/1053, 1278/1152, 1338/1204,
+1470/1326 and 1578/1578 MHz. Voltage bins differ per chip; the table is
+selected from its ADT. The firmware accepted these tables, reached
+READY and completed a compute job. This layout-based version has not
+been booted on hardware.
+
+Signed-off-by: Sean Dolbec <sdolbec1@gmail.com>
+[dylan: one tool trailer of the original message is not reproduced here]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/board.rs            |  24 ++--
+ drivers/gpu/drm/asahi/g16/board/data.rs       |  43 ++++---
+ drivers/gpu/drm/asahi/g16/boot.rs             |   8 ++
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs      |  25 +++-
+ drivers/gpu/drm/asahi/g16/glue.c              |  10 ++
+ drivers/gpu/drm/asahi/g16/glue.h              |   7 ++
+ drivers/gpu/drm/asahi/g16/initdata.rs         |  14 ++-
+ .../gpu/asahi-m4/check-initdata-bounds.rs     |  11 +-
+ .../drivers/gpu/asahi-m4/check-initdata.rs    |  25 ++--
+ .../drivers/gpu/asahi-m4/test-perf.py         | 107 +++++++++++++++---
+ 10 files changed, 216 insertions(+), 58 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/glue.h
+
+diff --git a/drivers/gpu/drm/asahi/g16/board.rs b/drivers/gpu/drm/asahi/g16/board.rs
+index 9d005164e6..7b0726b586 100644
+--- a/drivers/gpu/drm/asahi/g16/board.rs
++++ b/drivers/gpu/drm/asahi/g16/board.rs
+@@ -2,33 +2,39 @@
+ 
+ //! M4 board admission for the qualified firmware graph.
+ //!
+-//! M4 uses ten firmware rows selected from sixteen source states, including off, and sixteen
+-//! voltage lanes. The source values belong to this machine's preserved original ADT.
++//! M4 uses ten (J713, J604) or eleven (J773g) firmware rows selected from sixteen source
++//! states, including off, and sixteen voltage lanes. The source values belong to this
++//! machine's preserved original ADT.
+ 
+ pub(crate) mod data;
+ 
+ use super::adt::GpuAdt;
+-use super::fw::initdata::{Performance, PERF_STATES};
++use super::fw::initdata::Performance;
+ use kernel::{device, prelude::*};
+ 
+ /// Admit the qualified table layout while preserving every machine-specific source value.
+-/// Differently shaped tables and inconsistent voltage pairs fail before publication.
++/// Differently shaped tables, inconsistent voltage pairs and layouts with a row count other
++/// than the one qualified for this board fail before publication.
+ pub(crate) fn qualify(dev: &device::Device, adt: &GpuAdt) -> Result<Performance> {
+-    let (performance, layout) = data::select_named(&adt.performance).map_err(|error| {
++    let rows = super::boot::glue::perf_rows();
++    let (performance, layout) = data::select_named(&adt.performance, Some(rows)).map_err(|error| {
+         dev_err!(
+             dev,
+-            "M4 original ADT performance layout rejected: {:?}\n",
++            "M4 original ADT performance layout rejected for {} firmware rows: {:?}\n",
++            rows,
+             error
+         );
+         EINVAL
+     })?;
+     dev_info!(
+         dev,
+-        "M4 ADT DVFS: 16 source states -> 10 firmware rows ({} layout), top {} MHz\n",
++        "M4 ADT DVFS: {} source states -> {} firmware rows ({} layout), top {} MHz\n",
++        adt.performance.count,
++        performance.count,
+         layout,
+-        performance.frequency[PERF_STATES - 1]
++        performance.frequency[performance.count - 1]
+     );
+-    for i in 0..PERF_STATES {
++    for i in 0..performance.count {
+         dev_info!(
+             dev,
+             "M4 ADT DVFS S{}: main={} MHz auxiliary={} MHz core={} mV SRAM={} mV\n",
+diff --git a/drivers/gpu/drm/asahi/g16/board/data.rs b/drivers/gpu/drm/asahi/g16/board/data.rs
+index 6d18386727..9e68f62748 100644
+--- a/drivers/gpu/drm/asahi/g16/board/data.rs
++++ b/drivers/gpu/drm/asahi/g16/board/data.rs
+@@ -2,27 +2,30 @@
+ 
+ //! Qualified selections of the original ADT's sixteen performance states for 25G83.
+ //!
+-//! The firmware takes ten rows, each a main and an auxiliary frequency at one voltage. Every
+-//! qualified layout maps the sixteen ADT states onto those rows by index; the values are always
+-//! this machine's own, never frequencies or voltages copied from a reference machine.
++//! The firmware takes ten or eleven rows, each a main and an auxiliary frequency at one voltage.
++//! Every qualified layout maps the sixteen ADT states onto those rows by index; the values are
++//! always this machine's own, never frequencies or voltages copied from a reference machine.
+ 
+ pub(crate) const SOURCE_STATES: usize = 16;
+ 
+-/// One qualified mapping of the ADT states onto the firmware rows.
++/// One qualified mapping of the ADT states onto the first `rows` firmware rows.
+ pub(crate) struct Layout {
+     pub(crate) name: &'static str,
++    pub(crate) rows: usize,
+     pub(crate) main: [usize; PERF_STATES],
+     pub(crate) auxiliary: [usize; PERF_STATES],
+ }
+ 
+ /// Tried in order; a layout matches only when each row's two states share frequency, SRAM
+-/// frequency and both voltages, so the shapes below cannot be mistaken for each other.
+-pub(crate) const LAYOUTS: [Layout; 2] = [
++/// frequency and both voltages, so the J713 shape cannot be mistaken for the others. J604 and
++/// J773g have the same shape and differ only in their row count, which the board selects.
++pub(crate) const LAYOUTS: [Layout; 3] = [
+     // J713: four common low states followed by six equal-voltage pairs.
+     Layout {
+         name: "J713",
+-        main: [0, 1, 2, 3, 5, 7, 9, 11, 13, 15],
+-        auxiliary: [0, 1, 2, 3, 4, 6, 8, 10, 12, 14],
++        rows: 10,
++        main: [0, 1, 2, 3, 5, 7, 9, 11, 13, 15, 0],
++        auxiliary: [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 0],
+     },
+     // J604 (MacBook Pro 14-inch, M4): five low states, five equal-voltage pairs (5/6 to
+     // 13/14) and a single top state 15. Eleven distinct rows do not fit in ten, so the fifth
+@@ -30,8 +33,16 @@ pub(crate) struct Layout {
+     // their own ADT values.
+     Layout {
+         name: "J604",
+-        main: [0, 1, 2, 3, 6, 8, 10, 12, 14, 15],
+-        auxiliary: [0, 1, 2, 3, 5, 7, 9, 11, 13, 15],
++        rows: 10,
++        main: [0, 1, 2, 3, 6, 8, 10, 12, 14, 15, 0],
++        auxiliary: [0, 1, 2, 3, 5, 7, 9, 11, 13, 15, 0],
++    },
++    // J773g (Mac mini, M4): the J604 shape, with every state kept in eleven rows.
++    Layout {
++        name: "J773g",
++        rows: 11,
++        main: [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 15],
++        auxiliary: [0, 1, 2, 3, 4, 5, 7, 9, 11, 13, 15],
+     },
+ ];
+ 
+@@ -41,18 +52,23 @@ pub(crate) struct Layout {
+ pub(crate) fn select(
+     source: &super::super::adt::perf::Source,
+ ) -> core::result::Result<Performance, super::super::adt::perf::Error> {
+-    select_named(source).map(|(performance, _)| performance)
++    select_named(source, None).map(|(performance, _)| performance)
+ }
+ 
+-/// As [`select`], with the name of the layout that matched.
++/// As [`select`], with the name of the layout that matched. With `rows`, only the layouts with
++/// that row count, the one qualified for the board, are tried.
+ pub(crate) fn select_named(
+     source: &super::super::adt::perf::Source,
++    rows: Option<usize>,
+ ) -> core::result::Result<(Performance, &'static str), super::super::adt::perf::Error> {
+     use super::super::adt::perf::Error;
+     if source.count != SOURCE_STATES {
+         return Err(Error::Shape);
+     }
+     for layout in LAYOUTS.iter() {
++        if rows.is_some_and(|rows| rows != layout.rows) {
++            continue;
++        }
+         match select_layout(source, layout) {
+             Err(Error::Shape) => continue,
+             Err(error) => return Err(error),
+@@ -68,12 +84,13 @@ fn select_layout(
+ ) -> core::result::Result<Performance, super::super::adt::perf::Error> {
+     use super::super::adt::perf::Error;
+     let mut performance = Performance {
++        count: layout.rows,
+         frequency: [0; PERF_STATES],
+         auxiliary: [0; PERF_STATES],
+         voltage: [0; PERF_STATES],
+         sram: [0; PERF_STATES],
+     };
+-    for i in 0..PERF_STATES {
++    for i in 0..layout.rows {
+         let (main, aux) = (layout.main[i], layout.auxiliary[i]);
+         if source.frequency_mhz[main] != source.sram_frequency_mhz[main]
+             || source.frequency_mhz[aux] != source.sram_frequency_mhz[aux]
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index d46a813b6f..59a55df99a 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -45,6 +45,8 @@ pub(crate) mod glue {
+         fn asahi_g16_display_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+         fn asahi_g16_identify_board() -> bool;
+         fn asahi_g16_j604_board() -> bool;
++
++        fn asahi_g16_perf_rows() -> core::ffi::c_uint;
+         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
+         fn asahi_g16_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
+@@ -86,6 +88,12 @@ pub(crate) fn j604_board() -> bool {
+         unsafe { asahi_g16_j604_board() }
+     }
+ 
++    /// The firmware DVFS row count qualified for this board, or zero.
++    pub(crate) fn perf_rows() -> usize {
++        // SAFETY: Reads the machine compatible strings only.
++        unsafe { asahi_g16_perf_rows() as usize }
++    }
++
+     /// Holds the GFX power domain for the retained session.
+     pub(crate) fn hold_power(dev: &device::Device) -> Result {
+         // SAFETY: `dev` is a valid device; runtime-PM accounting on it has no other requirement.
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index 375c4b3ac8..5133183dcf 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -362,12 +362,15 @@ pub(crate) fn loader_encode(slot: usize, va: u64, record: &mut [u8]) -> Result<(
+     put64(out, 0x20, u64::from(e.mode))
+ }
+ 
+-pub(crate) const PERF_STATES: usize = 10;
++/// Capacity for the largest qualified table: J713 has ten rows, J773g eleven.
++pub(crate) const PERF_STATES: usize = 11;
+ 
+ /// Machine-specific values selected from the original ADT before firmware publication.
+ /// Frequencies are exact MHz, voltages are millivolts. No reference-bin defaults exist.
++/// Only the first `count` rows are used; the rest are zero.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub(crate) struct Performance {
++    pub(crate) count: usize,
+     pub(crate) frequency: [u32; PERF_STATES],
+     pub(crate) auxiliary: [u32; PERF_STATES],
+     pub(crate) voltage: [u32; PERF_STATES],
+@@ -376,7 +379,19 @@ pub(crate) struct Performance {
+ 
+ impl Performance {
+     pub(crate) fn valid(&self) -> bool {
+-        for i in 0..PERF_STATES {
++        if !(2..=PERF_STATES).contains(&self.count) {
++            return false;
++        }
++        for i in self.count..PERF_STATES {
++            if self.frequency[i] != 0
++                || self.auxiliary[i] != 0
++                || self.voltage[i] != 0
++                || self.sram[i] != 0
++            {
++                return false;
++            }
++        }
++        for i in 0..self.count {
+             if self.frequency[i] > 3000
+                 || self.auxiliary[i] > self.frequency[i]
+                 || ((i == 0) != (self.frequency[i] == 0))
+@@ -485,8 +500,8 @@ pub(crate) fn encode(
+     input: &Input,
+     ceiling: u32,
+ ) -> Result<(), ()> {
+-    if !(1..=9).contains(&ceiling)
+-        || !input.performance.valid()
++    if !input.performance.valid()
++        || !(1..input.performance.count as u32).contains(&ceiling)
+         || !object_va(input.scratch, 0x8000)
+         || !bootstrap_alias(input.lower_uma)
+         || !bootstrap_alias(input.lower_parameter)
+@@ -568,7 +583,7 @@ pub(crate) fn encode(
+         (0xed0, 24000),
+         (0xed4, 1),
+         (0xed8, 8),
+-        (0xfc0, 10),
++        (0xfc0, input.performance.count as u32),
+         (0x259c, 1),
+         (0x2544, 4),
+         (0x2548, 6),
+diff --git a/drivers/gpu/drm/asahi/g16/glue.c b/drivers/gpu/drm/asahi/g16/glue.c
+index ba990103fa..6084e88223 100644
+--- a/drivers/gpu/drm/asahi/g16/glue.c
++++ b/drivers/gpu/drm/asahi/g16/glue.c
+@@ -25,6 +25,8 @@
+ #include <linux/soc/apple/pmp-telemetry.h>
+ #include <linux/thermal.h>
+ 
++#include "glue.h"
++
+ bool asahi_g16_board(void);
+ bool asahi_g16_identify_board(void);
+ bool asahi_g16_j604_board(void);
+@@ -208,6 +210,14 @@ bool asahi_g16_board(void)
+ 	return apple_pmp_t8132_retained_board();
+ }
+ 
++/* Preserve the existing ten-row table except for the qualified J773g layout. */
++unsigned int asahi_g16_perf_rows(void)
++{
++	if (!apple_pmp_t8132_retained_board())
++		return 0;
++	return of_machine_is_compatible("apple,j773g") ? 11 : 10;
++}
++
+ /*
+  * Any T8132 machine. On one that asahi_g16_board() does not qualify, this
+  * only selects the "board not qualified" report; it never admits a board.
+diff --git a/drivers/gpu/drm/asahi/g16/glue.h b/drivers/gpu/drm/asahi/g16/glue.h
+new file mode 100644
+index 0000000000..c1c3adc3e2
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/glue.h
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++#ifndef _ASAHI_G16_GLUE_H
++#define _ASAHI_G16_GLUE_H
++
++unsigned int asahi_g16_perf_rows(void);
++
++#endif /* _ASAHI_G16_GLUE_H */
+diff --git a/drivers/gpu/drm/asahi/g16/initdata.rs b/drivers/gpu/drm/asahi/g16/initdata.rs
+index c03dc3e696..d10250f872 100644
+--- a/drivers/gpu/drm/asahi/g16/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/initdata.rs
+@@ -91,7 +91,9 @@ pub(crate) fn build(
+     objects: &mut Objects,
+ ) -> Result<(InitData, Channels, u32)> {
+     let performance = board::qualify(dev, adt)?;
+-    let max_khz = performance.frequency[wire::PERF_STATES - 1] * 1000;
++    // The top row: S9 on J713, S10 on J773g.
++    let ceiling = performance.count as u32 - 1;
++    let max_khz = performance.frequency[ceiling as usize] * 1000;
+     let mut graph = KVec::with_capacity(wire::OBJECT_COUNT, GFP_KERNEL)?;
+     for (i, size) in wire::OBJECT_SIZE.iter().copied().enumerate() {
+         let lower = match i {
+@@ -202,11 +204,11 @@ pub(crate) fn build(
+         }
+         let array: &mut [&mut [u8]; wire::OBJECT_COUNT] =
+             (&mut slices[..]).try_into().map_err(|_| EINVAL)?;
+-        wire::encode(array, &input, 9).map_err(|()| EINVAL)?;
++        wire::encode(array, &input, ceiling).map_err(|()| EINVAL)?;
+     }
+     let mut loader = KBox::<[u8; wire::LOADER_BYTES]>::zeroed(GFP_KERNEL)?;
+     loader.copy_from_slice(&images[id::MAIN][0x640..0x640 + wire::LOADER_BYTES]);
+-    // Host startup policy: Main and PowerPerformance contain S9, but the
++    // Host startup policy: Main and PowerPerformance contain the top row, but the
+     // published selectors remain S1 until the thermal owner admits a raise.
+     for at in globals::PSTATE_SELECTORS {
+         images[id::GLOBALS][at..at + 4].copy_from_slice(&100u32.to_le_bytes());
+@@ -215,7 +217,11 @@ pub(crate) fn build(
+         graph[i].write(0, &images[i])?;
+     }
+ 
+-    dev_info!(dev, "M4 initdata: 31 objects, 12 submit channel pairs, 42 loader records, S1 startup (S9 tables)\n");
++    dev_info!(
++        dev,
++        "M4 initdata: 31 objects, 12 submit channel pairs, 42 loader records, S1 startup (S{} tables)\n",
++        ceiling
++    );
+     Ok((
+         InitData {
+             globals: Some(graph[id::GLOBALS].clone()),
+diff --git a/tools/testing/selftests/drivers/gpu/asahi-m4/check-initdata-bounds.rs b/tools/testing/selftests/drivers/gpu/asahi-m4/check-initdata-bounds.rs
+index 29b51ee5ce..72eae3a009 100644
+--- a/tools/testing/selftests/drivers/gpu/asahi-m4/check-initdata-bounds.rs
++++ b/tools/testing/selftests/drivers/gpu/asahi-m4/check-initdata-bounds.rs
+@@ -6,12 +6,13 @@
+ fn emit<T>(out:&mut Vec<u8>, value:Result<T,()>)->Option<T> { out.push(u8::from(value.is_err()));value.ok() }
+ fn input()->wire::Input {
+     wire::Input {
+-        // Independently pinned qualified C/J713 bin for this immutable byte fixture.
++        // J713 frequencies with synthetic voltage bins.
+         performance: wire::Performance {
+-            frequency: [0,338,618,796,928,1056,1170,1278,1338,1470],
+-            auxiliary: [0,338,618,796,836,952,1053,1152,1204,1326],
+-            voltage: [125,610,645,680,725,780,825,865,895,970],
+-            sram: [780,780,780,780,780,780,825,865,895,970],
++            count: 10,
++            frequency: [0,338,618,796,928,1056,1170,1278,1338,1470,0],
++            auxiliary: [0,338,618,796,836,952,1053,1152,1204,1326,0],
++            voltage: [100,600,650,700,750,800,850,900,950,1000,0],
++            sram: [800,800,800,800,800,800,850,900,950,1000,0],
+         },
+         va: core::array::from_fn(|i|HOST+0x100000+i as u64*0x100000),
+         channel_state:core::array::from_fn(|i|HOST+0x4000000+i as u64*0x10000),
+diff --git a/tools/testing/selftests/drivers/gpu/asahi-m4/check-initdata.rs b/tools/testing/selftests/drivers/gpu/asahi-m4/check-initdata.rs
+index 97d526fbf5..98419052d4 100644
+--- a/tools/testing/selftests/drivers/gpu/asahi-m4/check-initdata.rs
++++ b/tools/testing/selftests/drivers/gpu/asahi-m4/check-initdata.rs
+@@ -7,12 +7,13 @@ fn input(variant: u64) -> initdata::Input {
+     let start = 0xfffffc2000000000u64;
+     let shift = variant * 0x100000000;
+     let mut input = initdata::Input {
+-        // Independently pinned qualified C/J713 bin for this immutable byte fixture.
++        // J713 frequencies with synthetic voltage bins.
+         performance: initdata::Performance {
+-            frequency: [0,338,618,796,928,1056,1170,1278,1338,1470],
+-            auxiliary: [0,338,618,796,836,952,1053,1152,1204,1326],
+-            voltage: [125,610,645,680,725,780,825,865,895,970],
+-            sram: [780,780,780,780,780,780,825,865,895,970],
++            count: 10,
++            frequency: [0,338,618,796,928,1056,1170,1278,1338,1470,0],
++            auxiliary: [0,338,618,796,836,952,1053,1152,1204,1326,0],
++            voltage: [100,600,650,700,750,800,850,900,950,1000,0],
++            sram: [800,800,800,800,800,800,850,900,950,1000,0],
+         },
+         va: core::array::from_fn(|i| start + shift + 0x100000 + i as u64 * 0x100000),
+         channel_state: core::array::from_fn(|i| start + shift + 0x4000000 + i as u64 * 0x10000),
+@@ -41,12 +42,22 @@ fn main() {
+         let mut slices: [&mut [u8]; initdata::OBJECT_COUNT] = buffers.each_mut().map(|buffer| buffer.as_mut_slice());
+         initdata::encode(&mut slices, &input(variant as u64), ceiling).expect("valid C fixture rejected");
+         let got: Vec<_> = buffers.into_iter().flatten().collect();
+-        let expected = std::fs::read(directory.join(format!("initdata-{variant}.bin"))).unwrap();
++        let mut expected =
++            std::fs::read(directory.join(format!("initdata-{variant}.bin"))).unwrap();
++        // Substitute synthetic voltages in the immutable C golden before comparison.
++        let main: usize = initdata::OBJECT_SIZE[..initdata::id::MAIN].iter().sum();
++        let perf = input(variant as u64).performance;
++        for i in 0..=ceiling as usize { for lane in 0..16 {
++            for (offset, value) in [(0x1008, perf.voltage[i]), (0x1408, perf.sram[i])] {
++                let at = main + offset + (i * 16 + lane) * 4;
++                expected[at..at+4].copy_from_slice(&value.to_le_bytes());
++            }
++        }}
+         if let Some(offset) = got.iter().zip(&expected).position(|(a, b)| a != b) {
+             panic!("initdata variant {variant} differs at {offset:#x}: C={:#x}, Rust={:#x}", expected[offset], got[offset]);
+         }
+         assert_eq!(got.len(), expected.len());
+         bytes_checked += got.len();
+     }
+-    println!("3 initdata fixtures / {bytes_checked} output bytes match qualified C exactly");
++    println!("3 initdata fixtures / {bytes_checked} bytes match C with synthetic voltages");
+ }
+diff --git a/tools/testing/selftests/drivers/gpu/asahi-m4/test-perf.py b/tools/testing/selftests/drivers/gpu/asahi-m4/test-perf.py
+index 36574512d4..0daa8ffdcd 100755
+--- a/tools/testing/selftests/drivers/gpu/asahi-m4/test-perf.py
++++ b/tools/testing/selftests/drivers/gpu/asahi-m4/test-perf.py
+@@ -66,11 +66,74 @@ fn encode(performance: wire::Performance) -> Result<[Vec<u8>; wire::OBJECT_COUNT
+ fn get32(bytes: &[u8], at: usize) -> u32 { u32::from_le_bytes(bytes[at..at+4].try_into().unwrap()) }
+ #[test] fn measured_original_adt_produces_qualified_tables() {
+     let s=source(); assert_eq!(s.count,16);
+-    let p=tables();
+-    assert_eq!(p.frequency,[0,338,618,796,928,1056,1170,1278,1338,1470]);
+-    assert_eq!(p.auxiliary,[0,338,618,796,836,952,1053,1152,1204,1326]);
+-    assert_eq!(p.voltage,[125,610,645,680,725,780,825,865,895,970]);
+-    assert_eq!(p.sram,[780,780,780,780,780,780,825,865,895,970]);
++    // Keep the original frequency layout but use synthetic voltage bins.
++    let mut s=s;
++    s.core_mv[..16].copy_from_slice(&[100,600,650,700,750,750,800,800,850,850,900,900,950,950,1000,1000]);
++    s.sram_mv[..16].copy_from_slice(&[800,800,800,800,800,800,800,800,850,850,900,900,950,950,1000,1000]);
++    let p=data::select(&s).unwrap(); assert_eq!(p.count,10);
++    assert_eq!(p.frequency,[0,338,618,796,928,1056,1170,1278,1338,1470,0]);
++    assert_eq!(p.auxiliary,[0,338,618,796,836,952,1053,1152,1204,1326,0]);
++    assert_eq!(p.voltage,[100,600,650,700,750,800,850,900,950,1000,0]);
++    assert_eq!(p.sram,[800,800,800,800,800,800,850,900,950,1000,0]);
++    assert_eq!(get32(&encode(p).unwrap()[wire::id::MAIN],0xfc0),10);
++}
++// J773g frequency layout with synthetic voltage bins, both with eleven groups.
++fn j773g(core: [u32; 16], sram: [u32; 16]) -> perf::Source {
++    let mhz=[0,338,618,796,928,952,1056,1053,1170,1152,1278,1204,1338,1326,1470,1578];
++    let mut s=source(); s.count=16;
++    s.frequency_mhz=[0;perf::MAX_STATES]; s.sram_frequency_mhz=[0;perf::MAX_STATES];
++    s.core_mv=[0;perf::MAX_STATES]; s.sram_mv=[0;perf::MAX_STATES];
++    s.frequency_mhz[..16].copy_from_slice(&mhz); s.sram_frequency_mhz[..16].copy_from_slice(&mhz);
++    s.core_mv[..16].copy_from_slice(&core); s.sram_mv[..16].copy_from_slice(&sram);
++    s
++}
++#[test] fn j773g_synthetic_bins_produce_eleven_rows_and_encode_all_of_them() {
++    for (core,sram,voltage,row_sram) in [
++        ([100,600,620,660,700,750,750,800,800,850,850,900,900,950,950,1000],
++         [740,740,740,740,740,750,750,800,800,850,850,900,900,950,950,1000],
++         [100,600,620,660,700,750,800,850,900,950,1000],
++         [740,740,740,740,740,750,800,850,900,950,1000]),
++        ([100,590,630,650,690,730,730,790,790,840,840,890,890,940,940,990],
++         [760,760,760,760,760,760,760,790,790,840,840,890,890,940,940,990],
++         [100,590,630,650,690,730,790,840,890,940,990],
++         [760,760,760,760,760,760,790,840,890,940,990]),
++    ] {
++        let (p,name)=data::select_named(&j773g(core,sram),Some(11)).unwrap();
++        assert_eq!(name,"J773g"); assert_eq!(p.count,11);
++        assert_eq!(p.frequency,[0,338,618,796,928,1056,1170,1278,1338,1470,1578]);
++        assert_eq!(p.auxiliary,[0,338,618,796,928,952,1053,1152,1204,1326,1578]);
++        assert_eq!(p.voltage,voltage); assert_eq!(p.sram,row_sram);
++        let mut buffers=wire::OBJECT_SIZE.map(|size|vec![0xa5;size]);
++        wire::encode(&mut buffers.each_mut().map(|b|b.as_mut_slice()),&input(p.clone()),10).unwrap();
++        let main=&buffers[wire::id::MAIN];
++        assert_eq!(get32(main,0xfc0),11); assert_eq!(get32(main,0xfc4),10);
++        for i in 0..11 {
++            assert_eq!(get32(main,0xfc8+i*4),p.frequency[i]);
++            assert_eq!(get32(main,0x1808+i*4),p.auxiliary[i]);
++            assert_eq!(get32(main,0x1008+i*16*4),p.voltage[i]);
++            assert_eq!(get32(main,0x1408+(i*16+15)*4),p.sram[i]);
++        }
++    }
++}
++#[test] fn the_row_count_bounds_the_encoded_ceiling() {
++    let j713=tables(); let j773g=data::select_named(&j773g(
++        [100,600,620,660,700,750,750,800,800,850,850,900,900,950,950,1000],
++        [740,740,740,740,740,750,750,800,800,850,850,900,900,950,950,1000]),Some(11)).unwrap().0;
++    for (p,good,bad) in [(j713,[1,9],[0,10]),(j773g,[1,10],[0,11])] {
++        for ceiling in good {
++            let mut buffers=wire::OBJECT_SIZE.map(|size|vec![0xa5;size]);
++            assert!(wire::encode(&mut buffers.each_mut().map(|b|b.as_mut_slice()),&input(p.clone()),ceiling).is_ok());
++            assert_eq!(get32(&buffers[wire::id::MAIN],0xfc0),p.count as u32);
++        }
++        for ceiling in bad {
++            let mut buffers=wire::OBJECT_SIZE.map(|size|vec![0xa5;size]);
++            assert!(wire::encode(&mut buffers.each_mut().map(|b|b.as_mut_slice()),&input(p.clone()),ceiling).is_err());
++            assert!(buffers.iter().all(|buffer|buffer.iter().all(|&byte|byte==0xa5)));
++        }
++    }
++    // Rows past the count must stay zero, and the count must match the rows.
++    let mut p=tables(); p.frequency[10]=1500; assert!(!p.valid());
++    let mut p=tables(); p.count=11; assert!(!p.valid());
+ }
+ #[test] fn different_real_bin_values_reach_all_firmware_lanes() {
+     let mut raw=MEASURED.to_vec();
+@@ -134,9 +197,12 @@ fn get32(bytes: &[u8], at: usize) -> u32 { u32::from_le_bytes(bytes[at..at+4].tr
+     let mut s=source();s.frequency_mhz[4]=s.frequency_mhz[5]+1;s.sram_frequency_mhz[4]=s.frequency_mhz[4];assert!(data::select(&s).is_err());
+     let mut s=source();s.frequency_mhz[7]=s.frequency_mhz[5];s.sram_frequency_mhz[7]=s.frequency_mhz[7];assert!(data::select(&s).is_err());
+     let mut s=source();s.core_mv[14]=600;s.core_mv[15]=600;assert!(data::select(&s).is_err());
++    // Three states at one voltage, and split pairs, match no layout.
++    let mut s=source();s.core_mv[6]=s.core_mv[5];s.sram_mv[6]=s.sram_mv[5];assert!(data::select(&s).is_err());
++    let mut s=source();s.core_mv[4]-=1;s.core_mv[6]-=1;assert!(data::select(&s).is_err());
+ }
+ #[test] fn j604_shape_selects_its_own_layout_and_the_j713_keeps_its_own() {
+-    assert_eq!(data::select_named(&source()).unwrap().1,"J713");
++    assert_eq!(data::select_named(&source(),None).unwrap().1,"J713");
+     // J604 shape: five low states, equal-voltage pairs 5/6 to 13/14, a single top state 15.
+     // Rows 0-3 and 5-15 are the J604's selected values; state 4 (left out) is synthetic.
+     let mhz=[0,338,618,796,928,952,1056,1053,1170,1152,1278,1204,1338,1326,1470,1578];
+@@ -146,16 +212,27 @@ fn get32(bytes: &[u8], at: usize) -> u32 { u32::from_le_bytes(bytes[at..at+4].tr
+         s.frequency_mhz[i]=mhz[i];s.sram_frequency_mhz[i]=mhz[i];
+         s.core_mv[i]=mv[i];s.sram_mv[i]=mv[i].max(780);
+     }
+-    let (p,name)=data::select_named(&s).unwrap();
+-    assert_eq!(name,"J604");
+-    assert_eq!(p.frequency,[0,338,618,796,1056,1170,1278,1338,1470,1578]);
+-    assert_eq!(p.auxiliary,[0,338,618,796,952,1053,1152,1204,1326,1578]);
+-    assert_eq!(p.voltage,[125,625,640,680,780,825,865,895,970,1045]);
+-    assert_eq!(p.sram,[780,780,780,780,780,825,865,895,970,1045]);
+-    assert!(encode(p).is_ok());
+-    // A J604 shape with one unequal pair matches neither layout.
++    let (p,name)=data::select_named(&s,None).unwrap();
++    assert_eq!(name,"J604"); assert_eq!(p.count,10);
++    assert_eq!(p.frequency,[0,338,618,796,1056,1170,1278,1338,1470,1578,0]);
++    assert_eq!(p.auxiliary,[0,338,618,796,952,1053,1152,1204,1326,1578,0]);
++    assert_eq!(p.voltage,[125,625,640,680,780,825,865,895,970,1045,0]);
++    assert_eq!(p.sram,[780,780,780,780,780,825,865,895,970,1045,0]);
++    assert!(encode(p.clone()).is_ok());
++    // The board's row count picks between the two layouts of this shape.
++    assert_eq!(data::select_named(&s,Some(10)).unwrap(),(p,"J604"));
++    let (p,name)=data::select_named(&s,Some(11)).unwrap();
++    assert_eq!(name,"J773g"); assert_eq!(p.count,11);
++    assert_eq!(p.frequency,[0,338,618,796,928,1056,1170,1278,1338,1470,1578]);
++    assert_eq!(p.auxiliary,[0,338,618,796,928,952,1053,1152,1204,1326,1578]);
++    // The J713 shape has no eleven-row layout, and no board has another row count.
++    assert_eq!(data::select_named(&source(),Some(10)).unwrap().1,"J713");
++    assert_eq!(data::select_named(&source(),Some(11)),Err(perf::Error::Shape));
++    for rows in [0,9,12] { assert_eq!(data::select_named(&s,Some(rows)),Err(perf::Error::Shape)); }
++    // A J604 shape with one unequal pair matches no layout.
+     let mut bad=s;bad.core_mv[9]+=1;bad.sram_mv[9]+=1;
+     assert_eq!(data::select(&bad),Err(perf::Error::Shape));
++    assert_eq!(data::select_named(&bad,Some(11)),Err(perf::Error::Shape));
+ }
+ #[test] fn invalid_encoder_input_is_refused_without_mutating_output() {
+     for variant in 0..5 {
+@@ -177,7 +254,7 @@ run = subprocess.run([str(binary), '--test-threads=1'], text=True, capture_outpu
+ print(run.stdout, end='')
+ print(run.stderr, end='')
+ run.check_returncode()
+-report = {'passed': True, 'test_groups': 8, 'hardware_validated': False,
++report = {'passed': True, 'test_groups': 10, 'hardware_validated': False,
+           'fixture_sha256': sha(fixture), 'original_adt_sha256': metadata['provenance']['source_sha256'],
+           'production_sha256': {str(p.relative_to(root)): sha(p) for p in
+               [backend / 'adt.rs', backend / 'adt/perf.rs', backend / 'board.rs', backend / 'board/data.rs', backend / 'initdata.rs', backend / 'fw/initdata.rs']}}
+-- 
+2.43.0
+

@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 04:16:01 +0000
+Subject: [PATCH] irqchip/apple-aic: let t8132_irq_cluster change at
+ runtime
+
+t8132_irq_cluster is read once at boot, so comparing IRQ delivery to the
+boot CPU and to another cluster takes a reboot per setting, and the
+power of each can then not be compared on one boot.
+
+Make it writable. A write first removes the cluster's hotplug state,
+whose offline callbacks hand IRQs back to the boot CPUs before the last
+CPU of the old cluster stops accepting them, then sets the state up for
+the new cluster, whose online callbacks move them there; -1 leaves them
+with the boot CPUs. Writes are serialized by their own lock, which the
+callbacks never take. The boot CPUs are now recorded on T8132 at EL2
+whatever the parameter says, so a later write knows where to give IRQs
+back. A value on the command line is applied by the late initcall as
+before; the default stays -1.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/irqchip/irq-apple-aic.c | 93 ++++++++++++++++++++++++++++-----
+ 1 file changed, 79 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/irqchip/irq-apple-aic.c b/drivers/irqchip/irq-apple-aic.c
+index fa06a7f2b2..d77f358cc3 100644
+--- a/drivers/irqchip/irq-apple-aic.c
++++ b/drivers/irqchip/irq-apple-aic.c
+@@ -431,12 +431,50 @@ static struct cpumask aic_irq_cpus;
+  * Effective affinity is still reported as before. -1 (the default) is off.
+  */
+ static int t8132_irq_cluster = -1;
+-module_param(t8132_irq_cluster, int, 0444);
+-MODULE_PARM_DESC(t8132_irq_cluster, "T8132: deliver AIC IRQs to the CPUs of this cluster (MPIDR Aff1) instead of the boot CPU (-1 = off)");
+ 
+ static struct cpumask aic_route_boot_cpus;	/* CPUs that accepted IRQs as booted */
+ static struct cpumask aic_route_cpus;		/* CPUs of the cluster now accepting */
+ static DEFINE_MUTEX(aic_route_lock);
++/*
++ * The cluster the hotplug callbacks route to, and their state (< 0: none).
++ * aic_route_param_lock serializes writes of t8132_irq_cluster; it is never
++ * held by the callbacks, which take aic_route_lock.
++ */
++static int aic_route_cluster = -1;
++static int aic_route_state = -1;
++static bool aic_route_ready;
++static DEFINE_MUTEX(aic_route_param_lock);
++static int aic_route_apply(int cluster);
++
++static int t8132_irq_cluster_set(const char *val, const struct kernel_param *kp)
++{
++	int cluster, ret;
++
++	ret = kstrtoint(val, 0, &cluster);
++	if (ret)
++		return ret;
++	if (cluster < -1 || cluster > 7)
++		return -EINVAL;
++	guard(mutex)(&aic_route_param_lock);
++	/* On the command line: aic_route_init() applies it. */
++	if (!aic_route_ready) {
++		t8132_irq_cluster = cluster;
++		return 0;
++	}
++	ret = aic_route_apply(cluster);
++	if (!ret)
++		t8132_irq_cluster = cluster;
++	return ret;
++}
++
++static const struct kernel_param_ops t8132_irq_cluster_ops = {
++	.set = t8132_irq_cluster_set,
++	.get = param_get_int,
++};
++
++module_param_cb(t8132_irq_cluster, &t8132_irq_cluster_ops, &t8132_irq_cluster, 0644);
++MODULE_PARM_DESC(t8132_irq_cluster,
++		 "T8132: CPU cluster (MPIDR Aff1) taking AIC IRQs (-1: the boot CPU, default)");
+ 
+ static void aic_handle_ipi(struct pt_regs *regs);
+ 
+@@ -1115,8 +1153,7 @@ static int aic_init_cpu(unsigned int cpu)
+ 	}
+ 
+ 	/* Which CPUs the boot chain left accepting IRQs, for t8132_irq_cluster. */
+-	if (aic_irqc->info.siq_cluster_route && t8132_irq_cluster >= 0 &&
+-	    is_kernel_in_hyp_mode() &&
++	if (aic_irqc->info.siq_cluster_route && is_kernel_in_hyp_mode() &&
+ 	    FIELD_GET(SIQ_CFG_ROUTE, read_sysreg_s(SYS_IMP_APL_SIQ_CFG_EL1)) !=
+ 	    SIQ_CFG_ROUTE_NONE)
+ 		cpumask_set_cpu(cpu, &aic_route_boot_cpus);
+@@ -1499,7 +1536,7 @@ static void aic_siq_route(void *accept)
+ 
+ static bool aic_route_in_cluster(unsigned int cpu)
+ {
+-	return MPIDR_CLUSTER(cpu_logical_map(cpu)) == t8132_irq_cluster;
++	return MPIDR_CLUSTER(cpu_logical_map(cpu)) == aic_route_cluster;
+ }
+ 
+ /* CPUHP_AP_ONLINE_DYN callbacks run on the CPU coming up or going down. */
+@@ -1537,26 +1574,54 @@ static int aic_route_offline(unsigned int cpu)
+ 	return 0;
+ }
+ 
+-static int __init aic_route_init(void)
++/*
++ * Under aic_route_param_lock. Removing the state runs the offline callbacks on
++ * the old cluster, which give IRQs back to the boot CPUs before the last of
++ * its CPUs stops accepting; setting it up for the new cluster then moves them.
++ */
++static int aic_route_apply(int cluster)
+ {
+ 	int ret;
+ 
+-	if (!aic_irqc || !aic_irqc->info.siq_cluster_route || t8132_irq_cluster < 0)
++	if (cluster == aic_route_cluster)
+ 		return 0;
+-	if (!is_kernel_in_hyp_mode() || cpumask_empty(&aic_route_boot_cpus)) {
+-		pr_warn("t8132_irq_cluster=%d ignored: not at EL2 or no boot IRQ CPU found\n",
+-			t8132_irq_cluster);
++	if (aic_route_state >= 0) {
++		cpuhp_remove_state(aic_route_state);
++		aic_route_state = -1;
++	}
++	aic_route_cluster = cluster;
++	if (cluster < 0) {
++		pr_info("IRQs back to the boot CPUs %*pbl\n",
++			cpumask_pr_args(&aic_route_boot_cpus));
+ 		return 0;
+ 	}
+ 	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "irqchip/apple-aic/route:online",
+ 				aic_route_online, aic_route_offline);
+ 	if (ret < 0) {
+-		pr_err("t8132_irq_cluster=%d: hotplug state failed (%d)\n", t8132_irq_cluster, ret);
+-		return 0;
++		pr_err("t8132_irq_cluster=%d: hotplug state failed (%d)\n", cluster, ret);
++		aic_route_cluster = -1;
++		return ret;
+ 	}
++	aic_route_state = ret;
+ 	pr_info("IRQs to cluster %d: CPUs %*pbl accept, boot CPUs were %*pbl\n",
+-		t8132_irq_cluster, cpumask_pr_args(&aic_route_cpus),
+-		cpumask_pr_args(&aic_route_boot_cpus));
++		cluster, cpumask_pr_args(&aic_route_cpus), cpumask_pr_args(&aic_route_boot_cpus));
++	return 0;
++}
++
++static int __init aic_route_init(void)
++{
++	if (!aic_irqc || !aic_irqc->info.siq_cluster_route)
++		return 0;
++	if (!is_kernel_in_hyp_mode() || cpumask_empty(&aic_route_boot_cpus)) {
++		if (t8132_irq_cluster >= 0)
++			pr_warn("t8132_irq_cluster=%d ignored: not at EL2 or no boot IRQ CPU found\n",
++				t8132_irq_cluster);
++		return 0;
++	}
++	guard(mutex)(&aic_route_param_lock);
++	aic_route_ready = true;
++	if (t8132_irq_cluster >= 0 && aic_route_apply(t8132_irq_cluster))
++		t8132_irq_cluster = -1;
+ 	return 0;
+ }
+ late_initcall(aic_route_init);
+-- 
+2.43.0
+

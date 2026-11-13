@@ -58,10 +58,10 @@ The J604 builds carried here, as installed on the machine on 2026-11-12 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`abd6d4a09ffe`, Aurora's tip), 422 patches | `1.875` |
+| `linux-aurora`, `linux-aurora-headers` | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`da8e1acf3656`, Aurora's tip), 448 patches | `1.878` |
 | `aura` | 1.0.0b12.1, aurora-silicon/aura (`54678354b7`), aurora-silicon/alarm-aurora recipe, 18 patches (0018 reverts 0017) | `1.610` (replaced `m1n1-aurora` on 2026-11-12) |
 | `uboot-aurora` | 2026.07.aurora11, aurora-silicon/u-boot (`250385f8c8`, the version Aurora packages), 1 patch | `1.604` |
-| `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261107, omacom/mesa (`b7b03c5b3b`) | `1.8140` |
+| `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261112, aurora-silicon/mesa (`33cf8cfc668`) | `1.8143` |
 | `alsa-ucm-conf-aurora` | 10.aurora3, aurora-silicon/alsa-ucm-conf-asahi (`b9b2d0c82c`) | `1.605` |
 | `aurora-audio` | 4.1.aurora3, aurora-silicon/asahi-audio (`06aec67a8a`) | `3.609` |
 | `speakersafetyd` | 2.0.1, AsahiLinux/speakersafetyd | `1.605` |
@@ -81,7 +81,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-12 (checked
 
 Also installed, unchanged from the official repositories: the rest of the edge userland; the Neural Engine stack (`omarchy-ane`, `omarchy-ane-dkms`, `mil-hwx-compiler`, `omarchy-mac-ml`), which we no longer rebuild. `j604-keyring` is a local keyring package that only signs the builds above; it has no source changes to publish.
 
-Since 2026-11-12 the Mac boots through Aurora's aura boot loader: the Stage 2 on the ESP (`m1n1/boot-ctxr.bin`) holds aura, the J604 device tree and U-Boot, and `asahi-scripts`' `update-m1n1` writes it as a trial and commits it after a good boot. Kernel 1.875 is on Aurora's tip (`abd6d4a09ffe`); `STATUS.md` lists what 1.703 to 1.875 changed over 1.617.
+Since 2026-11-12 the Mac boots through Aurora's aura boot loader: the Stage 2 on the ESP (`m1n1/boot-ctxr.bin`) holds aura, the J604 device tree and U-Boot, and `asahi-scripts`' `update-m1n1` writes it as a trial and commits it after a good boot. Kernel 1.878 is on Aurora's tip (`da8e1acf3656`); `STATUS.md` lists what 1.703 to 1.878 changed over 1.617.
 
 ## Layout
 
@@ -90,7 +90,7 @@ Since 2026-11-12 the Mac boots through Aurora's aura boot loader: the Stage 2 on
 | `kernel/` | `git format-patch` series (apply in `series` order); `BASE` names the commit it applies to and the official recipe | aurora-silicon/linux `integration/aurora` (built with the omacom `linux-aurora` recipe) | GPL-2.0 (see `kernel/COPYING`) |
 | `aura/` | J604 patches and the `aura` recipe (Aurora's boot loader; it replaced `m1n1-aurora` on 2026-11-12, whose last published `m1n1/` is in commit 6c7bda4) | aurora-silicon/aura (aurora-silicon/alarm-aurora recipe) | MIT and GPL-2.0-only (see `aura/LICENSE`) |
 | `uboot-aurora/` | J604 board patch and the `uboot-aurora` recipe | aurora-silicon/u-boot | GPL-2.0+ |
-| `mesa/` | T8132 patch, the "aurora" driver-name patch, seven G16 fixes from aurora-silicon/mesa, opt-in G16G sparse binding, the P010 conversion fix and the `mesa-aurora` recipe (builds `mesa-aurora` and `vulkan-aurora`) | omacom/mesa | MIT (main code) |
+| `mesa/` | the P010 conversion fix, opt-in G16G sparse binding, aurora-silicon/mesa#218 (GBM NV12 and P010 buffers, author kept) and the `mesa-aurora` recipe (builds `mesa-aurora` and `vulkan-aurora`) | aurora-silicon/mesa | MIT (main code) |
 | `alsa-ucm-conf-aurora/` | J604 headphone jack, microphone and speaker UCM | aurora-silicon/alsa-ucm-conf-asahi | BSD-3-Clause |
 | `aurora-audio/` | J604 speaker graph and microphone, plus upstream audio fixes | aurora-silicon/asahi-audio | MIT |
 | `speakersafetyd/` | J604 speaker protection profile | AsahiLinux/speakersafetyd | MIT |

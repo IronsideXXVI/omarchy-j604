@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 05:46:52 +0000
+Subject: [PATCH] iommu: apple-dart: let an idle-gated dcpext's display
+ DART sleep
+
+A T8132 external DCP with nothing attached is powered down after
+dcpext_idle_ms, its display domains with it. A deep sleep then skips its
+stop, as it is already down, and with it the prepare/off transaction of
+its display DART. That DART refuses any deep sleep outside the
+transaction: "genpd_suspend_noirq returns -16" for 48a300000.iommu.
+
+Add apple_dart_cio_gated(): the owner says its DCP is down for this deep
+sleep, so the DART's registers are not used and the sleep may go on. The
+DCP calls it for a gated DCP only. The mark is cleared at the DART's next
+resume or prepare, so each sleep sets it again from the DCP's state.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/iomfb_m4.c   |  7 +++++--
+ drivers/iommu/apple-dart-cio.c     | 15 +++++++++++++++
+ drivers/iommu/apple-dart.c         |  7 ++++++-
+ include/linux/soc/apple/dart-cio.h |  6 ++++++
+ 4 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index b01480363d..3a7097add3 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -8251,9 +8251,12 @@ int iomfb_m4_suspend(struct apple_dcp *owner)
+ 
+ 			if (session)
+ 				ret = iomfb_m4_ext_stop(dcp);
+-			/* Gated while idle, or stopped already: down for the sleep as it is. */
++			/*
++			 * Gated while idle, or stopped already: down for the sleep as
++			 * it is. A gated one ran no stop, so tell its display DART.
++			 */
+ 			if (ret == -EALREADY)
+-				ret = 0;
++				ret = dcp->gated ? apple_dart_cio_gated(dcp->ext_darts[1]) : 0;
+ 		}
+ 		mutex_unlock(&dcp->lock);
+ 		return ret;
+diff --git a/drivers/iommu/apple-dart-cio.c b/drivers/iommu/apple-dart-cio.c
+index e88fedbacf..713adf6b8f 100644
+--- a/drivers/iommu/apple-dart-cio.c
++++ b/drivers/iommu/apple-dart-cio.c
+@@ -98,6 +98,7 @@ int apple_dart_cio_prepare(struct apple_dart_cio *s)
+ 		s->restored = false;
+ 		s->tlb_stale = false;
+ 		dart->cio_active = true;
++		dart->cio_gated = false;
+ 		ret = 0;
+ 	}
+ 	spin_unlock_irqrestore(&dart->managed_lock, flags);
+@@ -107,6 +108,20 @@ int apple_dart_cio_prepare(struct apple_dart_cio *s)
+ }
+ EXPORT_SYMBOL_GPL(apple_dart_cio_prepare);
+ 
++/*
++ * Its owner was powered down while idle and stays down for this deep sleep,
++ * so no prepare/off/on/finish transaction runs: the DART's registers are not
++ * used and the sleep may go on. Cleared at its next resume or prepare.
++ */
++int apple_dart_cio_gated(struct apple_dart_cio *s)
++{
++	if (!s || !s->owner || pm_suspend_target_state != PM_SUSPEND_MEM)
++		return -EINVAL;
++	WRITE_ONCE(s->dart->cio_gated, true);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(apple_dart_cio_gated);
++
+ static int apple_dart_cio_gapf(struct apple_dart_cio *s, bool on)
+ {
+ 	u32 value;
+diff --git a/drivers/iommu/apple-dart.c b/drivers/iommu/apple-dart.c
+index 5bff70f207..7be0a3ecbe 100644
+--- a/drivers/iommu/apple-dart.c
++++ b/drivers/iommu/apple-dart.c
+@@ -496,6 +496,8 @@ struct apple_dart {
+ 	struct apple_dart_sleep *sleep_record;
+ 	struct apple_dart_cio *cio;
+ 	bool cio_active;
++	/* Its external DCP is down for this deep sleep: apple_dart_cio_gated(). */
++	bool cio_gated;
+ 	unsigned int sleep_writers;
+ 	bool sleep_closed;
+ 
+@@ -6303,7 +6305,7 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
+ 	 */
+ 	if (dart->dispext) {
+ 		if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+-			return -EBUSY;
++			return READ_ONCE(dart->cio_gated) ? 0 : -EBUSY;
+ 		if (apple_dart_has_borrowed(dart))
+ 			apple_dart_pm_invalidate(dart, true);
+ 		return 0;
+@@ -6689,6 +6691,9 @@ static __maybe_unused int apple_dart_sys_suspend_noirq(struct device *dev)
+ 
+ static __maybe_unused int apple_dart_sys_resume_noirq(struct device *dev)
+ {
++	struct apple_dart *dart = dev_get_drvdata(dev);
++
++	WRITE_ONCE(dart->cio_gated, false);
+ 	return pm_suspend_via_firmware() ? apple_dart_resume_noirq(dev) : 0;
+ }
+ 
+diff --git a/include/linux/soc/apple/dart-cio.h b/include/linux/soc/apple/dart-cio.h
+index 35cb98e3da..cc08f887d1 100644
+--- a/include/linux/soc/apple/dart-cio.h
++++ b/include/linux/soc/apple/dart-cio.h
+@@ -20,6 +20,7 @@ struct apple_dart_cio;
+ int apple_dart_cio_bind(struct device *owner, struct device *provider,
+ 			struct apple_dart_cio **state);
+ int apple_dart_cio_prepare(struct apple_dart_cio *state);
++int apple_dart_cio_gated(struct apple_dart_cio *state);
+ int apple_dart_cio_off(struct apple_dart_cio *state);
+ int apple_dart_cio_on(struct apple_dart_cio *state);
+ int apple_dart_cio_finish(struct apple_dart_cio *state);
+@@ -35,6 +36,11 @@ static inline int apple_dart_cio_prepare(struct apple_dart_cio *s)
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline int apple_dart_cio_gated(struct apple_dart_cio *s)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline int apple_dart_cio_off(struct apple_dart_cio *s)
+ {
+ 	return -EOPNOTSUPP;
+-- 
+2.43.0
+
