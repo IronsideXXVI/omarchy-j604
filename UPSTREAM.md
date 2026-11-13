@@ -66,7 +66,7 @@ These aurora-silicon/linux changes are in our kernel series under their authors'
 ## Direction we follow (SOURCE: Omarchy M team decisions and chat, Sep–Nov 2026)
 
 - Integrate into the main omacom repositories wherever practical: omacom/omarchy, omacom/omarchy-pkgs, omacom/omarchy-mac-pkgs, omacom/linux-aurora, omacom/m1n1.
-- **The kernel work for M4, M5 and M6 is merged together with Linux 7.3.** Our kernel series now applies to aurora-silicon/linux `integration/aurora` 7.3.0 (local 1.864, installed 2026-11-12; rebased onto Aurora's tip `cc7696978e4c` since 1.862) for that merge, rather than being sent as a separate J604 tree.
+- **The kernel work for M4, M5 and M6 is merged together with Linux 7.3.** Our kernel series now applies to aurora-silicon/linux `integration/aurora` 7.3.0 (local 1.865, installed 2026-11-12; rebased onto Aurora's tip `cc7696978e4c` since 1.862) for that merge, rather than being sent as a separate J604 tree.
 - Results are reported through [omarchy-m-testing.org](https://omarchy-m-testing.org), one result per check. "Not tested" is the default; an implementation alone is not a pass.
 
 ## How we work
