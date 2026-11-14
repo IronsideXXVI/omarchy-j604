@@ -1073,3 +1073,5 @@ New in 1.910: 0581 (`soc: apple: sleep: mark the T8132 wake's progress in WD2`),
 New in 1.913: 0588 (`thermal: apple-pmp: poll the raw sensor every 50 ms while cool`), 0589 (`media: apple: isp: drop the T8132 first-open workarounds`), 0590 (`arm64: dts: apple: t8132-j604: publish the SMC's power channels`), 0591 (`soc: apple: sleep: mark __cpu_setup on the T8132 wake, clear OS lock`), 0592 (`ASoC: cs42l84: acknowledge the remote status latch under macOS's probe sequence`), 0593 (`drm/asahi: G16: admit twice as many jobs per queue as it has units`).
 
 New in 1.914: 0594 (`arm64: dts: apple: t8132-j604: write the HDMI converter power the ADT way`), 0595 (`drm/asahi: G16: count doorbells in the Globals tally as macOS does`).
+
+New in 1.915: 0596 (`soc: apple: sleep: mark the T8132 wake up to init_kernel_el`), 0597 (`pmdomain: apple: pmp-report: T8132 memory bandwidth vote`).

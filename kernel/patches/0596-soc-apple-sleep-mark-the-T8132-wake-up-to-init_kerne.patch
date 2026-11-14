@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 19:20:39 +0000
+Subject: [PATCH] soc: apple: sleep: mark the T8132 wake up to
+ init_kernel_el
+
+The J604 deep wake reset at alarm + 69.6 s. The stub's 60 s WD2
+restart lands about 9.6 s after the alarm (8.5 to 9.6 s on every
+earlier run), so this was its window: the woken core never wrote the
+70 s mark after init_kernel_el. Nothing between the stub's WD2 stores
+and that mark is told apart yet.
+
+Mark that stretch, with the reset time as the only output:
+ - in the stub, a dsb after the 60 s restart, then a 45 s restart and
+   a magic in x23;
+ - at cpu_resume, a 150 s mark that needs no memory access, taken only
+   when x23 holds the magic, then a 160 s mark (a load of the flag)
+   just before init_kernel_el.
+Each mark also takes the stub's fault vectors again.
+
+The reset also loses the kernel pointer authentication keys, and
+nothing on the resume path puts them back before cpu_suspend's frame
+returns through them. Install the current task's kernel keys right
+after cpu_do_resume.
+
+All of it only when the sleep driver armed the T8132 wake.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ arch/arm64/include/asm/t8132-wake.h | 28 ++++++++++++++++++++++++++++
+ arch/arm64/kernel/sleep.S           | 15 +++++++++++++++
+ drivers/soc/apple/sleep.c           | 16 ++++++++++++++++
+ 3 files changed, 59 insertions(+)
+
+diff --git a/arch/arm64/include/asm/t8132-wake.h b/arch/arm64/include/asm/t8132-wake.h
+index 6c2b4a206f..797a83b9ad 100644
+--- a/arch/arm64/include/asm/t8132-wake.h
++++ b/arch/arm64/include/asm/t8132-wake.h
+@@ -2,6 +2,9 @@
+ #ifndef __ASM_T8132_WAKE_H
+ #define __ASM_T8132_WAKE_H
+ 
++/* Left in x23 by the T8132 resume stub: "t8132wk1". */
++#define T8132_WAKE_MAGIC	0x7438313332776b31
++
+ #ifdef __ASSEMBLY__
+ #ifdef CONFIG_APPLE_SOC_SLEEP
+ /*
+@@ -39,6 +42,29 @@
+ .Lt8132_unvec_\@:
+ 	.endm
+ 
++/*
++ * The same mark without a memory access: only when x23 holds the stub's
++ * magic, so it says whether the woken core got here before its first load.
++ */
++	.macro	t8132_wake_mark_reg, secs
++	mov_q	x9, T8132_WAKE_MAGIC
++	cmp	x23, x9
++	b.ne	.Lt8132_markr_\@
++	movz	x9, #0x882b, lsl #16
++	movk	x9, #0x3, lsl #32
++	str	wzr, [x9, #0x2c]
++	str	wzr, [x9, #0x20]
++	mov_q	x10, (\secs * 24000000)
++	str	w10, [x9, #0x28]
++	mov	w10, #1
++	str	w10, [x9, #0x2c]
++	adr_l	x10, t8132_wake_vectors
++	msr	vbar_el2, x10
++	isb
++.Lt8132_markr_\@:
++	mov	x23, xzr
++	.endm
++
+ /*
+  * Clear the OS lock on the woken core before __cpu_setup. A core coming
+  * out of reset has it set; at boot m1n1 clears it on every core before
+@@ -59,6 +85,8 @@
+ 	.endm
+ 	.macro	t8132_wake_oslar
+ 	.endm
++	.macro	t8132_wake_mark_reg, secs
++	.endm
+ #endif
+ #endif /* __ASSEMBLY__ */
+ 
+diff --git a/arch/arm64/kernel/sleep.S b/arch/arm64/kernel/sleep.S
+index 077bb31381..4a9f16ac00 100644
+--- a/arch/arm64/kernel/sleep.S
++++ b/arch/arm64/kernel/sleep.S
+@@ -3,6 +3,7 @@
+ #include <linux/linkage.h>
+ #include <asm/asm-offsets.h>
+ #include <asm/assembler.h>
++#include <asm/asm_pointer_auth.h>
+ #include <asm/t8132-wake.h>
+ #include <asm/smp.h>
+ 
+@@ -104,6 +105,8 @@ SYM_CODE_START(cpu_resume)
+ #ifdef CONFIG_ARM64_CTXR_EXECMEM
+ 	mov	x22, #1				// a resuming CPU may be confined
+ #endif
++	t8132_wake_mark_reg 150
++	t8132_wake_mark 160
+ 	bl	init_kernel_el
+ 	mov	x19, x0			// preserve boot mode
+ 	t8132_wake_mark 70
+@@ -147,6 +150,18 @@ SYM_FUNC_START(_cpu_resume)
+ 	 * cpu_do_resume expects x0 to contain context address pointer
+ 	 */
+ 	bl	cpu_do_resume
++#ifdef CONFIG_APPLE_SOC_SLEEP
++	/*
++	 * The T8132 wake reset this core: give it the kernel keys the frames
++	 * below were signed with before any of them returns.
++	 */
++	adr_l	x9, t8132_wake_marks
++	ldr	w9, [x9]
++	cbz	w9, 1f
++	get_current_task x1
++	ptrauth_keys_install_kernel x1, x8, x9, x10
++1:
++#endif
+ 
+ #if defined(CONFIG_KASAN) && defined(CONFIG_KASAN_STACK)
+ 	mov	x0, sp
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 7eed9ffde4..12a0ca6fd9 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -3315,6 +3315,10 @@ static void t8140_wake(struct apple_sleep *s)
+  * waits, for 10 s on an instruction abort, 20 s on a data abort and 30 s on anything
+  * else, so the reset time says which, and a hang still takes the 60 s.
+  * init_kernel_el sets the kernel's own vectors, as on a cold boot.
++ *
++ * After the 60 s restart, a dsb and a 45 s restart: a reset in the 60 s window then
++ * means the core stalled on the barrier behind its own WD2 stores, one in the 45 s
++ * window that it never reached cpu_resume's first mark. x23 carries a magic there.
+  */
+ asm(
+ "	.pushsection .text, \"ax\"\n"
+@@ -3342,6 +3346,18 @@ asm(
+ "	str	w10, [x9, #0x28]\n"
+ "	mov	w10, #1\n"
+ "	str	w10, [x9, #0x2c]\n"
++"	dsb	sy\n"
++"	str	wzr, [x9, #0x2c]\n"
++"	str	wzr, [x9, #0x20]\n"
++"	movz	w10, #0x7e00\n"
++"	movk	w10, #0x405f, lsl #16\n"
++"	str	w10, [x9, #0x28]\n"
++"	mov	w10, #1\n"
++"	str	w10, [x9, #0x2c]\n"
++"	movz	x23, #0x6b31\n"
++"	movk	x23, #0x3277, lsl #16\n"
++"	movk	x23, #0x3133, lsl #32\n"
++"	movk	x23, #0x7438, lsl #48\n"
+ "	b	cpu_resume\n"
+ "	.size	t8132_resume_stub, . - t8132_resume_stub\n"
+ "	.balign	2048\n"
+-- 
+2.43.0
+

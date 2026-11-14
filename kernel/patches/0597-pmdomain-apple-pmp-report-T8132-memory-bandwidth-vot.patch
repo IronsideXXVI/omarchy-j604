@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 19:26:06 +0000
+Subject: [PATCH] pmdomain: apple: pmp-report: T8132 memory bandwidth
+ vote
+
+Under a CPU memory load macOS on the J604 (T8132) writes the PMP's
+SOC-DEV-DVFS entries 409 and 411, always as a pair, at main level
+0x10-0x12 (0x13 while it measures latency) and at 0-5 when idle. Linux
+never writes either entry, and a single thread reads memory at 47-59 %
+of macOS's bandwidth on the same benchmark even with the CPU at its top
+frequency.
+
+Add t8132_bw_vote, a runtime parameter that writes both entries at the
+given main level, through the DVFS shadow so that a system sleep's wake
+writes the vote again, and that a vote set on the command line is
+handed over once the PMP runs. 0, the default, writes both entries
+empty again, which is how Linux runs without it. It allows the vote to
+be measured against bandwidth on one boot before a load-driven policy
+follows.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/pmdomain/apple/pmp-report.c | 60 +++++++++++++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+diff --git a/drivers/pmdomain/apple/pmp-report.c b/drivers/pmdomain/apple/pmp-report.c
+index 95246ad2a5..78320904d8 100644
+--- a/drivers/pmdomain/apple/pmp-report.c
++++ b/drivers/pmdomain/apple/pmp-report.c
+@@ -484,6 +484,64 @@ static void apple_pmp_report_t8132_dvfs_trial(struct apple_pmp_report *rep)
+ 		 t8132_dvfs_entry, t8132_dvfs_entry, word);
+ }
+ 
++/*
++ * T8132 memory bandwidth vote (default off). Under a CPU memory load macOS
++ * writes SOC-DEV-DVFS entries 409 and 411, always as a pair, at main level
++ * 0x10-0x12 (0x13 for latency), and at 0-5 when idle; Linux never writes them.
++ * Both entries take the same level here. 0 writes both entries empty again,
++ * which is how Linux runs without this vote. Runtime, for an A/B of the vote
++ * against bandwidth; the word is kept in the DVFS shadow across a sleep.
++ */
++#define T8132_BW_VOTE_ENTRY_A	409
++#define T8132_BW_VOTE_ENTRY_B	411
++
++static unsigned int t8132_bw_vote;
++
++static void apple_pmp_report_t8132_bw_vote(struct apple_pmp_report *rep, unsigned int level)
++{
++	const struct apple_pmp_report_offsets *offs = rep->offsets;
++	u64 word = 0;
++
++	if (offs != &apple_pmp_offsets_t8132 || !rep->dvfs_shadow ||
++	    offs->dvfs_first > T8132_BW_VOTE_ENTRY_A ||
++	    offs->dvfs_first + offs->dvfs_count <= T8132_BW_VOTE_ENTRY_B)
++		return;
++	if (level && !apple_pmp_dvfs_word(level, NULL, 0, &word))
++		return;
++	apple_pmp_report_dvfs_write(rep, T8132_BW_VOTE_ENTRY_A, word);
++	apple_pmp_report_dvfs_write(rep, T8132_BW_VOTE_ENTRY_B, word);
++	dev_info(rep->dev, "t8132 bandwidth vote: entries %u + %u = %#llx\n",
++		 T8132_BW_VOTE_ENTRY_A, T8132_BW_VOTE_ENTRY_B, word);
++}
++
++static int apple_pmp_report_bw_vote_set(const char *val, const struct kernel_param *kp)
++{
++	struct apple_pmp_report *rep;
++	unsigned int level;
++	int ret;
++
++	ret = kstrtouint(val, 0, &level);
++	if (ret)
++		return ret;
++	if (level > PMP_DVFS_MAIN_LEVEL_MAX)
++		return -EINVAL;
++
++	guard(mutex)(&apple_pmp_reports_lock);
++	WRITE_ONCE(t8132_bw_vote, level);
++	list_for_each_entry(rep, &apple_pmp_reports, list)
++		if (apple_pmp_report_running(rep))
++			apple_pmp_report_t8132_bw_vote(rep, level);
++	return 0;
++}
++
++static const struct kernel_param_ops apple_pmp_report_bw_vote_ops = {
++	.set = apple_pmp_report_bw_vote_set,
++	.get = param_get_uint,
++};
++module_param_cb(t8132_bw_vote, &apple_pmp_report_bw_vote_ops, &t8132_bw_vote, 0644);
++MODULE_PARM_DESC(t8132_bw_vote,
++		 "T8132: main level for the memory bandwidth vote, SOC-DEV-DVFS entries 409 + 411 (macOS: 0x10-0x12 under CPU memory load); 0 = no vote (default)");
++
+ /*
+  * Wait for the PMP to run, then hand it every request made so far, as macOS
+  * does for each PMP-notified device that is already powered on.
+@@ -521,6 +579,8 @@ static void apple_pmp_report_ready_work(struct work_struct *work)
+ 	dev_info(rep->dev, "PMP running (status %#llx), requests %#llx\n",
+ 		 readq(rep->base + offs->status), want);
+ 	apple_pmp_report_t8132_dvfs_trial(rep);
++	if (READ_ONCE(t8132_bw_vote))
++		apple_pmp_report_t8132_bw_vote(rep, READ_ONCE(t8132_bw_vote));
+ }
+ 
+ /* A report names its PMP where a SoC has more than one kind of link to it. */
+-- 
+2.43.0
+
