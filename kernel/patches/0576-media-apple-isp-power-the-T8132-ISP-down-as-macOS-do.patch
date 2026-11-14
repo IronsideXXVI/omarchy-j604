@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 16:18:28 +0000
+Subject: [PATCH] media: apple: isp: power the T8132 ISP down as macOS
+ does
+
+macOS powers the J604's ISP (M4 MacBook Pro 14", T8132) down with the
+stop request, the WFI status check, GPIO_1 = 0xfeedbabe, the fabric
+park bits in COPROC+0xc00, three reads of the words after the four
+fabric words, the quiesce request and the core park words. It never
+writes the coprocessor control word 0 and never writes the fabric
+words; read from the ISP's MMIO in two macOS camera sessions. This
+driver writes control 0 and the fabric words 0 at every power-down.
+
+On T8132 leave both alone by default, read the words after the fabric
+words as macOS does, and let the next boot accept the start word the
+domain kept after such a power-down; the boot still writes 0 then
+0x10. macos_stop=N gives back the old power-down.
+
+The first camera stream after system boot fails its firmware boot
+once; this is a candidate cause.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/isp/isp-drv.c |  2 ++
+ drivers/media/platform/apple/isp/isp-drv.h |  4 +++
+ drivers/media/platform/apple/isp/isp-fw.c  | 35 +++++++++++++++++++---
+ 3 files changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index 64505aaae8..89431c4e32 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -1334,6 +1334,8 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
+ 	.min_off_ms = 1500,
+ 	/* Its first stream after the detection fails stage 1 once (1.902, 1.905) */
+ 	.boot_retries = 2,
++	/* macOS never writes its control word 0 or its fabric words (q9-cam-cmd-3) */
++	.macos_stop = true,
+ };
+ 
+ /*
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 78d71b9e8b..5d20c05dfe 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -320,6 +320,8 @@ struct apple_isp_hw {
+ 	unsigned int min_off_ms;
+ 	/* Boot again after a failed firmware boot, this many times at most */
+ 	unsigned int boot_retries;
++	/* Power down as macOS does: no control word or fabric word writes */
++	bool macos_stop;
+ };
+ 
+ enum isp_sensor_id {
+@@ -446,6 +448,8 @@ struct apple_isp {
+ 	void __iomem *core_park[2];
+ 	/* When the ISP domains were last powered down (0: not since boot) */
+ 	ktime_t off_at;
++	/* The last power-down left the coprocessor control word as it was */
++	bool macos_stopped;
+ 	void __iomem *pre_dart;
+ 	void __iomem *dart_setup[3];
+ 	struct device *dapf_dart;
+diff --git a/drivers/media/platform/apple/isp/isp-fw.c b/drivers/media/platform/apple/isp/isp-fw.c
+index 8275eb84bc..94a4a376af 100644
+--- a/drivers/media/platform/apple/isp/isp-fw.c
++++ b/drivers/media/platform/apple/isp/isp-fw.c
+@@ -46,6 +46,16 @@ MODULE_PARM_DESC(macos_irq_enables,
+  * Park the ISP CPU cores at power-down in macOS's order where that is
+  * known (T8132): macOS 26B123 writes the same words on every clean stop.
+  */
++/*
++ * macOS powers the T8132 ISP down without writing the coprocessor control
++ * word 0 and without writing the fabric words, which it only reads at
++ * +0x4. macos_stop=N writes both again, as before.
++ */
++static bool macos_stop = true;
++module_param(macos_stop, bool, 0644);
++MODULE_PARM_DESC(macos_stop,
++		 "Power the ISP down as macOS does where known, e.g. T8132: leave the control and fabric words alone (default: on)");
++
+ static bool core_park = true;
+ module_param(core_park, bool, 0644);
+ MODULE_PARM_DESC(core_park,
+@@ -423,7 +433,11 @@ static int isp_check_coproc_t6040(struct apple_isp *isp)
+ 	u32 control = isp_coproc_read32(isp, isp_coproc_control(isp));
+ 	u64 rvbar = readq(isp->coproc + ISP_COPROC_RVBAR);
+ 
+-	if (control) {
++	/*
++	 * A macOS-style power-down leaves the start word (0x10) where the
++	 * domain kept it; the boot writes 0 then 0x10 as for a fresh start.
++	 */
++	if (control && !(isp->macos_stopped && control == 0x10)) {
+ 		isp_err(isp, "coprocessor already started (control 0x%x)\n",
+ 			control);
+ 		return -EBUSY;
+@@ -537,12 +551,22 @@ static int isp_coproc_entry(struct apple_isp *isp)
+ }
+ 
+ /* before the quiesce: bits 24-25 of the park word, then the fabric words */
+-static void isp_park_fabric(struct apple_isp *isp)
++static void isp_park_fabric(struct apple_isp *isp, bool macos)
+ {
+ 	u32 val = isp_coproc_read32(isp, ISP_COPROC_PARK_T8132);
+ 
+ 	isp_coproc_write32(isp, ISP_COPROC_PARK_T8132,
+ 			   val & ~ISP_COPROC_PARK_CLR_T8132);
++	if (macos) {
++		/* macOS reads the word after each fabric word, three times */
++		for (unsigned int i = 0; i < 3; i++) {
++			isp_coproc_read32(isp, ISP_COPROC_FABRIC_0_T8140 + 4);
++			isp_coproc_read32(isp, ISP_COPROC_FABRIC_1_T8140 + 4);
++			isp_coproc_read32(isp, ISP_COPROC_FABRIC_2_T8140 + 4);
++			isp_coproc_read32(isp, ISP_COPROC_FABRIC_3_T8140 + 4);
++		}
++		return;
++	}
+ 	isp_coproc_write32(isp, ISP_COPROC_FABRIC_0_T8140, 0x0);
+ 	isp_coproc_write32(isp, ISP_COPROC_FABRIC_1_T8140, 0x0);
+ 	isp_coproc_write32(isp, ISP_COPROC_FABRIC_2_T8140, 0x0);
+@@ -566,6 +590,7 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
+ 	/* Only a coprocessor that was started has to settle and quiesce */
+ 	bool started = isp->hw->coproc_quiesce &&
+ 		       isp_coproc_read32(isp, isp_coproc_control(isp));
++	bool macos = READ_ONCE(macos_stop) && isp->hw->macos_stop;
+ 	bool park;
+ 	u32 val;
+ 
+@@ -576,11 +601,12 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
+ 		dev_warn(isp->dev, "coproc not in WFI before power-down (status 0x%x)\n",
+ 			 val);
+ 
+-	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
++	if (!macos)
++		isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
+ 
+ 	park = started && core_park && isp->core_park[0];
+ 	if (park)
+-		isp_park_fabric(isp);
++		isp_park_fabric(isp, macos);
+ 
+ 	if (started) {
+ 		/* The request bit alone asks for it, and reads back once done */
+@@ -595,6 +621,7 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
+ 
+ 	apple_isp_power_down_domains(isp);
+ 	isp->off_at = ktime_get();
++	isp->macos_stopped = macos;
+ }
+ 
+ /*
+-- 
+2.43.0
+

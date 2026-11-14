@@ -1,0 +1,271 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 16:11:46 +0000
+Subject: [PATCH] drm/asahi: G16: let up to three compute commands
+ queue behind a running one
+
+With one compute command allowed behind its running predecessor, the
+J604 ran compute.light at 124 us per submit (macOS: 21 us). The chain
+statistics show why: 30318 commands went ahead with a 32 us gap, but
+74866 still ran serially with a ~200 us gap, because every second
+command had to wait for the host to notice a retirement and publish
+again. macOS keeps many compute commands in the ring at once.
+
+Each command in flight needs its own compute unit, which binds its own
+split UMA slot (compute 1 + k of the 32 per class of the 25G83 layout).
+There were two. Allocate four: units 2 and 3 take the next 64 MiB
+intervals below the render units, so nothing else moves, and only VMs
+that run compute allocate them.
+
+g16_horizon becomes a count: the number of compute commands that may
+be queued behind a running one, 1..3, default 3. 1 is the previous
+behaviour and 0 keeps one compute command at a time.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/engine.rs         |  8 ++++--
+ drivers/gpu/drm/asahi/g16/hw.rs             | 15 ++++++++--
+ drivers/gpu/drm/asahi/g16/job.rs            |  4 +--
+ drivers/gpu/drm/asahi/g16/params.rs         | 19 +++++++++----
+ drivers/gpu/drm/asahi/g16/pools/lifetime.rs |  1 +
+ drivers/gpu/drm/asahi/g16/resources.rs      |  4 +--
+ drivers/gpu/drm/asahi/g16/slots.rs          | 31 +++++++++++----------
+ 7 files changed, 53 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 881582f8a0..92e1995fb2 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -906,11 +906,13 @@ pub(crate) fn enqueue(&mut self, job: Arc<Job>) -> Result {
+     fn ahead_ok(&self, job: &Job) -> bool {
+         let n = self.engine.flights.len();
+         if matches!(command(job, job.progress.sent()), Some(Command::Compute(_))) {
+-            // g16_horizon = 1: one compute command behind a running healthy compute-only
+-            // flight, in the other split UMA slot (Slots::claim_compute finds it free only
++            // g16_horizon = N: up to N compute commands behind a running healthy compute-only
++            // flight, each in its own split UMA slot (Slots::claim_compute finds one free only
+             // with the overlap rule); never behind or beside render.
+             return params::horizon()
+-                && n < sizes::FLIGHTS.min(sizes::COMPUTE_SLOTS)
++                && n < sizes::FLIGHTS
++                    .min(sizes::COMPUTE_SLOTS)
++                    .min(1 + params::horizon_depth() as usize)
+                 && self.engine.queue_registered
+                 && !self.engine.frozen
+                 && self.engine.flights.iter().all(|f| {
+diff --git a/drivers/gpu/drm/asahi/g16/hw.rs b/drivers/gpu/drm/asahi/g16/hw.rs
+index e9d3ecb178..65d2575678 100644
+--- a/drivers/gpu/drm/asahi/g16/hw.rs
++++ b/drivers/gpu/drm/asahi/g16/hw.rs
+@@ -201,7 +201,8 @@ pub(crate) mod client {
+     pub(crate) const CLIENT_APERTURE: Range<u64> = 0x7000000000..0x7100000000;
+     pub(crate) const COMPACT_WINDOW: Range<u64> = 0x1000000000..0x9000000000;
+ 
+-    // Two persistent compute units, each in its own 64 MiB interval and reused across
++    // Persistent compute units (sizes::COMPUTE_SLOTS), each in its own 64 MiB interval, reused
++    // across
+     // application queues. Every alias is inside Mesa's reserved driver hole.
+     pub(crate) const fn compute_base(k: u64) -> u64 {
+         0x7001000000 + k * 0x04000000
+@@ -348,7 +349,17 @@ pub(crate) mod sizes {
+     pub(crate) const POOL_SIZE: u64 = 0x200000;
+     pub(crate) const FREELIST_SEED: u32 = 8192;
+     pub(crate) const QUEUE_CAP: u32 = 256;
+-    pub(crate) const COMPUTE_SLOTS: usize = 2;
++    /// Compute units a VM may hold, one compute command in flight per unit, each binding its own
++    /// split UMA slot (compute 1 + k of the 32 per class of the 25G83 layout). Units 0 and 1 are
++    /// the qualified ones; 2 and 3 take the next 64 MiB intervals below the render units, so a
++    /// compute horizon of up to three commands can stay queued behind a running one.
++    pub(crate) const COMPUTE_SLOTS: usize = 4;
++    const _: () = assert!(
++        super::client::compute_context(COMPUTE_SLOTS as u64 - 1) + 0x40000
++            <= super::client::render_base(0)
++            && super::client::WORK_PAGE + COMPUTE_SLOTS as u64 * super::client::CWORK_STRIDE
++                <= super::client::compute_base(0)
++    );
+     pub(crate) const RENDER_SLOTS: usize = 2;
+     pub(crate) const CT_BUFS: usize = 0;
+     pub(crate) const CLUSTER_PB_PAGES: u32 = 0x3c;
+diff --git a/drivers/gpu/drm/asahi/g16/job.rs b/drivers/gpu/drm/asahi/g16/job.rs
+index f31f16be7a..4d43851b25 100644
+--- a/drivers/gpu/drm/asahi/g16/job.rs
++++ b/drivers/gpu/drm/asahi/g16/job.rs
+@@ -295,10 +295,10 @@ pub(crate) fn check_command_dependencies(&self, index: u32) -> Result {
+         }
+         // Only a job's first command goes behind in-flight predecessors (of earlier jobs):
+         // one job never occupies two flights. Render with g16_depth (one) or g16_resident
+-        // (resident depth - 1), compute with g16_horizon (one).
++        // (resident depth - 1), compute with g16_horizon (up to its depth).
+         let resident = super::params::resident();
+         let (ahead, behind) = if order.engine == super::command::COMPUTE {
+-            (super::params::horizon(), 1)
++            (super::params::horizon(), super::params::horizon_depth())
+         } else if resident >= 2 {
+             (true, resident as u64 - 1)
+         } else {
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 44497b7fd3..48ee887f69 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -575,8 +575,8 @@ pub(crate) fn submit_ts() -> u32 {
+     "G16: clock of the submit record time word (default 0: architectural counter; 1: firmware stage clock, 24 MHz; runtime 0644)"
+ );
+ 
+-/// Storage of `g16_horizon` (runtime 0644, default 1).
+-static HORIZON: AtomicU32 = AtomicU32::new(1);
++/// Storage of `g16_horizon` (runtime 0644, default 3).
++static HORIZON: AtomicU32 = AtomicU32::new(3);
+ 
+ /// Compute horizon, format A (per-command ahead posting): with `g16_horizon` = 1, a queue's
+ /// next compute command may be published behind its running compute predecessor, into the
+@@ -585,10 +585,17 @@ pub(crate) fn submit_ts() -> u32 {
+ /// and the UMA split is latched, which make the second compute owner reusable at once. Explicit
+ /// barriers and historical priors still wait for completion; one job never occupies two
+ /// flights. 1 is the default (J604, k884 window: compute.light d64 210.4 -> 165.0 us/submit, deqp-vk
+-/// compute/render/sync clean); 0 keeps the qualified one-compute-at-a-time protocol. 2 (format B,
+-/// several commands in one prefix) is reserved and acts as 0.
++/// compute/render/sync clean); 0 keeps the qualified one-compute-at-a-time protocol. N > 1 lets
++/// up to N commands queue behind the running one, each on its own compute unit (at most
++/// `COMPUTE_SLOTS - 1`): with one behind, every second command still waited for the host to
++/// notice a retirement (J604 k884: 30318 ahead at a 32 us gap, 74866 serial at ~200 us). Default 3.
+ pub(crate) fn horizon() -> bool {
+-    HORIZON.load(Ordering::Relaxed) == 1 && super::pools::lifetime::overlap_active()
++    HORIZON.load(Ordering::Relaxed) != 0 && super::pools::lifetime::overlap_active()
++}
++
++/// How many compute commands may be queued behind a running one ([`horizon`] on), 1..=3.
++pub(crate) fn horizon_depth() -> u64 {
++    (HORIZON.load(Ordering::Relaxed) as u64).clamp(1, super::hw::sizes::COMPUTE_SLOTS as u64 - 1)
+ }
+ 
+ live_u32_param!(
+@@ -597,7 +604,7 @@ pub(crate) fn horizon() -> bool {
+     HORIZON_PARM,
+     HORIZON,
+     "g16_horizon",
+-    "G16: compute commands of one queue that may go behind its running compute predecessor (default 1: one, needs g16_overlap=1 and g16_uma_split=1; 0: none; 2 reserved; runtime 0644)"
++    "G16: compute commands of one queue that may go behind its running compute predecessor (default 3; 1..3, each on its own compute unit; needs g16_overlap=1 and g16_uma_split=1; 0: none; runtime 0644)"
+ );
+ 
+ /// Storage of `g16_depth` (runtime 0644, default 0).
+diff --git a/drivers/gpu/drm/asahi/g16/pools/lifetime.rs b/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
+index 5cb9bc252c..bfce32c506 100644
+--- a/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
++++ b/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
+@@ -104,6 +104,7 @@ pub(crate) struct Lifetime {
+     last_owner: Option<usize>,
+ }
+ impl Lifetime {
++    #[allow(dead_code)]
+     pub(crate) const fn new() -> Self {
+         Self::with_units(2)
+     }
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 4d66cb0401..0f0f2d7ae5 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -56,8 +56,8 @@ fn new(
+         live: &Arc<super::vm::LiveToken>,
+     ) -> Result<Arc<Self>> {
+         let mut objects = factory.objects(vm);
+-        let mut compute = KVec::with_capacity(2, GFP_KERNEL)?;
+-        for k in 0..2 {
++        let mut compute = KVec::with_capacity(super::hw::sizes::COMPUTE_SLOTS, GFP_KERNEL)?;
++        for k in 0..super::hw::sizes::COMPUTE_SLOTS as u64 {
+             compute.push(ComputeSlot::new(&mut objects, k)?, GFP_KERNEL)?;
+         }
+         objects.finish_private()?;
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index 26107b360f..c517360ecd 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -397,11 +397,11 @@ pub(crate) struct Slots {
+     pass_lifetime: Lifetime,
+     // Last-owner leases remain bound through retirement and displacement. Replaced only
+     // when the displaced unit is safely rebound to a new publication.
+-    compute_owner: [Option<Arc<super::vm::VmState>>; 2],
++    compute_owner: [Option<Arc<super::vm::VmState>>; sizes::COMPUTE_SLOTS],
+     pass_owner: [Option<Arc<super::vm::VmState>>; sizes::RENDER_UNITS],
+-    pending_compute_retarget: [Option<VmRetarget>; 2],
++    pending_compute_retarget: [Option<VmRetarget>; sizes::COMPUTE_SLOTS],
+     pending_pass_retarget: [Option<VmRetarget>; sizes::RENDER_UNITS],
+-    pending_compute_owner: [Option<Arc<super::vm::VmState>>; 2],
++    pending_compute_owner: [Option<Arc<super::vm::VmState>>; sizes::COMPUTE_SLOTS],
+     pending_pass_owner: [Option<Arc<super::vm::VmState>>; sizes::RENDER_UNITS],
+ }
+ impl Slots {
+@@ -411,14 +411,14 @@ pub(crate) fn new() -> Result<Self> {
+             pass_busy: 0,
+             pass_cursor: 0,
+             stats: SlotStats::default(),
+-            compute_lifetime: Lifetime::new(),
++            compute_lifetime: Lifetime::with_units(sizes::COMPUTE_SLOTS),
+             // Every VM's render arena holds the latched number of pass units.
+             pass_lifetime: Lifetime::with_units(super::params::resident_units()),
+-            compute_owner: [None, None],
++            compute_owner: [const { None }; sizes::COMPUTE_SLOTS],
+             pass_owner: [const { None }; sizes::RENDER_UNITS],
+-            pending_compute_retarget: [None, None],
++            pending_compute_retarget: [None; sizes::COMPUTE_SLOTS],
+             pending_pass_retarget: [None; sizes::RENDER_UNITS],
+-            pending_compute_owner: [None, None],
++            pending_compute_owner: [const { None }; sizes::COMPUTE_SLOTS],
+             pending_pass_owner: [const { None }; sizes::RENDER_UNITS],
+         })
+     }
+@@ -427,7 +427,7 @@ pub(crate) fn init(&self) -> Result {
+     }
+     #[allow(dead_code)]
+     pub(crate) fn compute_generation(&self, k: usize) -> Result<u8> {
+-        if k >= 2 {
++        if k >= sizes::COMPUTE_SLOTS {
+             return Err(EINVAL);
+         }
+         Ok(self.compute_lifetime.generation(k))
+@@ -450,7 +450,7 @@ pub(crate) fn render_exhausted(&self) -> bool {
+     }
+     #[allow(dead_code)]
+     pub(crate) fn free_compute(&self) -> u32 {
+-        (0..2)
++        (0..sizes::COMPUTE_SLOTS)
+             .filter(|&k| self.compute_lifetime.available(k))
+             .count() as u32
+     }
+@@ -463,8 +463,9 @@ pub(crate) fn claim_compute(
+         if f.slot_count != 0 {
+             return Ok(None);
+         }
+-        for i in 0..2 {
+-            let k = (self.cursor as usize + i) % 2;
++        let units = sizes::COMPUTE_SLOTS;
++        for i in 0..units {
++            let k = (self.cursor as usize + i) % units;
+             if self.compute_lifetime.claim(k) {
+                 if let Err(e) = arena.compute[k].scrub() {
+                     self.compute_lifetime.cancel(k);
+@@ -472,7 +473,7 @@ pub(crate) fn claim_compute(
+                 }
+                 f.slot[0] = k as u32;
+                 f.slot_count = 1;
+-                self.cursor = (1 - k) as u32;
++                self.cursor = ((k + 1) % units) as u32;
+                 return Ok(Some(k));
+             }
+         }
+@@ -569,8 +570,10 @@ pub(crate) fn note_published(&mut self, f: &Claims) {
+     /// Retains each actual owner's VM/ASID binding through the firmware's last-owner era.
+     /// A previous lease is replaced only after the new publication fully retires.
+     pub(crate) fn hold_vm(&mut self, f: &Claims, vm: &Arc<super::vm::VmState>) -> Result {
+-        if f.slot_count > 2
+-            || f.slot[..f.slot_count as usize].iter().any(|&k| k >= 2)
++        if f.slot_count as usize > sizes::COMPUTE_SLOTS
++            || f.slot[..f.slot_count as usize]
++                .iter()
++                .any(|&k| k as usize >= sizes::COMPUTE_SLOTS)
+             || f.pass_mask & !((1u32 << sizes::RENDER_UNITS) - 1) != 0
+         {
+             return Err(EINVAL);
+-- 
+2.43.0
+
