@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 02:12:20 +0000
+Subject: [PATCH] soc: apple: sleep: t8132: optionally stop AMCC1 at
+ the commit too
+
+An hv trace of XNU on the J604, from entry, shows it programs both
+AMCCs: the plane enables at +0x24000/+0x64000 of 0x220000000 and of
+0x222000000, bit by bit in the order t8132_sleep_mcc_stop clears
+them, the stage words at +0x24800 and the DCS enables of channels 0
+and 1 of each AMCC. The stop, as in PR #1314, covers AMCC0 only.
+
+t8132_mcc_amcc1 (default N) also steps AMCC1's planes, DCS channels
+and stage words down, in the same order and interleaved per bit with
+AMCC0's. AMCC1 is mapped at probe from AMCC0's windows plus
+0x2000000 (the ADT apertures). With the parameter off nothing changes.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 46 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 4630f848b0..3d7fb12905 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -624,6 +624,8 @@ struct apple_sleep {
+ 	void __iomem *aon_misc;
+ 	void __iomem *wake;
+ 	void __iomem *amcc[4];
++	/* T8132, with t8132_mcc_amcc1: AMCC1 planes 0/1, then AMCC1 DCS channels 0/1 */
++	void __iomem *t8132_a1[4];
+ 	void __iomem *pmc_dcp;
+ 	void __iomem *ps_prot;
+ 	void __iomem *spmi;
+@@ -4409,24 +4411,45 @@ static void t8132_mcc_step_down(void __iomem *reg)
+  * two memory controllers' lane enables down to 0, the first controller's second word, and
+  * each plane's stage word stepped down from 7.
+  */
++/*
++ * XNU on the J604 (hv trace from entry, q-rows-2) programs BOTH AMCCs: the plane enables at
++ * +0x24000/+0x64000 of 0x220000000 and of 0x222000000, bit by bit in this same order (AMCC1
++ * plane 1 ends at 0x3ef), their stage words, and the DCS enables of channels 0/1 of each.
++ * #1314's stop, which this follows, covers AMCC0 only. Off: as #1314.
++ */
++static bool t8132_mcc_amcc1;
++module_param(t8132_mcc_amcc1, bool, 0644);
++MODULE_PARM_DESC(t8132_mcc_amcc1,
++		 "T8132: step AMCC1's planes, stages and DCS channels down at the commit too (default: off)");
++
+ static void t8132_sleep_mcc_stop(struct apple_sleep *s)
+ {
+ 	static const u8 order[] = { 8, 0, 1, 2, 3, 4, 9, 5, 6, 7 };
+ 	static const u8 stages[] = { 0, 1, 2 };
++	bool a1 = READ_ONCE(t8132_mcc_amcc1) && s->t8132_a1[0] && s->t8132_a1[1] &&
++		  s->t8132_a1[2] && s->t8132_a1[3];
+ 	int i, plane, ch;
+ 
+-	for (i = 0; i < ARRAY_SIZE(order); i++)
++	for (i = 0; i < ARRAY_SIZE(order); i++) {
+ 		for (plane = 0; plane < T8132_AMCC_PLANES; plane++)
+ 			t8132_amcc_clear_bits(s->amcc[plane] + T8132_AMCC_ENABLES, &order[i], 1);
++		for (plane = 0; a1 && plane < 2; plane++)
++			t8132_amcc_clear_bits(s->t8132_a1[plane] + T8132_AMCC_ENABLES, &order[i], 1);
++	}
+ 
+ 	for (ch = 0; ch < T8132_MCC_CHANNELS; ch++)
+ 		t8132_mcc_step_down(s->mcc[ch] + MCC_ENABLES);
++	for (ch = 0; a1 && ch < 2; ch++)
++		t8132_mcc_step_down(s->t8132_a1[2 + ch] + MCC_ENABLES);
+ 
+ 	t8132_mcc_step_down(s->mcc[0] + MCC_LANES);
+ 
+ 	for (plane = 0; plane < T8132_AMCC_PLANES; plane++)
+ 		t8132_amcc_clear_bits(s->amcc[plane] + T8132_AMCC_STAGES, stages,
+ 				      ARRAY_SIZE(stages));
++	for (plane = 0; a1 && plane < 2; plane++)
++		t8132_amcc_clear_bits(s->t8132_a1[plane] + T8132_AMCC_STAGES, stages,
++				      ARRAY_SIZE(stages));
+ }
+ 
+ /*
+@@ -6796,11 +6819,32 @@ static int apple_sleep_alloc_books(struct apple_sleep *s)
+ }
+ 
+ /* What the resume marks and the early-exception vectors need, set once at probe. */
++/*
++ * AMCC1 sits 0x2000000 above AMCC0 (ADT /chosen/lock-regs/amcc apertures 0x220000000 and
++ * 0x222000000), with the same plane and DCS layout, so map it from the "amcc0"/"amcc1"/"mcc0"/
++ * "mcc1" windows the DT already gives for AMCC0. Mapped always, used only with t8132_mcc_amcc1.
++ */
++#define T8132_AMCC1_DELTA	0x2000000
++static void t8132_amcc1_init(struct platform_device *pdev, struct apple_sleep *s)
++{
++	static const char *const names[] = { "amcc0", "amcc1", "mcc0", "mcc1" };
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		struct resource *r = platform_get_resource_byname(pdev, IORESOURCE_MEM, names[i]);
++
++		s->t8132_a1[i] = r ? devm_ioremap(&pdev->dev, r->start + T8132_AMCC1_DELTA,
++						  resource_size(r)) : NULL;
++	}
++}
++
+ static void t8132_catch_init(struct platform_device *pdev, struct apple_sleep *s)
+ {
+ 	struct resource *wdt = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wdt");
+ 	struct resource *spmi = platform_get_resource_byname(pdev, IORESOURCE_MEM, "spmi");
+ 
++	t8132_amcc1_init(pdev, s);
++
+ 	WRITE_ONCE(arm64_suspend_mark_hook, t8132_return_mark);
+ 	if (!wdt)
+ 		return;
+-- 
+2.43.0
+

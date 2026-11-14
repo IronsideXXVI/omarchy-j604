@@ -1,0 +1,505 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 23:16:00 +0000
+Subject: [PATCH] soc: apple: sleep: t8132: arm the wake at
+ .prepare_late and check it
+
+On k888 only the first stores of the commit's arm block reached DRAM,
+even with all of it done before DCS down: the mailbox line arrived as
+it was after its second clean, not its third. So write the wake words
+where memory is surely live and check that they are in DRAM.
+
+t8132_wake_prep (default Y) adds a .prepare_late, which runs after the
+devices' noirq phase (mcc has written the SLC back and turned it off)
+and before the other CPUs and the coprocessors stop. It runs the arm
+block once (mailbox and resume_pa, init_kernel_el marks, stub checks,
+stub config, and a DRAM check over static ranges only: the stub pages
+and .idmap.text). Then it reads every one of those words back through
+a write-combine view of its PA. A word that differs refuses the sleep
+with -EAGAIN and names the word: no commit, no reset.
+
+The finisher, with t8132_frame_verify (default Y), cleans and compares
+cpu_suspend()'s frame, sleep_save_stash and the driver state the same
+way. It is too late to refuse there, so a mismatch arms WD2 for 2 s
+and parks: a reset well before the RTC alarm. t8132_setway (default
+N) can then clean and invalidate the data caches by set/way, as aura
+and XNU do before a sleep. From there the commit writes only MMIO,
+apart from the AIC mask save (same values as the early save) and
+spin_table_stop_released, which only the stopped cores read.
+
+The stub config's magic is now also written for the probe and in the
+new order, so probe bit 2 no longer needs a stub flag. .prepare_late
+logs the wake data PAs and HID4/EHID4 (read fault-safe). mcc logs its
+write-back time at info level, once per sleep.
+
+From TB's diff against #1314: t8132_elchk (default Y, as before) can
+leave the stub's first check unarmed, and t8132_unlatch (default N)
+waits for the still-on words and unlatches the power states in the
+commit, as #1314's generic commit does.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/mcc.c   |   2 +-
+ drivers/soc/apple/sleep.c | 353 +++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 349 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/soc/apple/mcc.c b/drivers/soc/apple/mcc.c
+index 5628aefd2e..10d09d3160 100644
+--- a/drivers/soc/apple/mcc.c
++++ b/drivers/soc/apple/mcc.c
+@@ -80,7 +80,7 @@ static int apple_mcc_disable_t8132(struct apple_mcc *mcc)
+ 			return -ETIMEDOUT;
+ 		}
+ 	}
+-	dev_dbg(mcc->dev, "cache written back in %lld us, status was %#x\n",
++	dev_info(mcc->dev, "cache written back in %lld us, status was %#x\n",
+ 		 ktime_us_delta(ktime_get(), start), first);
+ 	return 0;
+ }
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index f0b191164a..2c6c8f96e3 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -784,6 +784,11 @@ struct apple_sleep {
+ 	unsigned int ps_unlatched_count;
+ 	/* T8132: what macOS polls off after its complex words, still on at that point. */
+ 	u32 quiesce_still_on;
++	/* t8132_wake_prep: this sleep's wake words were armed and verified at .prepare_late */
++	bool wake_prep;
++	/* Write-combine views for the finisher's check, made at .prepare_late */
++	void *nc_stack, *nc_stash, *nc_s;
++	unsigned long nc_stack_base;
+ 	/* J604: the ADT's pwrgate-regs words, read only (j604_adt_pwrgate_print()). */
+ 	void __iomem *adt_pg[4];
+ };
+@@ -4514,6 +4519,12 @@ static void t8132_arm_dram_check(struct apple_sleep *s)
+ 		stub_end = stub + SZ_4K;
+ 	}
+ 	sleep_check_add(c, va, (void *)stub, stub_end - stub);
++	/* Written at .prepare_late: only what nothing writes before the wake. */
++	if (s->wake_prep) {
++		sleep_check_add(c, va, __idmap_text_start,
++				(__idmap_text_end - __idmap_text_start) & ~3UL);
++		goto crc;
++	}
+ 
+ 	for (i = 0; i < mpidr_hash_size(); i++) {
+ 		unsigned long v = sleep_save_stash[i];
+@@ -4542,6 +4553,7 @@ static void t8132_arm_dram_check(struct apple_sleep *s)
+ 	sleep_check_add(c, va, word, SZ_4K);
+ 	sleep_check_add(c, va, sleep_save_stash, mpidr_hash_size() * sizeof(*sleep_save_stash));
+ 
++crc:
+ 	for (i = 0; i < c->nranges; i++)
+ 		crc = crc32_le(crc, va[i], c->range[i].len);
+ 	c->crc32 = ~crc;
+@@ -4726,7 +4738,9 @@ static void t8132_arm_stubcfg(void)
+ 		f |= BIT(6);
+ 	c->flags = f;
+ 	dsb(ishst);
+-	WRITE_ONCE(c->magic, f ? T8132_STUBCFG_MAGIC : 0);
++	/* The probe and the new order read the magic itself, flags or not. */
++	WRITE_ONCE(c->magic, (f || READ_ONCE(t8132_probe_entry) ||
++			      (apple_sleep && apple_sleep->wake_prep)) ? T8132_STUBCFG_MAGIC : 0);
+ 	dcache_clean_poc((unsigned long)c, (unsigned long)(c + 1));
+ 	dsb(sy);
+ }
+@@ -4780,6 +4794,52 @@ module_param(t8132_arm_early, bool, 0644);
+ MODULE_PARM_DESC(t8132_arm_early,
+ 		 "T8132: write and clean what the wake reads before DCS and the memory controller go down (default: off)");
+ 
++/*
++ * The order TB designed after k888's runs (only the first stores of the commit's arm block
++ * reached DRAM): everything the wake reads is written once at .prepare_late, after the
++ * devices' noirq phase (the SLC is written back and off by then), and read back through a
++ * non-cacheable view; a word that differs refuses the sleep with -EAGAIN, so no reset. The
++ * finisher then only cleans and checks cpu_suspend()'s frame, the stash and *s (and, with
++ * t8132_setway, cleans this core's caches by set/way); from there on it writes only MMIO.
++ */
++static bool t8132_wake_prep = true;
++module_param(t8132_wake_prep, bool, 0644);
++MODULE_PARM_DESC(t8132_wake_prep,
++		 "T8132: arm and verify the wake words at .prepare_late, not in the commit (default: on)");
++
++/*
++ * With t8132_wake_prep: the finisher's frame check. A mismatch can't refuse the sleep that
++ * late (the coprocessors are stopped), so it restarts WD2 for 2 s and parks: a reset well
++ * before the RTC alarm (reset - alarm about -58 s) means the frame did not reach DRAM.
++ */
++static bool t8132_frame_verify = true;
++module_param(t8132_frame_verify, bool, 0644);
++MODULE_PARM_DESC(t8132_frame_verify,
++		 "T8132: check the cpu_suspend frame, stash and driver state in DRAM in the finisher (default: on)");
++
++/* With t8132_wake_prep: clean this core's data caches by set/way in the finisher, as aura and XNU do. */
++static bool t8132_setway;
++module_param(t8132_setway, bool, 0644);
++MODULE_PARM_DESC(t8132_setway,
++		 "T8132: clean and invalidate the data caches by set/way in the finisher (default: off)");
++
++/*
++ * The stub's first check (.idmap.text and .mmuoff.data CRCs). N = not armed: the stub goes on
++ * to elchk2 and cpu_resume, whose marks (75/135/125/59..) tell how far it gets.
++ */
++static bool t8132_elchk_on = true;
++module_param_named(t8132_elchk, t8132_elchk_on, bool, 0644);
++MODULE_PARM_DESC(t8132_elchk, "T8132: arm the resume stub's .idmap.text/.mmuoff.data check (default: on)");
++
++/*
++ * As #1314's generic commit does for T8132: wait for the still-on words and unlatch the power
++ * states after lowering the I/O, and take the deep DRAM path if a latch had to be cleared.
++ */
++static bool t8132_unlatch;
++module_param(t8132_unlatch, bool, 0644);
++MODULE_PARM_DESC(t8132_unlatch,
++		 "T8132: wait for the still-on words and unlatch power states in the commit, as #1314 does (default: off)");
++
+ static bool t8132_cpu_perf_down = true;
+ module_param(t8132_cpu_perf_down, bool, 0644);
+ MODULE_PARM_DESC(t8132_cpu_perf_down,
+@@ -5269,10 +5329,194 @@ static void t8132_ovrd_apply(u32 m)
+ static void t8132_commit_arm(struct apple_sleep *s);
+ static void __noreturn t8132_commit_tail(struct apple_sleep *s);
+ 
++/* A write-combine (non-cacheable) view of [pa, pa + len): vmap for mapped RAM, else ioremap_wc. */
++static void *t8132_nc_map(phys_addr_t pa, size_t len, bool *io)
++{
++	phys_addr_t base = pa & PAGE_MASK;
++	unsigned int n = DIV_ROUND_UP(offset_in_page(pa) + len, PAGE_SIZE), i;
++	struct page *pg[16];
++	void *v;
++
++	*io = !pfn_is_map_memory(PHYS_PFN(base));
++	if (*io) {
++		v = (void __force *)ioremap_wc(base, (size_t)n * PAGE_SIZE);
++		return v ? v + offset_in_page(pa) : NULL;
++	}
++	if (n > ARRAY_SIZE(pg))
++		return NULL;
++	for (i = 0; i < n; i++)
++		pg[i] = pfn_to_page(PHYS_PFN(base) + i);
++	v = vmap(pg, n, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
++	return v ? v + offset_in_page(pa) : NULL;
++}
++
++static void t8132_nc_unmap(void *p, bool io)
++{
++	void *base = (void *)((unsigned long)p & PAGE_MASK);
++
++	if (!p)
++		return;
++	if (io)
++		iounmap((void __iomem __force *)base);
++	else
++		vunmap(base);
++}
++
++/* Clean [va, va + len) to the PoC, then compare it with DRAM at pa through a non-cacheable view. */
++static int t8132_word_check_pa(struct apple_sleep *s, const char *name, const void *va,
++			       phys_addr_t pa, size_t len)
++{
++	bool io;
++	void *nc;
++	int ret = 0;
++
++	dcache_clean_poc((unsigned long)va, (unsigned long)va + len);
++	dsb(sy);
++	nc = t8132_nc_map(pa, len, &io);
++	if (!nc) {
++		dev_err(s->dev, "wake word %s: no non-cacheable view of %pa\n", name, &pa);
++		return -EAGAIN;
++	}
++	if (memcmp(nc, va, len)) {
++		dev_err(s->dev, "wake word %s at %pa: DRAM differs from the cached copy (%zu bytes), sleep refused\n",
++			name, &pa, len);
++		ret = -EAGAIN;
++	}
++	t8132_nc_unmap(nc, io);
++	return ret;
++}
++
++static int t8132_word_check(struct apple_sleep *s, const char *name, const void *va, size_t len)
++{
++	return t8132_word_check_pa(s, name, va, sleep_check_pa(va), len);
++}
++
++/* The suspending task's stack, the stash and *s, viewed non-cacheable for the finisher. */
++static void t8132_frame_map(struct apple_sleep *s)
++{
++	unsigned long stack = (unsigned long)task_stack_page(current);
++	struct page *pg[THREAD_SIZE / PAGE_SIZE];
++	unsigned int i;
++	bool io;
++
++	for (i = 0; i < ARRAY_SIZE(pg); i++) {
++		void *p = (void *)(stack + i * PAGE_SIZE);
++
++		pg[i] = is_vmalloc_addr(p) ? vmalloc_to_page(p) : virt_to_page(p);
++	}
++	s->nc_stack_base = stack;
++	s->nc_stack = vmap(pg, ARRAY_SIZE(pg), VM_MAP, pgprot_writecombine(PAGE_KERNEL));
++	s->nc_stash = t8132_nc_map(virt_to_phys(sleep_save_stash),
++				   mpidr_hash_size() * sizeof(*sleep_save_stash), &io);
++	s->nc_s = t8132_nc_map(virt_to_phys(s), sizeof(*s), &io);
++	if (!s->nc_stack || !s->nc_stash || !s->nc_s)
++		dev_warn(s->dev, "no non-cacheable view for the frame check: skipped this sleep\n");
++}
++
++static void t8132_frame_unmap(struct apple_sleep *s)
++{
++	if (s->nc_stack)
++		vunmap(s->nc_stack);
++	t8132_nc_unmap(s->nc_stash, false);
++	t8132_nc_unmap(s->nc_s, false);
++	s->nc_stack = s->nc_stash = s->nc_s = NULL;
++}
++
++/*
++ * The finisher's first check: cpu_suspend()'s frame (found through the stash, as cpu_resume
++ * finds it), the stash and *s, cleaned and compared with DRAM. True if equal, or if there is
++ * nothing to compare with.
++ */
++static bool t8132_frame_check(struct apple_sleep *s)
++{
++	const size_t ctx_len = sizeof(struct sleep_stack_data);
++	const size_t stash_len = mpidr_hash_size() * sizeof(*sleep_save_stash);
++	unsigned long stack = s->nc_stack_base, ctx = 0;
++	unsigned int i, try;
++
++	if (!s->nc_stack || !s->nc_stash || !s->nc_s)
++		return true;
++	for (i = 0; i < mpidr_hash_size(); i++) {
++		unsigned long v = sleep_save_stash[i];
++
++		if (v >= stack && v + ctx_len <= stack + THREAD_SIZE) {
++			ctx = v;
++			break;
++		}
++	}
++	if (!ctx)
++		return true;
++	for (try = 0; try < 3; try++) {
++		dcache_clean_poc(ctx, ctx + ctx_len);
++		dcache_clean_poc((unsigned long)sleep_save_stash,
++				 (unsigned long)sleep_save_stash + stash_len);
++		dcache_clean_poc((unsigned long)s, (unsigned long)(s + 1));
++		dsb(sy);
++		if (!memcmp(s->nc_stack + (ctx - stack), (void *)ctx, ctx_len) &&
++		    !memcmp(s->nc_stash, sleep_save_stash, stash_len) &&
++		    !memcmp(s->nc_s, s, sizeof(*s)))
++			return true;
++	}
++	return false;
++}
++
++/* Clean and invalidate every data cache level up to the LoC by set/way (aura's DCCISW pass). */
++static void t8132_dc_cisw_all(void)
++{
++	u64 clidr = read_sysreg(clidr_el1);
++	bool ccidx = (read_sysreg_s(SYS_ID_AA64MMFR2_EL1) >> 20) & 0xf;
++	unsigned int loc = (clidr >> 24) & 7, level;
++
++	for (level = 0; level < loc; level++) {
++		unsigned int ctype = (clidr >> (level * 3)) & 7, line, ways, sets, wshift, w, set;
++		u64 ccsidr;
++
++		if (ctype < 2)
++			continue;
++		write_sysreg(level << 1, csselr_el1);
++		isb();
++		ccsidr = read_sysreg(ccsidr_el1);
++		line = (ccsidr & 7) + 4;
++		if (ccidx) {
++			ways = ((ccsidr >> 3) & 0x1fffff) + 1;
++			sets = ((ccsidr >> 32) & 0xffffff) + 1;
++		} else {
++			ways = ((ccsidr >> 3) & 0x3ff) + 1;
++			sets = ((ccsidr >> 13) & 0x7fff) + 1;
++		}
++		wshift = ways > 1 ? __builtin_clz(ways - 1) : 0;
++		for (w = 0; w < ways; w++)
++			for (set = 0; set < sets; set++)
++				asm volatile("dc cisw, %0" : : "r" (((u64)w << wshift) |
++								    ((u64)set << line) |
++								    (level << 1)) : "memory");
++	}
++	dsb(sy);
++	isb();
++}
++
++/* HID4 (P cores) or EHID4 (E cores), whichever this core has; -EFAULT if it faults. */
++static int t8132_hid4_read(bool e, u64 *val)
++{
++	int err = 0;
++	u64 v = 0;
++
++	if (e)
++		asm volatile("1:	mrs	%1, s3_0_c15_c4_1\n2:\n"
++			     _ASM_EXTABLE_KACCESS_ERR_ZERO(1b, 2b, %w0, %w1)
++			     : "+r" (err), "=r" (v));
++	else
++		asm volatile("1:	mrs	%1, s3_0_c15_c4_0\n2:\n"
++			     _ASM_EXTABLE_KACCESS_ERR_ZERO(1b, 2b, %w0, %w1)
++			     : "+r" (err), "=r" (v));
++	*val = v;
++	return err;
++}
++
+ static int t8132_sleep_commit(unsigned long unused)
+ {
+ 	struct apple_sleep *s = apple_sleep;
+-	bool early = READ_ONCE(t8132_arm_early);
++	bool prep = s->wake_prep, early = prep || READ_ONCE(t8132_arm_early);
+ 	int i;
+ 
+ 	s->siq_cfg = read_sysreg_s(SYS_APL_SIQ_CFG_EL1);
+@@ -5282,6 +5526,13 @@ static int t8132_sleep_commit(unsigned long unused)
+ 	t8132_clean_extra(s);
+ 	t8132_sleep_lower_io(s);
+ 	apple_sleep_arm_wd2(s);
++	if (READ_ONCE(t8132_unlatch)) {
++		apple_sleep_wait_still_on(s);
++		if (apple_sleep_ps_unlatch(s)) {
++			s->deep_once = true;
++			sleep_slp_ddr_set_deep_once(true);
++		}
++	}
+ 	if (early) {
+ 		const struct apple_sleep_words *all = &s->soc->ps_all, *aon = &s->soc->ps_aon_all;
+ 
+@@ -5293,8 +5544,19 @@ static int t8132_sleep_commit(unsigned long unused)
+ 				 (unsigned long)(s->ps_aon_commit + aon->count));
+ 		aic_sleep_save_masks();
+ 		s->quiesce_still_on = 0;
+-		t8132_commit_arm(s);
+-		t8132_clean_ram();
++		if (!prep) {
++			t8132_commit_arm(s);
++			t8132_clean_ram();
++		} else {
++			/* Armed and verified at .prepare_late: only the frame is new. */
++			if (READ_ONCE(t8132_frame_verify) && !t8132_frame_check(s)) {
++				apple_sleep_set_wd2(s, 2);
++				while (true)
++					wfe();
++			}
++			if (READ_ONCE(t8132_setway))
++				t8132_dc_cisw_all();
++		}
+ 	}
+ 	/*
+ 	 * macOS has the SoC at its sleep perf state and DCS at state 4 by now. Its firmware
+@@ -5382,7 +5644,10 @@ static void t8132_commit_arm(struct apple_sleep *s)
+ 		t8132_disarm_el_check2();
+ 		t8132_disarm_stubcfg();
+ 	} else {
+-		t8132_arm_el_check();
++		if (READ_ONCE(t8132_elchk_on))
++			t8132_arm_el_check();
++		else
++			t8132_disarm_el_check();
+ 		t8132_arm_el_check2();
+ 		t8132_arm_stubcfg();
+ 	}
+@@ -5608,8 +5873,11 @@ static int apple_sleep_begin(suspend_state_t state)
+ 	return 0;
+ }
+ 
++static void apple_sleep_end_t8132(struct apple_sleep *s);
++
+ static void apple_sleep_end(void)
+ {
++	apple_sleep_end_t8132(apple_sleep);
+ 	WRITE_ONCE(sleep_deep_requested, false);
+ 	if (pm_suspend_via_firmware())
+ 		writel(0, apple_sleep->wdt + WDT_WD2_CTL);
+@@ -5964,10 +6232,85 @@ static void apple_sleep_report(void)
+ 			s->pcie_ans_on_ret);
+ }
+ 
++static void t8132_wake_disarm(struct apple_sleep *s)
++{
++	t8132_disarm_el_check();
++	t8132_disarm_el_check2();
++	t8132_disarm_stubcfg();
++	if (t8132_team_armed) {
++		t8132_team_marks(false);
++		t8132_team_armed = false;
++	}
++	WRITE_ONCE(arm64_resume_armed, 0);
++	dcache_clean_poc((unsigned long)&arm64_resume_armed, (unsigned long)(&arm64_resume_armed + 1));
++	s->wake_prep = false;
++}
++
++/*
++ * After the devices' noirq phase (the SLC written back and off), before the other CPUs go and
++ * the coprocessors stop: with t8132_wake_prep, write every wake word once and check it in DRAM.
++ * A mismatch refuses the sleep here, where refusing costs nothing.
++ */
++static int apple_sleep_prepare_late(void)
++{
++	struct apple_sleep *s = apple_sleep;
++	u64 h4, eh4;
++	int e4, ee4, ret;
++
++	if (!s || s->soc->commit != t8132_sleep_commit)
++		return 0;
++	s->wake_prep = false;
++	e4 = t8132_hid4_read(false, &h4);
++	ee4 = t8132_hid4_read(true, &eh4);
++	dev_info(s->dev, "wake data: mailbox %#llx, stubcfg %pa, suspend stack %pa; cpu%d HID4 %s%#llx EHID4 %s%#llx; wake_prep %d\n",
++		 t8132_mbox_pa, &(phys_addr_t){ __pa_symbol(&t8132_stubcfg) },
++		 &(phys_addr_t){ sleep_check_pa(task_stack_page(current)) }, raw_smp_processor_id(),
++		 e4 ? "fault " : "", h4, ee4 ? "fault " : "", eh4, READ_ONCE(t8132_wake_prep));
++	if (!READ_ONCE(t8132_wake_prep) || !s->mbox || !t8132_mbox_pa)
++		return 0;
++	s->wake_prep = true;
++	t8132_commit_arm(s);
++	ret = t8132_word_check_pa(s, "mailbox", s->mbox, t8132_mbox_pa,
++				  s->mbox_check ? AURA_S2R_CHECKED_SIZE : sizeof(*s->mbox));
++	if (!ret)
++		ret = t8132_word_check(s, "t8132_stubcfg", &t8132_stubcfg, sizeof(t8132_stubcfg));
++	if (!ret)
++		ret = t8132_word_check(s, "t8132_elchk", &t8132_elchk, sizeof(t8132_elchk));
++	if (!ret)
++		ret = t8132_word_check(s, "t8132_elchk2_tab", &t8132_elchk2_tab,
++				       sizeof(t8132_elchk2_tab));
++	if (!ret)
++		ret = t8132_word_check(s, "arm64_resume_armed", &arm64_resume_armed,
++				       sizeof(arm64_resume_armed));
++	if (!ret)
++		ret = t8132_word_check(s, "arm64_resume_wdt", arm64_resume_wdt,
++				       sizeof(arm64_resume_wdt));
++	if (!ret)
++		ret = t8132_word_check(s, "arm64_resume_vbar", &arm64_resume_vbar,
++				       sizeof(arm64_resume_vbar));
++	if (ret) {
++		t8132_wake_disarm(s);
++		return ret;
++	}
++	if (READ_ONCE(t8132_frame_verify))
++		t8132_frame_map(s);
++	return 0;
++}
++
++static void apple_sleep_end_t8132(struct apple_sleep *s)
++{
++	if (!s || s->soc->commit != t8132_sleep_commit)
++		return;
++	t8132_frame_unmap(s);
++	if (s->wake_prep)
++		t8132_wake_disarm(s);
++}
++
+ static const struct platform_suspend_ops apple_sleep_ops = {
+ 	.valid = suspend_valid_only_mem,
+ 	.begin = apple_sleep_begin,
+ 	.prepare = apple_sleep_prepare,
++	.prepare_late = apple_sleep_prepare_late,
+ 	.enter = apple_sleep_enter,
+ 	.wake = apple_sleep_report,
+ 	.end = apple_sleep_end,
+-- 
+2.43.0
+

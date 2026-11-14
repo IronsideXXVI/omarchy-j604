@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 23:33:08 +0000
+Subject: [PATCH] drm/asahi: G16: keep four render commands resident by
+ default
+
+Turn on resident render depth 4 by default. Four defaults change:
+g16_uma_split=1, g16_overlap=1, g16_resident=4 and
+g16_resident_compact=1. Render commands then go into the firmware rings
+up to four deep, each in its own render unit (units 2 and 3 are
+compact), instead of one at a time.
+
+Measured on the J604 (k888 split boot, session unlocked, display on),
+gpubench render.light (tri) at queue depth 64, median us per submit:
+
+  k887 qualified defaults     244.4
+  split boot, depth 0         285.7
+  depth 4                     192.5   (-21 % vs 244.4)
+  depth 8                     176.1
+  depth 18                    184.8
+
+deqp-vk ov3-render ran before each depth: 23 pass, 4 not supported,
+0 fail. There was no hang, recovery or stall, and the PB managers saw
+no growth request (pb: bad 0), including the 128-block compact heaps.
+
+Depth 4 is chosen over 8 for memory. Each compact unit backs about
+51 MiB per rendering client, and a pass unit keeps its last VM's
+arena until a later command displaces it. With 18 units, available
+memory fell from 9.9 GB to 6.4 GB on a 16 GB machine. Depth 4 adds two
+compact units (about 100 MiB per client).
+
+g16_horizon (compute) stays 0. All four parameters can still be set
+back to 0 as module options. The lifetime host tests that model the
+older single-slot ledger now set it explicitly.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/params.rs         | 16 ++++++++--------
+ drivers/gpu/drm/asahi/g16/pools/lifetime.rs | 19 +++++++++++++++----
+ 2 files changed, 23 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 63339f9b80..69453e2271 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -853,7 +853,7 @@ pub(crate) fn prof() -> bool {
+     UMA_SPLIT_PARM,
+     UMA_SPLIT,
+     "g16_uma_split",
+-    "G16: give each of the two owners of a class its own firmware UMA slot (compute 1/2, render 33/34) (default 0: one slot per class, as qualified; read once at the first GPU use of the boot, so set it as a module option)"
++    "G16: give each of the two owners of a class its own firmware UMA slot (compute 1/2, render 33/34) (default 1: own slots, needed by g16_resident; 0: one slot per class, the older qualified layout; read once at the first GPU use of the boot, so set it as a module option)"
+ );
+ 
+ live_u32_param!(
+@@ -862,7 +862,7 @@ pub(crate) fn prof() -> bool {
+     OVERLAP_PARM,
+     OVERLAP,
+     "g16_overlap",
+-    "G16: with g16_uma_split latched on, release a render/compute owner at completion and let two be in flight on their own UMA slots (default 0: displacement ledger, one at a time; no effect without the split; runtime 0644; use with g16_depth=1 g16_flights=2)"
++    "G16: with g16_uma_split latched on, release a render/compute owner at completion and let two be in flight on their own UMA slots (default 1, needed by g16_resident; 0: displacement ledger, one at a time; no effect without the split; runtime 0644)"
+ );
+ 
+ /// Storage of `g16_lat_qos_us` (runtime 0644, default 0).
+@@ -920,8 +920,8 @@ pub(crate) fn flights() -> usize {
+     "G16: render commands in flight at once, 1 (default, the qualified one-at-a-time protocol) or 2 (one render published behind a running render; experimental; runtime 0644)"
+ );
+ 
+-/// Storage of `g16_resident` (runtime 0644, default 0).
+-static RESIDENT: AtomicU32 = AtomicU32::new(0);
++/// Storage of `g16_resident` (runtime 0644, default 4).
++static RESIDENT: AtomicU32 = AtomicU32::new(4);
+ 
+ /// Render pass units per VM, latched at the first G16 slot setup of the boot: 0 until then.
+ static RESIDENT_LATCH: AtomicU32 = AtomicU32::new(0);
+@@ -960,8 +960,8 @@ fn resident_latch() -> u32 {
+     RESIDENT_LATCH.load(Ordering::Acquire)
+ }
+ 
+-/// Storage of `g16_resident_compact` (0644, default 0; read with `g16_resident` at the latch).
+-static RESIDENT_COMPACT: AtomicU32 = AtomicU32::new(0);
++/// Storage of `g16_resident_compact` (0644, default 1; read with `g16_resident` at the latch).
++static RESIDENT_COMPACT: AtomicU32 = AtomicU32::new(1);
+ 
+ live_u32_param!(
+     RESIDENT_COMPACT_PARAM,
+@@ -969,7 +969,7 @@ fn resident_latch() -> u32 {
+     RESIDENT_COMPACT_PARM,
+     RESIDENT_COMPACT,
+     "g16_resident_compact",
+-    "G16: resident render units 2.. are compact (1 MiB TPC/tilemap, 16 MiB PB heap of 128 blocks; about 51 MiB each) so g16_resident may reach 18; set at module load with g16_resident (default 0: full-size units, at most 4; latched)"
++    "G16: resident render units 2.. are compact (1 MiB TPC/tilemap, 16 MiB PB heap of 128 blocks; about 51 MiB each) so g16_resident may reach 18; set at module load with g16_resident (default 1; 0: full-size units, at most 4; latched)"
+ );
+ 
+ /// Resident render depth: how many render commands may sit in the firmware's TA/FS rings at
+@@ -1000,7 +1000,7 @@ pub(crate) fn resident_credits() -> u32 {
+     RESIDENT_PARM,
+     RESIDENT,
+     "g16_resident",
+-    "G16: render commands that may be resident in the firmware rings at once, each in its own render unit (default 0: off; 2..4, 2..18 with g16_resident_compact=1; >= 3 must be set at module load to allocate the extra units; needs g16_overlap=1 and g16_uma_split=1; runtime 0644)"
++    "G16: render commands that may be resident in the firmware rings at once, each in its own render unit (default 4; 0 or 1: off; 2..4, 2..18 with g16_resident_compact=1; >= 3 must be set at module load to allocate the extra units; needs g16_overlap=1 and g16_uma_split=1; runtime 0644)"
+ );
+ 
+ /// Storage of `g16_submit_ahead` (runtime 0644, default 0).
+diff --git a/drivers/gpu/drm/asahi/g16/pools/lifetime.rs b/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
+index 23c3c001f3..9d91f604ee 100644
+--- a/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
++++ b/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
+@@ -6,13 +6,13 @@
+ 
+ use core::sync::atomic::{AtomicU32, Ordering};
+ 
+-/// Storage of `g16_overlap` (runtime 0644, default 0; declared in params.rs).
+-pub(crate) static OVERLAP: AtomicU32 = AtomicU32::new(0);
++/// Storage of `g16_overlap` (runtime 0644, default 1; declared in params.rs).
++pub(crate) static OVERLAP: AtomicU32 = AtomicU32::new(1);
+ 
+-/// Storage of `g16_uma_split` (0644, default 0; declared in params.rs). Read once, at the
++/// Storage of `g16_uma_split` (0644, default 1; declared in params.rs). Read once, at the
+ /// first G16 slot use of the boot, and latched: it must be set before the GPU is used
+ /// (module option in the initramfs).
+-pub(crate) static UMA_SPLIT: AtomicU32 = AtomicU32::new(0);
++pub(crate) static UMA_SPLIT: AtomicU32 = AtomicU32::new(1);
+ 
+ /// The boot's UMA slot mode: 2 until latched, then 0 or 1.
+ static SPLIT_LATCH: AtomicU32 = AtomicU32::new(2);
+@@ -238,6 +238,13 @@ pub(crate) fn quarantine(&mut self, k: usize) {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    /// The qualified layout (no split, no overlap) for the tests that model it; the driver
++    /// defaults are split + overlap on since resident depth 4 is the default.
++    fn qualified() {
++        UMA_SPLIT.store(0, Ordering::Relaxed);
++        OVERLAP.store(0, Ordering::Relaxed);
++        reset_latch();
++    }
+     #[test]
+     fn overlap_releases_at_completion_and_keeps_order() {
+         reset_latch();
+@@ -349,6 +356,7 @@ fn split_is_latched_once_per_boot() {
+     }
+     #[test]
+     fn distinct_retired_displacement_is_required() {
++        qualified();
+         let mut l = Lifetime::new();
+         assert!(l.claim(0));
+         assert!(l.publish(0));
+@@ -368,6 +376,7 @@ fn distinct_retired_displacement_is_required() {
+     }
+     #[test]
+     fn abort_does_not_recycle_or_authorize_displacement() {
++        qualified();
+         let mut l = Lifetime::new();
+         assert!(l.claim(0));
+         assert!(l.publish(0));
+@@ -389,6 +398,7 @@ fn abort_does_not_recycle_or_authorize_displacement() {
+     }
+     #[test]
+     fn preparation_cancel_preserves_retirement() {
++        qualified();
+         let mut l = Lifetime::new();
+         assert!(l.claim(0));
+         l.cancel(0);
+@@ -406,6 +416,7 @@ fn preparation_cancel_preserves_retirement() {
+     }
+     #[test]
+     fn publication_is_serialized_and_command_count_is_not_binding_generation() {
++        qualified();
+         let mut l = Lifetime::new();
+         assert!(l.claim(0));
+         assert!(l.publish(0));
+-- 
+2.43.0
+

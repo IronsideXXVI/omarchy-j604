@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 02:17:53 +0000
+Subject: [PATCH] drm/apple: m4: run the J604 panel's image processing
+ as macOS does
+
+macOS's IOMobileFramebufferShim mirrors the DCP's RuntimeProperty store.
+On the J604 (26B123) it holds values for 142 of the 290 ids in the 25G83
+firmware's table. Linux sends four of them (idle caching and, since the
+previous change, the BLM set), so the panel-processing switches stay at
+whatever the DCP starts with: PCCEnable, PCC2DEnable, PCCCabalEnable,
+enableDither, the gamut mapper, dark enhancer, latency-leak and DBM
+compensation, GP deringing and alpha divide, linear-to-panel, VUC, display
+TM DPC, the PDC and temperature-compensation switches and the EDR scaling
+flags.
+
+Add a dcal_props parameter with those 29 ids and macOS's values as the
+default, sent after the BLM set through the same applyProperty path and
+again after every DCP power-up. Brightness levels, caps and counters,
+logging, test and capability entries stay with the firmware. The two
+property parameters now share one parser. An empty list sends nothing.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/iomfb_m4.c | 100 +++++++++++++++++++++++++------
+ 1 file changed, 81 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 31df315c07..b1162310c3 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -153,11 +153,22 @@ MODULE_PARM_DESC(blm_ah_mode,
+  * and again after the DCP comes back from a power gate or a power-off.
+  */
+ #define DCP_M4_BLM_PROPS_MAX	8
++/* The panel-processing set below has 29 ids. */
++#define DCP_M4_PROPS_MAX	32
+ 
+ struct dcp_m4_blm_prop {
+ 	u32 id, value;
+ };
+ 
++/* A parameter's property list, its allowed ids and its lock. */
++struct dcp_m4_prop_set {
++	struct dcp_m4_blm_prop *props;
++	unsigned int *count;
++	unsigned int max;
++	const u16 *ids;
++	unsigned int nids;
++};
++
+ static const u16 dcp_m4_blm_prop_ids[] = { 167, 169, 171, 172, 173, 174, 178, 215 };
+ /* The default is the set macOS runs the J604 panel with (26B123). */
+ static struct dcp_m4_blm_prop blm_props[DCP_M4_BLM_PROPS_MAX] = {
+@@ -165,21 +176,63 @@ static struct dcp_m4_blm_prop blm_props[DCP_M4_BLM_PROPS_MAX] = {
+ };
+ 
+ static unsigned int blm_props_count = 7;
++
++/*
++ * The panel's image-processing switches as macOS runs the J604 (26B123,
++ * IOMobileFramebufferShim, which mirrors the DCP's RuntimeProperty store;
++ * ids from the 25G83 firmware's table): brightness compensation 28, temperature
++ * compensation 29, enableDither 30, enableDarkEnhancer 31, 2D / default
++ * temperature correction 35 / 36, uniformity2D 42, enableLatLeakComp 47,
++ * enableGamutMapper 50, enableDBMMode 67, GP deringing / alpha divide 72 / 73,
++ * PCCCabalEnable 127, PCCStabilityThreshold 128, its AOT value 129, PCCEnable
++ * 145, PCC2DEnable 147, BypassPCC2DLed 150, DisablePCC2DBrc 153,
++ * GCPDisablesTwilightLumaComp 159, GCPBypassesEDRPixels 160, DisableTempComp
++ * 161, edrScaleinGP 166, enableLinearToPanel 180, APTPDCEnable 181,
++ * APTPDCEnablePM 182, VUCEnable 216, disableBLKSFComp 253 and
++ * enableDisplayTMDpc 254. Brightness levels, caps and counters, logging,
++ * test and capability entries are left to the firmware. Sent after the BLM
++ * set through the same applyProperty path; empty sends nothing.
++ */
++static const u16 dcp_m4_dcal_prop_ids[] = {
++	28, 29, 30, 31, 35, 36, 42, 47, 50, 67, 72, 73, 127, 128, 129,
++	145, 147, 150, 153, 159, 160, 161, 166, 180, 181, 182, 216, 253, 254,
++};
++
++static struct dcp_m4_blm_prop dcal_props[DCP_M4_PROPS_MAX] = {
++	{ 28, 0 }, { 29, 0 }, { 30, 1 }, { 31, 1 }, { 35, 0 }, { 36, 0 }, { 42, 0 },
++	{ 47, 1 }, { 50, 1 }, { 67, 1 }, { 72, 1 }, { 73, 1 }, { 127, 1 }, { 128, 9 },
++	{ 129, 50000 }, { 145, 1 }, { 147, 1 }, { 150, 0 }, { 153, 0 }, { 159, 1 },
++	{ 160, 1 }, { 161, 0 }, { 166, 1 }, { 180, 1 }, { 181, 1 }, { 182, 1 },
++	{ 216, 1 }, { 253, 0 }, { 254, 1 },
++};
++
++static unsigned int dcal_props_count = 29;
+ static DEFINE_MUTEX(blm_props_lock);
+ 
+-static bool dcp_m4_blm_prop_ok(u32 id)
++static struct dcp_m4_prop_set blm_prop_set = {
++	blm_props, &blm_props_count, DCP_M4_BLM_PROPS_MAX,
++	dcp_m4_blm_prop_ids, ARRAY_SIZE(dcp_m4_blm_prop_ids),
++};
++
++static struct dcp_m4_prop_set dcal_prop_set = {
++	dcal_props, &dcal_props_count, DCP_M4_PROPS_MAX,
++	dcp_m4_dcal_prop_ids, ARRAY_SIZE(dcp_m4_dcal_prop_ids),
++};
++
++static bool dcp_m4_prop_ok(const struct dcp_m4_prop_set *set, u32 id)
+ {
+ 	unsigned int i;
+ 
+-	for (i = 0; i < ARRAY_SIZE(dcp_m4_blm_prop_ids); i++)
+-		if (id == dcp_m4_blm_prop_ids[i])
++	for (i = 0; i < set->nids; i++)
++		if (id == set->ids[i])
+ 			return true;
+ 	return false;
+ }
+ 
+-static int blm_props_set(const char *val, const struct kernel_param *kp)
++static int dcp_m4_props_set(const char *val, const struct kernel_param *kp)
+ {
+-	struct dcp_m4_blm_prop p[DCP_M4_BLM_PROPS_MAX];
++	const struct dcp_m4_prop_set *set = kp->arg;
++	struct dcp_m4_blm_prop p[DCP_M4_PROPS_MAX];
+ 	unsigned int n = 0;
+ 	char *buf, *s, *tok, *eq;
+ 	int ret = 0;
+@@ -190,21 +243,21 @@ static int blm_props_set(const char *val, const struct kernel_param *kp)
+ 	s = strim(buf);
+ 	while ((tok = strsep(&s, ",")) && *tok) {
+ 		eq = strchr(tok, '=');
+-		if (!eq || n == DCP_M4_BLM_PROPS_MAX) {
++		if (!eq || n == set->max) {
+ 			ret = -EINVAL;
+ 			goto out;
+ 		}
+ 		*eq = '\0';
+ 		if (kstrtou32(tok, 0, &p[n].id) || kstrtou32(eq + 1, 0, &p[n].value) ||
+-		    !dcp_m4_blm_prop_ok(p[n].id)) {
++		    !dcp_m4_prop_ok(set, p[n].id)) {
+ 			ret = -EINVAL;
+ 			goto out;
+ 		}
+ 		n++;
+ 	}
+ 	mutex_lock(&blm_props_lock);
+-	memcpy(blm_props, p, n * sizeof(p[0]));
+-	blm_props_count = n;
++	memcpy(set->props, p, n * sizeof(p[0]));
++	*set->count = n;
+ 	mutex_unlock(&blm_props_lock);
+ 	atomic_inc(&blm_ah_gen);
+ out:
+@@ -212,28 +265,33 @@ static int blm_props_set(const char *val, const struct kernel_param *kp)
+ 	return ret;
+ }
+ 
+-static int blm_props_get(char *buf, const struct kernel_param *kp)
++static int dcp_m4_props_get(char *buf, const struct kernel_param *kp)
+ {
++	const struct dcp_m4_prop_set *set = kp->arg;
+ 	unsigned int i;
+ 	int len = 0;
+ 
+ 	mutex_lock(&blm_props_lock);
+-	for (i = 0; i < blm_props_count; i++)
++	for (i = 0; i < *set->count; i++)
+ 		len += sysfs_emit_at(buf, len, "%s%u=%u", i ? "," : "",
+-				     blm_props[i].id, blm_props[i].value);
++				     set->props[i].id, set->props[i].value);
+ 	mutex_unlock(&blm_props_lock);
+ 	return len + sysfs_emit_at(buf, len, "\n");
+ }
+ 
+-static const struct kernel_param_ops blm_props_ops = {
+-	.set = blm_props_set,
+-	.get = blm_props_get,
++static const struct kernel_param_ops dcp_m4_props_ops = {
++	.set = dcp_m4_props_set,
++	.get = dcp_m4_props_get,
+ };
+ 
+-module_param_cb(blm_props, &blm_props_ops, NULL, 0644);
++module_param_cb(blm_props, &dcp_m4_props_ops, &blm_prop_set, 0644);
+ MODULE_PARM_DESC(blm_props,
+ 		 "Internal mini-LED panel: more BLM runtime properties sent to the DCP, \"id=value,...\" (ids 167 169 171 172 173 174 178 215; default: macOS's J604 set 167=0,169=220,172=1,173=1,174=1,178=1,215=0; empty: none; applies after the next swap)");
+ 
++module_param_cb(dcal_props, &dcp_m4_props_ops, &dcal_prop_set, 0644);
++MODULE_PARM_DESC(dcal_props,
++		 "Internal panel: image-processing runtime properties sent to the DCP after blm_props, \"id=value,...\" (PCC, dither, gamut mapper and the other 29 ids macOS sets on the J604; default: macOS's values; empty: none; applies after the next swap)");
++
+ static unsigned int power_gate_ms;
+ /* Given on the command line or written: the machine default stays out. */
+ static bool power_gate_ms_given;
+@@ -5446,15 +5504,15 @@ static void iomfb_m4_blm_send(struct iomfb_m4 *dcp, u32 id, u32 value)
+ 		dev_info(dcp->dev, "BLMAHMode %d sent: rpc %d, applyProperty status %#x\n",
+ 			 (int)value, ret, le32_to_cpu(out));
+ 	else
+-		dev_info(dcp->dev, "BLM property %u = %u sent: rpc %d, applyProperty status %#x\n",
++		dev_info(dcp->dev, "DCP property %u = %u sent: rpc %d, applyProperty status %#x\n",
+ 			 id, value, ret, le32_to_cpu(out));
+ }
+ 
+ static void iomfb_m4_blm_work(struct work_struct *work)
+ {
+ 	struct iomfb_m4 *dcp = container_of(to_delayed_work(work), struct iomfb_m4, blm_work);
+-	struct dcp_m4_blm_prop props[DCP_M4_BLM_PROPS_MAX];
+-	unsigned int i, n;
++	struct dcp_m4_blm_prop props[DCP_M4_BLM_PROPS_MAX], cal[DCP_M4_PROPS_MAX];
++	unsigned int i, n, m;
+ 	int gen, mode;
+ 
+ 	mutex_lock(&dcp->lock);
+@@ -5468,11 +5526,15 @@ static void iomfb_m4_blm_work(struct work_struct *work)
+ 	mutex_lock(&blm_props_lock);
+ 	n = blm_props_count;
+ 	memcpy(props, blm_props, n * sizeof(props[0]));
++	m = dcal_props_count;
++	memcpy(cal, dcal_props, m * sizeof(cal[0]));
+ 	mutex_unlock(&blm_props_lock);
+ 	if (mode >= 0)
+ 		iomfb_m4_blm_send(dcp, DCP_M4_PROP_BLM_AH_MODE, mode);
+ 	for (i = 0; i < n; i++)
+ 		iomfb_m4_blm_send(dcp, props[i].id, props[i].value);
++	for (i = 0; i < m; i++)
++		iomfb_m4_blm_send(dcp, cal[i].id, cal[i].value);
+ out:
+ 	mutex_unlock(&dcp->lock);
+ }
+-- 
+2.43.0
+

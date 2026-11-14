@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 01:52:24 +0000
+Subject: [PATCH] drm/apple: m4: run the J604's mini-LED with macOS's
+ BLM settings
+
+At equal brightness (382 nits) the J604's lit desktop draws 8.14 W on
+Linux against 3.92 W on macOS, and the backlight rail alone is 5.3 W at
+438 nits. macOS runs the panel with BLMAHMode 2 and seven more BLM
+runtime properties (26B123: ModeBlm 0, BLMVLEDManual 220, BLMPLimitCfg
+1, enableBLMSloper 1, enableLAC 1, BLMPowergateEnable 1,
+BLMStandbyEnable 0). Linux sends none of them unless blm_ah_mode or
+blm_props is written, so the DCP keeps whatever it starts with.
+
+Make macOS's values the defaults, and send them again whenever the DCP
+comes back from a power gate or a power-off, since they go with its
+power. Both parameters still take other values at runtime, and -1 or an
+empty list sends nothing, as before.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/iomfb_m4.c | 32 ++++++++++++++++++++++++--------
+ 1 file changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index e589002a5a..31df315c07 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -115,8 +115,9 @@ MODULE_PARM_DESC(idle_cache_ms,
+  * swap, and again whenever it is written.
+  */
+ #define DCP_M4_PROP_BLM_AH_MODE 171
+-static int blm_ah_mode = -1;
+-static atomic_t blm_ah_gen = ATOMIC_INIT(0);
++/* macOS's value is the default; generation 1 makes the first swap send it. */
++static int blm_ah_mode = 2;
++static atomic_t blm_ah_gen = ATOMIC_INIT(1);
+ 
+ static int blm_ah_mode_set(const char *val, const struct kernel_param *kp)
+ {
+@@ -140,7 +141,7 @@ module_param_cb(blm_ah_mode, &blm_ah_mode_ops, &blm_ah_mode, 0644);
+ static void iomfb_m4_blm_work(struct work_struct *work);
+ 
+ MODULE_PARM_DESC(blm_ah_mode,
+-		 "Internal mini-LED panel: BLM Adaptive Headroom mode sent to the DCP (RuntimeProperty 171; macOS on the J604: 2; -1: send nothing, the default; applies after the next swap)");
++		 "Internal mini-LED panel: BLM Adaptive Headroom mode sent to the DCP (RuntimeProperty 171; macOS on the J604: 2, the default; -1: send nothing; applies after the next swap)");
+ 
+ /*
+  * The other BLM runtime properties of the 25G83 table, sent the same way, so
+@@ -148,7 +149,8 @@ MODULE_PARM_DESC(blm_ah_mode,
+  * (26B123) publishes ModeBlm (167) 0, BLMVLEDManual (169) 220, BLMPLimitCfg
+  * (172) 1, enableBLMSloper (173) 1, enableLAC (174) 1, BLMPowergateEnable
+  * (178) 1 and BLMStandbyEnable (215) 0. "id=value,...", only those ids and
+- * 171; empty, the default, sends nothing. Applies after the next swap.
++ * 171. That set is the default; empty sends nothing. Applies after the next swap,
++ * and again after the DCP comes back from a power gate or a power-off.
+  */
+ #define DCP_M4_BLM_PROPS_MAX	8
+ 
+@@ -157,8 +159,12 @@ struct dcp_m4_blm_prop {
+ };
+ 
+ static const u16 dcp_m4_blm_prop_ids[] = { 167, 169, 171, 172, 173, 174, 178, 215 };
+-static struct dcp_m4_blm_prop blm_props[DCP_M4_BLM_PROPS_MAX];
+-static unsigned int blm_props_count;
++/* The default is the set macOS runs the J604 panel with (26B123). */
++static struct dcp_m4_blm_prop blm_props[DCP_M4_BLM_PROPS_MAX] = {
++	{ 167, 0 }, { 169, 220 }, { 172, 1 }, { 173, 1 }, { 174, 1 }, { 178, 1 }, { 215, 0 },
++};
++
++static unsigned int blm_props_count = 7;
+ static DEFINE_MUTEX(blm_props_lock);
+ 
+ static bool dcp_m4_blm_prop_ok(u32 id)
+@@ -226,7 +232,7 @@ static const struct kernel_param_ops blm_props_ops = {
+ 
+ module_param_cb(blm_props, &blm_props_ops, NULL, 0644);
+ MODULE_PARM_DESC(blm_props,
+-		 "Internal mini-LED panel: more BLM runtime properties sent to the DCP, \"id=value,...\" (ids 167 169 171 172 173 174 178 215; empty: none, the default; applies after the next swap)");
++		 "Internal mini-LED panel: more BLM runtime properties sent to the DCP, \"id=value,...\" (ids 167 169 171 172 173 174 178 215; default: macOS's J604 set 167=0,169=220,172=1,173=1,174=1,178=1,215=0; empty: none; applies after the next swap)");
+ 
+ static unsigned int power_gate_ms;
+ /* Given on the command line or written: the machine default stays out. */
+@@ -6029,6 +6035,8 @@ static int iomfb_m4_power_ungate(struct iomfb_m4 *dcp)
+ 	if (ret)
+ 		goto fail;
+ 	WRITE_ONCE(dcp->gated, false);
++	/* The BLM properties went with the DCP's power: send them again. */
++	dcp->blm_gen = -1;
+ 
+ 	step = "A414";
+ 	ret = dcp_m4_runtime_call(r, 414, false, prepare, sizeof(prepare),
+@@ -6178,6 +6186,8 @@ static int iomfb_m4_ext_power_ungate(struct iomfb_m4 *dcp, const char *why)
+ 	if (ret)
+ 		goto fail;
+ 	WRITE_ONCE(dcp->gated, false);
++	/* The BLM properties went with the DCP's power: send them again. */
++	dcp->blm_gen = -1;
+ 	WRITE_ONCE(dcp->ext_idle_gated, false);
+ 	dev_info(dcp->dev, "%s: external display coprocessor up\n", why);
+ 	return 0;
+@@ -8237,6 +8247,8 @@ static int iomfb_m4_ext_stop(struct iomfb_m4 *dcp)
+ 		return ret;
+ 	}
+ 	WRITE_ONCE(dcp->gated, false);
++	/* The BLM properties went with the DCP's power: send them again. */
++	dcp->blm_gen = -1;
+ 	return ret;
+ fail:
+ 	dev_err(dcp->dev, "external DCP stop failed at %s: %d\n", step, ret);
+@@ -8305,6 +8317,8 @@ static int iomfb_m4_ext_start(struct iomfb_m4 *dcp)
+ 		return 0;
+ 	}
+ 	WRITE_ONCE(dcp->gated, false);
++	/* The BLM properties went with the DCP's power: send them again. */
++	dcp->blm_gen = -1;
+ 	dev_info(dcp->dev, "external DCP restarted after sleep\n");
+ 	return 0;
+ }
+@@ -8567,8 +8581,10 @@ int iomfb_m4_resume(struct apple_dcp *owner)
+ 		ret = 0;
+ 	} else if (dcp->powered_off) {
+ 		ret = dcp_m4_set_power_state(dcp, true);
+-		if (!ret)
++		if (!ret) {
+ 			dcp->powered_off = false;
++			dcp->blm_gen = -1;
++		}
+ 	} else {
+ 		ret = dcp_m4_runtime_health(dcp->runtime);
+ 		if (ret)
+-- 
+2.43.0
+

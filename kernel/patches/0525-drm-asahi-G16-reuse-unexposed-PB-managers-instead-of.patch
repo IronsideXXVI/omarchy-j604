@@ -1,0 +1,281 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 00:23:21 +0000
+Subject: [PATCH] drm/asahi: G16: reuse unexposed PB managers instead
+ of building one per command
+
+Cache::prepare() builds a new PB manager (PbEpoch) for every render
+command in SUBMIT. That is three objects, each zeroed and mapped for the
+firmware, with the page list also mapped into the client VM, and all
+three are unmapped again when the job is dropped. Most of them are never
+used. With g16_pb_reuse (default 1) the command reuses the manager its
+pass slot still leases: on the J604 that happened for 41,563 of 41,769
+render commands.
+
+The cost shows in the submit time. gpubench at queue depth 64 measured
+142 us of CPU in vkQueueSubmit per render.light submit against 13.5 us
+per compute.light submit, which builds no PB manager.
+
+Keep the managers the firmware never saw in a small per-VM pool and
+hand them to the VM's next render commands. Returning one never
+allocates and happens under a spinlock, so it is safe wherever the job
+is dropped. An unexposed manager has no other holder: a flight keeps
+only an exposed manager or the leased one it reused, and the PB-slot
+lease takes exposed managers only. A pooled manager holds its VM, so
+the pool is closed and emptied when the VM's handle closes, and later
+returns are refused.
+
+g16_pb_pool (runtime 0644, default 8, at most 16) is the pool size; 0
+builds one manager per command, as before. A "pbpool:" stats line counts
+managers taken from the pool, built new, returned and refused.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/params.rs    |  19 +++++
+ drivers/gpu/drm/asahi/g16/poll.rs      |   9 +++
+ drivers/gpu/drm/asahi/g16/resources.rs | 101 +++++++++++++++++++++++--
+ drivers/gpu/drm/asahi/g16/vm.rs        |   8 ++
+ 4 files changed, 132 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index a5f33c745a..10a25d7704 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -920,6 +920,25 @@ pub(crate) fn flights() -> usize {
+     "G16: render commands in flight at once, 1 (default, the qualified one-at-a-time protocol) or 2 (one render published behind a running render; experimental; runtime 0644)"
+ );
+ 
++/// Storage of `g16_pb_pool` (runtime 0644, default 8).
++static PB_POOL: AtomicU32 = AtomicU32::new(8);
++
++/// PB managers a VM keeps for reuse when the firmware never saw them: each render
++/// command used to build a new one in SUBMIT (three objects mapped for firmware and client)
++/// even when it then reused the leased manager instead. 0 builds one per command again.
++pub(crate) fn pb_pool() -> u32 {
++    PB_POOL.load(Ordering::Relaxed).min(super::resources::PB_POOL_MAX as u32)
++}
++
++live_u32_param!(
++    PB_POOL_PARAM,
++    PB_POOL_PARMTYPE,
++    PB_POOL_PARM,
++    PB_POOL,
++    "g16_pb_pool",
++    "G16: PB managers a VM keeps for reuse instead of building one per render command in SUBMIT (default 8; 0: one per command, as before; max 16; runtime 0644)"
++);
++
+ /// Storage of `g16_resident` (runtime 0644, default 8).
+ static RESIDENT: AtomicU32 = AtomicU32::new(8);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index bd10084c27..2bbbf1c4c5 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1302,6 +1302,15 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.subgen_caught[2],
+             s.subgen_err
+         )?;
++        writeln!(
++            f,
++            "pbpool: size {} taken {} built {} returned {} refused {}",
++            super::params::pb_pool(),
++            super::resources::PB_POOL_STATS[0].load(core::sync::atomic::Ordering::Relaxed),
++            super::resources::PB_POOL_STATS[1].load(core::sync::atomic::Ordering::Relaxed),
++            super::resources::PB_POOL_STATS[2].load(core::sync::atomic::Ordering::Relaxed),
++            super::resources::PB_POOL_STATS[3].load(core::sync::atomic::Ordering::Relaxed)
++        )?;
+         writeln!(
+             f,
+             "resident: depth {} units {} compact {} max {} deep {}",
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 43895ed0cd..4d66cb0401 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -15,11 +15,25 @@
+ use crate::mmu;
+ use core::sync::atomic::{AtomicU64, Ordering};
+ use kernel::{
+-    new_mutex,
++    new_mutex, new_spinlock,
+     prelude::*,
+-    sync::{Arc, Mutex},
++    sync::{Arc, Mutex, SpinLock},
+ };
+ 
++/// Most PB managers a VM keeps for reuse (`g16_pb_pool` is clamped to it).
++pub(crate) const PB_POOL_MAX: usize = 16;
++
++/// `g16_pb_pool` counters: managers taken from a pool, built new, returned, refused.
++pub(crate) static PB_POOL_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
++
++/// A VM's PB managers that the firmware never saw (never exposed), kept to back later
++/// render commands of the same VM instead of building a new one for each in SUBMIT.
++/// Closed (and emptied) when the VM's handle closes: a pooled manager holds the VM.
++pub(crate) struct EpochPool {
++    items: KVec<Arc<PbEpoch>>,
++    closed: bool,
++}
++
+ pub(crate) struct ComputeArena(crate::cleanup::Deferred<ComputeInner>);
+ impl core::ops::Deref for ComputeArena {
+     type Target = ComputeInner;
+@@ -129,6 +143,7 @@ pub(crate) struct Cache {
+     bind: mmu::VmBind,
+     live: Arc<super::vm::LiveToken>,
+     budget: Arc<super::budget::Budget>,
++    pool: Arc<SpinLock<EpochPool>>,
+ }
+ impl Cache {
+     pub(crate) fn new(
+@@ -137,12 +152,24 @@ pub(crate) fn new(
+         live: Arc<super::vm::LiveToken>,
+     ) -> Result<Arc<Self>> {
+         let budget = super::budget::Budget::new()?;
++        let items = KVec::with_capacity(PB_POOL_MAX, GFP_KERNEL)?;
++        let pool = Arc::pin_init(
++            new_spinlock!(EpochPool { items, closed: false }, "g16::pb_pool"),
++            GFP_KERNEL,
++        )?;
+         Arc::pin_init(
+             pin_init!(Self { ready <- new_mutex!(Ready::default(), "g16::resources"),
+-            factory, bind, live, budget }),
++            factory, bind, live, budget, pool }),
+             GFP_KERNEL,
+         )
+     }
++    /// Closes the PB manager pool when the VM's handle closes and returns what it held, to
++    /// be dropped by the caller outside its locks. Later returns are refused.
++    pub(crate) fn close_pool(&self) -> KVec<Arc<PbEpoch>> {
++        let mut pool = self.pool.lock();
++        pool.closed = true;
++        core::mem::take(&mut pool.items)
++    }
+     pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<Prepared> {
+         let compute = commands.iter().any(|c| matches!(c, Command::Compute(_)));
+         let render_count = commands
+@@ -150,7 +177,28 @@ pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<
+             .filter(|c| matches!(c, Command::Render(_)))
+             .count();
+         let render = render_count != 0;
+-        let mut epochs = super::budget::Budget::reserve(&self.budget, render_count.try_into()?)?;
++        // g16_pb_pool: managers this VM never exposed come back from its pool first; only
++        // the rest are built (and charged against the VM's PB budget) here.
++        let mut pooled = KVec::with_capacity(render_count, GFP_KERNEL)?;
++        if super::params::pb_pool() != 0 {
++            let mut pool = self.pool.lock();
++            while pooled.len() < render_count {
++                let Some(epoch) = pool.items.pop() else {
++                    break;
++                };
++                // Capacity reserved above: cannot fail.
++                if let Err(e) = pooled.push_within_capacity(epoch) {
++                    let _ = pool.items.push_within_capacity(e.0);
++                    break;
++                }
++            }
++        }
++        PB_POOL_STATS[0].fetch_add(pooled.len() as u64, Ordering::Relaxed);
++        PB_POOL_STATS[1].fetch_add((render_count - pooled.len()) as u64, Ordering::Relaxed);
++        let mut epochs = super::budget::Budget::reserve(
++            &self.budget,
++            (render_count - pooled.len()).try_into()?,
++        )?;
+         let (compute, render) = {
+             // Never held by publication, completion, recovery or fence signalling.
+             let mut ready = self.ready.lock();
+@@ -186,7 +234,10 @@ pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<
+         for command in commands {
+             pb.push(
+                 if matches!(command, Command::Render(_)) {
+-                    Some(PbEpoch::new(&self.factory, vm, epochs.take()?)?)
++                    match pooled.pop() {
++                        Some(epoch) => Some(epoch),
++                        None => Some(PbEpoch::new(&self.factory, vm, epochs.take()?)?),
++                    }
+                 } else {
+                     None
+                 },
+@@ -200,6 +251,7 @@ pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<
+             compute,
+             render,
+             pb,
++            pool: Some(self.pool.clone()),
+         })
+     }
+ }
+@@ -209,6 +261,45 @@ pub(crate) struct Prepared {
+     pub(crate) compute: Option<Arc<ComputeArena>>,
+     pub(crate) render: Option<Arc<RenderArena>>,
+     pb: KVec<Option<Arc<PbEpoch>>>,
++    pool: Option<Arc<SpinLock<EpochPool>>>,
++}
++impl Drop for Prepared {
++    /// Returns the job's PB managers the firmware never saw to the VM's pool (bounded by
++    /// `g16_pb_pool`, never allocating, so it is safe wherever the job is dropped). An
++    /// unexposed manager has no other holder: a flight keeps only an exposed one or the
++    /// leased one it reused, and the PB-slot lease takes exposed managers only.
++    fn drop(&mut self) {
++        let Some(pool) = self.pool.take() else {
++            return;
++        };
++        let max = (super::params::pb_pool() as usize).min(PB_POOL_MAX);
++        let mut refused = 0u64;
++        let mut returned = 0u64;
++        {
++            let mut pool = pool.lock();
++            for slot in self.pb.iter_mut() {
++                if !slot.as_ref().is_some_and(|epoch| !epoch.is_exposed()) {
++                    continue;
++                }
++                if pool.closed || pool.items.len() >= max || pool.items.len() >= pool.items.capacity()
++                {
++                    refused += 1;
++                    continue;
++                }
++                if let Some(epoch) = slot.take() {
++                    // len < capacity was checked: cannot fail, so nothing drops under the lock.
++                    if let Err(e) = pool.items.push_within_capacity(epoch) {
++                        *slot = Some(e.0);
++                        refused += 1;
++                    } else {
++                        returned += 1;
++                    }
++                }
++            }
++        }
++        PB_POOL_STATS[2].fetch_add(returned, Ordering::Relaxed);
++        PB_POOL_STATS[3].fetch_add(refused, Ordering::Relaxed);
++    }
+ }
+ impl Prepared {
+     pub(crate) fn compute(&self) -> Result<&ComputeArena> {
+diff --git a/drivers/gpu/drm/asahi/g16/vm.rs b/drivers/gpu/drm/asahi/g16/vm.rs
+index 5bb4f43445..343986a9f3 100644
+--- a/drivers/gpu/drm/asahi/g16/vm.rs
++++ b/drivers/gpu/drm/asahi/g16/vm.rs
+@@ -254,6 +254,12 @@ pub(crate) fn close(&self, id: u64) {
+             let index = vms.iter().position(|state| state.id == id);
+             index.and_then(|index| vms.remove(index).ok())
+         };
++        // A pooled PB manager holds its VM: empty the pool so the VM can be destroyed.
++        let pooled = state
++            .as_ref()
++            .and_then(|state| state.resources.as_ref())
++            .map(|cache| cache.close_pool());
++        drop(pooled);
+         drop(state);
+     }
+ 
+@@ -268,6 +274,8 @@ fn prune(&self) {
+             let Some(closed) = closed else {
+                 break;
+             };
++            let pooled = closed.resources.as_ref().map(|cache| cache.close_pool());
++            drop(pooled);
+             // No allocation while holding the registry lock, which fail_all() also needs.
+             // Final VM destruction is deferred independently of this caller's locks.
+             drop(closed);
+-- 
+2.43.0
+

@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 02:54:16 +0000
+Subject: [PATCH] media: apple: isp: set up the T8132 ISP DARTs as
+ macOS does at power-up
+
+macOS 26B123 on the J604, traced under a hypervisor across four ISP
+sessions (boot, login warm-up and a 30 s Photo Booth stream), powers
+the ISP up the same way every time: it sets a word at 0x28a4080 from
+the ISP base to 1, then writes eight setup words on the second and
+third ISP DART (0x20c 0x800001f5, 0x220 0xf0f0f, 0x224 0x80808,
+0x300 1, 0x308 0x10000000, 0x310 0x3fffffff, 0x228 0x3f3f3f3f,
+0x22c 0x1010101) and the last two of them on the first, which keeps
+the others across ISP power cycles. Those two DARTs come up with the
+first six at reset values. Neither apple-dart nor this driver writes
+any of them.
+
+Write them the same way at each power-up, before the address filter,
+behind the macos_dart_setup module parameter, on by default for
+T8132. The DART windows come from the device's iommus, mapped without
+claiming them from apple-dart. macos_dart_setup=0 restores the
+current power-up.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/isp/isp-drv.c  | 32 +++++++++++++++++
+ drivers/media/platform/apple/isp/isp-drv.h  |  9 +++++
+ drivers/media/platform/apple/isp/isp-fw.c   | 39 +++++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-regs.h |  9 +++++
+ 4 files changed, 89 insertions(+)
+
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index febbda6b91..186135313b 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -800,6 +800,36 @@ static int apple_isp_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	if (isp->hw->pre_dart_word) {
++		struct resource *co = platform_get_resource_byname(pdev,
++								 IORESOURCE_MEM, "coproc");
++
++		isp->pre_dart = devm_ioremap(dev, co->start + isp->hw->pre_dart_word,
++					      sizeof(u32));
++		if (!isp->pre_dart) {
++			err = -ENOMEM;
++			goto detach_genpd;
++		}
++	}
++
++	/* The DARTs belong to apple-dart: map their setup words without a claim. */
++	for (unsigned int i = 0; isp->hw->dart_setup && i < ARRAY_SIZE(isp->dart_setup); i++) {
++		struct of_phandle_args args;
++		struct resource dres;
++
++		if (of_parse_phandle_with_args(dev->of_node, "iommus", "#iommu-cells", i, &args))
++			break;
++		err = of_address_to_resource(args.np, 0, &dres);
++		of_node_put(args.np);
++		if (err)
++			goto detach_genpd;
++		isp->dart_setup[i] = devm_ioremap(dev, dres.start, ISP_DART_SETUP_SIZE);
++		if (!isp->dart_setup[i]) {
++			err = -ENOMEM;
++			goto detach_genpd;
++		}
++	}
++
+ 	if (isp->hw->mbox_irq_route_t8132) {
+ 		struct resource *mb = platform_get_resource_byname(pdev,
+ 								 IORESOURCE_MEM, "mbox");
+@@ -1272,6 +1302,8 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
+ 	.coproc_status = ISP_COPROC_STATUS_T8140,
+ 	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
+ 	.core_park = { 0x2c7c008, 0x2c80008 },
++	.pre_dart_word = 0x28a4080,
++	.dart_setup = true,
+ 	.boot_mode = 1,
+ 	.shared_size = 0xdec00000,
+ 	.fw_restore = true,
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 54ab0b231e..1acd319d32 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -223,6 +223,13 @@ struct apple_isp_hw {
+ 	 * with the core_park module parameter.
+ 	 */
+ 	u32 core_park[2];
++	/*
++	 * Offset from the coprocessor window of the word macOS sets to 1 before
++	 * the DARTs, and whether it writes its DART setup words (T8132); used
++	 * with the macos_dart_setup module parameter.
++	 */
++	u32 pre_dart_word;
++	bool dart_setup;
+ 
+ 	/* windows mapped 1:1 for the firmware */
+ 	const struct isp_mmio_window *fw_mmio;
+@@ -428,6 +435,8 @@ struct apple_isp {
+ 	void __iomem *dapf;
+ 	void __iomem *mbox_route;
+ 	void __iomem *core_park[2];
++	void __iomem *pre_dart;
++	void __iomem *dart_setup[3];
+ 	struct device *dapf_dart;
+ 	struct hrtimer wdt_timer;
+ 	bool wdt_running;
+diff --git a/drivers/media/platform/apple/isp/isp-fw.c b/drivers/media/platform/apple/isp/isp-fw.c
+index ba69ee8d89..89b11f3b04 100644
+--- a/drivers/media/platform/apple/isp/isp-fw.c
++++ b/drivers/media/platform/apple/isp/isp-fw.c
+@@ -51,6 +51,43 @@ module_param(core_park, bool, 0644);
+ MODULE_PARM_DESC(core_park,
+ 		 "Park the ISP CPU cores before power-down as macOS does, e.g. T8132 (default: on)");
+ 
++/*
++ * Write the ISP DART setup and the word before it at each power-up as
++ * macOS does where they are known (T8132). Read at each power-up.
++ */
++static bool macos_dart_setup = true;
++module_param(macos_dart_setup, bool, 0644);
++MODULE_PARM_DESC(macos_dart_setup,
++		 "Write the ISP DART setup words macOS writes at power-up, e.g. T8132 (default: on)");
++
++static const struct {
++	u16 off;
++	u32 val;
++	bool first;	/* the first DART keeps it across power cycles */
++} isp_dart_setup_words[] = {
++	{ 0x20c, 0x800001f5, true }, { 0x220, 0x000f0f0f, true },
++	{ 0x224, 0x00080808, true }, { 0x300, 0x00000001, true },
++	{ 0x308, 0x10000000, true }, { 0x310, 0x3fffffff, true },
++	{ 0x228, 0x3f3f3f3f, false }, { 0x22c, 0x01010101, false },
++};
++
++static void isp_macos_dart_setup(struct apple_isp *isp)
++{
++	if (!READ_ONCE(macos_dart_setup) || !isp->pre_dart)
++		return;
++	writel(ISP_PRE_DART_VAL_T8132, isp->pre_dart);
++	for (unsigned int i = 0; i < ARRAY_SIZE(isp->dart_setup); i++) {
++		if (!isp->dart_setup[i])
++			continue;
++		for (unsigned int j = 0; j < ARRAY_SIZE(isp_dart_setup_words); j++) {
++			if (i == 0 && isp_dart_setup_words[j].first)
++				continue;
++			writel(isp_dart_setup_words[j].val,
++			       isp->dart_setup[i] + isp_dart_setup_words[j].off);
++		}
++	}
++}
++
+ /* the waits for firmware that has been told to power down */
+ #define ISP_STOP_KEY_TRIES     20
+ #define ISP_STOP_KEY_MS	       10
+@@ -561,6 +598,8 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
+ 	if (err < 0)
+ 		return err;
+ 
++	isp_macos_dart_setup(isp);
++
+ 	if (isp->dapf) {
+ 		err = apple_isp_program_dapf(isp);
+ 		if (err)
+diff --git a/drivers/media/platform/apple/isp/isp-regs.h b/drivers/media/platform/apple/isp/isp-regs.h
+index 26c74a7010..6401455e0c 100644
+--- a/drivers/media/platform/apple/isp/isp-regs.h
++++ b/drivers/media/platform/apple/isp/isp-regs.h
+@@ -39,6 +39,15 @@
+ #define ISP_COPROC_PARK_CLR_T8132 GENMASK(25, 24)
+ #define ISP_CORE_PARK_VAL_T8132	  0x2
+ 
++/*
++ * T8132 power-up as macOS 26B123 runs it on the J604, before it touches the
++ * DARTs: a word in the ISP window set to 1, then these DART words. The first
++ * DART keeps all but the last two across ISP power cycles; the other two
++ * come up at reset values and get all eight.
++ */
++#define ISP_PRE_DART_VAL_T8132	  0x1
++#define ISP_DART_SETUP_SIZE	  0x400
++
+ /*
+  * ISP17a (T8140) reset. The fourth fabric word is at 0xa50, off the 0x100
+  * stride of the other three, in the observed sequence.
+-- 
+2.43.0
+

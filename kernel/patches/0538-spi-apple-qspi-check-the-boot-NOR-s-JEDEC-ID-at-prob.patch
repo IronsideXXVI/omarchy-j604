@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 05:35:37 +0000
+Subject: [PATCH] spi: apple-qspi: check the boot NOR's JEDEC ID at
+ probe
+
+The NVRAM write path re-reads the JEDEC ID before every WREN, but
+nothing reports which part a board carries until the first write
+attempt, and the J604's ID is assumed from the J713 (its ADT dump
+omits the NOR).
+
+Read the ID once at probe, before root can clear read_only, and print
+it with the NVRAM write state. A qualified board whose part is not one
+its table names stays read-only for this boot: its writes are
+refused as for an unqualified layout, even after read_only=N.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/spi/spi-apple-qspi.c | 54 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 54 insertions(+)
+
+diff --git a/drivers/spi/spi-apple-qspi.c b/drivers/spi/spi-apple-qspi.c
+index cf11c31add..6c7e7f6ed5 100644
+--- a/drivers/spi/spi-apple-qspi.c
++++ b/drivers/spi/spi-apple-qspi.c
+@@ -994,6 +994,10 @@ static void apple_qspi_nvram_window(struct device *dev, struct apple_qspi *qspi)
+ 		dev_dbg(dev, "boot NOR read-only: no usable nvram partition\n");
+ }
+ 
++static void apple_qspi_probe_jedec(struct device *dev,
++				   struct spi_controller *ctlr,
++				   struct apple_qspi *qspi);
++
+ static int apple_qspi_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -1101,6 +1105,9 @@ static int apple_qspi_probe(struct platform_device *pdev)
+ 				     "failed to register SPI controller\n");
+ 	}
+ 
++	/* Before root can clear read_only: the part must be the expected one. */
++	apple_qspi_probe_jedec(dev, ctlr, qspi);
++
+ 	mutex_lock(&apple_qspi_policy_lock);
+ 	runtime_ready = true;
+ 	mutex_unlock(&apple_qspi_policy_lock);
+@@ -1130,6 +1137,53 @@ static int apple_qspi_flash_read_reg(struct spi_mem *mem, u8 opcode,
+ 	return spi_mem_exec_op(mem, &op);
+ }
+ 
++/*
++ * Read the boot NOR's JEDEC ID once at probe, before root can clear
++ * read_only, and print it with the NVRAM write state. A qualified board
++ * whose part is not one its table names stays read-only for this boot;
++ * every write still re-reads the ID before WREN.
++ */
++static void apple_qspi_probe_jedec(struct device *dev,
++				   struct spi_controller *ctlr,
++				   struct apple_qspi *qspi)
++{
++	struct spi_mem mem = { };
++	struct device *child;
++	const char *state;
++	u8 *id;
++	int ret = -ENODEV;
++
++	id = kzalloc(3, GFP_KERNEL);
++	if (!id) {
++		qspi->nvram_write_candidate = false;
++		return;
++	}
++	child = device_find_child(&ctlr->dev, NULL, apple_qspi_match_cs0);
++	if (child) {
++		mem.spi = to_spi_device(child);
++		ret = apple_qspi_flash_read_reg(&mem, 0x9f, id, 3);
++		put_device(child);
++	}
++	if (ret) {
++		qspi->nvram_write_candidate = false;
++		dev_info(dev, "boot NOR JEDEC unreadable (%d); NVRAM read-only\n",
++			 ret);
++		goto out;
++	}
++	if (!qspi->nvram_write_candidate) {
++		state = "read-only (board or nvram layout not qualified)";
++	} else if (memcmp(id, qspi->jedec, 3) &&
++		   (!qspi->jedec_alt[0] || memcmp(id, qspi->jedec_alt, 3))) {
++		qspi->nvram_write_candidate = false;
++		state = "read-only (unknown part)";
++	} else {
++		state = "qualified, writable only after read_only=N";
++	}
++	dev_info(dev, "boot NOR JEDEC %3phN; NVRAM %s\n", id, state);
++out:
++	kfree(id);
++}
++
+ static ssize_t flash_status_show(struct device *dev,
+ 				struct device_attribute *attr, char *buf)
+ {
+-- 
+2.43.0
+

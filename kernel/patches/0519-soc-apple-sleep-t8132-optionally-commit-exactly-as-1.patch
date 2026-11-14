@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 13 Nov 2026 23:37:07 +0000
+Subject: [PATCH] soc: apple: sleep: t8132: optionally commit exactly
+ as #1314 does
+
+PR #1314 (aurora-silicon/linux at 04f43c7fd9) resumes on J713, also a
+T8132. Its stub alone, used in our commit path, still reset at its 60 s
+window on the J604 (k888), so the difference may be in the commit.
+
+t8132_team_commit (default N) runs #1314's commit for T8132 step for
+step: the other cores stopped, the RAM clean that starts its lower_io,
+ATC0 and ANS lowered, WD2, the still-on wait and the power-state
+unlatch (which takes the deep DRAM path if a latch had to be cleared),
+its last mile, then resume_pa = its own stub after all of that, the
+mailbox, stack and driver state cleaned, the commit, the AIC masked,
+the boot core's WFI. Our checks, stub config, marks and DRAM check are
+cleared first and the .prepare_late arm is skipped, so none of our
+additions runs on the way down or back.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 94 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 93 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 2c6c8f96e3..4630f848b0 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -4840,6 +4840,15 @@ module_param(t8132_unlatch, bool, 0644);
+ MODULE_PARM_DESC(t8132_unlatch,
+ 		 "T8132: wait for the still-on words and unlatch power states in the commit, as #1314 does (default: off)");
+ 
++/*
++ * #1314's T8132 commit as the team ships it (aurora-silicon/linux at 04f43c7fd9), which
++ * resumes on J713 (also T8132): none of this driver's additions on the way down or back.
++ */
++static bool t8132_team_commit;
++module_param(t8132_team_commit, bool, 0644);
++MODULE_PARM_DESC(t8132_team_commit,
++		 "T8132: commit exactly as #1314 does, through its stub, with none of our additions (default: off)");
++
+ static bool t8132_cpu_perf_down = true;
+ module_param(t8132_cpu_perf_down, bool, 0644);
+ MODULE_PARM_DESC(t8132_cpu_perf_down,
+@@ -5329,6 +5338,85 @@ static void t8132_ovrd_apply(u32 m)
+ static void t8132_commit_arm(struct apple_sleep *s);
+ static void __noreturn t8132_commit_tail(struct apple_sleep *s);
+ 
++/*
++ * #1314's apple_sleep_commit() with t8132_sleep_ops, step for step: the other cores stopped,
++ * the RAM clean that starts its lower_io, ATC0 and ANS lowered, WD2, the still-on wait and
++ * the power-state unlatch, its last mile (SoC and DCS down, the memory controller, the gates
++ * and voter, the clusters, the quiesce read, the clock muxes, the power-state save, AON 0xa0),
++ * then resume_pa = its own stub after all of that, the mailbox, stack and driver state
++ * cleaned, the commit, the AIC masked, the boot core's WFI. Only our own leftovers are
++ * cleared first, so nothing of ours runs at the wake: checks, config, marks, the DRAM check.
++ */
++static void __noreturn t8132_team_sleep_commit(struct apple_sleep *s)
++{
++	int i;
++
++	t8132_team_armed = true;
++	t8132_team_marks(true);
++	t8132_disarm_el_check();
++	t8132_disarm_el_check2();
++	t8132_disarm_stubcfg();
++	if (s->mbox_check) {
++		WRITE_ONCE(s->mbox_check->magic, 0);
++		dcache_clean_poc((unsigned long)s->mbox,
++				 (unsigned long)s->mbox + AURA_S2R_CHECKED_SIZE);
++	}
++
++	s->siq_cfg = read_sysreg_s(SYS_APL_SIQ_CFG_EL1);
++	s->cpus_stop_ret = spin_table_stop_parked();
++
++	t8132_clean_ram();
++	t8132_sleep_lower_io(s);
++	apple_sleep_arm_wd2(s);
++	apple_sleep_wait_still_on(s);
++	if (apple_sleep_ps_unlatch(s)) {
++		s->deep_once = true;
++		sleep_slp_ddr_set_deep_once(true);
++	}
++
++	if (sleep_perf_wait(s->clk_perf + CLK_PERF_SOC, SOC_SLEEP_STATE)) {
++		writel(SOC_SLEEP_STATE, s->clk_perf + CLK_PERF_SOC);
++		sleep_perf_wait(s->clk_perf + CLK_PERF_SOC, SOC_SLEEP_STATE);
++	}
++	apple_sleep_dcs_down(s);
++	t8132_sleep_mcc_stop(s);
++	for (i = 0; i < 2; i++) {
++		writel(PWRGATE_ON, s->pwrgate + T8132_PWRGATE_CPM_0);
++		writel(PWRGATE_ON, s->pwrgate + T8132_PWRGATE_CPM_1);
++	}
++	readl(s->pmc_voters + T8132_PMC_VOTER3);
++	writel(0, s->pmc_voters + T8132_PMC_VOTER3);
++	readl(s->pmc_voters + T8132_PMC_VOTER3_B);
++	writel(PWRGATE_ON, s->pwrgate + T8132_PWRGATE_CPM_0);
++	writel(PWRGATE_ON, s->pwrgate + T8132_PWRGATE_CPM_1);
++	writel(0, s->cluster + CLUSTER_E);
++	writel(0, s->cluster + CLUSTER_P);
++	s->quiesce_still_on = 0;
++	for (i = 0; i < ARRAY_SIZE(t8132_quiesce_words); i++)
++		if (sleep_ps_on(s, t8132_quiesce_words[i]))
++			s->quiesce_still_on |= BIT(i);
++	writel(CLK_MUX_PARKED, s->clk_mux + T8132_CLK_MUX_50);
++	writel(CLK_MUX_PARKED, s->clk_mux + T8132_CLK_MUX_54);
++	writel(CLK_MUX_PARKED, s->clk_mux + T8132_CLK_MUX_40);
++	writel(CLK_MUX_PARKED, s->clk_mux + T8132_CLK_MUX_44);
++	sleep_ps_save(s);
++	writel((readl(s->ps_aon + 0xa0) & ~PS_FLAGS) | PS_AUTO_ENABLE, s->ps_aon + 0xa0);
++
++	s->resumes_before = READ_ONCE(s->mbox->resumes);
++	WRITE_ONCE(s->mbox->resume_pa, __pa_symbol(t8132_team_stub));
++	dcache_clean_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
++	dcache_clean_poc((unsigned long)task_stack_page(current),
++			 (unsigned long)task_stack_page(current) + THREAD_SIZE);
++	dcache_clean_poc((unsigned long)s, (unsigned long)(s + 1));
++	dsb(sy);
++
++	writel(1, s->commit);
++	aic_sleep_mask_all();
++	spin_table_release_stopped();
++	mdelay(T8132_POST_COMMIT_MS);
++	sleep_boot_wfi(s);
++}
++
+ /* A write-combine (non-cacheable) view of [pa, pa + len): vmap for mapped RAM, else ioremap_wc. */
+ static void *t8132_nc_map(phys_addr_t pa, size_t len, bool *io)
+ {
+@@ -5519,6 +5607,9 @@ static int t8132_sleep_commit(unsigned long unused)
+ 	bool prep = s->wake_prep, early = prep || READ_ONCE(t8132_arm_early);
+ 	int i;
+ 
++	if (READ_ONCE(t8132_team_commit))
++		t8132_team_sleep_commit(s);
++
+ 	s->siq_cfg = read_sysreg_s(SYS_APL_SIQ_CFG_EL1);
+ 	s->cpus_stop_ret = spin_table_stop_parked();
+ 
+@@ -6266,7 +6357,8 @@ static int apple_sleep_prepare_late(void)
+ 		 t8132_mbox_pa, &(phys_addr_t){ __pa_symbol(&t8132_stubcfg) },
+ 		 &(phys_addr_t){ sleep_check_pa(task_stack_page(current)) }, raw_smp_processor_id(),
+ 		 e4 ? "fault " : "", h4, ee4 ? "fault " : "", eh4, READ_ONCE(t8132_wake_prep));
+-	if (!READ_ONCE(t8132_wake_prep) || !s->mbox || !t8132_mbox_pa)
++	if (!READ_ONCE(t8132_wake_prep) || READ_ONCE(t8132_team_commit) || !s->mbox ||
++	    !t8132_mbox_pa)
+ 		return 0;
+ 	s->wake_prep = true;
+ 	t8132_commit_arm(s);
+-- 
+2.43.0
+

@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 00:17:01 +0000
+Subject: [PATCH] drm/asahi: G16: rotate render commands over every
+ resident unit
+
+A render pass unit keeps a lease on the VM of its last command
+(Slots::pass_owner, and the PB-slot lease in Pools) until a later
+command uses that unit. The lease holds the VM's VmState, and with it
+the VM's whole render arena: every unit's pass storage, UMA pool and
+PB heap.
+
+pick_pass() only rotated over the first g16_resident units. After a
+client exits and the depth drops, units above it are never used again,
+so they keep the closed VMs' arenas until reboot. On the J604 with 18
+units, available memory fell from 9.9 GB to 6.4 GB after a test run
+and did not come back.
+
+Rotate over every latched unit. How many render commands are in flight
+is still bounded by Firmware::ahead_ok(), not by which unit they use.
+Each unit is now used once per turn of commands from any live client
+(the compositor), which displaces closed VMs' leases and frees their
+arenas. The render-unit exhaustion check covers all latched units. A
+host test checks that with g16_overlap 0 every unit of 8 can be
+claimed in turn.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/pools/lifetime.rs | 18 ++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/slots.rs          | 20 ++++++++++----------
+ 2 files changed, 28 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/pools/lifetime.rs b/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
+index 9d91f604ee..5cb9bc252c 100644
+--- a/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
++++ b/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
+@@ -307,6 +307,24 @@ fn resident_four_owners_retire_oldest_first() {
+         reset_latch();
+     }
+     #[test]
++    fn rotation_over_all_units_reuses_each_without_overlap() {
++        // Depth 0 at runtime (g16_overlap 0) with 8 latched units: the rotation still finds
++        // every unit claimable in turn (Fresh, then the displacement rule), so each unit's
++        // last-owner lease is replaced once per turn.
++        reset_latch();
++        UMA_SPLIT.store(1, Ordering::Relaxed);
++        OVERLAP.store(0, Ordering::Relaxed);
++        let mut l = Lifetime::with_units(8);
++        for n in 0..24 {
++            let k = n % 8;
++            assert!(l.claim(k), "claim {k} at turn {n}");
++            assert!(l.publish(k));
++            assert!(l.retire(k));
++        }
++        OVERLAP.store(1, Ordering::Relaxed);
++        reset_latch();
++    }
++    #[test]
+     fn c1_overlap_without_split_keeps_one_owner_per_firmware_slot() {
+         reset_latch();
+         UMA_SPLIT.store(0, Ordering::Relaxed);
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index b0bb87b581..26107b360f 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -443,14 +443,7 @@ pub(crate) fn compute_exhausted(&self) -> bool {
+         self.compute_lifetime.exhausted()
+     }
+     pub(crate) fn render_exhausted(&self) -> bool {
+-        self.pass_lifetime.exhausted_within(self.pass_units())
+-    }
+-    /// Pass units new render commands may claim now: the two qualified ones, or the
+-    /// resident depth (`g16_resident`) within the latched units.
+-    pub(crate) fn pass_units(&self) -> usize {
+-        super::params::resident()
+-            .max(2)
+-            .min(self.pass_lifetime.units())
++        self.pass_lifetime.exhausted()
+     }
+     pub(crate) fn lifetime_counts(&self) -> [super::pools::lifetime::Counts; 2] {
+         [self.compute_lifetime.counts(), self.pass_lifetime.counts()]
+@@ -491,7 +484,14 @@ pub(crate) fn pick_pass(
+         geo: &Geometry,
+         picked: u32,
+     ) -> Option<usize> {
+-        let units = self.pass_units().min(arena.passes.len());
++        // Rotate over EVERY latched unit, not only the first g16_resident ones: how many
++        // render commands are in flight is bounded by Firmware::ahead_ok(), not by the unit
++        // index. A unit's last-owner lease (pass_owner, and the PB-slot lease in Pools) holds
++        // that VM's VmState, and with it the VM's whole render arena, until the unit is used
++        // again. Rotating through all units displaces a closed VM's leases within one turn
++        // of commands from any live client, so its arena is freed; restricting the rotation
++        // left units above the current depth holding closed VMs' arenas until reboot.
++        let units = self.pass_lifetime.units().min(arena.passes.len());
+         for i in 0..units {
+             let k = (self.pass_cursor as usize + i) % units;
+             let p = &arena.passes[k];
+@@ -522,7 +522,7 @@ pub(crate) fn claim_pass(&mut self, arena: &super::resources::RenderArena, k: us
+         }
+         arena.tpc_dirty[k].store(0, Ordering::Relaxed);
+         arena.tilemap_dirty[k].store(0, Ordering::Relaxed);
+-        self.pass_cursor = ((k + 1) % self.pass_units().max(1)) as u32;
++        self.pass_cursor = ((k + 1) % self.pass_lifetime.units().max(1)) as u32;
+         Ok(())
+     }
+     #[allow(dead_code)]
+-- 
+2.43.0
+
