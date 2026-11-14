@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 17:26:37 +0000
+Subject: [PATCH] drm/asahi: G16: import Globals again after the
+ power-asserting controls
+
+With the power-assert tally kept, the J604 GPU still never powered off
+at idle (1.907: GFX on for all of a 60 s sample, tally 4).
+
+The boot imports Globals (device control 0x34) right after the staged
+NOP, when the tally is 2; START and the idle policy then take the
+firmware's count of drained power-asserting records to 4. Nothing has
+shown that the firmware reads Globals live after that import: neither
+the idle power-off word nor the effort word ever changed anything at
+runtime. If the firmware works from the copy taken at import, it sees
+a tally of 2 against its count of 4 for the whole session and keeps
+the cores powered.
+
+Import Globals once more after the boot policy record, and after every
+later power-asserting control, so the imported tally matches the
+firmware's count, the import record itself included. A refused import
+at boot is logged and leaves the GPU working.
+
+g16_reimport (default 1, runtime 0644) set to 0 imports at boot only,
+as before.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/boot.rs    | 15 +++++++++++++++
+ drivers/gpu/drm/asahi/g16/channel.rs | 19 ++++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/params.rs  | 20 ++++++++++++++++++++
+ 3 files changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 260ed39ab0..868fb10c7a 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -755,6 +755,21 @@ fn run(
+             Ok(()) => dev_info!(dev, "M4 power: firmware idle power-off allowed\n"),
+             Err(e) => dev_warn!(dev, "M4 power: idle power-off policy not taken: {:?}\n", e),
+         }
++        // The boot import ran before START and the policy record; import once more so a
++        // firmware copy of Globals carries the tally that matches every record it drained.
++        if super::params::reimport() {
++            match channel::devctl_submit(
++                session,
++                channels,
++                events,
++                init,
++                &DevCtl::op(devctl::IMPORT_GLOBALS),
++                true,
++            ) {
++                Ok(()) => dev_info!(dev, "M4 power: Globals re-imported after the policy\n"),
++                Err(e) => dev_warn!(dev, "M4 power: Globals re-import not taken: {:?}\n", e),
++            }
++        }
+     }
+     Ok(())
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/channel.rs b/drivers/gpu/drm/asahi/g16/channel.rs
+index c62d550b97..5974e427f7 100644
+--- a/drivers/gpu/drm/asahi/g16/channel.rs
++++ b/drivers/gpu/drm/asahi/g16/channel.rs
+@@ -349,6 +349,8 @@ impl Firmware {
+     /// Posts a device-control record; with `wait` waits for its consumption and completion,
+     /// otherwise returns once posted. EBUSY while the firmware is halted; the transport error if
+     /// the session failed.
++    /// A power-asserting record is followed by a Globals import (`g16_reimport`), so a
++    /// firmware copy of Globals keeps the tally that matches its own count.
+     #[allow(dead_code)]
+     pub(crate) fn devctl(&mut self, record: &DevCtl, wait: bool) -> Result {
+         devctl_submit(
+@@ -358,7 +360,22 @@ pub(crate) fn devctl(&mut self, record: &DevCtl, wait: bool) -> Result {
+             &self.init,
+             record,
+             wait,
+-        )
++        )?;
++        let opcode = record.opcode();
++        if opcode != devctl::IMPORT_GLOBALS
++            && devctl::asserts_gpu_power(opcode)
++            && super::params::reimport()
++        {
++            devctl_submit(
++                &mut self.session,
++                &mut self.channels,
++                &mut self.events,
++                &self.init,
++                &DevCtl::op(devctl::IMPORT_GLOBALS),
++                wait,
++            )?;
++        }
++        Ok(())
+     }
+ 
+     /// The latched transport error: an RTKit crash or a refused RTKit buffer.
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 48ee887f69..dbe8d4f723 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -965,6 +965,26 @@ pub(crate) fn power_tally() -> bool {
+     "G16: count power-asserting device controls in the Globals power-assert tally, as the firmware counts them, so idle cores can power off (default 1; 0: tally left at zero, as before; runtime 0644, takes effect from the next record)"
+ );
+ 
++/// Storage of `g16_reimport` (runtime 0644, default 1).
++static REIMPORT: AtomicU32 = AtomicU32::new(1);
++
++/// Whether a power-asserting device control is followed by IMPORT_GLOBALS, so a firmware that
++/// reads the policy block as the copy taken at import sees the power-assert tally that matches
++/// its own count of drained records (the boot import ran with the tally at 2; START and the
++/// idle policy then took the firmware's count to 4). Needs `g16_power_tally`.
++pub(crate) fn reimport() -> bool {
++    REIMPORT.load(Ordering::Relaxed) != 0 && power_tally()
++}
++
++live_u32_param!(
++    REIMPORT_PARAM,
++    REIMPORT_PARMTYPE,
++    REIMPORT_PARM,
++    REIMPORT,
++    "g16_reimport",
++    "G16: follow each power-asserting device control with a Globals import, so the firmware's copy carries the matching power-assert tally (default 1; 0: import at boot only, as before; runtime 0644)"
++);
++
+ /// Storage of `g16_pb_pool` (runtime 0644, default 8).
+ static PB_POOL: AtomicU32 = AtomicU32::new(8);
+ 
+-- 
+2.43.0
+

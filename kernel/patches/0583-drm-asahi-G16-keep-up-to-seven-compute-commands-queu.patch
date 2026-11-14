@@ -1,0 +1,226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 17:48:36 +0000
+Subject: [PATCH] drm/asahi: G16: keep up to seven compute commands
+ queued behind a running one
+
+With three compute commands allowed behind a running one, the J604 ran
+compute.light at 103.6 us per submit (macOS: 21 us), and 80 % of the
+commands still started with nothing running ahead of them. Completions
+already reach the host through the firmware's event, not the re-poll:
+what is exposed is one command's round trip, about 95 us from the
+doorbell to its start and 108 us from its completion to the host. Four
+tiny commands finish well inside it, so the firmware runs dry. macOS
+keeps about twenty in the ring.
+
+Make room for eight compute units: units 4 to 7 take the free interval
+between render pass slot 0's tilemap and pass slot 1, 36 MiB apart, so
+nothing else moves. g16_compute_units (default 8, latched at the engine
+start; 4 is the previous layout) sets how many a VM allocates when it
+first runs compute, and g16_horizon now defaults to 7.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/engine.rs    |  2 +-
+ drivers/gpu/drm/asahi/g16/hw.rs        | 29 ++++++++++++-----
+ drivers/gpu/drm/asahi/g16/params.rs    | 43 ++++++++++++++++++++++----
+ drivers/gpu/drm/asahi/g16/resources.rs |  5 +--
+ drivers/gpu/drm/asahi/g16/slots.rs     |  8 ++---
+ 5 files changed, 66 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 92e1995fb2..bf58165f3b 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -911,7 +911,7 @@ fn ahead_ok(&self, job: &Job) -> bool {
+             // with the overlap rule); never behind or beside render.
+             return params::horizon()
+                 && n < sizes::FLIGHTS
+-                    .min(sizes::COMPUTE_SLOTS)
++                    .min(params::compute_units())
+                     .min(1 + params::horizon_depth() as usize)
+                 && self.engine.queue_registered
+                 && !self.engine.frozen
+diff --git a/drivers/gpu/drm/asahi/g16/hw.rs b/drivers/gpu/drm/asahi/g16/hw.rs
+index 65d2575678..315c58b62c 100644
+--- a/drivers/gpu/drm/asahi/g16/hw.rs
++++ b/drivers/gpu/drm/asahi/g16/hw.rs
+@@ -205,8 +205,17 @@ pub(crate) mod client {
+     // across
+     // application queues. Every alias is inside Mesa's reserved driver hole.
+     pub(crate) const fn compute_base(k: u64) -> u64 {
+-        0x7001000000 + k * 0x04000000
++        if k < 4 {
++            0x7001000000 + k * 0x04000000
++        } else {
++            COMPUTE_HIGH_BASE + (k - 4) * COMPUTE_HIGH_STRIDE
++        }
+     }
++    /// Compute units 4.. (`g16_compute_units`): the free interval between render pass slot 0's
++    /// tilemap and pass slot 1 (`FS_WORK_PAGE + WORK_STRIDE`), 36 MiB apart (a unit spans
++    /// 0x20c0000: the 32 MiB pool, then state, list, preempt, aux and context).
++    pub(crate) const COMPUTE_HIGH_BASE: u64 = 0x7027000000;
++    pub(crate) const COMPUTE_HIGH_STRIDE: u64 = 0x2400000;
+     pub(crate) const fn compute_pool(k: u64) -> u64 {
+         compute_base(k)
+     }
+@@ -349,14 +358,18 @@ pub(crate) mod sizes {
+     pub(crate) const POOL_SIZE: u64 = 0x200000;
+     pub(crate) const FREELIST_SEED: u32 = 8192;
+     pub(crate) const QUEUE_CAP: u32 = 256;
+-    /// Compute units a VM may hold, one compute command in flight per unit, each binding its own
+-    /// split UMA slot (compute 1 + k of the 32 per class of the 25G83 layout). Units 0 and 1 are
+-    /// the qualified ones; 2 and 3 take the next 64 MiB intervals below the render units, so a
+-    /// compute horizon of up to three commands can stay queued behind a running one.
+-    pub(crate) const COMPUTE_SLOTS: usize = 4;
++    /// Compute units a VM may hold at most, one compute command in flight per unit, each
++    /// binding its own split UMA slot (compute 1 + k of the 32 per class of the 25G83 layout).
++    /// Units 0 and 1 are the qualified ones; 2 and 3 take the next 64 MiB intervals below the
++    /// render units; 4..7 the free interval below render pass slot 1. How many a VM allocates
++    /// is `g16_compute_units` (latched).
++    pub(crate) const COMPUTE_SLOTS: usize = 8;
+     const _: () = assert!(
+-        super::client::compute_context(COMPUTE_SLOTS as u64 - 1) + 0x40000
+-            <= super::client::render_base(0)
++        super::client::compute_context(3) + 0x40000 <= super::client::render_base(0)
++            && super::client::TILEMAP + super::client::TILEMAP_SIZE
++                <= super::client::COMPUTE_HIGH_BASE
++            && super::client::compute_context(COMPUTE_SLOTS as u64 - 1) + 0x40000
++                <= super::client::FS_WORK_PAGE + super::client::WORK_STRIDE
+             && super::client::WORK_PAGE + COMPUTE_SLOTS as u64 * super::client::CWORK_STRIDE
+                 <= super::client::compute_base(0)
+     );
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index dbe8d4f723..67f7660e4e 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -575,8 +575,8 @@ pub(crate) fn submit_ts() -> u32 {
+     "G16: clock of the submit record time word (default 0: architectural counter; 1: firmware stage clock, 24 MHz; runtime 0644)"
+ );
+ 
+-/// Storage of `g16_horizon` (runtime 0644, default 3).
+-static HORIZON: AtomicU32 = AtomicU32::new(3);
++/// Storage of `g16_horizon` (runtime 0644, default 7).
++static HORIZON: AtomicU32 = AtomicU32::new(7);
+ 
+ /// Compute horizon, format A (per-command ahead posting): with `g16_horizon` = 1, a queue's
+ /// next compute command may be published behind its running compute predecessor, into the
+@@ -588,23 +588,54 @@ pub(crate) fn submit_ts() -> u32 {
+ /// compute/render/sync clean); 0 keeps the qualified one-compute-at-a-time protocol. N > 1 lets
+ /// up to N commands queue behind the running one, each on its own compute unit (at most
+ /// `COMPUTE_SLOTS - 1`): with one behind, every second command still waited for the host to
+-/// notice a retirement (J604 k884: 30318 ahead at a 32 us gap, 74866 serial at ~200 us). Default 3.
++/// notice a retirement (J604 k884: 30318 ahead at a 32 us gap, 74866 serial at ~200 us). With
++/// three behind (1.908) 80 % still ran serial: a command's round trip (doorbell to start ~95 us,
++/// completion to host ~108 us) outlasts four tiny commands. Default 7, on `g16_compute_units`.
+ pub(crate) fn horizon() -> bool {
+     HORIZON.load(Ordering::Relaxed) != 0 && super::pools::lifetime::overlap_active()
+ }
+ 
+-/// How many compute commands may be queued behind a running one ([`horizon`] on), 1..=3.
++/// How many compute commands may be queued behind a running one ([`horizon`] on), 1 up to
++/// one less than the latched compute units.
+ pub(crate) fn horizon_depth() -> u64 {
+-    (HORIZON.load(Ordering::Relaxed) as u64).clamp(1, super::hw::sizes::COMPUTE_SLOTS as u64 - 1)
++    (HORIZON.load(Ordering::Relaxed) as u64).clamp(1, compute_units() as u64 - 1)
+ }
+ 
++/// Storage of `g16_compute_units` (0644, default 8; latched at the engine start).
++static COMPUTE_UNITS: AtomicU32 = AtomicU32::new(8);
++/// The latched compute units, 0 until latched.
++static COMPUTE_UNITS_LATCH: AtomicU32 = AtomicU32::new(0);
++
++/// Compute units every VM that runs compute allocates (each ~33 MiB, created at its first
++/// compute command), 2..=[`hw::sizes::COMPUTE_SLOTS`]; read once, at the engine start.
++pub(crate) fn compute_units() -> usize {
++    let l = COMPUTE_UNITS_LATCH.load(Ordering::Acquire);
++    if l != 0 {
++        return l as usize;
++    }
++    let v = COMPUTE_UNITS
++        .load(Ordering::Relaxed)
++        .clamp(2, hw::sizes::COMPUTE_SLOTS as u32);
++    let _ = COMPUTE_UNITS_LATCH.compare_exchange(0, v, Ordering::AcqRel, Ordering::Acquire);
++    COMPUTE_UNITS_LATCH.load(Ordering::Acquire) as usize
++}
++
++live_u32_param!(
++    COMPUTE_UNITS_PARAM,
++    COMPUTE_UNITS_PARMTYPE,
++    COMPUTE_UNITS_PARM,
++    COMPUTE_UNITS,
++    "g16_compute_units",
++    "G16: compute units per VM, one compute command in flight each (default 8; 2..8; 4 = k908; latched at the engine start, set it as a module option)"
++);
++
+ live_u32_param!(
+     HORIZON_PARAM,
+     HORIZON_PARMTYPE,
+     HORIZON_PARM,
+     HORIZON,
+     "g16_horizon",
+-    "G16: compute commands of one queue that may go behind its running compute predecessor (default 3; 1..3, each on its own compute unit; needs g16_overlap=1 and g16_uma_split=1; 0: none; runtime 0644)"
++    "G16: compute commands of one queue that may go behind its running compute predecessor (default 7; 1 up to g16_compute_units - 1, each on its own compute unit; needs g16_overlap=1 and g16_uma_split=1; 0: none; runtime 0644)"
+ );
+ 
+ /// Storage of `g16_depth` (runtime 0644, default 0).
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 0f0f2d7ae5..957d6c2408 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -56,8 +56,9 @@ fn new(
+         live: &Arc<super::vm::LiveToken>,
+     ) -> Result<Arc<Self>> {
+         let mut objects = factory.objects(vm);
+-        let mut compute = KVec::with_capacity(super::hw::sizes::COMPUTE_SLOTS, GFP_KERNEL)?;
+-        for k in 0..super::hw::sizes::COMPUTE_SLOTS as u64 {
++        let units = super::params::compute_units();
++        let mut compute = KVec::with_capacity(units, GFP_KERNEL)?;
++        for k in 0..units as u64 {
+             compute.push(ComputeSlot::new(&mut objects, k)?, GFP_KERNEL)?;
+         }
+         objects.finish_private()?;
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index c517360ecd..4541ff26f1 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -411,7 +411,7 @@ pub(crate) fn new() -> Result<Self> {
+             pass_busy: 0,
+             pass_cursor: 0,
+             stats: SlotStats::default(),
+-            compute_lifetime: Lifetime::with_units(sizes::COMPUTE_SLOTS),
++            compute_lifetime: Lifetime::with_units(super::params::compute_units()),
+             // Every VM's render arena holds the latched number of pass units.
+             pass_lifetime: Lifetime::with_units(super::params::resident_units()),
+             compute_owner: [const { None }; sizes::COMPUTE_SLOTS],
+@@ -427,7 +427,7 @@ pub(crate) fn init(&self) -> Result {
+     }
+     #[allow(dead_code)]
+     pub(crate) fn compute_generation(&self, k: usize) -> Result<u8> {
+-        if k >= sizes::COMPUTE_SLOTS {
++        if k >= self.compute_lifetime.units() {
+             return Err(EINVAL);
+         }
+         Ok(self.compute_lifetime.generation(k))
+@@ -450,7 +450,7 @@ pub(crate) fn render_exhausted(&self) -> bool {
+     }
+     #[allow(dead_code)]
+     pub(crate) fn free_compute(&self) -> u32 {
+-        (0..sizes::COMPUTE_SLOTS)
++        (0..self.compute_lifetime.units())
+             .filter(|&k| self.compute_lifetime.available(k))
+             .count() as u32
+     }
+@@ -463,7 +463,7 @@ pub(crate) fn claim_compute(
+         if f.slot_count != 0 {
+             return Ok(None);
+         }
+-        let units = sizes::COMPUTE_SLOTS;
++        let units = self.compute_lifetime.units().min(arena.compute.len());
+         for i in 0..units {
+             let k = (self.cursor as usize + i) % units;
+             if self.compute_lifetime.claim(k) {
+-- 
+2.43.0
+

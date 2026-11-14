@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 17:00:38 +0000
+Subject: [PATCH] soc: apple: clpc: hold an all-core-busy J604 cluster
+ where macOS does
+
+Under ten threads on AC macOS on the J604 delivers P 3936 and E 2808
+MHz for ten minutes while both clusters request their top state: 16 W,
+die 77 C, fan off. One thread still gets 4313 to 4464 MHz, so the
+clamp follows the number of busy cores. Linux runs the same load at
+4464 and 2892 MHz, 25.9 W, and the die passes 100 C in 90 s before the
+SMC starts the fan.
+
+Count the CPUs of each cluster that were at least 90% busy in the
+sample. Outside the low-power profile, when all of a cluster's online
+CPUs are busy, hold it at the J604's all-core frequency for that
+cluster, 3936 or 2808 MHz, and lift the ceiling again when they are
+not. Other machines have no all-core frequency and are unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/clpc.c | 50 ++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 45 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/soc/apple/clpc.c b/drivers/soc/apple/clpc.c
+index 6fb71060c5..4f8f3dc36f 100644
+--- a/drivers/soc/apple/clpc.c
++++ b/drivers/soc/apple/clpc.c
+@@ -68,6 +68,8 @@ enum apple_clpc_rail {
+ #define APPLE_CLPC_GPU_BACKOFF_MS	100
+ /* Package power readings in the low-power profile: every 100 ms */
+ #define APPLE_CLPC_POWER_MS	100
++/* A CPU at least this busy (percent of the sample) counts for the all-core ceiling */
++#define APPLE_CLPC_ALL_CORE_BUSY	90
+ 
+ /* Why the last vote was cast, for debugfs */
+ #define APPLE_CLPC_REASON_CPU		BIT(0)
+@@ -116,6 +118,9 @@ enum apple_clpc_rail {
+  * @low_power_fast_only: the low-power ceiling holds only the clusters that
+  *	have @low_power_khz in their table; the others keep their top, as macOS's
+  *	Low Power mode leaves the J604's E cluster at 2892 MHz
++ * @all_core_khz: outside the low-power profile, the ceiling of a cluster whose
++ *	online CPUs are all busy, for each cluster whose table has the frequency;
++ *	0 for none. macOS's own all-core clamp, measured on the machine
+  * @low_power_mw: package power (the SMC's PHPC key) the low-power profile
+  *	holds the CPU clusters to; 0 for none
+  * @gpu_busy: state of each rail for reported GPU work below @gpu_busy_mid,
+@@ -155,6 +160,7 @@ struct apple_clpc_hw {
+ 	unsigned int low_power_khz;
+ 	const char *low_power_machine;
+ 	bool low_power_fast_only;
++	unsigned int all_core_khz[2];
+ 	unsigned int low_power_mw;
+ 	const struct apple_clpc_hw *stock;
+ };
+@@ -290,6 +296,8 @@ struct apple_clpc_cluster {
+ 	unsigned int policy_cpu;
+ 	cpumask_var_t cpus;
+ 	unsigned int busy;
++	/* Online CPUs in the last sample, and how many of them were all-core busy */
++	unsigned int online, nbusy;
+ 	unsigned int streak;
+ 	unsigned int level;
+ 	unsigned int request[APPLE_CLPC_RAILS];
+@@ -736,6 +744,8 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
+ 	struct cpufreq_policy *policy;
+ 	unsigned int cpu, busy = 0, q, rail, sustain;
+ 
++	cl->online = 0;
++	cl->nbusy = 0;
+ 	for_each_cpu(cpu, cl->cpus) {
+ 		u64 wall, idle, dw, di;
+ 		bool valid;
+@@ -756,9 +766,14 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
+ 		valid = clpc->wall[cpu];
+ 		clpc->wall[cpu] = wall;
+ 		clpc->idle[cpu] = idle;
+-		if (valid && dw && di <= dw)
+-			busy = max_t(unsigned int, busy,
+-				     div64_u64((dw - di) * 100, dw));
++		cl->online++;
++		if (valid && dw && di <= dw) {
++			unsigned int b = div64_u64((dw - di) * 100, dw);
++
++			busy = max(busy, b);
++			if (b >= APPLE_CLPC_ALL_CORE_BUSY)
++				cl->nbusy++;
++		}
+ 	}
+ 	cl->busy = busy;
+ 
+@@ -1072,12 +1087,30 @@ static bool apple_clpc_steps_first(unsigned int a_khz, unsigned int a_max,
+ 	return up ? a_max < b_max : a_max > b_max;
+ }
+ 
++/* hw->all_core_khz for a cluster whose online CPUs are all busy, else 0 */
++static unsigned int apple_clpc_all_core_khz(struct apple_clpc *clpc,
++					    struct apple_clpc_cluster *cl,
++					    struct cpufreq_policy *policy)
++{
++	unsigned int i;
++
++	if (cl->online < 2 || cl->nbusy < cl->online)
++		return 0;
++	for (i = 0; i < ARRAY_SIZE(clpc->hw->all_core_khz); i++)
++		if (clpc->hw->all_core_khz[i] &&
++		    apple_clpc_has_khz(policy, clpc->hw->all_core_khz[i]))
++			return clpc->hw->all_core_khz[i];
++	return 0;
++}
++
+ /*
+  * The platform profile's ceilings. In the low-power profile every cluster
+  * stays at or below the first frequency at or above hw->low_power_khz. Each
+  * new package power reading above hw->low_power_mw takes one table step off
+  * one cluster, and each one below 90% of it puts one back, in the order of
+- * apple_clpc_steps_first(). Elsewhere there is no ceiling.
++ * apple_clpc_steps_first(). Elsewhere a cluster whose online CPUs are all
++ * busy stays at hw->all_core_khz where the SoC has one, as macOS's clamp holds
++ * it, and has no ceiling otherwise.
+  */
+ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
+ {
+@@ -1119,7 +1152,7 @@ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
+ 		     !apple_clpc_has_khz(policy[i], clpc->low_power_khz)))
+ 			cl->top_khz = policy[i]->cpuinfo.max_freq;
+ 		if (!low)
+-			cl->max_khz = 0;
++			cl->max_khz = apple_clpc_all_core_khz(clpc, cl, policy[i]);
+ 		else if (!cl->max_khz)
+ 			cl->max_khz = cl->top_khz;
+ 		if (!step)
+@@ -1781,6 +1814,7 @@ static const struct apple_clpc_hw apple_clpc_hw_t8132 = {
+ 	.low_power_khz = 2088000,
+ 	.low_power_machine = "apple,j604",
+ 	.low_power_fast_only = true,
++	.all_core_khz = { 3936000, 2808000 },
+ };
+ 
+ /*
+@@ -1809,6 +1843,12 @@ static const struct apple_clpc_hw apple_clpc_hw_t8132_j604 = {
+ 	.low_power_khz = 2088000,
+ 	.low_power_machine = "apple,j604",
+ 	.low_power_fast_only = true,
++	/*
++	 * macOS 26B123 on the J604, ten threads for ten minutes on AC: P 3936 and
++	 * E 2808 MHz delivered while both clusters request their top, 16 W, die
++	 * 77 C, fan off. One thread still gets 4313 to 4464 MHz.
++	 */
++	.all_core_khz = { 3936000, 2808000 },
+ 	.stock = &apple_clpc_hw_t8132,
+ };
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 16:54:27 +0000
+Subject: [PATCH] soc: apple: sleep: mark the T8132 wake's progress in
+ WD2
+
+After a failed T8132 deep wake only the reset time is left: pstore is
+empty and the SoC reset clears every register. With the resume stub at
+60 s and the C wake path at 120 s, a reset at 60 s cannot say where in
+cpu_resume the woken core stopped.
+
+When the sleep driver arms it for the wake, restart WD2 by its
+physical address after init_kernel_el (70 s) and after __cpu_setup
+(80 s), and from C right after cpu_suspend returns (90 s). Each step
+then has its own reset time. The two marks with the MMU off also take
+the resume stub's fault vectors again, which init_kernel_el replaced
+with the hyp stub's, so a fault there keeps its short reset time; the
+hyp stub vectors come back before __enable_mmu. Without the flag
+cpu_resume is unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ arch/arm64/kernel/sleep.S | 45 +++++++++++++++++++++++++++++++++++++++
+ drivers/soc/apple/sleep.c | 18 ++++++++++++++++
+ 2 files changed, 63 insertions(+)
+
+diff --git a/arch/arm64/kernel/sleep.S b/arch/arm64/kernel/sleep.S
+index 11a08cb030..78bef53617 100644
+--- a/arch/arm64/kernel/sleep.S
++++ b/arch/arm64/kernel/sleep.S
+@@ -98,6 +98,48 @@ SYM_FUNC_START(__cpu_suspend_enter)
+ SYM_FUNC_END(__cpu_suspend_enter)
+ 
+ 	.pushsection ".idmap.text", "a"
++#ifdef CONFIG_APPLE_SOC_SLEEP
++/*
++ * T8132 deep wake progress, MMU off: restart WD2 by its physical address with a
++ * distinct timeout, so the reset time after a failed wake says how far cpu_resume
++ * got, and take the resume stub's fault vectors again (init_kernel_el replaced
++ * them), so a fault keeps its own short timeout. The hyp stub vectors come back
++ * before the MMU is on. Only when the sleep driver armed it for this wake.
++ */
++	.macro	t8132_wake_mark, secs
++	adr_l	x9, t8132_wake_marks
++	ldr	w9, [x9]
++	cbz	w9, .Lt8132_mark_\@
++	movz	x9, #0x882b, lsl #16
++	movk	x9, #0x3, lsl #32
++	str	wzr, [x9, #0x2c]
++	str	wzr, [x9, #0x20]
++	mov_q	x10, (\secs * 24000000)
++	str	w10, [x9, #0x28]
++	mov	w10, #1
++	str	w10, [x9, #0x2c]
++	adr_l	x10, t8132_wake_vectors
++	msr	vbar_el2, x10
++	isb
++.Lt8132_mark_\@:
++	.endm
++
++	.macro	t8132_wake_unvec
++	adr_l	x9, t8132_wake_marks
++	ldr	w9, [x9]
++	cbz	w9, .Lt8132_unvec_\@
++	adr_l	x9, __hyp_stub_vectors
++	msr	vbar_el2, x9
++	isb
++.Lt8132_unvec_\@:
++	.endm
++#else
++	.macro	t8132_wake_mark, secs
++	.endm
++	.macro	t8132_wake_unvec
++	.endm
++#endif
++
+ SYM_CODE_START(cpu_resume)
+ 	mov	x0, xzr
+ #ifdef CONFIG_ARM64_CTXR_EXECMEM
+@@ -105,7 +147,10 @@ SYM_CODE_START(cpu_resume)
+ #endif
+ 	bl	init_kernel_el
+ 	mov	x19, x0			// preserve boot mode
++	t8132_wake_mark 70
+ 	bl	__cpu_setup
++	t8132_wake_mark 80
++	t8132_wake_unvec
+ 	/* enable the MMU early - so we can access sleep_save_stash by va */
+ 	adrp	x1, swapper_pg_dir
+ 	adrp	x2, idmap_pg_dir
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 917ce1077a..7eed9ffde4 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -3345,6 +3345,7 @@ asm(
+ "	b	cpu_resume\n"
+ "	.size	t8132_resume_stub, . - t8132_resume_stub\n"
+ "	.balign	2048\n"
++"	.globl	t8132_wake_vectors\n"
+ "	.type	t8132_wake_vectors, %object\n"
+ "t8132_wake_vectors:\n"
+ "	.rept	16\n"
+@@ -3375,6 +3376,16 @@ asm(
+ );
+ void t8132_resume_stub(void);
+ 
++/* Read by cpu_resume with the MMU off: restart WD2 at each step of the wake. */
++u32 t8132_wake_marks __section(".mmuoff.data.read");
++
++static void t8132_wake_marks_set(u32 on)
++{
++	WRITE_ONCE(t8132_wake_marks, on);
++	dcache_clean_inval_poc((unsigned long)&t8132_wake_marks,
++			       (unsigned long)&t8132_wake_marks + sizeof(t8132_wake_marks));
++}
++
+ /*
+  * T8132: T8140's steps with its own words, no AVE complex to bring back, and ATC0's words
+  * after the others.
+@@ -3463,9 +3474,16 @@ static int apple_sleep_enter(suspend_state_t state)
+ 
+ 	s->cntkctl = read_sysreg(cntkctl_el1);
+ 	pm_set_resume_via_firmware();
++	if (s->soc->ops->resume == t8132_resume_stub)
++		t8132_wake_marks_set(1);
+ 	ret = cpu_suspend(0, apple_sleep_commit);
+ 	if (ret)
+ 		panic("Apple committed sleep returned without physical wake: %d", ret);
++	if (READ_ONCE(t8132_wake_marks)) {
++		/* Past cpu_resume, in C: the 90 s mark until the wake re-arms 120 s. */
++		apple_sleep_set_wd2(s, 90);
++		t8132_wake_marks_set(0);
++	}
+ 	apple_sleep_return(s);
+ 	if (s->deep_once)
+ 		sleep_slp_ddr_set_deep_once(false);
+-- 
+2.43.0
+
