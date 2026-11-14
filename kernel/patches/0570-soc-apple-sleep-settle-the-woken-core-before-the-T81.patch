@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 15:09:19 +0000
+Subject: [PATCH] soc: apple: sleep: settle the woken core before the
+ T8132 resume
+
+After a deep sleep the T8132 boot core comes back with its CTXR_D and
+CTRR_D locks armed and locked, as a freshly started secondary does:
+CTXR_D_CTL_EL1 goes from 0 at the commit to 0xc000000000aa0199 at the
+first trap after the wake, CTRR_D_CTL from 0 to 0x8000000000000001
+(macOS 26B123 on a J604 under a hypervisor). The resume stub then
+writes the watchdog and branches into cpu_resume with interrupts
+unmasked, the guest timer FIQs as the wake program left them and the
+TLB and I-cache never invalidated. On the J604 the core resets 61.9 s
+after the RTC alarm: the stub's 60 s watchdog fired before the C wake
+path could re-arm it.
+
+At EL2, first thing in the stub, do what SPTM's warm entry does: mask
+DAIF, clear VM_TMR_FIQ_ENA_EL2 as the AIC driver leaves it, and
+invalidate the EL2 TLB and the I-cache. Below EL2 the stub is unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index c6a1d24fc8..846b55bae8 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -3302,12 +3302,28 @@ static void t8140_wake(struct apple_sleep *s)
+  * The first thing Linux runs after a wake, MMU off and no stack. The last wake program
+  * leaves WD2 running for 5 s: restart it for 60 s, in the order apple_sleep_set_wd2() uses. No
+  * SPMI here: macOS leaves that bus alone for a long time after a wake.
++ *
++ * The woken core comes back with its CTXR/CTRR locks armed, like a freshly started
++ * secondary, and with whatever the wake program left in its TLB, I-cache and FIQ
++ * sources. At EL2, before anything else, do what SPTM's warm entry does: mask DAIF,
++ * turn the guest timer FIQs off (as the AIC driver leaves them), and invalidate the
++ * EL2 TLB and the I-cache.
+  */
+ asm(
+ "	.pushsection .text, \"ax\"\n"
+ "	.type	t8132_resume_stub, %function\n"
+ "t8132_resume_stub:\n"
+-"	movz	x9, #0x882b, lsl #16\n"
++"	mrs	x10, CurrentEL\n"
++"	cmp	x10, #8\n"
++"	b.ne	1f\n"
++"	msr	daifset, #0xf\n"
++"	msr	s3_5_c15_c1_3, xzr\n"
++"	tlbi	alle2\n"
++"	dsb	sy\n"
++"	ic	iallu\n"
++"	dsb	sy\n"
++"	isb\n"
++"1:	movz	x9, #0x882b, lsl #16\n"
+ "	movk	x9, #0x3, lsl #32\n"
+ "	str	wzr, [x9, #0x2c]\n"
+ "	str	wzr, [x9, #0x20]\n"
+-- 
+2.43.0
+

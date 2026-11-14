@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 09:11:59 +0000
+Subject: [PATCH] leds: pwm: Add an optional duty cycle range
+
+leds-pwm drives max-brightness at 100 % duty and brightness 0..max at
+0..100 %. Some LEDs must not run at full duty, and some stay dark below a
+threshold duty cycle, so a linear 0..100 % scale wastes the bottom of the
+range and overdrives the top.
+
+Add two optional properties, in basis points of the period:
+min-duty-cycle-bp and max-duty-cycle-bp. Brightness b > 0 gives
+min + (max - min) * b / max-brightness; brightness 0 stays off. Without
+the properties the duty cycle is exactly period * b / max-brightness, as
+before. default-state = "keep" reads the brightness back on the same
+scale.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+(cherry picked from commit c3bcbd596b17db3807795db41e0821bfb9f4adce)
+---
+ drivers/leds/leds-pwm.c | 58 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 50 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/leds/leds-pwm.c b/drivers/leds/leds-pwm.c
+index 9633626053..1e3d05ab20 100644
+--- a/drivers/leds/leds-pwm.c
++++ b/drivers/leds/leds-pwm.c
+@@ -13,17 +13,23 @@
+ #include <linux/gpio/consumer.h>
+ #include <linux/kernel.h>
+ #include <linux/leds.h>
++#include <linux/math64.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/pwm.h>
+ #include <linux/slab.h>
+ 
++/* Duty cycles are given in basis points: 1/100 of a percent of the period. */
++#define LED_PWM_FULL_DUTY_BP	10000
++
+ struct led_pwm {
+ 	const char	*name;
+ 	u8		active_low;
+ 	u8		default_state;
+ 	unsigned int	max_brightness;
++	unsigned int	min_duty_bp;
++	unsigned int	max_duty_bp;
+ };
+ 
+ struct led_pwm_data {
+@@ -32,6 +38,8 @@ struct led_pwm_data {
+ 	struct pwm_device	*pwm;
+ 	struct pwm_state	pwmstate;
+ 	unsigned int		active_low;
++	unsigned int		min_duty_bp;
++	unsigned int		max_duty_bp;
+ };
+ 
+ struct led_pwm_priv {
+@@ -45,10 +53,20 @@ static int led_pwm_set(struct led_classdev *led_cdev,
+ 	struct led_pwm_data *led_dat =
+ 		container_of(led_cdev, struct led_pwm_data, cdev);
+ 	unsigned int max = led_dat->cdev.max_brightness;
+-	unsigned long long duty = led_dat->pwmstate.period;
++	unsigned long long duty = 0;
+ 
+-	duty *= brightness;
+-	do_div(duty, max);
++	/*
++	 * Brightness b > 0 gives min + (max - min) * b / max_brightness of
++	 * the duty cycle range; 0 is off.
++	 * The scale is in basis points times max, so the default 0..100 %
++	 * gives exactly period * brightness / max.
++	 */
++	if (brightness) {
++		duty = (u64)led_dat->min_duty_bp * (max - brightness) +
++		       (u64)led_dat->max_duty_bp * brightness;
++		duty = mul_u64_u64_div_u64(led_dat->pwmstate.period, duty,
++					   (u64)max * LED_PWM_FULL_DUTY_BP);
++	}
+ 
+ 	if (led_dat->active_low)
+ 		duty = led_dat->pwmstate.period - duty;
+@@ -89,6 +107,8 @@ static int led_pwm_add(struct device *dev, struct led_pwm_priv *priv,
+ 	int ret;
+ 
+ 	led_data->active_low = led->active_low;
++	led_data->min_duty_bp = led->min_duty_bp;
++	led_data->max_duty_bp = led->max_duty_bp;
+ 	led_data->cdev.name = led->name;
+ 	led_data->cdev.brightness = LED_OFF;
+ 	led_data->cdev.max_brightness = led->max_brightness;
+@@ -133,11 +153,19 @@ static int led_pwm_add(struct device *dev, struct led_pwm_priv *priv,
+ 		break;
+ 	case LEDS_DEFSTATE_KEEP:
+ 		{
+-		uint64_t brightness;
+-
+-		brightness = led->max_brightness;
+-		brightness *= led_data->pwmstate.duty_cycle;
+-		do_div(brightness, led_data->pwmstate.period);
++		u64 max = led->max_brightness;
++		u64 scale, floor, brightness = 0;
++
++		if (led_data->pwmstate.duty_cycle) {
++			scale = mul_u64_u64_div_u64(led_data->pwmstate.duty_cycle,
++						    max * LED_PWM_FULL_DUTY_BP,
++						    led_data->pwmstate.period);
++			floor = max * led->min_duty_bp;
++			brightness = scale > floor ? scale - floor : 0;
++			brightness = div_u64(brightness, led->max_duty_bp -
++					     led->min_duty_bp);
++			brightness = clamp_val(brightness, led->min_duty_bp ? 1 : 0, max);
++		}
+ 		led_data->cdev.brightness = brightness;
+ 		}
+ 		break;
+@@ -198,6 +226,20 @@ static int led_pwm_create_fwnode(struct device *dev, struct led_pwm_priv *priv)
+ 		fwnode_property_read_u32(fwnode, "max-brightness",
+ 					 &led.max_brightness);
+ 
++		led.max_duty_bp = LED_PWM_FULL_DUTY_BP;
++		fwnode_property_read_u32(fwnode, "max-duty-cycle-bp",
++					 &led.max_duty_bp);
++		fwnode_property_read_u32(fwnode, "min-duty-cycle-bp",
++					 &led.min_duty_bp);
++		if (!led.max_duty_bp || led.max_duty_bp > LED_PWM_FULL_DUTY_BP ||
++		    led.min_duty_bp >= led.max_duty_bp) {
++			dev_warn(dev, "%s: invalid duty cycle range %u..%u bp, using 0..%u\n",
++				 led.name, led.min_duty_bp, led.max_duty_bp,
++				 LED_PWM_FULL_DUTY_BP);
++			led.min_duty_bp = 0;
++			led.max_duty_bp = LED_PWM_FULL_DUTY_BP;
++		}
++
+ 		led.default_state = led_init_default_state_get(fwnode);
+ 
+ 		ret = led_pwm_add(dev, priv, &led, fwnode);
+-- 
+2.43.0
+

@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 15:17:06 +0000
+Subject: [PATCH] media: apple: isp: boot the T8132 firmware again when
+ a boot fails
+
+On the J604 (M4 MacBook Pro 14", T8132) the first camera stream after
+system boot fails: the camera detection boots the firmware and powers
+the ISP down, and the stream's boot after it gets no first magic
+number (-ENODEV) whether it follows at once (1.902) or 1.5 s later
+(1.905, with the least off time). The next open boots, as does every
+open after it. The boot that works follows a failed stage 1; the boot
+that fails follows a full firmware stop.
+
+Until the cause is known, boot again from apple_isp_firmware_boot(),
+at most twice on T8132: the failed boot has powered the ISP down, so
+drop and take the runtime PM reference again, as the second open does.
+The stream then starts on the first open. Not for resident firmware,
+which cannot be restarted.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/isp/isp-drv.c |  2 ++
+ drivers/media/platform/apple/isp/isp-drv.h |  2 ++
+ drivers/media/platform/apple/isp/isp-fw.c  | 16 ++++++++++++++++
+ 3 files changed, 20 insertions(+)
+
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index a45c098070..64505aaae8 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -1332,6 +1332,8 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
+ 	.macos_session_settings = true,
+ 	/* macOS keeps it down at least about 1.2 s between two boots */
+ 	.min_off_ms = 1500,
++	/* Its first stream after the detection fails stage 1 once (1.902, 1.905) */
++	.boot_retries = 2,
+ };
+ 
+ /*
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index a38ad70ec9..78d71b9e8b 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -318,6 +318,8 @@ struct apple_isp_hw {
+ 	bool macos_session_settings;
+ 	/* Least time the ISP stays powered down before it is powered up again, in ms */
+ 	unsigned int min_off_ms;
++	/* Boot again after a failed firmware boot, this many times at most */
++	unsigned int boot_retries;
+ };
+ 
+ enum isp_sensor_id {
+diff --git a/drivers/media/platform/apple/isp/isp-fw.c b/drivers/media/platform/apple/isp/isp-fw.c
+index b9e6a52278..8275eb84bc 100644
+--- a/drivers/media/platform/apple/isp/isp-fw.c
++++ b/drivers/media/platform/apple/isp/isp-fw.c
+@@ -1396,6 +1396,7 @@ static int isp_check_restarted(struct apple_isp *isp)
+ int apple_isp_firmware_boot(struct apple_isp *isp)
+ {
+ 	bool restart = isp->hw->resident_fw && isp->fw.started;
++	unsigned int tries = 0;
+ 	int err;
+ 
+ 	switch (isp->fw_state) {
+@@ -1410,6 +1411,7 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
+ 		return -EIO;
+ 	}
+ 
++again:
+ 	/* The firmware starts with new rings. */
+ 	isp->ipc_stale = NULL;
+ 	isp->ipc_failed = false;
+@@ -1427,6 +1429,18 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
+ 		if (err)
+ 			isp_firmware_shutdown(isp);
+ 	}
++	if (err && !isp->hw->resident_fw && tries < isp->hw->boot_retries) {
++		/*
++		 * On T8132 the first boot after the camera detection gets no
++		 * first magic number, and the next one starts. The failed
++		 * boot powered the ISP down: cycle it as a second open does.
++		 */
++		tries++;
++		dev_warn(isp->dev, "firmware boot failed: %d; booting again (%u of %u)\n",
++			 err, tries, isp->hw->boot_retries);
++		pm_runtime_put_sync(isp->dev);
++		goto again;
++	}
+ 	if (err) {
+ 		dev_err(isp->dev, "failed to boot firmware: %d\n", err);
+ 		pm_runtime_put_sync(isp->dev);
+@@ -1435,6 +1449,8 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
+ 		return err;
+ 	}
+ 
++	if (tries)
++		dev_info(isp->dev, "firmware booted on try %u\n", tries + 1);
+ 	isp->fw_state = ISP_FW_RUNNING;
+ 
+ 	return 0;
+-- 
+2.43.0
+

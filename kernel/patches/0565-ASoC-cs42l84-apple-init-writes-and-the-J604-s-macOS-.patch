@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 12:59:48 +0000
+Subject: [PATCH] ASoC: cs42l84: apple,init-writes, and the J604's
+ macOS probe writes
+
+macOS sets 20 registers of the J604's headset codec during probe that
+this driver leaves at their reset values: 0x0203, two 16-bit values at
+0x31e8 and 0x31f4, four at 0x31b0/0x31bc/0x31c8/0x31d4, 0x31ae, 0x3065,
+0x0c01, the jack detect controls 0x1471, 0x1473, 0x1478 and 0x1480, and
+DAC_CTL1 with bit 6 clear. They come from an I2C trace of macOS 26B123
+booting on the J604 under the hypervisor, compared with the same
+registers read on Linux 1.902; everything else macOS writes at probe
+the driver already does, or holds its reset value.
+
+Add an optional apple,init-writes property, (register, value) pairs
+applied in order right after the device ID and revision checks, and
+give the J604 its sequence. DAC_CTL1 is written muted; playback unmutes
+it as before. Machines without the property are unchanged.
+
+Assisted-by: LLM
+(cherry picked from commit 323a136d6d1989c708f7f1c8ad3feabc6057fc0a)
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ .../bindings/sound/cirrus,cs42l84.yaml        |  7 ++++
+ arch/arm64/boot/dts/apple/t8132-j604.dts      | 20 +++++++++
+ sound/soc/codecs/cs42l84.c                    | 41 +++++++++++++++++++
+ 3 files changed, 68 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/sound/cirrus,cs42l84.yaml b/Documentation/devicetree/bindings/sound/cirrus,cs42l84.yaml
+index 4c376062d6..8719dea4e7 100644
+--- a/Documentation/devicetree/bindings/sound/cirrus,cs42l84.yaml
++++ b/Documentation/devicetree/bindings/sound/cirrus,cs42l84.yaml
+@@ -32,6 +32,13 @@ properties:
+   '#sound-dai-cells':
+     const: 0
+ 
++  apple,init-writes:
++    description:
++      Register writes the machine's own driver makes once the device ID is
++      verified, as (register, value) pairs applied in order.
++    $ref: /schemas/types.yaml#/definitions/uint16-array
++    maxItems: 64
++
+ required:
+   - compatible
+   - reg
+diff --git a/arch/arm64/boot/dts/apple/t8132-j604.dts b/arch/arm64/boot/dts/apple/t8132-j604.dts
+index f2c0c51e92..389d013872 100644
+--- a/arch/arm64/boot/dts/apple/t8132-j604.dts
++++ b/arch/arm64/boot/dts/apple/t8132-j604.dts
+@@ -472,3 +472,23 @@ &kbd_led {
+ 	min-duty-cycle-bp = <542>;
+ 	max-duty-cycle-bp = <3500>;
+ };
++
++/*
++ * The headset codec registers macOS sets at probe that the driver leaves at
++ * their reset values (macOS trace vs the same registers read on Linux):
++ * 0x0203, the 16-bit pairs at 0x31e8/0x31f4 (0x0277) and
++ * 0x31b0/0x31bc/0x31c8/0x31d4 (0x05e6), 0x31ae, 0x3065, 0x0c01, the jack
++ * detect controls 0x1471/0x1473/0x1478/0x1480, and DAC_CTL1 with bit 6
++ * clear (still muted; the driver unmutes on playback).
++ */
++&jack_codec {
++	apple,init-writes = /bits/ 16 <
++		0x0203 0x5a
++		0x31e8 0x77  0x31e9 0x02  0x31f4 0x77  0x31f5 0x02
++		0x31b0 0xe6  0x31b1 0x05  0x31bc 0xe6  0x31bd 0x05
++		0x31c8 0xe6  0x31c9 0x05  0x31d4 0xe6  0x31d5 0x05
++		0x31ae 0xab  0x3065 0x66  0x0c01 0x0b
++		0x1471 0xe0  0x1473 0xc0  0x1478 0x8f  0x1480 0x80
++		0x3000 0x20
++	>;
++};
+diff --git a/sound/soc/codecs/cs42l84.c b/sound/soc/codecs/cs42l84.c
+index 07a47433ef..6c8a726fa8 100644
+--- a/sound/soc/codecs/cs42l84.c
++++ b/sound/soc/codecs/cs42l84.c
+@@ -1143,6 +1143,43 @@ static void cs42l84_setup_plug_detect(struct cs42l84_private *cs42l84)
+ 
+ }
+ 
++/*
++ * Register writes the platform's own driver makes right after the device ID
++ * check, from the device tree's apple,init-writes: 16-bit (register, value)
++ * pairs, applied in order. Machines without the property are unchanged.
++ */
++#define CS42L84_INIT_WRITES_MAX 32
++
++static int cs42l84_apply_init_writes(struct cs42l84_private *cs42l84)
++{
++	struct device *dev = cs42l84->dev;
++	u16 seq[CS42L84_INIT_WRITES_MAX * 2];
++	int n, i, ret;
++
++	n = device_property_count_u16(dev, "apple,init-writes");
++	if (n <= 0)
++		return 0;
++	if (n % 2 || n > ARRAY_SIZE(seq))
++		return dev_err_probe(dev, -EINVAL, "apple,init-writes: %d entries\n", n);
++
++	ret = device_property_read_u16_array(dev, "apple,init-writes", seq, n);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < n; i += 2) {
++		if (seq[i] > CS42L84_REVID || seq[i + 1] > 0xff)
++			return dev_err_probe(dev, -EINVAL,
++					     "apple,init-writes: bad pair %#x %#x\n",
++					     seq[i], seq[i + 1]);
++		ret = regmap_write(cs42l84->regmap, seq[i], seq[i + 1]);
++		if (ret)
++			return ret;
++	}
++
++	dev_dbg(dev, "%d init writes\n", n / 2);
++	return 0;
++}
++
+ static int cs42l84_i2c_probe(struct i2c_client *i2c_client)
+ {
+ 	struct cs42l84_private *cs42l84;
+@@ -1229,6 +1266,10 @@ static int cs42l84_i2c_probe(struct i2c_client *i2c_client)
+ 	dev_info(&i2c_client->dev,
+ 		 "Cirrus Logic CS42L84, Revision: %02X\n", reg & 0xFF);
+ 
++	ret = cs42l84_apply_init_writes(cs42l84);
++	if (ret)
++		goto err_shutdown;
++
+ 	/* Setup plug detection */
+ 	cs42l84_setup_plug_detect(cs42l84);
+ 
+-- 
+2.43.0
+

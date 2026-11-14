@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 15:13:13 +0000
+Subject: [PATCH] drm/asahi: G16: keep the firmware's power-assert
+ tally so idle cores can power off
+
+With the idle power-off allowed after start, the J604 GPU still never
+powered off: the GFX PMGR word read target and actual "on" for all of a
+60 s idle desktop at 1 kHz (macOS: off or gated 98.6 % of the time).
+
+The firmware counts every drained device-control record whose opcode
+asserts GPU power and keeps the cores powered while its count differs
+from a host tally in the shared policy block. The G17 and G18 backends
+for the same firmware family bump that tally after writing each such
+record and before the producer store; G16 never did, so the tally stayed
+zero while the boot records (NOP, Globals import, START, and the idle
+policy itself) put the firmware's count at four.
+
+Bump the tally the same way for every power-asserting record, the boot
+NOP included, and show it in the stats file. G17 keeps it packed at
+region C +0xe51 next to its required 3 at +0xe39; the qualified G16
+Globals carries that 3 at +0xe28, so the G16 word is the aligned +0xe40,
+zero in the qualified image.
+
+g16_power_tally (default 1, runtime 0644) set to 0 stops counting, as
+before.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/boot.rs        |  2 +-
+ drivers/gpu/drm/asahi/g16/channel.rs     | 19 ++++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/fw/channels.rs | 11 +++++++++++
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs |  8 ++++++++
+ drivers/gpu/drm/asahi/g16/params.rs      | 19 +++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs        | 10 ++++++++--
+ 6 files changed, 65 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 36d7a1814a..260ed39ab0 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -665,7 +665,7 @@ fn run(
+         session.check()?;
+     }
+     session.regs.set_generation(0)?;
+-    channels.stage_boot_nop(session)?;
++    channels.stage_boot_nop(session, init)?;
+     // This table is the only host write to the loaded DATA segment. It is empty on cold entry.
+     let table = init.loader_bytes();
+     let loader = regs::Mapping::write_combined(session.adt.data.start + 0x1332f0, table.len())?;
+diff --git a/drivers/gpu/drm/asahi/g16/channel.rs b/drivers/gpu/drm/asahi/g16/channel.rs
+index d4c58a5880..c62d550b97 100644
+--- a/drivers/gpu/drm/asahi/g16/channel.rs
++++ b/drivers/gpu/drm/asahi/g16/channel.rs
+@@ -15,9 +15,11 @@
+ 
+ use super::boot::Session;
+ use super::event::Events;
++use super::fw::channels::devctl;
+ use super::fw::channels::{
+     DevCtl, SubmitRecord, RING_SLOTS, STATE_COMPLETION, STATE_READ, STATE_WRITE,
+ };
++use super::fw::initdata::globals;
+ use super::hw::{self, rings};
+ use super::initdata::InitData;
+ use super::object::{Class, FwObject, Objects, Placement, Request};
+@@ -184,7 +186,7 @@ fn post_inner(&mut self, channel: Channel, record: &SubmitRecord, ahead: bool) -
+     }
+ 
+     /// Stage the boot NOP before the initdata root is handed to the firmware.
+-    pub(crate) fn stage_boot_nop(&mut self, session: &Session) -> Result {
++    pub(crate) fn stage_boot_nop(&mut self, session: &Session, init: &InitData) -> Result {
+         if self.devctl_producer != 0
+             || self.devctl.read()? != 0
+             || self.devctl.completion()? != 0
+@@ -195,6 +197,7 @@ pub(crate) fn stage_boot_nop(&mut self, session: &Session) -> Result {
+         self.devctl
+             .ring
+             .write(0, &DevCtl::op(super::fw::channels::devctl::NOP).to_bytes())?;
++        bump_power_tally(init, super::fw::channels::devctl::NOP)?;
+         wmb();
+         session.regs.set_generation(1)?;
+         self.devctl.state.w32(STATE_WRITE, 1)?;
+@@ -254,6 +257,19 @@ pub(crate) fn drain_reports(&self, dev: &kernel::device::Device, events: &mut Ev
+     }
+ }
+ 
++/// Adds one to the Globals power-assert tally for a record the firmware counts, after the record
++/// and before the producer store (the caller's barrier orders both). The firmware keeps the GPU
++/// cores powered while its count of drained power-asserting records differs from this tally;
++/// left at zero, the boot records alone kept them powered for the whole session.
++fn bump_power_tally(init: &InitData, opcode: u32) -> Result {
++    if !super::params::power_tally() || !devctl::asserts_gpu_power(opcode) {
++        return Ok(());
++    }
++    let g = init.globals.as_ref().ok_or(ENODEV)?;
++    let at = globals::POWER_ASSERT_TALLY;
++    g.w32(at, g.r32(at)?.wrapping_add(1))
++}
++
+ /// Posts one 0x40-byte device-control record (EP 0x21 `0x0084000000000011`) behind the earlier
+ /// ones (one posted without waiting may still be pending: wait for its consumption first) and,
+ /// with `wait`, waits for its consumption and completion. A firmware halted for recovery consumes
+@@ -295,6 +311,7 @@ pub(crate) fn devctl_submit(
+         .devctl
+         .ring
+         .write(producer as usize * rings::DEVCTL_RECORD, &record.to_bytes())?;
++    bump_power_tally(init, opcode)?;
+     wmb();
+     session.regs.set_generation(next)?;
+     channels.devctl.state.w32(STATE_WRITE, next)?;
+diff --git a/drivers/gpu/drm/asahi/g16/fw/channels.rs b/drivers/gpu/drm/asahi/g16/fw/channels.rs
+index 66be71aa1f..263779226b 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/channels.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/channels.rs
+@@ -64,6 +64,17 @@ pub(crate) mod devctl {
+     pub(crate) const NOP: u32 = 0x1a;
+     /// PB growth reply.
+     pub(crate) const GROW_REPLY: u32 = 7;
++
++    /// Whether the firmware counts a drained record with this opcode as asserting GPU power
++    /// (the firmware's 64-entry flag table as the G17/G18 backends carry it for the same
++    /// firmware family). Every opcode this driver sends asserts it.
++    pub(crate) const fn asserts_gpu_power(opcode: u32) -> bool {
++        opcode <= 0x3f
++            && !matches!(
++                opcode,
++                0x00 | 0x0e | 0x15 | 0x16 | 0x1b | 0x22 | 0x2a | 0x2e | 0x3a..=0x3f
++            )
++    }
+ }
+ 
+ /// A device-control record (0x40 bytes, opcode first).
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index 5133183dcf..69cb266a0d 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -107,7 +107,15 @@ pub(crate) mod globals {
+         (0x9c8, 40),
+         (0x9cc, 50),
+     ];
++    /// The host power-assert tally the firmware compares with its own count of drained
++    /// power-asserting device-control records, keeping the GPU cores powered while the two
++    /// differ (the G17 region C `power_assert_tally`, same 25G83 family). G17 keeps it packed at
++    /// +0xe51, its required 3 at +0xe39; the qualified G16 Globals carries that 3 at +0xe28, so
++    /// the block sits 0x11 lower here and the tally is the aligned word at +0xe40 (zero in the
++    /// qualified image).
++    pub(crate) const POWER_ASSERT_TALLY: usize = 0xe40;
+     const _: () = assert!(IDLE_POWER_OFF + 4 <= SIZE);
++    const _: () = assert!(POWER_ASSERT_TALLY + 4 <= SIZE);
+ }
+ 
+ /// Writes the Globals policy words; `idle_power_off` adds only [`globals::IDLE_POWER_OFF`].
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 3c2282ee7d..44497b7fd3 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -939,6 +939,25 @@ pub(crate) fn s2idle() -> bool {
+     "G16: at suspend-to-idle, drain the GPU (never refusing the sleep) and publish the idle performance floor; poll at resume (default 1; 0: no s2idle callbacks, as before; runtime 0644)"
+ );
+ 
++/// Storage of `g16_power_tally` (runtime 0644, default 1).
++static POWER_TALLY: AtomicU32 = AtomicU32::new(1);
++
++/// Whether each power-asserting device-control record also adds one to the Globals
++/// power-assert tally, so the firmware's count of drained records and the host's agree and the
++/// idle cores can power off. 0 leaves the tally at zero, as before (cores stay powered).
++pub(crate) fn power_tally() -> bool {
++    POWER_TALLY.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    POWER_TALLY_PARAM,
++    POWER_TALLY_PARMTYPE,
++    POWER_TALLY_PARM,
++    POWER_TALLY,
++    "g16_power_tally",
++    "G16: count power-asserting device controls in the Globals power-assert tally, as the firmware counts them, so idle cores can power off (default 1; 0: tally left at zero, as before; runtime 0644, takes effect from the next record)"
++);
++
+ /// Storage of `g16_pb_pool` (runtime 0644, default 8).
+ static PB_POOL: AtomicU32 = AtomicU32::new(8);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 7bff0fc2c9..972a2b3ff2 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1130,11 +1130,17 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         )?;
+         writeln!(
+             f,
+-            "idle_power_off: published {} requested {} boot_level {} changes {}",
++            "idle_power_off: published {} requested {} boot_level {} changes {} tally {} counting {}",
+             self.init.idle_power_off,
+             params::idle_power_off(),
+             self.init.idle_power_off_level,
+-            self.init.idle_power_off_changes
++            self.init.idle_power_off_changes,
++            self.init
++                .globals
++                .as_ref()
++                .and_then(|g| g.r32(super::fw::initdata::globals::POWER_ASSERT_TALLY).ok())
++                .unwrap_or(0),
++            u32::from(params::power_tally())
+         )?;
+         writeln!(
+             f,
+-- 
+2.43.0
+

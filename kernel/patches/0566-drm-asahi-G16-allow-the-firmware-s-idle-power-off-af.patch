@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 13:41:18 +0000
+Subject: [PATCH] drm/asahi: G16: allow the firmware's idle power-off
+ after start
+
+The boot sequence posts device-control opcode 0x0a with a zero argument
+as its "start" record. In the G17 and G18 backends for the same 25G83
+firmware family that opcode is the idle power-off policy, and a zero
+argument means "keep the GPU cores powered and power them up now". G16
+never sent anything else, so the firmware kept the GPU powered for the
+whole session: on the J604 the GFX power domain read actual state 0xf in
+every 1 kHz sample of an idle desktop for 60 s, with no work submitted,
+where macOS has it off 99.9% of the time. Setting Globals +0x30
+(g16_idle_power_off) alone never changed that.
+
+Keep the boot record as it is (it powers the cores up for init) and,
+once the firmware reports READY, post the policy with argument 1 so
+the firmware powers the idle cores off, as macOS runs. A refusal only
+warns and leaves the old behaviour. A runtime change of
+asahi.g16_idle_power_off now posts the matching policy too, and a warm
+restart after a deep sleep restates it.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/boot.rs        | 19 +++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/fw/channels.rs | 19 +++++++++++++++++--
+ drivers/gpu/drm/asahi/g16/power.rs       |  4 ++++
+ drivers/gpu/drm/asahi/g16/sleep.rs       |  7 ++++++-
+ 4 files changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 73c1a20f04..36d7a1814a 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -737,6 +737,25 @@ fn run(
+         "M4 firmware accepted owned initdata root{:#x}, NOP and policy; READY\n",
+         root
+     );
++    /*
++     * The boot policy record is IdlePowerOff(KEEP_POWERED): it powers the cores up for init and,
++     * left alone, keeps them powered for the whole session (the J604 measured GFX on 100 % of an
++     * idle desktop, macOS off 99.9 %). Allow the idle power-off now, as the policy macOS runs
++     * with. A refusal keeps the old behaviour and the GPU working.
++     */
++    if super::params::idle_power_off() != 0 {
++        match channel::devctl_submit(
++            session,
++            channels,
++            events,
++            init,
++            &DevCtl::idle_power_off(true),
++            true,
++        ) {
++            Ok(()) => dev_info!(dev, "M4 power: firmware idle power-off allowed\n"),
++            Err(e) => dev_warn!(dev, "M4 power: idle power-off policy not taken: {:?}\n", e),
++        }
++    }
+     Ok(())
+ }
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/fw/channels.rs b/drivers/gpu/drm/asahi/g16/fw/channels.rs
+index 9b5ae1e7c4..66be71aa1f 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/channels.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/channels.rs
+@@ -50,8 +50,16 @@ impl SubmitRecord {
+ pub(crate) mod devctl {
+     /// Re-import Globals.
+     pub(crate) const IMPORT_GLOBALS: u32 = 0x34;
+-    /// Start.
+-    pub(crate) const START: u32 = 0x0a;
++    /// Idle power-off policy (the G17/G18 backends' IdlePowerOff, same 25G83 family): word 1 is
++    /// [`KEEP_POWERED`] ("keep the GPU cores powered and power them up now") or
++    /// [`ALLOW_POWER_OFF`] (the firmware powers the cores off when idle).
++    pub(crate) const IDLE_POWER_OFF: u32 = 0x0a;
++    /// The boot record: [`IDLE_POWER_OFF`] with [`KEEP_POWERED`], which powers the cores up for init.
++    pub(crate) const START: u32 = IDLE_POWER_OFF;
++    /// [`IDLE_POWER_OFF`] argument: keep the cores powered.
++    pub(crate) const KEEP_POWERED: u32 = 0;
++    /// [`IDLE_POWER_OFF`] argument: let the firmware power the cores off when idle.
++    pub(crate) const ALLOW_POWER_OFF: u32 = 1;
+     /// Initial no-op, staged before the initdata doorbell.
+     pub(crate) const NOP: u32 = 0x1a;
+     /// PB growth reply.
+@@ -74,6 +82,13 @@ pub(crate) const fn op(opcode: u32) -> Self {
+         Self { words }
+     }
+ 
++    /// The idle power-off policy record: `allow` lets the firmware power the idle cores off.
++    pub(crate) const fn idle_power_off(allow: bool) -> Self {
++        let mut record = Self::op(devctl::IDLE_POWER_OFF);
++        record.words[1] = if allow { devctl::ALLOW_POWER_OFF } else { devctl::KEEP_POWERED };
++        record
++    }
++
+     /// The opcode.
+     pub(crate) const fn opcode(&self) -> u32 {
+         self.words[0]
+diff --git a/drivers/gpu/drm/asahi/g16/power.rs b/drivers/gpu/drm/asahi/g16/power.rs
+index 9e8803245f..4c509c3616 100644
+--- a/drivers/gpu/drm/asahi/g16/power.rs
++++ b/drivers/gpu/drm/asahi/g16/power.rs
+@@ -356,6 +356,10 @@ fn service_idle_power_off(&mut self) -> Result {
+         );
+         self.init.idle_power_off = want;
+         self.init.idle_power_off_changes += 1;
++        // The firmware's policy follows the knob: posted, not waited for (the next record waits).
++        if let Err(e) = self.devctl(&super::fw::channels::DevCtl::idle_power_off(want != 0), false) {
++            dev_warn!(self.dev(), "M4 power: idle power-off policy {} not posted: {:?}\n", want, e);
++        }
+         Ok(())
+     }
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/sleep.rs b/drivers/gpu/drm/asahi/g16/sleep.rs
+index 38100bcb9c..6447386766 100644
+--- a/drivers/gpu/drm/asahi/g16/sleep.rs
++++ b/drivers/gpu/drm/asahi/g16/sleep.rs
+@@ -73,7 +73,12 @@ fn sleep_restart(&mut self) -> Result {
+         let control = self.session.regs.asc_control()?;
+         self.session.regs.set_asc_control(control | ASC_RUN)?;
+         regs::mb();
+-        self.session.rtkit.boot()
++        self.session.rtkit.boot()?;
++        // The warm restart keeps the firmware's state; restate the idle policy anyway.
++        if params::idle_power_off() != 0 {
++            let _ = self.devctl(&super::fw::channels::DevCtl::idle_power_off(true), false);
++        }
++        Ok(())
+     }
+ }
+ 
+-- 
+2.43.0
+
