@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 19:42:49 +0000
+Subject: [PATCH] soc: apple: keep the boot crumbs in PMU scratch that
+ holds them
+
+The boot crumbs went to 0xf840 of the J604 PMU's legacy scratch. A
+write there is accepted but reads back as zero: the scratch is backed
+at 0xf800-0xf82f only (per-byte write and read-back on the J604:
+0xf804-0xf824 hold a write, 0xf830 and 0xf840 do not). So a stalled
+boot left no record, and the next boot printed nothing.
+
+Move the record to 0xf818, eight free bytes inside the backed range,
+and give it a new magic. Use the two new bytes for the last power step
+an external DCP reached (release, CPU stop, DART off, PMC off, PMGR off,
+down, and the power-up), written before each step, so a stall inside
+its power-down names the step as well as the section.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi | 10 ++--
+ drivers/gpu/drm/apple/iomfb_m4.c              |  9 ++++
+ drivers/soc/apple/boot-crumb.c                | 47 +++++++++++++++++--
+ include/linux/soc/apple/boot-crumb.h          |  6 ++-
+ 4 files changed, 62 insertions(+), 10 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi b/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
+index 218f91d7c4..71df651078 100644
+--- a/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
++++ b/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
+@@ -204,9 +204,13 @@ boot_error_stage: boot-error-stage@f803 {
+ 				resume_exception: resume-exception@f804 {
+ 					reg = <0xf804 0x0b>;
+ 				};
+-				/* Boot crumbs: early sections entered and not left, heartbeat. */
+-				boot_crumb: boot-crumb@f840 {
+-					reg = <0xf840 0x06>;
++				/*
++				 * Boot crumbs: early sections entered and not left, heartbeat, the
++				 * last external-DCP power step. Free bytes of the legacy scratch,
++				 * which is backed at 0xf800-0xf82f only.
++				 */
++				boot_crumb: boot-crumb@f818 {
++					reg = <0xf818 0x08>;
+ 				};
+ 				panic_count: panic-count@f802,4 {
+ 					reg = <0xf802 0x01>;
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 430d103812..0724d287d4 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -6428,6 +6428,7 @@ static int __iomfb_m4_ext_power_gate(struct iomfb_m4 *dcp, const char *why)
+ 		return ret;
+ 	}
+ 
++	apple_boot_crumb_step(iomfb_m4_crumb_id(dcp), 1);
+ 	step = "A500";
+ 	ret = dcp_m4_runtime_call(r, 500, false, &zero, sizeof(zero), NULL, 0);
+ 	if (!ret) {
+@@ -6443,6 +6444,7 @@ static int __iomfb_m4_ext_power_gate(struct iomfb_m4 *dcp, const char *why)
+ 	if (ret)
+ 		goto fail;
+ 	apple_rtkit_hold_rx(dcp->rtkit);
++	apple_boot_crumb_step(iomfb_m4_crumb_id(dcp), 2);
+ 	step = "CPU stop";
+ 	ret = iomfb_m4_cpu_run(dcp, false);
+ 	if (ret)
+@@ -6461,18 +6463,22 @@ static int __iomfb_m4_ext_power_gate(struct iomfb_m4 *dcp, const char *why)
+ 
+ 	/* From here on nothing may use the DCP's or its firmware DART's registers. */
+ 	WRITE_ONCE(dcp->gated, true);
++	apple_boot_crumb_step(iomfb_m4_crumb_id(dcp), 3);
+ 	step = "DART";
+ 	ret = apple_dart_dcp_power_off(dcp->dev);
+ 	if (!ret) {
++		apple_boot_crumb_step(iomfb_m4_crumb_id(dcp), 4);
+ 		step = "PMC";
+ 		ret = apple_pmc_interface_consumer_off(dcp->dev);
+ 	}
+ 	if (!ret) {
++		apple_boot_crumb_step(iomfb_m4_crumb_id(dcp), 5);
+ 		step = "PMGR";
+ 		ret = apple_pmgr_ps_consumer_off(dcp->dev);
+ 	}
+ 	if (ret)
+ 		goto fail;
++	apple_boot_crumb_step(iomfb_m4_crumb_id(dcp), 6);
+ 	return 0;
+ fail:
+ 	dev_err(dcp->dev, "%s: power-down failed at %s: %d\n", why, step, ret);
+@@ -6496,7 +6502,10 @@ static int iomfb_m4_ext_power_ungate(struct iomfb_m4 *dcp, const char *why)
+ 	int ret;
+ 
+ 	apple_boot_crumb_enter(id);
++	apple_boot_crumb_step(id, 8);
+ 	ret = __iomfb_m4_ext_power_ungate(dcp, why);
++	if (!ret)
++		apple_boot_crumb_step(id, 12);
+ 	apple_boot_crumb_leave(id);
+ 	return ret;
+ }
+diff --git a/drivers/soc/apple/boot-crumb.c b/drivers/soc/apple/boot-crumb.c
+index 0cfa6232d9..60b6a8487e 100644
+--- a/drivers/soc/apple/boot-crumb.c
++++ b/drivers/soc/apple/boot-crumb.c
+@@ -12,8 +12,9 @@
+  * never left, and when the boot stopped.
+  *
+  * Record (APPLE_CRUMB_RECORD_LEN bytes): magic, a little-endian u32 mask with
+- * bit 2n = section n entered and bit 2n + 1 = section n left, and the
+- * heartbeat second (APPLE_CRUMB_BEAT_DONE once the window passed). A clean
++ * bit 2n = section n entered and bit 2n + 1 = section n left, the heartbeat
++ * second (APPLE_CRUMB_BEAT_DONE once the window passed), the last external
++ * DCP power step (section << 4 | step, see apple_crumb_steps) and a zero. A clean
+  * shutdown clears it. Nothing is written after the window.
+  */
+ 
+@@ -30,7 +31,7 @@
+ #include <linux/unaligned.h>
+ #include <linux/workqueue.h>
+ 
+-#define APPLE_CRUMB_MAGIC	0xc5
++#define APPLE_CRUMB_MAGIC	0xc6
+ #define APPLE_CRUMB_BEAT_DONE	0xff
+ #define APPLE_CRUMB_WINDOW_NS	(20 * NSEC_PER_SEC)
+ 
+@@ -54,6 +55,12 @@ static const char *const apple_crumb_names[APPLE_CRUMB_COUNT] = {
+ };
+ 
+ static atomic_t apple_crumb_mask = ATOMIC_INIT(0);
++static atomic_t apple_crumb_step_v = ATOMIC_INIT(0);
++
++static const char *const apple_crumb_steps[16] = {
++	[1] = "A500/drain/idle", [2] = "CPU stop", [3] = "DART off", [4] = "PMC off",
++	[5] = "PMGR off", [6] = "down", [8] = "power-up started", [12] = "up",
++};
+ static bool apple_crumb_closed;
+ 
+ /* Under apple_crumb_lock. */
+@@ -63,6 +70,7 @@ static void *apple_crumb_ctx;
+ static u8 apple_crumb_beat;
+ static u32 apple_crumb_written_mask;
+ static u8 apple_crumb_written_beat;
++static u8 apple_crumb_written_step;
+ static bool apple_crumb_written;
+ 
+ static bool apple_crumb_window(void)
+@@ -73,22 +81,25 @@ static bool apple_crumb_window(void)
+ static void apple_crumb_write_locked(void)
+ {
+ 	u32 mask = (u32)atomic_read(&apple_crumb_mask);
+-	u8 rec[APPLE_CRUMB_RECORD_LEN];
++	u8 step = (u8)atomic_read(&apple_crumb_step_v);
++	u8 rec[APPLE_CRUMB_RECORD_LEN] = {};
+ 
+ 	lockdep_assert_held(&apple_crumb_lock);
+ 	if (!apple_crumb_writer || apple_crumb_closed)
+ 		return;
+ 	if (apple_crumb_written && mask == apple_crumb_written_mask &&
+-	    apple_crumb_beat == apple_crumb_written_beat)
++	    apple_crumb_beat == apple_crumb_written_beat && step == apple_crumb_written_step)
+ 		return;
+ 	rec[0] = APPLE_CRUMB_MAGIC;
+ 	put_unaligned_le32(mask, &rec[1]);
+ 	rec[5] = apple_crumb_beat;
++	rec[6] = step;
+ 	if (apple_crumb_writer(apple_crumb_ctx, rec, sizeof(rec)))
+ 		return;
+ 	apple_crumb_written = true;
+ 	apple_crumb_written_mask = mask;
+ 	apple_crumb_written_beat = apple_crumb_beat;
++	apple_crumb_written_step = step;
+ }
+ 
+ static void apple_crumb_flush(void)
+@@ -127,6 +138,8 @@ static void apple_crumb_beat_fn(struct work_struct *work)
+ 	queue_delayed_work(system_highpri_wq, &apple_crumb_beat_work, HZ);
+ }
+ 
++static void apple_crumb_kick(void);
++
+ static void apple_crumb_update(u32 set, u32 clear)
+ {
+ 	int old, new;
+@@ -139,7 +152,11 @@ static void apple_crumb_update(u32 set, u32 clear)
+ 		if (new == old)
+ 			return;
+ 	} while (!atomic_try_cmpxchg(&apple_crumb_mask, &old, new));
++	apple_crumb_kick();
++}
+ 
++static void apple_crumb_kick(void)
++{
+ 	/* Before a writer exists the mask is written when it registers. */
+ 	if (!READ_ONCE(apple_crumb_writer))
+ 		return;
+@@ -175,6 +192,23 @@ void apple_boot_crumb_leave(unsigned int id)
+ }
+ EXPORT_SYMBOL_GPL(apple_boot_crumb_leave);
+ 
++/**
++ * apple_boot_crumb_step() - record the step an external DCP's power change reached
++ * @id: APPLE_CRUMB_DCPEXT0 or APPLE_CRUMB_DCPEXT1
++ * @step: 1-15 (apple_crumb_steps)
++ *
++ * Written before the step runs, like a section's entered bit.
++ */
++void apple_boot_crumb_step(unsigned int id, unsigned int step)
++{
++	int v = (int)((id & 0xf) << 4 | (step & 0xf));
++
++	if (!apple_crumb_window() || atomic_xchg(&apple_crumb_step_v, v) == v)
++		return;
++	apple_crumb_kick();
++}
++EXPORT_SYMBOL_GPL(apple_boot_crumb_step);
++
+ /**
+  * apple_boot_crumb_set_writer() - set or clear the PMU writer
+  * @writer: writes a record to the PMU scratch, may sleep; NULL to stop
+@@ -251,6 +285,9 @@ int apple_boot_crumb_decode(const u8 *rec, size_t len, char *buf, size_t size)
+ 	}
+ 	if (!done)
+ 		n += scnprintf(buf + n, size - n, " none");
++	if (rec[6] && (rec[6] >> 4) < APPLE_CRUMB_COUNT && apple_crumb_steps[rec[6] & 0xf])
++		n += scnprintf(buf + n, size - n, "; last power step: %s %s",
++			       apple_crumb_names[rec[6] >> 4], apple_crumb_steps[rec[6] & 0xf]);
+ 	return n;
+ }
+ EXPORT_SYMBOL_GPL(apple_boot_crumb_decode);
+diff --git a/include/linux/soc/apple/boot-crumb.h b/include/linux/soc/apple/boot-crumb.h
+index 4c7421d6a7..5c74305004 100644
+--- a/include/linux/soc/apple/boot-crumb.h
++++ b/include/linux/soc/apple/boot-crumb.h
+@@ -30,8 +30,8 @@ enum apple_boot_crumb {
+ 	APPLE_CRUMB_COUNT
+ };
+ 
+-/* The PMU scratch record: magic, entered/left mask (le32), heartbeat. */
+-#define APPLE_CRUMB_RECORD_LEN	6
++/* The PMU scratch record: magic, entered/left mask (le32), heartbeat, dcpext step, 0. */
++#define APPLE_CRUMB_RECORD_LEN	8
+ 
+ /* Writes the record to the PMU; may sleep. Registered by macsmc-reboot. */
+ typedef int (*apple_boot_crumb_writer_t)(void *ctx, const u8 *rec, size_t len);
+@@ -39,11 +39,13 @@ typedef int (*apple_boot_crumb_writer_t)(void *ctx, const u8 *rec, size_t len);
+ #if IS_ENABLED(CONFIG_APPLE_BOOT_CRUMB)
+ void apple_boot_crumb_enter(unsigned int id);
+ void apple_boot_crumb_leave(unsigned int id);
++void apple_boot_crumb_step(unsigned int id, unsigned int step);
+ void apple_boot_crumb_set_writer(apple_boot_crumb_writer_t writer, void *ctx);
+ int apple_boot_crumb_decode(const u8 *rec, size_t len, char *buf, size_t size);
+ #else
+ static inline void apple_boot_crumb_enter(unsigned int id) { }
+ static inline void apple_boot_crumb_leave(unsigned int id) { }
++static inline void apple_boot_crumb_step(unsigned int id, unsigned int step) { }
+ static inline void apple_boot_crumb_set_writer(apple_boot_crumb_writer_t writer, void *ctx) { }
+ static inline int apple_boot_crumb_decode(const u8 *rec, size_t len, char *buf, size_t size)
+ {
+-- 
+2.43.0
+

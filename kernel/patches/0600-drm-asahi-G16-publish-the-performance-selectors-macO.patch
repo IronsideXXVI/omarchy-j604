@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 19:44:02 +0000
+Subject: [PATCH] drm/asahi: G16: publish the performance selectors
+ macOS publishes
+
+Our utilization governor writes its state x 100 into the three Globals
+performance selectors, so an idle or lightly loaded GPU is held at S1
+(100) and even the top state publishes 900.
+
+A capture of macOS 26B123 on the J604 shows the same three words (4
+bytes higher in its layout) at 1000 at init, during video playback, at
+an idle desktop and at the start of a benchmark: macOS leaves the
+choice of state to the firmware. The G17 backends call these words
+"required 1000".
+
+Publish 1000 whenever the cooling ceiling allows the top state, and
+only the cooling ceiling otherwise, so thermal limits still apply; the
+startup image stays at S1 until the cooling owner's first sample.
+g16_selectors (default 1, runtime 0644) set to 0 restores the
+governor's states.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs |  5 +++++
+ drivers/gpu/drm/asahi/g16/params.rs      | 19 +++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/power.rs       | 12 +++++++++++-
+ 3 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index 5f6f3e0287..c71a8c167f 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -81,6 +81,11 @@ pub(crate) mod control {
+ pub(crate) mod globals {
+     pub(crate) const SIZE: usize = super::OBJECT_SIZE[super::id::GLOBALS];
+     pub(crate) const PSTATE_SELECTORS: [usize; 3] = [0x88, 0x8c, 0x98];
++    /// What macOS 26B123 keeps in all three selectors (its +0x8c/+0x90/+0x9c, 4 bytes above
++    /// ours): 1000 at init, during video playback, at idle and at a gpubench start (MEASURED,
++    /// list 13, 4 snapshots); the G17 backends call the same words "required 1000". The
++    /// firmware then picks the performance state itself.
++    pub(crate) const MACOS_SELECTOR: u32 = 1000;
+     /// The word the G17 backend documents as region C `idle_power_off` ("non-zero lets the
+     /// firmware power the GPU cores off when idle"), at the same offset. The qualified G16
+     /// Globals leaves it zero; the G17 region C values around it (+0x24, +0x998..+0x9cc,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 2d6371e463..e92b1fd22c 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1034,6 +1034,25 @@ pub(crate) fn doorbell_tally() -> bool {
+     "G16: add one to the Globals doorbell tally (+0x80) before each doorbell, as macOS does (default 1; 0: never written, as before; runtime 0644)"
+ );
+ 
++/// Storage of `g16_selectors` (runtime 0644, default 1).
++static SELECTORS: AtomicU32 = AtomicU32::new(1);
++
++/// Whether the three Globals performance selectors carry what macOS keeps in them (1000, the
++/// firmware chooses its state) whenever the cooling ceiling allows the top state, instead of
++/// the host utilization governor's state.
++pub(crate) fn selectors_macos() -> bool {
++    SELECTORS.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    SELECTORS_PARAM,
++    SELECTORS_PARMTYPE,
++    SELECTORS_PARM,
++    SELECTORS,
++    "g16_selectors",
++    "G16: performance selectors (default 1: 1000 as macOS whenever the cooling ceiling allows the top state, else that ceiling; 0: the host utilization governor's state x 100, as before; runtime 0644)"
++);
++
+ /// Storage of `g16_pb_pool` (runtime 0644, default 8).
+ static PB_POOL: AtomicU32 = AtomicU32::new(8);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/power.rs b/drivers/gpu/drm/asahi/g16/power.rs
+index 4c509c3616..5003d2905f 100644
+--- a/drivers/gpu/drm/asahi/g16/power.rs
++++ b/drivers/gpu/drm/asahi/g16/power.rs
+@@ -299,12 +299,22 @@ pub(crate) fn service_power(&mut self) -> Result {
+                 limit
+             );
+         }
++        // g16_selectors = 1: publish what macOS publishes, the full value whenever the cooling
++        // ceiling allows the top state, and only the cooling ceiling otherwise; the host
++        // utilization governor no longer lowers the firmware's states.
++        let macos = params::selectors_macos();
++        let target = if macos { limit } else { target };
+         if target == self.power.effective {
+             return Ok(());
+         }
++        let value = if macos && target >= PSTATE_MAX {
++            globals::MACOS_SELECTOR
++        } else {
++            target * 100
++        };
+         let globals = self.init.globals.as_ref().ok_or(ENODEV)?;
+         for offset in globals::PSTATE_SELECTORS {
+-            globals.w32(offset, target * 100)?;
++            globals.w32(offset, value)?;
+         }
+         wmb();
+         self.power.effective = target;
+-- 
+2.43.0
+

@@ -1075,3 +1075,5 @@ New in 1.913: 0588 (`thermal: apple-pmp: poll the raw sensor every 50 ms while c
 New in 1.914: 0594 (`arm64: dts: apple: t8132-j604: write the HDMI converter power the ADT way`), 0595 (`drm/asahi: G16: count doorbells in the Globals tally as macOS does`).
 
 New in 1.915: 0596 (`soc: apple: sleep: mark the T8132 wake up to init_kernel_el`), 0597 (`pmdomain: apple: pmp-report: T8132 memory bandwidth vote`).
+
+New in 1.916: 0598 (`soc: apple: keep the boot crumbs in PMU scratch that holds them`), 0599 (`drm/apple: keep an idle external DCP powered by default`), 0600 (`drm/asahi: G16: publish the performance selectors macOS publishes`), 0601 (`arm64: dts: apple: t8132-j604: add the ATC PHY CIO calibration`).
