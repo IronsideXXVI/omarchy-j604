@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 06:53:45 +0000
+Subject: [PATCH] drm/asahi: G16: drain the GPU and publish its idle
+ floor at suspend-to-idle
+
+The G16 sleep callbacks act only on a sleep that stops the firmware
+(pm_suspend_via_firmware); at suspend-to-idle, the J604's default
+sleep, .prepare returned at once and nothing in the driver took part.
+
+At s2idle the firmware keeps running (a stop needs a real wake's
+restart), so all the GPU needs is to be idle when the CPUs park:
+
+- .prepare waits up to 500 ms for published work to retire, polling as
+  the deep-sleep path does, and never refuses the sleep;
+- once quiet, it publishes the idle performance floor (bounded by the
+  cooling and user ceilings). The firmware runs at the published state,
+  busy or not, and the utilization governor cannot lower it while the
+  tick is frozen, so a sleep entered right after a burst would keep the
+  burst's state;
+- .complete polls once; the governor raises the state with the first
+  work.
+
+The GFX domain stays under automatic power management and the deep
+sleep path is unchanged. asahi.g16_s2idle (runtime 0644, default 1)
+turns this off; aurora-g16/stats gains an "s2idle:" line (entries,
+entries still busy after the drain, last drain in us, floor published).
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 18 ++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  9 ++++
+ drivers/gpu/drm/asahi/g16/power.rs  | 22 ++++++++++
+ drivers/gpu/drm/asahi/g16/sleep.rs  | 68 ++++++++++++++++++++++++++++-
+ 4 files changed, 116 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 10a25d7704..e6dcc6a70f 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -920,6 +920,24 @@ pub(crate) fn flights() -> usize {
+     "G16: render commands in flight at once, 1 (default, the qualified one-at-a-time protocol) or 2 (one render published behind a running render; experimental; runtime 0644)"
+ );
+ 
++/// Storage of `g16_s2idle` (runtime 0644, default 1).
++static S2IDLE: AtomicU32 = AtomicU32::new(1);
++
++/// Whether a suspend-to-idle drains the GPU and publishes its idle floor at `.prepare` (and
++/// polls it at `.complete`). 0 leaves s2idle to the GPU alone, as before.
++pub(crate) fn s2idle() -> bool {
++    S2IDLE.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    S2IDLE_PARAM,
++    S2IDLE_PARMTYPE,
++    S2IDLE_PARM,
++    S2IDLE,
++    "g16_s2idle",
++    "G16: at suspend-to-idle, drain the GPU (never refusing the sleep) and publish the idle performance floor; poll at resume (default 1; 0: no s2idle callbacks, as before; runtime 0644)"
++);
++
+ /// Storage of `g16_pb_pool` (runtime 0644, default 8).
+ static PB_POOL: AtomicU32 = AtomicU32::new(8);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 2bbbf1c4c5..7bff0fc2c9 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1302,6 +1302,15 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.subgen_caught[2],
+             s.subgen_err
+         )?;
++        writeln!(
++            f,
++            "s2idle: enabled {} entries {} busy {} last_drain_us {} floor S{}",
++            u8::from(super::params::s2idle()),
++            super::sleep::S2IDLE_STATS[0].load(core::sync::atomic::Ordering::Relaxed),
++            super::sleep::S2IDLE_STATS[1].load(core::sync::atomic::Ordering::Relaxed),
++            super::sleep::S2IDLE_STATS[2].load(core::sync::atomic::Ordering::Relaxed),
++            super::sleep::S2IDLE_STATS[3].load(core::sync::atomic::Ordering::Relaxed)
++        )?;
+         writeln!(
+             f,
+             "pbpool: size {} taken {} built {} returned {} refused {}",
+diff --git a/drivers/gpu/drm/asahi/g16/power.rs b/drivers/gpu/drm/asahi/g16/power.rs
+index 0476553599..9e8803245f 100644
+--- a/drivers/gpu/drm/asahi/g16/power.rs
++++ b/drivers/gpu/drm/asahi/g16/power.rs
+@@ -312,6 +312,28 @@ pub(crate) fn service_power(&mut self) -> Result {
+         Ok(())
+     }
+ 
++    /// For a suspend-to-idle: publishes the idle floor (bounded by the cooling and user
++    /// ceilings) now, since the governor's windows do not run while the tick is frozen and
++    /// the firmware runs at the published state, busy or not. Returns (before, published).
++    pub(crate) fn publish_idle_floor(&mut self) -> Result<(u32, u32)> {
++        if let Some(error) = self.recovery.failed() {
++            return Err(error);
++        }
++        let (limit, _) = self.power.ceiling(now_ns(), true);
++        let target = params::idle_floor().min(limit).max(1);
++        let before = self.power.effective;
++        if target != before {
++            let globals = self.init.globals.as_ref().ok_or(ENODEV)?;
++            for offset in globals::PSTATE_SELECTORS {
++                globals.w32(offset, target * 100)?;
++            }
++            wmb();
++            self.power.effective = target;
++            self.power.updates += 1;
++        }
++        Ok((before, target))
++    }
++
+     /// Publishes Globals +0x30 when `asahi.g16_idle_power_off` changed between zero and
+     /// non-zero since the last publication. The firmware reads it from the same shared
+     /// Globals object as the performance selectors.
+diff --git a/drivers/gpu/drm/asahi/g16/sleep.rs b/drivers/gpu/drm/asahi/g16/sleep.rs
+index 72e1694a43..38100bcb9c 100644
+--- a/drivers/gpu/drm/asahi/g16/sleep.rs
++++ b/drivers/gpu/drm/asahi/g16/sleep.rs
+@@ -15,7 +15,7 @@
+ //! Only a real wake restarts the firmware. A sleep refused after a stop leaves it stopped and
+ //! publication closed until the next real sleep, with the domain on.
+ 
+-use core::sync::atomic::Ordering;
++use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+ 
+ use kernel::{
+     bindings,
+@@ -25,6 +25,7 @@
+     workqueue::{DelayedWork, Work},
+ };
+ 
++use super::params;
+ use super::recovery::now_ns;
+ use super::regs::{self, ASC_RUN};
+ use super::{Firmware, Gpu, Shared};
+@@ -32,6 +33,15 @@
+ 
+ /// Time work in flight gets to finish before the sleep is refused.
+ const DRAIN_NS: u64 = 3_000_000_000;
++/// Time work in flight gets to retire at a suspend-to-idle; the sleep goes on either way.
++const S2IDLE_DRAIN_NS: u64 = 500_000_000;
++
++/// Suspend-to-idle counters for `aurora-g16/stats` (`s2idle:`): entries, entries that found
++/// work still in flight after [`S2IDLE_DRAIN_NS`], the last drain in us, the last floor published.
++pub(crate) static S2IDLE_STATS: [AtomicU64; 4] =
++    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
++/// From an s2idle `.prepare` until its `.complete`.
++static S2IDLE_ACTIVE: AtomicBool = AtomicBool::new(false);
+ const DRAIN_TICK_MS: i64 = 2;
+ 
+ extern "C" {
+@@ -270,8 +280,57 @@ fn sleep_prepare(&self) -> Result {
+         result
+     }
+ 
++    /// Suspend-to-idle: the firmware keeps running (a stop needs the real wake's restart), so
++    /// the GPU only has to be idle when the CPUs park: work in flight retires (bounded, the
++    /// sleep is never refused) and the idle floor is published, which the governor cannot do
++    /// with the tick frozen. The domain stays under automatic power management.
++    fn s2idle_prepare(&self) {
++        let started = now_ns();
++        let quiet = self.shared.wait_quiet(started.saturating_add(S2IDLE_DRAIN_NS)).is_ok();
++        let us = now_ns().saturating_sub(started) / 1000;
++        let published = if quiet {
++            let mut state = self.shared.state.lock();
++            state.as_deref_mut().map(|firmware| firmware.publish_idle_floor())
++        } else {
++            None
++        };
++        S2IDLE_STATS[0].fetch_add(1, Ordering::Relaxed);
++        if !quiet {
++            S2IDLE_STATS[1].fetch_add(1, Ordering::Relaxed);
++        }
++        S2IDLE_STATS[2].store(us, Ordering::Relaxed);
++        S2IDLE_ACTIVE.store(true, Ordering::Release);
++        match published {
++            Some(Ok((before, floor))) => {
++                S2IDLE_STATS[3].store(u64::from(floor), Ordering::Relaxed);
++                dev_info!(
++                    self.shared.dev.as_ref(),
++                    "s2idle: GPU quiet in {} us, published S{} (was S{})\n",
++                    us,
++                    floor,
++                    before
++                );
++            }
++            Some(Err(error)) => dev_info!(
++                self.shared.dev.as_ref(),
++                "s2idle: GPU quiet in {} us, floor not published: {:?}\n",
++                us,
++                error
++            ),
++            None => dev_info!(
++                self.shared.dev.as_ref(),
++                "s2idle: GPU work still in flight after {} us: left running\n",
++                us
++            ),
++        }
++    }
++
+     /// Called after every device resumed, whether or not the sleep reached the hardware.
+     fn sleep_complete(&self) {
++        if S2IDLE_ACTIVE.swap(false, Ordering::AcqRel) {
++            // The governor raises the state again with the first work.
++            self.shared.poll_now();
++        }
+         if !self.shared.sleeping.load(Ordering::Acquire) {
+             return;
+         }
+@@ -309,6 +368,13 @@ unsafe fn sleep_gpu<'a>(dev: *mut bindings::device) -> Option<&'a Arc<Gpu>> {
+ unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_int {
+     // SAFETY: Reads a global flag word.
+     if !unsafe { bindings::pm_suspend_via_firmware() } {
++        // Suspend-to-idle: drain and publish the floor, never refuse.
++        if params::s2idle() {
++            // SAFETY: Called by the PM core.
++            if let Some(gpu) = unsafe { sleep_gpu(dev) } {
++                gpu.s2idle_prepare();
++            }
++        }
+         return 0;
+     }
+     // SAFETY: Called by the PM core.
+-- 
+2.43.0
+

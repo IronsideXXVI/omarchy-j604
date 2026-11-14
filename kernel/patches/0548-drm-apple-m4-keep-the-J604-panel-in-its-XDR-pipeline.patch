@@ -1,0 +1,389 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 03:23:29 +0000
+Subject: [PATCH] drm/apple: m4: keep the J604 panel in its XDR
+ pipeline (skeleton)
+
+macOS never switches the internal panel for HDR: each frame carries its
+own transfer and the swaps carry level, EDR scale and headroom words.
+With appledrm.panel_xdr_always the connector-level PQ gate goes: a PQ or
+HLG frame is tagged as such and gets the EDR words, an SDR frame gets the
+SDR-desktop words, and nothing else changes when HDR starts or stops.
+
+The SDR words are named constants to be filled from the macOS trace;
+until then they are the values SDR swaps imply today, and the parameter
+is off.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp-m4-edr-test.c   | 34 ++++++++++++
+ drivers/gpu/drm/apple/dcp-m4-edr.h        | 65 +++++++++++++++++++++++
+ drivers/gpu/drm/apple/dcp-m4-frame-test.c | 25 +++++++++
+ drivers/gpu/drm/apple/dcp-m4-frame.h      | 20 ++++++-
+ drivers/gpu/drm/apple/iomfb_m4.c          | 65 +++++++++++++++++++----
+ 5 files changed, 196 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-m4-edr-test.c b/drivers/gpu/drm/apple/dcp-m4-edr-test.c
+index e292488001..263f0b1cfa 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-edr-test.c
++++ b/drivers/gpu/drm/apple/dcp-m4-edr-test.c
+@@ -18,6 +18,8 @@
+ #define J604_PEAK	1600U
+ #define J604_CEILING	dcp_edr_ceiling(16U << 16)
+ #define SWAP_SIZE	0x588
++#define XDR_STEP(st, hdr, carries, sdr, v, w) \
++	dcp_m4_xdr_step(st, hdr, carries, sdr, J604_PEAK, J604_CEILING, v, w)
+ 
+ static void edr_binary64(struct kunit *test)
+ {
+@@ -257,6 +259,37 @@ static void boost_scales_the_user_level(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(swap + 0x35e), 0x408f480000000000ULL);
+ }
+ 
++/* panel_xdr_always: SDR frames carry the SDR words once (or every swap); HDR and back. */
++static void xdr_sdr_hdr_sdr(struct kunit *test)
++{
++	const struct dcp_m4_xdr_sdr v = { .hm = 1000, .used = 1000 };
++	const struct dcp_m4_xdr_sdr every = { .hm = 1000, .used = 1000, .every = true };
++	struct dcp_m4_edr_state st = {};
++	struct dcp_m4_edr_words w = {};
++
++	KUNIT_EXPECT_TRUE(test, XDR_STEP(&st, false, false, 400, &v, &w));
++	KUNIT_EXPECT_EQ(test, w.nits, 400);
++	KUNIT_EXPECT_EQ(test, w.hm, 1000);
++	KUNIT_EXPECT_EQ(test, w.used, 1000);
++	KUNIT_EXPECT_FALSE(test, XDR_STEP(&st, false, false, 400, &v, &w));
++	KUNIT_EXPECT_TRUE(test, XDR_STEP(&st, false, false, 400, &every, &w));
++	/* a new level is carried */
++	KUNIT_EXPECT_TRUE(test, XDR_STEP(&st, false, false, 300, &v, &w));
++	KUNIT_EXPECT_EQ(test, w.nits, 300);
++	/* HDR: the EDR ramp starts, headroom used = applied */
++	KUNIT_EXPECT_TRUE(test, XDR_STEP(&st, true, false, 300, &v, &w));
++	KUNIT_EXPECT_GT(test, w.hm, 1000);
++	KUNIT_EXPECT_EQ(test, w.used, w.hm);
++	KUNIT_EXPECT_FALSE(test, st.xdr_sdr);
++	/* back to SDR in one swap, with the SDR words */
++	KUNIT_EXPECT_TRUE(test, XDR_STEP(&st, false, false, 300, &v, &w));
++	KUNIT_EXPECT_EQ(test, w.hm, 1000);
++	KUNIT_EXPECT_EQ(test, w.used, 1000);
++	KUNIT_EXPECT_EQ(test, st.hm, 0);
++	/* panel off: nothing */
++	KUNIT_EXPECT_FALSE(test, XDR_STEP(&st, false, true, 0, &every, &w));
++}
++
+ static struct kunit_case m4_edr_cases[] = {
+ 	KUNIT_CASE(edr_binary64),
+ 	KUNIT_CASE(edr_words_land_at_the_desktop_offsets),
+@@ -270,6 +303,7 @@ static struct kunit_case m4_edr_cases[] = {
+ 	KUNIT_CASE(edr_content_headroom),
+ 	KUNIT_CASE(edr_follows_the_content),
+ 	KUNIT_CASE(boost_scales_the_user_level),
++	KUNIT_CASE(xdr_sdr_hdr_sdr),
+ 	{}
+ };
+ 
+diff --git a/drivers/gpu/drm/apple/dcp-m4-edr.h b/drivers/gpu/drm/apple/dcp-m4-edr.h
+index 864509b8fc..389bcd415c 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-edr.h
++++ b/drivers/gpu/drm/apple/dcp-m4-edr.h
+@@ -39,6 +39,7 @@
+ #define DCP_M4_SURFACE_PRIMARIES	0x14
+ #define DCP_M4_XFER_SRGB		13
+ #define DCP_M4_XFER_PQ			16
++#define DCP_M4_XFER_HLG			18
+ #define DCP_M4_PRIMARIES_BT709		1
+ #define DCP_M4_PRIMARIES_BT2020		9
+ #define DCP_M4_PRIMARIES_P3_D65		12
+@@ -92,6 +93,8 @@ struct dcp_m4_edr_state {
+ 	u32 cll;	/* MaxCLL of the frames in nits; 0: not given */
+ 	bool sent;	/* swaps carry headroom used */
+ 	bool restart;	/* the next EDR ramp starts again from 1.0 */
++	struct dcp_m4_edr_words last;	/* panel_xdr_always: the words last sent */
++	bool xdr_sdr;	/* panel_xdr_always: the last words were an SDR frame's */
+ };
+ 
+ /*
+@@ -167,6 +170,68 @@ static inline bool dcp_m4_edr_step(struct dcp_m4_edr_state *st, bool edr, bool c
+ 	return true;
+ }
+ 
++/*
++ * Constant XDR (appledrm.panel_xdr_always): the panel stays in the pipeline macOS
++ * runs it in; nothing switches when HDR starts or stops.  An HDR frame (PQ or
++ * HLG) gets the EDR words above; an SDR frame gets macOS's SDR-desktop words.
++ * Those are TO-FILL from the A407 payloads of q-tb-xdr-2 / q6-tb-xdr-3
++ * (unlocked screen); until then, the words our SDR swaps imply today: scale
++ * 1, headroom used 1.0, sent only when they change.
++ */
++struct dcp_m4_xdr_sdr {
++	u32 hm;		/* applied headroom x1000: EDR scale 1000 / hm */
++	u32 used;	/* headroom used x1000; 0 leaves the word out */
++	bool every;	/* words on every swap, else only when they change */
++};
++#define DCP_M4_XDR_SDR_HM	1000U	/* TO-FILL: macOS's A407 +0x37e on an SDR desktop */
++#define DCP_M4_XDR_SDR_USED	1000U	/* TO-FILL: macOS's A407 +0x3e6 on an SDR desktop */
++#define DCP_M4_XDR_EVERY	false	/* TO-FILL: does macOS set bl_flags[2]/[4] every swap? */
++
++static inline bool dcp_m4_xdr_words_eq(const struct dcp_m4_edr_words *a,
++				       const struct dcp_m4_edr_words *b)
++{
++	return a->nits == b->nits && a->hm == b->hm && a->used == b->used &&
++	       a->limit == b->limit;
++}
++
++/*
++ * One present under panel_xdr_always.  @hdr: the frame is PQ or HLG; @v: the SDR
++ * words.  Returns true with @w set when the swap carries words.
++ */
++static inline bool dcp_m4_xdr_step(struct dcp_m4_edr_state *st, bool hdr, bool carries,
++				   u32 sdr, u32 peak, u32 ceiling,
++				   const struct dcp_m4_xdr_sdr *v, struct dcp_m4_edr_words *w)
++{
++	struct dcp_m4_edr_words e;
++
++	if (!sdr)
++		return false;	/* off: a swap that turns the panel off keeps its zero */
++	if (hdr) {
++		st->xdr_sdr = false;
++		if (dcp_m4_edr_step(st, true, carries, sdr, peak, ceiling, &e))
++			st->last = e;
++		else if (!v->every)
++			return false;
++		*w = st->last;
++		return true;
++	}
++	e = (struct dcp_m4_edr_words) {
++		.nits = min_t(u64, (u64)sdr * v->hm / DCP_EDR_UNITY, DCP_M4_EDR_MAX_NITS),
++		.hm = v->hm,
++		.used = v->used,
++	};
++	if (st->xdr_sdr && !carries && !v->every && dcp_m4_xdr_words_eq(&e, &st->last))
++		return false;
++	/* The next HDR frame starts from the SDR words, as after a wind-down. */
++	st->hm = 0;
++	st->sent = false;
++	st->sdr = sdr;
++	st->xdr_sdr = true;
++	st->last = e;
++	*w = e;
++	return true;
++}
++
+ /*
+  * The panel level with a raised SDR ceiling (bright surroundings): the user's
+  * full scale @user_max shows @ceiling nits, the rest in proportion.
+diff --git a/drivers/gpu/drm/apple/dcp-m4-frame-test.c b/drivers/gpu/drm/apple/dcp-m4-frame-test.c
+index a038520ad8..a4a8cb03fb 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-frame-test.c
++++ b/drivers/gpu/drm/apple/dcp-m4-frame-test.c
+@@ -161,6 +161,30 @@ static void frame_output_colour(struct kunit *test)
+ 	}
+ }
+ 
++/* panel_xdr_always: the frame's transfer is its tag, no gate; HLG frames are BT.2020. */
++static void frame_output_colour_xdr(struct kunit *test)
++{
++	static const struct { bool pqe, hlge, bt2020, pq, hlg, sdr2020; } t[] = {
++		{ false, false, false, false, false, false },	/* SDR, P3 */
++		{ false, false, true, false, false, true },	/* wide SDR */
++		{ true, false, false, true, false, false },	/* PQ, no BT2020_RGB: PQ */
++		{ true, false, true, true, false, false },
++		{ false, true, false, false, true, false },	/* HLG */
++		{ true, true, true, true, false, false },	/* both: PQ wins */
++	};
++	struct dcp_m4_frame f = { .hlg = true };
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(t); i++) {
++		bool pq = !t[i].pq, hlg = !t[i].hlg, sdr2020 = !t[i].sdr2020;
++
++		dcp_m4_output_colour_xdr(t[i].pqe, t[i].hlge, t[i].bt2020, &pq, &hlg, &sdr2020);
++		KUNIT_EXPECT_EQ(test, pq, t[i].pq);
++		KUNIT_EXPECT_EQ(test, hlg, t[i].hlg);
++		KUNIT_EXPECT_EQ(test, sdr2020, t[i].sdr2020);
++	}
++	KUNIT_EXPECT_EQ(test, dcp_m4_frame_primaries(&f), DCP_M4_PRIMARIES_BT2020);
++}
++
+ /* The surface tags: P3-D65/sRGB, BT.2020/sRGB (wide SDR), BT.2020/PQ (EDR). */
+ static void frame_surface_colour_tags(struct kunit *test)
+ {
+@@ -275,6 +299,7 @@ static struct kunit_case m4_frame_cases[] = {
+ 	KUNIT_CASE(frame_surface_encoding),
+ 	KUNIT_CASE(frame_j604_profile),
+ 	KUNIT_CASE(frame_output_colour),
++	KUNIT_CASE(frame_output_colour_xdr),
+ 	KUNIT_CASE(frame_surface_colour_tags),
+ 	KUNIT_CASE(frame_surface_bt709_tag),
+ 	KUNIT_CASE(frame_ext_formats),
+diff --git a/drivers/gpu/drm/apple/dcp-m4-frame.h b/drivers/gpu/drm/apple/dcp-m4-frame.h
+index 53fbc6193f..ee2582d551 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-frame.h
++++ b/drivers/gpu/drm/apple/dcp-m4-frame.h
+@@ -101,6 +101,8 @@ struct dcp_m4_frame {
+ 	enum dcp_m4_frame_format format;
+ 	/* BT.2020 PQ code values, shown as EDR (dcp-m4-edr.h); else P3-D65 sRGB */
+ 	bool pq;
++	/* BT.2020 HLG code values (appledrm.panel_xdr_always), shown as EDR */
++	bool hlg;
+ 	/* SDR code values in BT.2020 primaries (sRGB transfer), not P3-D65 */
+ 	bool bt2020;
+ 	/* SDR code values in BT.709 primaries (an sRGB external sink), not P3-D65 */
+@@ -110,7 +112,7 @@ struct dcp_m4_frame {
+ /* The H.273 primaries a frame's surface is tagged with. */
+ static inline u8 dcp_m4_frame_primaries(const struct dcp_m4_frame *frame)
+ {
+-	if (frame->pq || frame->bt2020)
++	if (frame->pq || frame->hlg || frame->bt2020)
+ 		return DCP_M4_PRIMARIES_BT2020;
+ 	return frame->bt709 ? DCP_M4_PRIMARIES_BT709 : DCP_M4_PRIMARIES_P3_D65;
+ }
+@@ -129,6 +131,19 @@ static inline void dcp_m4_output_colour(bool pq_eotf, bool bt2020_rgb, bool edr_
+ 	*bt2020_sdr = bt2020_rgb && !pq_eotf;
+ }
+ 
++/*
++ * appledrm.panel_xdr_always: the frame's own transfer is its tag, with no connector
++ * gate and no panel mode behind it: PQ or HLG metadata marks an HDR frame
++ * (its primaries BT.2020), else SDR in BT.2020 or P3 primaries as above.
++ */
++static inline void dcp_m4_output_colour_xdr(bool pq_eotf, bool hlg_eotf, bool bt2020_rgb,
++					    bool *pq, bool *hlg, bool *bt2020_sdr)
++{
++	*pq = pq_eotf;
++	*hlg = hlg_eotf && !pq_eotf;
++	*bt2020_sdr = bt2020_rgb && !*pq && !*hlg;
++}
++
+ static inline int dcp_m4_frame_check(const struct dcp_m4_frame *frame)
+ {
+ 	u64 size = (u64)frame->stride * frame->height;
+@@ -200,7 +215,8 @@ static inline void dcp_m4_surface_encode(u8 *surface, const struct dcp_m4_frame
+ 	put_unaligned_le32(1, surface + 3);
+ 	put_unaligned_le32(1, surface + 7);
+ 	put_unaligned_le32(dcp_m4_format_fourcc(frame->format), surface + 0x0b);
+-	surface[DCP_M4_SURFACE_XFER] = frame->pq ? DCP_M4_XFER_PQ : DCP_M4_XFER_SRGB;
++	surface[DCP_M4_SURFACE_XFER] = frame->pq ? DCP_M4_XFER_PQ :
++				       frame->hlg ? DCP_M4_XFER_HLG : DCP_M4_XFER_SRGB;
+ 	surface[DCP_M4_SURFACE_PRIMARIES] = dcp_m4_frame_primaries(frame);
+ 	put_unaligned_le32(frame->stride, surface + 0x15);
+ 	put_unaligned_le16(1, surface + 0x19);
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index ef9d388360..b23d6c071a 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -493,6 +493,23 @@ module_param_cb(panel_edr, &panel_edr_ops, &panel_edr, 0644);
+ MODULE_PARM_DESC(panel_edr,
+ 		 "J604: offer HDR to the compositor and show BT.2020 PQ content as EDR on the internal panel, up to its ADT peak (default: the machine's, J604 on, J713/J715 off). Set at boot it offers HDR (Colorspace, HDR_OUTPUT_METADATA, the EDID HDR block); written off later, frames are shown without EDR from the next commit");
+ 
++/*
++ * Constant XDR, as macOS runs the internal panel (DYLAN-ORDERS 10): no HDR
++ * mode gate; each frame is tagged with its own transfer (sRGB, PQ, HLG) and
++ * the swaps carry macOS's level/scale/headroom words (dcp_m4_xdr_step()).
++ * Needs panel_edr. Off until the SDR words are filled from the macOS trace.
++ */
++static bool panel_xdr_always;
++module_param(panel_xdr_always, bool, 0644);
++MODULE_PARM_DESC(panel_xdr_always,
++		 "J604: keep the internal panel in its XDR pipeline as macOS does: frames tagged with their own transfer (sRGB, PQ, HLG), no HDR mode switch, macOS's swap words (needs panel_edr; experimental; default: off)");
++
++static const struct dcp_m4_xdr_sdr dcp_m4_xdr_sdr_words = {
++	.hm = DCP_M4_XDR_SDR_HM,
++	.used = DCP_M4_XDR_SDR_USED,
++	.every = DCP_M4_XDR_EVERY,
++};
++
+ static unsigned int panel_vrr_min_hz;
+ /* Given on the command line or written: the machine default stays out. */
+ static bool panel_vrr_min_hz_given;
+@@ -675,6 +692,8 @@ struct iomfb_m4 {
+ 	u32 output_cll;
+ 	/* SDR frames in BT.2020 primaries: Colorspace BT2020_RGB without PQ */
+ 	bool output_bt2020;
++	/* panel_xdr_always: the compositor sends HLG frames */
++	bool output_hlg;
+ 	bool edr_latched; /* the offer is decided once, at the first publication */
+ 	struct dcp_m4_edr_state edr;
+ 	u64 edr_swaps;
+@@ -5001,17 +5020,32 @@ void iomfb_m4_atomic_hdr(struct apple_dcp *owner, struct drm_crtc *crtc,
+ {
+ 	struct iomfb_m4 *dcp = owner->v26_6;
+ 	const struct drm_connector_state *conn_state;
+-	bool edr, bt2020;
++	bool edr, bt2020, hlg = false;
++	u8 eotf;
+ 
+ 	if (!dcp || !READ_ONCE(dcp->edr_capable))
+ 		return;
+ 	conn_state = iomfb_m4_connector_state(owner, crtc, commit);
+-	/* panel_edr written off at run time: PQ commits stay valid, shown without EDR. */
+-	dcp_m4_output_colour(iomfb_m4_eotf(conn_state) == HDMI_EOTF_SMPTE_ST2084,
+-			     conn_state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB,
+-			     READ_ONCE(panel_edr), &edr, &bt2020);
++	eotf = iomfb_m4_eotf(conn_state);
++	if (READ_ONCE(panel_xdr_always) && READ_ONCE(panel_edr))
++		/* Constant XDR: the frame's transfer is its tag, no gate. */
++		dcp_m4_output_colour_xdr(eotf == HDMI_EOTF_SMPTE_ST2084,
++					 eotf == HDMI_EOTF_BT_2100_HLG,
++					 conn_state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB,
++					 &edr, &hlg, &bt2020);
++	else
++		/* panel_edr written off at run time: PQ commits stay valid, shown without EDR. */
++		dcp_m4_output_colour(eotf == HDMI_EOTF_SMPTE_ST2084,
++				     conn_state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB,
++				     READ_ONCE(panel_edr), &edr, &bt2020);
+ 	mutex_lock(&dcp->lock);
+-	if (edr != dcp->output_edr)
++	/* Under panel_xdr_always an HDR frame is not a mode change: no log line for it. */
++	if (hlg != dcp->output_hlg)
++		dev_dbg(dcp->dev, "panel HLG frames %s (panel_xdr_always)\n", hlg ? "on" : "off");
++	dcp->output_hlg = hlg;
++	if (edr != dcp->output_edr && READ_ONCE(panel_xdr_always))
++		dev_dbg(dcp->dev, "PQ frames %s (panel_xdr_always)\n", edr ? "on" : "off");
++	else if (edr != dcp->output_edr)
+ 		dev_info(dcp->dev, "panel EDR %s\n", edr ? "on: BT.2020 PQ" : "off");
+ 	if (bt2020 != dcp->output_bt2020)
+ 		dev_info(dcp->dev, "panel SDR colour: %s\n",
+@@ -5724,8 +5758,12 @@ static int iomfb_m4_swap(struct iomfb_m4 *dcp, const struct dcp_m4_frame *frame)
+ 		asked = sdr;
+ 	}
+ 	if (frame && dcp->edr_capable &&
+-	    dcp_m4_edr_step(&dcp->edr, frame->pq, carries, sdr,
+-			    min(dcp->panel_peak, limit), dcp->edr_ceiling, &words)) {
++	    (READ_ONCE(panel_xdr_always) ?
++	     dcp_m4_xdr_step(&dcp->edr, frame->pq || frame->hlg, carries, sdr,
++			     min(dcp->panel_peak, limit), dcp->edr_ceiling,
++			     &dcp_m4_xdr_sdr_words, &words) :
++	     dcp_m4_edr_step(&dcp->edr, frame->pq, carries, sdr,
++			     min(dcp->panel_peak, limit), dcp->edr_ceiling, &words))) {
+ 		words.limit = min_t(u64, words.limit, (u64)limit * 10);
+ 		dcp->runtime->edr = &words;
+ 		asked = max(asked, words.nits);
+@@ -5791,6 +5829,7 @@ int iomfb_m4_present(struct apple_dcp *owner, struct drm_framebuffer *fb,
+ 	mutex_lock(&dcp->lock);
+ 	/* The compositor encoded the frame for the HDR sink: BT.2020 PQ. */
+ 	frame.pq = dcp->output_edr;
++	frame.hlg = dcp->output_hlg;
+ 	frame.bt2020 = dcp->output_bt2020;
+ 	dcp->edr.cll = dcp->output_cll;
+ 	ret = dcp_m4_runtime_live(dcp->runtime);
+@@ -8930,9 +8969,13 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
+ 			   READ_ONCE(panel_vrr_min_hz), dcp->vrr_min_sent, dcp->vrr_media_sent,
+ 			   dcp->vrr_calls, dcp->vrr_status);
+ 	if (READ_ONCE(panel_edr))
+-		seq_printf(s, "edr capable=%u output=%u peak=%u ceiling=%u hm=%u sdr=%u sent=%u swaps=%llu cll=%u\n",
+-			   dcp->edr_capable, dcp->output_edr, dcp->panel_peak, dcp->edr_ceiling,
+-			   dcp->edr.hm, dcp->edr.sdr, dcp->edr.sent, dcp->edr_swaps, dcp->edr.cll);
++		/* output: the panel in its EDR pipeline (always, under panel_xdr_always) */
++		seq_printf(s, "edr capable=%u output=%u peak=%u ceiling=%u hm=%u sdr=%u sent=%u swaps=%llu cll=%u xdr=%u frame=%s\n",
++			   dcp->edr_capable,
++			   dcp->output_edr || (READ_ONCE(panel_xdr_always) && dcp->edr_capable),
++			   dcp->panel_peak, dcp->edr_ceiling, dcp->edr.hm, dcp->edr.sdr,
++			   dcp->edr.sent, dcp->edr_swaps, dcp->edr.cll, READ_ONCE(panel_xdr_always),
++			   dcp->output_edr ? "pq" : dcp->output_hlg ? "hlg" : "sdr");
+ 	if (r) {
+ 		u64 f = arch_timer_get_cntfrq() ?: 1;
+ 
+-- 
+2.43.0
+

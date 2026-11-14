@@ -1,0 +1,299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 05:08:44 +0000
+Subject: [PATCH] drm/apple: m4: hold and ramp the panel level after
+ HDR as macOS does
+
+Under panel_xdr_always the first SDR frame after HDR content dropped the
+panel level and EDR scale back to the SDR words at once. macOS 26B123 on
+the J604 keeps the level the HDR content left for 15.1 s, with the scale
+holding SDR white, then brings it down in 1.947 s, one step per 120 Hz
+frame (248 brightness calls 8.33 ms apart; the brightness cap goes from
+1600 to 400 nits).
+
+dcp_m4_xdr_step() now takes a clock and holds, then ramps the headroom
+linearly to the SDR words, and tells the caller when the standing frame
+has to be presented again. A delayed work re-presents it when the
+desktop sends no frame. HDR within the hold goes on from the held level;
+a blank ends the hold. The KUnit case follows the hold, the ramp, HDR
+again and the blank.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp-m4-edr-test.c | 43 +++++++++++++++++--
+ drivers/gpu/drm/apple/dcp-m4-edr.h      | 55 +++++++++++++++++++++----
+ drivers/gpu/drm/apple/iomfb_m4.c        | 36 +++++++++++++++-
+ 3 files changed, 123 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-m4-edr-test.c b/drivers/gpu/drm/apple/dcp-m4-edr-test.c
+index 263f0b1cfa..af55fcb9a0 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-edr-test.c
++++ b/drivers/gpu/drm/apple/dcp-m4-edr-test.c
+@@ -18,8 +18,9 @@
+ #define J604_PEAK	1600U
+ #define J604_CEILING	dcp_edr_ceiling(16U << 16)
+ #define SWAP_SIZE	0x588
++static u64 xdr_now, xdr_next;
+ #define XDR_STEP(st, hdr, carries, sdr, v, w) \
+-	dcp_m4_xdr_step(st, hdr, carries, sdr, J604_PEAK, J604_CEILING, v, w)
++	dcp_m4_xdr_step(st, hdr, carries, sdr, J604_PEAK, J604_CEILING, v, xdr_now, &xdr_next, w)
+ 
+ static void edr_binary64(struct kunit *test)
+ {
+@@ -266,6 +267,7 @@ static void xdr_sdr_hdr_sdr(struct kunit *test)
+ 	const struct dcp_m4_xdr_sdr every = { .hm = 1000, .used = 1000, .every = true };
+ 	struct dcp_m4_edr_state st = {};
+ 	struct dcp_m4_edr_words w = {};
++	u32 hm;
+ 
+ 	KUNIT_EXPECT_TRUE(test, XDR_STEP(&st, false, false, 400, &v, &w));
+ 	KUNIT_EXPECT_EQ(test, w.nits, 400);
+@@ -281,11 +283,46 @@ static void xdr_sdr_hdr_sdr(struct kunit *test)
+ 	KUNIT_EXPECT_GT(test, w.hm, 1000);
+ 	KUNIT_EXPECT_EQ(test, w.used, w.hm);
+ 	KUNIT_EXPECT_FALSE(test, st.xdr_sdr);
+-	/* back to SDR in one swap, with the SDR words */
++	/* back to SDR: macOS's hold, then its ramp, then the SDR words */
++	hm = w.hm;
++	xdr_now = 1000;
+ 	KUNIT_EXPECT_TRUE(test, XDR_STEP(&st, false, false, 300, &v, &w));
+-	KUNIT_EXPECT_EQ(test, w.hm, 1000);
++	KUNIT_EXPECT_EQ(test, w.hm, hm);
++	KUNIT_EXPECT_EQ(test, w.nits, 300 * hm / 1000);
+ 	KUNIT_EXPECT_EQ(test, w.used, 1000);
++	KUNIT_EXPECT_EQ(test, xdr_next, 1000 + DCP_M4_XDR_HOLD_MS);
++	/* a still frame within the hold carries nothing new */
++	xdr_now = 9000;
++	KUNIT_EXPECT_FALSE(test, XDR_STEP(&st, false, false, 300, &v, &w));
++	KUNIT_EXPECT_EQ(test, xdr_next, 1000 + DCP_M4_XDR_HOLD_MS);
++	/* half way down the ramp, the next step one frame later */
++	xdr_now = 1000 + DCP_M4_XDR_HOLD_MS + DCP_M4_XDR_RAMP_MS / 2;
++	KUNIT_EXPECT_TRUE(test, XDR_STEP(&st, false, false, 300, &v, &w));
++	KUNIT_EXPECT_LT(test, w.hm, hm);
++	KUNIT_EXPECT_GT(test, w.hm, 1000);
++	KUNIT_EXPECT_EQ(test, xdr_next, xdr_now + DCP_M4_XDR_STEP_MS);
++	/* the end of the ramp: the SDR words, nothing more to present */
++	xdr_now = 1000 + DCP_M4_XDR_HOLD_MS + DCP_M4_XDR_RAMP_MS;
++	KUNIT_EXPECT_TRUE(test, XDR_STEP(&st, false, false, 300, &v, &w));
++	KUNIT_EXPECT_EQ(test, w.hm, 1000);
++	KUNIT_EXPECT_EQ(test, w.nits, 300);
++	KUNIT_EXPECT_EQ(test, xdr_next, 0);
+ 	KUNIT_EXPECT_EQ(test, st.hm, 0);
++	KUNIT_EXPECT_FALSE(test, XDR_STEP(&st, false, false, 300, &v, &w));
++	/* HDR again within a hold goes on from the held headroom */
++	KUNIT_EXPECT_TRUE(test, XDR_STEP(&st, true, false, 300, &v, &w));
++	hm = w.hm;
++	xdr_now = 30000;
++	KUNIT_EXPECT_TRUE(test, XDR_STEP(&st, false, false, 300, &v, &w));
++	KUNIT_EXPECT_EQ(test, w.hm, hm);
++	KUNIT_EXPECT_TRUE(test, XDR_STEP(&st, true, false, 300, &v, &w));
++	KUNIT_EXPECT_GE(test, w.hm, hm);
++	KUNIT_EXPECT_EQ(test, xdr_next, 0);
++	/* a blank ends the hold */
++	KUNIT_EXPECT_TRUE(test, XDR_STEP(&st, false, false, 300, &v, &w));
++	KUNIT_EXPECT_FALSE(test, XDR_STEP(&st, false, true, 0, &v, &w));
++	KUNIT_EXPECT_EQ(test, st.wind_hm, 0);
++	xdr_now = 0;
+ 	/* panel off: nothing */
+ 	KUNIT_EXPECT_FALSE(test, XDR_STEP(&st, false, true, 0, &every, &w));
+ }
+diff --git a/drivers/gpu/drm/apple/dcp-m4-edr.h b/drivers/gpu/drm/apple/dcp-m4-edr.h
+index 389bcd415c..b6101a6928 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-edr.h
++++ b/drivers/gpu/drm/apple/dcp-m4-edr.h
+@@ -95,6 +95,8 @@ struct dcp_m4_edr_state {
+ 	bool restart;	/* the next EDR ramp starts again from 1.0 */
+ 	struct dcp_m4_edr_words last;	/* panel_xdr_always: the words last sent */
+ 	bool xdr_sdr;	/* panel_xdr_always: the last words were an SDR frame's */
++	u64 wind_t0;	/* panel_xdr_always: ms the first SDR frame after HDR came */
++	u32 wind_hm;	/* panel_xdr_always: the headroom HDR left; 0: no wind-down */
+ };
+ 
+ /*
+@@ -187,6 +189,18 @@ struct dcp_m4_xdr_sdr {
+ #define DCP_M4_XDR_SDR_USED	1000U	/* TO-FILL: macOS's A407 +0x3e6 on an SDR desktop */
+ #define DCP_M4_XDR_EVERY	false	/* TO-FILL: does macOS set bl_flags[2]/[4] every swap? */
+ 
++/*
++ * When HDR stops, macOS 26B123 on the J604 keeps the panel level the HDR
++ * content left for 15.1 s (the EDR scale keeps SDR white where it was), then
++ * brings it down to the SDR level in 1.947 s, one step per 120 Hz frame
++ * (q6-tb-xdr-3: 248 brightness calls 8.33 ms apart; BLNitsCap 1600 -> 400).
++ * The steps here are linear in headroom; they come from re-presents of the
++ * standing frame (@next_ms) when the desktop sends none.
++ */
++#define DCP_M4_XDR_HOLD_MS	15100U
++#define DCP_M4_XDR_RAMP_MS	1947U
++#define DCP_M4_XDR_STEP_MS	8U
++
+ static inline bool dcp_m4_xdr_words_eq(const struct dcp_m4_edr_words *a,
+ 				       const struct dcp_m4_edr_words *b)
+ {
+@@ -196,17 +210,25 @@ static inline bool dcp_m4_xdr_words_eq(const struct dcp_m4_edr_words *a,
+ 
+ /*
+  * One present under panel_xdr_always.  @hdr: the frame is PQ or HLG; @v: the SDR
+- * words.  Returns true with @w set when the swap carries words.
++ * words; @now_ms: a monotonic clock.  Returns true with @w set when the swap
++ * carries words; @next_ms is set to when the standing frame must be presented
++ * again for the HDR-stop hold and ramp, else 0.
+  */
+ static inline bool dcp_m4_xdr_step(struct dcp_m4_edr_state *st, bool hdr, bool carries,
+ 				   u32 sdr, u32 peak, u32 ceiling,
+-				   const struct dcp_m4_xdr_sdr *v, struct dcp_m4_edr_words *w)
++				   const struct dcp_m4_xdr_sdr *v, u64 now_ms, u64 *next_ms,
++				   struct dcp_m4_edr_words *w)
+ {
+ 	struct dcp_m4_edr_words e;
++	u32 hm = v->hm;
+ 
+-	if (!sdr)
++	*next_ms = 0;
++	if (!sdr) {
++		st->wind_hm = 0;	/* a blank ends it: the next HDR ramps from 1.0 */
+ 		return false;	/* off: a swap that turns the panel off keeps its zero */
++	}
+ 	if (hdr) {
++		st->wind_hm = 0;	/* HDR again: its ramp goes on from the standing level */
+ 		st->xdr_sdr = false;
+ 		if (dcp_m4_edr_step(st, true, carries, sdr, peak, ceiling, &e))
+ 			st->last = e;
+@@ -215,15 +237,34 @@ static inline bool dcp_m4_xdr_step(struct dcp_m4_edr_state *st, bool hdr, bool c
+ 		*w = st->last;
+ 		return true;
+ 	}
++	/* The first SDR frame after HDR that raised the headroom starts the hold. */
++	if (!st->xdr_sdr && !st->wind_hm && st->hm > v->hm) {
++		st->wind_hm = st->hm;
++		st->wind_t0 = now_ms;
++	}
++	if (st->wind_hm) {
++		u64 t = now_ms - st->wind_t0;
++
++		if (t < DCP_M4_XDR_HOLD_MS) {
++			hm = st->wind_hm;
++			*next_ms = st->wind_t0 + DCP_M4_XDR_HOLD_MS;
++		} else if (t < DCP_M4_XDR_HOLD_MS + DCP_M4_XDR_RAMP_MS) {
++			hm = st->wind_hm - div_u64((u64)(st->wind_hm - v->hm) *
++						    (t - DCP_M4_XDR_HOLD_MS), DCP_M4_XDR_RAMP_MS);
++			*next_ms = now_ms + DCP_M4_XDR_STEP_MS;
++		} else {
++			st->wind_hm = 0;
++		}
++	}
+ 	e = (struct dcp_m4_edr_words) {
+-		.nits = min_t(u64, (u64)sdr * v->hm / DCP_EDR_UNITY, DCP_M4_EDR_MAX_NITS),
+-		.hm = v->hm,
++		.nits = min_t(u64, (u64)sdr * hm / DCP_EDR_UNITY, DCP_M4_EDR_MAX_NITS),
++		.hm = hm,
+ 		.used = v->used,
+ 	};
+ 	if (st->xdr_sdr && !carries && !v->every && dcp_m4_xdr_words_eq(&e, &st->last))
+ 		return false;
+-	/* The next HDR frame starts from the SDR words, as after a wind-down. */
+-	st->hm = 0;
++	/* A new HDR frame ramps from the standing headroom (1.0 after the ramp). */
++	st->hm = st->wind_hm ? hm : 0;
+ 	st->sent = false;
+ 	st->sdr = sdr;
+ 	st->xdr_sdr = true;
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index b23d6c071a..a8c395cbc4 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -581,6 +581,8 @@ struct iomfb_m4 {
+ 	/* The realtime bandwidth mailbox from the DT (0: none), see dcp_m4_bw_mailbox() */
+ 	u64 bw_mailbox;
+ 	struct delayed_work backlight_work;
++	/* panel_xdr_always: re-presents the standing frame for the HDR-stop hold/ramp */
++	struct delayed_work xdr_wind_work;
+ 	void __iomem *coproc;
+ 	struct apple_rtkit *rtkit;
+ 	struct mutex lock;
+@@ -3985,6 +3987,7 @@ static int iomfb_m4_check_frame(const struct dcp_m4_frame *frame)
+ }
+ 
+ static void iomfb_m4_backlight_work(struct work_struct *work);
++static void iomfb_m4_xdr_wind_work(struct work_struct *work);
+ static void iomfb_m4_idle_cache_work(struct work_struct *work);
+ static void iomfb_m4_ext_put_work(struct work_struct *work);
+ 
+@@ -4139,6 +4142,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
+ 	spin_lock_init(&dcp->ext_av_lock);
+ 	init_completion(&dcp->reply);
+ 	INIT_DELAYED_WORK(&dcp->backlight_work, iomfb_m4_backlight_work);
++	INIT_DELAYED_WORK(&dcp->xdr_wind_work, iomfb_m4_xdr_wind_work);
+ 	spin_lock_init(&dcp->ext_put_lock);
+ 	INIT_LIST_HEAD(&dcp->ext_puts);
+ 	INIT_WORK(&dcp->ext_put_work, iomfb_m4_ext_put_work);
+@@ -5722,6 +5726,7 @@ static int iomfb_m4_swap(struct iomfb_m4 *dcp, const struct dcp_m4_frame *frame)
+ 	int prepared = -ENODATA, ret;
+ 	u32 ceiling = iomfb_m4_boost_ceiling(dcp), sdr, limit, below, key, asked = 0, us;
+ 	bool carries, level = false, shown;
++	u64 now_ms = ktime_to_ms(ktime_get()), next_ms = 0;
+ 	ktime_t start;
+ 
+ 	lockdep_assert_held(&dcp->lock);
+@@ -5761,7 +5766,7 @@ static int iomfb_m4_swap(struct iomfb_m4 *dcp, const struct dcp_m4_frame *frame)
+ 	    (READ_ONCE(panel_xdr_always) ?
+ 	     dcp_m4_xdr_step(&dcp->edr, frame->pq || frame->hlg, carries, sdr,
+ 			     min(dcp->panel_peak, limit), dcp->edr_ceiling,
+-			     &dcp_m4_xdr_sdr_words, &words) :
++			     &dcp_m4_xdr_sdr_words, now_ms, &next_ms, &words) :
+ 	     dcp_m4_edr_step(&dcp->edr, frame->pq, carries, sdr,
+ 			     min(dcp->panel_peak, limit), dcp->edr_ceiling, &words))) {
+ 		words.limit = min_t(u64, words.limit, (u64)limit * 10);
+@@ -5770,6 +5775,10 @@ static int iomfb_m4_swap(struct iomfb_m4 *dcp, const struct dcp_m4_frame *frame)
+ 	}
+ 	if (!frame)
+ 		dcp->edr.restart = true;
++	/* The hold and ramp go on with no client present: re-present then. */
++	if (next_ms && dcp->runtime->wq)
++		mod_delayed_work(dcp->runtime->wq, &dcp->xdr_wind_work,
++				 msecs_to_jiffies(next_ms > now_ms ? next_ms - now_ms : 1));
+ 	/*
+ 	 * Asking for more than the guard has taken, while it ramps, is a probe:
+ 	 * one the firmware refuses or leaves without its D590 is given up
+@@ -8839,6 +8848,30 @@ static void iomfb_m4_backlight_work(struct work_struct *work)
+ 	mutex_unlock(&dcp->lock);
+ }
+ 
++/* panel_xdr_always: one HDR-stop hold/ramp step on the standing frame. */
++static void iomfb_m4_xdr_wind_work(struct work_struct *work)
++{
++	struct iomfb_m4 *dcp = container_of(to_delayed_work(work), struct iomfb_m4,
++					    xdr_wind_work);
++	int ret;
++
++	mutex_lock(&dcp->lock);
++	if (READ_ONCE(dcp->owner->quiescing) || !dcp->runtime || !dcp->active_frame.dva ||
++	    !dcp->edr.wind_hm || !READ_ONCE(panel_xdr_always))
++		goto out;
++	ret = dcp_m4_runtime_live(dcp->runtime);
++	if (!ret)
++		ret = iomfb_m4_swap(dcp, &dcp->active_frame);
++	if (ret) {
++		dcp_m4_failed(dcp, ret);
++	} else {
++		dcp->brightness_swaps++;
++		iomfb_m4_idle_cache_kick(dcp);
++	}
++out:
++	mutex_unlock(&dcp->lock);
++}
++
+ static void iomfb_m4_backlight_kick(struct apple_dcp *owner)
+ {
+ 	struct iomfb_m4 *dcp = owner->v26_6;
+@@ -8870,6 +8903,7 @@ void iomfb_m4_quiesce(struct apple_dcp *owner)
+ 	/* Wake any RPC waiter before waiting for workers; never recycle its DMA. */
+ 	dcp_m4_failed(dcp, -ENODEV);
+ 	cancel_delayed_work_sync(&dcp->backlight_work);
++	cancel_delayed_work_sync(&dcp->xdr_wind_work);
+ 	if (dcp->runtime) {
+ 		mutex_lock(&dcp->lock);
+ 		dcp_m4_int_flight_lost(dcp->runtime, -ENODEV);
+-- 
+2.43.0
+

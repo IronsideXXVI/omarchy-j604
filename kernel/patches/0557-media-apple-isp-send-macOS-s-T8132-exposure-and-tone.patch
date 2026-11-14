@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 11:18:31 +0000
+Subject: [PATCH] media: apple: isp: send macOS's T8132 exposure and
+ tone session settings
+
+macOS sends the J604's camera (M4 MacBook Pro 14", T8132) six channel
+settings this driver never sent, every session: an auto exposure gain
+cap of 0x6000, local tone mapping mode 1 with gamma 0, highlight
+compression off, the white balance temporal stabilizer on, the auto
+exposure speed 28 each way and a neutral exposure bias of 0x100. Read
+with their payloads from the ISP's command channel while macOS streamed
+the camera in Photo Booth; the same session repeats on a second run.
+
+Send them after the auto exposure stability thresholds, by default, on
+T8132 only. The firmware loaded here is not macOS's, so a refused
+setting is warned about once and the stream starts without the rest.
+macos_session_settings=N leaves them at the firmware's defaults.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/isp/isp-cam.c | 52 ++++++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-cmd.c | 20 +++++++++
+ drivers/media/platform/apple/isp/isp-cmd.h | 27 +++++++++++
+ drivers/media/platform/apple/isp/isp-drv.c |  1 +
+ drivers/media/platform/apple/isp/isp-drv.h |  2 +
+ 5 files changed, 102 insertions(+)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index ef00126ce3..f1a2d67423 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -589,6 +589,56 @@ static const struct isp_preset isp_lens_source = {
+ 	.output_dim = { 1920, 1080 },
+ };
+ 
++/*
++ * macOS sends this Mac's camera an exposure gain cap, a neutral exposure
++ * bias, the auto exposure speed both ways, local tone mapping on with its
++ * gamma at 0, highlight compression off and the white balance temporal
++ * stabilizer on, every session; macos_session_settings=N leaves them at the
++ * firmware's defaults.
++ */
++static bool macos_session_settings = true;
++module_param(macos_session_settings, bool, 0644);
++MODULE_PARM_DESC(macos_session_settings,
++		 "Send the exposure and tone settings macOS sends this camera each session, where known (default: on)");
++
++static const struct {
++	u16 opcode;
++	u32 value;
++} isp_macos_session[] = {
++	{ CISP_CMD_CH_AE_GAIN_CAP_SET, 0x6000 },
++	{ CISP_CMD_CH_LTM_GAMMA_SET, 0 },
++	{ CISP_CMD_CH_LTM_MODE_SET, 1 },
++	{ CISP_CMD_CH_HDRC_ENABLE, 0 },
++	{ CISP_CMD_APPLE_CH_AWB_TEMPORAL_STABILIZER_SET, 1 },
++	/* 28 each way, one byte per direction */
++	{ CISP_CMD_CH_AE_2WAYSPEED_SET, 0x1c1c },
++};
++
++/*
++ * The firmware loaded here is not the one macOS runs, so a setting it
++ * refuses is reported once and the stream goes on without the rest.
++ */
++static void isp_ch_macos_session(struct apple_isp *isp, u32 ch)
++{
++	int err;
++
++	if (!READ_ONCE(macos_session_settings) || !isp->hw->macos_session_settings)
++		return;
++	for (unsigned int i = 0; i < ARRAY_SIZE(isp_macos_session); i++) {
++		err = isp_cmd_ch_u32_set(isp, isp_macos_session[i].opcode, ch,
++					 isp_macos_session[i].value);
++		if (err) {
++			/* Stop here: a timeout would delay the stream per setting. */
++			dev_warn_once(isp->dev, "session setting 0x%04x refused: %d\n",
++				      isp_macos_session[i].opcode, err);
++			return;
++		}
++	}
++	err = isp_cmd_ch_ae_bias_exposure_set(isp, ch, 0x100);
++	if (err)
++		dev_warn_once(isp->dev, "exposure bias refused: %d\n", err);
++}
++
+ /*
+  * macOS sets this Mac's auto exposure stability thresholds to 16 and 8 for
+  * every camera session; macos_ae_stability=N gives back 32 and 20.
+@@ -1391,6 +1441,8 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
+ 	if (err)
+ 		return err;
+ 
++	isp_ch_macos_session(isp, ch);
++
+ 	err = isp_cmd_ch_sif_pixel_format_set(isp, ch);
+ 	if (err)
+ 		return err;
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.c b/drivers/media/platform/apple/isp/isp-cmd.c
+index 4dc706aad6..a7b2382f36 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.c
++++ b/drivers/media/platform/apple/isp/isp-cmd.c
+@@ -806,6 +806,26 @@ int isp_cmd_ch_semantic_video_enable(struct apple_isp *isp, u32 chan,
+ 	return CISP_SEND_IN(isp, args);
+ }
+ 
++int isp_cmd_ch_u32_set(struct apple_isp *isp, u16 opcode, u32 chan, u32 value)
++{
++	struct cmd_ch_u32_set args = {
++		.opcode = CISP_OPCODE(opcode),
++		.chan = chan,
++		.value = value,
++	};
++	return CISP_SEND_IN(isp, args);
++}
++
++int isp_cmd_ch_ae_bias_exposure_set(struct apple_isp *isp, u32 chan, u32 bias)
++{
++	struct cmd_ch_ae_bias_exposure_set args = {
++		.opcode = CISP_OPCODE(CISP_CMD_CH_AE_BIAS_EXPOSURE_SET),
++		.chan = chan,
++		.bias = bias,
++	};
++	return CISP_SEND_IN(isp, args);
++}
++
+ int isp_cmd_ch_semantic_awb_enable(struct apple_isp *isp, u32 chan, u32 enable)
+ {
+ 	struct cmd_ch_semantic_awb_enable args = {
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.h b/drivers/media/platform/apple/isp/isp-cmd.h
+index 6511b625c5..0d4a6c87e3 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.h
++++ b/drivers/media/platform/apple/isp/isp-cmd.h
+@@ -49,12 +49,15 @@
+ #define CISP_CMD_CH_CAMERA_AGILE_FREQ_ARRAY_CURRENT_GET	     0x015e
+ #define CISP_CMD_CH_AE_START				     0x0200
+ #define CISP_CMD_CH_AE_STOP				     0x0201
++#define CISP_CMD_CH_AE_BIAS_EXPOSURE_SET		     0x0204
+ #define CISP_CMD_CH_AE_FRAME_RATE_MAX_GET		     0x0207
+ #define CISP_CMD_CH_AE_FRAME_RATE_MAX_SET		     0x0208
+ #define CISP_CMD_CH_AE_FRAME_RATE_MIN_GET		     0x0209
+ #define CISP_CMD_CH_AE_FRAME_RATE_MIN_SET		     0x020a
++#define CISP_CMD_CH_AE_GAIN_CAP_SET			     0x020c
+ #define CISP_CMD_CH_AE_STABILITY_SET			     0x021a
+ #define CISP_CMD_CH_AE_STABILITY_TO_STABLE_SET		     0x0229
++#define CISP_CMD_CH_AE_2WAYSPEED_SET			     0x0243
+ #define CISP_CMD_CH_SENSOR_NVM_GET			     0x0501
+ #define CISP_CMD_CH_SENSOR_PERMODULE_LSC_INFO_GET	     0x0507
+ #define CISP_CMD_CH_SENSOR_PERMODULE_LSC_GRID_GET	     0x0511
+@@ -70,6 +73,7 @@
+ #define CISP_CMD_CH_ALS_DISABLE				     0x0a1d
+ #define CISP_CMD_CH_CNR_START				     0x0a2f
+ #define CISP_CMD_CH_MBNR_ENABLE				     0x0a3a
++#define CISP_CMD_CH_HDRC_ENABLE				     0x0a48
+ #define CISP_CMD_CH_LSC_IDEAL_PERCENT_SET		     0x0a4e
+ #define CISP_CMD_CH_OUTPUT_CONFIG_SET			     0x0b01
+ #define CISP_CMD_CH_OUTPUT_CONFIG_SCL1_SET		     0x0b09
+@@ -82,6 +86,8 @@
+ #define CISP_CMD_CH_FACE_DETECTION_CONFIG_SET		     0x0d03
+ #define CISP_CMD_CH_FACE_DETECTION_DISABLE		     0x0d04
+ #define CISP_CMD_CH_FACE_DETECTION_ENABLE		     0x0d05
++#define CISP_CMD_CH_LTM_MODE_SET			     0x2004
++#define CISP_CMD_CH_LTM_GAMMA_SET			     0x200a
+ #define CISP_CMD_CH_FID_START				     0x3000
+ #define CISP_CMD_CH_FID_STOP				     0x3001
+ #define CISP_CMD_IPC_ENDPOINT_SET2			     0x300c
+@@ -92,6 +98,7 @@
+ #define CISP_CMD_APPLE_CH_AE_METERING_MODE_SET		     0x8206
+ #define CISP_CMD_APPLE_CH_AE_FD_SCENE_METERING_CONFIG_SET    0x820e
+ #define CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_UPDATE_CURRENT_SET 0x8212
++#define CISP_CMD_APPLE_CH_AWB_TEMPORAL_STABILIZER_SET	     0x8327
+ #define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_START		     0xc100
+ #define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_STOP		     0xc101
+ #define CISP_CMD_APPLE_CH_MOTION_HISTORY_START		     0xc102
+@@ -839,6 +846,26 @@ struct cmd_ch_semantic_awb_enable {
+ } __packed;
+ static_assert(sizeof(struct cmd_ch_semantic_awb_enable) == 0x10);
+ 
++/* A channel command whose only argument is one word, e.g. a mode or an enable */
++struct cmd_ch_u32_set {
++	u64 opcode;
++	u32 chan;
++	u32 value;
++} __packed;
++static_assert(sizeof(struct cmd_ch_u32_set) == 0x10);
++
++/* Exposure bias in 1/256 steps (256 = neutral, as macOS sends it) */
++struct cmd_ch_ae_bias_exposure_set {
++	u64 opcode;
++	u32 chan;
++	u32 bias;
++	u32 unk_10;
++} __packed;
++static_assert(sizeof(struct cmd_ch_ae_bias_exposure_set) == 0x14);
++
++int isp_cmd_ch_u32_set(struct apple_isp *isp, u16 opcode, u32 chan, u32 value);
++int isp_cmd_ch_ae_bias_exposure_set(struct apple_isp *isp, u32 chan, u32 bias);
++
+ int isp_cmd_ch_semantic_video_enable(struct apple_isp *isp, u32 chan,
+ 				     u32 enable);
+ int isp_cmd_ch_semantic_awb_enable(struct apple_isp *isp, u32 chan, u32 enable);
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index 55a6b0b11e..ce459970ba 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -1329,6 +1329,7 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
+ 	/* As macOS sets up each camera session on this Mac */
+ 	.ae_stability = 16,
+ 	.ae_stability_to_stable = 8,
++	.macos_session_settings = true,
+ };
+ 
+ /*
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 34f2971d43..0d35412517 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -314,6 +314,8 @@ struct apple_isp_hw {
+ 	/* Auto exposure stability thresholds as macOS sets them (0: driver default) */
+ 	u32 ae_stability;
+ 	u32 ae_stability_to_stable;
++	/* Send the tone and exposure settings macOS sends this camera each session */
++	bool macos_session_settings;
+ };
+ 
+ enum isp_sensor_id {
+-- 
+2.43.0
+

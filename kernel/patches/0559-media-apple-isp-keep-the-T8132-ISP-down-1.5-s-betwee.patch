@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 13:24:15 +0000
+Subject: [PATCH] media: apple: isp: keep the T8132 ISP down 1.5 s
+ between two boots
+
+On the J604 (M4 MacBook Pro 14", T8132) the first camera stream after
+boot failed: the camera detection boots the firmware, reads the sensor
+and powers the ISP down, and the stream's boot that follows at once
+gets no first magic number (-ENODEV, "coproc not in WFI" at its
+power-down). The next open, seconds later, streams, as does every
+open after it. macOS leaves the ISP down for about 1.2 s between the
+two boots it does at every system start.
+
+Note when the ISP domains were powered down and, on T8132, wait out
+what is left of 1.5 s before powering them up again. Only a boot that
+follows a power-down within 1.5 s waits.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/isp/isp-drv.c |  2 ++
+ drivers/media/platform/apple/isp/isp-drv.h |  4 ++++
+ drivers/media/platform/apple/isp/isp-fw.c  | 22 ++++++++++++++++++++++
+ 3 files changed, 28 insertions(+)
+
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index ce459970ba..a45c098070 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -1330,6 +1330,8 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
+ 	.ae_stability = 16,
+ 	.ae_stability_to_stable = 8,
+ 	.macos_session_settings = true,
++	/* macOS keeps it down at least about 1.2 s between two boots */
++	.min_off_ms = 1500,
+ };
+ 
+ /*
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 0d35412517..a38ad70ec9 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -316,6 +316,8 @@ struct apple_isp_hw {
+ 	u32 ae_stability_to_stable;
+ 	/* Send the tone and exposure settings macOS sends this camera each session */
+ 	bool macos_session_settings;
++	/* Least time the ISP stays powered down before it is powered up again, in ms */
++	unsigned int min_off_ms;
+ };
+ 
+ enum isp_sensor_id {
+@@ -440,6 +442,8 @@ struct apple_isp {
+ 	void __iomem *dapf;
+ 	void __iomem *mbox_route;
+ 	void __iomem *core_park[2];
++	/* When the ISP domains were last powered down (0: not since boot) */
++	ktime_t off_at;
+ 	void __iomem *pre_dart;
+ 	void __iomem *dart_setup[3];
+ 	struct device *dapf_dart;
+diff --git a/drivers/media/platform/apple/isp/isp-fw.c b/drivers/media/platform/apple/isp/isp-fw.c
+index bbf581509a..b9e6a52278 100644
+--- a/drivers/media/platform/apple/isp/isp-fw.c
++++ b/drivers/media/platform/apple/isp/isp-fw.c
+@@ -594,6 +594,27 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
+ 		isp_park_cores(isp);
+ 
+ 	apple_isp_power_down_domains(isp);
++	isp->off_at = ktime_get();
++}
++
++/*
++ * On T8132 a boot that follows a power-down at once gets no first magic
++ * number, and the next one, seconds later, starts: the first stream after
++ * the camera detection failed that way. macOS leaves the ISP down for about
++ * 1.2 s between two boots. Wait out what is left of hw->min_off_ms.
++ */
++static void isp_wait_off_time(struct apple_isp *isp)
++{
++	s64 off_ms;
++
++	if (!isp->hw->min_off_ms || !isp->off_at)
++		return;
++	off_ms = ktime_ms_delta(ktime_get(), isp->off_at);
++	if (off_ms >= 0 && off_ms < isp->hw->min_off_ms) {
++		dev_dbg(isp->dev, "powered down %lld ms ago, waiting %lld ms\n",
++			off_ms, isp->hw->min_off_ms - off_ms);
++		msleep(isp->hw->min_off_ms - off_ms);
++	}
+ }
+ 
+ static int isp_firmware_boot_stage1(struct apple_isp *isp)
+@@ -602,6 +623,7 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
+ 	// u32 val;
+ 
+ 	isp_restore_fw_memory(isp);
++	isp_wait_off_time(isp);
+ 
+ 	err = apple_isp_power_up_domains(isp);
+ 	if (err < 0)
+-- 
+2.43.0
+

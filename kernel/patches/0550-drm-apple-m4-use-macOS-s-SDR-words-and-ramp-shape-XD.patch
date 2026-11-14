@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 11:08:28 +0000
+Subject: [PATCH] drm/apple: m4: use macOS's SDR words and ramp shape,
+ XDR on by default
+
+The swap_submit payloads macOS 26B123 sends on the J604 (an unlocked
+trace with SDR, HDR full screen, HDR windowed, a brightness change and
+both HDR stops) give the values the skeleton left open:
+
+- SDR desktop: level = SDR white x 1.2, EDR scale 1/1.2, headroom used
+  1.2 (hm = used = 1200), the 1.2 macOS reports as maxEDR there.
+- The words ride a swap only when they change: steady SDR and HDR
+  swaps carry no backlight flags.
+- After HDR the level holds for 14.45 s from the last HDR swap, not
+  15.1 s, then falls to the SDR level in 1.95 s by a constant ratio per
+  frame (1225 to 169 nits, x0.876 every 16 frames): geometric in nits,
+  where the ramp here was linear.
+
+Set those, take the ramp steps geometrically (an integer square-root
+chain, no floating point), and turn panel_xdr_always on. A KUnit case
+checks the SDR words, the settle swap and the ramp's midpoint and step
+ratio against the trace.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/dcp-m4-edr-test.c | 36 +++++++++++++
+ drivers/gpu/drm/apple/dcp-m4-edr.h      | 70 ++++++++++++++++++++-----
+ drivers/gpu/drm/apple/iomfb_m4.c        |  7 +--
+ 3 files changed, 96 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp-m4-edr-test.c b/drivers/gpu/drm/apple/dcp-m4-edr-test.c
+index af55fcb9a0..a1b5c8d1fe 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-edr-test.c
++++ b/drivers/gpu/drm/apple/dcp-m4-edr-test.c
+@@ -327,7 +327,43 @@ static void xdr_sdr_hdr_sdr(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, XDR_STEP(&st, false, true, 0, &every, &w));
+ }
+ 
++/* The J604's SDR words and macOS's HDR-stop ramp shape (q9-tb-xdr-6). */
++static void xdr_macos_words_and_ramp(struct kunit *test)
++{
++	const struct dcp_m4_xdr_sdr v = {
++		.hm = DCP_M4_XDR_SDR_HM, .used = DCP_M4_XDR_SDR_USED, .every = DCP_M4_XDR_EVERY,
++	};
++	struct dcp_m4_edr_state st = {};
++	struct dcp_m4_edr_words w = {};
++	u32 mid, quarter;
++
++	KUNIT_EXPECT_EQ(test, v.hm, 1200);
++	KUNIT_EXPECT_EQ(test, v.used, 1200);
++	KUNIT_EXPECT_FALSE(test, v.every);
++	/* SDR white 140 nits: macOS's settle swap, level 168.00, hm = used = 1200 */
++	KUNIT_EXPECT_TRUE(test, XDR_STEP(&st, false, false, 140, &v, &w));
++	KUNIT_EXPECT_EQ(test, w.nits, 168);
++	KUNIT_EXPECT_EQ(test, w.hm, 1200);
++	KUNIT_EXPECT_EQ(test, w.used, 1200);
++	KUNIT_EXPECT_FALSE(test, XDR_STEP(&st, false, false, 140, &v, &w));
++	/* geometric: the middle is the geometric mean of the ends (8751, 1200 -> 3240) */
++	mid = dcp_m4_xdr_geo(8751, 1200, 512, 1024);
++	KUNIT_EXPECT_GE(test, mid, 3220);
++	KUNIT_EXPECT_LE(test, mid, 3260);
++	quarter = dcp_m4_xdr_geo(8751, 1200, 256, 1024);
++	KUNIT_EXPECT_GE(test, quarter, 5300);
++	KUNIT_EXPECT_LE(test, quarter, 5340);
++	KUNIT_EXPECT_EQ(test, dcp_m4_xdr_geo(8751, 1200, 0, 1024), 8751);
++	KUNIT_EXPECT_GE(test, dcp_m4_xdr_geo(8751, 1200, 1023, 1024), 1200);
++	KUNIT_EXPECT_LE(test, dcp_m4_xdr_geo(8751, 1200, 1023, 1024), 1210);
++	/* the measured step: x0.876 over 16 frames (133 ms of 1950 ms) */
++	KUNIT_EXPECT_GE(test, dcp_m4_xdr_geo(8751, 1200, 133, 1950) * 1000ULL / 8751, 868);
++	KUNIT_EXPECT_LE(test, dcp_m4_xdr_geo(8751, 1200, 133, 1950) * 1000ULL / 8751, 884);
++	KUNIT_EXPECT_EQ(test, DCP_M4_XDR_HOLD_MS, 14450);
++}
++
+ static struct kunit_case m4_edr_cases[] = {
++	KUNIT_CASE(xdr_macos_words_and_ramp),
+ 	KUNIT_CASE(edr_binary64),
+ 	KUNIT_CASE(edr_words_land_at_the_desktop_offsets),
+ 	KUNIT_CASE(edr_words_left_out),
+diff --git a/drivers/gpu/drm/apple/dcp-m4-edr.h b/drivers/gpu/drm/apple/dcp-m4-edr.h
+index b6101a6928..a7026d4843 100644
+--- a/drivers/gpu/drm/apple/dcp-m4-edr.h
++++ b/drivers/gpu/drm/apple/dcp-m4-edr.h
+@@ -176,31 +176,73 @@ static inline bool dcp_m4_edr_step(struct dcp_m4_edr_state *st, bool edr, bool c
+  * Constant XDR (appledrm.panel_xdr_always): the panel stays in the pipeline macOS
+  * runs it in; nothing switches when HDR starts or stops.  An HDR frame (PQ or
+  * HLG) gets the EDR words above; an SDR frame gets macOS's SDR-desktop words.
+- * Those are TO-FILL from the A407 payloads of q-tb-xdr-2 / q6-tb-xdr-3
+- * (unlocked screen); until then, the words our SDR swaps imply today: scale
+- * 1, headroom used 1.0, sent only when they change.
++ * macOS 26B123 on the J604 (q9-tb-xdr-6, unlocked; swap_submit payloads): the
++ * SDR words are level = SDR white x 1.2, EDR scale 1/1.2, headroom used 1.2
++ * (the 1.2 NSScreen reports as maxEDR on the SDR desktop), and a swap carries
++ * them only when they change (bl_flags [2]/[4] clear on steady swaps, SDR or
++ * HDR; q9-rows-tt-4 agrees).
+  */
+ struct dcp_m4_xdr_sdr {
+ 	u32 hm;		/* applied headroom x1000: EDR scale 1000 / hm */
+ 	u32 used;	/* headroom used x1000; 0 leaves the word out */
+ 	bool every;	/* words on every swap, else only when they change */
+ };
+-#define DCP_M4_XDR_SDR_HM	1000U	/* TO-FILL: macOS's A407 +0x37e on an SDR desktop */
+-#define DCP_M4_XDR_SDR_USED	1000U	/* TO-FILL: macOS's A407 +0x3e6 on an SDR desktop */
+-#define DCP_M4_XDR_EVERY	false	/* TO-FILL: does macOS set bl_flags[2]/[4] every swap? */
++#define DCP_M4_XDR_SDR_HM	1200U	/* swap +0x37e on the SDR desktop: scale 1/1.2 */
++#define DCP_M4_XDR_SDR_USED	1200U	/* swap +0x3e6 on the SDR desktop: 1.2 */
++#define DCP_M4_XDR_EVERY	false	/* bl_flags [2]/[4] only when the words change */
+ 
+ /*
+  * When HDR stops, macOS 26B123 on the J604 keeps the panel level the HDR
+- * content left for 15.1 s (the EDR scale keeps SDR white where it was), then
+- * brings it down to the SDR level in 1.947 s, one step per 120 Hz frame
+- * (q6-tb-xdr-3: 248 brightness calls 8.33 ms apart; BLNitsCap 1600 -> 400).
+- * The steps here are linear in headroom; they come from re-presents of the
+- * standing frame (@next_ms) when the desktop sends none.
++ * content left for 14.45 s after its last HDR swap (the EDR scale keeps SDR
++ * white where it was), then brings it down to the SDR level in 1.95 s, one
++ * step per 120 Hz frame, by a constant ratio per frame: geometric in nits,
++ * not linear (q9-tb-xdr-6: 1225 -> 169 nits, x0.876 every 16 frames; both
++ * stops 14.4 s, and q6-tb-xdr-3's quit + 15.09 s = last swap + 14.47 s). The
++ * steps come from re-presents of the standing frame (@next_ms) when the
++ * desktop sends none.
+  */
+-#define DCP_M4_XDR_HOLD_MS	15100U
++#define DCP_M4_XDR_HOLD_MS	14450U
+ #define DCP_M4_XDR_RAMP_MS	1947U
+ #define DCP_M4_XDR_STEP_MS	8U
+ 
++/* floor(sqrt(@x)), bit by bit. */
++static inline u64 dcp_m4_isqrt64(u64 x)
++{
++	u64 r = 0, bit = 1ULL << 62;
++
++	while (bit > x)
++		bit >>= 2;
++	while (bit) {
++		if (x >= r + bit) {
++			x -= r + bit;
++			r = (r >> 1) + bit;
++		} else {
++			r >>= 1;
++		}
++		bit >>= 2;
++	}
++	return r;
++}
++
++/*
++ * @from x (@to / @from)^(@num / @den), @to < @from, @num < @den: the geometric
++ * step between two headrooms. The exponent is taken in 1/1024ths; the powers
++ * of the ratio are square roots in Q30.
++ */
++static inline u32 dcp_m4_xdr_geo(u32 from, u32 to, u64 num, u32 den)
++{
++	u64 s = div_u64((u64)to << 30, from), acc = 1ULL << 30;
++	u32 f = div_u64(num << 10, den);
++	int b;
++
++	for (b = 9; b >= 0; b--) {
++		s = dcp_m4_isqrt64(s << 30);
++		if (f & (1U << b))
++			acc = (acc * s) >> 30;
++	}
++	return max_t(u32, (u32)(((u64)from * acc) >> 30), to);
++}
++
+ static inline bool dcp_m4_xdr_words_eq(const struct dcp_m4_edr_words *a,
+ 				       const struct dcp_m4_edr_words *b)
+ {
+@@ -249,8 +291,8 @@ static inline bool dcp_m4_xdr_step(struct dcp_m4_edr_state *st, bool hdr, bool c
+ 			hm = st->wind_hm;
+ 			*next_ms = st->wind_t0 + DCP_M4_XDR_HOLD_MS;
+ 		} else if (t < DCP_M4_XDR_HOLD_MS + DCP_M4_XDR_RAMP_MS) {
+-			hm = st->wind_hm - div_u64((u64)(st->wind_hm - v->hm) *
+-						    (t - DCP_M4_XDR_HOLD_MS), DCP_M4_XDR_RAMP_MS);
++			hm = dcp_m4_xdr_geo(st->wind_hm, v->hm, t - DCP_M4_XDR_HOLD_MS,
++					    DCP_M4_XDR_RAMP_MS);
+ 			*next_ms = now_ms + DCP_M4_XDR_STEP_MS;
+ 		} else {
+ 			st->wind_hm = 0;
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index a8c395cbc4..9a459c198b 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -497,12 +497,13 @@ MODULE_PARM_DESC(panel_edr,
+  * Constant XDR, as macOS runs the internal panel (DYLAN-ORDERS 10): no HDR
+  * mode gate; each frame is tagged with its own transfer (sRGB, PQ, HLG) and
+  * the swaps carry macOS's level/scale/headroom words (dcp_m4_xdr_step()).
+- * Needs panel_edr. Off until the SDR words are filled from the macOS trace.
++ * Needs panel_edr. On by default: the SDR words, hold and ramp are macOS's
++ * (q9-tb-xdr-6).
+  */
+-static bool panel_xdr_always;
++static bool panel_xdr_always = true;
+ module_param(panel_xdr_always, bool, 0644);
+ MODULE_PARM_DESC(panel_xdr_always,
+-		 "J604: keep the internal panel in its XDR pipeline as macOS does: frames tagged with their own transfer (sRGB, PQ, HLG), no HDR mode switch, macOS's swap words (needs panel_edr; experimental; default: off)");
++		 "J604: keep the internal panel in its XDR pipeline as macOS does: frames tagged with their own transfer (sRGB, PQ, HLG), no HDR mode switch, macOS's swap words (needs panel_edr; default: on)");
+ 
+ static const struct dcp_m4_xdr_sdr dcp_m4_xdr_sdr_words = {
+ 	.hm = DCP_M4_XDR_SDR_HM,
+-- 
+2.43.0
+

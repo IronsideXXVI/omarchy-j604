@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 12:56:32 +0000
+Subject: [PATCH] drm/apple: m4: compose a panel white-point adaptation
+ with the CTM
+
+macOS sends one colour matrix to the T8132 panel at set_matrix location
+9, and its True Tone and Night Shift share it: CoreBrightness composes the
+white-point adaptation with the night colour. On Linux the KMS CTM is the
+compositor's (a night light owns it through Hyprland's CTM protocol, one
+client at a time), so a True Tone that also wanted the CTM would replace
+the night light or be refused.
+
+Keep a second matrix in the driver, the panel adaptation, set from the
+DCP device's panel_adaptation attribute (nine S31.32 values, row-major),
+and send adaptation x CTM. The night light keeps the KMS CTM, the
+adaptation is applied on top of it, and either one alone is sent as
+before. A write goes out at once rather than after the next swap, so a
+ramp can step it per frame as macOS does (one set_matrix per frame over
+about 1.9 s). Both matrices are clamped to +-4.0; the product keeps 16
+fractional bits per operand.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/apple/iomfb_m4.c | 125 +++++++++++++++++++++++++++++--
+ 1 file changed, 117 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 9a459c198b..874c48a5ce 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -739,6 +739,8 @@ struct iomfb_m4 {
+ 	struct delayed_work ctm_work;
+ 	u64 ctm_fw[9];
+ 	bool ctm_pending, ctm_active;
++	/* The KMS CTM and the panel adaptation it is composed with (Q32.32) */
++	s64 ctm_kms[9], ctm_adapt[9];
+ 	/*
+ 	 * Framebuffer references a window let go of, put
+ 	 * by ext_put_work outside the session lock
+@@ -3991,6 +3993,7 @@ static void iomfb_m4_backlight_work(struct work_struct *work);
+ static void iomfb_m4_xdr_wind_work(struct work_struct *work);
+ static void iomfb_m4_idle_cache_work(struct work_struct *work);
+ static void iomfb_m4_ext_put_work(struct work_struct *work);
++static const struct attribute_group iomfb_m4_ctm_group;
+ 
+ /* Once adopted, even driver unbind must preserve the callback cookie and DMA. */
+ static void iomfb_m4_release(void *cookie)
+@@ -4097,6 +4100,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
+ 	struct iomfb_m4 *dcp;
+ 	struct resource *res;
+ 	const struct dcp_m4_profile *pf = dcp_m4_machine_profile();
++	unsigned int i;
+ 	u32 ready = 0;
+ 	int ret;
+ 	/* An external DCP the boot loader handed over: same firmware, no panel. */
+@@ -4151,6 +4155,10 @@ int iomfb_m4_init(struct apple_dcp *owner)
+ 	INIT_DELAYED_WORK(&dcp->idle_cache, iomfb_m4_idle_cache_work);
+ 	INIT_DELAYED_WORK(&dcp->blm_work, iomfb_m4_blm_work);
+ 	INIT_DELAYED_WORK(&dcp->ctm_work, iomfb_m4_ctm_work);
++	for (i = 0; i < 9; i++) {
++		dcp->ctm_kms[i] = (i % 4 == 0) ? 1LL << 32 : 0;
++		dcp->ctm_adapt[i] = dcp->ctm_kms[i];
++	}
+ 	INIT_DELAYED_WORK(&dcp->gate_work, iomfb_m4_gate_work);
+ 	spin_lock_init(&dcp->retire_lock);
+ 	INIT_WORK(&dcp->retire_work, iomfb_m4_retire_work);
+@@ -4197,6 +4205,12 @@ int iomfb_m4_init(struct apple_dcp *owner)
+ 				of_property_present(dev->of_node, "apple,pmc-interface");
+ 	dcp->gate_capable = !external && apple_pmp_display_board() &&
+ 			    of_property_present(dev->of_node, "apple,pmc-interface");
++	/* Added after the release action, so it goes before dcp is freed. */
++	if (!external && iomfb_m4_ctm_supported(dev)) {
++		ret = devm_device_add_group(dev, &iomfb_m4_ctm_group);
++		if (ret)
++			dev_warn(dev, "panel_adaptation: %d\n", ret);
++	}
+ 	owner->v26_6 = dcp;
+ 	owner->rtk = dcp->rtkit;
+ 	owner->coproc_reg = dcp->coproc;
+@@ -5605,30 +5619,125 @@ static void iomfb_m4_ctm_work(struct work_struct *work)
+ 	mutex_unlock(&dcp->lock);
+ }
+ 
++/* Q32.32 product, operands within +-4.0: each is shifted by 16 so no step overflows. */
++static s64 iomfb_m4_q32_mul(s64 a, s64 b)
++{
++	return (a >> 16) * (b >> 16);
++}
++
++/*
++ * Under dcp->lock: the matrix sent is the panel adaptation times the KMS CTM,
++ * out = adaptation x CTM x in, so a compositor's night light (the KMS CTM) and
++ * the white-point adaptation compose instead of replacing each other. The
++ * identity is sent once to clear a matrix, never at boot.
++ */
++static void iomfb_m4_ctm_compose(struct iomfb_m4 *dcp)
++{
++	unsigned int i, j, k;
++	bool active = false;
++	u64 fw[9];
++
++	for (i = 0; i < 3; i++)
++		for (j = 0; j < 3; j++) {
++			s64 v = 0;
++
++			for (k = 0; k < 3; k++)
++				v += iomfb_m4_q32_mul(dcp->ctm_adapt[i * 3 + k],
++						       dcp->ctm_kms[k * 3 + j]);
++			fw[i * 3 + j] = (u64)v;
++			active |= fw[i * 3 + j] != ((i == j) ? 1ULL << 32 : 0);
++		}
++	if (active || dcp->ctm_active) {
++		memcpy(dcp->ctm_fw, fw, sizeof(fw));
++		dcp->ctm_pending = true;
++	}
++	dcp->ctm_active = active;
++}
++
++static s64 iomfb_m4_ctm_clamp(s64 v)
++{
++	return clamp_t(s64, v, -(4LL << 32), 4LL << 32);
++}
++
+ void iomfb_m4_atomic_ctm(struct apple_dcp *owner, const struct drm_crtc_state *st)
+ {
+ 	struct iomfb_m4 *dcp = owner->v26_6;
+ 	const struct drm_color_ctm *ctm = st->ctm ? st->ctm->data : NULL;
+ 	u64 fw[9];
+ 	unsigned int i;
+-	bool active = false;
+ 
+ 	if (!dcp || dcp->external || !st->color_mgmt_changed ||
+ 	    !iomfb_m4_ctm_supported(owner->dev))
+ 		return;
+ 	dcp_ctm_to_fw(fw, ctm);
++	mutex_lock(&dcp->lock);
+ 	for (i = 0; i < 9; i++)
+-		active |= fw[i] != ((i % 4 == 0) ? 1ULL << 32 : 0);
++		dcp->ctm_kms[i] = iomfb_m4_ctm_clamp((s64)fw[i]);
++	iomfb_m4_ctm_compose(dcp);
++	mutex_unlock(&dcp->lock);
++}
++
++/*
++ * panel_adaptation: the internal panel's white-point adaptation (True Tone),
++ * nine S31.32 fixed-point values in decimal, two's complement, row-major;
++ * the identity (4294967296 0 0 0 4294967296 0 0 0 4294967296) clears it.
++ * It is composed with the KMS CTM (see iomfb_m4_ctm_compose) and goes out at
++ * once, without waiting for a swap, so a ramp can step it per frame.
++ */
++static ssize_t panel_adaptation_show(struct device *dev,
++				     struct device_attribute *attr, char *buf)
++{
++	struct apple_dcp *owner = dev_get_drvdata(dev);
++	struct iomfb_m4 *dcp = owner ? owner->v26_6 : NULL;
++	const s64 *m;
++	int n;
++
++	if (!dcp)
++		return -ENODEV;
+ 	mutex_lock(&dcp->lock);
+-	/* The identity is sent once to clear a matrix, never at boot. */
+-	if (active || dcp->ctm_active) {
+-		memcpy(dcp->ctm_fw, fw, sizeof(fw));
+-		dcp->ctm_pending = true;
+-	}
+-	dcp->ctm_active = active;
++	m = dcp->ctm_adapt;
++	n = sysfs_emit(buf, "%lld %lld %lld %lld %lld %lld %lld %lld %lld\n",
++		       m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]);
+ 	mutex_unlock(&dcp->lock);
++	return n;
+ }
+ 
++static ssize_t panel_adaptation_store(struct device *dev,
++				      struct device_attribute *attr,
++				      const char *buf, size_t count)
++{
++	struct apple_dcp *owner = dev_get_drvdata(dev);
++	struct iomfb_m4 *dcp = owner ? owner->v26_6 : NULL;
++	s64 m[9];
++	unsigned int i;
++
++	if (!dcp || dcp->external || !iomfb_m4_ctm_supported(dev))
++		return -ENODEV;
++	if (sscanf(buf, "%lld %lld %lld %lld %lld %lld %lld %lld %lld",
++		   &m[0], &m[1], &m[2], &m[3], &m[4], &m[5], &m[6], &m[7],
++		   &m[8]) != 9)
++		return -EINVAL;
++	mutex_lock(&dcp->lock);
++	for (i = 0; i < 9; i++)
++		dcp->ctm_adapt[i] = iomfb_m4_ctm_clamp(m[i]);
++	iomfb_m4_ctm_compose(dcp);
++	if (dcp->ctm_pending && dcp->runtime && !dcp->powered_off &&
++	    !READ_ONCE(dcp->owner->quiescing))
++		mod_delayed_work(dcp->runtime->wq, &dcp->ctm_work, 0);
++	mutex_unlock(&dcp->lock);
++	return count;
++}
++static DEVICE_ATTR_RW(panel_adaptation);
++
++static struct attribute *iomfb_m4_ctm_attrs[] = {
++	&dev_attr_panel_adaptation.attr,
++	NULL
++};
++
++static const struct attribute_group iomfb_m4_ctm_group = {
++	.attrs = iomfb_m4_ctm_attrs,
++};
++
+ static void iomfb_m4_blm_work(struct work_struct *work)
+ {
+ 	struct iomfb_m4 *dcp = container_of(to_delayed_work(work), struct iomfb_m4, blm_work);
+-- 
+2.43.0
+

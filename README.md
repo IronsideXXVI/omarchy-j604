@@ -58,7 +58,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-12 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora-next`, `linux-aurora-next-headers` (`linux-aurora` 1.888 stays installed beside it) | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`da8e1acf3656`, Aurora's tip), 540 patches | `1.902` |
+| `linux-aurora`, `linux-aurora-headers` (`linux-aurora-next` 1.902 stays installed beside it) | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`da8e1acf3656`, Aurora's tip), 559 patches | `1.903` |
 | `aura` | 1.0.0b13, aurora-silicon/aura (`f0f180afe5`), aurora-silicon/alarm-aurora recipe, 15 patches | `1.612` (replaced `m1n1-aurora` on 2026-11-12) |
 | `uboot-aurora` | 2026.07.aurora11, aurora-silicon/u-boot (`250385f8c8`, the version Aurora packages), 1 patch | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261113, aurora-silicon/mesa (`8f013bf96bd`) | `1.8144` |
