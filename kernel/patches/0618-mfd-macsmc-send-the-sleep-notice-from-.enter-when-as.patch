@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 21:36:26 +0000
+Subject: [PATCH] mfd: macsmc: send the sleep notice from .enter when
+ asked
+
+Register the sleep notice with the Apple sleep driver. When it sends
+the notice from the end of .enter (apple_sleep.smc_notice_late), the
+noirq suspend still ends the debug link and sends a late warning, but
+leaves out MBSE = slpa and the AP idle notice. The late notice runs
+on one CPU with interrupts off, so it writes the key through the
+polled path the atomic writes use, without the atomic mode, and sends
+the notice with apple_rtkit_ap_idle_polled(). Its failure is logged
+and the commit follows; the wake sends the notice back as before.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/mfd/macsmc.c | 63 +++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 60 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/mfd/macsmc.c b/drivers/mfd/macsmc.c
+index 04e90a97cc..8cc70d77ad 100644
+--- a/drivers/mfd/macsmc.c
++++ b/drivers/mfd/macsmc.c
+@@ -354,7 +354,9 @@ int apple_smc_enter_atomic(struct apple_smc *smc)
+ }
+ EXPORT_SYMBOL(apple_smc_enter_atomic);
+ 
+-int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, size_t size)
++/* Interrupts off: before a shutdown, or at the end of a sleep's .enter. */
++static int apple_smc_write_polled(struct apple_smc *smc, smc_key key, const void *buf,
++				  size_t size)
+ {
+ 	guard(spinlock_irqsave)(&smc->lock);
+ 	u8 result;
+@@ -368,8 +370,6 @@ int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf,
+ 
+ 	if (smc->boot_stage != APPLE_SMC_INITIALIZED)
+ 		return -EIO;
+-	if (!smc->atomic_mode)
+-		return -EIO;
+ 	/*
+ 	 * A poll timeout or a mismatched reply does not cancel the command or
+ 	 * release its SRAM. Its late reply does: take it if it has arrived.
+@@ -436,6 +436,14 @@ int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf,
+ 
+ 	return FIELD_GET(SMC_SIZE, smc->cmd_ret);
+ }
++
++int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, size_t size)
++{
++	if (!smc->atomic_mode)
++		return -EIO;
++
++	return apple_smc_write_polled(smc, key, buf, size);
++}
+ EXPORT_SYMBOL(apple_smc_write_atomic);
+ 
+ static void apple_smc_rtkit_crashed(void *cookie, const void *bfr, size_t bfr_len)
+@@ -572,6 +580,9 @@ static const struct apple_smc_wake_reason apple_smc_t8132_wake_reasons[] = {
+ 	{ 44, "USB2_wake" }, { 45, "aupo" }, { 48, "rtc" }, { }
+ };
+ 
++static int apple_smc_sleep_notice_late(void *data);
++static void apple_smc_sleep_unregister(void *data);
++
+ static int apple_smc_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -657,6 +668,13 @@ static int apple_smc_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	/* Without the sleep driver the notice stays in the noirq suspend. */
++	if (!apple_sleep_smc_register(dev, apple_smc_sleep_notice_late, smc)) {
++		ret = devm_add_action_or_reset(dev, apple_smc_sleep_unregister, dev);
++		if (ret)
++			return ret;
++	}
++
+ 	t6050 = of_device_is_compatible(dev->of_node, "apple,t6050-smc");
+ 	if (t6050)
+ 		ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
+@@ -795,6 +813,42 @@ static int apple_smc_sleep_commit(struct apple_smc *smc)
+ 	return ret;
+ }
+ 
++/*
++ * apple_sleep.smc_notice_late: the same notice from the end of .enter, after every other
++ * coprocessor has stopped, as macOS orders it on the J604. One CPU runs, with interrupts
++ * off, so the key write and the notice poll, and no mutex is taken.
++ */
++static int apple_smc_sleep_notice_late(void *data)
++{
++	struct apple_smc *smc = data;
++	u32 value = SMC_KEY(slpa);
++	unsigned int us;
++	int ret;
++
++	ret = apple_smc_write_polled(smc, SMC_KEY(MBSE), &value, sizeof(value));
++	if (ret < 0) {
++		dev_err(smc->dev, "Failed to issue MBSE = slpa: %d\n", ret);
++		return ret;
++	}
++	mdelay(SMC_SLEEP_ARM_MS);
++
++	/* Taken or not, the commit follows, and the wake sends the notice back. */
++	smc->ap_notified = true;
++	ret = apple_rtkit_ap_idle_polled(smc->rtk, &us);
++	if (ret) {
++		dev_err(smc->dev, "SMC did not take the sleep notice: %d\n", ret);
++		return ret;
++	}
++	mdelay(SMC_SLEEP_IDLE_MS);
++
++	return 0;
++}
++
++static void apple_smc_sleep_unregister(void *data)
++{
++	apple_sleep_smc_unregister(data);
++}
++
+ static int apple_smc_wake_reason_names(const struct apple_smc *smc, u64 record, char *buf,
+ 				       size_t size)
+ {
+@@ -972,6 +1026,9 @@ static int apple_smc_sleep_enter(struct apple_smc *smc)
+ 		apple_smc_sleep_warn(smc);
+ 		apple_smc_outbox_poll(smc, "late sleep warning", SMC_SLEEP_WARN_MS, 0);
+ 	}
++	/* The sleep's .enter sends it instead, after the coprocessors stop. */
++	if (apple_sleep_smc_notice_late())
++		return 0;
+ 
+ 	return apple_smc_sleep_commit(smc);
+ }
+-- 
+2.43.0
+

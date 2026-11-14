@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 21:17:46 +0000
+Subject: [PATCH] soc: apple: sleep: T8132 PMU SPMI wake variants as
+ runtime parameters
+
+On the J604, macOS handles the PMU's SPMI controller differently from
+this driver around a deep sleep (its S2R records of Nov 13 and 14):
+it leaves the notify enable at 0x3f833ff1 where we write the T8132
+table's value, it rewrites the eight response-vector words at +0x60
+after the wake and acknowledges them, and the PMU boot stage written
+before the commit is never set back. Any of these may matter for a
+wake that does not come back, so put each behind an apple_sleep
+module parameter, writable at run time. Every default keeps today's
+path.
+
+ - wake_spmi_notify: 0 writes the table value (today), 1 leaves both
+   notify enables as the sleep found them, any other value is
+   written instead.
+ - wake_spmi_vectors saves the response-vector words before the
+   commit and writes them back on the way out of the sleep.
+ - wake_stage30 sets the PMU boot stage back to 0x30, the value of a
+   running OS, after the wake.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 49 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 47 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 568a253d0a..a3837e6e4f 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -155,6 +155,9 @@ MODULE_PARM_DESC(wake_entry_marks, "WD2 marks on the way into a deep sleep: 130
+ #define SPMI_NOTIFY_ENABLE	0x40
+ #define SPMI_NOTIFY_REPLY	BIT(0)
+ #define SPMI_NOTIFY_ACK		0x80
++/* The response-vector words macOS rewrites after a wake (+0x60..+0x7c), then acknowledges */
++#define SPMI_VECTORS		0x60
++#define SPMI_VECTOR_WORDS	8
+ #define SPMI_CMD_ACTIVE		BIT(15)
+ #define SPMI_OP_EXT_WRITE(n)	((n) - 1)
+ #define SPMI_OP_EXT_READ(n)	(0x20 | ((n) - 1))
+@@ -591,6 +594,9 @@ struct apple_sleep {
+ 	bool *ps_done;
+ 	bool *ps_aon_done;
+ 	u32 spmi_saved[2];
++	/* wake_spmi_vectors: the PMU SPMI response vectors as the sleep found them */
++	u32 spmi_vec_saved[SPMI_VECTOR_WORDS];
++	bool spmi_vec_saved_ok;
+ 	bool matched;
+ 	void __iomem *dvfm[SLEEP_CLUSTERS];
+ 	struct aura_s2r_mailbox *mbox;
+@@ -2702,10 +2708,33 @@ static void apple_sleep_read_ps_keep(struct apple_sleep *s,
+ 			 hweight_long(s->ps_on_keep));
+ }
+ 
++/*
++ * T8132 wake variants on the PMU's SPMI controller, against what macOS does on the J604 (its S2R
++ * records of Nov 13 and 14): it leaves the notify enable at 0x3f833ff1 over the sleep where this
++ * driver writes the T8132 table's value; after the wake it rewrites the eight response-vector
++ * words; and nothing here sets the PMU boot stage back after a wake. Defaults keep today's sleep.
++ */
++static unsigned int wake_spmi_notify;
++module_param(wake_spmi_notify, uint, 0644);
++MODULE_PARM_DESC(wake_spmi_notify,
++		 "PMU and port-controller SPMI notify enable over a sleep: 0 the SoC table's value (today), 1 leave both as found, other = this value (macOS on the J604 leaves 0x3f833ff1)");
++static bool wake_spmi_vectors;
++module_param(wake_spmi_vectors, bool, 0644);
++MODULE_PARM_DESC(wake_spmi_vectors,
++		 "save the PMU SPMI response-vector words (+0x60..+0x7c) at the sleep and write them back after the wake, as macOS rewrites them");
++static bool wake_stage30;
++module_param(wake_stage30, bool, 0644);
++MODULE_PARM_DESC(wake_stage30,
++		 "after a wake, set the PMU boot stage back to 0x30 (OS running); otherwise it keeps the sleep's 0x50 until shutdown");
++
++/* The PMU boot stage of a running OS, as macsmc-reboot writes it at probe */
++#define PMU_STAGE_RUNNING	0x30
++
+ static void apple_sleep_match(struct apple_sleep *s)
+ {
+ 	const struct apple_sleep_soc *soc = s->soc;
+ 	int i, raised = 0, lowered = 0, failed = 0;
++	u32 notify;
+ 
+ 	writel(0, s->wdt + WDT_WD0_COUNT);
+ 	writel(0, s->wdt + WDT_WD1_COUNT);
+@@ -2713,8 +2742,17 @@ static void apple_sleep_match(struct apple_sleep *s)
+ 
+ 	s->spmi_saved[0] = readl(s->spmi + SPMI_NOTIFY_ENABLE);
+ 	s->spmi_saved[1] = readl(s->spmi_a0);
+-	writel(soc->spmi_notify_sleep, s->spmi + SPMI_NOTIFY_ENABLE);
+-	writel(soc->spmi_notify_sleep, s->spmi_a0);
++	s->spmi_vec_saved_ok = READ_ONCE(wake_spmi_vectors);
++	if (s->spmi_vec_saved_ok)
++		for (i = 0; i < SPMI_VECTOR_WORDS; i++)
++			s->spmi_vec_saved[i] = readl(s->spmi + SPMI_VECTORS + 4 * i);
++	notify = READ_ONCE(wake_spmi_notify);
++	if (notify != 1) {
++		if (!notify)
++			notify = soc->spmi_notify_sleep;
++		writel(notify, s->spmi + SPMI_NOTIFY_ENABLE);
++		writel(notify, s->spmi_a0);
++	}
+ 
+ 	for (i = 0; i < soc->ps_macos_on.count; i++) {
+ 		u32 offset = soc->ps_macos_on.offset[i];
+@@ -2821,8 +2859,15 @@ static void apple_sleep_match_undo(struct apple_sleep *s)
+ 		else if (FIELD_GET(PS_ACTUAL, val) != 0xf)
+ 			writel(val & ~PS_FLAGS, s->ps + soc->ps_macos_on.offset[i]);
+ 	}
++	if (s->spmi_vec_saved_ok) {
++		for (i = 0; i < SPMI_VECTOR_WORDS; i++)
++			writel(s->spmi_vec_saved[i], s->spmi + SPMI_VECTORS + 4 * i);
++		s->spmi_vec_saved_ok = false;
++	}
+ 	writel(s->spmi_saved[0], s->spmi + SPMI_NOTIFY_ENABLE);
+ 	writel(s->spmi_saved[1], s->spmi_a0);
++	if (READ_ONCE(wake_stage30) && soc->pmu_sleep_reg)
++		sleep_pmu_write(s, soc->pmu_sleep_reg, PMU_STAGE_RUNNING);
+ }
+ 
+ /* The safety net, as macOS arms it. */
+-- 
+2.43.0
+

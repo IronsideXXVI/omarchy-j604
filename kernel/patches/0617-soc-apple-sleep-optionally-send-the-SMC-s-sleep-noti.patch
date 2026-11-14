@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 21:36:26 +0000
+Subject: [PATCH] soc: apple: sleep: optionally send the SMC's sleep
+ notice from .enter
+
+On the J604, macOS tells the SMC about the sleep last: in its S2R
+record, MBSE = slpa goes out 46 ms and the AP idle notice 43 ms before
+the commit, after the last mailbox writes to the display, enclave, GPU,
+PMP and audio coprocessors. Here the SMC's driver sends both from its
+noirq suspend, before .enter turns the display off and stops the
+enclave and the other coprocessors, and a T8132 deep sleep has been
+seen to hang inside .enter.
+
+Let the SMC's driver register its notice, and with the new
+smc_notice_late parameter call it at the end of .enter, after every
+coprocessor stop and the debug link's end, right before the commit.
+The parameter is read once per sleep, in .begin; by default the order
+stays as it is.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c       | 57 +++++++++++++++++++++++++++++++++
+ include/linux/soc/apple/sleep.h | 26 +++++++++++++++
+ 2 files changed, 83 insertions(+)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index a3837e6e4f..66b2da106b 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -325,6 +325,23 @@ static struct {
+ 	void *data;
+ } apple_sleep_enclave;
+ 
++/* The SMC's sleep notice, for smc_notice_late. */
++static struct {
++	struct device *dev;
++	int (*notice)(void *data);
++	void *data;
++} apple_sleep_smc;
++
++/*
++ * On the J604, macOS tells the SMC last (MBSE = slpa 46 ms and the AP idle notice 43 ms
++ * before the commit), after the display, enclave, GPU, PMP and audio coprocessors have
++ * stopped. The SMC's driver tells it in its noirq suspend, before .enter stops any of them.
++ */
++static bool smc_notice_late;
++module_param(smc_notice_late, bool, 0644);
++MODULE_PARM_DESC(smc_notice_late,
++		 "send the SMC's sleep notice (slpa, AP idle) at the end of .enter, after every coprocessor stop, as macOS does, instead of from its noirq suspend");
++
+ /*
+  * Written with bits 0 and 63 by every core right before its last WFI, measured
+  * from macOS. This is not CYC_OVRD, which is undefined on this SoC.
+@@ -689,6 +706,8 @@ struct apple_sleep {
+ 	bool deep_ran;
+ 	/* This sleep's wake came from the SMC's sources alone. */
+ 	bool smc_woke_alone;
++	/* smc_notice_late, as this sleep's .begin read it */
++	bool smc_notice_late;
+ 	/* A power word the DRAM-kept wake polls stayed latched: this sleep went deep. */
+ 	bool deep_once;
+ 	/* Each latched word the commit cleared, as it found it */
+@@ -1014,6 +1033,36 @@ void apple_sleep_enclave_unregister(struct device *dev)
+ }
+ EXPORT_SYMBOL_GPL(apple_sleep_enclave_unregister);
+ 
++int apple_sleep_smc_register(struct device *dev, int (*notice)(void *data), void *data)
++{
++	if (!notice)
++		return -EINVAL;
++
++	guard(mutex)(&apple_sleep_coprocs_lock);
++	if (apple_sleep_smc.dev)
++		return -EBUSY;
++	apple_sleep_smc.notice = notice;
++	apple_sleep_smc.data = data;
++	apple_sleep_smc.dev = dev;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(apple_sleep_smc_register);
++
++void apple_sleep_smc_unregister(struct device *dev)
++{
++	guard(mutex)(&apple_sleep_coprocs_lock);
++	if (apple_sleep_smc.dev == dev)
++		memset(&apple_sleep_smc, 0, sizeof(apple_sleep_smc));
++}
++EXPORT_SYMBOL_GPL(apple_sleep_smc_unregister);
++
++bool apple_sleep_smc_notice_late(void)
++{
++	return apple_sleep && apple_sleep->smc_notice_late;
++}
++EXPORT_SYMBOL_GPL(apple_sleep_smc_notice_late);
++
+ void apple_sleep_coproc_unregister(struct device *dev)
+ {
+ 	struct apple_sleep_coproc *c;
+@@ -3760,6 +3809,9 @@ static int apple_sleep_enter(suspend_state_t state)
+ 	apple_sleep_coprocs_stop(s, false);
+ 	/* Done by now unless no SMC driver is bound. */
+ 	apple_sleep_usb_down(s);
++	/* Past every stop, a failure can't refuse any more: the commit follows either way. */
++	if (s->smc_notice_late && apple_sleep_smc.notice(apple_sleep_smc.data))
++		dev_err(s->dev, "the SMC took no late sleep notice\n");
+ 	s->deep_once = READ_ONCE(sleep_deep_requested);
+ 	if (s->deep_once)
+ 		sleep_slp_ddr_set_deep_once(true);
+@@ -3806,6 +3858,9 @@ static int apple_sleep_begin(suspend_state_t state)
+ 		apple_sleep->apcie_port_stopped = false;
+ 		apple_sleep->usb_down_ran = false;
+ 		apple_sleep->smc_woke_alone = false;
++		scoped_guard(mutex, &apple_sleep_coprocs_lock)
++			apple_sleep->smc_notice_late = READ_ONCE(smc_notice_late) &&
++						      apple_sleep_smc.notice;
+ 		sleep_pins_save(apple_sleep);
+ 	}
+ 	apple_sleep_set_wd2(apple_sleep, WDT_SUSPEND_SECS);
+@@ -3817,6 +3872,8 @@ static int apple_sleep_begin(suspend_state_t state)
+ static void apple_sleep_end(void)
+ {
+ 	WRITE_ONCE(sleep_deep_requested, false);
++	if (apple_sleep)
++		apple_sleep->smc_notice_late = false;
+ 	if (pm_suspend_via_firmware())
+ 		writel(0, apple_sleep->wdt + WDT_WD2_CTL);
+ }
+diff --git a/include/linux/soc/apple/sleep.h b/include/linux/soc/apple/sleep.h
+index 07e03087cb..e4ce96ad68 100644
+--- a/include/linux/soc/apple/sleep.h
++++ b/include/linux/soc/apple/sleep.h
+@@ -58,6 +58,17 @@ int apple_sleep_coproc_set_last_check(struct device *dev, int (*last_check)(void
+ int apple_sleep_enclave_register(struct device *dev, int (*stop)(void *data), void *data);
+ void apple_sleep_enclave_unregister(struct device *dev);
+ 
++/*
++ * The SMC's sleep notice (MBSE = slpa, then the AP idle notice), with interrupts off and
++ * one CPU up. With apple_sleep.smc_notice_late, the end of .enter runs @notice, after
++ * every coprocessor stop, and the SMC's noirq suspend leaves it out.
++ */
++int apple_sleep_smc_register(struct device *dev, int (*notice)(void *data), void *data);
++void apple_sleep_smc_unregister(struct device *dev);
++
++/* For the SMC's noirq suspend: this sleep sends its notice from .enter. */
++bool apple_sleep_smc_notice_late(void);
++
+ /* Its driver has quiesced it for that last step, or has taken it back. */
+ void apple_sleep_coproc_set_ready(struct device *dev, bool ready);
+ 
+@@ -209,6 +220,21 @@ static inline void apple_sleep_enclave_unregister(struct device *dev)
+ {
+ }
+ 
++static inline int apple_sleep_smc_register(struct device *dev, int (*notice)(void *data),
++					   void *data)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline void apple_sleep_smc_unregister(struct device *dev)
++{
++}
++
++static inline bool apple_sleep_smc_notice_late(void)
++{
++	return false;
++}
++
+ static inline void apple_sleep_coproc_set_ready(struct device *dev, bool ready)
+ {
+ }
+-- 
+2.43.0
+
