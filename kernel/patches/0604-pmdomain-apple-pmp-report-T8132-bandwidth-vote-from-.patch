@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 20:11:31 +0000
+Subject: [PATCH] pmdomain: apple: pmp-report: T8132 bandwidth vote
+ from powered devices
+
+On the J604 (T8132) macOS writes the memory bandwidth vote, SOC-DEV-DVFS
+entries 409 and 411, at main level 19 at the start of each flat-out
+decode (18 for AV1) and at 0x12 while the video encoder runs, and lowers
+it when they finish. Linux writes the vote only from the t8132_bw_vote
+parameter, which is 0 by default.
+
+The cost shows in 10-bit decode. On the same SoC macOS decodes 4K HEVC
+and AV1 at the same rate at 8 and at 10 bits, but here a 4K 10-bit frame
+takes 0.42 ms (HEVC) and 0.34 ms (AV1) longer than an 8-bit one, with
+the CPU idle, while 8-bit HEVC already decodes faster than on macOS.
+
+Let a report entry carry apple,bw-vote, the level its device needs while
+the domain is powered. The vote written to both entries is the highest
+of the parameter and the levels of the powered entries; an entry's level
+is counted after its request is admitted and withdrawn before its
+request is cleared, as with apple,dvfs. The DVFS words are written under
+the report lock so that concurrent votes keep their order, and through
+the DVFS shadow so that a sleep's wake writes the vote again.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/pmdomain/apple/pmp-report.c | 124 ++++++++++++++++++++++++----
+ 1 file changed, 107 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/pmdomain/apple/pmp-report.c b/drivers/pmdomain/apple/pmp-report.c
+index 78320904d8..f31a852504 100644
+--- a/drivers/pmdomain/apple/pmp-report.c
++++ b/drivers/pmdomain/apple/pmp-report.c
+@@ -130,6 +130,13 @@ struct apple_pmp_report {
+ 	u64 sleep_request;
+ 	/* The last SOC-DEV-DVFS word written to each entry, 0 if none. */
+ 	u64 *dvfs_shadow;
++	/*
++	 * T8132 memory bandwidth vote (under @lock): powered report entries
++	 * with apple,bw-vote counted per main level, and the level last
++	 * written to SOC-DEV-DVFS entries 409 + 411.
++	 */
++	u16 bw_count[PMP_DVFS_MAIN_LEVEL_MAX + 1];
++	unsigned int bw_applied;
+ 	unsigned int polls;
+ 	struct delayed_work ready_work;
+ 	/* J613 floor owner, absent on all other report instances. */
+@@ -184,6 +191,7 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030;
+ static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x;
+ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8132;
+ static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry, u64 val);
++static void apple_pmp_report_dvfs_write_locked(struct apple_pmp_report *rep, u32 entry, u64 val);
+ 
+ /* T6001 AGX request (see the engine below set_state): AGX is soc-device record 9 on the T6001. */
+ #define APPLE_PMP_T6001_AGX_ID 9
+@@ -497,21 +505,61 @@ static void apple_pmp_report_t8132_dvfs_trial(struct apple_pmp_report *rep)
+ 
+ static unsigned int t8132_bw_vote;
+ 
+-static void apple_pmp_report_t8132_bw_vote(struct apple_pmp_report *rep, unsigned int level)
++static bool apple_pmp_report_has_bw_vote(struct apple_pmp_report *rep)
+ {
+ 	const struct apple_pmp_report_offsets *offs = rep->offsets;
++
++	return offs == &apple_pmp_offsets_t8132 && rep->dvfs_shadow &&
++	       offs->dvfs_first <= T8132_BW_VOTE_ENTRY_A &&
++	       offs->dvfs_first + offs->dvfs_count > T8132_BW_VOTE_ENTRY_B;
++}
++
++/*
++ * The vote is the highest of the parameter and the levels of the powered
++ * report entries that have apple,bw-vote (macOS raises 409 + 411 to 18-19 at
++ * the start of each flat-out decode and to 0x12 while it encodes). Called with
++ * rep->lock held; @force writes a non-zero vote again although it is the one
++ * last written (the PMP has just started). Returns true if it wrote.
++ */
++static bool apple_pmp_report_bw_update_locked(struct apple_pmp_report *rep,
++					      bool force, unsigned int *applied)
++{
++	unsigned int level = READ_ONCE(t8132_bw_vote), i;
+ 	u64 word = 0;
+ 
+-	if (offs != &apple_pmp_offsets_t8132 || !rep->dvfs_shadow ||
+-	    offs->dvfs_first > T8132_BW_VOTE_ENTRY_A ||
+-	    offs->dvfs_first + offs->dvfs_count <= T8132_BW_VOTE_ENTRY_B)
+-		return;
++	lockdep_assert_held(&rep->lock);
++	if (!apple_pmp_report_has_bw_vote(rep))
++		return false;
++	for (i = PMP_DVFS_MAIN_LEVEL_MAX; i > level; i--) {
++		if (rep->bw_count[i]) {
++			level = i;
++			break;
++		}
++	}
++	*applied = level;
++	if (level == rep->bw_applied && !(force && level))
++		return false;
+ 	if (level && !apple_pmp_dvfs_word(level, NULL, 0, &word))
+-		return;
+-	apple_pmp_report_dvfs_write(rep, T8132_BW_VOTE_ENTRY_A, word);
+-	apple_pmp_report_dvfs_write(rep, T8132_BW_VOTE_ENTRY_B, word);
+-	dev_info(rep->dev, "t8132 bandwidth vote: entries %u + %u = %#llx\n",
+-		 T8132_BW_VOTE_ENTRY_A, T8132_BW_VOTE_ENTRY_B, word);
++		return false;
++	rep->bw_applied = level;
++	apple_pmp_report_dvfs_write_locked(rep, T8132_BW_VOTE_ENTRY_A, word);
++	apple_pmp_report_dvfs_write_locked(rep, T8132_BW_VOTE_ENTRY_B, word);
++	return true;
++}
++
++static void apple_pmp_report_t8132_bw_vote(struct apple_pmp_report *rep, bool force)
++{
++	unsigned long flags;
++	unsigned int level = 0;
++	bool written;
++
++	spin_lock_irqsave(&rep->lock, flags);
++	written = apple_pmp_report_bw_update_locked(rep, force, &level);
++	spin_unlock_irqrestore(&rep->lock, flags);
++	if (written)
++		dev_info(rep->dev, "t8132 bandwidth vote: entries %u + %u at level %u (parameter %u)\n",
++			 T8132_BW_VOTE_ENTRY_A, T8132_BW_VOTE_ENTRY_B, level,
++			 READ_ONCE(t8132_bw_vote));
+ }
+ 
+ static int apple_pmp_report_bw_vote_set(const char *val, const struct kernel_param *kp)
+@@ -530,7 +578,7 @@ static int apple_pmp_report_bw_vote_set(const char *val, const struct kernel_par
+ 	WRITE_ONCE(t8132_bw_vote, level);
+ 	list_for_each_entry(rep, &apple_pmp_reports, list)
+ 		if (apple_pmp_report_running(rep))
+-			apple_pmp_report_t8132_bw_vote(rep, level);
++			apple_pmp_report_t8132_bw_vote(rep, false);
+ 	return 0;
+ }
+ 
+@@ -540,7 +588,7 @@ static const struct kernel_param_ops apple_pmp_report_bw_vote_ops = {
+ };
+ module_param_cb(t8132_bw_vote, &apple_pmp_report_bw_vote_ops, &t8132_bw_vote, 0644);
+ MODULE_PARM_DESC(t8132_bw_vote,
+-		 "T8132: main level for the memory bandwidth vote, SOC-DEV-DVFS entries 409 + 411 (macOS: 0x10-0x12 under CPU memory load); 0 = no vote (default)");
++		 "T8132: main level for the memory bandwidth vote, SOC-DEV-DVFS entries 409 + 411 (macOS: 0x10-0x12 under CPU memory load); the highest of it and the powered apple,bw-vote report entries is written; 0 = no vote from the parameter (default)");
+ 
+ /*
+  * Wait for the PMP to run, then hand it every request made so far, as macOS
+@@ -579,8 +627,7 @@ static void apple_pmp_report_ready_work(struct work_struct *work)
+ 	dev_info(rep->dev, "PMP running (status %#llx), requests %#llx\n",
+ 		 readq(rep->base + offs->status), want);
+ 	apple_pmp_report_t8132_dvfs_trial(rep);
+-	if (READ_ONCE(t8132_bw_vote))
+-		apple_pmp_report_t8132_bw_vote(rep, READ_ONCE(t8132_bw_vote));
++	apple_pmp_report_t8132_bw_vote(rep, true);
+ }
+ 
+ /* A report names its PMP where a SoC has more than one kind of link to it. */
+@@ -2655,6 +2702,13 @@ struct apple_pmp_report_entry {
+ 	u32 dvfs_entry;
+ 	u64 dvfs_off;
+ 	u64 dvfs_on;
++	/*
++	 * With apple,bw-vote, the main level this device votes for the memory
++	 * bandwidth (T8132 entries 409 + 411) while powered, and whether its
++	 * vote is counted now (under the report's lock).
++	 */
++	u32 bw_vote;
++	bool bw_counted;
+ 	bool removed;
+ };
+ 
+@@ -2977,14 +3031,20 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_set_t6030_gfx);
+  * back after storing it: the read retires the pending PTD update before the
+  * PMP handles it, and the request is lost.
+  */
++static void apple_pmp_report_dvfs_write_locked(struct apple_pmp_report *rep, u32 entry, u64 val)
++{
++	lockdep_assert_held(&rep->lock);
++	rep->dvfs_shadow[entry - rep->offsets->dvfs_first] = val;
++	if (!rep->defer)
++		writeq(val, rep->base + rep->offsets->update + 8 * entry);
++}
++
+ static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry, u64 val)
+ {
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&rep->lock, flags);
+-	rep->dvfs_shadow[entry - rep->offsets->dvfs_first] = val;
+-	if (!rep->defer)
+-		writeq(val, rep->base + rep->offsets->update + 8 * entry);
++	apple_pmp_report_dvfs_write_locked(rep, entry, val);
+ 	spin_unlock_irqrestore(&rep->lock, flags);
+ }
+ 
+@@ -3035,6 +3095,25 @@ int apple_pmp_report_set_request(const struct device_node *report_np, unsigned i
+ }
+ EXPORT_SYMBOL_GPL(apple_pmp_report_set_request);
+ 
++/* Count or withdraw a powered entry's apple,bw-vote and write the vote. */
++static void apple_pmp_report_entry_bw_vote(struct apple_pmp_report *rep,
++					   struct apple_pmp_report_entry *ent, bool on)
++{
++	unsigned long flags;
++	unsigned int level;
++
++	spin_lock_irqsave(&rep->lock, flags);
++	if (ent->bw_counted != on) {
++		ent->bw_counted = on;
++		if (on)
++			rep->bw_count[ent->bw_vote]++;
++		else
++			rep->bw_count[ent->bw_vote]--;
++		apple_pmp_report_bw_update_locked(rep, false, &level);
++	}
++	spin_unlock_irqrestore(&rep->lock, flags);
++}
++
+ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, bool enable)
+ {
+ 	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
+@@ -3051,9 +3130,13 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
+ 		/* The device request is admitted first and the level dropped first. */
+ 		if (ent->dvfs && !enable)
+ 			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, ent->dvfs_off);
++		if (ent->bw_vote && !enable)
++			apple_pmp_report_entry_bw_vote(rep, ent, false);
+ 		ret = apple_pmp_report_set_state(rep, ent->id, enable, ent->no_ack);
+ 		if (ent->dvfs && enable && !ret)
+ 			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, ent->dvfs_on);
++		if (ent->bw_vote && enable && !ret)
++			apple_pmp_report_entry_bw_vote(rep, ent, true);
+ 		break;
+ 	}
+ 	rcu_read_unlock();
+@@ -3394,6 +3477,13 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
+ 		ent->dvfs_entry = dvfs[0];
+ 	}
+ 
++	if (of_property_present(node, "apple,bw-vote") &&
++	    (of_property_read_u32(node, "apple,bw-vote", &ent->bw_vote) ||
++	     !ent->bw_vote || ent->bw_vote > PMP_DVFS_MAIN_LEVEL_MAX)) {
++		ret = dev_err_probe(dev, -EINVAL, "invalid apple,bw-vote\n");
++		goto err_free;
++	}
++
+ 	ret = of_property_read_string(node, "label", &name);
+ 	if (ret < 0) {
+ 		ret = dev_err_probe(dev, ret, "missing label property\n");
+-- 
+2.43.0
+

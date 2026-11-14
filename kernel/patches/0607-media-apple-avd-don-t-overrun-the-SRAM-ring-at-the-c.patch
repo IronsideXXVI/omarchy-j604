@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 21:05:11 +0000
+Subject: [PATCH] media: apple: avd: don't overrun the SRAM ring at the
+ counter wrap
+
+The queue firmware transport streams program words through a ring in the
+CM3's SRAM. Host and firmware count words with free-running u32 counters
+and both place word n at n % ring_words, but the ring holds 6144 words,
+which does not divide 2^32: the lap that ends at the wrap has only 4096
+slots, and the next one starts again at slot 0. While the writer has
+wrapped and the reader has not, the free space computed from the counters
+counts the 2048 slots that lap skipped, so the host can write over words
+of the old lap that are not read yet.
+
+Take those slots off the free space while the reader is behind the wrap.
+A write that fits still crosses it (the split test keeps passing); a host
+test now puts the reader at slot 3000 of the last lap and checks that the
+writer stops before it.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ .../media/platform/apple/avd/avd-backend-queue.c    | 13 +++++++++++++
+ .../media/platform/apple/avd/tests/program-test.py  | 11 +++++++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/drivers/media/platform/apple/avd/avd-backend-queue.c b/drivers/media/platform/apple/avd/avd-backend-queue.c
+index 36ae764906..bec03920c2 100644
+--- a/drivers/media/platform/apple/avd/avd-backend-queue.c
++++ b/drivers/media/platform/apple/avd/avd-backend-queue.c
+@@ -284,6 +284,19 @@ static int avd_qfw_stream(struct avd_dev *avd, const u32 *words, u32 count)
+ 		if (used > q->ring_words)
+ 			return -EIO;
+ 		space = q->ring_words - used;
++		/*
++		 * Both sides place word n at n % ring_words, and ring_words does
++		 * not divide 2^32: the lap that ends at the counter wrap has only
++		 * 2^32 % ring_words slots, and the next lap starts again at slot 0.
++		 * While the writer has wrapped and the reader has not, the slots
++		 * that lap skipped do not separate them.
++		 */
++		if (rp > q->wp) {
++			u32 skip = (q->ring_words - (u32)((1ULL << 32) % q->ring_words)) %
++				   q->ring_words;
++
++			space = space > skip ? space - skip : 0;
++		}
+ 		if (!space) {
+ 			if (time_after(jiffies, timeout))
+ 				return -ETIMEDOUT;
+diff --git a/drivers/media/platform/apple/avd/tests/program-test.py b/drivers/media/platform/apple/avd/tests/program-test.py
+index 6a0f353e4a..16c637a9a1 100755
+--- a/drivers/media/platform/apple/avd/tests/program-test.py
++++ b/drivers/media/platform/apple/avd/tests/program-test.py
+@@ -336,6 +336,17 @@ int main(int argc, char **argv)
+   assert(q.wp==(u32)(start+32));
+   for(unsigned int i=0;i<32;i++)assert(readl(q.sram+4*((u32)(start+i)%0x1800))==words[i]);
+  }
++ /* After the u32 wrap, the reader still in the short last lap (slot 3000):
++  * the writer may fill slots 0-2999 only, not the 2048 slots that lap skipped. */
++ {
++  static u32 many[3100];u32 rp=(u32)(0x100000000ULL-4096+3000);
++  for(unsigned int i=0;i<3100;i++)many[i]=0x56780000U+i;
++  memset(q.sram,0,0x10000);writel(0xdeadbeef,q.sram+4*3000);
++  q.wp=0;writel(rp,q.sram+0x7ff8);
++  assert(avd_qfw_stream(&dev,many,3100)==-ETIMEDOUT);
++  assert(q.wp==3000);
++  assert(readl(q.sram+4*2999)==many[2999]&&readl(q.sram+4*3000)==0xdeadbeef);
++ }
+  /* A sole fatal completion must keep DMA buffers owned until reset. */
+  memset(q.sram,0,0x10000);jiffies=123;
+  dev.frames[0].tag=0x10;dev.frames[0].state=AVD_FRAME_SUBMITTED;
+-- 
+2.43.0
+

@@ -1,0 +1,392 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 20:49:09 +0000
+Subject: [PATCH] soc: apple: sleep: T8132 wake variants as runtime
+ parameters
+
+A failed T8132 deep wake leaves only its reset time, and each try has
+needed its own kernel. Put the next steps behind apple_sleep module
+parameters, writable at run time, so one boot can try several wakes
+back to back. Every default keeps today's path.
+
+ - wake_stub picks the resume entry written to the mailbox: 0 today;
+   1 the stub as merged in #1314 (the 60 s WD2 restart, then
+   cpu_resume); 2 today without the dsb after the WD2 stores; 3 today
+   with an I-cache invalidate before the branch; 4 today plus a
+   restore of the boot core registers chosen by wake_hid_mask, saved
+   before the commit.
+ - wake_clean_image cleans the whole kernel image to the PoC before
+   the commit, so nothing the woken core reads with the MMU off can be
+   stale in DRAM.
+ - wake_init_marks adds a 175 s WD2 mark inside init_kernel_el, after
+   init_el2_state, to split the stretch before the 70 s mark.
+
+The variants share today's stub through assembler macros, so the
+default entry is the same instructions. The init mark only acts when
+the sleep driver set its flag bit for the wake.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ arch/arm64/include/asm/t8132-wake.h |  21 +++
+ arch/arm64/kernel/head.S            |   2 +
+ drivers/soc/apple/sleep.c           | 231 +++++++++++++++++++++++++++-
+ 3 files changed, 247 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm64/include/asm/t8132-wake.h b/arch/arm64/include/asm/t8132-wake.h
+index 797a83b9ad..3f356c3c24 100644
+--- a/arch/arm64/include/asm/t8132-wake.h
++++ b/arch/arm64/include/asm/t8132-wake.h
+@@ -65,6 +65,25 @@
+ 	mov	x23, xzr
+ 	.endm
+ 
++/* The same mark, only when bit 1 asks for marks inside init_kernel_el. */
++	.macro	t8132_wake_mark_init, secs
++	adr_l	x9, t8132_wake_marks
++	ldr	w9, [x9]
++	tbz	w9, #1, .Lt8132_marki_\@
++	movz	x9, #0x882b, lsl #16
++	movk	x9, #0x3, lsl #32
++	str	wzr, [x9, #0x2c]
++	str	wzr, [x9, #0x20]
++	mov_q	x10, (\secs * 24000000)
++	str	w10, [x9, #0x28]
++	mov	w10, #1
++	str	w10, [x9, #0x2c]
++	adr_l	x10, t8132_wake_vectors
++	msr	vbar_el2, x10
++	isb
++.Lt8132_marki_\@:
++	.endm
++
+ /*
+  * Clear the OS lock on the woken core before __cpu_setup. A core coming
+  * out of reset has it set; at boot m1n1 clears it on every core before
+@@ -87,6 +106,8 @@
+ 	.endm
+ 	.macro	t8132_wake_mark_reg, secs
+ 	.endm
++	.macro	t8132_wake_mark_init, secs
++	.endm
+ #endif
+ #endif /* __ASSEMBLY__ */
+ 
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index a596a8d347..83f1090d0a 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -15,6 +15,7 @@
+ 
+ #include <asm/asm_pointer_auth.h>
+ #include <asm/assembler.h>
++#include <asm/t8132-wake.h>
+ #include <asm/boot.h>
+ #include <asm/bug.h>
+ #include <asm/ptrace.h>
+@@ -304,6 +305,7 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
+ 
+ 	init_el2_hcr	HCR_HOST_NVHE_FLAGS | HCR_ATA
+ 	init_el2_state
++	t8132_wake_mark_init 175
+ 
+ 	/* Hypervisor stub */
+ 	adr_l	x0, __hyp_stub_vectors
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 12a0ca6fd9..50f326854e 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -129,6 +129,10 @@ struct aura_s2r_mailbox {
+ #define WDT_WD2_ALARM		0x28
+ #define WDT_WD2_CTL		0x2c
+ #define WDT_TICKS_PER_S		24000000
++
++/* The T8132 resume stub and the wake variant picked for the next commit (below). */
++void t8132_resume_stub(void);
++static void *t8132_wake_entry(void);
+ /* The sleep's own safety net: ADT /arm-io/wdt simple-reconfig-wdog-icc-time. */
+ #define WDT_SLEEP_SECS		5
+ /* Device suspend and resume can take a while, and nothing else recovers a hang in them. */
+@@ -2951,7 +2955,10 @@ static int apple_sleep_commit(unsigned long unused)
+ 
+ 	/* aura reads this with the MMU off. */
+ 	s->resumes_before = READ_ONCE(s->mbox->resumes);
+-	WRITE_ONCE(s->mbox->resume_pa, __pa_symbol(s->soc->ops->resume));
++	if (s->soc->ops->resume == t8132_resume_stub)
++		WRITE_ONCE(s->mbox->resume_pa, __pa_symbol(t8132_wake_entry()));
++	else
++		WRITE_ONCE(s->mbox->resume_pa, __pa_symbol(s->soc->ops->resume));
+ 	dcache_clean_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
+ 	if (s->soc->ops->pre_commit)
+ 		s->soc->ops->pre_commit(s);
+@@ -3323,10 +3330,10 @@ static void t8140_wake(struct apple_sleep *s)
+ asm(
+ "	.pushsection .text, \"ax\"\n"
+ "	.type	t8132_resume_stub, %function\n"
+-"t8132_resume_stub:\n"
++"	.macro	t8132_stub_head\n"
+ "	mrs	x10, CurrentEL\n"
+ "	cmp	x10, #8\n"
+-"	b.ne	1f\n"
++"	b.ne	9f\n"
+ "	adr	x10, t8132_wake_vectors\n"
+ "	msr	vbar_el2, x10\n"
+ "	isb\n"
+@@ -3337,7 +3344,7 @@ asm(
+ "	ic	iallu\n"
+ "	dsb	sy\n"
+ "	isb\n"
+-"1:	movz	x9, #0x882b, lsl #16\n"
++"9:	movz	x9, #0x882b, lsl #16\n"
+ "	movk	x9, #0x3, lsl #32\n"
+ "	str	wzr, [x9, #0x2c]\n"
+ "	str	wzr, [x9, #0x20]\n"
+@@ -3346,7 +3353,8 @@ asm(
+ "	str	w10, [x9, #0x28]\n"
+ "	mov	w10, #1\n"
+ "	str	w10, [x9, #0x2c]\n"
+-"	dsb	sy\n"
++"	.endm\n"
++"	.macro	t8132_stub_tail\n"
+ "	str	wzr, [x9, #0x2c]\n"
+ "	str	wzr, [x9, #0x20]\n"
+ "	movz	w10, #0x7e00\n"
+@@ -3358,8 +3366,141 @@ asm(
+ "	movk	x23, #0x3277, lsl #16\n"
+ "	movk	x23, #0x3133, lsl #32\n"
+ "	movk	x23, #0x7438, lsl #48\n"
++"	.endm\n"
++"t8132_resume_stub:\n"
++"	t8132_stub_head\n"
++"	dsb	sy\n"
++"	t8132_stub_tail\n"
+ "	b	cpu_resume\n"
+ "	.size	t8132_resume_stub, . - t8132_resume_stub\n"
++"	.type	t8132_resume_stub_min, %function\n"
++"t8132_resume_stub_min:\n"
++"	movz	x9, #0x882b, lsl #16\n"
++"	movk	x9, #0x3, lsl #32\n"
++"	str	wzr, [x9, #0x2c]\n"
++"	str	wzr, [x9, #0x20]\n"
++"	movz	w10, #0xa800\n"
++"	movk	w10, #0x55d4, lsl #16\n"
++"	str	w10, [x9, #0x28]\n"
++"	mov	w10, #1\n"
++"	str	w10, [x9, #0x2c]\n"
++"	b	cpu_resume\n"
++"	.type	t8132_resume_stub_nodsb, %function\n"
++"t8132_resume_stub_nodsb:\n"
++"	t8132_stub_head\n"
++"	t8132_stub_tail\n"
++"	b	cpu_resume\n"
++"	.type	t8132_resume_stub_ic, %function\n"
++"t8132_resume_stub_ic:\n"
++"	t8132_stub_head\n"
++"	dsb	sy\n"
++"	ic	iallu\n"
++"	dsb	sy\n"
++"	isb\n"
++"	t8132_stub_tail\n"
++"	b	cpu_resume\n"
++"	.type	t8132_resume_stub_hid, %function\n"
++"t8132_resume_stub_hid:\n"
++"	t8132_stub_head\n"
++"	dsb	sy\n"
++"	adrp	x12, t8132_wake_hid\n"
++"	add	x12, x12, :lo12:t8132_wake_hid\n"
++"	ldr	x11, [x12]\n"
++"	tbz	x11, #0, 8f\n"
++"	ldr	x10, [x12, #8]\n"
++"	msr	s3_0_c15_c0_0, x10\n"
++"8:\n"
++"	tbz	x11, #1, 8f\n"
++"	ldr	x10, [x12, #16]\n"
++"	msr	s3_0_c15_c1_0, x10\n"
++"8:\n"
++"	tbz	x11, #2, 8f\n"
++"	ldr	x10, [x12, #24]\n"
++"	msr	s3_0_c15_c2_0, x10\n"
++"8:\n"
++"	tbz	x11, #3, 8f\n"
++"	ldr	x10, [x12, #32]\n"
++"	msr	s3_0_c15_c3_0, x10\n"
++"8:\n"
++"	tbz	x11, #4, 8f\n"
++"	ldr	x10, [x12, #40]\n"
++"	msr	s3_0_c15_c4_0, x10\n"
++"8:\n"
++"	tbz	x11, #5, 8f\n"
++"	ldr	x10, [x12, #48]\n"
++"	msr	s3_0_c15_c5_0, x10\n"
++"8:\n"
++"	tbz	x11, #6, 8f\n"
++"	ldr	x10, [x12, #56]\n"
++"	msr	s3_0_c15_c6_0, x10\n"
++"8:\n"
++"	tbz	x11, #7, 8f\n"
++"	ldr	x10, [x12, #64]\n"
++"	msr	s3_0_c15_c7_0, x10\n"
++"8:\n"
++"	tbz	x11, #8, 8f\n"
++"	ldr	x10, [x12, #72]\n"
++"	msr	s3_0_c15_c8_0, x10\n"
++"8:\n"
++"	tbz	x11, #9, 8f\n"
++"	ldr	x10, [x12, #80]\n"
++"	msr	s3_0_c15_c9_0, x10\n"
++"8:\n"
++"	tbz	x11, #10, 8f\n"
++"	ldr	x10, [x12, #88]\n"
++"	msr	s3_0_c15_c10_0, x10\n"
++"8:\n"
++"	tbz	x11, #11, 8f\n"
++"	ldr	x10, [x12, #96]\n"
++"	msr	s3_0_c15_c11_0, x10\n"
++"8:\n"
++"	tbz	x11, #12, 8f\n"
++"	ldr	x10, [x12, #104]\n"
++"	msr	s3_0_c15_c12_0, x10\n"
++"8:\n"
++"	tbz	x11, #13, 8f\n"
++"	ldr	x10, [x12, #112]\n"
++"	msr	s3_0_c15_c14_0, x10\n"
++"8:\n"
++"	tbz	x11, #14, 8f\n"
++"	ldr	x10, [x12, #120]\n"
++"	msr	s3_0_c15_c15_0, x10\n"
++"8:\n"
++"	tbz	x11, #15, 8f\n"
++"	ldr	x10, [x12, #128]\n"
++"	msr	s3_0_c15_c15_2, x10\n"
++"8:\n"
++"	tbz	x11, #16, 8f\n"
++"	ldr	x10, [x12, #136]\n"
++"	msr	s3_0_c15_c11_2, x10\n"
++"8:\n"
++"	tbz	x11, #17, 8f\n"
++"	ldr	x10, [x12, #144]\n"
++"	msr	s3_0_c15_c1_3, x10\n"
++"8:\n"
++"	tbz	x11, #18, 8f\n"
++"	ldr	x10, [x12, #152]\n"
++"	msr	s3_0_c15_c0_3, x10\n"
++"8:\n"
++"	tbz	x11, #19, 8f\n"
++"	ldr	x10, [x12, #160]\n"
++"	msr	s3_0_c15_c0_4, x10\n"
++"8:\n"
++"	tbz	x11, #20, 8f\n"
++"	ldr	x10, [x12, #168]\n"
++"	msr	s3_5_c15_c4_0, x10\n"
++"8:\n"
++"	tbz	x11, #21, 8f\n"
++"	ldr	x10, [x12, #176]\n"
++"	msr	s3_5_c15_c5_0, x10\n"
++"8:\n"
++"	tbz	x11, #22, 8f\n"
++"	ldr	x10, [x12, #184]\n"
++"	msr	s3_5_c15_c6_0, x10\n"
++"8:\n"
++"	isb\n"
++"	t8132_stub_tail\n"
++"	b	cpu_resume\n"
+ "	.balign	2048\n"
+ "	.globl	t8132_wake_vectors\n"
+ "	.type	t8132_wake_vectors, %object\n"
+@@ -3391,6 +3532,79 @@ asm(
+ "	.popsection\n"
+ );
+ void t8132_resume_stub(void);
++void t8132_resume_stub_min(void);
++void t8132_resume_stub_nodsb(void);
++void t8132_resume_stub_ic(void);
++void t8132_resume_stub_hid(void);
++
++/*
++ * Wake variants, so one kernel can try several deep wakes back to back. Every default is
++ * today's path; each flag answers one question.
++ */
++static unsigned int wake_stub;
++module_param(wake_stub, uint, 0644);
++MODULE_PARM_DESC(wake_stub, "T8132 resume stub: 0 today, 1 #1314 as merged (WD2 60 s only), 2 no dsb after the WD2 stores, 3 I-cache invalidate before cpu_resume, 4 restore wake_hid_mask registers");
++static unsigned long wake_hid_mask;
++module_param(wake_hid_mask, ulong, 0644);
++MODULE_PARM_DESC(wake_hid_mask, "wake_stub=4: boot-core registers saved before the commit and restored by the stub (bit n = t8132_hid_regs[n]; set only bits pwrhid read on cpu0)");
++static bool wake_clean_image;
++module_param(wake_clean_image, bool, 0644);
++MODULE_PARM_DESC(wake_clean_image, "clean the whole kernel image to the PoC before the commit");
++static bool wake_init_marks;
++module_param(wake_init_marks, bool, 0644);
++MODULE_PARM_DESC(wake_init_marks, "WD2 mark (175 s) inside init_kernel_el on the wake");
++
++/* Read by the wake_stub=4 stub with the MMU off: [0] = mask, [1 + n] = register n. */
++u64 t8132_wake_hid[24] __section(".mmuoff.data.read");
++
++#define T8132_HID_SAVE(n, enc)						\
++	do {								\
++		if (wake_hid_mask & BIT(n))				\
++			t8132_wake_hid[1 + (n)] = read_sysreg_s(enc);	\
++	} while (0)
++
++static void t8132_wake_hid_save(void)
++{
++	T8132_HID_SAVE(0, sys_reg(3, 0, 15, 0, 0));
++	T8132_HID_SAVE(1, sys_reg(3, 0, 15, 1, 0));
++	T8132_HID_SAVE(2, sys_reg(3, 0, 15, 2, 0));
++	T8132_HID_SAVE(3, sys_reg(3, 0, 15, 3, 0));
++	T8132_HID_SAVE(4, sys_reg(3, 0, 15, 4, 0));
++	T8132_HID_SAVE(5, sys_reg(3, 0, 15, 5, 0));
++	T8132_HID_SAVE(6, sys_reg(3, 0, 15, 6, 0));
++	T8132_HID_SAVE(7, sys_reg(3, 0, 15, 7, 0));
++	T8132_HID_SAVE(8, sys_reg(3, 0, 15, 8, 0));
++	T8132_HID_SAVE(9, sys_reg(3, 0, 15, 9, 0));
++	T8132_HID_SAVE(10, sys_reg(3, 0, 15, 10, 0));
++	T8132_HID_SAVE(11, sys_reg(3, 0, 15, 11, 0));
++	T8132_HID_SAVE(12, sys_reg(3, 0, 15, 12, 0));
++	T8132_HID_SAVE(13, sys_reg(3, 0, 15, 14, 0));
++	T8132_HID_SAVE(14, sys_reg(3, 0, 15, 15, 0));
++	T8132_HID_SAVE(15, sys_reg(3, 0, 15, 15, 2));
++	T8132_HID_SAVE(16, sys_reg(3, 0, 15, 11, 2));
++	T8132_HID_SAVE(17, sys_reg(3, 0, 15, 1, 3));
++	T8132_HID_SAVE(18, sys_reg(3, 0, 15, 0, 3));
++	T8132_HID_SAVE(19, sys_reg(3, 0, 15, 0, 4));
++	T8132_HID_SAVE(20, sys_reg(3, 5, 15, 4, 0));
++	T8132_HID_SAVE(21, sys_reg(3, 5, 15, 5, 0));
++	T8132_HID_SAVE(22, sys_reg(3, 5, 15, 6, 0));
++	t8132_wake_hid[0] = wake_hid_mask & GENMASK(22, 0);
++	dcache_clean_inval_poc((unsigned long)t8132_wake_hid,
++			       (unsigned long)t8132_wake_hid + sizeof(t8132_wake_hid));
++}
++
++static void *t8132_wake_entry(void)
++{
++	switch (READ_ONCE(wake_stub)) {
++	case 1: return t8132_resume_stub_min;
++	case 2: return t8132_resume_stub_nodsb;
++	case 3: return t8132_resume_stub_ic;
++	case 4:
++		t8132_wake_hid_save();
++		return t8132_resume_stub_hid;
++	default: return t8132_resume_stub;
++	}
++}
+ 
+ /* Read by cpu_resume with the MMU off: restart WD2 at each step of the wake. */
+ u32 t8132_wake_marks __section(".mmuoff.data.read");
+@@ -3490,8 +3704,11 @@ static int apple_sleep_enter(suspend_state_t state)
+ 
+ 	s->cntkctl = read_sysreg(cntkctl_el1);
+ 	pm_set_resume_via_firmware();
+-	if (s->soc->ops->resume == t8132_resume_stub)
+-		t8132_wake_marks_set(1);
++	if (s->soc->ops->resume == t8132_resume_stub) {
++		if (READ_ONCE(wake_clean_image))
++			dcache_clean_poc((unsigned long)_text, (unsigned long)_end);
++		t8132_wake_marks_set(READ_ONCE(wake_init_marks) ? 3 : 1);
++	}
+ 	ret = cpu_suspend(0, apple_sleep_commit);
+ 	if (ret)
+ 		panic("Apple committed sleep returned without physical wake: %d", ret);
+-- 
+2.43.0
+

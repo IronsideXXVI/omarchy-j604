@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 20:02:04 +0000
+Subject: [PATCH] drm/asahi: G16: write the two Globals words macOS
+ sets after init
+
+The J604 GPU still never powers off at idle with the firmware's idle
+power-off allowed and the doorbell tally kept as macOS keeps it.
+
+Two more Globals words differ: macOS 26B123 writes its +0x990 = 2 and
++0x994 = 200000 after INIT (zero in the INIT snapshot, these values in
+every later one) and leaves them; with its four-byte shift these are
+our +0x98c and +0x990, which we never write.
+
+Write both once the firmware is READY and show them in the stats file.
+g16_runtime_words (default 1, read at boot) set to 0 leaves them zero.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/boot.rs        | 10 ++++++++++
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs |  6 ++++++
+ drivers/gpu/drm/asahi/g16/params.rs      | 18 ++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs        |  6 ++++--
+ 4 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 08b5e87620..81302597d5 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -766,6 +766,16 @@ fn run(
+             Ok(()) => dev_info!(dev, "M4 power: firmware idle power-off allowed\n"),
+             Err(e) => dev_warn!(dev, "M4 power: idle power-off policy not taken: {:?}\n", e),
+         }
++        // macOS writes these two Globals words after INIT and leaves them (list 13).
++        if super::params::runtime_words() {
++            if let Some(g) = init.globals.as_ref() {
++                for (at, value) in super::fw::initdata::globals::RUNTIME_WORDS {
++                    g.w32(at, value)?;
++                }
++                regs::wmb();
++                dev_info!(dev, "M4 power: Globals runtime words written as macOS\n");
++            }
++        }
+         // The boot import ran before START and the policy record; import once more so a
+         // firmware copy of Globals carries the tally that matches every record it drained.
+         if super::params::reimport() {
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index c71a8c167f..78dc31440a 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -86,6 +86,12 @@ pub(crate) mod globals {
+     /// list 13, 4 snapshots); the G17 backends call the same words "required 1000". The
+     /// firmware then picks the performance state itself.
+     pub(crate) const MACOS_SELECTOR: u32 = 1000;
++    /// Two words macOS 26B123 writes after INIT and then leaves (its +0x990 = 2, +0x994 =
++    /// 200000; MEASURED list 13: 0 at INIT, these values in every later snapshot), our
++    /// +0x98c/+0x990 with its 4-byte shift; the qualified image leaves both zero.
++    pub(crate) const RUNTIME_WORDS: [(usize, u32); 2] = [(0x98c, 2), (0x990, 200000)];
++    const _: () =
++        assert!(RUNTIME_WORDS[0].0 > PSTATE_SELECTORS[2] && RUNTIME_WORDS[1].0 + 4 <= 0x998);
+     /// The word the G17 backend documents as region C `idle_power_off` ("non-zero lets the
+     /// firmware power the GPU cores off when idle"), at the same offset. The qualified G16
+     /// Globals leaves it zero; the G17 region C values around it (+0x24, +0x998..+0x9cc,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index e92b1fd22c..c42d279734 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1053,6 +1053,24 @@ pub(crate) fn selectors_macos() -> bool {
+     "G16: performance selectors (default 1: 1000 as macOS whenever the cooling ceiling allows the top state, else that ceiling; 0: the host utilization governor's state x 100, as before; runtime 0644)"
+ );
+ 
++/// Storage of `g16_runtime_words` (0644, default 1; read at boot after READY).
++static RUNTIME_WORDS: AtomicU32 = AtomicU32::new(1);
++
++/// Whether the boot writes the two Globals words macOS writes after INIT (+0x98c = 2,
++/// +0x990 = 200000 in our layout) once the firmware is READY.
++pub(crate) fn runtime_words() -> bool {
++    RUNTIME_WORDS.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    RUNTIME_WORDS_PARAM,
++    RUNTIME_WORDS_PARMTYPE,
++    RUNTIME_WORDS_PARM,
++    RUNTIME_WORDS,
++    "g16_runtime_words",
++    "G16: after READY, write the Globals words macOS writes after INIT (+0x98c = 2, +0x990 = 200000) (default 1; 0: left zero, as before; read at boot)"
++);
++
+ /// Storage of `g16_pb_pool` (runtime 0644, default 8).
+ static PB_POOL: AtomicU32 = AtomicU32::new(8);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 9972c57f87..7cefea92e8 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1130,7 +1130,7 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         )?;
+         writeln!(
+             f,
+-            "idle_power_off: published {} requested {} boot_level {} changes {} tally {} counting {} doorbells {}",
++            "idle_power_off: published {} requested {} boot_level {} changes {} tally {} counting {} doorbells {} rt {:#x}/{}",
+             self.init.idle_power_off,
+             params::idle_power_off(),
+             self.init.idle_power_off_level,
+@@ -1145,7 +1145,9 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                 .globals
+                 .as_ref()
+                 .and_then(|g| g.r32(super::fw::initdata::globals::DOORBELL_TALLY).ok())
+-                .unwrap_or(0)
++                .unwrap_or(0),
++            self.init.globals.as_ref().and_then(|g| g.r32(0x98c).ok()).unwrap_or(0),
++            self.init.globals.as_ref().and_then(|g| g.r32(0x990).ok()).unwrap_or(0)
+         )?;
+         writeln!(
+             f,
+-- 
+2.43.0
+
