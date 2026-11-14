@@ -180,6 +180,7 @@ Each row compares this Mac under Omarchy with the same Mac under macOS 26B123, m
 - **PARITY:** measured at macOS or better.
 - **SHORT:** measured below macOS; the number is given.
 - **UNTESTED:** no like-for-like number on both systems yet. Most of these need someone at the Mac, a device plugged in, or a macOS session.
+- **How macOS is measured:** on this Mac, macOS now starts only as a guest under our hypervisor, because its startup disk boots our hypervisor stage; CPU, storage and power-under-load numbers taken that way carry the hypervisor's overhead. Some macOS numbers come from a Mac mini M4 with the same T8132 chip running macOS natively. A native macOS start on the J604 needs the owner at the Mac for two visits to its recovery system, so the rows that need it wait for that.
 
 Of 52 blocks: **22 at parity, 16 short, 13 untested**, and 1 not applicable to Omarchy. All MEASURED 2026-11-13/14 unless the row says CODE or INFERENCE.
 
@@ -204,7 +205,7 @@ Of 52 blocks: **22 at parity, 16 short, 13 untested**, and 1 not applicable to O
 | ProMotion video cadence | UNTESTED | macOS swaps 60/s for 60 fps video and 0 when still; ours not read |
 | Idle desktop power (whole machine) | SHORT | 4.93 vs 4.64 W (106 %) = 12.6 vs 13.4 h on battery |
 | Sleep: s2idle | UNTESTED | works: 0.98 W = 1.57 %/h; no macOS sleep drain on file to compare |
-| Sleep: deep | SHORT | **the wake resets the Mac**: the four deep sleeps since 1.905 (1.905, 1.908, 1.910, 1.913) each slept and woke into the boot firmware's resume, then the SoC reset 61-70 s after the wake alarm; on 1.910 that is the resume stub's 60 s window, before the kernel's CPU bring-up (first read as `__cpu_setup`, corrected); the other three fit both that window and the sleep-entry watchdog, and the next attempt separates them (INFERENCE); macOS sleeps and wakes |
+| Sleep: deep | SHORT | **the wake resets the Mac**: the four deep sleeps since 1.905 (1.905, 1.908, 1.910, 1.913) each slept and woke into the boot firmware's resume, then the SoC reset 61-70 s after the wake alarm; on 1.910 that is the resume stub's 60 s window, before the kernel's CPU bring-up (first read as `__cpu_setup`, corrected); the other three fit both that window and the sleep-entry watchdog, and the next attempt separates them (INFERENCE); macOS sleeps and wakes. Next (plan of 2026-11-14): the fixes for each possible stopping point go into one kernel behind runtime switches, so 3-4 variants are tried back to back without a new kernel each time; our whole wake path is compared step by step with the J713's working one (same T8132 chip); and the boot CPU's HID registers are read against another core's on a live boot |
 | Battery + charge limit | PARITY | 80 % limit holds (80/75); discharge with the limit -594 vs -632 mA |
 | Charging: MagSafe + USB-C PD | PARITY | MagSafe and 3 USB-C PD supplies charge |
 | Ports: idle power | PARITY | USB controllers and PHYs suspended, SD reader off, as on macOS |
