@@ -1065,3 +1065,5 @@ New in 1.905 (1.904 was not kept): 0560 (`dt-bindings: leds: pwm: Add an optiona
 New in 1.907 (1.906 did not start and was not kept): 0570 (`soc: apple: sleep: settle the woken core before the T8132 resume`), 0571 (`drm/asahi: G16: keep the firmware's power-assert tally so idle cores can power off`), 0572 (`wifi: brcmfmac: Say which country the firmware runs`), 0573 (`media: apple: isp: boot the T8132 firmware again when a boot fails`).
 
 New in 1.908: 0574 (`soc: apple: sleep: give the T8132 resume stub its own vectors`), 0575 (`drm/asahi: G16: let up to three compute commands queue behind a running one`), 0576 (`media: apple: isp: power the T8132 ISP down as macOS does`).
+
+New in 1.909: 0577 (`soc: apple: name the section a stalled boot stopped in`), 0578 (`iommu: apple-dart: leave a powered-down DCP DART alone in its IRQ handler`), 0579 (`soc: apple: sleep: tell the woken core's faults apart by time`), 0580 (`media: apple: isp: keep the detecting firmware up into the first stream`).

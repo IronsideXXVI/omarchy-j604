@@ -1,0 +1,1088 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 16:52:48 +0000
+Subject: [PATCH] soc: apple: name the section a stalled boot stopped
+ in
+
+A J604 boot can stop between about 6 and 15 seconds of uptime with
+nothing logged: no CPU schedules the watchdog keepalive any more, so the
+watchdog resets the SoC 30 seconds after Linux took it over. The journal
+holds only what was synced, and the ramoops region does not survive the
+reset. The PMU scratch does, and macsmc-reboot already reads it.
+
+Add boot crumbs. For the first 20 seconds of a boot, each instrumented
+section marks itself entered in the PMU scratch before it runs and left
+after it ran, and a 1 Hz heartbeat records the last uptime second. The
+write happens at the call when the caller may sleep and from a work item
+otherwise. After 20 seconds nothing is written. macsmc-reboot reads the
+previous boot's record before this boot writes, prints which sections
+were entered and not left and when the heartbeat stopped, and clears the
+record on a clean shutdown, so only a boot that did not shut down
+cleanly is reported.
+
+The sections are what runs between 4.5 and 16 seconds in a good J604
+boot: the external DCPs' power-down and power-up, connector detect on an
+external DCP, appledrm open and atomic commit, GPU start (its first
+power-up included), brcmfmac preinit and country update, SEP attach and
+the SEP sensor probe, the ANE idle power-down, the tas2764 fault
+handler, the PMP thermal sample, macaudio and AVD open, and the
+pcie-apple port interrupt. The record is 6 bytes at 0xf840 in the
+primary PMU's legacy scratch, where a live read showed only zeros.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi |  10 +-
+ drivers/accel/ane/ane_h16_backend.c           |  11 +
+ drivers/gpu/drm/apple/apple_drv.c             |  20 ++
+ drivers/gpu/drm/apple/iomfb_m4.c              |  36 +++
+ drivers/gpu/drm/apple/t8132_ext_drm.c         |  16 ++
+ drivers/gpu/drm/asahi/gpu.rs                  |  35 +++
+ drivers/media/platform/apple/avd/avd-drv.c    |  14 +
+ .../broadcom/brcm80211/brcmfmac/cfg80211.c    |  14 +
+ .../broadcom/brcm80211/brcmfmac/common.c      |  14 +
+ drivers/pci/controller/pcie-apple.c           |  14 +
+ drivers/power/reset/macsmc-reboot.c           |  55 ++++
+ drivers/soc/apple/Kconfig                     |  12 +
+ drivers/soc/apple/Makefile                    |   1 +
+ drivers/soc/apple/boot-crumb.c                | 256 ++++++++++++++++++
+ drivers/soc/apple/sensor_shim.c               |  14 +
+ drivers/soc/apple/sep.rs                      |  39 ++-
+ drivers/thermal/apple-pmp-thermal.c           |  14 +
+ include/linux/soc/apple/boot-crumb.h          |  54 ++++
+ sound/soc/apple/macaudio.c                    |  14 +
+ sound/soc/codecs/tas2764.c                    |  14 +
+ 20 files changed, 654 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/soc/apple/boot-crumb.c
+ create mode 100644 include/linux/soc/apple/boot-crumb.h
+
+diff --git a/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi b/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
+index c93dc4122a..d881f50ca0 100644
+--- a/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
++++ b/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
+@@ -204,6 +204,10 @@ boot_error_stage: boot-error-stage@f803 {
+ 				resume_exception: resume-exception@f804 {
+ 					reg = <0xf804 0x0b>;
+ 				};
++				/* Boot crumbs: early sections entered and not left, heartbeat. */
++				boot_crumb: boot-crumb@f840 {
++					reg = <0xf840 0x06>;
++				};
+ 				panic_count: panic-count@f802,4 {
+ 					reg = <0xf802 0x01>;
+ 					bits = <0x04 0x04>;
+@@ -1008,9 +1012,11 @@ typec3_dcpext1: endpoint@1 {
+ /* What ended the previous boot, printed once by macsmc-reboot (read-only). */
+ &{/soc/smc@38c600000/reboot} {
+ 	nvmem-cells = <&shutdown_flag>, <&boot_stage>, <&boot_error_count>, <&panic_count>,
+-		      <&pm_setting>, <&boot_error_stage>, <&fault_shadow>, <&resume_exception>;
++		      <&pm_setting>, <&boot_error_stage>, <&fault_shadow>, <&resume_exception>,
++		      <&boot_crumb>;
+ 	nvmem-cell-names = "shutdown_flag", "boot_stage", "boot_error_count", "panic_count",
+-			   "pm_setting", "boot_error_stage", "fault_shadow", "resume_exception";
++			   "pm_setting", "boot_error_stage", "fault_shadow", "resume_exception",
++			   "boot_crumb";
+ };
+ 
+ &{/soc/smc@38c600000/rtc} {
+diff --git a/drivers/accel/ane/ane_h16_backend.c b/drivers/accel/ane/ane_h16_backend.c
+index cef4cbf67f..ecad2f4017 100644
+--- a/drivers/accel/ane/ane_h16_backend.c
++++ b/drivers/accel/ane/ane_h16_backend.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ /* Staged H16 backend, using the accepted H16 cold-boot facts, round 5. */
+ #include <linux/debugfs.h>
++#include <linux/soc/apple/boot-crumb.h>
+ #include <linux/delay.h>
+ #include <linux/dma-map-ops.h>
+ #include <linux/hex.h>
+@@ -690,7 +691,17 @@ static void ane_h16_idle_arm(struct ane_h16_device *h)
+ 		mod_delayed_work(system_wq, &h->idle, msecs_to_jiffies(ms));
+ }
+ 
++static void __ane_h16_idle_work(struct work_struct *work);
++
++/* Boot crumb (boot-crumb.c): a stall in here is named after a reset. */
+ static void ane_h16_idle_work(struct work_struct *work)
++{
++	apple_boot_crumb_enter(APPLE_CRUMB_ANE_IDLE);
++	__ane_h16_idle_work(work);
++	apple_boot_crumb_leave(APPLE_CRUMB_ANE_IDLE);
++}
++
++static void __ane_h16_idle_work(struct work_struct *work)
+ {
+ 	struct ane_h16_device *h = container_of(to_delayed_work(work), struct ane_h16_device, idle);
+ 	struct ane_h16_session *s = &h->session;
+diff --git a/drivers/gpu/drm/apple/apple_drv.c b/drivers/gpu/drm/apple/apple_drv.c
+index 378d63fb32..a269214ce1 100644
+--- a/drivers/gpu/drm/apple/apple_drv.c
++++ b/drivers/gpu/drm/apple/apple_drv.c
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <linux/aperture.h>
++#include <linux/soc/apple/boot-crumb.h>
+ #include <linux/component.h>
+ #include <linux/completion.h>
+ #include <linux/delay.h>
+@@ -291,6 +292,14 @@ static void apple_drm_postclose(struct drm_device *drm, struct drm_file *file)
+ 		apple_drm_reset_hdr(drm);
+ }
+ 
++/* Boot crumb (boot-crumb.c): a client opening the card. */
++static int apple_drm_open(struct drm_device *drm, struct drm_file *file)
++{
++	apple_boot_crumb_enter(APPLE_CRUMB_DRM_OPEN);
++	apple_boot_crumb_leave(APPLE_CRUMB_DRM_OPEN);
++	return 0;
++}
++
+ static const struct drm_driver apple_drm_driver = {
+ 	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(apple_drm_gem_dumb_create),
+ #ifdef CONFIG_DRM_FBDEV_EMULATION
+@@ -298,6 +307,7 @@ static const struct drm_driver apple_drm_driver = {
+ #else
+ 	DRM_FBDEV_DMA_DRIVER_OPS,
+ #endif
++	.open			= apple_drm_open,
+ 	.postclose		= apple_drm_postclose,
+ 	.name			= DRIVER_NAME,
+ 	.desc			= DRIVER_DESC,
+@@ -777,7 +787,17 @@ static const struct drm_mode_config_funcs apple_mode_config_funcs = {
+ 	.fb_create		= drm_gem_fb_create,
+ };
+ 
++static void __apple_atomic_commit_tail(struct drm_atomic_commit *state);
++
++/* Boot crumb (boot-crumb.c): a stall in here is named after a reset. */
+ static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
++{
++	apple_boot_crumb_enter(APPLE_CRUMB_DRM_COMMIT);
++	__apple_atomic_commit_tail(state);
++	apple_boot_crumb_leave(APPLE_CRUMB_DRM_COMMIT);
++}
++
++static void __apple_atomic_commit_tail(struct drm_atomic_commit *state)
+ {
+ 	struct drm_plane *plane;
+ 	struct drm_plane_state *old, *new;
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 874c48a5ce..430d103812 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -8,6 +8,7 @@
+  * completion; an uncertain transaction stays pinned until reboot.
+  */
+ #include <linux/atomic.h>
++#include <linux/soc/apple/boot-crumb.h>
+ #include <linux/completion.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/iommu.h>
+@@ -6376,7 +6377,28 @@ static int iomfb_m4_power_ungate(struct iomfb_m4 *dcp)
+  * provider cannot take part nothing changes; a failure after that fails
+  * the session.
+  */
++static int __iomfb_m4_ext_power_gate(struct iomfb_m4 *dcp, const char *why);
++
++/* Boot crumb (boot-crumb.c): which external DCP is changing power. */
++static unsigned int iomfb_m4_crumb_id(struct iomfb_m4 *dcp)
++{
++	return of_alias_get_id(dcp->dev->of_node, "dcpext") == 1 ? APPLE_CRUMB_DCPEXT1 :
++								  APPLE_CRUMB_DCPEXT0;
++}
++
++/* Boot crumb (boot-crumb.c): a stall in here is named after a reset. */
+ static int iomfb_m4_ext_power_gate(struct iomfb_m4 *dcp, const char *why)
++{
++	unsigned int id = iomfb_m4_crumb_id(dcp);
++	int ret;
++
++	apple_boot_crumb_enter(id);
++	ret = __iomfb_m4_ext_power_gate(dcp, why);
++	apple_boot_crumb_leave(id);
++	return ret;
++}
++
++static int __iomfb_m4_ext_power_gate(struct iomfb_m4 *dcp, const char *why)
+ {
+ 	struct dcp_m4_runtime *r = dcp->runtime;
+ 	unsigned long flags;
+@@ -6465,7 +6487,21 @@ static int iomfb_m4_ext_power_gate(struct iomfb_m4 *dcp, const char *why)
+  * its mode from scratch (t8132_ext_sleep_restore()). A failure fails the
+  * session: the replay then marks the link BAD.
+  */
++static int __iomfb_m4_ext_power_ungate(struct iomfb_m4 *dcp, const char *why);
++
++/* Boot crumb (boot-crumb.c): a stall in here is named after a reset. */
+ static int iomfb_m4_ext_power_ungate(struct iomfb_m4 *dcp, const char *why)
++{
++	unsigned int id = iomfb_m4_crumb_id(dcp);
++	int ret;
++
++	apple_boot_crumb_enter(id);
++	ret = __iomfb_m4_ext_power_ungate(dcp, why);
++	apple_boot_crumb_leave(id);
++	return ret;
++}
++
++static int __iomfb_m4_ext_power_ungate(struct iomfb_m4 *dcp, const char *why)
+ {
+ 	const char *step;
+ 	int ret;
+diff --git a/drivers/gpu/drm/apple/t8132_ext_drm.c b/drivers/gpu/drm/apple/t8132_ext_drm.c
+index ec729c35cd..1196682bc5 100644
+--- a/drivers/gpu/drm/apple/t8132_ext_drm.c
++++ b/drivers/gpu/drm/apple/t8132_ext_drm.c
+@@ -12,6 +12,7 @@
+  * swapped in, its flip completed with the swap (D590).
+  */
+ #include <linux/device.h>
++#include <linux/soc/apple/boot-crumb.h>
+ #include <linux/dma-buf.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/hdmi.h>
+@@ -695,8 +696,23 @@ static const struct drm_crtc_funcs t8132_ext_crtc_funcs = {
+ 	.atomic_destroy_state = t8132_ext_crtc_destroy_state,
+ };
+ 
++static enum drm_connector_status __t8132_ext_detect(struct drm_connector *connector,
++						    bool force);
++
++/* Boot crumb (boot-crumb.c): a stall in here is named after a reset. */
+ static enum drm_connector_status t8132_ext_detect(struct drm_connector *connector,
+ 						  bool force)
++{
++	enum drm_connector_status ret;
++
++	apple_boot_crumb_enter(APPLE_CRUMB_DCPEXT_DETECT);
++	ret = __t8132_ext_detect(connector, force);
++	apple_boot_crumb_leave(APPLE_CRUMB_DCPEXT_DETECT);
++	return ret;
++}
++
++static enum drm_connector_status __t8132_ext_detect(struct drm_connector *connector,
++						    bool force)
+ {
+ 	struct t8132_ext_out *out = container_of(connector, struct t8132_ext_out, connector);
+ 	struct apple_dcp *owner = t8132_ext_owner(out);
+diff --git a/drivers/gpu/drm/asahi/gpu.rs b/drivers/gpu/drm/asahi/gpu.rs
+index 08634c365a..8c6a265036 100644
+--- a/drivers/gpu/drm/asahi/gpu.rs
++++ b/drivers/gpu/drm/asahi/gpu.rs
+@@ -1383,6 +1383,7 @@ pub(crate) fn run_job(&self, job: workqueue::JobSubmission::ver<'_>) -> Result {
+     }
+ 
+     pub(crate) fn start_op(self: &Arc<GpuManager::ver>) -> Result<OpGuard> {
++        let _crumb = BootCrumb::enter();
+         if self.is_crashed() {
+             return Err(ENODEV);
+         }
+@@ -1951,3 +1952,37 @@ fn end_op(&self) {
+         unsafe { kernel::bindings::apple_pmp_agx_activity_end() };
+     }
+ }
++
++/// Boot crumb (drivers/soc/apple/boot-crumb.c): section 5 (GPU start_op, the
++/// first power-up included) is marked entered when this is made and left when it is dropped, so a stall
++/// inside it is named by the next boot.
++struct BootCrumb;
++
++#[cfg(CONFIG_APPLE_BOOT_CRUMB)]
++extern "C" {
++    fn apple_boot_crumb_enter(id: u32);
++    fn apple_boot_crumb_leave(id: u32);
++}
++
++impl BootCrumb {
++    const ID: u32 = 5;
++
++    fn enter() -> Self {
++        #[cfg(CONFIG_APPLE_BOOT_CRUMB)]
++        // SAFETY: A plain C call with an integer argument, valid in any context.
++        unsafe {
++            apple_boot_crumb_enter(Self::ID)
++        };
++        BootCrumb
++    }
++}
++
++impl Drop for BootCrumb {
++    fn drop(&mut self) {
++        #[cfg(CONFIG_APPLE_BOOT_CRUMB)]
++        // SAFETY: As in `BootCrumb::enter`.
++        unsafe {
++            apple_boot_crumb_leave(Self::ID)
++        };
++    }
++}
+diff --git a/drivers/media/platform/apple/avd/avd-drv.c b/drivers/media/platform/apple/avd/avd-drv.c
+index 91786b047e..ecdedbe022 100644
+--- a/drivers/media/platform/apple/avd/avd-drv.c
++++ b/drivers/media/platform/apple/avd/avd-drv.c
+@@ -12,6 +12,7 @@
+  */
+ 
+ #include <linux/of.h>
++#include <linux/soc/apple/boot-crumb.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/iommu.h>
+@@ -176,7 +177,20 @@ static int avd_m2m_queue_init(void *priv, struct vb2_queue *src_vq,
+ 	return vb2_queue_init(dst_vq);
+ }
+ 
++static int __avd_open(struct file *filp);
++
++/* Boot crumb (boot-crumb.c): a stall in here is named after a reset. */
+ static int avd_open(struct file *filp)
++{
++	int ret;
++
++	apple_boot_crumb_enter(APPLE_CRUMB_AVD_OPEN);
++	ret = __avd_open(filp);
++	apple_boot_crumb_leave(APPLE_CRUMB_AVD_OPEN);
++	return ret;
++}
++
++static int __avd_open(struct file *filp)
+ {
+ 	struct avd_dev *avd = video_drvdata(filp);
+ 	struct avd_ctx *ctx;
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
+index eac1261258..92226e646a 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
+@@ -6,6 +6,7 @@
+ /* Toplevel file. Relies on dhd_linux.c to send commands to the dongle. */
+ 
+ #include <linux/kernel.h>
++#include <linux/soc/apple/boot-crumb.h>
+ #include <linux/etherdevice.h>
+ #include <linux/inetdevice.h>
+ #include <linux/module.h>
+@@ -9675,7 +9676,20 @@ brcmf_cfg80211_dump_survey(struct wiphy *wiphy, struct net_device *ndev,
+ 	return err;
+ }
+ 
++static int __brcmf_cfg80211_update_country(struct brcmf_cfg80211_info *cfg);
++
++/* Boot crumb (boot-crumb.c): a stall in here is named after a reset. */
+ static int brcmf_cfg80211_update_country(struct brcmf_cfg80211_info *cfg)
++{
++	int ret;
++
++	apple_boot_crumb_enter(APPLE_CRUMB_WIFI_COUNTRY);
++	ret = __brcmf_cfg80211_update_country(cfg);
++	apple_boot_crumb_leave(APPLE_CRUMB_WIFI_COUNTRY);
++	return ret;
++}
++
++static int __brcmf_cfg80211_update_country(struct brcmf_cfg80211_info *cfg)
+ {
+ 	struct brcmf_if *ifp = brcmf_get_ifp(cfg->pub, 0);
+ 	struct brcmf_pub *drvr = cfg->pub;
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/common.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/common.c
+index 56c24f5b12..bca9d5eb61 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/common.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/common.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include <linux/soc/apple/boot-crumb.h>
+ #include <linux/string.h>
+ #include <linux/netdevice.h>
+ #include <linux/module.h>
+@@ -284,7 +285,20 @@ static int brcmf_c_process_cal_blob(struct brcmf_if *ifp)
+ 	return err;
+ }
+ 
++static int __brcmf_c_preinit_dcmds(struct brcmf_if *ifp);
++
++/* Boot crumb (boot-crumb.c): a stall in here is named after a reset. */
+ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
++{
++	int ret;
++
++	apple_boot_crumb_enter(APPLE_CRUMB_WIFI_PREINIT);
++	ret = __brcmf_c_preinit_dcmds(ifp);
++	apple_boot_crumb_leave(APPLE_CRUMB_WIFI_PREINIT);
++	return ret;
++}
++
++static int __brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
+ {
+ 	struct brcmf_pub *drvr = ifp->drvr;
+ 	u8 buf[BRCMF_DCMD_SMLEN];
+diff --git a/drivers/pci/controller/pcie-apple.c b/drivers/pci/controller/pcie-apple.c
+index 70b59ab876..630a1fa28c 100644
+--- a/drivers/pci/controller/pcie-apple.c
++++ b/drivers/pci/controller/pcie-apple.c
+@@ -19,6 +19,7 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <linux/soc/apple/boot-crumb.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/kernel.h>
+ #include <linux/iopoll.h>
+@@ -1031,7 +1032,20 @@ static int apple_pcie_port_setup_irq(struct apple_pcie_port *port)
+ 	return 0;
+ }
+ 
++static irqreturn_t __apple_pcie_port_irq(int irq, void *data);
++
++/* Boot crumb (boot-crumb.c): a stall in here is named after a reset. */
+ static irqreturn_t apple_pcie_port_irq(int irq, void *data)
++{
++	irqreturn_t ret;
++
++	apple_boot_crumb_enter(APPLE_CRUMB_PCIE_LINK);
++	ret = __apple_pcie_port_irq(irq, data);
++	apple_boot_crumb_leave(APPLE_CRUMB_PCIE_LINK);
++	return ret;
++}
++
++static irqreturn_t __apple_pcie_port_irq(int irq, void *data)
+ {
+ 	struct apple_pcie_port *port = data;
+ 	unsigned int hwirq = irq_domain_get_irq_data(port->domain, irq)->hwirq;
+diff --git a/drivers/power/reset/macsmc-reboot.c b/drivers/power/reset/macsmc-reboot.c
+index 9da1bac1f4..939fdd4e32 100644
+--- a/drivers/power/reset/macsmc-reboot.c
++++ b/drivers/power/reset/macsmc-reboot.c
+@@ -12,6 +12,7 @@
+ #include <linux/nvmem-consumer.h>
+ #include <linux/platform_device.h>
+ #include <linux/reboot.h>
++#include <linux/soc/apple/boot-crumb.h>
+ #include <linux/slab.h>
+ #include <linux/unaligned.h>
+ #if IS_ENABLED(CONFIG_ARM64)
+@@ -72,6 +73,7 @@ struct macsmc_reboot {
+ 	struct notifier_block reboot_notify;
+ 	struct nvmem_cell *pm_setting;
+ 	struct mutex pm_setting_lock;
++	struct nvmem_cell *boot_crumb;
+ 
+ 	union {
+ 		struct macsmc_reboot_nvmem nvm;
+@@ -192,6 +194,14 @@ static int macsmc_reboot_notify(struct notifier_block *this, unsigned long actio
+ 	    nvmem_cell_set_u8(reboot->nvm.boot_stage, BOOT_STAGE_SHUTDOWN) < 0)
+ 		dev_err(reboot->dev, "Failed to write boot_stage\n");
+ 	macsmc_reboot_resume_exception(reboot, false);
++	/* A clean shutdown leaves no boot crumbs: stop them, then clear the record. */
++	if (reboot->boot_crumb) {
++		u8 zero[APPLE_CRUMB_RECORD_LEN] = {};
++
++		apple_boot_crumb_set_writer(NULL, NULL);
++		if (nvmem_cell_write(reboot->boot_crumb, zero, sizeof(zero)) < 0)
++			dev_err(reboot->dev, "Failed to clear the boot crumbs\n");
++	}
+ 
+ 	/*
+ 	 * Set the PMU flag to actually reboot into the off state.
+@@ -398,6 +408,49 @@ static const struct attribute_group macsmc_reboot_group = {
+ };
+ __ATTRIBUTE_GROUPS(macsmc_reboot);
+ 
++static int macsmc_reboot_crumb_write(void *ctx, const u8 *rec, size_t len)
++{
++	struct macsmc_reboot *reboot = ctx;
++	u8 buf[APPLE_CRUMB_RECORD_LEN];
++	int ret;
++
++	if (len > sizeof(buf))
++		return -EINVAL;
++	memcpy(buf, rec, len);
++	ret = nvmem_cell_write(reboot->boot_crumb, buf, len);
++	return ret < 0 ? ret : 0;
++}
++
++static void macsmc_reboot_crumb_stop(void *data)
++{
++	apple_boot_crumb_set_writer(NULL, NULL);
++}
++
++/*
++ * Optional boot crumbs (boot-crumb.c): print the previous boot's record if it
++ * did not shut down cleanly, then keep this boot's record for the next one.
++ */
++static void macsmc_reboot_boot_crumb(struct macsmc_reboot *reboot)
++{
++	struct nvmem_cell *cell = devm_nvmem_cell_get(reboot->dev, "boot_crumb");
++	char line[256];
++	size_t len = 0;
++	u8 *rec;
++
++	if (IS_ERR(cell))
++		return;
++	rec = nvmem_cell_read(cell, &len);
++	if (!IS_ERR(rec)) {
++		if (apple_boot_crumb_decode(rec, len, line, sizeof(line)) > 0)
++			dev_warn(reboot->dev, "previous boot: crumb: %s\n", line);
++		kfree(rec);
++	}
++	if (devm_add_action_or_reset(reboot->dev, macsmc_reboot_crumb_stop, NULL))
++		return;
++	reboot->boot_crumb = cell;
++	apple_boot_crumb_set_writer(macsmc_reboot_crumb_write, reboot);
++}
++
+ static int macsmc_reboot_probe(struct platform_device *pdev)
+ {
+ 	struct apple_smc *smc = dev_get_drvdata(pdev->dev.parent);
+@@ -487,6 +540,8 @@ static int macsmc_reboot_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return dev_err_probe(&pdev->dev, ret, "Failed to register reboot notifier\n");
+ 
++	macsmc_reboot_boot_crumb(reboot);
++
+ 	dev_info(&pdev->dev, "Handling reboot and poweroff requests via SMC\n");
+ 
+ 	return 0;
+diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
+index 9225b054e7..cecd95a6fc 100644
+--- a/drivers/soc/apple/Kconfig
++++ b/drivers/soc/apple/Kconfig
+@@ -258,6 +258,18 @@ config APPLE_SEP_KEY_RESEARCH
+ 
+ 	  Say N unless you are measuring the enclave on a lab machine.
+ 
++config APPLE_BOOT_CRUMB
++	bool "Apple boot crumbs in PMU scratch"
++	depends on ARCH_APPLE
++	default y
++	help
++	  For the first 20 seconds of a boot, record in the PMU scratch which
++	  early sections (display coprocessors, GPU, Wi-Fi, SEP, audio, ...)
++	  were entered and not left, plus a 1 Hz heartbeat. The PMU scratch
++	  survives a watchdog reset, so macsmc-reboot can name the section a
++	  stalled boot stopped in on the next boot. Nothing is written after
++	  the first 20 seconds.
++
+ config APPLE_PMP
+ 	tristate "Apple Power Management Processor"
+ 	depends on ARCH_APPLE || COMPILE_TEST
+diff --git a/drivers/soc/apple/Makefile b/drivers/soc/apple/Makefile
+index 5065bb7a13..1ef4c4def0 100644
+--- a/drivers/soc/apple/Makefile
++++ b/drivers/soc/apple/Makefile
+@@ -68,3 +68,4 @@ obj-$(CONFIG_APPLE_REGVIEW) += apple-regview.o
+ apple-regview-y := regview.o
+ 
+ obj-$(CONFIG_APPLE_AURORA_BOOT_SECURITY) += aurora-boot-security.o
++obj-$(CONFIG_APPLE_BOOT_CRUMB) += boot-crumb.o
+diff --git a/drivers/soc/apple/boot-crumb.c b/drivers/soc/apple/boot-crumb.c
+new file mode 100644
+index 0000000000..0cfa6232d9
+--- /dev/null
++++ b/drivers/soc/apple/boot-crumb.c
+@@ -0,0 +1,256 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/*
++ * Apple boot crumbs.
++ *
++ * A stall early in a boot that stops every CPU (or the watchdog's keepalive
++ * thread) leaves nothing behind: the journal holds only what was synced, the
++ * ramoops region does not survive the watchdog reset, and the panel shows
++ * nothing. The PMU's scratch does survive. For the first 20 s of a boot, each
++ * instrumented section sets its "entered" bit there before it runs and its
++ * "left" bit after, and a 1 Hz heartbeat records the last uptime second seen,
++ * so the next boot (macsmc-reboot) can say which sections were entered and
++ * never left, and when the boot stopped.
++ *
++ * Record (APPLE_CRUMB_RECORD_LEN bytes): magic, a little-endian u32 mask with
++ * bit 2n = section n entered and bit 2n + 1 = section n left, and the
++ * heartbeat second (APPLE_CRUMB_BEAT_DONE once the window passed). A clean
++ * shutdown clears it. Nothing is written after the window.
++ */
++
++#include <linux/atomic.h>
++#include <linux/bits.h>
++#include <linux/export.h>
++#include <linux/kernel.h>
++#include <linux/ktime.h>
++#include <linux/math64.h>
++#include <linux/mutex.h>
++#include <linux/preempt.h>
++#include <linux/rcupdate.h>
++#include <linux/soc/apple/boot-crumb.h>
++#include <linux/unaligned.h>
++#include <linux/workqueue.h>
++
++#define APPLE_CRUMB_MAGIC	0xc5
++#define APPLE_CRUMB_BEAT_DONE	0xff
++#define APPLE_CRUMB_WINDOW_NS	(20 * NSEC_PER_SEC)
++
++static const char *const apple_crumb_names[APPLE_CRUMB_COUNT] = {
++	[APPLE_CRUMB_DCPEXT0] = "dcpext0-power",
++	[APPLE_CRUMB_DCPEXT1] = "dcpext1-power",
++	[APPLE_CRUMB_DCPEXT_DETECT] = "dcpext-detect",
++	[APPLE_CRUMB_DRM_OPEN] = "drm-open",
++	[APPLE_CRUMB_DRM_COMMIT] = "drm-commit",
++	[APPLE_CRUMB_GPU_START] = "gpu-start",
++	[APPLE_CRUMB_WIFI_PREINIT] = "wifi-preinit",
++	[APPLE_CRUMB_WIFI_COUNTRY] = "wifi-country",
++	[APPLE_CRUMB_SEP_ATTACH] = "sep-attach",
++	[APPLE_CRUMB_SEP_SENSOR] = "sep-sensor",
++	[APPLE_CRUMB_ANE_IDLE] = "ane-idle",
++	[APPLE_CRUMB_TAS_FAULT] = "tas2764-fault",
++	[APPLE_CRUMB_PMP_THERMAL] = "pmp-thermal",
++	[APPLE_CRUMB_AUDIO_OPEN] = "audio-open",
++	[APPLE_CRUMB_AVD_OPEN] = "avd-open",
++	[APPLE_CRUMB_PCIE_LINK] = "pcie-port-irq",
++};
++
++static atomic_t apple_crumb_mask = ATOMIC_INIT(0);
++static bool apple_crumb_closed;
++
++/* Under apple_crumb_lock. */
++static DEFINE_MUTEX(apple_crumb_lock);
++static apple_boot_crumb_writer_t apple_crumb_writer;
++static void *apple_crumb_ctx;
++static u8 apple_crumb_beat;
++static u32 apple_crumb_written_mask;
++static u8 apple_crumb_written_beat;
++static bool apple_crumb_written;
++
++static bool apple_crumb_window(void)
++{
++	return !READ_ONCE(apple_crumb_closed) && ktime_get_ns() < APPLE_CRUMB_WINDOW_NS;
++}
++
++static void apple_crumb_write_locked(void)
++{
++	u32 mask = (u32)atomic_read(&apple_crumb_mask);
++	u8 rec[APPLE_CRUMB_RECORD_LEN];
++
++	lockdep_assert_held(&apple_crumb_lock);
++	if (!apple_crumb_writer || apple_crumb_closed)
++		return;
++	if (apple_crumb_written && mask == apple_crumb_written_mask &&
++	    apple_crumb_beat == apple_crumb_written_beat)
++		return;
++	rec[0] = APPLE_CRUMB_MAGIC;
++	put_unaligned_le32(mask, &rec[1]);
++	rec[5] = apple_crumb_beat;
++	if (apple_crumb_writer(apple_crumb_ctx, rec, sizeof(rec)))
++		return;
++	apple_crumb_written = true;
++	apple_crumb_written_mask = mask;
++	apple_crumb_written_beat = apple_crumb_beat;
++}
++
++static void apple_crumb_flush(void)
++{
++	mutex_lock(&apple_crumb_lock);
++	apple_crumb_write_locked();
++	mutex_unlock(&apple_crumb_lock);
++}
++
++static void apple_crumb_work_fn(struct work_struct *work)
++{
++	apple_crumb_flush();
++}
++
++static DECLARE_WORK(apple_crumb_work, apple_crumb_work_fn);
++
++static void apple_crumb_beat_fn(struct work_struct *work);
++static DECLARE_DELAYED_WORK(apple_crumb_beat_work, apple_crumb_beat_fn);
++
++static void apple_crumb_beat_fn(struct work_struct *work)
++{
++	u64 now = ktime_get_ns();
++
++	mutex_lock(&apple_crumb_lock);
++	if (now >= APPLE_CRUMB_WINDOW_NS) {
++		/* The window passed: say so once, then never write again. */
++		apple_crumb_beat = APPLE_CRUMB_BEAT_DONE;
++		apple_crumb_write_locked();
++		WRITE_ONCE(apple_crumb_closed, true);
++		mutex_unlock(&apple_crumb_lock);
++		return;
++	}
++	apple_crumb_beat = div_u64(now, NSEC_PER_SEC);
++	apple_crumb_write_locked();
++	mutex_unlock(&apple_crumb_lock);
++	queue_delayed_work(system_highpri_wq, &apple_crumb_beat_work, HZ);
++}
++
++static void apple_crumb_update(u32 set, u32 clear)
++{
++	int old, new;
++
++	if (!apple_crumb_window())
++		return;
++	old = atomic_read(&apple_crumb_mask);
++	do {
++		new = (int)(((u32)old | set) & ~clear);
++		if (new == old)
++			return;
++	} while (!atomic_try_cmpxchg(&apple_crumb_mask, &old, new));
++
++	/* Before a writer exists the mask is written when it registers. */
++	if (!READ_ONCE(apple_crumb_writer))
++		return;
++	/* The "entered" bit must reach the PMU before the section runs. */
++	if (preemptible() && !rcu_preempt_depth())
++		apple_crumb_flush();
++	else
++		queue_work(system_highpri_wq, &apple_crumb_work);
++}
++
++/**
++ * apple_boot_crumb_enter() - mark a section entered, before it runs
++ * @id: the section (enum apple_boot_crumb)
++ *
++ * Any context; only atomic callers have the write deferred. Does nothing
++ * after the first 20 s of the boot.
++ */
++void apple_boot_crumb_enter(unsigned int id)
++{
++	if (id < APPLE_CRUMB_COUNT)
++		apple_crumb_update(BIT(2 * id), BIT(2 * id + 1));
++}
++EXPORT_SYMBOL_GPL(apple_boot_crumb_enter);
++
++/**
++ * apple_boot_crumb_leave() - mark a section left, after it ran
++ * @id: the section (enum apple_boot_crumb)
++ */
++void apple_boot_crumb_leave(unsigned int id)
++{
++	if (id < APPLE_CRUMB_COUNT)
++		apple_crumb_update(BIT(2 * id + 1), 0);
++}
++EXPORT_SYMBOL_GPL(apple_boot_crumb_leave);
++
++/**
++ * apple_boot_crumb_set_writer() - set or clear the PMU writer
++ * @writer: writes a record to the PMU scratch, may sleep; NULL to stop
++ * @ctx: passed to @writer
++ *
++ * The owner of the PMU cells (macsmc-reboot) reads the previous boot's record
++ * first and then registers. Clearing it stops the heartbeat and every later
++ * write, for good: a clean shutdown clears the record after this.
++ */
++void apple_boot_crumb_set_writer(apple_boot_crumb_writer_t writer, void *ctx)
++{
++	if (!writer) {
++		mutex_lock(&apple_crumb_lock);
++		WRITE_ONCE(apple_crumb_closed, true);
++		WRITE_ONCE(apple_crumb_writer, NULL);
++		apple_crumb_ctx = NULL;
++		mutex_unlock(&apple_crumb_lock);
++		cancel_delayed_work_sync(&apple_crumb_beat_work);
++		cancel_work_sync(&apple_crumb_work);
++		return;
++	}
++	if (!apple_crumb_window())
++		return;
++	mutex_lock(&apple_crumb_lock);
++	apple_crumb_ctx = ctx;
++	WRITE_ONCE(apple_crumb_writer, writer);
++	apple_crumb_beat = div_u64(ktime_get_ns(), NSEC_PER_SEC);
++	apple_crumb_write_locked();
++	mutex_unlock(&apple_crumb_lock);
++	queue_delayed_work(system_highpri_wq, &apple_crumb_beat_work, HZ);
++}
++EXPORT_SYMBOL_GPL(apple_boot_crumb_set_writer);
++
++/**
++ * apple_boot_crumb_decode() - describe a record read from the PMU
++ * @rec: the record
++ * @len: its length
++ * @buf: output
++ * @size: size of @buf
++ *
++ * Return: the length written, or -ENOENT if @rec holds no record (cleared by
++ * a clean shutdown, or never written).
++ */
++int apple_boot_crumb_decode(const u8 *rec, size_t len, char *buf, size_t size)
++{
++	unsigned int i, inside = 0, done = 0;
++	int n;
++	u32 mask;
++
++	if (len < APPLE_CRUMB_RECORD_LEN || rec[0] != APPLE_CRUMB_MAGIC)
++		return -ENOENT;
++	mask = get_unaligned_le32(&rec[1]);
++	if (rec[5] == APPLE_CRUMB_BEAT_DONE)
++		n = scnprintf(buf, size, "heartbeat passed 20 s;");
++	else
++		n = scnprintf(buf, size, "last heartbeat %u s;", rec[5]);
++
++	n += scnprintf(buf + n, size - n, " entered, not left:");
++	for (i = 0; i < APPLE_CRUMB_COUNT; i++) {
++		if ((mask & BIT(2 * i)) && !(mask & BIT(2 * i + 1))) {
++			n += scnprintf(buf + n, size - n, " %s", apple_crumb_names[i]);
++			inside++;
++		}
++	}
++	if (!inside)
++		n += scnprintf(buf + n, size - n, " none");
++
++	n += scnprintf(buf + n, size - n, "; done:");
++	for (i = 0; i < APPLE_CRUMB_COUNT; i++) {
++		if ((mask & BIT(2 * i)) && (mask & BIT(2 * i + 1))) {
++			n += scnprintf(buf + n, size - n, " %s", apple_crumb_names[i]);
++			done++;
++		}
++	}
++	if (!done)
++		n += scnprintf(buf + n, size - n, " none");
++	return n;
++}
++EXPORT_SYMBOL_GPL(apple_boot_crumb_decode);
+diff --git a/drivers/soc/apple/sensor_shim.c b/drivers/soc/apple/sensor_shim.c
+index ffe3979c02..3ede15c295 100644
+--- a/drivers/soc/apple/sensor_shim.c
++++ b/drivers/soc/apple/sensor_shim.c
+@@ -3,6 +3,7 @@
+ /* Fingerprint sensor SPI shim: moves bytes over the bus and toggles power. */
+ 
+ #include <linux/build_bug.h>
++#include <linux/soc/apple/boot-crumb.h>
+ #include <linux/completion.h>
+ #include <linux/device.h>
+ #include <linux/delay.h>
+@@ -462,7 +463,20 @@ static int sep_apply_cs_timing(struct spi_device *spi)
+ 	return 0;
+ }
+ 
++static int __sep_sensor_probe_locked(struct spi_device *spi);
++
++/* Boot crumb (boot-crumb.c): a stall in here is named after a reset. */
+ static int sep_sensor_probe_locked(struct spi_device *spi)
++{
++	int ret;
++
++	apple_boot_crumb_enter(APPLE_CRUMB_SEP_SENSOR);
++	ret = __sep_sensor_probe_locked(spi);
++	apple_boot_crumb_leave(APPLE_CRUMB_SEP_SENSOR);
++	return ret;
++}
++
++static int __sep_sensor_probe_locked(struct spi_device *spi)
+ {
+ 	int rc;
+ 
+diff --git a/drivers/soc/apple/sep.rs b/drivers/soc/apple/sep.rs
+index 6fc917acd2..5f6d21a647 100644
+--- a/drivers/soc/apple/sep.rs
++++ b/drivers/soc/apple/sep.rs
+@@ -3570,7 +3570,10 @@ fn probe<'bound>(
+ 
+         *data.mbox.lock() = Some(Mailbox::new_byname(dev, c"mbox", data.clone())?);
+ 
+-        data.attach(&sep_node)?;
++        {
++            let _crumb = BootCrumb::enter();
++            data.attach(&sep_node)?;
++        }
+ 
+         if module_parameters::filevault_api.value() != 0 {
+             if let Err(e) = data.register_fv_kernel() {
+@@ -3722,3 +3725,37 @@ fn init(module: &'static ThisModule) -> impl PinInit<Self, Error> {
+         },
+     },
+ }
++
++/// Boot crumb (drivers/soc/apple/boot-crumb.c): section 8 (SEP attach) is
++/// marked entered when this is made and left when it is dropped, so a stall
++/// inside it is named by the next boot.
++struct BootCrumb;
++
++#[cfg(CONFIG_APPLE_BOOT_CRUMB)]
++extern "C" {
++    fn apple_boot_crumb_enter(id: u32);
++    fn apple_boot_crumb_leave(id: u32);
++}
++
++impl BootCrumb {
++    const ID: u32 = 8;
++
++    fn enter() -> Self {
++        #[cfg(CONFIG_APPLE_BOOT_CRUMB)]
++        // SAFETY: A plain C call with an integer argument, valid in any context.
++        unsafe {
++            apple_boot_crumb_enter(Self::ID)
++        };
++        BootCrumb
++    }
++}
++
++impl Drop for BootCrumb {
++    fn drop(&mut self) {
++        #[cfg(CONFIG_APPLE_BOOT_CRUMB)]
++        // SAFETY: As in `BootCrumb::enter`.
++        unsafe {
++            apple_boot_crumb_leave(Self::ID)
++        };
++    }
++}
+diff --git a/drivers/thermal/apple-pmp-thermal.c b/drivers/thermal/apple-pmp-thermal.c
+index 56e949ef7d..a814a3772b 100644
+--- a/drivers/thermal/apple-pmp-thermal.c
++++ b/drivers/thermal/apple-pmp-thermal.c
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <linux/cpu.h>
++#include <linux/soc/apple/boot-crumb.h>
+ #include <linux/cpu_cooling.h>
+ #include <linux/cpufreq.h>
+ #include <linux/hwmon.h>
+@@ -400,7 +401,20 @@ static int apple_pmp_guard(unsigned int level)
+ 	return err;
+ }
+ 
++static int __apple_pmp_sample(void);
++
++/* Boot crumb (boot-crumb.c): a stall in here is named after a reset. */
+ static int apple_pmp_sample(void)
++{
++	int ret;
++
++	apple_boot_crumb_enter(APPLE_CRUMB_PMP_THERMAL);
++	ret = __apple_pmp_sample();
++	apple_boot_crumb_leave(APPLE_CRUMB_PMP_THERMAL);
++	return ret;
++}
++
++static int __apple_pmp_sample(void)
+ {
+ 	struct apple_pmp_snapshot snapshot;
+ 	struct apple_pmp_cooling *cooling = &pmp_thermal.cooling;
+diff --git a/include/linux/soc/apple/boot-crumb.h b/include/linux/soc/apple/boot-crumb.h
+new file mode 100644
+index 0000000000..4c7421d6a7
+--- /dev/null
++++ b/include/linux/soc/apple/boot-crumb.h
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/*
++ * Apple boot crumbs: which early-boot sections a boot entered and did not
++ * leave, kept in PMU scratch, which survives a watchdog reset.
++ */
++#ifndef _LINUX_SOC_APPLE_BOOT_CRUMB_H
++#define _LINUX_SOC_APPLE_BOOT_CRUMB_H
++
++#include <linux/errno.h>
++#include <linux/types.h>
++
++/* Sections; the numbers are stored and also used by Rust callers. */
++enum apple_boot_crumb {
++	APPLE_CRUMB_DCPEXT0 = 0,	/* dcpext0 power-down/up */
++	APPLE_CRUMB_DCPEXT1 = 1,	/* dcpext1 power-down/up */
++	APPLE_CRUMB_DCPEXT_DETECT = 2,	/* connector detect on a dcpext */
++	APPLE_CRUMB_DRM_OPEN = 3,	/* appledrm open */
++	APPLE_CRUMB_DRM_COMMIT = 4,	/* appledrm atomic commit (modeset) */
++	APPLE_CRUMB_GPU_START = 5,	/* GPU start_op, first power-up incl. */
++	APPLE_CRUMB_WIFI_PREINIT = 6,	/* brcmfmac preinit commands */
++	APPLE_CRUMB_WIFI_COUNTRY = 7,	/* brcmfmac country update */
++	APPLE_CRUMB_SEP_ATTACH = 8,	/* SEP attach */
++	APPLE_CRUMB_SEP_SENSOR = 9,	/* SEP biometric sensor probe */
++	APPLE_CRUMB_ANE_IDLE = 10,	/* ANE idle power-down */
++	APPLE_CRUMB_TAS_FAULT = 11,	/* tas2764 fault handler */
++	APPLE_CRUMB_PMP_THERMAL = 12,	/* apple-pmp-thermal sample */
++	APPLE_CRUMB_AUDIO_OPEN = 13,	/* macaudio PCM open */
++	APPLE_CRUMB_AVD_OPEN = 14,	/* AVD open */
++	APPLE_CRUMB_PCIE_LINK = 15,	/* pcie-apple port interrupt */
++	APPLE_CRUMB_COUNT
++};
++
++/* The PMU scratch record: magic, entered/left mask (le32), heartbeat. */
++#define APPLE_CRUMB_RECORD_LEN	6
++
++/* Writes the record to the PMU; may sleep. Registered by macsmc-reboot. */
++typedef int (*apple_boot_crumb_writer_t)(void *ctx, const u8 *rec, size_t len);
++
++#if IS_ENABLED(CONFIG_APPLE_BOOT_CRUMB)
++void apple_boot_crumb_enter(unsigned int id);
++void apple_boot_crumb_leave(unsigned int id);
++void apple_boot_crumb_set_writer(apple_boot_crumb_writer_t writer, void *ctx);
++int apple_boot_crumb_decode(const u8 *rec, size_t len, char *buf, size_t size);
++#else
++static inline void apple_boot_crumb_enter(unsigned int id) { }
++static inline void apple_boot_crumb_leave(unsigned int id) { }
++static inline void apple_boot_crumb_set_writer(apple_boot_crumb_writer_t writer, void *ctx) { }
++static inline int apple_boot_crumb_decode(const u8 *rec, size_t len, char *buf, size_t size)
++{
++	return -ENODEV;
++}
++#endif
++
++#endif
+diff --git a/sound/soc/apple/macaudio.c b/sound/soc/apple/macaudio.c
+index 7a8fa29a60..90b2a33151 100644
+--- a/sound/soc/apple/macaudio.c
++++ b/sound/soc/apple/macaudio.c
+@@ -23,6 +23,7 @@
+ /* #define DEBUG */
+ 
+ #include <linux/module.h>
++#include <linux/soc/apple/boot-crumb.h>
+ #include <linux/atomic.h>
+ #include <linux/capability.h>
+ #include <linux/debugfs.h>
+@@ -2901,7 +2902,20 @@ static int macaudio_dpcm_hw_params(struct snd_pcm_substream *substream,
+ 	return 0;
+ }
+ 
++static int __macaudio_fe_startup(struct snd_pcm_substream *substream);
++
++/* Boot crumb (boot-crumb.c): a stall in here is named after a reset. */
+ static int macaudio_fe_startup(struct snd_pcm_substream *substream)
++{
++	int ret;
++
++	apple_boot_crumb_enter(APPLE_CRUMB_AUDIO_OPEN);
++	ret = __macaudio_fe_startup(substream);
++	apple_boot_crumb_leave(APPLE_CRUMB_AUDIO_OPEN);
++	return ret;
++}
++
++static int __macaudio_fe_startup(struct snd_pcm_substream *substream)
+ {
+ 
+ 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+diff --git a/sound/soc/codecs/tas2764.c b/sound/soc/codecs/tas2764.c
+index a84ff861fd..cc1df5d5d7 100644
+--- a/sound/soc/codecs/tas2764.c
++++ b/sound/soc/codecs/tas2764.c
+@@ -4,6 +4,7 @@
+ // Copyright (C) 2020 Texas Instruments Inc.
+ 
+ #include <linux/module.h>
++#include <linux/soc/apple/boot-crumb.h>
+ #include <linux/moduleparam.h>
+ #include <linux/err.h>
+ #include <linux/init.h>
+@@ -294,7 +295,20 @@ static irqreturn_t tas2764_irq_locked(struct tas2764_priv *tas2764)
+ 	return ret;
+ }
+ 
++static irqreturn_t __tas2764_irq(int irq, void *data);
++
++/* Boot crumb (boot-crumb.c): a stall in here is named after a reset. */
+ static irqreturn_t tas2764_irq(int irq, void *data)
++{
++	irqreturn_t ret;
++
++	apple_boot_crumb_enter(APPLE_CRUMB_TAS_FAULT);
++	ret = __tas2764_irq(irq, data);
++	apple_boot_crumb_leave(APPLE_CRUMB_TAS_FAULT);
++	return ret;
++}
++
++static irqreturn_t __tas2764_irq(int irq, void *data)
+ {
+ 	struct tas2764_priv *tas2764 = data;
+ 	irqreturn_t ret;
+-- 
+2.43.0
+
