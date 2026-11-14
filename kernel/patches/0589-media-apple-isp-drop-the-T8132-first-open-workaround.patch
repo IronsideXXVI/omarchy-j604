@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 18:12:31 +0000
+Subject: [PATCH] media: apple: isp: drop the T8132 first-open
+ workarounds
+
+The first camera stream after system boot on the J604 (M4 MacBook Pro
+14", T8132) failed its firmware boot because of how the ISP was powered
+down: the driver wrote the coprocessor control word 0 and the fabric
+words 0, which macOS never does. "power the T8132 ISP down as macOS
+does" fixed that: three cold boots in a row (1.908 twice, 1.909) gave
+the first stream all its frames with no failed boot, the last one with
+the camera detection stopping and booting the firmware again.
+
+The three workarounds tried before it are no longer needed: the 1.5 s
+least off time did not help (the boot still failed after it), the boot
+retry never succeeded (three boots in one call all failed), and keeping
+the detecting firmware up only hid the failing boot. Remove all three;
+the minimum off time, the retry and the detect_keep parameter go with
+them.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/isp/isp-cam.c | 22 ++-----------
+ drivers/media/platform/apple/isp/isp-drv.c |  4 ---
+ drivers/media/platform/apple/isp/isp-drv.h |  8 -----
+ drivers/media/platform/apple/isp/isp-fw.c  | 38 ----------------------
+ 4 files changed, 2 insertions(+), 70 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index a07f072058..71211c2adc 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -589,19 +589,6 @@ static const struct isp_preset isp_lens_source = {
+ 	.output_dim = { 1920, 1080 },
+ };
+ 
+-/*
+- * With a deferred start the camera is detected inside the first stream
+- * start. Booting the firmware a second time right after the detection
+- * stopped it fails on T8132 (no first magic number), every time, while the
+- * boot of the next open works. detect_keep keeps the firmware that detected
+- * the camera running into that first stream, as for resident firmware;
+- * detect_keep=N stops and boots it again, as before.
+- */
+-static bool detect_keep = true;
+-module_param(detect_keep, bool, 0644);
+-MODULE_PARM_DESC(detect_keep,
+-		 "Keep the firmware that detected the camera running into the first stream (deferred start, e.g. T8132; default: on)");
+-
+ /*
+  * macOS sends this Mac's camera an exposure gain cap, a neutral exposure
+  * bias, the auto exposure speed both ways, local tone mapping on with its
+@@ -971,11 +958,8 @@ int apple_isp_detect_camera(struct apple_isp *isp)
+ 
+ 	err = isp_detect_camera(isp);
+ 
+-	/*
+-	 * Resident firmware stays up; the channel is set up per stream. So
+-	 * does firmware that detected the camera inside the first stream start.
+-	 */
+-	if (isp->hw->resident_fw || isp->detect_in_stream) {
++	/* Resident firmware stays up; the channel is set up per stream. */
++	if (isp->hw->resident_fw) {
+ 		if (err)
+ 			apple_isp_firmware_halt(isp);
+ 		else
+@@ -1500,9 +1484,7 @@ int apple_isp_start_camera(struct apple_isp *isp)
+ 	 * detection like at probe, and booted again here.
+ 	 */
+ 	if (isp->hw->deferred_start && !isp->camera_detected) {
+-		isp->detect_in_stream = READ_ONCE(detect_keep);
+ 		err = apple_isp_detect_camera(isp);
+-		isp->detect_in_stream = false;
+ 		if (err < 0) {
+ 			dev_err(isp->dev, "failed to detect the camera: %d\n", err);
+ 			return err;
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index 89431c4e32..b93de4aaae 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -1330,10 +1330,6 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
+ 	.ae_stability = 16,
+ 	.ae_stability_to_stable = 8,
+ 	.macos_session_settings = true,
+-	/* macOS keeps it down at least about 1.2 s between two boots */
+-	.min_off_ms = 1500,
+-	/* Its first stream after the detection fails stage 1 once (1.902, 1.905) */
+-	.boot_retries = 2,
+ 	/* macOS never writes its control word 0 or its fabric words (q9-cam-cmd-3) */
+ 	.macos_stop = true,
+ };
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 6cbf9c75b0..12620083e8 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -316,10 +316,6 @@ struct apple_isp_hw {
+ 	u32 ae_stability_to_stable;
+ 	/* Send the tone and exposure settings macOS sends this camera each session */
+ 	bool macos_session_settings;
+-	/* Least time the ISP stays powered down before it is powered up again, in ms */
+-	unsigned int min_off_ms;
+-	/* Boot again after a failed firmware boot, this many times at most */
+-	unsigned int boot_retries;
+ 	/* Power down as macOS does: no control word or fabric word writes */
+ 	bool macos_stop;
+ };
+@@ -446,12 +442,8 @@ struct apple_isp {
+ 	void __iomem *dapf;
+ 	void __iomem *mbox_route;
+ 	void __iomem *core_park[2];
+-	/* When the ISP domains were last powered down (0: not since boot) */
+-	ktime_t off_at;
+ 	/* The last power-down left the coprocessor control word as it was */
+ 	bool macos_stopped;
+-	/* The camera detection runs inside the first stream start (deferred_start) */
+-	bool detect_in_stream;
+ 	void __iomem *pre_dart;
+ 	void __iomem *dart_setup[3];
+ 	struct device *dapf_dart;
+diff --git a/drivers/media/platform/apple/isp/isp-fw.c b/drivers/media/platform/apple/isp/isp-fw.c
+index 94a4a376af..23ecca9dfa 100644
+--- a/drivers/media/platform/apple/isp/isp-fw.c
++++ b/drivers/media/platform/apple/isp/isp-fw.c
+@@ -620,37 +620,15 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
+ 		isp_park_cores(isp);
+ 
+ 	apple_isp_power_down_domains(isp);
+-	isp->off_at = ktime_get();
+ 	isp->macos_stopped = macos;
+ }
+ 
+-/*
+- * On T8132 a boot that follows a power-down at once gets no first magic
+- * number, and the next one, seconds later, starts: the first stream after
+- * the camera detection failed that way. macOS leaves the ISP down for about
+- * 1.2 s between two boots. Wait out what is left of hw->min_off_ms.
+- */
+-static void isp_wait_off_time(struct apple_isp *isp)
+-{
+-	s64 off_ms;
+-
+-	if (!isp->hw->min_off_ms || !isp->off_at)
+-		return;
+-	off_ms = ktime_ms_delta(ktime_get(), isp->off_at);
+-	if (off_ms >= 0 && off_ms < isp->hw->min_off_ms) {
+-		dev_dbg(isp->dev, "powered down %lld ms ago, waiting %lld ms\n",
+-			off_ms, isp->hw->min_off_ms - off_ms);
+-		msleep(isp->hw->min_off_ms - off_ms);
+-	}
+-}
+-
+ static int isp_firmware_boot_stage1(struct apple_isp *isp)
+ {
+ 	int err;
+ 	// u32 val;
+ 
+ 	isp_restore_fw_memory(isp);
+-	isp_wait_off_time(isp);
+ 
+ 	err = apple_isp_power_up_domains(isp);
+ 	if (err < 0)
+@@ -1423,7 +1401,6 @@ static int isp_check_restarted(struct apple_isp *isp)
+ int apple_isp_firmware_boot(struct apple_isp *isp)
+ {
+ 	bool restart = isp->hw->resident_fw && isp->fw.started;
+-	unsigned int tries = 0;
+ 	int err;
+ 
+ 	switch (isp->fw_state) {
+@@ -1438,7 +1415,6 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
+ 		return -EIO;
+ 	}
+ 
+-again:
+ 	/* The firmware starts with new rings. */
+ 	isp->ipc_stale = NULL;
+ 	isp->ipc_failed = false;
+@@ -1456,18 +1432,6 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
+ 		if (err)
+ 			isp_firmware_shutdown(isp);
+ 	}
+-	if (err && !isp->hw->resident_fw && tries < isp->hw->boot_retries) {
+-		/*
+-		 * On T8132 the first boot after the camera detection gets no
+-		 * first magic number, and the next one starts. The failed
+-		 * boot powered the ISP down: cycle it as a second open does.
+-		 */
+-		tries++;
+-		dev_warn(isp->dev, "firmware boot failed: %d; booting again (%u of %u)\n",
+-			 err, tries, isp->hw->boot_retries);
+-		pm_runtime_put_sync(isp->dev);
+-		goto again;
+-	}
+ 	if (err) {
+ 		dev_err(isp->dev, "failed to boot firmware: %d\n", err);
+ 		pm_runtime_put_sync(isp->dev);
+@@ -1476,8 +1440,6 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
+ 		return err;
+ 	}
+ 
+-	if (tries)
+-		dev_info(isp->dev, "firmware booted on try %u\n", tries + 1);
+ 	isp->fw_state = ISP_FW_RUNNING;
+ 
+ 	return 0;
+-- 
+2.43.0
+

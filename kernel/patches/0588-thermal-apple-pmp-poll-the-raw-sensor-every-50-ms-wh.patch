@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 17:51:02 +0000
+Subject: [PATCH] thermal: apple-pmp: poll the raw sensor every 50 ms
+ while cool
+
+The raw thermal poll fires every 5 ms on CPU 8 whatever the die
+temperature. On an idle J604 desktop that is 200 timer wakeups a
+second on a P core (600 apple_pmp_poll_timer starts in a 3 s trace),
+each one a busy tick that also kicks the idle load balancer.
+
+Run the poll every 50 ms while the last sample was valid, below 85 C
+and with no guard step in force, and every 5 ms otherwise. A rise is
+sampled at 5 ms at most two slow periods after it starts, with 21 C
+left to the 106 C passive trip. The slope window is 50 ms, so the
+forecast still gets one fresh point per slow sample, and the governor
+keeps its 100 ms cadence. Both periods are tick multiples, so the
+fixed CPU and tick phase are kept. After a deep sleep the poll starts
+at 5 ms.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/thermal/apple-pmp-thermal.c | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/thermal/apple-pmp-thermal.c b/drivers/thermal/apple-pmp-thermal.c
+index a814a3772b..2ebe14d022 100644
+--- a/drivers/thermal/apple-pmp-thermal.c
++++ b/drivers/thermal/apple-pmp-thermal.c
+@@ -43,6 +43,17 @@
+  */
+ #define APPLE_PMP_HYST_MC		2000
+ #define APPLE_PMP_POLL_MS		5
++/*
++ * Far below the passive trip the raw poll runs ten times slower. At idle
++ * the 5 ms poll was 200 timer wakeups a second on a P core, each one a
++ * busy tick. A sensor error, a guard step or a sample at or above
++ * APPLE_PMP_POLL_COOL_MC returns it to 5 ms at the next expiry, so a
++ * rise is seen at 5 ms at most two slow periods after it began, with
++ * 21 C left to the passive trip. Both periods are tick multiples at
++ * HZ 1000, 500, 200 and 100, so the tick phase below holds across them.
++ */
++#define APPLE_PMP_POLL_COOL_MS		50
++#define APPLE_PMP_POLL_COOL_MC		85000
+ #define APPLE_PMP_GOVERNOR_NS	100000000ULL
+ 
+ /*
+@@ -116,6 +127,7 @@ static struct {
+ 	struct hrtimer poll_timer;
+ 	struct work_struct poll_work;
+ 	bool polling;
++	bool poll_cool; /* the raw poll runs at APPLE_PMP_POLL_COOL_MS */
+ 	bool owner; /* apple-soc-cpufreq's unmanaged cap is released */
+ 	bool critical_dumped;
+ 	bool ready;
+@@ -558,6 +570,10 @@ static void apple_pmp_poll_work(struct work_struct *work)
+ 
+ 	apple_pmp_sample();
+ 	pmp_thermal.sample_count++;
++	scoped_guard(mutex, &pmp_thermal.lock)
++		WRITE_ONCE(pmp_thermal.poll_cool,
++			   !pmp_thermal.cached_error && !pmp_thermal.guard_level &&
++			   pmp_thermal.cached_mc < APPLE_PMP_POLL_COOL_MC);
+ 	apple_pmp_critical(pmp_thermal.zone);
+ 	now = ktime_get_ns();
+ 	if (now - pmp_thermal.governor_ns >= APPLE_PMP_GOVERNOR_NS) {
+@@ -573,7 +589,9 @@ static enum hrtimer_restart apple_pmp_poll_timer(struct hrtimer *timer)
+ 	 * One work item coalesces missed ticks; no burst of stale confirmations.
+ 	 */
+ 	queue_work(system_highpri_wq, &pmp_thermal.poll_work);
+-	hrtimer_forward_now(timer, ms_to_ktime(APPLE_PMP_POLL_MS));
++	hrtimer_forward_now(timer, ms_to_ktime(READ_ONCE(pmp_thermal.poll_cool) ?
++					       APPLE_PMP_POLL_COOL_MS :
++					       APPLE_PMP_POLL_MS));
+ 	return HRTIMER_RESTART;
+ }
+ 
+@@ -911,6 +929,7 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
+ 	pmp_thermal.shutdown_requested = false;
+ 	pmp_thermal.critical_dumped = false;
+ 	pmp_thermal.governor_ns = 0;
++	pmp_thermal.poll_cool = false;
+ 	INIT_DELAYED_WORK(&pmp_thermal.setup_work, apple_pmp_thermal_setup_work);
+ 	INIT_DELAYED_WORK(&pmp_thermal.power_work, apple_pmp_power_work);
+ 	INIT_WORK(&pmp_thermal.poll_work, apple_pmp_poll_work);
+@@ -935,6 +954,8 @@ static int apple_pmp_thermal_prepare(struct device *dev)
+ 	}
+ 	if (pmp_thermal.power_polling)
+ 		cancel_delayed_work_sync(&pmp_thermal.power_work);
++	/* The first samples after the wake run at 5 ms. */
++	WRITE_ONCE(pmp_thermal.poll_cool, false);
+ 	pmp_thermal.sleep_paused = true;
+ 	return 0;
+ }
+-- 
+2.43.0
+
