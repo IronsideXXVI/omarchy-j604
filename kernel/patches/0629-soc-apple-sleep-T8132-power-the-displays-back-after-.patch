@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 04:11:09 +0000
+Subject: [PATCH] soc: apple: sleep: T8132: power the displays back
+ after a sleep
+
+The display off step lowers each display complex's CPU, front-end and
+system states by hand, after the display coprocessor's driver kept
+them on for genpd through the suspend. The commit's power snapshot is
+taken after that, so the wake restores those words off, and genpd,
+which still counts them on, never raises them either: the display
+driver's resume finds its block unpowered. A refusal after display off
+leaves them the same way.
+
+Save the words before display off and put them back after a wake or a
+refusal, as the wake already does for ATC0's, in the order the J604's
+macOS raises them after its wake: system state, front end, then the
+CPU with its power-gate retention released first, and pmc-dcp as it
+was. An unbound external display stays off, as macOS has them.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 55 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 7141df4fe5..ebdef29192 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -660,6 +660,10 @@ struct apple_sleep {
+ 	u64 resumes_after;
+ 	/* T8132: ATC0's words as they were before the commit path lowered them. */
+ 	u32 atc0_saved[3];
++	/* Each display complex's CPU, front-end and system words, and pmc-dcp, at display off */
++	u32 disp_saved[SLEEP_DISPLAYS_MAX][3];
++	u32 pmc_dcp_saved;
++	bool disp_saved_valid;
+ 	int cluster_e_ret;
+ 	int cluster_ave_ret;
+ 	/* The AVE complex, as the parent domain of the encoders' enabled domains */
+@@ -1977,6 +1981,12 @@ static int sleep_display_off(struct apple_sleep *s)
+ 	bool bridge = READ_ONCE(display_bridge);
+ 	int n = soc->ndisp, j, i, ret = 0;
+ 
++	for (i = 0; i < n; i++)
++		for (j = 0; j < 3; j++)
++			s->disp_saved[i][j] = readl(s->ps + domains[i][j]);
++	s->pmc_dcp_saved = readl(s->pmc_dcp);
++	s->disp_saved_valid = true;
++
+ 	if (READ_ONCE(display_raise_first))
+ 		sleep_display_raise(s);
+ 
+@@ -3842,6 +3852,49 @@ static void t8132_wake(struct apple_sleep *s)
+ 	s->pins_lost = s->pins_saved_valid;
+ }
+ 
++/*
++ * After a refusal or a wake, each display complex its driver owns back as display off found
++ * it. Those words went off by hand, after the driver had kept them on for genpd, and the
++ * commit's snapshot was taken later, so neither the wake's restore nor genpd brings them
++ * back. As macOS raises them after its wake: system, front end, then the CPU with its
++ * power-gate retention released first. An unbound one stays off, as macOS has them.
++ */
++static void sleep_display_restore(struct apple_sleep *s)
++{
++	const struct apple_sleep_soc *soc = s->soc;
++	const u32 (*domains)[3] = soc->ps.disp;
++	int i;
++
++	if (!s->disp_saved_valid)
++		return;
++	s->disp_saved_valid = false;
++
++	for (i = 0; i < soc->ndisp; i++) {
++		const u32 *saved = s->disp_saved[i];
++
++		if (i != 0 && !s->display[i].bound)
++			continue;
++		if (FIELD_GET(PS_TARGET, saved[2]) &&
++		    sleep_ps_restore(s->ps + domains[i][2], saved[2]))
++			dev_warn(s->dev, "display %d: system state not back: %#x\n", i,
++				 readl(s->ps + domains[i][2]));
++		if (FIELD_GET(PS_TARGET, saved[1]) &&
++		    sleep_ps_restore(s->ps + domains[i][1], saved[1]))
++			dev_warn(s->dev, "display %d: front end not back: %#x\n", i,
++				 readl(s->ps + domains[i][1]));
++		if (!FIELD_GET(PS_TARGET, saved[0]))
++			continue;
++		if (soc->pwrgate_disp[i][0]) {
++			writel(0, s->pwrgate + soc->pwrgate_disp[i][0]);
++			writel(1, s->pwrgate + soc->pwrgate_disp[i][1]);
++		}
++		if (sleep_ps_restore(s->ps + domains[i][0], saved[0]))
++			dev_warn(s->dev, "display %d: CPU state not back: %#x\n", i,
++				 readl(s->ps + domains[i][0]));
++	}
++	writel(s->pmc_dcp_saved, s->pmc_dcp);
++}
++
+ static int apple_sleep_enter(suspend_state_t state)
+ {
+ 	struct apple_sleep *s = apple_sleep;
+@@ -3867,6 +3920,7 @@ static int apple_sleep_enter(suspend_state_t state)
+ 		dev_dbg(s->dev, "refused before any commit coprocessor stop: %d\n", ret);
+ 		spin_table_unhold_parked();
+ 		apple_sleep_stray_restore(s);
++		sleep_display_restore(s);
+ 		return ret;
+ 	}
+ 	apple_sleep_entry_mark(s, 160);
+@@ -3910,6 +3964,7 @@ static int apple_sleep_enter(suspend_state_t state)
+ 
+ 	apple_sleep_match_undo(s);
+ 	apple_sleep_stray_restore(s);
++	sleep_display_restore(s);
+ 	sleep_wake_restore(s);
+ 
+ 	return ret;
+-- 
+2.43.0
+
