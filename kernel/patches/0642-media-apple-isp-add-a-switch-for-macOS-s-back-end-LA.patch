@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 05:40:15 +0000
+Subject: [PATCH] media: apple: isp: add a switch for macOS's back-end
+ LA setting
+
+At every stream start macOS reads the T8132 camera's back-end LA setting
+and writes it back as 0x20000, 0x960028, 0, 0, 0, 0x8086, 0, 0. The
+driver has never sent the command, and the camera's picture turns
+magenta in dim light.
+
+What each word controls is not known, so add the command and
+macos_be_la, off by default, to send the values exactly as macOS does
+and measure the effect in low light first. It is read at stream start;
+a refusal is reported once and the stream goes on.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/isp/isp-cam.c | 21 +++++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-cmd.c | 12 ++++++++++++
+ drivers/media/platform/apple/isp/isp-cmd.h | 10 ++++++++++
+ 3 files changed, 43 insertions(+)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index b1e5661db6..69402f23de 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -707,6 +707,21 @@ module_param(macos_ae_table, bool, 0644);
+ MODULE_PARM_DESC(macos_ae_table,
+ 		 "Select the auto exposure integration table macOS selects on this camera (default: off)");
+ 
++/*
++ * macOS reads this camera's back-end LA setting at every stream start and
++ * writes it back with the values below. What each word does is not
++ * known, so they are sent as macOS sends them, behind macos_be_la (off by
++ * default) until a low-light side-by-side shows their effect.
++ */
++static bool macos_be_la;
++module_param(macos_be_la, bool, 0644);
++MODULE_PARM_DESC(macos_be_la,
++		 "Write the back-end LA setting macOS writes on this camera (default: off)");
++
++static const u32 isp_macos_be_la[8] = {
++	0x20000, 0x960028, 0, 0, 0, 0x8086, 0, 0,
++};
++
+ /*
+  * macOS sets this Mac's auto exposure stability thresholds to 16 and 8 for
+  * every camera session; macos_ae_stability=N gives back 32 and 20.
+@@ -1522,6 +1537,12 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
+ 			dev_warn_once(isp->dev, "AE integration table refused: %d\n", err);
+ 	}
+ 
++	if (READ_ONCE(macos_be_la) && isp->hw->macos_session_settings) {
++		err = isp_cmd_ch_be_lasetting_set(isp, ch, isp_macos_be_la);
++		if (err)
++			dev_warn_once(isp->dev, "back-end LA setting refused: %d\n", err);
++	}
++
+ 	if (READ_ONCE(macos_sif_format))
+ 		err = isp_cmd_ch_sif_pixel_format_set(isp, ch, 1, 0, 1);
+ 	else
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.c b/drivers/media/platform/apple/isp/isp-cmd.c
+index 7387607b0b..14c7776d7a 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.c
++++ b/drivers/media/platform/apple/isp/isp-cmd.c
+@@ -705,6 +705,18 @@ int isp_cmd_ch_ae_stability_set(struct apple_isp *isp, u32 chan, u32 stability)
+ 	return CISP_SEND_IN(isp, args);
+ }
+ 
++int isp_cmd_ch_be_lasetting_set(struct apple_isp *isp, u32 chan,
++				const u32 setting[8])
++{
++	struct cmd_ch_be_lasetting_set args = {
++		.opcode = CISP_OPCODE(CISP_CMD_CH_BE_LASETTING_SET),
++		.chan = chan,
++	};
++
++	memcpy(args.setting, setting, sizeof(args.setting));
++	return CISP_SEND_IN(isp, args);
++}
++
+ int isp_cmd_ch_ae_integration_table_set(struct apple_isp *isp, u32 chan,
+ 					u32 table)
+ {
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.h b/drivers/media/platform/apple/isp/isp-cmd.h
+index 25560185f5..d37256882e 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.h
++++ b/drivers/media/platform/apple/isp/isp-cmd.h
+@@ -59,6 +59,7 @@
+ #define CISP_CMD_CH_AE_STABILITY_SET			     0x021a
+ #define CISP_CMD_CH_AE_STABILITY_TO_STABLE_SET		     0x0229
+ #define CISP_CMD_CH_AE_INTEGRATION_TABLE_SET		     0x0240
++#define CISP_CMD_CH_BE_LASETTING_SET			     0x0a15
+ #define CISP_CMD_CH_AE_2WAYSPEED_SET			     0x0243
+ #define CISP_CMD_CH_SENSOR_NVM_GET			     0x0501
+ #define CISP_CMD_CH_SENSOR_PERMODULE_LSC_INFO_GET	     0x0507
+@@ -770,6 +771,13 @@ struct cmd_ch_ae_integration_table_set {
+ } __packed;
+ static_assert(sizeof(struct cmd_ch_ae_integration_table_set) == 0xd4);
+ 
++struct cmd_ch_be_lasetting_set {
++	u64 opcode;
++	u32 chan;
++	u32 setting[8];
++} __packed;
++static_assert(sizeof(struct cmd_ch_be_lasetting_set) == 0x2c);
++
+ struct cmd_ch_ae_frame_rate_max_get {
+ 	u64 opcode;
+ 	u32 chan;
+@@ -833,6 +841,8 @@ int isp_cmd_ch_ae_stability_to_stable_set(struct apple_isp *isp, u32 chan,
+ 					  u32 stability);
+ int isp_cmd_ch_ae_integration_table_set(struct apple_isp *isp, u32 chan,
+ 					u32 table);
++int isp_cmd_ch_be_lasetting_set(struct apple_isp *isp, u32 chan,
++				const u32 setting[8]);
+ int isp_cmd_ch_ae_frame_rate_max_get(struct apple_isp *isp, u32 chan,
+ 				     struct cmd_ch_ae_frame_rate_max_get *args);
+ int isp_cmd_ch_ae_frame_rate_max_set(struct apple_isp *isp, u32 chan,
+-- 
+2.43.0
+

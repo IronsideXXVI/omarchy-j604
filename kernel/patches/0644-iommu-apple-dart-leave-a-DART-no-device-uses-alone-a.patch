@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 06:05:08 +0000
+Subject: [PATCH] iommu: apple-dart: leave a DART no device uses alone
+ after a deep sleep
+
+After a firmware-driven resume, every DART that runtime PM had
+suspended gets its saved state written back in the noirq phase, and
+the write-back starts by reading the stream registers. That includes a
+DART whose consumers are all disabled, as the J604's SIO DART is (SIO
+and the AES engine are both off in its tree). It has no power-domains
+of its own, so genpd powers nothing for it, and its block may well be
+off after the wake: the read then aborts, as the radio's DART did
+before its host learnt to restore it.
+
+A DART with no stream in any group has nothing to restore. Skip it,
+unless apple_dart.restore_unused is set. Its runtime resume restores
+it as before, should a consumer ever bind.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/iommu/apple-dart.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/drivers/iommu/apple-dart.c b/drivers/iommu/apple-dart.c
+index 3176df5265..1203ba49a7 100644
+--- a/drivers/iommu/apple-dart.c
++++ b/drivers/iommu/apple-dart.c
+@@ -6561,6 +6561,27 @@ module_param(wake_restore_suspended, bool, 0644);
+ MODULE_PARM_DESC(wake_restore_suspended,
+ 		 "After a real sleep, restore runtime-suspended DARTs in noirq (default) or at their runtime resume");
+ 
++/*
++ * A DART no device uses (its consumers' nodes disabled, as the J604's SIO DART) has nothing to
++ * restore after a real sleep, and nothing may have powered its block: a DART without
++ * power-domains of its own gets none from genpd. Off, the restore's first read aborts, as the
++ * radio's DART did. Its runtime resume restores it should a consumer ever bind.
++ */
++static bool restore_unused;
++module_param(restore_unused, bool, 0644);
++MODULE_PARM_DESC(restore_unused,
++		 "After a deep sleep, also restore the DARTs no device uses (default off)");
++
++static bool apple_dart_in_use(struct apple_dart *dart)
++{
++	unsigned int sid;
++
++	for (sid = 0; sid < dart->num_streams; sid++)
++		if (dart->sid2group[sid])
++			return true;
++	return false;
++}
++
+ static __maybe_unused int apple_dart_resume_noirq(struct device *dev)
+ {
+ 	struct apple_dart *dart = dev_get_drvdata(dev);
+@@ -6582,6 +6603,12 @@ static __maybe_unused int apple_dart_resume_noirq(struct device *dev)
+ 
+ 	ret = pm_runtime_force_resume(dev);
+ 
++	if (!ret && pm_resume_via_firmware() && pm_runtime_status_suspended(dev) &&
++	    !READ_ONCE(restore_unused) && !apple_dart_in_use(dart)) {
++		dev_dbg(dev, "no device uses it: not restored after sleep\n");
++		return 0;
++	}
++
+ 	/*
+ 	 * A real sleep took the registers even of a DART runtime PM had suspended, which
+ 	 * force_resume leaves alone. Its consumer's firmware may DMA through it before
+-- 
+2.43.0
+
