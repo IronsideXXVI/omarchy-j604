@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 21:06:20 +0000
+Subject: [PATCH] sched/fair: Optionally place a new task on an idle
+ CPU of the highest capacity
+
+A new task has no utilization history, so fork and exec balancing treat
+every idle CPU alike. A CPU-bound thread therefore often starts on a small
+CPU and stays there until it becomes a misfit and is moved up.
+
+On the M4 MacBook Pro (T8132, 4 P cores at capacity 1024, 6 E cores at
+488) a single-thread memory bandwidth test that starts a new thread for
+each repetition reaches 51-74 GB/s for copy when it is free to run
+anywhere, and 94.6 GB/s when the same thread is pinned to a P core;
+macOS reaches 92.0 GB/s with the same source.
+
+Add FORK_BIG: a new task goes to an idle CPU of the highest capacity it
+may use, when one is idle; otherwise the usual slow path runs. Kernel
+threads, SCHED_IDLE tasks and tasks whose uclamp_max is below that
+capacity are left alone. The feature is off by default.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ kernel/sched/fair.c     | 37 +++++++++++++++++++++++++++++++++++++
+ kernel/sched/features.h |  6 ++++++
+ 2 files changed, 43 insertions(+)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index d6e25fde77..98d4719523 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -9964,6 +9964,36 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+  *
+  * Returns the target CPU number.
+  */
++/*
++ * A new task has no utilization history, so fork and exec balancing treat
++ * every idle CPU alike and a CPU-bound thread often starts on a small CPU,
++ * where it stays until it becomes a misfit. With FORK_BIG, a new task goes
++ * to an idle CPU of the highest capacity it is allowed to use, if there is
++ * one; otherwise the usual slow path runs. Kernel threads, SCHED_IDLE tasks
++ * and tasks whose uclamp_max is below that capacity are left alone.
++ */
++static int select_idle_biggest(struct task_struct *p)
++{
++	int cpu;
++
++	for_each_cpu_wrap(cpu, p->cpus_ptr, smp_processor_id()) {
++		if (!cpu_active(cpu) ||
++		    arch_scale_cpu_capacity(cpu) != p->max_allowed_capacity)
++			continue;
++		if (available_idle_cpu(cpu))
++			return cpu;
++	}
++	return -1;
++}
++
++static inline bool fork_big_candidate(struct task_struct *p, int wake_flags)
++{
++	return (wake_flags & (WF_FORK | WF_EXEC)) && sched_feat(FORK_BIG) &&
++	       sched_asym_cpucap_active() && !(p->flags & PF_KTHREAD) &&
++	       !task_has_idle_policy(p) &&
++	       uclamp_eff_value(p, UCLAMP_MAX) >= p->max_allowed_capacity;
++}
++
+ static int
+ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ {
+@@ -9979,6 +10009,13 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 	 * required for stable ->cpus_allowed
+ 	 */
+ 	lockdep_assert_held(&p->pi_lock);
++	if (fork_big_candidate(p, wake_flags)) {
++		new_cpu = select_idle_biggest(p);
++		if (new_cpu >= 0)
++			return new_cpu;
++		new_cpu = prev_cpu;
++	}
++
+ 	if (wake_flags & WF_TTWU) {
+ 		record_wakee(p);
+ 
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index 26f53ceb34..9383de757c 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -149,6 +149,12 @@ SCHED_FEAT(MISFIT_ROTATE, true)
+  */
+ SCHED_FEAT(MISFIT_RUNTIME, true)
+ 
++/*
++ * On asymmetric CPU capacity systems, place a new task (fork or exec) on an
++ * idle CPU of the highest capacity it may use, when one is idle.
++ */
++SCHED_FEAT(FORK_BIG, false)
++
+ SCHED_FEAT(LATENCY_WARN, false)
+ 
+ /*
+-- 
+2.43.0
+

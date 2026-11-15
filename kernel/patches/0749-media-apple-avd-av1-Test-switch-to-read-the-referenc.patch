@@ -1,0 +1,370 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 21:36:59 +0000
+Subject: [PATCH] media: apple: avd: av1: Test switch to read the
+ reference's CDFs in place
+
+An AV1 picture's CDF input is a CPU copy of its primary reference's VP
+output, made while the picture is prepared. So the next picture is not
+built until the previous picture's VP callback has run, and with one AV1
+VP engine that engine waits for the callback and the next picture's
+whole preparation on every picture. The queue keeps about 1.33 AV1
+pictures in flight, where macOS keeps 2.19 on the same silicon, and AV1
+8-bit decodes at 88 % of macOS (598 vs 683 fps at 4K).
+
+Add av1_cdf_chain, off by default and latched when a stream starts. It
+applies only when the queue firmware lists exactly one AV1 VP engine
+(new avd_qfw_vp_engines()). A picture whose CDFs come from a reference
+still in a bank then names that bank's CDF output as its CDF input,
+and does not wait for a named reference's VP callback: one engine runs
+VP in submit order. The motion-field and segmentation-map waits on the
+whole reference picture stay, as do pictures with frame-end update off
+(their output must start as their input) and pictures on default CDFs.
+A bank that is read this way stays reserved until the reader's VP
+callback or its retirement, and the reader's CAPTURE tail gets the CDFs
+it read at its VP callback, as before.
+
+With the switch off nothing changes. Whether one engine keeps VP in
+submit order across queue slots is what the switch tests: a bit-exact
+decode against software decides it.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/avd/avd-av1.c    | 82 +++++++++++++++++--
+ .../platform/apple/avd/avd-backend-queue.c    | 13 +++
+ drivers/media/platform/apple/avd/avd.h        |  1 +
+ .../platform/apple/avd/tests/av1-test.py      | 61 +++++++++++++-
+ 4 files changed, 150 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/media/platform/apple/avd/avd-av1.c b/drivers/media/platform/apple/avd/avd-av1.c
+index 99a4b9e7da..7697dd23d6 100644
+--- a/drivers/media/platform/apple/avd/avd-av1.c
++++ b/drivers/media/platform/apple/avd/avd-av1.c
+@@ -47,6 +47,11 @@ module_param(av1_out_hdr58, uint, 0644);
+ MODULE_PARM_DESC(av1_out_hdr58,
+ 		 "Test only: 10-bit AV1 picture header word at HEVC's hdr_58 place (default 0)");
+ 
++static bool av1_cdf_chain;
++module_param(av1_cdf_chain, bool, 0644);
++MODULE_PARM_DESC(av1_cdf_chain,
++		 "Test only: one AV1 VP engine reads its reference's CDFs in place (at stream start); default off");
++
+ static bool av1_mvs_after_vp;
+ module_param(av1_mvs_after_vp, bool, 0644);
+ MODULE_PARM_DESC(av1_mvs_after_vp,
+@@ -242,6 +247,7 @@ struct avd_av1_run {
+ 	struct avd_run base;
+ 
+ 	struct {
++		dma_addr_t probs;	/* 0: this bank's own CDF input */
+ 		dma_addr_t probs_out;
+ 		dma_addr_t color;
+ 		dma_addr_t seg;
+@@ -291,10 +297,15 @@ struct avd_av1_bank {
+ 	u64 timestamp;
+ 	u32 flags;
+ 	u8 seg_flags;
++	/* av1_cdf_chain: the bank whose probs_out this picture's VP reads, and readers of ours */
++	struct avd_av1_bank *cdf_src;
++	unsigned int cdf_users;
++	bool retired;	/* PP done, still held for a reader's VP */
+ };
+ 
+ struct avd_av1_stream {
+ 	unsigned int nbanks;
++	bool cdf_chain;
+ 	struct avd_av1_bank bank[AVD_AV1_BANKS];
+ 	struct avd_av1_bank *b;
+ };
+@@ -326,6 +337,19 @@ static bool avd_av1_writes_seg(u8 flags)
+ 	       (flags & V4L2_AV1_SEGMENTATION_FLAG_UPDATE_MAP);
+ }
+ 
++/*
++ * av1_cdf_chain: with one AV1 VP engine, VP runs in submit order, so a picture can
++ * read the CDFs its primary reference's VP writes in place, without waiting for
++ * that VP's callback to copy them. Not when frame-end update is off: that picture's
++ * output must start as its input, which is copied while it is prepared.
++ */
++static bool avd_av1_cdf_chain(const struct avd_av1_stream *stream,
++			      const struct v4l2_ctrl_av1_frame *frame)
++{
++	return stream && stream->cdf_chain && !avd_av1_default_cdf(frame) &&
++	       !(frame->flags & V4L2_AV1_FRAME_FLAG_DISABLE_FRAME_END_UPDATE_CDF);
++}
++
+ /*
+  * Queued CDF output is private coherent VP storage, published by the tagged
+  * VP callback after the queue's dma_rmb(). CAPTURE maps and motion fields
+@@ -334,10 +358,14 @@ static bool avd_av1_writes_seg(u8 flags)
+ static bool avd_av1_depends(const struct v4l2_ctrl_av1_frame *frame,
+ 			   const struct avd_av1_bank *bank)
+ {
++	bool chain = avd_av1_cdf_chain(bank->codec.stream, frame);
++	/* Pairs with the release in avd_av1_vp_done(). */
++	bool vp_done = smp_load_acquire(&bank->vp_done);
++
+ 	/* Preserve same-VP ordering for named references when engines differ. */
+ 	for (unsigned int i = 0; i < V4L2_AV1_REFS_PER_FRAME; i++)
+ 		if (avd_av1_ref_ts(frame, frame->ref_frame_idx[i]) == bank->timestamp &&
+-		    (!smp_load_acquire(&bank->vp_done) ||
++		    ((!chain && !vp_done) ||
+ 		     ((frame->flags & V4L2_AV1_FRAME_FLAG_USE_REF_FRAME_MVS) &&
+ 		      !READ_ONCE(av1_mvs_after_vp))))
+ 			return true;
+@@ -397,6 +425,7 @@ static bool avd_av1_ready(struct avd_ctx *ctx)
+ 		ready = true;
+ 		for (unsigned int i = 0; i < av1_ctx->nbanks; i++)
+ 			if (READ_ONCE(av1_ctx->bank[i].busy) &&
++			    !READ_ONCE(av1_ctx->bank[i].retired) &&
+ 			    avd_av1_depends(frame, &av1_ctx->bank[i]))
+ 				ready = false;
+ 	}
+@@ -987,7 +1016,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
+ 	push(0, "");
+ 
+ 	pusha(run->addresses.probs_out, "probs_out", 0);
+-	pusha(av1_ctx->bufs.probs.addr, "probs", 1);
++	pusha(run->addresses.probs ?: av1_ctx->bufs.probs.addr, "probs", 1);
+ 	pusha(av1_ctx->bufs.above_info.addr, "col", 0);
+ 	pusha(run->addresses.seg, "seg", 0);
+ 	pusha(run->addresses.prev_seg, "prev_seg", 1);
+@@ -1327,6 +1356,7 @@ static void avd_av1_prepare_prob(struct avd_ctx *ctx, struct avd_av1_run *run)
+ 	struct avd_decoded_buffer *dst, *ref;
+ 	struct avd_av1_bank *bank = NULL;
+ 
++	run->addresses.probs = 0;
+ 	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
+ 	if (stream->nbanks > 1 && !avd_av1_default_cdf(run->frame)) {
+ 		ref = avd_get_ref_buf(ctx, &dst->base.vb,
+@@ -1336,6 +1366,11 @@ static void avd_av1_prepare_prob(struct avd_ctx *ctx, struct avd_av1_run *run)
+ 	}
+ 	if (!bank) {
+ 		avd_av1_set_prob(ctx, run);
++	} else if (avd_av1_cdf_chain(stream, run->frame)) {
++		/* Read in VP order; the CAPTURE-tail copy waits for our VP callback. */
++		run->addresses.probs = bank->codec.bufs.probs_out.addr;
++		bank->cdf_users++;
++		stream->b->cdf_src = bank;	/* avd_av1_run() made b this picture's bank */
+ 	} else {
+ 		memcpy(codec->bufs.probs.cpu, bank->codec.bufs.probs_out.cpu,
+ 		       AVD_CDFS_SIZE);
+@@ -1346,7 +1381,8 @@ static void avd_av1_prepare_prob(struct avd_ctx *ctx, struct avd_av1_run *run)
+ 	}
+ 	if (stream->nbanks > 1) {
+ 		/* No VP write when frame-end update is disabled: preserve its input. */
+-		memcpy(codec->bufs.probs_out.cpu, codec->bufs.probs.cpu, AVD_CDFS_SIZE);
++		if (!run->addresses.probs)
++			memcpy(codec->bufs.probs_out.cpu, codec->bufs.probs.cpu, AVD_CDFS_SIZE);
+ 		run->addresses.probs_out = codec->bufs.probs_out.addr;
+ 	}
+ }
+@@ -1738,6 +1774,9 @@ static int avd_av1_run(struct avd_ctx *ctx)
+ 		smp_store_release(&ctx->priv, &bank->codec);
+ 		WRITE_ONCE(bank->prepared, false);
+ 		WRITE_ONCE(bank->vp_done, false);
++		bank->cdf_src = NULL;
++		bank->cdf_users = 0;
++		WRITE_ONCE(bank->retired, false);
+ 		WRITE_ONCE(bank->busy, true);
+ 		bank->dst = dst;
+ 		bank->timestamp = run.base.bufs.src->vb2_buf.timestamp;
+@@ -1779,6 +1818,30 @@ static int avd_av1_run(struct avd_ctx *ctx)
+ }
+ 
+ 
++/*
++ * av1_cdf_chain: the picture in @bank has read (or will never read) the CDFs its
++ * source bank's VP wrote. Keep the CAPTURE-tail ABI with the CDFs it read, then let
++ * a source whose PP already retired go.
++ */
++static void avd_av1_cdf_release(struct avd_av1_bank *bank,
++				struct avd_decoded_buffer *buf, bool copy)
++{
++	struct avd_av1_bank *src = bank->cdf_src;
++
++	if (!src)
++		return;
++	bank->cdf_src = NULL;
++	if (copy)
++		memcpy(vb2_plane_vaddr(&buf->base.vb.vb2_buf, 0) +
++			AVD_AV1_CDFS_OFFSET(buf->base.vb.vb2_buf.planes[0].length,
++					    buf->av1.color_size),
++		       src->codec.bufs.probs_out.cpu, AVD_CDFS_SIZE);
++	if (!--src->cdf_users && READ_ONCE(src->retired)) {
++		WRITE_ONCE(src->retired, false);
++		WRITE_ONCE(src->busy, false);
++	}
++}
++
+ /*
+  * VP writes probs_out, independently of PP reconstruction. The queue executes
+  * dma_rmb() before this callback. Publish coherent output, never read a live
+@@ -1790,8 +1853,10 @@ static void avd_av1_vp_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *dst)
+ 	struct avd_decoded_buffer *buf = vb2_to_avd_decoded_buf(&dst->vb2_buf);
+ 	struct avd_av1_bank *bank = avd_av1_ref_bank(stream, buf);
+ 
+-	if (bank)
++	if (bank) {
+ 		smp_store_release(&bank->vp_done, true);
++		avd_av1_cdf_release(bank, buf, true);
++	}
+ }
+ 
+ static void avd_av1_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src,
+@@ -1811,7 +1876,12 @@ static void avd_av1_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src,
+ 							    buf->av1.color_size),
+ 					bank->codec.bufs.probs_out.cpu, AVD_CDFS_SIZE);
+ 			}
+-			WRITE_ONCE(bank->busy, false);
++			/* A picture that never reached its VP callback still holds its source. */
++			avd_av1_cdf_release(bank, buf, false);
++			if (bank->cdf_users)
++				WRITE_ONCE(bank->retired, true);
++			else
++				WRITE_ONCE(bank->busy, false);
+ 		}
+ 		buf->bank = 0;
+ 	}
+@@ -1894,6 +1964,8 @@ static int avd_av1_start(struct avd_ctx *ctx)
+ 
+ 	av1_ctx->nbanks = avd_qfw_has_vp_done(ctx->dev) ?
+ 		avd_qfw_picture_banks(ctx->dev, AVD_CODEC_AV1) : 1;
++	av1_ctx->cdf_chain = READ_ONCE(av1_cdf_chain) && av1_ctx->nbanks > 1 &&
++			     avd_qfw_vp_engines(ctx->dev, AVD_CODEC_AV1) == 1;
+ 	av1_ctx->b = &av1_ctx->bank[0];
+ 	for (unsigned int i = 0; i < av1_ctx->nbanks; i++) {
+ 		av1_ctx->bank[i].codec.stream = av1_ctx;
+diff --git a/drivers/media/platform/apple/avd/avd-backend-queue.c b/drivers/media/platform/apple/avd/avd-backend-queue.c
+index bec03920c2..a5e4db7e76 100644
+--- a/drivers/media/platform/apple/avd/avd-backend-queue.c
++++ b/drivers/media/platform/apple/avd/avd-backend-queue.c
+@@ -487,6 +487,19 @@ unsigned int avd_qfw_picture_banks(const struct avd_dev *avd, unsigned int codec
+ 	return avd_backend_is_qfw(avd) ? avd_qfw_bank_limit(avd->qfw, codec) : 1;
+ }
+ 
++/* Hardware VP engines the queue firmware lists for a codec; 0 when it lists none. */
++unsigned int avd_qfw_vp_engines(const struct avd_dev *avd, unsigned int codec)
++{
++	unsigned int n = 0;
++	u32 pool;
++
++	if (!avd_backend_is_qfw(avd) || !avd->qfw->multi_vp || codec > AVD_CODEC_AV1)
++		return 0;
++	for (pool = avd->qfw->vp_pool[codec]; pool; pool &= pool - 1)
++		n++;
++	return n;
++}
++
+ /*
+  * SRAM survives a CM3 reload, so a stale info block from an earlier ABI 2
+  * image could make a legacy image look queue capable. Clear the magic before
+diff --git a/drivers/media/platform/apple/avd/avd.h b/drivers/media/platform/apple/avd/avd.h
+index 6686301a56..a9e62fdf51 100644
+--- a/drivers/media/platform/apple/avd/avd.h
++++ b/drivers/media/platform/apple/avd/avd.h
+@@ -436,6 +436,7 @@ void avd_qfw_debug(struct avd_dev *avd, struct avd_frame *f, const char *where);
+ bool avd_backend_is_qfw(const struct avd_dev *avd);
+ bool avd_qfw_has_vp_done(const struct avd_dev *avd);
+ unsigned int avd_qfw_picture_banks(const struct avd_dev *avd, unsigned int codec);
++unsigned int avd_qfw_vp_engines(const struct avd_dev *avd, unsigned int codec);
+ int avd_backend_select(struct avd_dev *avd);
+ bool avd_mbox_pop(struct avd_dev *avd, u32 *msg);
+ int avd_backend_boot(struct avd_dev *avd);
+diff --git a/drivers/media/platform/apple/avd/tests/av1-test.py b/drivers/media/platform/apple/avd/tests/av1-test.py
+index 79dd5ae0c6..430b7c6305 100644
+--- a/drivers/media/platform/apple/avd/tests/av1-test.py
++++ b/drivers/media/platform/apple/avd/tests/av1-test.py
+@@ -62,7 +62,7 @@ pre += r'''
+ #define smp_load_acquire(p) (*(p))
+ #define smp_store_release(p,v) (*(p)=(v))
+ #define READ_ONCE(x) (x)
+-static bool av1_mvs_after_vp, av1_out_packed;
++static bool av1_mvs_after_vp, av1_out_packed, av1_cdf_chain;
+ static unsigned int av1_out_hdr58;
+ #define WRITE_ONCE(x,v) ((x)=(v))
+ #define static_assert _Static_assert
+@@ -72,6 +72,7 @@ enum vb2_buffer_state { STATE_DUMMY };
+ #define kzalloc(n,f) calloc(1,n)
+ #define kfree free
+ static unsigned int avd_qfw_picture_banks(const struct avd_dev *, unsigned int);
++static unsigned int avd_qfw_vp_engines(const struct avd_dev *, unsigned int);
+ static bool vp_feature=true;
+ static bool avd_qfw_has_vp_done(const struct avd_dev *d){return d->queued&&vp_feature;}
+ static void *vb2_plane_vaddr(struct vb2_buffer *b,int p){(void)p;return b->cpu;}
+@@ -129,7 +130,7 @@ post += qfw[qfw.index('#define AVDQ_MAGIC'):qfw.index('/* Arguments of dev_dbg()
+ post += hw[hw.index('#define AVD_V3_'):hw.index('int avd_boot(')]
+ post += '#define w32(r,v) writel((v),avd->ctrl+(r))\n#define m32(r,v) w32(r,(v)|readl(avd->ctrl+(r)))\n'
+ post += function(hw, 't8112_configure_stream') + function(hw, 't8122_configure_stream')
+-post += function(qfw, 'avd_qfw_picture_banks')
++post += function(qfw, 'avd_qfw_picture_banks') + function(qfw, 'avd_qfw_vp_engines')
+ post += function(qfw, 'avd_qfw_stream') + function(qfw, 'avd_qfw_submit')
+ post += '\nstatic int avd_submit_job(struct avd_ctx *ctx){return avd_open_build_program(ctx);}\n'
+ 
+@@ -347,6 +348,62 @@ int main(int argc,char **argv){
+  current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_av1_run(&ctx));
+  assert(dst[0].bank==1&&p->bank[0].busy);
+  avd_av1_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);avd_av1_stop(&ctx);
++ /* av1_cdf_chain (default off): ONE AV1 VP engine, so a picture reads its primary reference's VP CDFs in place. */
++ av1_cdf_chain=true;queue.vp_pool[3]=BIT(9)|BIT(10);queue.next_vp[3]=0;
++ assert(!avd_av1_start(&ctx));p=((struct avd_av1_ctx *)ctx.priv)->stream;assert(p->nbanks==3&&!p->cdf_chain);avd_av1_stop(&ctx);
++ av1_cdf_chain=false;queue.vp_pool[3]=BIT(9);queue.next_vp[3]=0;
++ assert(!avd_av1_start(&ctx));p=((struct avd_av1_ctx *)ctx.priv)->stream;assert(p->nbanks==2&&!p->cdf_chain);avd_av1_stop(&ctx);
++ av1_cdf_chain=true;
++ assert(!avd_av1_start(&ctx));p=((struct avd_av1_ctx *)ctx.priv)->stream;assert(p->nbanks==2&&p->cdf_chain);
++ av1_cdf_chain=false; /* latched at start: a later write does not change this stream */
++ params.frame_type=V4L2_AV1_KEY_FRAME;params.primary_ref_frame=7;params.flags=0;params.segmentation.flags=0;
++ for(unsigned int i=0;i<7;i++)params.ref_frame_idx[i]=-1;
++ src.vb2_buf.timestamp=1000;current_dst=&dst[0].base.vb;frame.idx=0;
++ queue_request(&src);assert(avd_av1_ready(&ctx));assert(!avd_av1_run(&ctx));
++ assert(dst[0].bank==1&&p->bank[0].busy&&p->bank[0].prepared&&!p->bank[0].vp_done&&!p->bank[0].cdf_src);
++ params.frame_type=V4L2_AV1_INTER_FRAME;params.primary_ref_frame=0;params.ref_frame_idx[0]=0;params.reference_frame_ts[0]=1000;
++ src.vb2_buf.timestamp=1001;queue_request(&src);
++ assert(avd_av1_ready(&ctx)); /* no wait for picture 0's VP callback */
++ request_params.flags=V4L2_AV1_FRAME_FLAG_DISABLE_FRAME_END_UPDATE_CDF;assert(!avd_av1_ready(&ctx));
++ request_params.flags=V4L2_AV1_FRAME_FLAG_USE_REF_FRAME_MVS;assert(!avd_av1_ready(&ctx)); /* motion fields keep the PP wait */
++ request_params.flags=V4L2_AV1_FRAME_FLAG_ERROR_RESILIENT_MODE;assert(!avd_av1_ready(&ctx)); /* not chained: the old wait */
++ avd_av1_vp_done(&ctx,&dst[0].base.vb);assert(avd_av1_ready(&ctx));p->bank[0].vp_done=false;
++ request_params.flags=0;params=request_params;
++ memset(p->bank[0].codec.bufs.probs_out.cpu,0x6c,AVD_CDFS_SIZE);
++ memset(p->bank[1].codec.bufs.probs_out.cpu,0x11,AVD_CDFS_SIZE);
++ memset(p->bank[1].codec.bufs.probs.cpu,0x22,AVD_CDFS_SIZE);
++ current_dst=&dst[1].base.vb;frame.idx=1;assert(!avd_av1_run(&ctx));
++ assert(dst[1].bank==2&&p->bank[1].cdf_src==&p->bank[0]&&p->bank[0].cdf_users==1);
++ assert(((u8 *)p->bank[1].codec.bufs.probs_out.cpu)[0]==0x11); /* no prepare-time copy: VP writes it */
++ assert(((u8 *)p->bank[1].codec.bufs.probs.cpu)[0]==0x22);     /* own input untouched */
++ struct avd_av1_run chain_probe={.frame=&params};chain_probe.base.bufs.dst=current_dst;
++ avd_av1_prepare_prob(&ctx,&chain_probe);
++ assert(chain_probe.addresses.probs==p->bank[0].codec.bufs.probs_out.addr);
++ assert(p->bank[0].cdf_users==2);p->bank[0].cdf_users=1;
++ /* Producer PP retires before the reader's VP: its bank stays held, nobody can reuse it. */
++ avd_av1_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
++ assert(p->bank[0].busy&&p->bank[0].retired&&!dst[0].bank);
++ current_dst=&dst[2].base.vb;assert(avd_av1_run(&ctx)==-EBUSY&&!dst[2].bank);
++ size_t ct1=AVD_AV1_CDFS_OFFSET(0x800000,dst[1].av1.color_size);
++ memset((u8 *)dst[1].base.vb.vb2_buf.cpu+ct1,0xee,AVD_CDFS_SIZE);
++ avd_av1_vp_done(&ctx,&dst[1].base.vb);
++ assert(((u8 *)dst[1].base.vb.vb2_buf.cpu)[ct1]==0x6c); /* the CDFs it read, as set_prob leaves them */
++ assert(!p->bank[0].busy&&!p->bank[0].retired&&!p->bank[0].cdf_users&&!p->bank[1].cdf_src);
++ avd_av1_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);assert(!p->bank[1].busy);
++ /* A reader that fails before its VP callback still releases a retired producer. */
++ params.frame_type=V4L2_AV1_KEY_FRAME;params.primary_ref_frame=7;
++ src.vb2_buf.timestamp=1002;current_dst=&dst[2].base.vb;frame.idx=2;queue_request(&src);assert(!avd_av1_run(&ctx));
++ unsigned int pb=dst[2].bank-1;
++ params.frame_type=V4L2_AV1_INTER_FRAME;params.primary_ref_frame=0;params.ref_frame_idx[0]=2;params.reference_frame_ts[2]=1002;
++ src.vb2_buf.timestamp=1003;current_dst=&dst[3].base.vb;frame.idx=3;queue_request(&src);assert(avd_av1_ready(&ctx));
++ assert(!avd_av1_run(&ctx));unsigned int rb=dst[3].bank-1;
++ assert(p->bank[rb].cdf_src==&p->bank[pb]&&p->bank[pb].cdf_users==1);
++ avd_av1_done(&ctx,&src,&dst[2].base.vb,VB2_BUF_STATE_DONE);assert(p->bank[pb].retired&&p->bank[pb].busy);
++ avd_av1_done(&ctx,&src,&dst[3].base.vb,VB2_BUF_STATE_ERROR);
++ assert(!p->bank[pb].busy&&!p->bank[pb].retired&&!p->bank[rb].busy&&!p->bank[rb].cdf_src&&avd_av1_ready(&ctx));
++ avd_av1_stop(&ctx);
++ queue.vp_pool[3]=BIT(9)|BIT(10)|BIT(11);queue.next_vp[3]=0;
++ puts("PASS: av1_cdf_chain: one-engine latch, no VP-callback wait, PP waits kept, CDF input in place, held producer, tail ABI, error release");
+  /* Fail allocation in every bank, including after earlier banks succeeded. */
+  for(int n=1;n<=16;n++){
+   fail_alloc_after=n;allocating_ctx=&ctx;assert(avd_av1_start(&ctx)==-ENOMEM);allocating_ctx=NULL;
+-- 
+2.43.0
+

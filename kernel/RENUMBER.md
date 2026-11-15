@@ -1166,3 +1166,10 @@ New in 1.939: 0737 (`soc: apple: clpc: let the all-core ceiling be set at run ti
 Kernel 1.940 keeps the base (`da8e1acf3656`) and all 743 patches of 1.939 under the same numbers.
 
 New in 1.940: 0744 (`hwmon: macsmc: Print voltage and current keys in the debugfs key list`), 0745 (`media: apple: isp: keep the camera firmware up 5 s after a stream`), 0746 (`media: apple: isp: offer 1080p60 by default on T8132`).
+
+
+# Kernel patch numbers: 1.940 to 1.942
+
+Kernel 1.942 keeps the base (`da8e1acf3656`) and all 746 patches of 1.940 under the same numbers. 1.941 was tried for one start and not kept, so it is not published.
+
+New in 1.942: 0747 (`sched/fair: Optionally place a new task on an idle CPU of the highest capacity`), 0748 (`drm/asahi: g16: Optionally release the AGX power vote at the PMP`), 0749 (`media: apple: avd: av1: Test switch to read the reference's CDFs in place`), 0750 (`drm/asahi: g16: Keep up to 16 render commands resident by default`).

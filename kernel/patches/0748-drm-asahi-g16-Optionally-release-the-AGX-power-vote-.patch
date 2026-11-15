@@ -1,0 +1,216 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 21:08:39 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally release the AGX power vote
+ at the PMP
+
+The GPU never powers off at an idle J604 desktop (GFX actual state on
+100% of the time), while macOS on the same machine gates it about ten
+times a second without sending the GPU a single message. Every
+host-side difference between the two found so far has been matched,
+except one: this driver votes AGX power at the PMP at probe and holds
+that vote for the whole boot, while macOS sends the PMP no message at
+runtime.
+
+Let the vote be released and taken again: pmp-display gains
+apple_pmp_j713_gpu_put(), which sends the AGX request with its state
+byte cleared, as DISP's release does. g16 gains g16_pmp_agx (runtime,
+default 1, held as before). 0 releases the vote at the next GPU
+submission, before the fence-signalling section and the device lock,
+and 1 takes it again there. A "pmp_agx:" stats line counts both
+directions and failures.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/params.rs   | 20 ++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs     | 57 +++++++++++++++++++++++++++
+ drivers/soc/apple/pmp-display.c       | 21 ++++++++--
+ include/linux/soc/apple/pmp-display.h |  1 +
+ 4 files changed, 95 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 433cfab5d3..987e2c1cb9 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -677,6 +677,26 @@ pub(crate) fn rt_poll() -> bool {
+     "G16: retire after a firmware event on the SCHED_FIFO poller thread instead of the CFS worker (default 0; 1: on; runtime 0644)"
+ );
+ 
++/// Storage of `g16_pmp_agx` (runtime 0644, default 1).
++static PMP_AGX: AtomicU32 = AtomicU32::new(1);
++
++/// Whether the GPU's AGX power vote at the PMP is wanted held. Probe takes it before the firmware
++/// starts and nothing released it so far; macOS sends the PMP no AGX message at runtime. 0 asks
++/// for the release, applied at the next submission (before anything is published); 1 takes it
++/// again there. An experiment for the GPU idle power-off.
++pub(crate) fn pmp_agx() -> bool {
++    PMP_AGX.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    PMP_AGX_PARAM,
++    PMP_AGX_PARMTYPE,
++    PMP_AGX_PARM,
++    PMP_AGX,
++    "g16_pmp_agx",
++    "G16: keep the AGX power vote at the PMP (default 1, as since probe); 0 releases it at the next GPU submission, 1 takes it again (experiment; runtime 0644)"
++);
++
+ /// Storage of `g16_revive` (runtime 0644, default 0).
+ static REVIVE: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 341ccc7434..07b540d0b1 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -127,6 +127,8 @@ pub(crate) fn run_poll(self: Arc<Self>) {
+     /// accepted (the engine failed: EIO) and the caller fails it; once accepted, its fence is
+     /// signalled by the engine, also on failure.
+     pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
++        // Before the fence-signalling section: the PMP round trip sleeps.
++        self.pmp_agx_sync();
+         let signalling = kernel::dma_fence::SignallingGuard::new();
+         let mut done = Completions::new();
+         let accepted = {
+@@ -1281,6 +1283,15 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.dep_wait[0][1],
+             s.dep_wait[0][2]
+         )?;
++        writeln!(
++            f,
++            "pmp_agx: wanted {} held {} releases {} takes {} errors {}",
++            u8::from(super::params::pmp_agx()),
++            u8::from(PMP_AGX_HELD.load(Ordering::Acquire)),
++            PMP_AGX_STATS[0].load(Ordering::Relaxed),
++            PMP_AGX_STATS[1].load(Ordering::Relaxed),
++            PMP_AGX_STATS[2].load(Ordering::Relaxed)
++        )?;
+         writeln!(
+             f,
+             "revive: enabled {} revived {} failed {}",
+@@ -1435,3 +1446,49 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         )
+     }
+ }
++
++/// `g16_pmp_agx`: whether the AGX vote is held now (probe takes it), and releases / takes / errors.
++pub(crate) static PMP_AGX_HELD: core::sync::atomic::AtomicBool =
++    core::sync::atomic::AtomicBool::new(true);
++pub(crate) static PMP_AGX_STATS: [core::sync::atomic::AtomicU64; 3] = [
++    core::sync::atomic::AtomicU64::new(0),
++    core::sync::atomic::AtomicU64::new(0),
++    core::sync::atomic::AtomicU64::new(0),
++];
++/// Serializes the PMP calls of concurrent submissions.
++static PMP_AGX_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
++
++impl Shared {
++    /// Applies `g16_pmp_agx` if it differs from the vote's state. Never inside the device lock.
++    fn pmp_agx_sync(&self) {
++        let want = super::params::pmp_agx();
++        if want == PMP_AGX_HELD.load(Ordering::Acquire)
++            || PMP_AGX_BUSY.swap(true, Ordering::AcqRel)
++        {
++            return;
++        }
++        if want != PMP_AGX_HELD.load(Ordering::Acquire) {
++            // SAFETY: `dev` is the bound GPU device, the consumer probe voted with.
++            let ret = unsafe {
++                if want {
++                    bindings::apple_pmp_j713_gpu_get(self.dev.as_raw())
++                } else {
++                    bindings::apple_pmp_j713_gpu_put(self.dev.as_raw())
++                }
++            };
++            if ret == 0 {
++                PMP_AGX_HELD.store(want, Ordering::Release);
++                PMP_AGX_STATS[usize::from(want)].fetch_add(1, Ordering::Relaxed);
++                dev_info!(
++                    self.dev.as_ref(),
++                    "G16: AGX PMP vote {}\n",
++                    if want { "taken again" } else { "released" }
++                );
++            } else {
++                PMP_AGX_STATS[2].fetch_add(1, Ordering::Relaxed);
++                dev_warn!(self.dev.as_ref(), "G16: AGX PMP vote change failed: {}\n", ret);
++            }
++        }
++        PMP_AGX_BUSY.store(false, Ordering::Release);
++    }
++}
+diff --git a/drivers/soc/apple/pmp-display.c b/drivers/soc/apple/pmp-display.c
+index b9a322fca8..df6a37c4c6 100644
+--- a/drivers/soc/apple/pmp-display.c
++++ b/drivers/soc/apple/pmp-display.c
+@@ -28,6 +28,8 @@
+ #define PMP_DISP_REQUEST	0x0020f80100000000ULL
+ /* DISP, state 0: released while its DCP has powered the display domains down. */
+ #define PMP_DISP_RELEASE	0x0020f80000000000ULL
++/* State byte 0, as DISP's release clears its request's 01 (INFERENCE: not seen from macOS). */
++#define PMP_AGX_RELEASE		0x0020f50000000000ULL
+ #define PMP_POWER_REPLY		0x0021000000000000ULL
+ #define PMP_ENDPOINT		0x20
+ 
+@@ -488,7 +490,7 @@ static int pmp_power_put(struct device *consumer, enum pmp_power_kind kind)
+ 
+ 	if (IS_ERR(p))
+ 		return PTR_ERR(p);
+-	if (kind != PMP_POWER_DISP)
++	if (kind != PMP_POWER_DISP && kind != PMP_POWER_AGX)
+ 		return -EINVAL;
+ 	device_lock(p->dev);
+ 	mutex_lock(&p->request);
+@@ -503,7 +505,7 @@ static int pmp_power_put(struct device *consumer, enum pmp_power_kind kind)
+ 	spin_unlock_irqrestore(&p->lock, flags);
+ 	if (ret <= 0)
+ 		goto out;
+-	ret = p->send(p->cookie, PMP_DISP_RELEASE);
++	ret = p->send(p->cookie, kind == PMP_POWER_AGX ? PMP_AGX_RELEASE : PMP_DISP_RELEASE);
+ 	if (ret) {
+ 		spin_lock_irqsave(&p->lock, flags);
+ 		pmp_vote_send_failed(&p->vote);
+@@ -515,8 +517,9 @@ static int pmp_power_put(struct device *consumer, enum pmp_power_kind kind)
+ 	ret = pmp_vote_finish_release(&p->vote, kind);
+ 	spin_unlock_irqrestore(&p->lock, flags);
+ 	if (!ret)
+-		dev_dbg(p->dev, "Retained DISP vote released: request=%016llx\n",
+-			PMP_DISP_RELEASE);
++		dev_info(p->dev, "Retained %s vote released: request=%016llx\n",
++			 kind == PMP_POWER_AGX ? "AGX" : "DISP",
++			 kind == PMP_POWER_AGX ? PMP_AGX_RELEASE : PMP_DISP_RELEASE);
+ out:
+ 	mutex_unlock(&p->request);
+ 	device_unlock(p->dev);
+@@ -572,6 +575,16 @@ int apple_pmp_j713_gpu_get(struct device *consumer)
+ }
+ EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_get);
+ 
++/*
++ * Release the AGX vote with the GPU firmware running: an experiment (g16_pmp_agx), since macOS
++ * sends the PMP no AGX message at runtime. apple_pmp_j713_gpu_get() takes it again.
++ */
++int apple_pmp_j713_gpu_put(struct device *consumer)
++{
++	return apple_pmp_display_board() ? pmp_power_put(consumer, PMP_POWER_AGX) : -ENODEV;
++}
++EXPORT_SYMBOL_GPL(apple_pmp_j713_gpu_put);
++
+ /*
+  * System sleep that stops the PMP (pmp-export.c). The bridge releases no
+  * vote itself: DISP is released by its consumer, which powers the display
+diff --git a/include/linux/soc/apple/pmp-display.h b/include/linux/soc/apple/pmp-display.h
+index 22a2a6e1a8..dab4a5b998 100644
+--- a/include/linux/soc/apple/pmp-display.h
++++ b/include/linux/soc/apple/pmp-display.h
+@@ -64,6 +64,7 @@ int apple_pmp_j713_display_check(struct device *consumer);
+ int apple_pmp_j713_display_check_release(struct device *consumer);
+ int apple_pmp_j713_gpu_prepare(struct device *consumer);
+ int apple_pmp_j713_gpu_get(struct device *consumer);
++int apple_pmp_j713_gpu_put(struct device *consumer);
+ int apple_pmp_j713_gpu_check(struct device *consumer);
+ 
+ /*
+-- 
+2.43.0
+
