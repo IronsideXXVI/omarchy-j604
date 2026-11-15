@@ -193,6 +193,7 @@ Each row compares this Mac under Omarchy with the same Mac under macOS 26B123, m
 - **SHORT:** measured below macOS; the number is given.
 - **UNTESTED:** no like-for-like number on both systems yet. Most of these need someone at the Mac, a device plugged in, or a macOS session.
 - **How macOS is measured:** on this Mac, macOS now starts only as a guest under our hypervisor, because its startup disk boots our hypervisor stage; CPU, storage and power-under-load numbers taken that way carry the hypervisor's overhead. Some macOS numbers come from a Mac mini M4 with the same T8132 chip running macOS natively. A native macOS start on the J604 needs the owner at the Mac for two visits to its recovery system, so the rows that need it wait for that.
+- **Hypervisor host:** on 2026-11-15 the computer that runs our hypervisor against the J604 over USB moved from a borrowed MacBook Air to an M1 running Linux. The host-side kit is being ported to Linux, so macOS trace sessions pause until that is done.
 
 Of 52 blocks: **23 at parity, 17 short, 11 untested**, and 1 not applicable to Omarchy. All MEASURED 2026-11-13/14 unless the row says CODE or INFERENCE.
 
