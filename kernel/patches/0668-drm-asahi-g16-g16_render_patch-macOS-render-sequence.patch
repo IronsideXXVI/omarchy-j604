@@ -1,0 +1,228 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 08:59:57 +0000
+Subject: [PATCH] drm/asahi: g16: g16_render_patch, macOS render
+ sequence words at runtime
+
+Our render commands run about 3x slower than macOS's on the J604 at
+depth 64, and the hypervisor capture of macOS's inline render job
+blocks is compared word by word against our TA and FS sequences
+(constant fields that differ, fields only macOS sets). Testing each
+of those values today needs a rebuild per field.
+
+Add g16_render_patch (runtime 0644, empty by default): up to 16 u32
+words, "ta:0xOFF=0xVAL" or "fs:0xOFF=0xVAL", written over the encoded
+TA / FS sequence of every render command after encoding. Offsets are
+4-aligned and bounded by the sequence length; the whole list is
+checked before it takes effect. Empty writes nothing.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |   1 +
+ drivers/gpu/drm/asahi/g16/params.rs | 177 ++++++++++++++++++++++++++++
+ 2 files changed, 178 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index bf58165f3b..e90c9b6e2b 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1610,6 +1610,7 @@ fn prefix_render(
+         );
+         encode::render_attachments(&mut scratch.tas[..], 0, &cmd.vertex_attachments);
+         encode::render_attachments(&mut scratch.fss[..], 1, &cmd.fragment_attachments);
++        params::render_patch_apply(&mut scratch.tas[..], &mut scratch.fss[..]);
+         encode::fill_scene(&refs, &pass, &mut scratch.scene[..]);
+         encode::scene_render(
+             &refs,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 5674a7dd9b..8a71c3c084 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -844,6 +844,183 @@ fn subgen_push_hex(out: &mut [u8], len: &mut usize, v: u32) {
+         },
+     });
+ 
++/// `g16_render_patch`: up to [`RENDER_PATCH_MAX`] u32 words written over the encoded TA / FS
++/// render sequences after encoding, for testing macOS's values field by field without a
++/// rebuild (the list-15/18 decode, gpu2/hv/l15cmp.py, prints them as CONST-DIFF rows). Each entry
++/// packs the offset in bits 0..15, the FS sequence in bit 31 (else TA) and "set" in bit 30.
++/// Empty (default): nothing is written. Set it while no render work runs.
++pub(crate) const RENDER_PATCH_MAX: usize = 16;
++static RENDER_PATCH_AT: [AtomicU32; RENDER_PATCH_MAX] =
++    [const { AtomicU32::new(0) }; RENDER_PATCH_MAX];
++static RENDER_PATCH_VAL: [AtomicU32; RENDER_PATCH_MAX] =
++    [const { AtomicU32::new(0) }; RENDER_PATCH_MAX];
++const RENDER_PATCH_SET: u32 = 1 << 30;
++const RENDER_PATCH_FS: u32 = 1 << 31;
++
++/// Applies `g16_render_patch` to one command's TA and FS sequences; returns the words written.
++pub(crate) fn render_patch_apply(ta: &mut [u8], fs: &mut [u8]) -> u32 {
++    let mut n = 0;
++    for (at, val) in RENDER_PATCH_AT.iter().zip(RENDER_PATCH_VAL.iter()) {
++        let at = at.load(Ordering::Acquire);
++        if at & RENDER_PATCH_SET == 0 {
++            continue;
++        }
++        let buf: &mut [u8] = if at & RENDER_PATCH_FS != 0 {
++            &mut *fs
++        } else {
++            &mut *ta
++        };
++        let off = (at & 0xffff) as usize;
++        if off + 4 <= buf.len() {
++            buf[off..off + 4].copy_from_slice(&val.load(Ordering::Relaxed).to_le_bytes());
++            n += 1;
++        }
++    }
++    n
++}
++
++fn render_patch_parse_u32(text: &str) -> Option<u32> {
++    let text = text.trim();
++    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
++        Some(hex) => u32::from_str_radix(hex, 16).ok(),
++        None => text.parse::<u32>().ok(),
++    }
++}
++
++/// `set` of `g16_render_patch`: "ta:0x268=0x6,fs:0x100=1", or empty / "none". The whole list
++/// is checked before any of it takes effect; offsets are 4-aligned and below 0x1000.
++///
++/// # Safety
++///
++/// Called by the module-parameter core with `val` NULL or a NUL-terminated string.
++unsafe extern "C" fn render_patch_set(
++    val: *const c_char,
++    _kp: *const kernel::bindings::kernel_param,
++) -> c_int {
++    if val.is_null() {
++        return EINVAL.to_errno();
++    }
++    // SAFETY: `val` is a NUL-terminated string per the function contract.
++    let Ok(text) = unsafe { core::ffi::CStr::from_ptr(val) }.to_str() else {
++        return EINVAL.to_errno();
++    };
++    let text = text.trim();
++    let mut at = [0u32; RENDER_PATCH_MAX];
++    let mut vals = [0u32; RENDER_PATCH_MAX];
++    if !text.is_empty() && text != "none" {
++        for (i, item) in text.split(',').enumerate() {
++            if i >= RENDER_PATCH_MAX {
++                return EINVAL.to_errno();
++            }
++            let Some((seq, rest)) = item.trim().split_once(':') else {
++                return EINVAL.to_errno();
++            };
++            let fs = match seq.trim() {
++                "ta" => 0,
++                "fs" => RENDER_PATCH_FS,
++                _ => return EINVAL.to_errno(),
++            };
++            let Some((off, v)) = rest.split_once('=') else {
++                return EINVAL.to_errno();
++            };
++            let (Some(off), Some(v)) = (render_patch_parse_u32(off), render_patch_parse_u32(v))
++            else {
++                return EINVAL.to_errno();
++            };
++            if off % 4 != 0 || off >= 0x1000 {
++                return EINVAL.to_errno();
++            }
++            at[i] = RENDER_PATCH_SET | fs | off;
++            vals[i] = v;
++        }
++    }
++    for a in RENDER_PATCH_AT.iter() {
++        a.store(0, Ordering::Release);
++    }
++    for (slot, v) in RENDER_PATCH_VAL.iter().zip(vals) {
++        slot.store(v, Ordering::Relaxed);
++    }
++    for (slot, a) in RENDER_PATCH_AT.iter().zip(at) {
++        slot.store(a, Ordering::Release);
++    }
++    0
++}
++
++/// `get` of `g16_render_patch`: the list as `set` takes it, or "none".
++///
++/// # Safety
++///
++/// `buffer` is the module-parameter core's PAGE_SIZE output buffer.
++unsafe extern "C" fn render_patch_get(
++    buffer: *mut c_char,
++    _kp: *const kernel::bindings::kernel_param,
++) -> c_int {
++    let mut out = [0u8; 512];
++    let mut len = 0;
++    for (a, v) in RENDER_PATCH_AT.iter().zip(RENDER_PATCH_VAL.iter()) {
++        let a = a.load(Ordering::Acquire);
++        if a & RENDER_PATCH_SET == 0 {
++            continue;
++        }
++        if len != 0 {
++            subgen_push(&mut out, &mut len, b',');
++        }
++        for &c in if a & RENDER_PATCH_FS != 0 {
++            b"fs:"
++        } else {
++            b"ta:"
++        } {
++            subgen_push(&mut out, &mut len, c);
++        }
++        subgen_push_hex(&mut out, &mut len, a & 0xffff);
++        subgen_push(&mut out, &mut len, b'=');
++        subgen_push_hex(&mut out, &mut len, v.load(Ordering::Relaxed));
++    }
++    if len == 0 {
++        for &c in b"none" {
++            subgen_push(&mut out, &mut len, c);
++        }
++    }
++    subgen_push(&mut out, &mut len, b'\n');
++    // SAFETY: the buffer holds PAGE_SIZE bytes; at most 513 are written.
++    unsafe {
++        core::ptr::copy_nonoverlapping(out.as_ptr(), buffer.cast::<u8>(), len);
++        *buffer.cast::<u8>().add(len) = 0;
++    }
++    len as c_int
++}
++
++static RENDER_PATCH_OPS: kernel::bindings::kernel_param_ops = kernel::bindings::kernel_param_ops {
++    flags: 0,
++    set: Some(render_patch_set),
++    get: Some(render_patch_get),
++    free: None,
++};
++
++#[link_section = "__param"]
++#[used(compiler)]
++static RENDER_PATCH_PARAM: kernel::module_param::KernelParam =
++    kernel::module_param::KernelParam::new(kernel::bindings::kernel_param {
++        name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
++            kernel::c_str!("g16_render_patch")
++        } else {
++            kernel::c_str!("asahi.g16_render_patch")
++        }),
++        // `__this_module` is constructed by the kernel at load time and is not freed until the
++        // module is unloaded. Take its address without a reference to the mutable static.
++        #[cfg(MODULE)]
++        mod_: (&raw const kernel::bindings::__this_module).cast_mut(),
++        #[cfg(not(MODULE))]
++        mod_: core::ptr::null_mut(),
++        ops: core::ptr::from_ref(&RENDER_PATCH_OPS),
++        perm: 0o644,
++        level: -1,
++        flags: 0,
++        __bindgen_anon_1: kernel::bindings::kernel_param__bindgen_ty_1 {
++            arg: core::ptr::from_ref(&RENDER_PATCH_AT).cast_mut().cast(),
++        },
++    });
++
+ /// Storage of `g16_tail_us` (runtime 0644, default 0).
+ static TAIL_US: AtomicU32 = AtomicU32::new(0);
+ 
+-- 
+2.43.0
+

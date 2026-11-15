@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 08:16:59 +0000
+Subject: [PATCH] media: apple: avd: Decode 10-bit HEVC into P030 on
+ request
+
+The decoder has a packed output mode for 10-bit pictures: three 10-bit
+samples in each 32-bit word, macOS's default 'p420' layout. On the J604
+it decodes 4K HEVC Main 10 at 699 fps in that mode against 547 fps when
+it expands each sample to 16 bits for P010 (MEASURED, media-43 test
+switch). The layout is DRM_FORMAT_P030.
+
+Offer P030 as a CAPTURE format for 10-bit HEVC, after P010 so the
+default stays P010, and only with apple_avd.hevc_p030=1 (default off):
+clients that do not know P030 keep getting what they get today. A P030
+CAPTURE buffer sets the packed mode in the picture header, with lines of
+whole 32-bit words padded to 64 bytes.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/avd/avd-hevc.c |  4 ++-
+ drivers/media/platform/apple/avd/avd-v4l2.c | 30 ++++++++++++++++++++-
+ 2 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/apple/avd/avd-hevc.c b/drivers/media/platform/apple/avd/avd-hevc.c
+index 29b2e72553..853496988a 100644
+--- a/drivers/media/platform/apple/avd/avd-hevc.c
++++ b/drivers/media/platform/apple/avd/avd-hevc.c
+@@ -347,7 +347,9 @@ static void set_header(struct avd_ctx *ctx, struct avd_hevc_run *run)
+ 	bool is_intra = run->sl[0].slice_type == V4L2_HEVC_SLICE_TYPE_I;
+ 
+ 	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
+-		     AVD_OP_HDR_FLAG_PACKED(READ_ONCE(hevc_out_packed) &&
++		     AVD_OP_HDR_FLAG_PACKED((READ_ONCE(hevc_out_packed) ||
++					     ctx->decoded_fmt.fmt.pix_mp.pixelformat ==
++					     V4L2_PIX_FMT_P030) &&
+ 					    sps->bit_depth_luma_minus8 == 2) |
+ 		     AVD_OP_HDR_FLAG_INTRA(is_intra) | AVD_OP_HDR_CONST |
+ 		     AVD_OP_HDR_FLAG_PIPE_STATE(
+diff --git a/drivers/media/platform/apple/avd/avd-v4l2.c b/drivers/media/platform/apple/avd/avd-v4l2.c
+index 745b23fa23..39d7c98395 100644
+--- a/drivers/media/platform/apple/avd/avd-v4l2.c
++++ b/drivers/media/platform/apple/avd/avd-v4l2.c
+@@ -66,6 +66,21 @@ static bool avd_image_fmt_fits_capture(struct avd_ctx *ctx,
+ 	       !memcmp(comp.offsets, ctx->comp.offsets, sizeof(comp.offsets));
+ }
+ 
++/*
++ * Default off: offer P030 (the decoder's packed 10-bit layout, a third less
++ * memory traffic than P010) for 10-bit HEVC. Clients that do not know P030
++ * never see it; read when the formats are enumerated or set.
++ */
++static bool hevc_p030;
++module_param(hevc_p030, bool, 0644);
++MODULE_PARM_DESC(hevc_p030,
++		 "Offer the packed P030 CAPTURE format for 10-bit HEVC (default: off)");
++
++static bool avd_decoded_fmt_offered(const struct avd_decoded_fmt_desc *f)
++{
++	return f->fourcc != V4L2_PIX_FMT_P030 || READ_ONCE(hevc_p030);
++}
++
+ static u32 avd_enum_decoded_fmt(struct avd_ctx *ctx, int index,
+ 				enum avd_image_fmt image_fmt)
+ {
+@@ -78,7 +93,8 @@ static u32 avd_enum_decoded_fmt(struct avd_ctx *ctx, int index,
+ 
+ 	for (i = 0; i < desc->num_decoded_fmts; i++) {
+ 		if (!avd_image_fmt_match(desc->decoded_fmts[i].image_fmt,
+-					 image_fmt))
++					 image_fmt) ||
++		    !avd_decoded_fmt_offered(&desc->decoded_fmts[i]))
+ 			continue;
+ 		fmt_idx++;
+ 		if (index == fmt_idx)
+@@ -97,6 +113,7 @@ static bool avd_is_valid_fmt(struct avd_ctx *ctx, u32 fourcc,
+ 	for (i = 0; i < desc->num_decoded_fmts; i++) {
+ 		if (avd_image_fmt_match(desc->decoded_fmts[i].image_fmt,
+ 					image_fmt) &&
++		    avd_decoded_fmt_offered(&desc->decoded_fmts[i]) &&
+ 		    desc->decoded_fmts[i].fourcc == fourcc)
+ 			return true;
+ 	}
+@@ -123,6 +140,13 @@ static void avd_fill_decoded_pixfmt(struct avd_ctx *ctx,
+ 
+ 	v4l2_fill_pixfmt_mp(pix_mp, pix_mp->pixelformat, pix_mp->width,
+ 			    pix_mp->height);
++	if (pix_mp->pixelformat == V4L2_PIX_FMT_P030) {
++		u32 bpl = ALIGN(DIV_ROUND_UP(pix_mp->width, 3) * 4, 64);
++
++		pix_mp->plane_fmt[0].bytesperline = bpl;
++		pix_mp->plane_fmt[0].sizeimage =
++			bpl * (pix_mp->height + DIV_ROUND_UP(pix_mp->height, 2));
++	}
+ 
+ 	ctx->comp.start_offset = pix_mp->plane_fmt[0].sizeimage;
+ 	if (gap)
+@@ -281,6 +305,10 @@ static const struct avd_decoded_fmt_desc avd_hevc_decoded_fmts[] = {
+ 		.fourcc = V4L2_PIX_FMT_P010,
+ 		.image_fmt = AVD_IMG_FMT_422_10BIT,
+ 	},
++	{
++		.fourcc = V4L2_PIX_FMT_P030,
++		.image_fmt = AVD_IMG_FMT_420_10BIT,
++	},
+ };
+ 
+ static const struct avd_ctrl_desc avd_h264_ctrl_descs[] = {
+-- 
+2.43.0
+

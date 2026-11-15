@@ -1,0 +1,266 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 09:39:13 +0000
+Subject: [PATCH] drm/asahi: g16: retire from a SCHED_FIFO poller after
+ a firmware event
+
+When the G16 firmware reports finished work (ring-service message on
+endpoint 0x20), the mailbox receive callback queues the poll that
+retires it on system_highpri_wq. On the J604 that poll starts about
+36 us after the message (mean of 28724 event-driven retires), with the
+cluster idle exit already kept off the path by g16_lat_qos: the delay
+is the CFS worker hop. While most small compute commands find the
+firmware idle, each of them waits through that hop before the next
+one can be published.
+
+Add a SCHED_FIFO (low) poller thread, created once next to the RTKit
+cookie and kept, like the cookie, until reboot. With g16_rt_poll=1 the
+receive callback wakes it directly and it runs the same poll body,
+which serializes on the G16 state lock like the poll work, the hrtimer
+and the backup poll do. g16_rt_poll=0 (default) keeps the poll work.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/boot.rs   | 52 ++++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/glue.c    | 79 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/mod.rs    |  4 ++
+ drivers/gpu/drm/asahi/g16/params.rs | 19 +++++++
+ 4 files changed, 153 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 01e5cf4aa2..0d370ecccc 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -49,6 +49,11 @@ pub(crate) mod glue {
+         fn asahi_g16_perf_rows() -> core::ffi::c_uint;
+         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+         fn asahi_g16_lat_qos(us: core::ffi::c_int) -> core::ffi::c_int;
++        fn asahi_g16_rt_start(
++            f: unsafe extern "C" fn(*mut core::ffi::c_void),
++            cookie: *mut core::ffi::c_void,
++        ) -> core::ffi::c_int;
++        fn asahi_g16_rt_kick() -> bool;
+         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
+         fn asahi_g16_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
+         fn asahi_g16_dma_unsupported(dev: *mut core::ffi::c_void) -> bool;
+@@ -72,6 +77,25 @@ pub(crate) fn lat_qos(us: Option<u32>) -> Result {
+         kernel::error::to_result(unsafe { asahi_g16_lat_qos(us) })
+     }
+ 
++    /// Starts the RT event poller (`g16_rt_poll`) once; `cookie` must stay valid until reboot.
++    ///
++    /// # Safety
++    ///
++    /// `f(cookie)` must be callable from a kthread at any time until reboot.
++    pub(crate) unsafe fn rt_start(
++        f: unsafe extern "C" fn(*mut core::ffi::c_void),
++        cookie: *mut core::ffi::c_void,
++    ) -> Result {
++        // SAFETY: Forwarded from the caller.
++        kernel::error::to_result(unsafe { asahi_g16_rt_start(f, cookie) })
++    }
++
++    /// Wakes the RT event poller; false when none runs. Any context.
++    pub(crate) fn rt_kick() -> bool {
++        // SAFETY: Reads the driver's own poller pointer and wakes its task.
++        unsafe { asahi_g16_rt_kick() }
++    }
++
+     /// A qualified T8132 board (J713, J773g).
+     pub(crate) fn board() -> bool {
+         // SAFETY: Reads the machine compatible strings only.
+@@ -228,6 +252,22 @@ unsafe fn shared<'a>(cookie: *mut c_void) -> ArcBorrow<'a, Shared> {
+ /// # Safety
+ ///
+ /// `cookie` must be the live Shared cookie registered with these RTKit operations.
++/// The RT event poller's pass (`g16_rt_poll`): the poll work's body.
++///
++/// # Safety
++///
++/// `cookie` must be the leaked Shared cookie registered with RTKit (live until reboot).
++unsafe extern "C" fn rt_poll_run(cookie: *mut c_void) {
++    // SAFETY: The thread was started with the RTKit cookie.
++    let shared = unsafe { shared(cookie) };
++    let this = Arc::<Shared>::from(shared);
++    if this.orphaned.load(Ordering::Acquire) {
++        this.drain_orphan();
++        return;
++    }
++    this.run_poll();
++}
++
+ unsafe extern "C" fn rtkit_recv_early(cookie: *mut c_void, endpoint: u8, message: u64) -> bool {
+     // SAFETY: RTKit passes back the registered cookie.
+     let shared = unsafe { shared(cookie) };
+@@ -346,7 +386,17 @@ fn new(dev: &device::Device, shared: &Arc<Shared>) -> Result<Self> {
+         });
+         match rtk {
+             // INVARIANT: The cookie stays leaked from here on.
+-            Ok(rtk) => Ok(Self { rtk }),
++            Ok(rtk) => {
++                // SAFETY: The cookie is a leaked `Arc<Shared>`, live until reboot.
++                if let Err(e) = unsafe { glue::rt_start(rt_poll_run, cookie) } {
++                    dev_warn!(
++                        dev,
++                        "G16: RT event poller not started ({:?}); g16_rt_poll has no effect\n",
++                        e
++                    );
++                }
++                Ok(Self { rtk })
++            }
+             Err(e) => {
+                 // SAFETY: Init failed, so RTKit holds no copy of the cookie from `into_raw`.
+                 drop(unsafe { Arc::from_raw(cookie as *const Shared) });
+diff --git a/drivers/gpu/drm/asahi/g16/glue.c b/drivers/gpu/drm/asahi/g16/glue.c
+index 47512608e8..2aee732c7a 100644
+--- a/drivers/gpu/drm/asahi/g16/glue.c
++++ b/drivers/gpu/drm/asahi/g16/glue.c
+@@ -8,6 +8,8 @@
+ #include <linux/dma-map-ops.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
++#include <linux/kthread.h>
++#include <linux/sched.h>
+ #include <linux/ioport.h>
+ #include <linux/mm.h>
+ #include <linux/mfd/syscon.h>
+@@ -34,6 +36,8 @@ bool asahi_g16_j604_board(void);
+ int asahi_g16_display_prepare(struct device *dev);
+ int asahi_g16_hold_power(struct device *dev);
+ int asahi_g16_lat_qos(int us);
++int asahi_g16_rt_start(void (*fn)(void *cookie), void *cookie);
++bool asahi_g16_rt_kick(void);
+ bool asahi_g16_ram_disjoint(u64 start, u64 size);
+ void __iomem *asahi_g16_ioremap_wc(u64 start, size_t size);
+ bool asahi_g16_dma_unsupported(struct device *dev);
+@@ -397,6 +401,81 @@ void asahi_g16_clpc_gpu_put(struct apple_clpc_gpu *gpu)
+ 	apple_clpc_gpu_put(gpu);
+ }
+ 
++/*
++ * The G16 event poller (g16_rt_poll). A ring-service message from the firmware is received
++ * in the mailbox's IRQ thread; the poll that retires the finished commands then ran on
++ * system_highpri_wq, a CFS worker, about 36 us later on the J604 (k883 tailsplit: IRQ ->
++ * poll work start; the cluster idle exit is already kept off this path by g16_lat_qos).
++ * This thread is SCHED_FIFO (low), so the receive callback wakes it without waiting for
++ * CFS. It runs the same poll body, which serializes on the G16 state lock like the work,
++ * the hrtimer and the backup poll. It is created once, next to the RTKit cookie, and like
++ * that cookie it stays until reboot (it holds a module reference so the code stays too).
++ */
++struct asahi_g16_rt {
++	struct task_struct *task;
++	atomic_t pending;
++	void (*fn)(void *cookie);
++	void *cookie;
++};
++
++static struct asahi_g16_rt *asahi_g16_rt_cur;
++
++static int asahi_g16_rt_thread(void *data)
++{
++	struct asahi_g16_rt *rt = data;
++
++	sched_set_fifo_low(current);
++	for (;;) {
++		set_current_state(TASK_INTERRUPTIBLE);
++		if (!atomic_xchg(&rt->pending, 0)) {
++			schedule();
++			continue;
++		}
++		__set_current_state(TASK_RUNNING);
++		rt->fn(rt->cookie);
++	}
++	return 0;
++}
++
++int asahi_g16_rt_start(void (*fn)(void *cookie), void *cookie)
++{
++	struct asahi_g16_rt *rt;
++	struct task_struct *t;
++
++	/* Pairs with the release below: a started poller is fully set up. */
++	if (smp_load_acquire(&asahi_g16_rt_cur))
++		return 0;
++	rt = kzalloc(sizeof(*rt), GFP_KERNEL);
++	if (!rt)
++		return -ENOMEM;
++	rt->fn = fn;
++	rt->cookie = cookie;
++	t = kthread_create(asahi_g16_rt_thread, rt, "aurora-g16-poll");
++	if (IS_ERR(t)) {
++		kfree(rt);
++		return PTR_ERR(t);
++	}
++	rt->task = t;
++	__module_get(THIS_MODULE);
++	wake_up_process(t);
++	/* Publish only a complete poller to asahi_g16_rt_kick(), which may run in IRQ context. */
++	smp_store_release(&asahi_g16_rt_cur, rt);
++	return 0;
++}
++
++/* Any context. False when no thread runs: the caller queues the poll work instead. */
++bool asahi_g16_rt_kick(void)
++{
++	/* Pairs with the release in asahi_g16_rt_start(). */
++	struct asahi_g16_rt *rt = smp_load_acquire(&asahi_g16_rt_cur);
++
++	if (!rt)
++		return false;
++	atomic_set(&rt->pending, 1);
++	wake_up_process(rt->task);
++	return true;
++}
++
+ /*
+  * A CPU wake-latency bound while G16 commands are in flight (g16_lat_qos_us): the
+  * cluster idle state's 75 us exit is then kept off the event -> retire path. @us < 0
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index d8d725bea8..ad044ee5bd 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -264,6 +264,10 @@ impl Shared {
+     pub(crate) fn kick(self: &Arc<Self>) {
+         self.event_ticks.store(engine::counter_ticks(), Ordering::Relaxed);
+         self.evented.store(true, Ordering::Release);
++        // g16_rt_poll: the SCHED_FIFO poller instead of the CFS worker (boot.rs rt_poll_run).
++        if params::rt_poll() && boot::glue::rt_kick() {
++            return;
++        }
+         // `mod_delayed_work(.., 0)` so that a kick also runs a poll whose 1-jiffy backup is
+         // pending (a plain enqueue is refused then).
+         self.poll_now();
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 8a71c3c084..917a70f911 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -658,6 +658,25 @@ pub(crate) fn depth() -> u32 {
+     "G16: render commands of one queue that may stay in flight behind the next publication (default 0: publish after retirement; 1: one in flight; runtime 0644)"
+ );
+ 
++/// Storage of `g16_rt_poll` (runtime 0644, default 0).
++static RT_POLL: AtomicU32 = AtomicU32::new(0);
++
++/// Who runs the poll after a firmware ring-service message: 0 (default) the poll work on
++/// `system_highpri_wq` (a CFS worker, ~36 us after the message on the J604, k883), 1 the
++/// driver's SCHED_FIFO (low) poller thread, woken from the receive callback.
++pub(crate) fn rt_poll() -> bool {
++    RT_POLL.load(Ordering::Relaxed) == 1
++}
++
++live_u32_param!(
++    RT_POLL_PARAM,
++    RT_POLL_PARMTYPE,
++    RT_POLL_PARM,
++    RT_POLL,
++    "g16_rt_poll",
++    "G16: retire after a firmware event on the SCHED_FIFO poller thread instead of the CFS worker (default 0; 1: on; runtime 0644)"
++);
++
+ /// Storage of `g16_subgen` (runtime 0644, default 0).
+ static SUBGEN: AtomicU32 = AtomicU32::new(0);
+ 
+-- 
+2.43.0
+

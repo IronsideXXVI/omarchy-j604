@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 09:32:57 +0000
+Subject: [PATCH] media: apple: isp: add a digital zoom control
+
+The camera firmware zooms by itself: it has ZOOM_FACTOR_SET (0x0810)
+with CURRENT_ZOOM_FACTOR_GET (0x0811) and MAX_ZOOM_FACTOR_GET (0x080f)
+next to the crop commands, and macOS reads the maximum at every start.
+The opcodes follow the firmware's command name table, whose order holds
+for the crop commands this driver already uses and for 0x080f and
+0x0815, which macOS sends.
+
+With the digital_zoom parameter set, offer V4L2_CID_ZOOM_ABSOLUTE in
+percent, 100 to 400. The factor unit is not documented, so the factor
+the firmware reports before the first change is taken as 1x and scaled,
+up to the reported maximum. A change during a stream is applied from a
+work item under the video lock. The default of 100 sends no command, and
+without the parameter there is no control, so nothing changes by
+default. This is the zoom that a framing helper (Center Stage) needs.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/isp/isp-cmd.c  | 25 +++++++
+ drivers/media/platform/apple/isp/isp-cmd.h  | 13 ++++
+ drivers/media/platform/apple/isp/isp-drv.h  |  8 ++
+ drivers/media/platform/apple/isp/isp-v4l2.c | 82 ++++++++++++++++++++-
+ 4 files changed, 127 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.c b/drivers/media/platform/apple/isp/isp-cmd.c
+index 751de96cfa..e199f803f5 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.c
++++ b/drivers/media/platform/apple/isp/isp-cmd.c
+@@ -447,6 +447,31 @@ int isp_cmd_ch_crop_set(struct apple_isp *isp, u32 chan, u32 x1, u32 y1, u32 x2,
+ 	return CISP_SEND_IN(isp, args);
+ }
+ 
++int isp_cmd_ch_zoom_factor_get(struct apple_isp *isp, u32 chan, bool max,
++			       u32 *factor)
++{
++	struct cmd_ch_zoom_factor args = {
++		.opcode = CISP_OPCODE(max ? CISP_CMD_CH_MAX_ZOOM_FACTOR_GET :
++					    CISP_CMD_CH_CURRENT_ZOOM_FACTOR_GET),
++		.chan = chan,
++	};
++	int err = CISP_SEND_INOUT(isp, args);
++
++	if (!err)
++		*factor = args.factor;
++	return err;
++}
++
++int isp_cmd_ch_zoom_factor_set(struct apple_isp *isp, u32 chan, u32 factor)
++{
++	struct cmd_ch_zoom_factor args = {
++		.opcode = CISP_OPCODE(CISP_CMD_CH_ZOOM_FACTOR_SET),
++		.chan = chan,
++		.factor = factor,
++	};
++	return CISP_SEND_IN(isp, args);
++}
++
+ int isp_cmd_ch_output_config_set(struct apple_isp *isp, u32 chan, u32 width,
+ 				 u32 height, u32 strides[3], u32 colorspace, u32 format)
+ {
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.h b/drivers/media/platform/apple/isp/isp-cmd.h
+index bf99879ddf..889e7657da 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.h
++++ b/drivers/media/platform/apple/isp/isp-cmd.h
+@@ -73,6 +73,9 @@
+ #define CISP_CMD_CH_CROP_SCL1_GET			     0x080b
+ #define CISP_CMD_CH_CROP_SCL1_SET			     0x080c
+ #define CISP_CMD_CH_SCALER_CROP_SCL1_SET		     0x080d
++#define CISP_CMD_CH_MAX_ZOOM_FACTOR_GET			     0x080f
++#define CISP_CMD_CH_ZOOM_FACTOR_SET			     0x0810
++#define CISP_CMD_CH_CURRENT_ZOOM_FACTOR_GET		     0x0811
+ #define CISP_CMD_CH_ALS_ENABLE				     0x0a1c
+ #define CISP_CMD_CH_ALS_DISABLE				     0x0a1d
+ #define CISP_CMD_CH_CNR_START				     0x0a2f
+@@ -510,6 +513,13 @@ struct cmd_ch_crop_set {
+ } __packed;
+ static_assert(sizeof(struct cmd_ch_crop_set) == 0x1c);
+ 
++struct cmd_ch_zoom_factor {
++	u64 opcode;
++	u32 chan;
++	u32 factor;
++} __packed;
++static_assert(sizeof(struct cmd_ch_zoom_factor) == 0x10);
++
+ struct cmd_ch_output_config_set {
+ 	u64 opcode;
+ 	u32 chan;
+@@ -624,6 +634,9 @@ int isp_cmd_ch_master_slave_sync_mode_set(struct apple_isp *isp, u32 chan,
+ 					  u32 mode);
+ int isp_cmd_ch_crop_set(struct apple_isp *isp, u32 chan, u32 x1, u32 y1, u32 x2,
+ 			u32 y2);
++int isp_cmd_ch_zoom_factor_get(struct apple_isp *isp, u32 chan, bool max,
++			       u32 *factor);
++int isp_cmd_ch_zoom_factor_set(struct apple_isp *isp, u32 chan, u32 factor);
+ int isp_cmd_ch_output_config_set(struct apple_isp *isp, u32 chan, u32 width,
+ 				 u32 height, u32 strides[3], u32 colorspace, u32 format);
+ int isp_cmd_ch_preview_stream_set(struct apple_isp *isp, u32 chan, u32 stream);
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 1a0937c4f5..aa4dc3a0aa 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -511,6 +511,14 @@ struct apple_isp {
+ 	/* restarts a stream that ran across that sleep, see apple_isp_resume() */
+ 	struct work_struct resume_work;
+ 
++	/* digital zoom in percent (digital_zoom), applied by zoom_work */
++	struct v4l2_ctrl *zoom;
++	struct work_struct zoom_work;
++	/* firmware zoom factor at the view a stream starts with, and its max */
++	u32 zoom_unit;
++	u32 zoom_max;
++	bool zoom_failed;
++
+ 	struct isp_surf *ipc_surf;
+ 	struct isp_surf *extra_surf;
+ 	struct isp_surf *data_surf;
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index 594802d977..ec0d2e1778 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -632,6 +632,8 @@ static void apple_isp_stop_streaming(struct apple_isp *isp)
+ 	apple_isp_stop_camera(isp);
+ }
+ 
++static void isp_apply_zoom(struct apple_isp *isp);
++
+ static int isp_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
+ {
+ 	struct apple_isp *isp = vb2_get_drv_priv(q);
+@@ -644,6 +646,8 @@ static int isp_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
+ 	v4l2_ctrl_grab(isp->power_line_frequency, true);
+ 
+ 	err = apple_isp_start_streaming(isp);
++	if (!err)
++		isp_apply_zoom(isp);
+ 	if (err) {
+ 		v4l2_ctrl_grab(isp->exposure_priority, false);
+ 		v4l2_ctrl_grab(isp->power_line_frequency, false);
+@@ -1200,6 +1204,76 @@ static const struct v4l2_ctrl_ops isp_exposure_ctrl_ops = {
+ 	.g_volatile_ctrl = isp_g_volatile_ctrl,
+ };
+ 
++static bool digital_zoom;
++module_param(digital_zoom, bool, 0444);
++MODULE_PARM_DESC(digital_zoom,
++		 "Offer a digital zoom control, done by the camera firmware");
++
++/*
++ * The firmware zooms into the view a stream starts with. Its factor unit is
++ * not documented: the factor it reports before the first change is taken as
++ * 1x, and the zoom control (in percent) scales it, up to the firmware's
++ * maximum. The default of 100 sends nothing, so the view stays as before.
++ * Called with video_lock held.
++ */
++static void isp_apply_zoom(struct apple_isp *isp)
++{
++	u32 pct, factor;
++	int err;
++
++	if (!isp->zoom || isp->zoom_failed ||
++	    !test_bit(ISP_STATE_STREAMING, &isp->state))
++		return;
++
++	pct = v4l2_ctrl_g_ctrl(isp->zoom);
++	if (!isp->zoom_unit) {
++		if (pct == 100)
++			return;
++		err = isp_cmd_ch_zoom_factor_get(isp, isp->current_ch, false,
++						 &isp->zoom_unit);
++		if (!err)
++			err = isp_cmd_ch_zoom_factor_get(isp, isp->current_ch,
++							 true, &isp->zoom_max);
++		dev_info(isp->dev, "zoom factor %#x at 1x, max %#x (%d)\n",
++			 isp->zoom_unit, isp->zoom_max, err);
++		if (err || !isp->zoom_unit || isp->zoom_max < isp->zoom_unit) {
++			isp->zoom_unit = 0;
++			isp->zoom_failed = true;
++			return;
++		}
++	}
++
++	factor = min_t(u64, div_u64((u64)isp->zoom_unit * pct, 100),
++		       isp->zoom_max);
++	err = isp_cmd_ch_zoom_factor_set(isp, isp->current_ch, factor);
++	if (err)
++		dev_warn_ratelimited(isp->dev, "zoom factor %#x refused: %d\n",
++				     factor, err);
++}
++
++static void isp_zoom_work(struct work_struct *work)
++{
++	struct apple_isp *isp = container_of(work, struct apple_isp, zoom_work);
++
++	mutex_lock(&isp->video_lock);
++	isp_apply_zoom(isp);
++	mutex_unlock(&isp->video_lock);
++}
++
++/* Takes the control lock only: the change is applied from a work item. */
++static int isp_s_zoom_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct apple_isp *isp =
++		container_of(ctrl->handler, struct apple_isp, ctrl_handler);
++
++	schedule_work(&isp->zoom_work);
++	return 0;
++}
++
++static const struct v4l2_ctrl_ops isp_zoom_ctrl_ops = {
++	.s_ctrl = isp_s_zoom_ctrl,
++};
++
+ /*
+  * Auto exposure picks the gain and exposure of each frame. Report the last
+  * frame's values read-only, so that userspace can follow the scene light, for
+@@ -1283,7 +1357,8 @@ int apple_isp_setup_video(struct apple_isp *isp)
+ 	 * Where macOS runs its camera with auto low-light video, exposure
+ 	 * priority is the default, so a dark room gets up to 1/15 s as there.
+ 	 */
+-	v4l2_ctrl_handler_init(&isp->ctrl_handler, 4);
++	INIT_WORK(&isp->zoom_work, isp_zoom_work);
++	v4l2_ctrl_handler_init(&isp->ctrl_handler, 5);
+ 	isp->exposure_priority =
+ 		v4l2_ctrl_new_std(&isp->ctrl_handler, NULL,
+ 				  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1,
+@@ -1302,6 +1377,10 @@ int apple_isp_setup_video(struct apple_isp *isp)
+ 					       V4L2_CID_POWER_LINE_FREQUENCY_50HZ);
+ 	if (isp_meta_exposure(isp))
+ 		isp_init_exposure_ctrls(isp);
++	if (digital_zoom)
++		isp->zoom = v4l2_ctrl_new_std(&isp->ctrl_handler, &isp_zoom_ctrl_ops,
++					      V4L2_CID_ZOOM_ABSOLUTE, 100, 400, 1,
++					      100);
+ 	if (isp->ctrl_handler.error) {
+ 		err = isp->ctrl_handler.error;
+ 		dev_err(isp->dev, "failed to create controls: %d\n", err);
+@@ -1365,6 +1444,7 @@ int apple_isp_setup_video(struct apple_isp *isp)
+ void apple_isp_remove_video(struct apple_isp *isp)
+ {
+ 	vb2_video_unregister_device(&isp->vdev);
++	cancel_work_sync(&isp->zoom_work);
+ 	v4l2_device_unregister(&isp->v4l2_dev);
+ 	media_device_unregister(&isp->mdev);
+ }
+-- 
+2.43.0
+

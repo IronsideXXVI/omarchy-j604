@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 10:05:54 +0000
+Subject: [PATCH] iommu/apple-dart: after a deep sleep, put back the
+ streams no table of ours used
+
+A J604 deep sleep with the panel on still quarantines the internal DCP
+on 1.928, which carries fe089e3e4331:
+
+  apple-dart 30a340000.iommu: SID6 TTBR0 03200000, had 00000000
+  apple-dart 30a340000.iommu: DCP SID23 retired: power-up: state lost (-5)
+  apple-dcp 30ae00000.dcp: Retained DCP session quarantined: -5
+
+and every later suspend fails in apple-drm with -EIO. Its test for a
+stream to leave out (off at power-down, no TCR, no page table) never
+matched: the DCP DART is adopted from iBoot, so its enable mask is
+iBoot's and SID6 can be on with a TCR while it has no table of ours.
+
+What the power-up check protects is the page tables of this kernel's
+streams: they stay in memory and the retained DCP session maps through
+them. A stream without one has nothing of ours to lose. After a real
+sleep, leave every such stream out of the check: on a locked DART (the
+DCP's, adopted with no writes) it is iBoot's and the wake hands it over
+as iBoot's boot did; elsewhere put its TCR and TTBRs back as they were
+at power-down, and keep checking it if that fails and it could still
+translate. A stream the wake turned on that was off at power-down goes
+off again, so the stream enable at power-up reads back as saved. Each
+stream that differs is logged once with what the check compares.
+
+Fixes: fe089e3e4331 ("iommu/apple-dart: don't fail a gated DCP's power-up on a stream the wake set up")
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/iommu/apple-dart.c | 86 ++++++++++++++++++++++++++++----------
+ 1 file changed, 65 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/iommu/apple-dart.c b/drivers/iommu/apple-dart.c
+index 0fcac376db..0e9aad7b98 100644
+--- a/drivers/iommu/apple-dart.c
++++ b/drivers/iommu/apple-dart.c
+@@ -6402,34 +6402,78 @@ static bool apple_dart_state_retained(struct apple_dart *dart)
+ 
+ /*
+  * After a real sleep a DCP's DART comes back as the wake rebuilt it, the way
+- * iBoot sets it up: a stream this kernel had left unused (no TCR, no page
+- * table) when it powered the DART down can come back with iBoot's page table
+- * (J604: SID6 TTBR0 0x01200000, had 0). Power-up enables only the streams that
+- * were on at power-down, so such a stream stays off and does no DMA: it is no
+- * sign that the state this kernel set up was lost. These are the streams to
+- * leave out of the check, each said once.
++ * iBoot sets it up (J604: SID6 TTBR0 0x01200000 or 0x03200000, had 0). Only a
++ * stream that had a page table of this kernel's at power-down holds state that
++ * could be lost: the tables live in memory and the DCP's retained session maps
++ * through them. Any other stream is put back as it was at power-down (its TCR,
++ * bypass included, and its page-table registers, and off again if the wake
++ * turned it on) and left out of the check. On a locked DART (the J604's DCP
++ * DART, adopted with no writes) such a stream is iBoot's: the wake hands it over
++ * as iBoot's boot did, so it is left as it is. Elsewhere a stream that cannot be
++ * put back and could still translate is not left out, so the check fails on it.
++ * Each stream that differs is said once, with what power-up checks.
+  */
+-static u64 apple_dart_slept_unused(struct apple_dart *dart)
++static u64 apple_dart_slept_restore_unowned(struct apple_dart *dart)
+ {
+ 	unsigned int sid, idx, n = min_t(unsigned int, dart->num_streams, 32);
+-	u64 ignore = 0;
++	u32 live_en = readl(dart->regs + DART_T8110_ENABLE_STREAMS);
++	u32 extra = live_en & ~dart->off_streams;
++	u64 skip = 0;
+ 
+ 	for (sid = 0; sid < n; sid++) {
+-		bool unused = !(dart->off_streams & BIT(sid)) && !dart->save_tcr[sid];
++		u32 tcr = apple_dart_readl(dart, DART_TCR(dart, sid));
++		u32 ttbr0 = apple_dart_readl(dart, DART_TTBR(dart, sid, 0));
++		bool owned = false, same = tcr == dart->save_tcr[sid];
+ 
+-		for (idx = 0; unused && idx < dart->hw->ttbr_count; idx++)
+-			unused = !dart->save_ttbr[sid][idx];
+-		if (!unused)
++		for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
++			owned |= !!(dart->save_ttbr[sid][idx] & dart->hw->ttbr_valid);
++			same &= apple_dart_readl(dart, DART_TTBR(dart, sid, idx)) ==
++				dart->save_ttbr[sid][idx];
++		}
++		if (same && !(extra & BIT(sid)))
++			continue;
++		dev_info(dart->dev,
++			 "SID%u after the wake: on %d (had %d), TCR %08x (had %08x), TTBR0 %08x (had %08x); %s\n",
++			 sid, !!(live_en & BIT(sid)), !!(dart->off_streams & BIT(sid)), tcr,
++			 dart->save_tcr[sid], ttbr0, dart->save_ttbr[sid][0],
++			 owned ? "ours at power-down" :
++			 dart->locked ? "iBoot's on a locked DART: left as the wake set it" :
++			 "not ours at power-down: put back");
++		if (owned)
++			continue;
++		if (dart->locked) {
++			skip |= BIT_ULL(sid);
+ 			continue;
+-		ignore |= BIT_ULL(sid);
+-		if (apple_dart_readl(dart, DART_TCR(dart, sid)) ||
+-		    apple_dart_readl(dart, DART_TTBR(dart, sid, 0)))
+-			dev_info(dart->dev,
+-				 "SID%u left set up by the wake (TCR %08x TTBR0 %08x), unused here: stays off\n",
+-				 sid, apple_dart_readl(dart, DART_TCR(dart, sid)),
+-				 apple_dart_readl(dart, DART_TTBR(dart, sid, 0)));
++		}
++
++		/* A TCR the wake changed: translation off, its tables, then the TCR it had. */
++		if (tcr != dart->save_tcr[sid])
++			apple_dart_writel(dart, dart->hw->tcr_disabled, DART_TCR(dart, sid));
++		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
++			apple_dart_writel(dart, dart->save_ttbr[sid][idx],
++					  DART_TTBR(dart, sid, idx));
++		if (tcr != dart->save_tcr[sid])
++			apple_dart_writel(dart, dart->save_tcr[sid], DART_TCR(dart, sid));
++
++		tcr = apple_dart_readl(dart, DART_TCR(dart, sid));
++		same = tcr == dart->save_tcr[sid];
++		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
++			same &= apple_dart_readl(dart, DART_TTBR(dart, sid, idx)) ==
++				dart->save_ttbr[sid][idx];
++		if (!same && tcr != dart->hw->tcr_disabled) {
++			dev_warn(dart->dev, "SID%u could not be put back (TCR %08x) and can translate\n",
++				 sid, tcr);
++			continue;
++		}
++		skip |= BIT_ULL(sid);
++	}
++	/* Streams the wake turned on that were off at power-down go off again. */
++	if (extra) {
++		writel(extra, dart->regs + DART_T8110_DISABLE_STREAMS);
++		dev_info(dart->dev, "streams %08x turned on by the wake: off again (now %08x)\n",
++			 extra, readl(dart->regs + DART_T8110_ENABLE_STREAMS));
+ 	}
+-	return ignore;
++	return skip;
+ }
+ 
+ /*
+@@ -7015,7 +7059,7 @@ static int apple_dart_host_power_on(struct apple_dart *dart)
+ 	    readl(dart->regs + DART_T8110_PROTECT) != dart->off_protect ||
+ 	    readl(dart->regs + DART_T8110_PROTECT_LOCK) != dart->off_lock ||
+ 	    !apple_dart_state_retained_except(dart, dart->host_off_slept ?
+-					      apple_dart_slept_unused(dart) : 0))
++					      apple_dart_slept_restore_unowned(dart) : 0))
+ 		goto fail;
+ 	dart->host_off_slept = false;
+ 	why = "commands";
+-- 
+2.43.0
+
