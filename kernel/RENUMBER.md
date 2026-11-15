@@ -1152,3 +1152,10 @@ New in 1.937: 0707 (`drm: apple: t8132: Power a gated DCP up before a timing cha
 Kernel 1.938 keeps the base (`da8e1acf3656`) and all 729 patches of 1.937 under the same numbers.
 
 New in 1.938: 0730 (`sched/fair: Treat a task that runs without sleeping on a smaller CPU as misfit`), 0731 (`sched/fair: Push a runtime misfit to an idle bigger CPU from the tick`), 0732 (`media: apple: avd: AV1 test switches for the 10-bit output and motion-field release`), 0733 (`drm: apple: t8132: Bring a quarantined display session back without a reboot`), 0734 (`drm: apple: t8132: Let the fault injector test the powered-down call net`), 0735 (`drm: apple: t8132: Re-arm the receive wait when a quarantined session comes back`), 0736 (`drm: apple: dptxep: Optionally wait for the Type-C PHY's DP mode before the lane count`).
+
+
+# Kernel patch numbers: 1.938 to 1.939
+
+Kernel 1.939 keeps the base (`da8e1acf3656`) and all 736 patches of 1.938 under the same numbers.
+
+New in 1.939: 0737 (`soc: apple: clpc: let the all-core ceiling be set at run time`), 0738 (`soc: apple: clpc: optionally hold an idle cluster at its slowest state`), 0739 (`media: apple: avd: HEVC test switch for the 10-bit packed-format scratch`), 0740 (`drm/asahi: g16: Count why commands wait on their dependencies`), 0741 (`drm/asahi: g16: Latch the render units apart from the resident depth`), 0742 (`drm/asahi: g16: Optionally revive a fail-stopped GPU at the next real wake`), 0743 (`sched/features: Enable MISFIT_RUNTIME`).

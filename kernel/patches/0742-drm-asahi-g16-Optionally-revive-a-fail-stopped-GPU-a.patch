@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 17:52:21 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally revive a fail-stopped GPU
+ at the next real wake
+
+A fail-stop leaves the GPU unusable until reboot. On the J604 a wake
+that timed out (the firmware did not acknowledge IOP power ON) did that
+to a running desktop. A G16 firmware that stops answering with its power
+kept restarts only through the warm handshake after iBoot's wake
+program, which runs on a real system wake: the path every deep sleep
+already takes.
+
+Add g16_revive (runtime, default 0). With it, a real wake that finds
+the device fail-stopped raises the GPU domain and warm-restarts the
+firmware as after any sleep. On success it clears the fail-stop latches
+and the engine's freeze. Contexts from before stay failed with EIO,
+while new ones work. On failure nothing changes. Add g16_test_failstop
+(runtime, test only): 1 makes the next submission fail-stop the device
+with ETIMEDOUT without touching the firmware, to exercise the path.
+A "revive:" stats line counts revivals and failures.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 39 +++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 12 +++++++
+ drivers/gpu/drm/asahi/g16/sleep.rs  | 53 +++++++++++++++++++++++++++++
+ 3 files changed, 104 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 8cb869a85f..433cfab5d3 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -677,6 +677,45 @@ pub(crate) fn rt_poll() -> bool {
+     "G16: retire after a firmware event on the SCHED_FIFO poller thread instead of the CFS worker (default 0; 1: on; runtime 0644)"
+ );
+ 
++/// Storage of `g16_revive` (runtime 0644, default 0).
++static REVIVE: AtomicU32 = AtomicU32::new(0);
++
++/// Whether a real wake revives a fail-stopped GPU: the domain is raised and the firmware
++/// warm-restarted as after any sleep, then the fail-stop latches clear. A G16 firmware that
++/// stopped answering with its power kept restarts only through iBoot's wake program, so a real
++/// sleep is the one way back short of a reboot. Contexts from before stay lost (EIO); new ones
++/// work. 0 leaves the GPU failed until reboot, as before.
++pub(crate) fn revive() -> bool {
++    REVIVE.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    REVIVE_PARAM,
++    REVIVE_PARMTYPE,
++    REVIVE_PARM,
++    REVIVE,
++    "g16_revive",
++    "G16: after a fail-stop, warm-restart the firmware at the next real wake (default 0: failed until reboot; runtime 0644)"
++);
++
++/// Storage of `g16_test_failstop` (runtime 0644, default 0).
++static TEST_FAILSTOP: AtomicU32 = AtomicU32::new(0);
++
++/// Test of the fail-stop path: 1 makes the next submission fail-stop the device (ETIMEDOUT)
++/// without touching the firmware. Reads back 0 once taken.
++pub(crate) fn take_test_failstop() -> bool {
++    TEST_FAILSTOP.swap(0, Ordering::AcqRel) != 0
++}
++
++live_u32_param!(
++    TEST_FAILSTOP_PARAM,
++    TEST_FAILSTOP_PARMTYPE,
++    TEST_FAILSTOP_PARM,
++    TEST_FAILSTOP,
++    "g16_test_failstop",
++    "G16: test only: 1 = the next GPU submission fail-stops the device (ETIMEDOUT) without touching the firmware; reads 0 once taken (runtime 0644)"
++);
++
+ /// Storage of `g16_subgen` (runtime 0644, default 0).
+ static SUBGEN: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index f84859871c..341ccc7434 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -135,6 +135,11 @@ pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+             if firmware.engine.shared.is_none() {
+                 firmware.engine.shared = Some(self.clone());
+             }
++            if super::params::take_test_failstop() && firmware.recovery.failed().is_none() {
++                dev_warn!(self.dev.as_ref(), "G16: g16_test_failstop: fail-stop now\n");
++                firmware.fail_stop(ETIMEDOUT, &mut done);
++                self.fail_stop(ETIMEDOUT);
++            }
+             let accepted = firmware.enqueue(job);
+             if accepted.is_ok() {
+                 if let Err(error) = firmware.publish(&mut done) {
+@@ -1276,6 +1281,13 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.dep_wait[0][1],
+             s.dep_wait[0][2]
+         )?;
++        writeln!(
++            f,
++            "revive: enabled {} revived {} failed {}",
++            u8::from(super::params::revive()),
++            super::sleep::REVIVE_STATS[0].load(core::sync::atomic::Ordering::Relaxed),
++            super::sleep::REVIVE_STATS[1].load(core::sync::atomic::Ordering::Relaxed)
++        )?;
+         self.pools.write_stats(f)?;
+         writeln!(
+             f,
+diff --git a/drivers/gpu/drm/asahi/g16/sleep.rs b/drivers/gpu/drm/asahi/g16/sleep.rs
+index 4e7e854b3b..838bd5f63e 100644
+--- a/drivers/gpu/drm/asahi/g16/sleep.rs
++++ b/drivers/gpu/drm/asahi/g16/sleep.rs
+@@ -31,6 +31,10 @@
+ use super::{Firmware, Gpu, Shared};
+ use crate::driver::{AsahiPlatformDriverData, SleepOps};
+ 
++/// `g16_revive`, for `aurora-g16/stats` (`revive:`): revivals that brought the firmware back,
++/// and those that failed.
++pub(crate) static REVIVE_STATS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
++
+ /// Time work in flight gets to finish before the sleep is refused.
+ const DRAIN_NS: u64 = 3_000_000_000;
+ /// Time work in flight gets to retire at a suspend-to-idle; the sleep goes on either way.
+@@ -259,6 +263,51 @@ fn sleep_hold(self: &Arc<Self>) -> bool {
+         true
+     }
+ 
++    /// `g16_revive`: after a real wake, raises the domain and warm-restarts a fail-stopped
++    /// firmware, then clears the fail-stop latches. On failure the device stays failed.
++    fn revive_up(self: &Arc<Self>) -> Result {
++        let started = now_ns();
++        let result = {
++            let mut state = self.state.lock();
++            match state.as_deref_mut() {
++                Some(firmware) => self
++                    .raise_domain()
++                    .and_then(|_| firmware.sleep_restart())
++                    .map(|_| {
++                        firmware.recovery.failed = None;
++                        firmware.engine.frozen = false;
++                    }),
++                None => self.raise_domain().and(Err(ENODEV)),
++            }
++        };
++        self.sleeping.store(false, Ordering::Release);
++        match result {
++            Ok(()) => {
++                self.error.store(0, Ordering::Release);
++                self.wedged.store(false, Ordering::Release);
++                self.wedged_notified.store(false, Ordering::Release);
++                self.crashed.store(false, Ordering::Release);
++                REVIVE_STATS[0].fetch_add(1, Ordering::Relaxed);
++                dev_warn!(
++                    self.dev.as_ref(),
++                    "G16: revived by the real wake in {} us; contexts from before stay lost\n",
++                    now_ns().saturating_sub(started) / 1000
++                );
++                self.poll_now();
++                Ok(())
++            }
++            Err(error) => {
++                REVIVE_STATS[1].fetch_add(1, Ordering::Relaxed);
++                dev_err!(
++                    self.dev.as_ref(),
++                    "G16: revive failed ({:?}); GPU unusable until reboot\n",
++                    error
++                );
++                Err(error)
++            }
++        }
++    }
++
+     /// Raises the domain and restarts the firmware. A failure loses the device.
+     fn sleep_up(self: &Arc<Self>) -> Result {
+         let started = now_ns();
+@@ -369,6 +418,10 @@ fn sleep_complete(&self) {
+         if !real && self.shared.sleep_hold() {
+             return;
+         }
++        if real && params::revive() && self.shared.crashed.load(Ordering::Acquire) {
++            let _ = self.shared.revive_up();
++            return;
++        }
+         let _ = self.shared.sleep_up();
+     }
+ }
+-- 
+2.43.0
+

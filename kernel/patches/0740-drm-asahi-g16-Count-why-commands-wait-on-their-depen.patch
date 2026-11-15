@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 17:42:47 +0000
+Subject: [PATCH] drm/asahi: g16: Count why commands wait on their
+ dependencies
+
+About two thirds of compute.light commands at depth 64 reach the
+firmware only after their predecessor has ended, and the horizon
+statistics cannot say why: a command held by an explicit barrier or a
+historical prior returns EAGAIN from check_command_dependencies(), and
+both the dispatch loop and pick() then stop without counting anything.
+
+Add a "depwait:" line to aurora-g16/stats. Per engine it counts the
+published commands whose own-engine dependency names nothing, an older
+prefix, or the immediate predecessor, and the dispatch passes that
+stopped on a waiting command, by cause: an incomplete barrier or prior,
+the in-flight window, or an input fence. Statistics only; nothing is
+published or held differently.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 23 ++++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/job.rs    | 35 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 16 +++++++++++++
+ 3 files changed, 73 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 86a2fbf0dd..08ca1d3aba 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -415,6 +415,12 @@ pub(crate) struct Stats {
+     pub(crate) rz_stop: [u64; 4],
+     pub(crate) rz_behind: u64,
+     pub(crate) rz_ahead: u64,
++    /// `depwait:` per engine (render, compute): published commands whose own-engine
++    /// dependency names nothing / an older prefix / the immediate predecessor; and dispatch
++    /// passes that stopped on a waiting command, by cause: its barrier or prior, the in-flight
++    /// window, an input fence.
++    pub(crate) prior: [[u64; 3]; 2],
++    pub(crate) dep_wait: [[u64; 3]; 2],
+     /// Why ready jobs stayed unpublished: both flights published, a channel record unconsumed,
+     /// no free slot.
+     pub(crate) hold: [u64; 3],
+@@ -1018,6 +1024,14 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+             && !self.engine.pending.is_empty()
+         {
+             let Some(index) = self.engine.pick() else {
++                let wait = self
++                    .engine
++                    .pending
++                    .first()
++                    .and_then(|job| job.dependency_wait(job.progress.sent()));
++                if let Some((engine, cause)) = wait {
++                    self.engine.stats.dep_wait[engine][cause] += 1;
++                }
+                 break;
+             };
+             let job = self.engine.pending[index].clone();
+@@ -1082,7 +1096,12 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+             }
+             match job.check_command_dependencies(job.progress.sent()) {
+                 Ok(()) => {}
+-                Err(e) if e == EAGAIN => break,
++                Err(e) if e == EAGAIN => {
++                    if let Some((engine, cause)) = job.dependency_wait(job.progress.sent()) {
++                        self.engine.stats.dep_wait[engine][cause] += 1;
++                    }
++                    break;
++                }
+                 Err(e) => {
+                     self.engine.unpend(&job);
+                     let _ = job.mark_terminal_retired();
+@@ -1094,8 +1113,10 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+             job.queue.turn.store(self.engine.turn, Ordering::Relaxed);
+             let behind = self.engine.flights.len() as u64;
+             let compute = matches!(command(&job, job.progress.sent()), Some(Command::Compute(_)));
++            let own_prior = job.own_prior(job.progress.sent());
+             match self.publish_prefix(&job, done) {
+                 Ok(()) => {
++                    self.engine.stats.prior[usize::from(compute)][own_prior] += 1;
+                     // Stats: compute commands posted behind running flights, and the flights
+                     // they found (mean depth = ahead / behind).
+                     if compute && behind != 0 {
+diff --git a/drivers/gpu/drm/asahi/g16/job.rs b/drivers/gpu/drm/asahi/g16/job.rs
+index 4d43851b25..cdb8a30406 100644
+--- a/drivers/gpu/drm/asahi/g16/job.rs
++++ b/drivers/gpu/drm/asahi/g16/job.rs
+@@ -317,6 +317,41 @@ pub(crate) fn check_command_dependencies(&self, index: u32) -> Result {
+         Err(EAGAIN)
+     }
+ 
++    /// For the stats line `depwait:`: how the command at `index` names its own engine's
++    /// predecessors: 0 not at all, 1 an older prefix, 2 its immediate predecessor (a barrier or
++    /// historical prior that chains it behind the previous command's completion).
++    pub(crate) fn own_prior(&self, index: u32) -> usize {
++        let Some(order) = self.orders.get(index as usize) else {
++            return 0;
++        };
++        match order.wait_through[order.engine] {
++            None => 0,
++            Some(last) if last.saturating_add(1) >= order.sequence => 2,
++            Some(_) => 1,
++        }
++    }
++
++    /// For the stats line `depwait:`: the engine of the command at `index` and why it waits:
++    /// 0 a barrier or historical prior not yet completed, 1 the in-flight rules (its
++    /// predecessor window), 2 an input fence.
++    pub(crate) fn dependency_wait(&self, index: u32) -> Option<(usize, usize)> {
++        let order = self.orders.get(index as usize)?;
++        if super::fence::check_dependencies(&self.inputs).is_err() {
++            return Some((order.engine, 2));
++        }
++        let completed = self
++            .queue
++            .completed
++            .each_ref()
++            .map(|value| value.load(Ordering::Acquire));
++        let prior_done = order
++            .wait_through
++            .iter()
++            .zip(completed)
++            .all(|(prefix, observed)| prefix.is_none_or(|last| observed >= last));
++        Some((order.engine, if prior_done { 1 } else { 0 }))
++    }
++
+     /// Records the queue's published frontier for the command at `index` (`g16_depth`).
+     pub(crate) fn command_published(&self, index: u32) {
+         if let Some(order) = self.orders.get(index as usize) {
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 8bc58d343d..f84859871c 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1260,6 +1260,22 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             "rhorizon: stop {}/{}/{}/{} behind {} ahead {}",
+             s.rz_stop[0], s.rz_stop[1], s.rz_stop[2], s.rz_stop[3], s.rz_behind, s.rz_ahead
+         )?;
++        writeln!(
++            f,
++            "depwait: compute prior {}/{}/{} wait {}/{}/{} render prior {}/{}/{} wait {}/{}/{}",
++            s.prior[1][0],
++            s.prior[1][1],
++            s.prior[1][2],
++            s.dep_wait[1][0],
++            s.dep_wait[1][1],
++            s.dep_wait[1][2],
++            s.prior[0][0],
++            s.prior[0][1],
++            s.prior[0][2],
++            s.dep_wait[0][0],
++            s.dep_wait[0][1],
++            s.dep_wait[0][2]
++        )?;
+         self.pools.write_stats(f)?;
+         writeln!(
+             f,
+-- 
+2.43.0
+
