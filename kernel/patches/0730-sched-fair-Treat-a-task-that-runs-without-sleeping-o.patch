@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 16:42:01 +0000
+Subject: [PATCH] sched/fair: Treat a task that runs without sleeping
+ on a smaller CPU as misfit
+
+A task becomes a misfit, and can be pulled up by an idle bigger CPU or
+rotated by MISFIT_ROTATE, only once task_fits_cpu() fails, i.e. once its
+PELT utilization exceeds 80 % of the smaller CPU's capacity. A new thread
+starts at about half the CPU's spare capacity and, running flat out on an
+E core of capacity 488, needs about 40 ms of execution to get there with
+the 32 ms half-life. Work that lasts less than that never moves.
+
+On the M4 MacBook Pro (T8132, 4 P cores at 1024 and 6 E cores at 488) a
+10-thread memory bandwidth test that splits 1 GiB into equal slices
+finishes the P core slices at 11 ms and the E core slices at 32 ms, with
+0-4 migrations: 66-78 GB/s, against 97.2 GB/s for the same source on
+macOS on the same machine. A work queue over the same arrays reaches
+95.8 GB/s, and uclamp_min 1024 on the test's threads 103 GB/s, so the
+loss is placement, not the memory system.
+
+Add MISFIT_RUNTIME: a fair task that has run without sleeping or
+migrating for misfit_runtime_ns (debugfs, default 8 ms) on a CPU smaller
+than its maximum allowed capacity also counts as misfit. The existing
+misfit balancing then moves it to an idle bigger CPU, and MISFIT_ROTATE
+shares the bigger CPUs once they are all busy. The checkpoint is reset on
+fork, wakeup and migration. Kernel threads, SCHED_IDLE tasks and tasks
+whose uclamp_max is at or below the smaller CPU's capacity are left
+alone. The feature is off by default.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ include/linux/sched.h   |  2 ++
+ kernel/sched/core.c     |  1 +
+ kernel/sched/debug.c    |  1 +
+ kernel/sched/fair.c     | 47 +++++++++++++++++++++++++++++++++++++----
+ kernel/sched/features.h |  7 ++++++
+ kernel/sched/sched.h    |  1 +
+ 6 files changed, 55 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 57ef9a060e..562bcca2cc 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -941,6 +941,8 @@ struct task_struct {
+ 	unsigned long			max_allowed_capacity;
+ 	/* Runtime checkpoint for misfit rotation, protected by the rq lock. */
+ 	u64				misfit_runtime;
++	/* Runtime at the last wakeup or migration, for MISFIT_RUNTIME. */
++	u64				burst_runtime;
+ 	int				nr_cpus_allowed;
+ 	const cpumask_t			*cpus_ptr;
+ 	cpumask_t			*user_cpus_ptr;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index c481404713..00a3b6615a 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4665,6 +4665,7 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
+ 	p->se.exec_start		= 0;
+ 	p->se.sum_exec_runtime		= 0;
+ 	p->misfit_runtime		= 0;
++	p->burst_runtime		= 0;
+ 	p->se.prev_sum_exec_runtime	= 0;
+ 	p->se.nr_migrations		= 0;
+ 	p->se.vruntime			= 0;
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 72236db679..806d90e304 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -729,6 +729,7 @@ static __init int sched_init_debug(void)
+ 	debugfs_create_file("tunable_scaling", 0644, debugfs_sched, NULL, &sched_scaling_fops);
+ 	debugfs_create_u32("migration_cost_ns", 0644, debugfs_sched, &sysctl_sched_migration_cost);
+ 	debugfs_create_u32("nr_migrate", 0644, debugfs_sched, &sysctl_sched_nr_migrate);
++	debugfs_create_u32("misfit_runtime_ns", 0644, debugfs_sched, &sysctl_sched_misfit_runtime);
+ 
+ 	sched_domains_mutex_lock();
+ 	update_sched_domain_debugfs();
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 5c8f84186e..d53f87bee8 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -87,6 +87,12 @@ static unsigned int normalized_sysctl_sched_base_slice	= 700000ULL;
+ 
+ __read_mostly unsigned int sysctl_sched_migration_cost	= 500000UL;
+ 
++/*
++ * MISFIT_RUNTIME: continuous execution after which a task on a smaller CPU
++ * counts as misfit. (default: 8 msec, units: nanoseconds)
++ */
++__read_mostly unsigned int sysctl_sched_misfit_runtime	= 8000000UL;
++
+ static int __init setup_sched_thermal_decay_shift(char *str)
+ {
+ 	pr_warn("Ignoring the deprecated sched_thermal_decay_shift= option\n");
+@@ -6337,6 +6343,36 @@ static inline int task_fits_cpu(struct task_struct *p, int cpu)
+ 	return (util_fits_cpu(util, uclamp_min, uclamp_max, cpu) > 0);
+ }
+ 
++/*
++ * A new or newly woken task starts with a utilization well below a small
++ * CPU's capacity, and PELT needs tens of milliseconds of execution before
++ * task_fits_cpu() fails. A CPU-bound task placed on a small CPU therefore
++ * stays there for that long even when a bigger CPU is idle. With
++ * MISFIT_RUNTIME, a task that has run without sleeping or migrating for
++ * sysctl_sched_misfit_runtime on a CPU smaller than its maximum allowed
++ * capacity is a misfit as well. Tasks capped by uclamp_max at or below this
++ * CPU's capacity, SCHED_IDLE tasks and kernel threads are left alone.
++ */
++static inline bool task_misfit_runtime(struct task_struct *p, int cpu)
++{
++	unsigned long cap = arch_scale_cpu_capacity(cpu);
++
++	if (!sched_feat(MISFIT_RUNTIME))
++		return false;
++
++	if (cap >= p->max_allowed_capacity || (p->flags & PF_KTHREAD) ||
++	    task_has_idle_policy(p) || uclamp_eff_value(p, UCLAMP_MAX) <= cap)
++		return false;
++
++	return p->se.sum_exec_runtime - p->burst_runtime >=
++	       sysctl_sched_misfit_runtime;
++}
++
++static inline bool task_is_misfit(struct task_struct *p, int cpu)
++{
++	return !task_fits_cpu(p, cpu) || task_misfit_runtime(p, cpu);
++}
++
+ static inline void update_misfit_status(struct task_struct *p, struct rq *rq)
+ {
+ 	int cpu = cpu_of(rq);
+@@ -6350,7 +6386,7 @@ static inline void update_misfit_status(struct task_struct *p, struct rq *rq)
+ 	 */
+ 	if (!p || (p->nr_cpus_allowed == 1) ||
+ 	    (arch_scale_cpu_capacity(cpu) == p->max_allowed_capacity) ||
+-	    task_fits_cpu(p, cpu)) {
++	    !task_is_misfit(p, cpu)) {
+ 
+ 		rq->misfit_task_load = 0;
+ 		if (p)
+@@ -8221,8 +8257,10 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 	unsigned long weight;
+ 	bool curr;
+ 
+-	if (flags & ENQUEUE_WAKEUP)
++	if (flags & ENQUEUE_WAKEUP) {
+ 		p->misfit_runtime = se->sum_exec_runtime;
++		p->burst_runtime = se->sum_exec_runtime;
++	}
+ 
+ 	if (task_is_throttled(p) && enqueue_throttled_task(p))
+ 		return;
+@@ -10004,6 +10042,7 @@ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
+ 	struct sched_entity *se = &p->se;
+ 
+ 	p->misfit_runtime = se->sum_exec_runtime;
++	p->burst_runtime = se->sum_exec_runtime;
+ 
+ 	if (!task_on_rq_migrating(p)) {
+ 		remove_entity_load_avg(se);
+@@ -11397,7 +11436,7 @@ static int detach_tasks(struct lb_env *env)
+ 
+ 		case migrate_misfit:
+ 			/* This is not a misfit task */
+-			if (task_fits_cpu(p, env->src_cpu))
++			if (!task_is_misfit(p, env->src_cpu))
+ 				goto next;
+ 
+ 			env->imbalance = 0;
+@@ -15083,7 +15122,7 @@ static void misfit_rotate_work(struct work_struct *work)
+ 
+ 	/* The task may have moved, slept or shrunk since the tick. */
+ 	if (task_cpu(p) != src_cpu || !task_on_rq_queued(p) ||
+-	    !misfit_rotate_candidate(p) || task_fits_cpu(p, src_cpu))
++	    !misfit_rotate_candidate(p) || !task_is_misfit(p, src_cpu))
+ 		goto out;
+ 
+ 	rcu_read_lock();
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index 07132f33d1..a18c5e10d3 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -142,6 +142,13 @@ SCHED_FEAT(UTIL_EST, true)
+  */
+ SCHED_FEAT(MISFIT_ROTATE, true)
+ 
++/*
++ * On asymmetric CPU capacity systems, treat a task that has run without
++ * sleeping for misfit_runtime_ns on a CPU smaller than it may use as a
++ * misfit, before its PELT utilization has grown past the smaller CPU.
++ */
++SCHED_FEAT(MISFIT_RUNTIME, false)
++
+ SCHED_FEAT(LATENCY_WARN, false)
+ 
+ /*
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 9dd8c6e6f7..a0b694dafa 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -3158,6 +3158,7 @@ static inline void attach_one_task(struct rq *rq, struct task_struct *p)
+ 
+ extern __read_mostly unsigned int sysctl_sched_nr_migrate;
+ extern __read_mostly unsigned int sysctl_sched_migration_cost;
++extern __read_mostly unsigned int sysctl_sched_misfit_runtime;
+ 
+ extern unsigned int sysctl_sched_base_slice;
+ 
+-- 
+2.43.0
+

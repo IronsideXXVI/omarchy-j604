@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 16:14:10 +0000
+Subject: [PATCH] media: apple: avd: AV1 test switches for the 10-bit
+ output and motion-field release
+
+Two AV1 rows trail the same silicon under macOS on a J604: 8-bit at
+85-92 % and 10-bit at 73-75 %. Give each a switch, all off by default,
+so a measurement can settle it without a rebuild:
+
+- av1_out_packed and av1_out_hdr58, as HEVC's hevc_out_packed and
+  hevc_out_hdr58: the packed 10-bit output mode (timing only, the
+  picture is not usable) and the header word at the place HEVC sends
+  hdr_58_pixfmt, which AV1 sends as 0. 10-bit HEVC reached 699-702
+  fps against macOS's 672-683 in packed mode on the same machine.
+- av1_mvs_after_vp: a picture that uses its references' motion fields
+  waits for the whole reference picture today, which keeps about 1.33
+  pictures in flight where macOS keeps 2.19. With the switch, such a
+  picture waits for the reference's VP callback only, like its other
+  inputs. A bit-exact decode against software decides whether PP still
+  writes those fields.
+
+Nothing changes with the switches off.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/avd/avd-av1.c    | 37 ++++++++++++++++++-
+ .../platform/apple/avd/tests/av1-test.py      |  8 +++-
+ 2 files changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/platform/apple/avd/avd-av1.c b/drivers/media/platform/apple/avd/avd-av1.c
+index 8b3c2f34c5..99a4b9e7da 100644
+--- a/drivers/media/platform/apple/avd/avd-av1.c
++++ b/drivers/media/platform/apple/avd/avd-av1.c
+@@ -22,6 +22,36 @@
+ #include "avd-av1-entropymode.h"
+ #include "avd-inst.h"
+ 
++/*
++ * Test switches, all default off, for the AV1 rows of the J604 parity table
++ * (AV1 85-92 % and AV1 10-bit 73-75 % of macOS on the same silicon).
++ *
++ * av1_out_packed / av1_out_hdr58: the 10-bit output, as HEVC's
++ * hevc_out_packed / hevc_out_hdr58. The AV1 header has the same word at the
++ * place HEVC sends hdr_58_pixfmt (0 for 10-bit today, 0x3a for H.264);
++ * packed is the 3-in-32 mode (picture not usable, timing only).
++ *
++ * av1_mvs_after_vp: a picture that uses its references' motion fields now
++ * waits for the whole reference picture (VP and PP). With this set it waits
++ * for the reference's VP callback only, as for its other inputs. Only a
++ * bit-exact decode against software shows whether PP still writes those
++ * fields; nothing else changes.
++ */
++static bool av1_out_packed;
++module_param(av1_out_packed, bool, 0644);
++MODULE_PARM_DESC(av1_out_packed,
++		 "Test only: decode 10-bit AV1 into the packed output mode (picture not usable); default off");
++
++static unsigned int av1_out_hdr58;
++module_param(av1_out_hdr58, uint, 0644);
++MODULE_PARM_DESC(av1_out_hdr58,
++		 "Test only: 10-bit AV1 picture header word at HEVC's hdr_58 place (default 0)");
++
++static bool av1_mvs_after_vp;
++module_param(av1_mvs_after_vp, bool, 0644);
++MODULE_PARM_DESC(av1_mvs_after_vp,
++		 "Test only: release a reference's motion fields at its VP callback, not at PP; default off");
++
+ /*
+  * This comes from
+  * verisilicon/rockchip_vpu981_hw_av1_dec.c
+@@ -308,7 +338,8 @@ static bool avd_av1_depends(const struct v4l2_ctrl_av1_frame *frame,
+ 	for (unsigned int i = 0; i < V4L2_AV1_REFS_PER_FRAME; i++)
+ 		if (avd_av1_ref_ts(frame, frame->ref_frame_idx[i]) == bank->timestamp &&
+ 		    (!smp_load_acquire(&bank->vp_done) ||
+-		     (frame->flags & V4L2_AV1_FRAME_FLAG_USE_REF_FRAME_MVS)))
++		     ((frame->flags & V4L2_AV1_FRAME_FLAG_USE_REF_FRAME_MVS) &&
++		      !READ_ONCE(av1_mvs_after_vp))))
+ 			return true;
+ 
+ 	if (frame->primary_ref_frame >= AV1_PRIMARY_REF_NONE ||
+@@ -795,6 +826,8 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
+ 	dst = vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf);
+ 
+ 	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
++		     AVD_OP_HDR_FLAG_PACKED(READ_ONCE(av1_out_packed) &&
++					    seq->bit_depth == 10) |
+ 		     AVD_OP_HDR_FLAG_INTRA(intra_only && !intrabc) |
+ 		     AVD_OP_HDR_CONST | AVD_OP_HDR_FLAG_PIPE_STATE(1),
+ 	     "op_hdr");
+@@ -810,7 +843,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_av1_run *run)
+ 	push(AVD_HDR_HEIGHT(frame->frame_height_minus_1) |
+ 		     AVD_HDR_WIDTH(frame->frame_width_minus_1),
+ 	     "height_width_1");
+-	push(0, "");
++	push(seq->bit_depth == 10 ? READ_ONCE(av1_out_hdr58) : 0, "hdr_58_pixfmt");
+ 	push(AVD_HDR_HEIGHT(frame->frame_height_minus_1) |
+ 		     AVD_HDR_WIDTH(frame->frame_width_minus_1),
+ 	     "height_width_2");
+diff --git a/drivers/media/platform/apple/avd/tests/av1-test.py b/drivers/media/platform/apple/avd/tests/av1-test.py
+index b073c8929f..79dd5ae0c6 100644
+--- a/drivers/media/platform/apple/avd/tests/av1-test.py
++++ b/drivers/media/platform/apple/avd/tests/av1-test.py
+@@ -62,6 +62,8 @@ pre += r'''
+ #define smp_load_acquire(p) (*(p))
+ #define smp_store_release(p,v) (*(p)=(v))
+ #define READ_ONCE(x) (x)
++static bool av1_mvs_after_vp, av1_out_packed;
++static unsigned int av1_out_hdr58;
+ #define WRITE_ONCE(x,v) ((x)=(v))
+ #define static_assert _Static_assert
+ #define VB2_BUF_STATE_DONE 0
+@@ -186,8 +188,10 @@ static void flag_table(struct avd_av1_bank *b){
+  }
+  f.primary_ref_frame=2;f.flags=V4L2_AV1_FRAME_FLAG_USE_REF_FRAME_MVS;f.reference_frame_ts[5]=b->timestamp;
+  assert(avd_av1_depends(&f,b));f.primary_ref_frame=7;assert(avd_av1_depends(&f,b));
+- f.reference_frame_ts[5]++;assert(!avd_av1_depends(&f,b));
+- puts("PASS: AV1 flag table (primary, consumer/producer CDF flags, segmentation enabled/update_map, every refresh mask), actual slot and MV dependencies");
++ f.reference_frame_ts[5]++;assert(!avd_av1_depends(&f,b));f.reference_frame_ts[5]--;
++ av1_mvs_after_vp=true;assert(!avd_av1_depends(&f,b));b->vp_done=false;assert(avd_av1_depends(&f,b));
++ b->vp_done=true;av1_mvs_after_vp=false;assert(avd_av1_depends(&f,b));f.reference_frame_ts[5]++;
++ puts("PASS: AV1 flag table (primary, consumer/producer CDF flags, segmentation enabled/update_map, every refresh mask), actual slot and MV dependencies (av1_mvs_after_vp both ways)");
+ }
+ int main(int argc,char **argv){
+  assert(argc==2);
+-- 
+2.43.0
+

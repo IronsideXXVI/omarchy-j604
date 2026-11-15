@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 16:16:08 +0000
+Subject: [PATCH] drm: apple: dptxep: Optionally wait for the Type-C
+ PHY's DP mode before the lane count
+
+DCP firmware asks for the maximum lane count when it starts a DP Alt Mode
+link. That can happen before the Type-C PHY has switched to its DP mode.
+The PHY then reports no DP lanes, and the reply is 4. That is right for
+pin assignments C and E, which carry four DP lanes. It is wrong for pin
+assignment D, which carries two DP lanes beside USB3: the firmware then
+plans a four-lane link on two lanes.
+
+Add dptx_lane_wait_ms (default 0, which keeps the current reply). When it
+is set, the call polls the PHY every 20 ms, for up to that many ms (at
+most 1000), until it reports a DP mode, and answers with that mode's lane
+count. If the PHY never reports one, the reply is 4 as before. Both
+outcomes are logged with the time waited.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/gpu/drm/apple/dptxep.c | 38 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/apple/dptxep.c b/drivers/gpu/drm/apple/dptxep.c
+index 807af7338f..ea2e4953a4 100644
+--- a/drivers/gpu/drm/apple/dptxep.c
++++ b/drivers/gpu/drm/apple/dptxep.c
+@@ -26,6 +26,35 @@
+ 
+ #include "dptx-j700-training.h"
+ 
++/*
++ * The firmware asks for the maximum lane count when it starts a DP Alt Mode
++ * link, which can be before the Type-C PHY has switched to its DP mode. The
++ * PHY then reports no DP lanes and the answer is 4, which is right for pin
++ * assignment C or E (four DP lanes) but not for D (two DP lanes beside USB3).
++ */
++static unsigned int dptx_lane_wait_ms;
++module_param(dptx_lane_wait_ms, uint, 0644);
++MODULE_PARM_DESC(dptx_lane_wait_ms,
++		 "USB-C DP Alt Mode: wait up to this many ms for the Type-C PHY's DP mode before answering the firmware's maximum lane count (0: answer 4 at once, as before; at most 1000; default 0)");
++
++/* The PHY's DP lanes, waiting up to dptx_lane_wait_ms for a mode that has some. */
++static int dptx_phy_lanes(struct dptx_port *dptx, union phy_configure_opts *ops,
++			  unsigned int *waited)
++{
++	unsigned int wait = min(READ_ONCE(dptx_lane_wait_ms), 1000U);
++	unsigned long start = jiffies, end = start + msecs_to_jiffies(wait);
++	int ret;
++
++	for (;;) {
++		ret = phy_validate(dptx->atcphy, PHY_MODE_DP, 0, ops);
++		if (ret < 0 || ops->dp.lanes >= 2 || !wait || time_after_eq(jiffies, end))
++			break;
++		msleep(20);
++	}
++	*waited = jiffies_to_msecs(jiffies - start);
++	return ret;
++}
++
+ struct dcpdptx_connection_cmd {
+ 	__le32 unk;
+ 	__le32 target;
+@@ -387,6 +416,7 @@ static int dptxport_call_get_max_lane_count(struct apple_epic_service *service,
+ 	struct dptx_port *dptx = service->cookie;
+ 	struct apple_dcp *dcp = service->ep->dcp;
+ 	union phy_configure_opts phy_ops;
++	unsigned int waited = 0;
+ 	int ret;
+ 
+ 	if (reply_size < sizeof(*reply))
+@@ -404,7 +434,7 @@ static int dptxport_call_get_max_lane_count(struct apple_epic_service *service,
+ 		return 0;
+ 	}
+ 
+-	ret = phy_validate(dptx->atcphy, PHY_MODE_DP, 0, &phy_ops);
++	ret = dptx_phy_lanes(dptx, &phy_ops, &waited);
+ 	if (ret < 0) {
+ 		dev_err(dcp->dev, "phy_validate failed: %d\n", ret);
+ 		reply->retcode = cpu_to_le32(1);
+@@ -417,8 +447,14 @@ static int dptxport_call_get_max_lane_count(struct apple_epic_service *service,
+ 				phy_ops.dp.lanes);
+ 			// default to 4 lanes
+ 			dptx->lane_count = 4;
++			if (READ_ONCE(dptx_lane_wait_ms))
++				dev_warn(dcp->dev, "get_max_lane_count: no PHY DP mode after %u ms: 4 lanes\n",
++					 waited);
+ 		} else {
+ 			dptx->lane_count = phy_ops.dp.lanes;
++			if (READ_ONCE(dptx_lane_wait_ms))
++				dev_info(dcp->dev, "get_max_lane_count: %u lanes after %u ms\n",
++					 dptx->lane_count, waited);
+ 		}
+ 		reply->retcode = cpu_to_le32(0);
+ 		reply->lane_count = cpu_to_le64(dptx->lane_count);
+-- 
+2.43.0
+

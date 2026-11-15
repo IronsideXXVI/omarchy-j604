@@ -1,0 +1,337 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 15:26:14 +0000
+Subject: [PATCH] drm: apple: t8132: Bring a quarantined display
+ session back without a reboot
+
+Once the retained internal session is quarantined, the panel stays dark
+and every later deep sleep is refused until a reboot. Nothing clears the
+stored error: every frame meets it in dcp_m4_runtime_live(), and the
+sleep verdict reports the failed session.
+
+When the failure came while the coprocessor was down after a power-down
+that completed every step, the firmware stopped in its idle state and
+never saw the call that failed. Only the host side needs resetting: the
+open transaction, the call deadline and the error. The next frame then
+powers the coprocessor up, as after any blank. The panel-dark failure was
+this case: True Tone wrote the colour matrix to a DCP gated after a blank
+or a deep sleep.
+
+When the failure came with the coprocessor running and the display off,
+the recovery can first take the normal power-down. That needs the
+firmware to answer A500 and finish the idle handshake; if it does not,
+nothing has been powered down and the session stays quarantined.
+
+The recovery never touches a crashed RTKit, a session still scanning out,
+or a power-down left half done. A power-down now records that it
+completed every step (gate_done), and a power-up clears that.
+
+Every commit is refused while the session is failed, so the recovery
+cannot wait for a frame. It runs from a worker 100 ms after the first
+failure, which brings a powered-down session back before the display is
+turned on again, and once more before a system sleep. The new
+quarantine_recover parameter controls it: 0 never, 1 (the default) the
+powered-down case only, 2 also the running case. Two debugfs files are
+added for testing. iomfb_m4_recover tries both cases now, and
+iomfb_m4_inject quarantines a session that is powered down ("gated") or
+running with its display off ("off"). The status file gains
+gate_done/recoveries/recover_last.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/gpu/drm/apple/iomfb_m4.c | 199 +++++++++++++++++++++++++++++++
+ 1 file changed, 199 insertions(+)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 9d26f22568..91b891c072 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -338,6 +338,11 @@ module_param_cb(power_gate_ms, &power_gate_ms_ops, &power_gate_ms, 0644);
+ MODULE_PARM_DESC(power_gate_ms,
+ 		 "J713, J604: power the display coprocessor and its domains down after this many ms blanked, and before system sleep (0: only before a deep sleep; default: the machine's, J604 5000, J713/J715 0; at most 600000; applies from the next blank)");
+ 
++static unsigned int quarantine_recover = 1;
++module_param(quarantine_recover, uint, 0644);
++MODULE_PARM_DESC(quarantine_recover,
++		 "Internal display: bring a quarantined session back without a reboot at its next frame or system sleep (0: never; 1: only when it failed with the coprocessor powered down, the firmware untouched; 2: also try the normal power-down first when it failed running with the display off; default 1)");
++
+ /*
+  * DCP CPU control and status, in the coprocessor's ASC block. The idle bit
+  * is dcp.c's APPLE_DCP_COPROC_CPU_STATUS_IDLE; macOS read status 0x6e at
+@@ -655,6 +660,16 @@ struct iomfb_m4 {
+ 	struct delayed_work gate_work;
+ 	u64 gate_cycles;
+ 	s64 gate_off_us, gate_on_us;
++	/*
++	 * Internal: gated by a power-down that completed every step, so the
++	 * firmware stopped in its idle state (iomfb_m4_recover()).
++	 */
++	bool gate_done;
++	/* iomfb_m4_recover() runs: a failure meanwhile queues no other try. */
++	bool recovering;
++	struct delayed_work recover_work;
++	u64 recoveries;
++	int recover_last;
+ 	/* Exact completed successor or blank is the only framebuffer retirement. */
+ 	struct drm_framebuffer *active_fb;
+ 	struct drm_framebuffer *uncertain_fb;
+@@ -829,6 +844,7 @@ static int dcp_m4_set_power_state(struct iomfb_m4 *dcp, bool on);
+ static int iomfb_m4_power_gate(struct iomfb_m4 *dcp);
+ static int iomfb_m4_power_ungate(struct iomfb_m4 *dcp);
+ static void iomfb_m4_gate_work(struct work_struct *work);
++static void iomfb_m4_recover_work(struct work_struct *work);
+ static void dcp_m4_runtime_receive(struct iomfb_m4 *dcp, u64 word);
+ 
+ static int dcp_m4_dart_check(struct device *dev)
+@@ -902,6 +918,10 @@ static void dcp_m4_failed(struct iomfb_m4 *dcp, int error)
+ 		dev_err(dcp->dev, "Retained DCP session quarantined: %d\n", error);
+ 	complete_all(&dcp->reply);
+ 	dcp_m4_runtime_wake(dcp);
++	/* Every commit is refused from now on: the way back is tried from a worker. */
++	if (first && !dcp->external && READ_ONCE(quarantine_recover) &&
++	    !READ_ONCE(dcp->recovering) && !READ_ONCE(dcp->owner->quiescing))
++		mod_delayed_work(system_dfl_wq, &dcp->recover_work, msecs_to_jiffies(100));
+ }
+ 
+ static int dcp_m4_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
+@@ -4192,6 +4212,7 @@ int iomfb_m4_init(struct apple_dcp *owner)
+ 		dcp->ctm_adapt[i] = dcp->ctm_kms[i];
+ 	}
+ 	INIT_DELAYED_WORK(&dcp->gate_work, iomfb_m4_gate_work);
++	INIT_DELAYED_WORK(&dcp->recover_work, iomfb_m4_recover_work);
+ 	spin_lock_init(&dcp->retire_lock);
+ 	INIT_WORK(&dcp->retire_work, iomfb_m4_retire_work);
+ 	if (!request_mem_region(res->start, resource_size(res), dev_name(dev))) {
+@@ -6366,6 +6387,7 @@ static int iomfb_m4_power_gate(struct iomfb_m4 *dcp)
+ 	}
+ 	if (ret)
+ 		goto fail;
++	dcp->gate_done = true;
+ 	dcp->gate_cycles++;
+ 	dcp->gate_off_us = ktime_us_delta(ktime_get(), start);
+ 	return 0;
+@@ -6394,6 +6416,7 @@ static int iomfb_m4_power_ungate(struct iomfb_m4 *dcp)
+ 	lockdep_assert_held(&dcp->lock);
+ 	if (!dcp->gated)
+ 		return 0;
++	dcp->gate_done = false;
+ 	step = "PMGR";
+ 	ret = apple_pmgr_ps_consumer_on(dcp->dev);
+ 	if (!ret) {
+@@ -6444,6 +6467,111 @@ static int iomfb_m4_power_ungate(struct iomfb_m4 *dcp)
+ 	return ret;
+ }
+ 
++/*
++ * A quarantined internal session whose coprocessor is powered down cleanly,
++ * or can still be, comes back without a reboot. Gated by a power-down that
++ * completed, the firmware stopped in its idle state and never saw the call
++ * that failed, so only the host side is reset: the next frame powers it up
++ * as after any blank. Still running with the display off (deep: 2), it
++ * first takes the normal power-down, which a firmware that no longer
++ * completes the idle handshake refuses: the session then stays quarantined
++ * as before. A crashed RTKit, a session scanning out or a power-down left
++ * half done is never touched.
++ */
++static int __iomfb_m4_recover(struct iomfb_m4 *dcp, bool deep)
++{
++	struct dcp_m4_runtime *r = dcp->runtime;
++	unsigned long flags;
++	int error, ret;
++	bool external;
++
++	lockdep_assert_held(&dcp->lock);
++	error = READ_ONCE(dcp->error);
++	if (!error)
++		return 0;
++	if (dcp->external || !r || !READ_ONCE(r->qualified) || !dcp->gate_capable ||
++	    IS_ERR_OR_NULL(dcp->rtkit) || apple_rtkit_is_crashed(dcp->rtkit) ||
++	    READ_ONCE(dcp->owner->quiescing))
++		return -EOPNOTSUPP;
++	if (!dcp->display_off || dcp->powered_off || dcp->active_fb || dcp->lost_fb ||
++	    dcp->active_frame.dva || r->int_fl.open || (dcp->gated && !dcp->gate_done) ||
++	    (!dcp->gated && !deep))
++		return -EBUSY;
++	spin_lock_irqsave(&dcp->state_lock, flags);
++	ret = r->count ? -EBUSY : 0;
++	spin_unlock_irqrestore(&dcp->state_lock, flags);
++	if (ret)
++		return ret;
++
++	/* The calls the failure left open are never answered: forget them. */
++	external = dcp->transaction.external;
++	memset(&dcp->transaction, 0, sizeof(dcp->transaction));
++	dcp->transaction.external = external;
++	r->deadline = 0;
++	r->limit = 0;
++	spin_lock_irqsave(&dcp->state_lock, flags);
++	dcp->error = 0;
++	spin_unlock_irqrestore(&dcp->state_lock, flags);
++	if (!dcp->gated) {
++		ret = iomfb_m4_power_gate(dcp);
++		if (ret) {
++			/* Refused before any step changed something: failed as it was. */
++			dcp_m4_failed(dcp, error);
++			dev_warn(dcp->dev, "quarantined session (%d) not recovered: power-down %d\n",
++				 error, ret);
++			dcp->recover_last = ret;
++			return ret;
++		}
++	}
++	spin_lock_irqsave(&dcp->state_lock, flags);
++	ret = dcp->error;
++	if (!ret) {
++		dcp->ready = true;
++		WRITE_ONCE(dcp->owner->crashed, false);
++	}
++	spin_unlock_irqrestore(&dcp->state_lock, flags);
++	dcp->recover_last = ret;
++	if (ret)
++		return ret;
++	dcp->recoveries++;
++	/* The power-up sends the matrix and the BLM properties again. */
++	dcp->ctm_pending |= dcp->ctm_active;
++	dcp->blm_gen = -1;
++	dev_warn(dcp->dev, "quarantined session (%d) recovered: powered down, up with the next frame\n",
++		 error);
++	return 0;
++}
++
++static int iomfb_m4_recover(struct iomfb_m4 *dcp, bool deep)
++{
++	int ret;
++
++	lockdep_assert_held(&dcp->lock);
++	WRITE_ONCE(dcp->recovering, true);
++	ret = __iomfb_m4_recover(dcp, deep);
++	WRITE_ONCE(dcp->recovering, false);
++	return ret;
++}
++
++static int iomfb_m4_recover_auto(struct iomfb_m4 *dcp)
++{
++	unsigned int mode = READ_ONCE(quarantine_recover);
++
++	if (!mode || !READ_ONCE(dcp->error))
++		return 0;
++	return iomfb_m4_recover(dcp, mode >= 2);
++}
++
++static void iomfb_m4_recover_work(struct work_struct *work)
++{
++	struct iomfb_m4 *dcp = container_of(to_delayed_work(work), struct iomfb_m4,
++					    recover_work);
++
++	mutex_lock(&dcp->lock);
++	iomfb_m4_recover_auto(dcp);
++	mutex_unlock(&dcp->lock);
++}
++
+ /*
+  * An external DCP (T8132 dcpext), for a sleep that powers the SoC down, its
+  * display already off (iomfb_m4_ext_sleep_down() before the freeze, or never
+@@ -8938,6 +9066,8 @@ int iomfb_m4_suspend_firmware(struct apple_dcp *owner)
+ 		return iomfb_m4_ext_suspend_firmware(dcp);
+ 	cancel_delayed_work_sync(&dcp->gate_work);
+ 	mutex_lock(&dcp->lock);
++	/* A quarantined session that can power down cleanly sleeps as a healthy one. */
++	iomfb_m4_recover_auto(dcp);
+ 	st = (struct dcp_m4_fw_sleep_state) {
+ 		.runtime = !!dcp->runtime,
+ 		.failed = READ_ONCE(dcp->error) != 0,
+@@ -9151,6 +9281,7 @@ void iomfb_m4_quiesce(struct apple_dcp *owner)
+ 	cancel_delayed_work_sync(&dcp->blm_work);
+ 	cancel_delayed_work_sync(&dcp->ctm_work);
+ 	cancel_delayed_work_sync(&dcp->gate_work);
++	cancel_delayed_work_sync(&dcp->recover_work);
+ }
+ 
+ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
+@@ -9174,6 +9305,8 @@ static int iomfb_m4_status_show(struct seq_file *s, void *unused)
+ 	seq_printf(s, "gate_capable=%u gated=%u gate_cycles=%llu gate_off_us=%lld gate_on_us=%lld\n",
+ 		   dcp->gate_capable, dcp->gated, dcp->gate_cycles, dcp->gate_off_us,
+ 		   dcp->gate_on_us);
++	seq_printf(s, "gate_done=%u recoveries=%llu recover_last=%d\n", dcp->gate_done,
++		   dcp->recoveries, dcp->recover_last);
+ 	if (dcp->external)
+ 		seq_printf(s, "ext_idle gate_capable=%u down=%u cycles=%llu wakes=%llu off_us=%lld on_us=%lld why=%s\n",
+ 			   dcp->ext_gate_capable, dcp->ext_idle_gated, dcp->ext_idle_cycles,
+@@ -9328,8 +9461,74 @@ static int iomfb_m4_present_show(struct seq_file *s, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(iomfb_m4_present);
+ 
++/* Any write: recover a quarantined session now, the power-down tried too. */
++static ssize_t iomfb_m4_recover_write(struct file *file, const char __user *buf,
++				      size_t count, loff_t *ppos)
++{
++	struct apple_dcp *owner = file->private_data;
++	struct iomfb_m4 *dcp = owner->v26_6;
++	int ret;
++
++	if (!dcp)
++		return -ENODEV;
++	mutex_lock(&dcp->lock);
++	ret = READ_ONCE(dcp->error) ? iomfb_m4_recover(dcp, true) : -EALREADY;
++	mutex_unlock(&dcp->lock);
++	return ret ?: count;
++}
++
++static const struct file_operations iomfb_m4_recover_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = iomfb_m4_recover_write,
++	.llseek = noop_llseek,
++};
++
++/*
++ * Fault injector for the recovery: "gated" quarantines a session that is
++ * powered down, as a call to it did before such calls were refused;
++ * "off" quarantines a running one with its display off.
++ */
++static ssize_t iomfb_m4_inject_write(struct file *file, const char __user *buf,
++				     size_t count, loff_t *ppos)
++{
++	struct apple_dcp *owner = file->private_data;
++	struct iomfb_m4 *dcp = owner->v26_6;
++	char cmd[8] = {};
++	int ret = 0;
++
++	if (!dcp || dcp->external || !dcp->runtime)
++		return -ENODEV;
++	if (copy_from_user(cmd, buf, min(count, sizeof(cmd) - 1)))
++		return -EFAULT;
++	mutex_lock(&dcp->lock);
++	if (READ_ONCE(dcp->error))
++		ret = -EALREADY;
++	else if (sysfs_streq(cmd, "gated"))
++		ret = dcp->gated ? 0 : -EAGAIN;
++	else if (sysfs_streq(cmd, "off"))
++		ret = !dcp->gated && dcp->display_off ? 0 : -EAGAIN;
++	else
++		ret = -EINVAL;
++	if (!ret) {
++		dev_warn(dcp->dev, "injected fault: %s\n", cmd);
++		dcp_m4_failed(dcp, -EPIPE);
++	}
++	mutex_unlock(&dcp->lock);
++	return ret ?: count;
++}
++
++static const struct file_operations iomfb_m4_inject_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = iomfb_m4_inject_write,
++	.llseek = noop_llseek,
++};
++
+ void iomfb_m4_debugfs_init(struct apple_dcp *owner, struct dentry *root)
+ {
+ 	debugfs_create_file("iomfb_m4", 0400, root, owner, &iomfb_m4_status_fops);
+ 	debugfs_create_file("iomfb_m4_present", 0400, root, owner, &iomfb_m4_present_fops);
++	debugfs_create_file("iomfb_m4_recover", 0200, root, owner, &iomfb_m4_recover_fops);
++	debugfs_create_file("iomfb_m4_inject", 0200, root, owner, &iomfb_m4_inject_fops);
+ }
+-- 
+2.43.0
+
