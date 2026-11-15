@@ -1,0 +1,522 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 22:13:19 +0000
+Subject: [PATCH] soc: apple: record what a boot died of where a
+ watchdog reset leaves it
+
+A panic with kernel.panic=0 spins with interrupts off until the watchdog
+resets the machine, and the reset takes the journal tail, pstore and the
+console with it. On the J604 the deep-sleep stop that looked like a
+silent hang for a day was such a panic (an SError), and the boot stall
+looks the same.
+
+Record the first die or panic of a boot in PMU scratch that survives
+the reset: its kind (oops, BUG, SError, other panic), the CPU, ESR.EC,
+and the PC as an offset from _text for an oops or the hash of the panic
+message otherwise. The record is written from die and panic notifiers
+through a new polled SPMI write in the Apple SPMI controller, which
+takes no lock and never sleeps. The PMU's NVMEM provider registers it
+when its node names the scratch to use (apple,panic-record), and
+macsmc-reboot prints the record on the next boot and clears it.
+
+On the J604 the record takes 0xf820-0xf823 and 0xf825-0xf827, which
+kept a pattern across a watchdog reset; 0xf824 belongs to someone else.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi |  13 +-
+ drivers/nvmem/apple-spmi-nvmem.c              |  63 ++++++++
+ drivers/power/reset/macsmc-reboot.c           |  36 +++++
+ drivers/soc/apple/boot-crumb.c                | 137 ++++++++++++++++++
+ drivers/spmi/spmi-apple-controller.c          |  49 +++++++
+ include/linux/soc/apple/boot-crumb.h          |  21 +++
+ include/linux/soc/apple/spmi.h                |  23 +++
+ 7 files changed, 340 insertions(+), 2 deletions(-)
+ create mode 100644 include/linux/soc/apple/spmi.h
+
+diff --git a/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi b/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
+index 96cc4ec56e..04c140ea06 100644
+--- a/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
++++ b/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
+@@ -164,6 +164,8 @@ nub_spmi: spmi@388714000 {
+ 		pmic1: pmic@e {
+ 			compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
+ 			reg = <0x0e 0x00>;
++			/* Kept across a watchdog reset; 0xf824 belongs to someone else. */
++			apple,panic-record = <0xf820 0x04>, <0xf825 0x03>;
+ 			nvmem-layout {
+ 				compatible = "fixed-layout";
+ 				#address-cells = <0x01>;
+@@ -213,6 +215,13 @@ resume_exception: resume-exception@f804 {
+ 				boot_crumb: boot-crumb@f810 {
+ 					reg = <0xf810 0x07>;
+ 				};
++				/* The panic record (apple,panic-record), in two runs. */
++				boot_panic_a: boot-panic@f820 {
++					reg = <0xf820 0x04>;
++				};
++				boot_panic_b: boot-panic@f825 {
++					reg = <0xf825 0x03>;
++				};
+ 				panic_count: panic-count@f802,4 {
+ 					reg = <0xf802 0x01>;
+ 					bits = <0x04 0x04>;
+@@ -1018,10 +1027,10 @@ typec3_dcpext1: endpoint@1 {
+ &{/soc/smc@38c600000/reboot} {
+ 	nvmem-cells = <&shutdown_flag>, <&boot_stage>, <&boot_error_count>, <&panic_count>,
+ 		      <&pm_setting>, <&boot_error_stage>, <&fault_shadow>, <&resume_exception>,
+-		      <&boot_crumb>;
++		      <&boot_crumb>, <&boot_panic_a>, <&boot_panic_b>;
+ 	nvmem-cell-names = "shutdown_flag", "boot_stage", "boot_error_count", "panic_count",
+ 			   "pm_setting", "boot_error_stage", "fault_shadow", "resume_exception",
+-			   "boot_crumb";
++			   "boot_crumb", "boot_panic_a", "boot_panic_b";
+ };
+ 
+ &{/soc/smc@38c600000/rtc} {
+diff --git a/drivers/nvmem/apple-spmi-nvmem.c b/drivers/nvmem/apple-spmi-nvmem.c
+index b31b8212d3..2c97474003 100644
+--- a/drivers/nvmem/apple-spmi-nvmem.c
++++ b/drivers/nvmem/apple-spmi-nvmem.c
+@@ -12,6 +12,8 @@
+ #include <linux/of_platform.h>
+ #include <linux/spmi.h>
+ #include <linux/regmap.h>
++#include <linux/soc/apple/boot-crumb.h>
++#include <linux/soc/apple/spmi.h>
+ 
+ static const struct regmap_config apple_spmi_regmap_config = {
+ 	.reg_bits	= 16,
+@@ -35,6 +37,65 @@ static int apple_spmi_nvmem_write(void *priv, unsigned int offset, void *val,
+ 	return regmap_bulk_write(map, offset, val, bytes);
+ }
+ 
++/* Where the panic record goes: at most two runs of scratch, 7 bytes in all. */
++struct apple_spmi_nvmem_panic {
++	struct spmi_device *sdev;
++	u32 off[2], len[2];
++	unsigned int nruns;
++};
++
++static int apple_spmi_nvmem_panic_write(void *ctx, const u8 *rec, size_t len)
++{
++	struct apple_spmi_nvmem_panic *p = ctx;
++	unsigned int i;
++	size_t done = 0;
++	int ret = 0;
++
++	for (i = 0; i < p->nruns && done < len; i++) {
++		size_t n = min_t(size_t, p->len[i], len - done);
++
++		ret = apple_spmi_ext_writel_polled(p->sdev, p->off[i], rec + done, n) ?: ret;
++		done += n;
++	}
++	return ret;
++}
++
++static void apple_spmi_nvmem_panic_stop(void *data)
++{
++	apple_boot_crumb_set_panic_writer(NULL, NULL);
++}
++
++/* apple,panic-record = <offset length>, ...: scratch for the boot-crumb panic record. */
++static int apple_spmi_nvmem_panic_init(struct spmi_device *sdev)
++{
++	struct device_node *np = sdev->dev.of_node;
++	struct apple_spmi_nvmem_panic *p;
++	u32 cells[4];
++	int n, i, total = 0;
++
++	n = of_property_count_u32_elems(np, "apple,panic-record");
++	if (n <= 0)
++		return 0;
++	if ((n != 2 && n != 4) || of_property_read_u32_array(np, "apple,panic-record", cells, n))
++		return -EINVAL;
++	p = devm_kzalloc(&sdev->dev, sizeof(*p), GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++	p->sdev = sdev;
++	p->nruns = n / 2;
++	for (i = 0; i < p->nruns; i++) {
++		p->off[i] = cells[2 * i];
++		p->len[i] = cells[2 * i + 1];
++		if (!p->len[i] || p->len[i] > 8 || p->off[i] > 0xffff)
++			return -EINVAL;
++		total += p->len[i];
++	}
++	if (total != APPLE_CRUMB_PANIC_LEN)
++		return -EINVAL;
++	apple_boot_crumb_set_panic_writer(apple_spmi_nvmem_panic_write, p);
++	return devm_add_action_or_reset(&sdev->dev, apple_spmi_nvmem_panic_stop, NULL);
++}
++
+ static int apple_spmi_nvmem_probe(struct spmi_device *sdev)
+ {
+ 	struct regmap *regmap;
+@@ -61,6 +122,8 @@ static int apple_spmi_nvmem_probe(struct spmi_device *sdev)
+ 	provider = devm_nvmem_register(&sdev->dev, &nvmem_cfg);
+ 	if (IS_ERR(provider))
+ 		return PTR_ERR(provider);
++	if (apple_spmi_nvmem_panic_init(sdev))
++		dev_warn(&sdev->dev, "invalid apple,panic-record, no panic record\n");
+ 	if (!of_device_is_compatible(sdev->dev.of_node, "apple,baku-pmic") &&
+ 	    !of_device_is_compatible(sdev->dev.of_node, "apple,abbey-pmic") &&
+ 	    !of_device_is_compatible(sdev->dev.of_node, "apple,chapel-pmic") &&
+diff --git a/drivers/power/reset/macsmc-reboot.c b/drivers/power/reset/macsmc-reboot.c
+index 939fdd4e32..a1ff9fe585 100644
+--- a/drivers/power/reset/macsmc-reboot.c
++++ b/drivers/power/reset/macsmc-reboot.c
+@@ -426,6 +426,41 @@ static void macsmc_reboot_crumb_stop(void *data)
+ 	apple_boot_crumb_set_writer(NULL, NULL);
+ }
+ 
++/*
++ * Optional panic record (boot-crumb.c): what the previous boot died of, if a
++ * die or panic wrote it. Printed once, then cleared.
++ */
++static void macsmc_reboot_panic_record(struct macsmc_reboot *reboot)
++{
++	static const char *const names[] = { "boot_panic_a", "boot_panic_b" };
++	u8 rec[APPLE_CRUMB_PANIC_LEN], zero[8] = {};
++	struct nvmem_cell *cells[2];
++	char line[128];
++	size_t got = 0, len;
++	unsigned int i;
++	u8 *part;
++
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		cells[i] = devm_nvmem_cell_get(reboot->dev, names[i]);
++		if (IS_ERR(cells[i]))
++			return;
++	}
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		part = nvmem_cell_read(cells[i], &len);
++		if (IS_ERR(part))
++			return;
++		len = min(len, sizeof(rec) - got);
++		memcpy(rec + got, part, len);
++		got += len;
++		kfree(part);
++	}
++	if (got < sizeof(rec) || apple_boot_crumb_panic_decode(rec, got, line, sizeof(line)) <= 0)
++		return;
++	dev_warn(reboot->dev, "previous boot: panic: %s\n", line);
++	for (i = 0; i < ARRAY_SIZE(names); i++)
++		nvmem_cell_write(cells[i], zero, i ? sizeof(rec) - 4 : 4);
++}
++
+ /*
+  * Optional boot crumbs (boot-crumb.c): print the previous boot's record if it
+  * did not shut down cleanly, then keep this boot's record for the next one.
+@@ -445,6 +480,7 @@ static void macsmc_reboot_boot_crumb(struct macsmc_reboot *reboot)
+ 			dev_warn(reboot->dev, "previous boot: crumb: %s\n", line);
+ 		kfree(rec);
+ 	}
++	macsmc_reboot_panic_record(reboot);
+ 	if (devm_add_action_or_reset(reboot->dev, macsmc_reboot_crumb_stop, NULL))
+ 		return;
+ 	reboot->boot_crumb = cell;
+diff --git a/drivers/soc/apple/boot-crumb.c b/drivers/soc/apple/boot-crumb.c
+index a7f7390910..dacc0eef52 100644
+--- a/drivers/soc/apple/boot-crumb.c
++++ b/drivers/soc/apple/boot-crumb.c
+@@ -19,6 +19,9 @@
+  */
+ 
+ #include <linux/atomic.h>
++#include <linux/kdebug.h>
++#include <linux/panic_notifier.h>
++#include <linux/smp.h>
+ #include <linux/bits.h>
+ #include <linux/export.h>
+ #include <linux/kernel.h>
+@@ -30,6 +33,8 @@
+ #include <linux/soc/apple/boot-crumb.h>
+ #include <linux/unaligned.h>
+ #include <linux/workqueue.h>
++#include <asm/esr.h>
++#include <asm/sections.h>
+ 
+ #define APPLE_CRUMB_MAGIC	0xc6
+ #define APPLE_CRUMB_BEAT_DONE	0xff
+@@ -291,3 +296,135 @@ int apple_boot_crumb_decode(const u8 *rec, size_t len, char *buf, size_t size)
+ 	return n;
+ }
+ EXPORT_SYMBOL_GPL(apple_boot_crumb_decode);
++
++/*
++ * Panic record. A stall that is a panic spinning with kernel.panic=0 (or an
++ * oops that takes a CPU down) ends in a watchdog reset with nothing on disk.
++ * The first die or panic of a boot writes what it is to PMU scratch that
++ * survives the reset, through a writer that polls; macsmc-reboot prints it on
++ * the next boot. Unlike the crumbs this runs for the whole boot.
++ */
++#define APPLE_CRUMB_PANIC_MAGIC	0xa0
++#define APPLE_CRUMB_PANIC_OOPS	1
++#define APPLE_CRUMB_PANIC_SERROR	2
++#define APPLE_CRUMB_PANIC_OTHER	3
++#define APPLE_CRUMB_PANIC_BUG	4
++
++static apple_boot_crumb_panic_writer_t apple_crumb_panic_writer;
++static void *apple_crumb_panic_ctx;
++static atomic_t apple_crumb_panicked = ATOMIC_INIT(0);
++
++static const char *const apple_crumb_panic_kinds[] = {
++	[APPLE_CRUMB_PANIC_OOPS] = "oops",
++	[APPLE_CRUMB_PANIC_SERROR] = "SError",
++	[APPLE_CRUMB_PANIC_OTHER] = "panic",
++	[APPLE_CRUMB_PANIC_BUG] = "BUG",
++};
++
++static u32 apple_crumb_fnv1a(const char *p)
++{
++	u32 h = 2166136261u;
++
++	while (p && *p) {
++		h ^= (u8)*p++;
++		h *= 16777619u;
++	}
++	return h;
++}
++
++/* The first record of a boot wins: a die is followed by its panic. */
++static void apple_crumb_panic_record(unsigned int kind, unsigned int ec, u32 value)
++{
++	apple_boot_crumb_panic_writer_t writer = READ_ONCE(apple_crumb_panic_writer);
++	u8 rec[APPLE_CRUMB_PANIC_LEN];
++
++	if (!writer || atomic_xchg(&apple_crumb_panicked, 1))
++		return;
++	rec[0] = APPLE_CRUMB_PANIC_MAGIC | kind;
++	rec[1] = raw_smp_processor_id() & 0xff;
++	rec[2] = ec;
++	put_unaligned_le32(value, &rec[3]);
++	writer(READ_ONCE(apple_crumb_panic_ctx), rec, sizeof(rec));
++}
++
++static int apple_crumb_die(struct notifier_block *nb, unsigned long action, void *data)
++{
++	struct die_args *args = data;
++	unsigned int kind = APPLE_CRUMB_PANIC_OOPS;
++
++	if (action != DIE_OOPS || !args || !args->regs)
++		return NOTIFY_DONE;
++	if (args->str && !strncmp(args->str, "Oops - BUG", 10))
++		kind = APPLE_CRUMB_PANIC_BUG;
++	apple_crumb_panic_record(kind, ESR_ELx_EC(args->err),
++				 (u32)(instruction_pointer(args->regs) - (unsigned long)_text));
++	return NOTIFY_DONE;
++}
++
++static int apple_crumb_panic(struct notifier_block *nb, unsigned long action, void *data)
++{
++	const char *msg = data;
++	bool serror = msg && strstr(msg, "SError");
++
++	apple_crumb_panic_record(serror ? APPLE_CRUMB_PANIC_SERROR : APPLE_CRUMB_PANIC_OTHER,
++				 serror ? ESR_ELx_EC_SERROR : 0, apple_crumb_fnv1a(msg));
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block apple_crumb_die_nb = {
++	.notifier_call = apple_crumb_die,
++	.priority = INT_MAX,
++};
++
++static struct notifier_block apple_crumb_panic_nb = {
++	.notifier_call = apple_crumb_panic,
++	.priority = INT_MAX,
++};
++
++/**
++ * apple_boot_crumb_set_panic_writer() - set or clear the panic record writer
++ * @writer: polls and never sleeps; NULL to stop
++ * @ctx: passed to @writer
++ */
++void apple_boot_crumb_set_panic_writer(apple_boot_crumb_panic_writer_t writer, void *ctx)
++{
++	static bool registered;
++
++	WRITE_ONCE(apple_crumb_panic_writer, NULL);
++	WRITE_ONCE(apple_crumb_panic_ctx, ctx);
++	WRITE_ONCE(apple_crumb_panic_writer, writer);
++	if (writer && !registered) {
++		registered = true;
++		register_die_notifier(&apple_crumb_die_nb);
++		atomic_notifier_chain_register(&panic_notifier_list, &apple_crumb_panic_nb);
++	}
++}
++EXPORT_SYMBOL_GPL(apple_boot_crumb_set_panic_writer);
++
++/**
++ * apple_boot_crumb_panic_decode() - describe a panic record read from the PMU
++ * @rec: the record
++ * @len: its length
++ * @buf: output
++ * @size: size of @buf
++ *
++ * Return: the length written, or -ENOENT if @rec holds no record.
++ */
++int apple_boot_crumb_panic_decode(const u8 *rec, size_t len, char *buf, size_t size)
++{
++	unsigned int kind;
++	u32 value;
++
++	if (len < APPLE_CRUMB_PANIC_LEN || (rec[0] & 0xf0) != APPLE_CRUMB_PANIC_MAGIC)
++		return -ENOENT;
++	kind = rec[0] & 0xf;
++	if (kind >= ARRAY_SIZE(apple_crumb_panic_kinds) || !apple_crumb_panic_kinds[kind])
++		return -ENOENT;
++	value = get_unaligned_le32(&rec[3]);
++	if (kind == APPLE_CRUMB_PANIC_OOPS || kind == APPLE_CRUMB_PANIC_BUG)
++		return scnprintf(buf, size, "%s on CPU %u, ESR.EC %#x, PC _text+%#x",
++				 apple_crumb_panic_kinds[kind], rec[1], rec[2], value);
++	return scnprintf(buf, size, "%s on CPU %u, ESR.EC %#x, message hash %#010x",
++			 apple_crumb_panic_kinds[kind], rec[1], rec[2], value);
++}
++EXPORT_SYMBOL_GPL(apple_boot_crumb_panic_decode);
+diff --git a/drivers/spmi/spmi-apple-controller.c b/drivers/spmi/spmi-apple-controller.c
+index ea0b6fe76b..72f3ddacbc 100644
+--- a/drivers/spmi/spmi-apple-controller.c
++++ b/drivers/spmi/spmi-apple-controller.c
+@@ -28,6 +28,7 @@
+ #include <linux/pm.h>
+ #include <linux/spinlock.h>
+ #include <linux/spmi.h>
++#include <linux/soc/apple/spmi.h>
+ #include <linux/suspend.h>
+ 
+ /* SPMI Controller Registers */
+@@ -366,6 +367,54 @@ static int spmi_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid)
+ 	return -EINVAL;
+ }
+ 
++/**
++ * apple_spmi_ext_writel_polled() - extended long write of 1-8 bytes, polled
++ * @sdev: the slave
++ * @addr: its register
++ * @buf: the bytes
++ * @len: their number
++ *
++ * For panic and die notifiers: takes no lock and never sleeps. Whatever a
++ * stopped CPU left in the reply FIFO is drained first.
++ *
++ * Return: 0 once the slave acknowledged the write, or a negative error.
++ */
++int apple_spmi_ext_writel_polled(struct spmi_device *sdev, u16 addr, const u8 *buf, size_t len)
++{
++	struct spmi_controller *ctrl = sdev->ctrl;
++	struct apple_spmi *spmi;
++	u32 word, status;
++	size_t i, j;
++	int n, ret;
++
++	if (!len || len > 8 || ctrl->write_cmd != spmi_write_cmd)
++		return -EINVAL;
++	spmi = spmi_controller_get_drvdata(ctrl);
++
++	for (n = 0; n < 16; n++) {
++		if (readl(spmi->regs + spmi->hw->status) & spmi->hw->rx_empty)
++			break;
++		readl(spmi->regs + spmi->hw->reply);
++	}
++
++	writel(apple_spmi_pack_cmd(SPMI_CMD_EXT_WRITEL | (len - 1), sdev->usid, addr),
++	       spmi->regs + spmi->hw->command);
++	for (i = 0; i < len; i += j) {
++		j = min_t(size_t, sizeof(word), len - i);
++		word = 0;
++		memcpy(&word, buf + i, j);
++		writel(word, spmi->regs + spmi->hw->command);
++	}
++
++	ret = readl_poll_timeout_atomic(spmi->regs + spmi->hw->status, status,
++					!(status & spmi->hw->rx_empty), 1, 20000);
++	if (ret)
++		return ret;
++	word = readl(spmi->regs + spmi->hw->reply);
++	return FIELD_GET(SPMI_REPLY_ACK, word) ? 0 : -EIO;
++}
++EXPORT_SYMBOL_GPL(apple_spmi_ext_writel_polled);
++
+ static int apple_spmi_irq_set_type(struct irq_data *d, unsigned int type)
+ {
+ 	/* all interrupts have MSI semantics */
+diff --git a/include/linux/soc/apple/boot-crumb.h b/include/linux/soc/apple/boot-crumb.h
+index d0b67cb012..efbf09e80f 100644
+--- a/include/linux/soc/apple/boot-crumb.h
++++ b/include/linux/soc/apple/boot-crumb.h
+@@ -36,12 +36,26 @@ enum apple_boot_crumb {
+ /* Writes the record to the PMU; may sleep. Registered by macsmc-reboot. */
+ typedef int (*apple_boot_crumb_writer_t)(void *ctx, const u8 *rec, size_t len);
+ 
++/*
++ * The panic record: 0xa0 | kind, the CPU, ESR.EC, then the PC as an le32
++ * offset from _text (an oops) or the FNV-1a hash of the panic message.
++ */
++#define APPLE_CRUMB_PANIC_LEN	7
++
++/*
++ * Writes the panic record from a panic or die notifier: must poll, never
++ * sleep, and take no lock. Registered by the PMU's NVMEM provider.
++ */
++typedef int (*apple_boot_crumb_panic_writer_t)(void *ctx, const u8 *rec, size_t len);
++
+ #if IS_ENABLED(CONFIG_APPLE_BOOT_CRUMB)
+ void apple_boot_crumb_enter(unsigned int id);
+ void apple_boot_crumb_leave(unsigned int id);
+ void apple_boot_crumb_step(unsigned int id, unsigned int step);
+ void apple_boot_crumb_set_writer(apple_boot_crumb_writer_t writer, void *ctx);
+ int apple_boot_crumb_decode(const u8 *rec, size_t len, char *buf, size_t size);
++void apple_boot_crumb_set_panic_writer(apple_boot_crumb_panic_writer_t writer, void *ctx);
++int apple_boot_crumb_panic_decode(const u8 *rec, size_t len, char *buf, size_t size);
+ #else
+ static inline void apple_boot_crumb_enter(unsigned int id) { }
+ static inline void apple_boot_crumb_leave(unsigned int id) { }
+@@ -51,6 +65,13 @@ static inline int apple_boot_crumb_decode(const u8 *rec, size_t len, char *buf,
+ {
+ 	return -ENODEV;
+ }
++static inline void apple_boot_crumb_set_panic_writer(apple_boot_crumb_panic_writer_t writer,
++						     void *ctx) { }
++
++static inline int apple_boot_crumb_panic_decode(const u8 *rec, size_t len, char *buf, size_t size)
++{
++	return -ENODEV;
++}
+ #endif
+ 
+ #endif
+diff --git a/include/linux/soc/apple/spmi.h b/include/linux/soc/apple/spmi.h
+new file mode 100644
+index 0000000000..f2edfaa8d4
+--- /dev/null
++++ b/include/linux/soc/apple/spmi.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/*
++ * Apple SPMI controller: the one operation other drivers need from it.
++ */
++#ifndef _LINUX_SOC_APPLE_SPMI_H_
++#define _LINUX_SOC_APPLE_SPMI_H_
++
++#include <linux/errno.h>
++#include <linux/types.h>
++
++struct spmi_device;
++
++#if IS_REACHABLE(CONFIG_SPMI_APPLE)
++int apple_spmi_ext_writel_polled(struct spmi_device *sdev, u16 addr, const u8 *buf, size_t len);
++#else
++static inline int apple_spmi_ext_writel_polled(struct spmi_device *sdev, u16 addr,
++					       const u8 *buf, size_t len)
++{
++	return -ENODEV;
++}
++#endif
++
++#endif
+-- 
+2.43.0
+

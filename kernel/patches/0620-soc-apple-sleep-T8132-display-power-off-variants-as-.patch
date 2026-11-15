@@ -1,0 +1,187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 22:18:31 +0000
+Subject: [PATCH] soc: apple: sleep: T8132 display power-off variants
+ as runtime parameters
+
+While the stop of a T8132 deep sleep on the J604 was still unplaced,
+the display power-off at the end of .enter's first steps was one
+suspect (the stop was later found at the SIO). The J604's macOS takes its displays down differently from this driver: it
+first raises every display complex to on with automatic power
+management and releases its power-gate retention, then lowers the
+internal DCP before the external ones. And each external display's
+system state has a bus bridge that the power domain driver unlinks
+before powering it off, which this path skips.
+
+Put each difference behind an apple_sleep parameter, writable at run
+time, so one boot can try them in turn. Every default keeps today's
+path; the bridge words are only mapped.
+
+ - display_raise_first raises each bound display complex, system state
+   first, releases its retention and counts pmc-dcp up, as macOS does,
+   before the lowering.
+ - display_dcp_first lowers the internal DCP first.
+ - display_bridge unlinks a powered external display's bridge before
+   its system state goes off. After a refused sleep that bridge stays
+   unlinked until the display's state is powered on again.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 96 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 95 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 44cc46bdd0..7141df4fe5 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -342,6 +342,25 @@ module_param(smc_notice_late, bool, 0644);
+ MODULE_PARM_DESC(smc_notice_late,
+ 		 "send the SMC's sleep notice (slpa, AP idle) at the end of .enter, after every coprocessor stop, as macOS does, instead of from its noirq suspend");
+ 
++/*
++ * How the J604's macOS takes its displays down (q-pwr-s2r-1 and the Nov 13 record): every
++ * complex raised to on with AUTO_ENABLE and its power-gate retention released first, then
++ * the internal DCP lowered before the external ones. A dispext's system state also has a bus
++ * bridge that the power domain driver unlinks before it goes off. Defaults keep today's way.
++ */
++static bool display_raise_first;
++module_param(display_raise_first, bool, 0644);
++MODULE_PARM_DESC(display_raise_first,
++		 "raise every bound display complex and release its power-gate retention before lowering them, as macOS does");
++static bool display_dcp_first;
++module_param(display_dcp_first, bool, 0644);
++MODULE_PARM_DESC(display_dcp_first,
++		 "lower the internal DCP's display complex first, then the external ones, in macOS's order on the J604");
++static bool display_bridge;
++module_param(display_bridge, bool, 0644);
++MODULE_PARM_DESC(display_bridge,
++		 "unlink a powered external display's bus bridge before its system state goes off, as the power domain driver does");
++
+ /*
+  * Written with bits 0 and 63 by every core right before its last WFI, measured
+  * from macOS. This is not CYC_OVRD, which is undefined on this SoC.
+@@ -627,6 +646,8 @@ struct apple_sleep {
+ 	struct {
+ 		struct device_node *np;
+ 		void __iomem *asc;
++		/* The two bridge link words of its system state, if the tree names them */
++		void __iomem *bridge;
+ 		bool bound;
+ 	} display[SLEEP_DISPLAYS_MAX];
+ 
+@@ -1908,16 +1929,62 @@ static void sleep_wake_restore(struct apple_sleep *s)
+  * writes. The coprocessors' secure mailboxes are not used here. Whether that
+  * holds is open.
+  */
++/*
++ * display_raise_first: as macOS starts its display shutdown, each bound complex to on with
++ * AUTO_ENABLE, system state first, its power-gate retention released between the CPU's
++ * target and its AUTO_ENABLE, and pmc-dcp counting them up. An unbound one's CPU word sits
++ * behind clock protection until the lowering clears it, so it's left alone.
++ */
++static void sleep_display_raise(struct apple_sleep *s)
++{
++	const struct apple_sleep_soc *soc = s->soc;
++	const u32 (*domains)[3] = soc->ps.disp;
++	int i, up = 0;
++
++	for (i = 0; i < soc->ndisp; i++) {
++		if (i != 0 && !s->display[i].bound)
++			continue;
++		sleep_ps_raise(s, domains[i][2]);
++		sleep_ps_raise(s, domains[i][1]);
++		if (sleep_ps_raise_start(s, domains[i][0]))
++			dev_warn(s->dev, "display %d: CPU state did not come on\n", i);
++		if (soc->pwrgate_disp[i][0]) {
++			writel(0, s->pwrgate + soc->pwrgate_disp[i][0]);
++			writel(1, s->pwrgate + soc->pwrgate_disp[i][1]);
++		}
++		sleep_ps_raise_finish(s, domains[i][0]);
++		writel(++up, s->pmc_dcp);
++	}
++}
++
++/* display_bridge: the link down, as pmgr-pwrstate.c does it before the state's power-off. */
++static void sleep_display_bridge_down(void __iomem *bridge)
++{
++	int i;
++
++	for (i = 0; i < 2; i++)
++		writel(readl(bridge + 4 * i) & ~BIT(0), bridge + 4 * i);
++	/* Complete the stores before the state word changes. */
++	mb();
++	readl(bridge);
++}
++
+ static int sleep_display_off(struct apple_sleep *s)
+ {
+ 	const struct apple_sleep_soc *soc = s->soc;
+ 	const u32 (*domains)[3] = soc->ps.disp;
++	bool dcp_first = READ_ONCE(display_dcp_first);
++	bool bridge = READ_ONCE(display_bridge);
+ 	int n = soc->ndisp, j, i, ret = 0;
+ 
++	if (READ_ONCE(display_raise_first))
++		sleep_display_raise(s);
++
+ 	for (j = 0; j < n; j++) {
+ 		void __iomem *asc;
+ 
+-		i = soc->display_order[j];
++		/* Index 0 is the internal DCP. */
++		i = dcp_first ? j : soc->display_order[j];
+ 		asc = s->display[i].asc;
+ 
+ 		/*
+@@ -1953,6 +2020,8 @@ static int sleep_display_off(struct apple_sleep *s)
+ 		}
+ 		sleep_ps_lower(s, domains[i][0]);
+ 		sleep_ps_lower(s, domains[i][1]);
++		if (bridge && s->display[i].bridge && sleep_ps_on(s, domains[i][2]))
++			sleep_display_bridge_down(s->display[i].bridge);
+ 		sleep_ps_lower(s, domains[i][2]);
+ 	}
+ 
+@@ -4214,6 +4283,30 @@ static int apple_sleep_read_wake_sources(struct apple_sleep *s)
+ 	return 0;
+ }
+ 
++/* The power state whose apple,bridge-link names a block of @disp: its two link words. */
++static void __iomem *apple_sleep_map_bridge(struct device_node *disp)
++{
++	struct device_node *np;
++
++	for_each_node_with_property(np, "apple,bridge-link") {
++		struct of_phandle_args link;
++		void __iomem *base = NULL;
++		struct resource res;
++
++		if (of_parse_phandle_with_fixed_args(np, "apple,bridge-link", 2, 0, &link))
++			continue;
++		if (link.np == disp && !of_address_to_resource(disp, link.args[0], &res))
++			base = ioremap(res.start + link.args[1], 8);
++		of_node_put(link.np);
++		if (base) {
++			of_node_put(np);
++			return base;
++		}
++	}
++
++	return NULL;
++}
++
+ static int apple_sleep_map_displays(struct apple_sleep *s)
+ {
+ 	int i;
+@@ -4233,6 +4326,7 @@ static int apple_sleep_map_displays(struct apple_sleep *s)
+ 		s->display[i].asc = of_iomap(np, index);
+ 		if (!s->display[i].asc)
+ 			return dev_err_probe(s->dev, -ENOMEM, "cannot map %pOF\n", np);
++		s->display[i].bridge = apple_sleep_map_bridge(np);
+ 	}
+ 
+ 	return 0;
+-- 
+2.43.0
+
