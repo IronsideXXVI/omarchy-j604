@@ -1,0 +1,369 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 15:34:07 +0000
+Subject: [PATCH] media: apple: isp: test the macOS module reads,
+ setfile override and switches
+
+Cover in KUnit what the macOS session switches send, without hardware:
+
+- the module reads per kind of session and phase, in macOS's order
+  (set-up session, stream sessions), with each read's record and the
+  command area limit; the selection moves into isp_cal_read_wanted() so
+  the test and the driver share it;
+- the setfile override name, moved into isp_setfile_path(). It used to
+  ignore strim()'s result, so an override written with a leading blank
+  was requested with that blank and not found; take the trimmed name;
+- macos_hr, macos_fep_thumb, macos_camera_control, macos_knobs and
+  macos_stream_config: nothing sent when off, and macOS's records in
+  macOS's places when on.
+
+The two preview stream tests had gone stale since the sensor preset of a
+stream is resolved at stream start, which they skip: set it there as the
+start does. The trace now holds 160 commands, for the longer setup.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ .../media/platform/apple/isp/isp-cam-test.c   | 232 +++++++++++++++++-
+ drivers/media/platform/apple/isp/isp-cam.c    |  36 ++-
+ 2 files changed, 257 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam-test.c b/drivers/media/platform/apple/isp/isp-cam-test.c
+index 4cb1ae2800..90dda2190b 100644
+--- a/drivers/media/platform/apple/isp/isp-cam-test.c
++++ b/drivers/media/platform/apple/isp/isp-cam-test.c
+@@ -126,6 +126,8 @@ static struct apple_isp *isp_test_capture_alloc(struct kunit *test)
+ 	fmt->version = 0x958;
+ 	fmt->pixelformat = V4L2_PIX_FMT_P010;
+ 	fmt->preset = &preset;
++	/* resolved at stream start, which these tests do not go through */
++	isp->stream_preset = preset;
+ 	fmt->strides[0] = 2560;
+ 	fmt->strides[1] = 2560;
+ 	fmt->plane_size[0] = 1843200;
+@@ -228,9 +230,9 @@ static void isp_test_optional_setfile_continues_setup(struct kunit *test)
+ 
+ struct isp_test_nv12_trace {
+ 	unsigned int count;
+-	u32 opcode[64];
+-	u32 size[64];
+-	u32 word[64][3];
++	u32 opcode[160];
++	u32 size[160];
++	u32 word[160][3];
+ };
+ 
+ /* Accept every NV12 setup command and record its opcode and first fields. */
+@@ -705,6 +707,225 @@ static void isp_test_call_size_capabilities(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, isp->presets[8].output_dim.y, 1536);
+ }
+ 
++/*
++ * The module reads per kind of session and phase, in macOS's order: its
++ * set-up session (q9-cam-cmd-3) and its stream sessions (q9 session 4).
++ */
++static void isp_test_cal_read_order(struct kunit *test)
++{
++	static const u16 first_before[] = {
++		0x0142, ISP_CAL_SWEEP, 0x0701, 0x0501, 0x0507, 0x0511,
++	};
++	static const u16 first_after_load[] = {
++		0x0814, 0x7005, 0x831b, 0x830c, 0x7002,
++	};
++	static const u16 later_after_load[] = { 0x0814, 0x7005, 0x7002, 0x7005 };
++	static const u16 after_select[] = { 0x7002, 0x0808, 0x831b, 0x016a };
++	static const struct {
++		enum isp_cal_phase phase;
++		u8 when;
++		const u16 *ops;
++		unsigned int n;
++	} cases[] = {
++		{ ISP_CAL_BEFORE_LOAD, ISP_CAL_FIRST, first_before,
++		  ARRAY_SIZE(first_before) },
++		{ ISP_CAL_BEFORE_LOAD, ISP_CAL_LATER, NULL, 0 },
++		{ ISP_CAL_AFTER_LOAD, ISP_CAL_FIRST, first_after_load,
++		  ARRAY_SIZE(first_after_load) },
++		{ ISP_CAL_AFTER_LOAD, ISP_CAL_LATER, later_after_load,
++		  ARRAY_SIZE(later_after_load) },
++		{ ISP_CAL_AFTER_SELECT, ISP_CAL_FIRST, after_select,
++		  ARRAY_SIZE(after_select) },
++		{ ISP_CAL_AFTER_SELECT, ISP_CAL_LATER, after_select,
++		  ARRAY_SIZE(after_select) },
++	};
++
++	for (unsigned int c = 0; c < ARRAY_SIZE(cases); c++) {
++		unsigned int n = 0;
++
++		for (unsigned int i = 0; i < ARRAY_SIZE(isp_cal_reads); i++) {
++			const struct isp_cal_read *r = &isp_cal_reads[i];
++
++			if (!isp_cal_read_wanted(r, cases[c].phase,
++						 cases[c].when, SIZE_MAX))
++				continue;
++			KUNIT_ASSERT_LT_MSG(test, n, cases[c].n, "case %u", c);
++			KUNIT_EXPECT_EQ_MSG(test, r->opcode, cases[c].ops[n],
++					    "case %u read %u", c, n);
++			n++;
++		}
++		KUNIT_EXPECT_EQ_MSG(test, n, cases[c].n, "case %u", c);
++	}
++}
++
++/* The record of each read, as macOS sends it, and the command area limit. */
++static void isp_test_cal_read_records(struct kunit *test)
++{
++	for (unsigned int i = 0; i < ARRAY_SIZE(isp_cal_reads); i++) {
++		const struct isp_cal_read *r = &isp_cal_reads[i];
++
++		/* A read too long for the command area is skipped. */
++		KUNIT_EXPECT_EQ(test, isp_cal_read_wanted(r, r->phase, r->when,
++							  0x100),
++				(bool)(r->len <= 0x100));
++		KUNIT_EXPECT_GE(test, r->count, 1);
++		if (r->opcode == ISP_CAL_SWEEP)
++			continue;
++		KUNIT_EXPECT_LE(test, (size_t)r->word_off + sizeof(u32),
++				(size_t)r->len);
++		KUNIT_EXPECT_NOT_NULL(test, r->name);
++		switch (r->opcode) {
++		case CISP_CMD_CH_LSC_POLYNOMIAL_COEFF_GET:
++			/* one read per sensor config, its index at 0xc */
++			KUNIT_EXPECT_EQ(test, r->len, 0x48);
++			KUNIT_EXPECT_EQ(test, r->word_off, 0xc);
++			KUNIT_EXPECT_EQ(test, r->count, 13);
++			break;
++		case CISP_CMD_CH_SENSOR_NVM_GET:
++			KUNIT_EXPECT_EQ(test, r->len, 0x400);
++			KUNIT_EXPECT_EQ(test, r->word_off, 0x10);
++			KUNIT_EXPECT_EQ(test, r->word, 0x1c11);
++			break;
++		case CISP_CMD_EXTRINSIC_DATA_GET:
++			KUNIT_EXPECT_TRUE(test, r->all_channels);
++			break;
++		default:
++			KUNIT_EXPECT_FALSE(test, r->all_channels);
++		}
++	}
++}
++
++static void isp_test_setfile_path(struct kunit *test)
++{
++	static const struct isp_setfile sf = {
++		.path = "apple/isp_2224_01XX.dat", .size = 0x6ff4,
++		.file_size = 0x6000,
++	};
++	char name[64];
++	size_t len;
++
++	strscpy(name, "", sizeof(name));
++	KUNIT_EXPECT_STREQ(test, isp_setfile_path(&sf, name, &len), sf.path);
++	KUNIT_EXPECT_EQ(test, len, 0x6000);
++	/* what "echo > setfile_override" leaves */
++	strscpy(name, "\n", sizeof(name));
++	KUNIT_EXPECT_STREQ(test, isp_setfile_path(&sf, name, &len), sf.path);
++	strscpy(name, "apple/macos.dat\n", sizeof(name));
++	KUNIT_EXPECT_STREQ(test, isp_setfile_path(&sf, name, &len),
++			   "apple/macos.dat");
++	KUNIT_EXPECT_EQ(test, len, 0x6ff4);
++	strscpy(name, "  apple/macos.dat ", sizeof(name));
++	KUNIT_EXPECT_STREQ(test, isp_setfile_path(&sf, name, &len),
++			   "apple/macos.dat");
++}
++
++static void isp_test_macos_reset(void *unused)
++{
++	macos_hr = false;
++	macos_fep_thumb = false;
++	macos_camera_control = false;
++	macos_knobs = false;
++	macos_stream_config = false;
++}
++
++/* An IMX958 NV12 setup on hardware that takes macOS's session settings */
++static struct isp_test_nv12_trace *isp_test_macos_run(struct kunit *test,
++						      bool on)
++{
++	struct apple_isp *isp = isp_test_nv12_alloc(test, ISP_IMX958_2224_01);
++	struct apple_isp_hw *hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
++	struct isp_test_nv12_trace *trace;
++
++	KUNIT_ASSERT_NOT_NULL(test, hw);
++	*hw = *isp->hw;
++	hw->macos_session_settings = true;
++	isp->hw = hw;
++	/* two-word settings read their reply back from the command area */
++	isp->cmd_virt = kunit_kzalloc(test, 0x400, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, isp->cmd_virt);
++	trace = kunit_kzalloc(test, sizeof(*trace), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, trace);
++	test->priv = trace;
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, isp_test_macos_reset,
++							NULL), 0);
++	macos_hr = on;
++	macos_fep_thumb = on;
++	macos_camera_control = on;
++	macos_knobs = on;
++	macos_stream_config = on;
++	KUNIT_EXPECT_EQ(test, isp_ch_configure_capture(isp, 0), 0);
++	return trace;
++}
++
++static const u32 isp_test_macos_ops[] = {
++	0x1005, 0x1008, 0x0169, 0x0141, 0x0a3d, 0x0a13, 0x0a09, 0x0a40,
++	0x0a14, 0x0903, 0x0167, 0x8102, 0x0b0a,
++};
++
++/* cam-55..59 send nothing unless asked */
++static void isp_test_macos_candidates_off(struct kunit *test)
++{
++	struct isp_test_nv12_trace *trace = isp_test_macos_run(test, false);
++	int i;
++
++	for (unsigned int k = 0; k < ARRAY_SIZE(isp_test_macos_ops); k++)
++		KUNIT_EXPECT_LT_MSG(test, isp_test_find(trace,
++							isp_test_macos_ops[k]),
++				    0, "opcode 0x%04x", isp_test_macos_ops[k]);
++	/* MBNR keeps chroma noise reduction on */
++	i = isp_test_find(trace, 0x0a3a);
++	KUNIT_ASSERT_GE(test, i, 0);
++	KUNIT_EXPECT_EQ(test, trace->word[i][2], 1);
++	KUNIT_EXPECT_LT(test, isp_test_find(trace, 0x0a3b), 0);
++}
++
++/* cam-55..59 send macOS's records in macOS's places */
++static void isp_test_macos_candidates_on(struct kunit *test)
++{
++	static const u32 hr[][2] = { { 0x1005, 0x14 }, { 0x1008, 0x10 },
++				     { 0x1005, 0x14 } };
++	static const u32 pre[][2] = { { 0x0169, 0x10 }, { 0x0141, 0x14 },
++				      { 0x0141, 0x14 }, { 0x0b0d, 0x10 } };
++	static const u32 knobs[][2] = { { 0x0a3d, 0x14 }, { 0x0a13, 0x10 },
++					{ 0x0a09, 0x14 }, { 0x0a40, 0x14 } };
++	static const u32 stream[][2] = { { 0x0903, 0x10 }, { 0x0167, 0x10 },
++					 { 0x8102, 0x14 }, { 0x0b0a, 0x14 } };
++	struct isp_test_nv12_trace *trace = isp_test_macos_run(test, true);
++	int i;
++
++	isp_test_expect_run(test, trace, hr, ARRAY_SIZE(hr));
++	isp_test_expect_run(test, trace, pre, ARRAY_SIZE(pre));
++	isp_test_expect_run(test, trace, knobs, ARRAY_SIZE(knobs));
++	isp_test_expect_run(test, trace, stream, ARRAY_SIZE(stream));
++
++	i = isp_test_find(trace, 0x1005);
++	KUNIT_EXPECT_EQ(test, trace->word[i][1], 0);
++	KUNIT_EXPECT_EQ(test, trace->word[i + 1][0], 1);
++	KUNIT_EXPECT_EQ(test, trace->word[i + 2][1], 1);
++	/* after the preview stream's local raw buffers */
++	KUNIT_EXPECT_LT(test, isp_test_find(trace, 0x0125),
++			isp_test_find(trace, 0x0169));
++	i = isp_test_find(trace, 0x0141);
++	KUNIT_EXPECT_EQ(test, trace->word[i][0], 3);
++	KUNIT_EXPECT_EQ(test, trace->word[i][1], 1);
++	KUNIT_EXPECT_EQ(test, trace->word[i + 1][0], 4);
++	KUNIT_EXPECT_EQ(test, trace->word[i + 1][1], 0);
++	i = isp_test_find(trace, 0x0a3d);
++	KUNIT_EXPECT_EQ(test, trace->word[i][1], 0x80);
++	/* the knobs, then MBNR with macOS's values and chroma off, then release */
++	KUNIT_EXPECT_LT(test, isp_test_find(trace, 0x0a40),
++			isp_test_find(trace, 0x0a3b));
++	i = isp_test_find(trace, 0x0a3a);
++	KUNIT_ASSERT_GE(test, i, 0);
++	KUNIT_EXPECT_EQ(test, trace->word[i][2], 0);
++	KUNIT_EXPECT_LT(test, i, isp_test_find(trace, 0x0a14));
++	i = isp_test_find(trace, 0x0167);
++	KUNIT_EXPECT_EQ(test, trace->word[i][0], 0x1e01);
++	i = isp_test_find(trace, 0x0b0a);
++	KUNIT_EXPECT_EQ(test, trace->word[i][0], 0x100);
++	KUNIT_EXPECT_EQ(test, trace->word[i][1], 0);
++}
++
+ static struct kunit_case isp_cam_test_cases[] = {
+ 	KUNIT_CASE(isp_test_call_crop),
+ 	KUNIT_CASE(isp_test_call_crop_bounds),
+@@ -722,6 +943,11 @@ static struct kunit_case isp_cam_test_cases[] = {
+ 	KUNIT_CASE(isp_test_temporal_filter_band0),
+ 	KUNIT_CASE(isp_test_temporal_filter_off),
+ 	KUNIT_CASE(isp_test_power_line_frequency),
++	KUNIT_CASE(isp_test_cal_read_order),
++	KUNIT_CASE(isp_test_cal_read_records),
++	KUNIT_CASE(isp_test_setfile_path),
++	KUNIT_CASE(isp_test_macos_candidates_off),
++	KUNIT_CASE(isp_test_macos_candidates_on),
+ 	{}
+ };
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 1d8d496f66..563b53cba2 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -1611,6 +1611,13 @@ static const struct isp_cal_read {
+ 	  "rotation correction" },
+ };
+ 
++/* Whether a module read belongs to this phase of this kind of session. */
++static bool isp_cal_read_wanted(const struct isp_cal_read *r,
++				enum isp_cal_phase phase, u8 when, size_t area)
++{
++	return r->phase == phase && (r->when & when) && r->len <= area;
++}
++
+ static void isp_ch_macos_cal_reads(struct apple_isp *isp, u32 ch,
+ 				   enum isp_cal_phase phase)
+ {
+@@ -1629,7 +1636,7 @@ static void isp_ch_macos_cal_reads(struct apple_isp *isp, u32 ch,
+ 	for (i = 0; i < ARRAY_SIZE(isp_cal_reads); i++) {
+ 		const struct isp_cal_read *r = &isp_cal_reads[i];
+ 
+-		if (r->phase != phase || !(r->when & when) || r->len > area)
++		if (!isp_cal_read_wanted(r, phase, when, area))
+ 			continue;
+ 		if (r->opcode == ISP_CAL_SWEEP) {
+ 			for (n = 0; n < isp->num_fw_presets; n++)
+@@ -1678,12 +1685,29 @@ module_param(setfile_override, charp, 0644);
+ MODULE_PARM_DESC(setfile_override,
+ 		 "Firmware file to load as the sensor setfile, as is (default: none)");
+ 
++/*
++ * The setfile to request and the bytes it must hold: the table's, or an
++ * override (blanks around it dropped) taken as is, at the setfile's size.
++ */
++static const char *isp_setfile_path(const struct isp_setfile *setfile,
++				    char *override, size_t *len)
++{
++	const char *name = strim(override);
++
++	if (!name[0]) {
++		*len = setfile->file_size ?: setfile->size;
++		return setfile->path;
++	}
++	*len = setfile->size;
++	return name;
++}
++
+ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
+ {
+ 	struct isp_format *fmt = isp_get_format(isp, ch);
+ 	const struct isp_setfile *setfile = &isp_setfiles[fmt->id];
+-	size_t len = setfile->file_size ?: setfile->size;
+-	const char *path = setfile->path;
++	size_t len;
++	const char *path;
+ 	char override[64] = "";
+ 	const struct firmware *fw;
+ 	u32 magic;
+@@ -1698,11 +1722,7 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
+ 	if (setfile_override)
+ 		strscpy(override, setfile_override, sizeof(override));
+ 	kernel_param_unlock(THIS_MODULE);
+-	strim(override);
+-	if (override[0]) {
+-		path = override;
+-		len = setfile->size;
+-	}
++	path = isp_setfile_path(setfile, override, &len);
+ 
+ 	err = firmware_request_nowarn(&fw, path, isp->dev);
+ 	if (err) {
+-- 
+2.43.0
+

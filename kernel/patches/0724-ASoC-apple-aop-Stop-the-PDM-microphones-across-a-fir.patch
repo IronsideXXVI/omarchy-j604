@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 15:59:40 +0000
+Subject: [PATCH] ASoC: apple: aop: Stop the PDM microphones across a
+ firmware sleep
+
+The PDM microphone card (T6030/T6040/T8132 firmware) has no system sleep
+handling. On T8132 the AOP core does not stop any endpoint for a
+firmware-driven sleep either (no sleep or wake endpoints for that SoC),
+so an array capture open at suspend stays RUNNING in ALSA while the AP's
+DMA channel stops, and the 'pwrd' state set at open is never sent
+again. Userspace sees a stream that is neither failed nor advancing.
+
+Behind apple_aop_audio.pdm_sleep_restart (default off until a J604
+measures it): for a firmware-driven sleep, suspend the array PCM the
+ALSA way, as the T8140 card already does, so userspace prepares and
+starts it again after the wake, and take an open array to 'pw1 ' as a
+close does. At resume, give it 'pwrd' back before userspace restarts
+it. s2idle and Macs without an array are unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ sound/soc/apple/aop_audio.rs | 90 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 86 insertions(+), 4 deletions(-)
+
+diff --git a/sound/soc/apple/aop_audio.rs b/sound/soc/apple/aop_audio.rs
+index 113b0ea6db..ec8d9246a4 100644
+--- a/sound/soc/apple/aop_audio.rs
++++ b/sound/soc/apple/aop_audio.rs
+@@ -552,6 +552,8 @@ struct SndSocAopData {
+     pstate_cookie: Atomic<u32>,
+     fwnode: ARef<FwNode>,
+     hwdata: &'static SndSocAopHwConfig,
++    /// Array captures open now (each holds the 'pwrd' state it set at open).
++    open_streams: Atomic<u32>,
+ }
+ 
+ impl SndSocAopData {
+@@ -570,6 +572,7 @@ fn new(
+                 fwnode,
+                 hwdata,
+                 pstate_cookie: Atomic::new(1),
++                open_streams: Atomic::new(0),
+             },
+             GFP_KERNEL,
+         )?)
+@@ -770,6 +773,11 @@ struct SndSocAopDriver {
+     spkr: Option<aop_spkr::SpeakerComponent>,
+     /// The low-power microphone, PCM 1 of the card, where the firmware streams it inline.
+     lpai: Option<Arc<aop_lpai::LpaiCapture>>,
++    /// The array's data and PCM 0, for a firmware-driven sleep; none on a Mac without mics.
++    data: Option<Arc<SndSocAopData>>,
++    pcm: *mut bindings::snd_pcm,
++    /// Captures were open when the last firmware-driven sleep began.
++    slept_open: Atomic<u32>,
+ }
+ 
+ fn copy_str(target: &mut [u8], source: &[u8]) {
+@@ -889,6 +897,7 @@ unsafe fn dmaengine_slave_config(
+         unsafe { bindings::snd_dmaengine_pcm_close_release_chan(substream) };
+         return e.to_errno();
+     }
++    data.open_streams.fetch_add(1, Relaxed);
+     0
+ }
+ 
+@@ -905,6 +914,7 @@ unsafe fn dmaengine_slave_config(
+         dev_err!(data.dev, "Unable to close channel");
+         return ret;
+     }
++    data.open_streams.fetch_sub(1, Relaxed);
+     if let Err(e) = data.set_audio_power(POWER_STATE_IDLE, 1) {
+         dev_err!(data.dev, "Unable to power mic off");
+         return e.to_errno();
+@@ -947,6 +957,9 @@ fn new(data: Arc<SndSocAopData>, lpai: Option<Arc<aop_lpai::LpaiCapture>>) -> Re
+             mic: aop_lid::MicLid::new()?,
+             spkr: None,
+             lpai,
++            data: Some(data.clone()),
++            pcm: ptr::null_mut(),
++            slept_open: Atomic::new(0),
+         };
+         let ret = unsafe {
+             bindings::snd_card_new(
+@@ -999,6 +1012,7 @@ fn new(data: Arc<SndSocAopData>, lpai: Option<Arc<aop_lpai::LpaiCapture>>) -> Re
+             dev_err!(data.dev, "Unable to allocate PCM device");
+             return Err(Error::from_errno(ret));
+         }
++        this.pcm = pcm;
+ 
+         unsafe {
+             bindings::snd_pcm_set_ops(
+@@ -1036,6 +1050,43 @@ fn new(data: Arc<SndSocAopData>, lpai: Option<Arc<aop_lpai::LpaiCapture>>) -> Re
+     }
+ }
+ 
++impl SndSocAopDriver {
++    /// A firmware-driven sleep. The AOP firmware keeps running, but the AP's DMA does not: stop
++    /// the array's streams the ALSA way, so userspace sees them suspended and prepares them
++    /// again afterwards (the PCM cannot resume), and take the array from 'pwrd' to 'pw1 ', as
++    /// a close does, so the firmware does not run the microphones into a stopped channel.
++    fn sleep_stop(&self) {
++        let Some(data) = &self.data else { return };
++        if self.pcm.is_null() {
++            return;
++        }
++        // SAFETY: PCM 0 lives as long as the card, and the driver core keeps unbind away from
++        // a system sleep.
++        let ret = unsafe { bindings::snd_pcm_suspend_all(self.pcm) };
++        if ret < 0 {
++            dev_err!(data.dev, "unable to suspend the array PCM: {}\n", ret);
++        }
++        let open = data.open_streams.load(Relaxed);
++        self.slept_open.store(open, Relaxed);
++        if open != 0 && data.set_audio_power(POWER_STATE_IDLE, 1).is_err() {
++            dev_warn!(data.dev, "array not taken to 'pw1 ' before the sleep\n");
++        }
++    }
++
++    /// After the wake: an array still open gets its 'pwrd' state back before userspace starts
++    /// it again, as at open.
++    fn sleep_restore(&self) {
++        let Some(data) = &self.data else { return };
++        if self.slept_open.xchg(0, Relaxed) == 0 || data.open_streams.load(Relaxed) == 0 {
++            return;
++        }
++        match data.set_audio_power(POWER_STATE_ON, 1) {
++            Ok(()) => dev_info!(data.dev, "array microphones powered again after the sleep\n"),
++            Err(e) => dev_err!(data.dev, "array microphones not back after the sleep: {:?}\n", e),
++        }
++    }
++}
++
+ impl Drop for SndSocAopDriver {
+     fn drop(&mut self) {
+         // The speaker component (and any card bound to its DAIs) goes before the microphone card.
+@@ -1126,14 +1177,38 @@ enum AopVariant {
+         return 0;
+     }
+     // SAFETY: this driver stored it at probe, and it stays until unbind.
+-    if let AopAudio::T8140(driver) = unsafe { &*driver } {
+-        driver.sleep_stop();
++    match unsafe { &*driver } {
++        AopAudio::T8140(driver) => driver.sleep_stop(),
++        AopAudio::Pdm { driver } if module_parameters::pdm_sleep_restart.value() != 0 => {
++            driver.sleep_stop()
++        }
++        AopAudio::Pdm { .. } => {}
++    }
++    0
++}
++
++/// The wake after a firmware-driven sleep: the PDM array gets its power state back.
++///
++/// # Safety
++///
++/// Called by the PM core with a live device of this driver.
++unsafe extern "C" fn aop_audio_resume(dev: *mut bindings::device) -> i32 {
++    // SAFETY: the PM core passes a live device, and keeps unbind away for this call.
++    let dev = unsafe { device::Device::<device::Normal>::from_raw(dev) };
++    let driver = dev.get_drvdata::<AopAudio>();
++    if driver.is_null() {
++        return 0;
++    }
++    // SAFETY: this driver stored it at probe, and it stays until unbind.
++    if let AopAudio::Pdm { driver } = unsafe { &*driver } {
++        driver.sleep_restore();
+     }
+     0
+ }
+ 
+ static AOP_AUDIO_PM_OPS: bindings::dev_pm_ops = bindings::dev_pm_ops {
+     suspend: Some(aop_audio_suspend),
++    resume: Some(aop_audio_resume),
+     // SAFETY: all-zero is a valid `dev_pm_ops`: no callbacks.
+     ..unsafe { core::mem::zeroed() }
+ };
+@@ -1141,7 +1216,7 @@ enum AopVariant {
+ /// The bound driver, as the variant set it up.
+ enum AopAudio {
+     /// Held for its `Drop`, which frees the card.
+-    Pdm { _driver: SndSocAopDriver },
++    Pdm { driver: SndSocAopDriver },
+     T8140(aop_t8140::SndSocT8140AopDriver),
+ }
+ 
+@@ -1162,7 +1237,7 @@ fn probe<'bound>(
+         let variant: &'static AopVariant = *info.ok_or(ENODEV)?;
+         Ok(match variant {
+             AopVariant::Pdm(hw) => AopAudio::Pdm {
+-                _driver: SndSocAopDriver::probe(pdev, hw)?,
++                driver: SndSocAopDriver::probe(pdev, hw)?,
+             },
+             AopVariant::T8140 => AopAudio::T8140(aop_t8140::SndSocT8140AopDriver::probe(pdev)?),
+         })
+@@ -1221,6 +1296,9 @@ fn probe(
+                 mic: aop_lid::MicLid::new()?,
+                 spkr: None,
+                 lpai: None,
++                data: None,
++                pcm: ptr::null_mut(),
++                slept_open: Atomic::new(0),
+             };
+             this.spkr = Some(aop_spkr::SpeakerComponent::register(data)?);
+             return Ok(this);
+@@ -1299,5 +1377,9 @@ fn probe(
+             default: 0,
+             description: "Enable mics without user space handling",
+         },
++        pdm_sleep_restart: u8 {
++            default: 0,
++            description: "Stop open PDM captures across a firmware-driven sleep",
++        },
+     },
+ }
+-- 
+2.43.0
+

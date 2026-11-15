@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Diljit Singh <hey@djdev.me>
+Date: Sun, 15 Nov 2026 04:22:36 -0500
+Subject: [PATCH] media: apple: avd: refuse VP9 and AV1 streams other
+ than 4:2:0
+
+The decoder never completes a VP9 profile 1 frame (4:2:2 or 4:4:4) or
+an AV1 High profile frame (4:4:4). Such a frame times out, and the
+recovery resets the whole decoder, failing every other stream's frames
+too. Three such clips in a row park the decoder for most of a minute.
+Synthetic test clips hit this easily: ffmpeg's testsrc is RGB, so
+without -pix_fmt yuv420p the VP9 and AV1 encoders pick 4:4:4.
+
+Refuse these when the control is set, as H.264 and HEVC already do for
+the formats they can't decode:
+
+- VP9: only profile 0 (8-bit) and profile 2 (10-bit), which are always
+  4:2:0.
+- AV1: only the Main profile at 8 or 10 bits with 4:2:0 subsampling.
+  Monochrome stays refused.
+
+Drop the 4:2:2 capture formats from the VP9 and AV1 lists and profiles
+1 and 3 from the VP9 profile menu, so clients see what the decoder can
+decode before they try.
+
+Signed-off-by: Diljit Singh <hey@djdev.me>
+(cherry picked from commit ef70aa39b5460f3e7a0893c3fa894bc3bf95e466)
+[dylan: one co-author trailer of the original message is not reproduced here]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/avd/avd-av1.c  | 24 +++++++++----
+ drivers/media/platform/apple/avd/avd-v4l2.c | 22 +++---------
+ drivers/media/platform/apple/avd/avd-vp9.c  | 38 ++++++++++++++++-----
+ 3 files changed, 50 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/media/platform/apple/avd/avd-av1.c b/drivers/media/platform/apple/avd/avd-av1.c
+index 41e4f3a29f..6c3d6a8ac9 100644
+--- a/drivers/media/platform/apple/avd/avd-av1.c
++++ b/drivers/media/platform/apple/avd/avd-av1.c
+@@ -1859,13 +1859,7 @@ static enum avd_image_fmt avd_av1_get_image_fmt(struct avd_ctx *ctx,
+ 	if (ctrl->id != V4L2_CID_STATELESS_AV1_SEQUENCE)
+ 		return AVD_IMG_FMT_ANY;
+ 
+-	if (!(seq->flags & V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X)) /* 4:4:4 */
+-		return AVD_IMG_FMT_ANY;
+-	if (!(seq->flags & V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y))
+-		return BIT_DEPTH(422);
+-	if (seq->flags & V4L2_AV1_SEQUENCE_FLAG_MONO_CHROME)
+-		return AVD_IMG_FMT_ANY; /* 4:0:0 (not supported?) */
+-
++	/* avd_av1_validate_sequence() admits only Main profile 4:2:0. */
+ 	return BIT_DEPTH(420);
+ #undef BIT_DEPTH
+ }
+@@ -1908,11 +1902,27 @@ static void avd_av1_adjust_decoded_fmt(struct avd_ctx *ctx,
+ 		avd_av1_seg_size(pix_mp->width, pix_mp->height);
+ }
+ 
++/*
++ * Only the AV1 Main profile at 4:2:0 (8 and 10 bits) decodes. A High
++ * profile (4:4:4) frame is never completed: it times out and the whole
++ * decoder is reset, failing every other stream's frames too. Professional
++ * (4:2:2, 12-bit) has no capture format. Refuse anything but Main 4:2:0
++ * when the sequence is set, so it never reaches the decoder.
++ */
+ static int avd_av1_validate_sequence(struct avd_ctx *ctx,
+ 				     struct v4l2_ctrl_av1_sequence *seq)
+ {
++	const u32 subsampling = V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
++				V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
++
++	if (seq->seq_profile != 0)
++		return -EINVAL;
++	if (seq->bit_depth != 8 && seq->bit_depth != 10)
++		return -EINVAL;
+ 	if (seq->flags & V4L2_AV1_SEQUENCE_FLAG_MONO_CHROME)
+ 		return -EINVAL; /* 4:0:0 (not supported?) */
++	if ((seq->flags & subsampling) != subsampling)
++		return -EINVAL;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/media/platform/apple/avd/avd-v4l2.c b/drivers/media/platform/apple/avd/avd-v4l2.c
+index 39d7c98395..5fbb772c7a 100644
+--- a/drivers/media/platform/apple/avd/avd-v4l2.c
++++ b/drivers/media/platform/apple/avd/avd-v4l2.c
+@@ -397,7 +397,8 @@ static const struct avd_ctrl_desc avd_vp9_ctrl_descs[] = {
+ 	{
+ 		.cfg.id = V4L2_CID_MPEG_VIDEO_VP9_PROFILE,
+ 		.cfg.min = V4L2_MPEG_VIDEO_VP9_PROFILE_0,
+-		.cfg.max = V4L2_MPEG_VIDEO_VP9_PROFILE_3,
++		.cfg.max = V4L2_MPEG_VIDEO_VP9_PROFILE_2,
++		.cfg.menu_skip_mask = BIT(V4L2_MPEG_VIDEO_VP9_PROFILE_1),
+ 		.cfg.def = V4L2_MPEG_VIDEO_VP9_PROFILE_0,
+ 	},
+ };
+@@ -407,6 +408,7 @@ static const struct avd_ctrls avd_vp9_ctrls = {
+ 	.num_ctrls = ARRAY_SIZE(avd_vp9_ctrl_descs),
+ };
+ 
++/* VP9 profiles 0 and 2 only; avd_vp9_try_ctrl() refuses the others. */
+ static const struct avd_decoded_fmt_desc avd_vp9_decoded_fmts[] = {
+ 	{
+ 		.fourcc = V4L2_PIX_FMT_NV12,
+@@ -416,16 +418,9 @@ static const struct avd_decoded_fmt_desc avd_vp9_decoded_fmts[] = {
+ 		.fourcc = V4L2_PIX_FMT_P010,
+ 		.image_fmt = AVD_IMG_FMT_420_10BIT,
+ 	},
+-	{
+-		.fourcc = V4L2_PIX_FMT_NV16,
+-		.image_fmt = AVD_IMG_FMT_422_8BIT,
+-	},
+-	{
+-		.fourcc = V4L2_PIX_FMT_P010,
+-		.image_fmt = AVD_IMG_FMT_422_10BIT,
+-	},
+ };
+ 
++/* AV1 Main profile 4:2:0 only; avd_av1_try_ctrl() refuses the others. */
+ static const struct avd_decoded_fmt_desc avd_av1_decoded_fmts[] = {
+ 	{
+ 		.fourcc = V4L2_PIX_FMT_NV12,
+@@ -435,15 +430,6 @@ static const struct avd_decoded_fmt_desc avd_av1_decoded_fmts[] = {
+ 		.fourcc = V4L2_PIX_FMT_P010,
+ 		.image_fmt = AVD_IMG_FMT_420_10BIT,
+ 	},
+-	{
+-		.fourcc = V4L2_PIX_FMT_NV16,
+-		.image_fmt = AVD_IMG_FMT_422_8BIT,
+-	},
+-	{
+-		/* TODO: missing P210 */
+-		.fourcc = V4L2_PIX_FMT_P010,
+-		.image_fmt = AVD_IMG_FMT_422_10BIT,
+-	},
+ };
+ 
+ static const struct avd_ctrl_desc avd_av1_ctrl_descs[] = {
+diff --git a/drivers/media/platform/apple/avd/avd-vp9.c b/drivers/media/platform/apple/avd/avd-vp9.c
+index 4535508d9c..8f2473d928 100644
+--- a/drivers/media/platform/apple/avd/avd-vp9.c
++++ b/drivers/media/platform/apple/avd/avd-vp9.c
+@@ -1161,18 +1161,37 @@ static enum avd_image_fmt avd_vp9_get_image_fmt(struct avd_ctx *ctx,
+ 	if (ctrl->id != V4L2_CID_STATELESS_VP9_FRAME)
+ 		return AVD_IMG_FMT_ANY;
+ 
+-	/* 7.2.2 Color config semantics */
+-	if (frame->flags & V4L2_VP9_FRAME_FLAG_X_SUBSAMPLING) {
+-		if (frame->flags & V4L2_VP9_FRAME_FLAG_Y_SUBSAMPLING)
+-			return BIT_DEPTH(420);
+-		else
+-			return BIT_DEPTH(422);
+-	}
+-
+-	return AVD_IMG_FMT_ANY;
++	/* avd_vp9_try_ctrl() admits only 4:2:0 (profiles 0 and 2). */
++	return BIT_DEPTH(420);
+ #undef BIT_DEPTH
+ }
+ 
++/*
++ * Only VP9 profiles 0 and 2 (4:2:0, 8 and 10 bits) decode. A profile 1
++ * frame (4:2:2 or 4:4:4) is never completed: it times out and the whole
++ * decoder is reset, failing every other stream's frames too. Refuse
++ * profiles 1 and 3, and 12-bit frames (no capture format), when the
++ * control is set, so they never reach the decoder.
++ */
++static int avd_vp9_validate_frame(struct avd_ctx *ctx,
++				  const struct v4l2_ctrl_vp9_frame *frame)
++{
++	if (frame->profile != 0 && frame->profile != 2)
++		return -EINVAL;
++	if (frame->bit_depth != (frame->profile ? 10 : 8))
++		return -EINVAL;
++
++	return 0;
++}
++
++static int avd_vp9_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
++{
++	if (ctrl->id == V4L2_CID_STATELESS_VP9_FRAME)
++		return avd_vp9_validate_frame(ctx, ctrl->p_new.p_vp9_frame);
++
++	return 0;
++}
++
+ static unsigned int avd_vp9_pp_kicks(struct avd_ctx *ctx)
+ {
+ 	struct avd_vp9_ctx *priv = ctx->priv;
+@@ -1212,5 +1231,6 @@ const struct avd_coded_fmt_ops avd_vp9_fmt_ops = {
+ 	.ready = avd_vp9_ready,
+ 	.submit = avd_vp9_submit,
+ 	.pp_kicks = avd_vp9_pp_kicks,
++	.try_ctrl = avd_vp9_try_ctrl,
+ 	.get_image_fmt = avd_vp9_get_image_fmt,
+ };
+-- 
+2.43.0
+

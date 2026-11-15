@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Diljit Singh <hey@djdev.me>
+Date: Sun, 15 Nov 2026 08:41:20 -0500
+Subject: [PATCH] media: apple: avd: re-check VP9 and AV1 stream
+ parameters when a frame runs
+
+All codecs' controls live in one handler, and a control is checked by
+the codec selected when it is set. A VP9 frame or AV1 sequence control
+set while the stream is still HEVC is therefore accepted unchecked. If
+the OUTPUT format is then switched to VP9 or AV1 and a buffer is queued
+without a request, the run uses the stored value, so a VP9 profile 1 or
+AV1 High profile frame can still reach the decoder. It times out, and
+the recovery resets the whole decoder, failing every other stream's
+frames too.
+
+Check the stored VP9 frame and AV1 sequence again when a frame runs,
+as H.264 and HEVC already do, and fail that frame instead. Move both
+checks above their run paths, which keeps them in the extracted source
+the host tests build. Give the AV1 preamble test a Main 4:2:0 sequence
+and check that it refuses a High profile or 4:2:2 one.
+
+Also compare the VP9 profile with 2 explicitly when picking the
+expected bit depth, and say plainly that AV1 monochrome is refused.
+
+Signed-off-by: Diljit Singh <hey@djdev.me>
+(cherry picked from commit 0ab5fcdeb41d7f760748e9d5485da09dbec1e350)
+[dylan: one co-author trailer of the original message is not reproduced here]
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/avd/avd-av1.c | 56 ++++++++++++----------
+ drivers/media/platform/apple/avd/avd-vp9.c | 42 +++++++++-------
+ tools/asahi/avd-av1-tail-tests.py          | 10 ++--
+ 3 files changed, 62 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/media/platform/apple/avd/avd-av1.c b/drivers/media/platform/apple/avd/avd-av1.c
+index 6c3d6a8ac9..8b3c2f34c5 100644
+--- a/drivers/media/platform/apple/avd/avd-av1.c
++++ b/drivers/media/platform/apple/avd/avd-av1.c
+@@ -1425,6 +1425,32 @@ static int avd_av1_check_tiles(struct avd_ctx *ctx, struct avd_av1_run *run,
+ 	return 0;
+ }
+ 
++/*
++ * Only the AV1 Main profile at 4:2:0 (8 and 10 bits) decodes. A High
++ * profile (4:4:4) frame is never completed: it times out and the whole
++ * decoder is reset, failing every other stream's frames too. Professional
++ * (4:2:2, 12-bit) has no capture format. Refuse anything but Main 4:2:0
++ * when the sequence is set and again when a frame runs, so it never
++ * reaches the decoder.
++ */
++static int avd_av1_validate_sequence(struct avd_ctx *ctx,
++				     const struct v4l2_ctrl_av1_sequence *seq)
++{
++	const u32 subsampling = V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
++				V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
++
++	if (seq->seq_profile != 0)
++		return -EINVAL;
++	if (seq->bit_depth != 8 && seq->bit_depth != 10)
++		return -EINVAL;
++	if (seq->flags & V4L2_AV1_SEQUENCE_FLAG_MONO_CHROME)
++		return -EINVAL; /* monochrome (4:0:0) is refused */
++	if ((seq->flags & subsampling) != subsampling)
++		return -EINVAL;
++
++	return 0;
++}
++
+ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
+ {
+ 	struct v4l2_ctrl *ctrl;
+@@ -1439,6 +1465,11 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
+ 		return -EINVAL;
+ 	run->seq = ctrl->p_cur.p;
+ 
++	/* The sequence may have been set, unchecked, while another codec was selected. */
++	ret = avd_av1_validate_sequence(ctx, run->seq);
++	if (ret)
++		return ret;
++
+ 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_AV1_FRAME);
+ 	if (WARN_ON(!ctrl))
+ 		return -EINVAL;
+@@ -1902,31 +1933,6 @@ static void avd_av1_adjust_decoded_fmt(struct avd_ctx *ctx,
+ 		avd_av1_seg_size(pix_mp->width, pix_mp->height);
+ }
+ 
+-/*
+- * Only the AV1 Main profile at 4:2:0 (8 and 10 bits) decodes. A High
+- * profile (4:4:4) frame is never completed: it times out and the whole
+- * decoder is reset, failing every other stream's frames too. Professional
+- * (4:2:2, 12-bit) has no capture format. Refuse anything but Main 4:2:0
+- * when the sequence is set, so it never reaches the decoder.
+- */
+-static int avd_av1_validate_sequence(struct avd_ctx *ctx,
+-				     struct v4l2_ctrl_av1_sequence *seq)
+-{
+-	const u32 subsampling = V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
+-				V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
+-
+-	if (seq->seq_profile != 0)
+-		return -EINVAL;
+-	if (seq->bit_depth != 8 && seq->bit_depth != 10)
+-		return -EINVAL;
+-	if (seq->flags & V4L2_AV1_SEQUENCE_FLAG_MONO_CHROME)
+-		return -EINVAL; /* 4:0:0 (not supported?) */
+-	if ((seq->flags & subsampling) != subsampling)
+-		return -EINVAL;
+-
+-	return 0;
+-}
+-
+ static int avd_av1_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
+ {
+ 	if (ctrl->id == V4L2_CID_STATELESS_AV1_SEQUENCE)
+diff --git a/drivers/media/platform/apple/avd/avd-vp9.c b/drivers/media/platform/apple/avd/avd-vp9.c
+index 8f2473d928..bf2d8b8085 100644
+--- a/drivers/media/platform/apple/avd/avd-vp9.c
++++ b/drivers/media/platform/apple/avd/avd-vp9.c
+@@ -767,6 +767,25 @@ static int avd_vp9_alloc_bufs(struct avd_ctx *ctx, struct avd_vp9_bank *bank)
+ 	return 0;
+ }
+ 
++/*
++ * Only VP9 profiles 0 and 2 (4:2:0, 8 and 10 bits) decode. A profile 1
++ * frame (4:2:2 or 4:4:4) is never completed: it times out and the whole
++ * decoder is reset, failing every other stream's frames too. Refuse
++ * profiles 1 and 3, and 12-bit frames (no capture format), when the
++ * control is set and again when the frame runs, so they never reach the
++ * decoder.
++ */
++static int avd_vp9_validate_frame(struct avd_ctx *ctx,
++				  const struct v4l2_ctrl_vp9_frame *frame)
++{
++	if (frame->profile != 0 && frame->profile != 2)
++		return -EINVAL;
++	if (frame->bit_depth != (frame->profile == 2 ? 10 : 8))
++		return -EINVAL;
++
++	return 0;
++}
++
+ static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
+ {
+ 	struct v4l2_ctrl *ctrl;
+@@ -794,6 +813,11 @@ static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
+ 	if (ret)
+ 		return ret;
+ 
++	/* The frame may have been set, unchecked, while another codec was selected. */
++	ret = avd_vp9_validate_frame(ctx, dec_params);
++	if (ret)
++		return ret;
++
+ 	run->decode_params = dec_params;
+ 
+ 	if (avd_backend_is_qfw(ctx->dev)) {
+@@ -1166,24 +1190,6 @@ static enum avd_image_fmt avd_vp9_get_image_fmt(struct avd_ctx *ctx,
+ #undef BIT_DEPTH
+ }
+ 
+-/*
+- * Only VP9 profiles 0 and 2 (4:2:0, 8 and 10 bits) decode. A profile 1
+- * frame (4:2:2 or 4:4:4) is never completed: it times out and the whole
+- * decoder is reset, failing every other stream's frames too. Refuse
+- * profiles 1 and 3, and 12-bit frames (no capture format), when the
+- * control is set, so they never reach the decoder.
+- */
+-static int avd_vp9_validate_frame(struct avd_ctx *ctx,
+-				  const struct v4l2_ctrl_vp9_frame *frame)
+-{
+-	if (frame->profile != 0 && frame->profile != 2)
+-		return -EINVAL;
+-	if (frame->bit_depth != (frame->profile ? 10 : 8))
+-		return -EINVAL;
+-
+-	return 0;
+-}
+-
+ static int avd_vp9_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
+ {
+ 	if (ctrl->id == V4L2_CID_STATELESS_VP9_FRAME)
+diff --git a/tools/asahi/avd-av1-tail-tests.py b/tools/asahi/avd-av1-tail-tests.py
+index 6e6c4bc846..6f1d5a98b8 100644
+--- a/tools/asahi/avd-av1-tail-tests.py
++++ b/tools/asahi/avd-av1-tail-tests.py
+@@ -73,7 +73,7 @@ struct v4l2_pix_format_mplane {unsigned int width,height; struct {unsigned int s
+ struct avd_ctx {void *priv; int ctrl_hdl; struct {struct {struct {unsigned int width,height;} pix_mp;} fmt;} decoded_fmt;};
+ static struct avd_decoded_buffer *reference;
+ static struct v4l2_ctrl_av1_frame frame;
+-static struct v4l2_ctrl_av1_sequence sequence;
++static struct v4l2_ctrl_av1_sequence sequence={.bit_depth=8,.flags=V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X|V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y};
+ static struct v4l2_ctrl_av1_tile_group_entry tile;
+ static struct v4l2_ctrl_av1_film_grain grain;
+ static struct v4l2_ctrl controls[4];
+@@ -137,7 +137,7 @@ static void reservation(unsigned int width,unsigned int height,unsigned int comp
+  assert(cdf%256==0&&co%256==0);assert(cdf>=compressed);assert(cdf+sizeof(struct avd_av1_cdfs)<=co);assert(co+color<=length);
+  assert(cdf==aligned_cdf(length,color));assert(co==cdf+9216);
+ }
+-/* The preamble refuses frames larger than the format and out-of-range reference indices. */
++/* The preamble refuses frames larger than the format, out-of-range reference indices and sequences other than Main 4:2:0. */
+ static int preamble(unsigned int w,unsigned int h,unsigned char primary,signed char idx){
+  struct avd_decoded_buffer dst={0};struct avd_av1_ctx av1={0};struct avd_ctx ctx={.priv=&av1};struct avd_av1_run run={0};set_frame_ctx(&ctx);
+  dst.base.vb.vb2_buf.planes[0].length=7000064;memset(&frame,0,sizeof(frame));
+@@ -149,6 +149,10 @@ static void guards(void){
+  assert(preamble(1921,1080,0,0)==-EINVAL);assert(preamble(1920,1081,0,0)==-EINVAL);
+  assert(preamble(1920,1080,7,0)==0);assert(preamble(1920,1080,8,0)==-EINVAL);assert(preamble(1920,1080,255,0)==-EINVAL);
+  assert(preamble(1920,1080,6,7)==0);assert(preamble(1920,1080,6,8)==-EINVAL);assert(preamble(1920,1080,0,-1)==-EINVAL);assert(preamble(1920,1080,3,-128)==-EINVAL);
++ /* A sequence stored while another codec was selected was never checked. */
++ sequence.seq_profile=1;assert(preamble(1920,1080,0,0)==-EINVAL);sequence.seq_profile=0;
++ sequence.flags&=~V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;assert(preamble(1920,1080,0,0)==-EINVAL);sequence.flags|=V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
++ assert(preamble(1920,1080,0,0)==0);
+ }
+ /* Segmentation map kept with each frame: expect 0 zeroes it, 1 copies the reference's, 2 leaves the AVD's map. */
+ static void segmap(unsigned char flags,unsigned char primary,unsigned int ref_w,unsigned int ref_h,bool missing,int expect){
+@@ -215,7 +219,7 @@ def main():
+     text = {name: p.read_text() for name, p in paths.items()}
+     src = text['avd-av1.c']
+     macros = src[src.index('#define AVD_CDFS_SIZE'):src.index('struct avd_av1_run {')]
+-    functions = {n: function(src, n) for n in ['avd_av1_ref_ts', 'avd_av1_set_prob', 'avd_av1_set_seg', 'avd_av1_seg_size', 'avd_color_size', 'avd_av1_check_tiles', 'avd_av1_run_preamble', 'avd_av1_adjust_decoded_fmt']}
++    functions = {n: function(src, n) for n in ['avd_av1_ref_ts', 'avd_av1_set_prob', 'avd_av1_set_seg', 'avd_av1_seg_size', 'avd_color_size', 'avd_av1_check_tiles', 'avd_av1_validate_sequence', 'avd_av1_run_preamble', 'avd_av1_adjust_decoded_fmt']}
+     unaligned = ('\n#define UNALIGNED_CDFS_OFFSET(dst,cl) ((dst)-ALIGN(cl,AVD_ALIGN)-ALIGN(AVD_CDFS_SIZE,AVD_ALIGN))\n'
+                  '#define UNALIGNED_SEG_OFFSET(dst,cl,sl) (UNALIGNED_CDFS_OFFSET(dst,cl)-(sl))\n')
+     # Each mutation names the extracted text it rewrites; a stale one is refused, never run as a no-op.
+-- 
+2.43.0
+

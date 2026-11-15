@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 15:06:48 +0000
+Subject: [PATCH] drm/asahi: g16: Log, and optionally restate, the
+ power-assert cell at a real wake
+
+The firmware compares its count of drained power-asserting device
+controls with a host count it reads through runtime +0x18: on the M4
+that is the device-control producer the host writes to the SGX scratch
+page. A real sleep takes the GPU domain down, and macOS restores that
+scratch RAM on its way back (AGXArmFirmware::restoreFenderScratchRAM);
+the warm restart here does not touch it.
+
+At every real wake, log what the cell holds next to the host's count
+before the firmware restarts. With g16_wake_restore (runtime, default
+0) a cell that differs is restated first, as the suspend-to-idle and
+runtime RTKit wakes already do.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 20 ++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/regs.rs   |  5 +++++
+ drivers/gpu/drm/asahi/g16/sleep.rs  | 16 ++++++++++++++++
+ 3 files changed, 41 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 6a11d60828..6b71bd30ed 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1173,6 +1173,26 @@ pub(crate) fn s2idle() -> bool {
+     "G16: at suspend-to-idle, drain the GPU (never refusing the sleep) and publish the idle performance floor; poll at resume (default 1; 0: no s2idle callbacks, as before; runtime 0644)"
+ );
+ 
++/// Storage of `g16_wake_restore` (runtime 0644, default 0).
++static WAKE_RESTORE: AtomicU32 = AtomicU32::new(0);
++
++/// Whether a real wake restates the power-assert count (the device-control producer) in the
++/// SGX scratch cell the firmware reads through runtime +0x18 before the firmware restarts.
++/// The domain was off through the sleep, and macOS restores that scratch RAM on its way back
++/// (AGXArmFirmware::restoreFenderScratchRAM). 0 leaves the cell as the wake finds it.
++pub(crate) fn wake_restore() -> bool {
++    WAKE_RESTORE.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    WAKE_RESTORE_PARAM,
++    WAKE_RESTORE_PARMTYPE,
++    WAKE_RESTORE_PARM,
++    WAKE_RESTORE,
++    "g16_wake_restore",
++    "G16: at a real wake, restate the power-assert count in the SGX scratch cell before the firmware restarts (default 0: leave it; the cell is logged either way; runtime 0644)"
++);
++
+ /// Storage of `g16_rt_idle_ms` (runtime 0644, default 0).
+ static RT_IDLE_MS: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/regs.rs b/drivers/gpu/drm/asahi/g16/regs.rs
+index 79439e692c..fc09250a53 100644
+--- a/drivers/gpu/drm/asahi/g16/regs.rs
++++ b/drivers/gpu/drm/asahi/g16/regs.rs
+@@ -242,6 +242,11 @@ pub(crate) fn bump_generation_cell(&self, cell: usize) -> Result<(u32, u32)> {
+         Ok((before, mirror))
+     }
+ 
++    /// The host-owned device-control generation as the SGX scratch page holds it now.
++    pub(crate) fn generation(&self) -> Result<u32> {
++        self.generation.io().try_read32(0)
++    }
++
+     /// Publishes the host-owned device-control generation and verifies the receipt.
+     pub(crate) fn set_generation(&self, value: u32) -> Result {
+         self.generation.io().try_write32(value, 0)?;
+diff --git a/drivers/gpu/drm/asahi/g16/sleep.rs b/drivers/gpu/drm/asahi/g16/sleep.rs
+index 608c4a3c12..bc09f9c3bc 100644
+--- a/drivers/gpu/drm/asahi/g16/sleep.rs
++++ b/drivers/gpu/drm/asahi/g16/sleep.rs
+@@ -165,6 +165,22 @@ pub(crate) fn rt_wake(&mut self) -> Result {
+ 
+     /// The run bit and the RTKit handshake, with the firmware's state as it was left.
+     fn sleep_restart(&mut self) -> Result {
++        // The domain was off through the sleep: say what the power-assert cell holds now, and
++        // with g16_wake_restore restate it before the firmware runs again.
++        let count = self.channels.devctl_producer();
++        let found = self.session.regs.generation().unwrap_or(u32::MAX);
++        let restate = params::wake_restore() && found != count;
++        if restate {
++            self.session.regs.set_generation(count)?;
++        }
++        let note = if restate { ", restated" } else { "" };
++        dev_info!(
++            self.session.dev,
++            "wake: power-assert cell {:#x}, count {:#x}{}\n",
++            found,
++            count,
++            note
++        );
+         self.session.rtkit.warm_restart()?;
+         let control = self.session.regs.asc_control()?;
+         self.session.regs.set_asc_control(control | ASC_RUN)?;
+-- 
+2.43.0
+

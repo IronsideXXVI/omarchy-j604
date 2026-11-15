@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 15:21:31 +0000
+Subject: [PATCH] media: apple: isp: offer macOS's manual noise and
+ detail knobs on T8132
+
+macOS sets this camera's noise and detail knobs by hand around its MBNR
+setup. It sends RNF_STRENGTH_SET (0x0a3d), KNOB_MANUAL_CONTROL_ENABLE
+(0x0a13), SHARPNESS_SET (0x0a09) and LCE_KNOB_SET (0x0a40), each knob at
+0, 0x80, then MBNR with its per-band values and chroma noise reduction
+off. KNOB_MANUAL_CONTROL_DISABLE (0x0a14) follows once auto exposure is
+set up. The driver sends none of the knobs. On their own, the MBNR
+values and chroma setting (macos_mbnr_config, macos_mbnr_chroma) did not
+change the low-light magenta cast.
+
+Add macos_knobs to send the whole set in macOS's places. It is off by
+default until a dark-room test shows its effect.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/isp/isp-cam.c | 61 +++++++++++++++++++++-
+ drivers/media/platform/apple/isp/isp-cmd.h |  5 ++
+ 2 files changed, 64 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 2acf313655..c944026bd4 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -1374,6 +1374,57 @@ static void isp_ch_macos_camera_control(struct apple_isp *isp, u32 ch)
+ 		dev_warn_once(isp->dev, "camera control refused: %d\n", err);
+ }
+ 
++/*
++ * macOS sets this camera's noise and detail knobs by hand around its MBNR
++ * setup: RNF_STRENGTH_SET (0x0a3d), KNOB_MANUAL_CONTROL_ENABLE (0x0a13),
++ * SHARPNESS_SET (0x0a09) and LCE_KNOB_SET (0x0a40), each knob at 0, 0x80;
++ * then MBNR with its own per-band values and chroma noise reduction off;
++ * and KNOB_MANUAL_CONTROL_DISABLE (0x0a14) once auto exposure is set up.
++ * macos_knobs sends that whole set for tests (default: off), including
++ * what macos_mbnr_config and macos_mbnr_chroma send alone.
++ */
++static bool macos_knobs;
++module_param(macos_knobs, bool, 0644);
++MODULE_PARM_DESC(macos_knobs,
++		 "Set the noise and detail knobs and MBNR as macOS does (default: off)");
++
++static bool isp_macos_knobs_on(struct apple_isp *isp)
++{
++	return READ_ONCE(macos_knobs) && isp->hw->macos_session_settings;
++}
++
++static void isp_ch_macos_knobs(struct apple_isp *isp, u32 ch)
++{
++	int err;
++
++	if (!isp_macos_knobs_on(isp))
++		return;
++	err = isp_ch_u32x2_set(isp, CISP_CMD_CH_RNF_STRENGTH_SET, ch, 0, 0x80);
++	if (!err)
++		err = isp_cmd_ch_u32_set(isp,
++					 CISP_CMD_CH_KNOB_MANUAL_CONTROL_ENABLE,
++					 ch, 1);
++	if (!err)
++		err = isp_ch_u32x2_set(isp, CISP_CMD_CH_SHARPNESS_SET, ch, 0,
++				       0x80);
++	if (!err)
++		err = isp_ch_u32x2_set(isp, CISP_CMD_CH_LCE_KNOB_SET, ch, 0, 0x80);
++	if (err)
++		dev_warn_once(isp->dev, "manual knobs refused: %d\n", err);
++}
++
++static void isp_ch_macos_knobs_done(struct apple_isp *isp, u32 ch)
++{
++	int err;
++
++	if (!isp_macos_knobs_on(isp))
++		return;
++	err = isp_cmd_ch_u32_set(isp, CISP_CMD_CH_KNOB_MANUAL_CONTROL_DISABLE,
++				 ch, 0);
++	if (err)
++		dev_warn_once(isp->dev, "manual knobs not released: %d\n", err);
++}
++
+ /*
+  * A floor on the auto exposure gain (1/256 steps, as AE_GAIN_CAP_SET), for
+  * tests: with it a lit scene is taken at the sensor gain of a dark room,
+@@ -1905,14 +1956,18 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
+ 	if (err)
+ 		return err;
+ 
+-	if (READ_ONCE(macos_mbnr_config) && isp->hw->macos_session_settings) {
++	isp_ch_macos_knobs(isp, ch);
++
++	if ((READ_ONCE(macos_mbnr_config) || isp_macos_knobs_on(isp)) &&
++	    isp->hw->macos_session_settings) {
+ 		err = isp_cmd_ch_mbnr_config(isp, ch, 0, isp_macos_mbnr_config);
+ 		if (err)
+ 			dev_warn_once(isp->dev, "MBNR config refused: %d\n", err);
+ 	}
+ 
+ 	err = isp_cmd_ch_mbnr_enable(isp, ch, 0, ISP_MBNR_MODE_ENABLE,
+-				     !READ_ONCE(macos_mbnr_chroma));
++				     !(READ_ONCE(macos_mbnr_chroma) ||
++				       isp_macos_knobs_on(isp)));
+ 	if (err)
+ 		return err;
+ 
+@@ -1962,6 +2017,8 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
+ 	isp_ch_desk_view(isp, ch);
+ 	isp_ch_macos_hr(isp, ch);
+ 
++	isp_ch_macos_knobs_done(isp, ch);
++
+ 	if (READ_ONCE(macos_be_la) && isp->hw->macos_session_settings) {
+ 		err = isp_cmd_ch_be_lasetting_set(isp, ch, isp_macos_be_la);
+ 		if (err)
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.h b/drivers/media/platform/apple/isp/isp-cmd.h
+index 901a8133e5..809f9d0fc0 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.h
++++ b/drivers/media/platform/apple/isp/isp-cmd.h
+@@ -84,11 +84,16 @@
+ #define CISP_CMD_CH_MAX_ZOOM_FACTOR_GET			     0x080f
+ #define CISP_CMD_CH_ZOOM_FACTOR_SET			     0x0810
+ #define CISP_CMD_CH_CURRENT_ZOOM_FACTOR_GET		     0x0811
++#define CISP_CMD_CH_SHARPNESS_SET			     0x0a09
++#define CISP_CMD_CH_KNOB_MANUAL_CONTROL_ENABLE		     0x0a13
++#define CISP_CMD_CH_KNOB_MANUAL_CONTROL_DISABLE		     0x0a14
+ #define CISP_CMD_CH_ALS_ENABLE				     0x0a1c
+ #define CISP_CMD_CH_ALS_DISABLE				     0x0a1d
+ #define CISP_CMD_CH_CNR_START				     0x0a2f
+ #define CISP_CMD_CH_MBNR_ENABLE				     0x0a3a
+ #define CISP_CMD_CH_MBNR_CONFIG				     0x0a3b
++#define CISP_CMD_CH_RNF_STRENGTH_SET			     0x0a3d
++#define CISP_CMD_CH_LCE_KNOB_SET			     0x0a40
+ #define CISP_CMD_CH_CPP_MODE				     0x0a4b
+ #define CISP_CMD_CH_TILE_GDC_ENABLE			     0x0a42
+ #define CISP_CMD_CH_MAX_GDC_STRENGTH_GET		     0x0a46
+-- 
+2.43.0
+

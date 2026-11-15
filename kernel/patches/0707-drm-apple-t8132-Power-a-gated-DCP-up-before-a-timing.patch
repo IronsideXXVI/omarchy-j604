@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 15:05:07 +0000
+Subject: [PATCH] drm: apple: t8132: Power a gated DCP up before a
+ timing change
+
+An audit of every path that can reach the internal DCP outside a frame
+found two more that can run while it is power-gated after a blank.
+
+A commit that lights the display with another timing (a refresh-rate
+change in the same commit as DPMS on, for example) sends the new mode
+from iomfb_m4_atomic_mode(). That runs before the frame that would
+power the DCP up, so the call goes to the stopped CPU and fails the
+session, as the colour paths did. Power the DCP up first, as the frame
+would. A blank followed by a mode change then behaves as before the
+power-down existed.
+
+The flight work of an asynchronous swap drained the mailbox while
+gated, with RX held. Let it only wait out its deadline there.
+
+Paths found already safe:
+ - backlight work, brightness keys, XDR wind-down: they need a shown
+   frame, which a blank clears;
+ - idle cache: it needs the display on;
+ - runtime idle work and resume: they check gated already;
+ - HDR metadata: state only, no call;
+ - debugfs: read-only;
+ - external DCPs: an idle-gated one is powered up by the call path
+   itself, and a sleep-gated one by resume before any request.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/gpu/drm/apple/iomfb_m4.c | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/apple/iomfb_m4.c b/drivers/gpu/drm/apple/iomfb_m4.c
+index 8b6b798337..28480b18ca 100644
+--- a/drivers/gpu/drm/apple/iomfb_m4.c
++++ b/drivers/gpu/drm/apple/iomfb_m4.c
+@@ -2468,7 +2468,14 @@ static void dcp_m4_int_fl_work(struct work_struct *work)
+ 	int ret;
+ 
+ 	mutex_lock(&dcp->lock);
+-	if (r->int_fl.open) {
++	/* Powered down: RX is held and nothing arrives; the deadline still ends it. */
++	if (r->int_fl.open && READ_ONCE(dcp->gated)) {
++		if (time_after_eq(jiffies, r->int_fl.deadline))
++			dcp_m4_int_flight_lost(r, -ETIMEDOUT);
++		else
++			queue_delayed_work(r->wq, &r->int_fl_work,
++					   max_t(long, (long)(r->int_fl.deadline - jiffies), 1));
++	} else if (r->int_fl.open) {
+ 		ret = READ_ONCE(dcp->error) ?: dcp_m4_runtime_drain(r, 32);
+ 		if (r->int_fl.open && (ret < 0 || time_after_eq(jiffies, r->int_fl.deadline)))
+ 			dcp_m4_int_flight_lost(r, ret < 0 ? ret : -ETIMEDOUT);
+@@ -4676,6 +4683,17 @@ int iomfb_m4_atomic_mode(struct apple_dcp *owner, const struct drm_display_mode
+ 	if (want->id == READ_ONCE(r->live_id))
+ 		return 0;
+ 	mutex_lock(&dcp->lock);
++	/*
++	 * A commit that lights the display with another timing reaches here before
++	 * the frame that powers a gated DCP up: power it up first, as that frame would.
++	 */
++	if (dcp->gated) {
++		ret = iomfb_m4_power_ungate(dcp);
++		if (ret) {
++			mutex_unlock(&dcp->lock);
++			return ret;
++		}
++	}
+ 	ret = dcp_m4_int_set_mode(dcp, want, &status);
+ 	if (!ret && !status) {
+ 		WRITE_ONCE(r->live_refresh_16_16, want->refresh_16_16);
+-- 
+2.43.0
+
