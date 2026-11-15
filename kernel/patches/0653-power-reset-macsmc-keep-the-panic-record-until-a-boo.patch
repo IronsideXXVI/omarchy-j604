@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 07:33:51 +0000
+Subject: [PATCH] power: reset: macsmc: keep the panic record until a
+ boot has run 30 s
+
+macsmc-reboot prints the previous boot's panic record at probe, about
+4 s into a boot, and clears it at once. In a reset loop a boot can die
+within seconds, before journald has kept that line on disk. Its record
+is then gone: cleared, or overwritten by that boot's own panic. On the
+J604 a loop of four watchdog resets left records for only two of them.
+
+Clear the record 30 s after it was printed instead. If this boot dies
+first, the next boot prints it again. The clear is skipped when this
+boot has written a record of its own, which is then the one the next
+boot reads. The line says when the record will be cleared, since after
+an early death it can be an earlier boot's record.
+
+boot-crumb gains apple_boot_crumb_panic_written() for that check.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/power/reset/macsmc-reboot.c  | 43 ++++++++++++++++++++++++----
+ drivers/soc/apple/boot-crumb.c       | 11 +++++++
+ include/linux/soc/apple/boot-crumb.h |  6 ++++
+ 3 files changed, 55 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/power/reset/macsmc-reboot.c b/drivers/power/reset/macsmc-reboot.c
+index a1ff9fe585..522a052c59 100644
+--- a/drivers/power/reset/macsmc-reboot.c
++++ b/drivers/power/reset/macsmc-reboot.c
+@@ -15,6 +15,7 @@
+ #include <linux/soc/apple/boot-crumb.h>
+ #include <linux/slab.h>
+ #include <linux/unaligned.h>
++#include <linux/workqueue.h>
+ #if IS_ENABLED(CONFIG_ARM64)
+ #include <asm/memory.h>
+ #endif
+@@ -74,6 +75,8 @@ struct macsmc_reboot {
+ 	struct nvmem_cell *pm_setting;
+ 	struct mutex pm_setting_lock;
+ 	struct nvmem_cell *boot_crumb;
++	struct nvmem_cell *panic_cells[2];
++	struct delayed_work panic_clear;
+ 
+ 	union {
+ 		struct macsmc_reboot_nvmem nvm;
+@@ -428,12 +431,37 @@ static void macsmc_reboot_crumb_stop(void *data)
+ 
+ /*
+  * Optional panic record (boot-crumb.c): what the previous boot died of, if a
+- * die or panic wrote it. Printed once, then cleared.
++ * die or panic wrote it. Printed, then cleared once this boot has run
++ * MACSMC_PANIC_KEEP_S: a boot that dies before its journal holds the line
++ * (a reset loop stops within seconds) leaves the record to the next boot,
++ * unless it writes its own. So it can be an earlier boot's.
+  */
++#define MACSMC_PANIC_KEEP_S	30
++
++static void macsmc_reboot_panic_clear(struct work_struct *work)
++{
++	struct macsmc_reboot *reboot = container_of(to_delayed_work(work), struct macsmc_reboot,
++						    panic_clear);
++	u8 zero[APPLE_CRUMB_PANIC_LEN] = {};
++
++	/* This boot's own record replaced it: that one is the next boot's to read. */
++	if (apple_boot_crumb_panic_written())
++		return;
++	nvmem_cell_write(reboot->panic_cells[0], zero, 4);
++	nvmem_cell_write(reboot->panic_cells[1], zero, sizeof(zero) - 4);
++}
++
++static void macsmc_reboot_panic_cancel(void *data)
++{
++	struct macsmc_reboot *reboot = data;
++
++	cancel_delayed_work_sync(&reboot->panic_clear);
++}
++
+ static void macsmc_reboot_panic_record(struct macsmc_reboot *reboot)
+ {
+ 	static const char *const names[] = { "boot_panic_a", "boot_panic_b" };
+-	u8 rec[APPLE_CRUMB_PANIC_LEN], zero[8] = {};
++	u8 rec[APPLE_CRUMB_PANIC_LEN];
+ 	struct nvmem_cell *cells[2];
+ 	char line[128];
+ 	size_t got = 0, len;
+@@ -456,9 +484,14 @@ static void macsmc_reboot_panic_record(struct macsmc_reboot *reboot)
+ 	}
+ 	if (got < sizeof(rec) || apple_boot_crumb_panic_decode(rec, got, line, sizeof(line)) <= 0)
+ 		return;
+-	dev_warn(reboot->dev, "previous boot: panic: %s\n", line);
+-	for (i = 0; i < ARRAY_SIZE(names); i++)
+-		nvmem_cell_write(cells[i], zero, i ? sizeof(rec) - 4 : 4);
++	dev_warn(reboot->dev, "previous boot: panic: %s (cleared after %u s)\n", line,
++		 MACSMC_PANIC_KEEP_S);
++	reboot->panic_cells[0] = cells[0];
++	reboot->panic_cells[1] = cells[1];
++	INIT_DELAYED_WORK(&reboot->panic_clear, macsmc_reboot_panic_clear);
++	if (devm_add_action_or_reset(reboot->dev, macsmc_reboot_panic_cancel, reboot))
++		return;
++	schedule_delayed_work(&reboot->panic_clear, MACSMC_PANIC_KEEP_S * HZ);
+ }
+ 
+ /*
+diff --git a/drivers/soc/apple/boot-crumb.c b/drivers/soc/apple/boot-crumb.c
+index dcf4210c18..079cd90e16 100644
+--- a/drivers/soc/apple/boot-crumb.c
++++ b/drivers/soc/apple/boot-crumb.c
+@@ -441,6 +441,17 @@ void apple_boot_crumb_set_panic_writer(apple_boot_crumb_panic_writer_t writer, v
+ }
+ EXPORT_SYMBOL_GPL(apple_boot_crumb_set_panic_writer);
+ 
++/**
++ * apple_boot_crumb_panic_written() - whether this boot has written its panic record
++ *
++ * Return: true once a die or panic of this boot has gone to the writer.
++ */
++bool apple_boot_crumb_panic_written(void)
++{
++	return atomic_read(&apple_crumb_panicked);
++}
++EXPORT_SYMBOL_GPL(apple_boot_crumb_panic_written);
++
+ /**
+  * apple_boot_crumb_panic_decode() - describe a panic record read from the PMU
+  * @rec: the record
+diff --git a/include/linux/soc/apple/boot-crumb.h b/include/linux/soc/apple/boot-crumb.h
+index efbf09e80f..514a9a4bfd 100644
+--- a/include/linux/soc/apple/boot-crumb.h
++++ b/include/linux/soc/apple/boot-crumb.h
+@@ -56,6 +56,7 @@ void apple_boot_crumb_set_writer(apple_boot_crumb_writer_t writer, void *ctx);
+ int apple_boot_crumb_decode(const u8 *rec, size_t len, char *buf, size_t size);
+ void apple_boot_crumb_set_panic_writer(apple_boot_crumb_panic_writer_t writer, void *ctx);
+ int apple_boot_crumb_panic_decode(const u8 *rec, size_t len, char *buf, size_t size);
++bool apple_boot_crumb_panic_written(void);
+ #else
+ static inline void apple_boot_crumb_enter(unsigned int id) { }
+ static inline void apple_boot_crumb_leave(unsigned int id) { }
+@@ -72,6 +73,11 @@ static inline int apple_boot_crumb_panic_decode(const u8 *rec, size_t len, char
+ {
+ 	return -ENODEV;
+ }
++
++static inline bool apple_boot_crumb_panic_written(void)
++{
++	return false;
++}
+ #endif
+ 
+ #endif
+-- 
+2.43.0
+

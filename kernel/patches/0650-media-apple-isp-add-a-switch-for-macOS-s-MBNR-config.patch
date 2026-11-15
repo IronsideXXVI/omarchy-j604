@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 06:30:40 +0000
+Subject: [PATCH] media: apple: isp: add a switch for macOS's MBNR
+ configuration
+
+Right before enabling MBNR on the T8132 camera, macOS configures it with
+0x80808080, 0x80808080, 0x01018080 and 0x00010101; the driver never sends
+the command and leaves the firmware's values. Noise reduction works
+hardest in dim light, where this camera's picture turns magenta.
+
+Add the command and macos_mbnr_config, off by default, so the values can
+be compared in low light before either becomes the default. It is read
+at stream start; a refusal is reported once and the stream goes on.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/isp/isp-cam.c | 21 +++++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-cmd.c | 13 +++++++++++++
+ drivers/media/platform/apple/isp/isp-cmd.h | 11 +++++++++++
+ 3 files changed, 45 insertions(+)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 69402f23de..f456d1ebc1 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -718,6 +718,21 @@ module_param(macos_be_la, bool, 0644);
+ MODULE_PARM_DESC(macos_be_la,
+ 		 "Write the back-end LA setting macOS writes on this camera (default: off)");
+ 
++/*
++ * macOS configures MBNR on this camera right before enabling it, with the
++ * per-band values below; the driver leaves the firmware's. The noise
++ * reduction works hardest in dim light, where the picture turns magenta,
++ * so the values are offered behind macos_mbnr_config, off by default.
++ */
++static bool macos_mbnr_config;
++module_param(macos_mbnr_config, bool, 0644);
++MODULE_PARM_DESC(macos_mbnr_config,
++		 "Configure MBNR with the values macOS uses on this camera (default: off)");
++
++static const u32 isp_macos_mbnr_config[4] = {
++	0x80808080, 0x80808080, 0x01018080, 0x00010101,
++};
++
+ static const u32 isp_macos_be_la[8] = {
+ 	0x20000, 0x960028, 0, 0, 0, 0x8086, 0, 0,
+ };
+@@ -1496,6 +1511,12 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
+ 	if (err)
+ 		return err;
+ 
++	if (READ_ONCE(macos_mbnr_config) && isp->hw->macos_session_settings) {
++		err = isp_cmd_ch_mbnr_config(isp, ch, 0, isp_macos_mbnr_config);
++		if (err)
++			dev_warn_once(isp->dev, "MBNR config refused: %d\n", err);
++	}
++
+ 	err = isp_cmd_ch_mbnr_enable(isp, ch, 0, ISP_MBNR_MODE_ENABLE,
+ 				     !READ_ONCE(macos_mbnr_chroma));
+ 	if (err)
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.c b/drivers/media/platform/apple/isp/isp-cmd.c
+index 14c7776d7a..5a557136c2 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.c
++++ b/drivers/media/platform/apple/isp/isp-cmd.c
+@@ -508,6 +508,19 @@ int isp_cmd_ch_mbnr_enable(struct apple_isp *isp, u32 chan, u32 use_case,
+ 	return CISP_SEND_IN(isp, args);
+ }
+ 
++int isp_cmd_ch_mbnr_config(struct apple_isp *isp, u32 chan, u32 use_case,
++			   const u32 config[4])
++{
++	struct cmd_ch_mbnr_config args = {
++		.opcode = CISP_OPCODE(CISP_CMD_CH_MBNR_CONFIG),
++		.chan = chan,
++		.use_case = use_case,
++	};
++
++	memcpy(args.config, config, sizeof(args.config));
++	return CISP_SEND_IN(isp, args);
++}
++
+ int isp_cmd_ch_sif_pixel_format_set(struct apple_isp *isp, u32 chan,
+ 				    u8 format, u8 type, u16 compress)
+ {
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.h b/drivers/media/platform/apple/isp/isp-cmd.h
+index d37256882e..539924968c 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.h
++++ b/drivers/media/platform/apple/isp/isp-cmd.h
+@@ -76,6 +76,7 @@
+ #define CISP_CMD_CH_ALS_DISABLE				     0x0a1d
+ #define CISP_CMD_CH_CNR_START				     0x0a2f
+ #define CISP_CMD_CH_MBNR_ENABLE				     0x0a3a
++#define CISP_CMD_CH_MBNR_CONFIG				     0x0a3b
+ #define CISP_CMD_CH_CPP_MODE				     0x0a4b
+ #define CISP_CMD_CH_LSC_STRENGTH_SET			     0x0a4c
+ #define CISP_CMD_CH_HDRC_ENABLE				     0x0a48
+@@ -531,6 +532,14 @@ struct cmd_ch_mbnr_enable {
+ } __packed;
+ static_assert(sizeof(struct cmd_ch_mbnr_enable) == 0x18);
+ 
++struct cmd_ch_mbnr_config {
++	u64 opcode;
++	u32 chan;
++	u32 use_case;
++	u32 config[4];
++} __packed;
++static_assert(sizeof(struct cmd_ch_mbnr_config) == 0x20);
++
+ struct cmd_ch_sif_pixel_format_set {
+ 	u64 opcode;
+ 	u32 chan;
+@@ -586,6 +595,8 @@ int isp_cmd_ch_als_disable(struct apple_isp *isp, u32 chan);
+ int isp_cmd_ch_cnr_start(struct apple_isp *isp, u32 chan);
+ int isp_cmd_ch_mbnr_enable(struct apple_isp *isp, u32 chan, u32 use_case,
+ 			   u32 mode, u32 enable_chroma);
++int isp_cmd_ch_mbnr_config(struct apple_isp *isp, u32 chan, u32 use_case,
++			   const u32 config[4]);
+ int isp_cmd_ch_sif_pixel_format_set(struct apple_isp *isp, u32 chan,
+ 				    u8 format, u8 type, u16 compress);
+ int isp_cmd_ch_lpdp_hs_receiver_tuning_set(struct apple_isp *isp, u32 chan, u32 unk1, u32 unk2);
+-- 
+2.43.0
+

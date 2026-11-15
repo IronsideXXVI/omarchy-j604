@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 07:30:12 +0000
+Subject: [PATCH] PCI: apple: hold the SD reader port's DART while the
+ reader is off
+
+With pcie_apple.t8132_sd_port_off (on by default) an empty slot takes
+the J604's SD reader off the bus, stops its port's link and holds the
+endpoint in reset, ten seconds after probe on a boot. Removing the
+endpoint drops the last runtime PM reference on the port's DART, and
+the DART's runtime suspend, which reads every stream's TCR and TTBRs to
+save them, runs later from the PM workqueue. When it lands after the
+port is stopped the read ends in a synchronous external abort and an
+SError, and with kernel.panic=0 the boot stops until the watchdog
+resets the Mac about a minute later.
+
+The panic records of two such resets on the J604 show it. One was an
+SError on CPU 2 after a data abort (EC 0x25, DFSC 0x10, a read) at
+apple_dart_save_state+0x44, and the FAR was in dart-apcie2
+(0x492000000). The other was an SError on CPU 1 with the L2C latching
+0x492001000, dart-apcie2's TCR block. The boot crumb of the first one
+stopped at 11 s, which is when the reader goes down. Both reset loops
+happened on two kernels with this code.
+
+Take a runtime PM reference on the port's DART, found through the
+host's iommu-map, before the endpoint is removed. Drop it after the
+reader is back and rescanned, when its own streams hold the DART
+again, or when the port goes away. The DART then saves nothing while
+its port is down. Its power domain stays on either way, with the
+radio's DART in it.
+
+Fixes: d5e1fa8bab00 ("PCI: apple: power a card reader port down while its slot is empty")
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/pci/controller/pcie-apple.c | 40 +++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/drivers/pci/controller/pcie-apple.c b/drivers/pci/controller/pcie-apple.c
+index fd2c27ca03..1f92eaebc1 100644
+--- a/drivers/pci/controller/pcie-apple.c
++++ b/drivers/pci/controller/pcie-apple.c
+@@ -635,6 +635,7 @@ struct apple_pcie_port {
+ 	struct list_head	sd_entry;
+ 	bool			sd_off;		/* powered down for an empty slot */
+ 	struct pci_dev		*sd_rp_held;	/* its root port, kept active while it is down */
++	struct device		*sd_dart;	/* its DART, kept active while it is down */
+ };
+ 
+ static bool apple_radio_writer_closed(struct apple_pcie *pcie);
+@@ -2999,6 +3000,37 @@ static int apple_pcie_port_reset_endpoint(struct apple_pcie *pcie,
+ #define APPLE_PCIE_SD_DEBOUNCE_MS	200
+ #define APPLE_PCIE_SD_BOOT_DELAY_MS	10000
+ 
++/*
++ * Once the port is stopped and its endpoint held in reset, a read of the port's DART registers
++ * can end in a synchronous external abort and an SError: on the J604 the boot stopped there,
++ * with dart-apcie2's TCR read from apple_dart_save_state(). Removing the endpoint drops the
++ * DART's last runtime PM reference, and its runtime suspend, which saves those registers, runs
++ * later from the PM workqueue, so it can land after the port is stopped. Hold the DART active
++ * from before the endpoint goes until the reader is back: nothing reads it while it is down.
++ */
++static void apple_pcie_sd_hold_dart(struct apple_pcie *pcie, struct apple_pcie_port *port,
++				    struct pci_dev *rp)
++{
++	struct of_phandle_args args = {};
++	struct platform_device *pdev;
++
++	if (port->sd_dart || !rp || !rp->subordinate)
++		return;
++	if (of_map_iommu_id(pcie->dev->of_node, PCI_DEVID(rp->subordinate->number, 0), &args) ||
++	    !args.np)
++		return;
++	pdev = of_find_device_by_node(args.np);
++	of_node_put(args.np);
++	if (!pdev)
++		return;
++	if (pm_runtime_resume_and_get(&pdev->dev) < 0) {
++		put_device(&pdev->dev);
++		dev_warn(pcie->dev, "port %pOF: could not hold its DART\n", port->np);
++		return;
++	}
++	port->sd_dart = &pdev->dev;
++}
++
+ static void apple_pcie_sd_power_down(struct apple_pcie *pcie, struct apple_pcie_port *port)
+ {
+ 	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+@@ -3017,6 +3049,7 @@ static void apple_pcie_sd_power_down(struct apple_pcie *pcie, struct apple_pcie_
+ 	/* The port's reset takes the root port's config too: kept for the power-up. */
+ 	if (port->sd_rp_held)
+ 		pci_save_state(port->sd_rp_held);
++	apple_pcie_sd_hold_dart(pcie, port, rp);
+ 	if (rp && rp->subordinate)
+ 		list_for_each_entry_safe_reverse(dev, tmp, &rp->subordinate->devices, bus_list)
+ 			pci_stop_and_remove_bus_device(dev);
+@@ -3040,7 +3073,14 @@ static void apple_pcie_sd_power_down(struct apple_pcie *pcie, struct apple_pcie_
+ static void apple_pcie_sd_release_rp(struct apple_pcie_port *port)
+ {
+ 	struct pci_dev *rp = port->sd_rp_held;
++	struct device *dart = port->sd_dart;
+ 
++	/* After the rescan: the reader's own streams hold the DART again. */
++	port->sd_dart = NULL;
++	if (dart) {
++		pm_runtime_put(dart);
++		put_device(dart);
++	}
+ 	if (!rp)
+ 		return;
+ 	port->sd_rp_held = NULL;
+-- 
+2.43.0
+

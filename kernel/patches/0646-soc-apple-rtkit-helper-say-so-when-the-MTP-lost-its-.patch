@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 06:24:48 +0000
+Subject: [PATCH] soc: apple: rtkit-helper: say so when the MTP lost
+ its CPU in a deep sleep
+
+On T8132 the MTP (keyboard and trackpad) is the bootloader's: this
+driver adopts its running RTKit session and has no firmware image to
+load. Its sleep path assumes the coprocessor runs through a firmware-
+driven suspend, which is measured on T8140 only. The MTP is one of the
+SoC's wake sources, so it should keep running, but if its CPU does stop
+the resume today sends AP on to a firmware that isn't there and the
+keyboard and trackpad are simply dead, with nothing in the log.
+
+After a firmware-driven resume, check the ASC's run bit first. Stopped,
+say so and send nothing. With apple_rtkit_helper.wake_restart=1, also
+start the firmware again the way a coprocessor whose CPU alone was
+reset comes back (apple_rtkit_power_cycled_return()). That only works
+if the image survived, so it stays off by default.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/rtkit-helper.c | 41 ++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/drivers/soc/apple/rtkit-helper.c b/drivers/soc/apple/rtkit-helper.c
+index 8c518ef434..ae6e5ad30a 100644
+--- a/drivers/soc/apple/rtkit-helper.c
++++ b/drivers/soc/apple/rtkit-helper.c
+@@ -538,10 +538,51 @@ static int __maybe_unused apple_rtkit_helper_suspend(struct device *dev)
+ 	return 0;
+ }
+ 
++/*
++ * This coprocessor is meant to run through a deep sleep: the MTP and the AOP are among the
++ * SoC's wake sources, and their firmware is the bootloader's, so Linux has no image to load
++ * should it be lost. Off, a lost CPU is only reported. On, the firmware is started again
++ * from where its image sits, the way a coprocessor whose CPU alone was reset comes back
++ * (apple_rtkit_power_cycled_return()); that can only work if its memory kept the image.
++ */
++static bool wake_restart;
++module_param(wake_restart, bool, 0644);
++MODULE_PARM_DESC(wake_restart,
++		 "After a deep sleep, restart a coprocessor whose CPU stopped (default off: report it)");
++
++/* After a deep sleep: false if its CPU stopped, which nothing here can undo but a restart. */
++static bool apple_rtkit_helper_wake_alive(struct apple_rtkit_helper *helper)
++{
++	u32 control;
++	int ret;
++
++	if (!pm_resume_via_firmware() || !helper->ap_idle)
++		return true;
++	control = readl(helper->asc_base + APPLE_ASC_CPU_CONTROL);
++	if (control & APPLE_ASC_CPU_CONTROL_RUN)
++		return true;
++
++	/* Nothing to tell a firmware that isn't running. */
++	helper->ap_idle = false;
++	dev_err(helper->dev, "CPU stopped across the deep sleep (control %#x): firmware lost\n",
++		control);
++	if (!READ_ONCE(wake_restart))
++		return false;
++	ret = apple_rtkit_power_cycled_return(helper->rtk,
++					      helper->asc_base + APPLE_ASC_CPU_CONTROL);
++	if (ret)
++		dev_err(helper->dev, "restart after the deep sleep failed: %d\n", ret);
++	else
++		dev_info(helper->dev, "restarted after the deep sleep\n");
++	return false;
++}
++
+ static int __maybe_unused apple_rtkit_helper_resume(struct device *dev)
+ {
+ 	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+ 
++	if (!apple_rtkit_helper_wake_alive(helper))
++		return 0;
+ 	/* After a firmware-driven suspend's idle notice; nothing otherwise. */
+ 	apple_rtkit_helper_ap_on(helper);
+ 	if (!helper->adopted || !of_machine_is_compatible("apple,j613"))
+-- 
+2.43.0
+
