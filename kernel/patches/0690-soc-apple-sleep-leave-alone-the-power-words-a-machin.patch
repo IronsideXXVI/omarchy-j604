@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 12:14:27 +0000
+Subject: [PATCH] soc: apple: sleep: leave alone the power words a
+ machine lacks
+
+The T8132 lists hold every power word of the J713's ADT. The J604, on
+the same SoC, has no power state at 32 of the main offsets and 34 of
+the always-on ones, yet the sleep saves them at the commit, raises
+those in the macOS lists for it, puts them back after the wake and
+names them in the wake report. The J604's macOS writes none of them in
+its S2R records.
+
+Read apple,ps-absent and apple,ps-aon-absent and skip the listed words
+in the commit's save, in the raise and lower of the main words and of
+the always-on words macOS has on, in their undo and in the wait for
+the main words macOS lowers. A word not saved at the commit keeps a
+saved value of 0, which the rewake and the report already pass over.
+
+The always-on words the sleep lowers are not skipped: on the J604 five
+of the absent ones read on while awake, and an always-on block that is
+left on stays on through the sleep. They are lowered as before.
+Without the properties nothing changes.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 83 ++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 74 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 1522861070..a345109e00 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -625,6 +625,11 @@ struct apple_sleep {
+ 	/* As the match found them: one for each word of the SoC's lists */
+ 	u32 *ps_on_saved;
+ 	unsigned long ps_on_keep;	/* ps_macos_on bits to leave alone */
++	/* apple,ps-absent / apple,ps-aon-absent: list words this machine lacks */
++	u32 *ps_absent;
++	int ps_absent_count;
++	u32 *ps_aon_absent;
++	int ps_aon_absent_count;
+ 	u32 *ps_off_saved;
+ 	u32 *ps_aon_saved;
+ 	u32 *ps_aon_on_saved;
+@@ -2686,15 +2691,29 @@ static void apple_sleep_entry_mark(struct apple_sleep *s, unsigned int secs)
+ #define PS_AUTO_STATE		GENMASK(27, 24)
+ #define PS_REWAKE_PASSES	2
+ 
++/* A word of the SoC's lists that this machine's ADT has no power state for. */
++static bool sleep_ps_absent(const struct apple_sleep *s, bool aon, u32 offset)
++{
++	const u32 *w = aon ? s->ps_aon_absent : s->ps_absent;
++	int i, n = aon ? s->ps_aon_absent_count : s->ps_absent_count;
++
++	for (i = 0; i < n; i++)
++		if (w[i] == offset)
++			return true;
++	return false;
++}
++
+ static void sleep_ps_save(struct apple_sleep *s)
+ {
+ 	const struct apple_sleep_words *all = &s->soc->ps_all, *aon = &s->soc->ps_aon_all;
+ 	int i;
+ 
+ 	for (i = 0; i < all->count; i++)
+-		s->ps_commit[i] = readl(s->ps + all->offset[i]);
++		s->ps_commit[i] = sleep_ps_absent(s, false, all->offset[i]) ? 0 :
++				  readl(s->ps + all->offset[i]);
+ 	for (i = 0; i < aon->count; i++)
+-		s->ps_aon_commit[i] = readl(s->ps_aon + aon->offset[i]);
++		s->ps_aon_commit[i] = sleep_ps_absent(s, true, aon->offset[i]) ? 0 :
++				      readl(s->ps_aon + aon->offset[i]);
+ }
+ 
+ static int sleep_ps_find(const u32 *all, int n, u32 offset)
+@@ -3023,6 +3042,8 @@ static void apple_sleep_match(struct apple_sleep *s)
+ 	for (i = 0; i < soc->ps_macos_on.count; i++) {
+ 		u32 offset = soc->ps_macos_on.offset[i];
+ 
++		if (sleep_ps_absent(s, false, offset))
++			continue;
+ 		s->ps_on_saved[i] = readl(s->ps + offset);
+ 		if (sleep_ps_keep(s, i))
+ 			continue;
+@@ -3037,12 +3058,19 @@ static void apple_sleep_match(struct apple_sleep *s)
+ 	for (i = 0; i < soc->ps_macos_off.count; i++) {
+ 		u32 offset = soc->ps_macos_off.offset[i];
+ 
++		if (sleep_ps_absent(s, false, offset))
++			continue;
+ 		s->ps_off_saved[i] = readl(s->ps + offset);
+ 		if (!sleep_ps_on(s, offset))
+ 			continue;
+ 		sleep_ps_lower(s, offset);
+ 		lowered++;
+ 	}
++	/*
++	 * Not skipped for apple,ps-aon-absent: on the J604 five of these read on while awake
++	 * although its ADT names no state for them, and an always-on block left on stays on
++	 * through the sleep. Lowered as before, and put back by the undo.
++	 */
+ 	for (i = 0; i < soc->ps_aon_macos_off.count; i++) {
+ 		void __iomem *reg = s->ps_aon + soc->ps_aon_macos_off.offset[i];
+ 		u32 val = readl(reg);
+@@ -3059,16 +3087,22 @@ static void apple_sleep_match(struct apple_sleep *s)
+ 	}
+ 	for (i = 0; i < soc->ps_aon_macos_no_auto.count; i++) {
+ 		void __iomem *reg = s->ps_aon + soc->ps_aon_macos_no_auto.offset[i];
+-		u32 val = readl(reg);
++		u32 val;
+ 
++		if (sleep_ps_absent(s, true, soc->ps_aon_macos_no_auto.offset[i]))
++			continue;
++		val = readl(reg);
+ 		s->ps_aon_auto_saved[i] = val;
+ 		writel(val & ~(PS_AUTO_ENABLE | PS_FLAGS), reg);
+ 	}
+ 	/* T8132's audio words stand at state 4 under macOS, not at f. */
+ 	for (i = 0; i < soc->ps_aon_macos_on.count; i++) {
+ 		void __iomem *reg = s->ps_aon + soc->ps_aon_macos_on.offset[i];
+-		u32 val = readl(reg), now;
++		u32 val, now;
+ 
++		if (sleep_ps_absent(s, true, soc->ps_aon_macos_on.offset[i]))
++			continue;
++		val = readl(reg);
+ 		s->ps_aon_on_saved[i] = val;
+ 		if (FIELD_GET(PS_ACTUAL, val) == T8132_PS_AON_ON_STATE)
+ 			continue;
+@@ -3084,6 +3118,8 @@ static void apple_sleep_match(struct apple_sleep *s)
+ 	for (i = 0; i < soc->ps_macos_off.count; i++) {
+ 		u32 offset = soc->ps_macos_off.offset[i];
+ 
++		if (sleep_ps_absent(s, false, offset))
++			continue;
+ 		if (sleep_ps_wait_off(s, offset))
+ 			dev_dbg(s->dev, "still on, macOS has it off: %x = %x\n", offset,
+ 				readl(s->ps + offset));
+@@ -3103,11 +3139,13 @@ static void apple_sleep_match_undo(struct apple_sleep *s)
+ 	s->matched = false;
+ 
+ 	for (i = soc->ps_aon_macos_on.count - 1; i >= 0; i--)
+-		writel(s->ps_aon_on_saved[i] & ~PS_FLAGS,
+-		       s->ps_aon + soc->ps_aon_macos_on.offset[i]);
++		if (!sleep_ps_absent(s, true, soc->ps_aon_macos_on.offset[i]))
++			writel(s->ps_aon_on_saved[i] & ~PS_FLAGS,
++			       s->ps_aon + soc->ps_aon_macos_on.offset[i]);
+ 	for (i = soc->ps_aon_macos_no_auto.count - 1; i >= 0; i--)
+-		writel(s->ps_aon_auto_saved[i] & ~PS_FLAGS,
+-		       s->ps_aon + soc->ps_aon_macos_no_auto.offset[i]);
++		if (!sleep_ps_absent(s, true, soc->ps_aon_macos_no_auto.offset[i]))
++			writel(s->ps_aon_auto_saved[i] & ~PS_FLAGS,
++			       s->ps_aon + soc->ps_aon_macos_no_auto.offset[i]);
+ 	for (i = soc->ps_aon_macos_off.count - 1; i >= 0; i--)
+ 		if (FIELD_GET(PS_ACTUAL, s->ps_aon_saved[i]))
+ 			writel(s->ps_aon_saved[i] & ~PS_FLAGS,
+@@ -3118,7 +3156,8 @@ static void apple_sleep_match_undo(struct apple_sleep *s)
+ 	for (i = soc->ps_macos_on.count - 1; i >= 0; i--) {
+ 		u32 val = s->ps_on_saved[i];
+ 
+-		if (sleep_ps_keep(s, i))
++		if (sleep_ps_keep(s, i) ||
++		    sleep_ps_absent(s, false, soc->ps_macos_on.offset[i]))
+ 			continue;
+ 		if (!FIELD_GET(PS_ACTUAL, val))
+ 			sleep_ps_lower(s, soc->ps_macos_on.offset[i]);
+@@ -4832,6 +4871,28 @@ static void apple_sleep_map_debug_port(struct apple_sleep *s)
+ 	s->hpm_np = np;
+ }
+ 
++/*
++ * apple,ps-absent and apple,ps-aon-absent: words of the SoC's lists (taken from one machine's ADT)
++ * that this machine's ADT has no power state for. They are not read at the commit, not raised or
++ * lowered for it, not put back after it and not reported.
++ */
++static int apple_sleep_read_ps_absent(struct apple_sleep *s, const char *prop, u32 **words,
++				      int *count)
++{
++	int n = of_property_count_u32_elems(s->dev->of_node, prop);
++
++	if (n <= 0)
++		return 0;
++	*words = devm_kcalloc(s->dev, n, sizeof(u32), GFP_KERNEL);
++	if (!*words)
++		return -ENOMEM;
++	if (of_property_read_u32_array(s->dev->of_node, prop, *words, n))
++		return 0;
++	*count = n;
++	dev_info(s->dev, "%s: %d words this machine has no block for\n", prop, n);
++	return 0;
++}
++
+ /* The books kept for each word of the SoC's lists */
+ static int apple_sleep_alloc_books(struct apple_sleep *s)
+ {
+@@ -4845,6 +4906,10 @@ static int apple_sleep_alloc_books(struct apple_sleep *s)
+ 
+ 	s->ps_on_saved = devm_kcalloc(dev, soc->ps_macos_on.count, sizeof(u32), GFP_KERNEL);
+ 	apple_sleep_read_ps_keep(s, soc);
++	if (apple_sleep_read_ps_absent(s, "apple,ps-absent", &s->ps_absent, &s->ps_absent_count) ||
++	    apple_sleep_read_ps_absent(s, "apple,ps-aon-absent", &s->ps_aon_absent,
++				       &s->ps_aon_absent_count))
++		return -ENOMEM;
+ 	s->ps_off_saved = devm_kcalloc(dev, soc->ps_macos_off.count, sizeof(u32), GFP_KERNEL);
+ 	s->ps_aon_on_saved = devm_kcalloc(dev, soc->ps_aon_macos_on.count, sizeof(u32), GFP_KERNEL);
+ 	s->ps_aon_saved = devm_kcalloc(dev, soc->ps_aon_macos_off.count, sizeof(u32),
+-- 
+2.43.0
+

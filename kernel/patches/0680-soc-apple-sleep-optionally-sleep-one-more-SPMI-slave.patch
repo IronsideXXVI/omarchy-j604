@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 10:50:57 +0000
+Subject: [PATCH] soc: apple: sleep: optionally sleep one more SPMI
+ slave on the debug port's bus
+
+On the J604, macOS's sleep entry sends the SPMI SLEEP command to two
+slaves on the bus of the debug port's controller just before the commit,
+and its wake sends them WAKEUP: SID 0xa, the port controller this driver
+already puts to sleep, and SID 8, which no driver here owns. What SID 8
+powers is not known; a deep sleep on Linux draws 173 mW, and leaving a
+device in its active state is one way to spend that.
+
+spmi_sleep_extra=<SID> sends SLEEP to that SID right after the debug
+link's own, past the last point a sleep can be refused, and WAKEUP when
+the wake is reported, with one line giving both replies. 0, the default,
+sends nothing, so nothing changes until an asleep-power A/B sets it.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/sleep.c | 41 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index 8bb0580931..1522861070 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -608,6 +608,9 @@ struct apple_sleep {
+ 	u64 siq_cfg;
+ 	u32 hpm_sid;
+ 	int usb_down_ret;
++	/* spmi_sleep_extra: the SID sent SLEEP at the entry (0: none) and the replies */
++	u32 spmi_extra_sid;
++	int spmi_extra_sleep_ret, spmi_extra_wake_ret;
+ 	/* Cut, or found already down, for this sleep. */
+ 	bool usb_down_ran;
+ 	/* The PMGR block "ps" maps, for the power controllers' nodes. */
+@@ -2207,6 +2210,32 @@ static int sleep_hpm_wait_contract(struct apple_sleep *s, int *gone_ms)
+ 	}
+ }
+ 
++/*
++ * An SPMI slave on the debug port's bus that no driver here owns: macOS's entry sends it the
++ * SLEEP command just before the commit and its wake sends WAKEUP (J604 macOS S2R record: SID 8,
++ * beside the port controller this driver already puts to sleep). What it powers is not known,
++ * so this is for an asleep-power A/B. 0, the default, sends nothing.
++ */
++static unsigned int spmi_sleep_extra;
++module_param(spmi_sleep_extra, uint, 0644);
++MODULE_PARM_DESC(spmi_sleep_extra,
++		 "SID (1-15) on the debug port's SPMI bus sent SLEEP before a deep sleep's commit and WAKEUP after it, as macOS (0 = none, default)");
++
++static int sleep_spmi_extra(struct apple_sleep *s, u32 sid, u32 op)
++{
++	u32 keep = s->hpm_sid, enable;
++	int ret;
++
++	enable = readl(s->hpm_spmi + SPMI_NOTIFY_ENABLE);
++	writel(enable & ~SPMI_NOTIFY_REPLY, s->hpm_spmi + SPMI_NOTIFY_ENABLE);
++	s->hpm_sid = sid;
++	ret = sleep_hpm_cmd(s, op, 0, NULL, NULL);
++	s->hpm_sid = keep;
++	writel(1, s->hpm_spmi + SPMI_NOTIFY_ACK);
++	writel(enable, s->hpm_spmi + SPMI_NOTIFY_ENABLE);
++	return ret;
++}
++
+ /* A live debug link holds the debug switch domain on. */
+ static bool sleep_debug_link_up(struct apple_sleep *s)
+ {
+@@ -4046,6 +4075,12 @@ static int apple_sleep_enter(suspend_state_t state)
+ 	apple_sleep_coprocs_stop(s, false);
+ 	/* Done by now unless no SMC driver is bound. */
+ 	apple_sleep_usb_down(s);
++	/* Past every stop: the commit and so apple_sleep_report() follow, which sends WAKEUP. */
++	s->spmi_extra_sid = READ_ONCE(spmi_sleep_extra);
++	if (s->spmi_extra_sid > 15 || s->spmi_extra_sid == s->hpm_sid || !s->hpm_spmi)
++		s->spmi_extra_sid = 0;
++	if (s->spmi_extra_sid)
++		s->spmi_extra_sleep_ret = sleep_spmi_extra(s, s->spmi_extra_sid, SPMI_OP_SLEEP);
+ 	/* Past every stop, a failure can't refuse any more: the commit follows either way. */
+ 	if (s->smc_notice_late && apple_sleep_smc.notice(apple_sleep_smc.data))
+ 		dev_err(s->dev, "the SMC took no late sleep notice\n");
+@@ -4379,6 +4414,12 @@ static void apple_sleep_report(void)
+ 		return;
+ 	s->returned = false;
+ 	s->smc_woke_alone = apple_sleep_smc_woke_alone(s);
++	if (s->spmi_extra_sid) {
++		s->spmi_extra_wake_ret = sleep_spmi_extra(s, s->spmi_extra_sid, SPMI_OP_WAKEUP);
++		dev_info(s->dev, "SPMI SID%u on the debug port's bus: sleep %d, wakeup %d\n",
++			 s->spmi_extra_sid, s->spmi_extra_sleep_ret, s->spmi_extra_wake_ret);
++		s->spmi_extra_sid = 0;
++	}
+ 
+ 	dev_info(s->dev, "back from sleep, boot object resumes %llu -> %llu\n",
+ 		 s->resumes_before, s->resumes_after);
+-- 
+2.43.0
+

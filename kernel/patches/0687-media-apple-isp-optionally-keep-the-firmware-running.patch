@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 12:06:02 +0000
+Subject: [PATCH] media: apple: isp: optionally keep the firmware
+ running after a stream
+
+On T8132 the camera firmware is stopped after every stream and started
+again at the next open. Of a 516 ms open-to-first-frame, 239 ms pass
+before the restarted firmware takes its first command, most of it
+installing the sensor; the driver's own setup commands take 10 ms.
+
+Add fw_keep_ms. When set, a stream that ends leaves non-resident
+firmware running and idle for that long, as resident firmware is left
+between streams, and an open within that time uses it as is. A delayed
+work item stops it afterwards; system sleep, hibernation, shutdown and
+unbind stop it at once. Its power domains stay on while it is kept, so
+the default of 0 keeps today's behaviour of stopping it at once.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit 6eafde9bd26a1a1c5faa0afc4efdfb602407708b)
+---
+ drivers/media/platform/apple/isp/isp-cam.c  | 50 ++++++++++++++++++++-
+ drivers/media/platform/apple/isp/isp-cam.h  |  2 +
+ drivers/media/platform/apple/isp/isp-drv.c  | 12 +++++
+ drivers/media/platform/apple/isp/isp-drv.h  |  4 ++
+ drivers/media/platform/apple/isp/isp-v4l2.c |  2 +-
+ 5 files changed, 67 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index c4c3bc8a53..9117509028 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -1770,6 +1770,36 @@ static int isp_configure_capture(struct apple_isp *isp)
+ 	return isp_ch_configure_capture(isp, isp->current_ch);
+ }
+ 
++/*
++ * Firmware that is stopped after every stream (not resident) spends about
++ * a quarter of a second starting again, before it takes the first command
++ * (T8132: 239 ms of a 516 ms open, most of it installing the sensor).
++ * With fw_keep_ms, a stream that ends leaves it running and idle for that
++ * long, and an open within that time uses it as is. Its power domains
++ * stay on meanwhile. 0 (the default) stops it at once, as before.
++ */
++static unsigned int fw_keep_ms;
++module_param(fw_keep_ms, uint, 0644);
++MODULE_PARM_DESC(fw_keep_ms,
++		 "Keep the camera firmware running this many ms after a stream (default: 0, stop at once)");
++
++/* Stop firmware left running after a stream; takes video_lock. */
++void apple_isp_fw_cool(struct apple_isp *isp)
++{
++	mutex_lock(&isp->video_lock);
++	if (isp->fw_warm) {
++		isp->fw_warm = false;
++		apple_isp_firmware_halt(isp);
++	}
++	mutex_unlock(&isp->video_lock);
++}
++
++void apple_isp_fw_cool_work(struct work_struct *work)
++{
++	apple_isp_fw_cool(container_of(to_delayed_work(work), struct apple_isp,
++				       fw_cool_work));
++}
++
+ int apple_isp_start_camera(struct apple_isp *isp)
+ {
+ 	struct isp_format *fmt = isp_get_current_format(isp);
+@@ -1787,6 +1817,13 @@ int apple_isp_start_camera(struct apple_isp *isp)
+ 			return err;
+ 		}
+ 	}
++	/* Firmware kept running since the last stream is used as is. */
++	isp->fw_reused = isp->fw_warm;
++	if (isp->fw_warm) {
++		cancel_delayed_work(&isp->fw_cool_work);
++		isp->fw_warm = false;
++	}
++
+ 	err = apple_isp_firmware_boot(isp);
+ 	if (err < 0) {
+ 		dev_err(isp->dev, "failed to boot firmware: %d\n", err);
+@@ -1819,10 +1856,19 @@ void apple_isp_stop_camera(struct apple_isp *isp)
+ 	 * still use for it is released. Firmware that does not answer even
+ 	 * late is stopped first.
+ 	 */
+-	if (isp_ipc_resync(isp))
++	if (isp_ipc_resync(isp)) {
+ 		apple_isp_firmware_halt(isp);
+-	else
++	} else if (READ_ONCE(fw_keep_ms) && !isp->hw->resident_fw &&
++		   isp->fw_state == ISP_FW_RUNNING && !isp->ipc_failed) {
++		/* As for resident firmware: collect what the stream freed. */
++		synchronize_irq(isp->irq);
++		isp_free_released_surfaces(isp);
++		isp->fw_warm = true;
++		schedule_delayed_work(&isp->fw_cool_work,
++				      msecs_to_jiffies(READ_ONCE(fw_keep_ms)));
++	} else {
+ 		apple_isp_firmware_shutdown(isp);
++	}
+ }
+ 
+ /*
+diff --git a/drivers/media/platform/apple/isp/isp-cam.h b/drivers/media/platform/apple/isp/isp-cam.h
+index 6f53f7c170..89224da7e0 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.h
++++ b/drivers/media/platform/apple/isp/isp-cam.h
+@@ -23,6 +23,8 @@ int apple_isp_add_wide_presets(struct apple_isp *isp);
+ 
+ int apple_isp_start_camera(struct apple_isp *isp);
+ void apple_isp_stop_camera(struct apple_isp *isp);
++void apple_isp_fw_cool(struct apple_isp *isp);
++void apple_isp_fw_cool_work(struct work_struct *work);
+ 
+ int apple_isp_start_capture(struct apple_isp *isp);
+ void apple_isp_stop_capture(struct apple_isp *isp);
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index d02d371b1a..eaf176a4c3 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -947,6 +947,7 @@ static int apple_isp_probe(struct platform_device *pdev)
+ 
+ 	mutex_init(&isp->video_lock);
+ 	INIT_WORK(&isp->resume_work, apple_isp_resume_work);
++	INIT_DELAYED_WORK(&isp->fw_cool_work, apple_isp_fw_cool_work);
+ 	spin_lock_init(&isp->buf_lock);
+ 	init_waitqueue_head(&isp->wait);
+ 	INIT_LIST_HEAD(&isp->gc);
+@@ -1037,6 +1038,8 @@ static void apple_isp_remove(struct platform_device *pdev)
+ 
+ 	debugfs_remove_recursive(isp->debugfs);
+ 	cancel_work_sync(&isp->resume_work);
++	cancel_delayed_work_sync(&isp->fw_cool_work);
++	apple_isp_fw_cool(isp);
+ 	apple_isp_remove_video(isp);
+ 	/* Stop resident firmware before freeing what it may still use. */
+ 	apple_isp_firmware_halt(isp);
+@@ -1622,6 +1625,9 @@ static __maybe_unused int apple_isp_suspend(struct device *dev)
+ 	 * before, we (essentially) stop streaming and start streaming again.
+ 	 */
+ 	apple_isp_video_suspend(isp);
++	/* Firmware kept running after a stream does not cross a sleep. */
++	cancel_delayed_work_sync(&isp->fw_cool_work);
++	apple_isp_fw_cool(isp);
+ 
+ 	/*
+ 	 * Resident firmware stays up, idle, across suspend-to-idle: its domains
+@@ -1639,6 +1645,9 @@ static __maybe_unused int apple_isp_freeze(struct device *dev)
+ 	struct apple_isp *isp = dev_get_drvdata(dev);
+ 
+ 	apple_isp_video_suspend(isp);
++	/* Firmware kept running after a stream does not cross a sleep. */
++	cancel_delayed_work_sync(&isp->fw_cool_work);
++	apple_isp_fw_cool(isp);
+ 
+ 	/*
+ 	 * Hibernation hands the system from one kernel to another, and
+@@ -1701,6 +1710,9 @@ static void apple_isp_shutdown(struct platform_device *pdev)
+ 		return;
+ 	/* A stream that still runs is stopped cleanly first, as for hibernation */
+ 	apple_isp_video_suspend(isp);
++	/* Firmware kept running after a stream does not cross a sleep. */
++	cancel_delayed_work_sync(&isp->fw_cool_work);
++	apple_isp_fw_cool(isp);
+ 	mutex_lock(&isp->video_lock);
+ 	apple_isp_firmware_halt(isp);
+ 	mutex_unlock(&isp->video_lock);
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 67947b48ce..63d153e693 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -521,6 +521,10 @@ struct apple_isp {
+ 	bool fw_sleep_stopped;
+ 	/* restarts a stream that ran across that sleep, see apple_isp_resume() */
+ 	struct work_struct resume_work;
++	/* fw_keep_ms: firmware left running after a stream, stopped later */
++	bool fw_warm;
++	bool fw_reused;
++	struct delayed_work fw_cool_work;
+ 
+ 	/* digital zoom in percent (digital_zoom), applied by zoom_work */
+ 	struct v4l2_ctrl *zoom;
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index 8ecc3b82b4..bac330917a 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -635,7 +635,7 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
+ 	 * afresh. Metadata buffers still marked as submitted to the previous
+ 	 * pools, or to firmware that stopped, would never reach the new ones.
+ 	 */
+-	if (isp->hw->resident_fw || isp->hw->fw_restore) {
++	if (isp->hw->resident_fw || isp->hw->fw_restore || isp->fw_reused) {
+ 		spin_lock_irqsave(&isp->buf_lock, flags);
+ 		for (int i = 0; i < ARRAY_SIZE(isp->meta_surfs); i++)
+ 			isp->meta_surfs[i]->submitted = false;
+-- 
+2.43.0
+

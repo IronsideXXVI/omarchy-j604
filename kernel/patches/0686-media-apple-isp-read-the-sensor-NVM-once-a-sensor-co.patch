@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 12:01:19 +0000
+Subject: [PATCH] media: apple: isp: read the sensor NVM once a sensor
+ config is selected
+
+With macos_cal_reads set on T8132, the firmware answers the lens shading
+polynomial reads but not the sensor NVM read that follows: it times out,
+every later request times out with it, and the stream fails to start.
+The driver makes that read before it selects the sensor config. macOS
+selects the sensor configs first and reads the NVM right after.
+
+Read the sensor NVM, the per-module lens shading info and grid and the
+focus limits right after the sensor config is selected. The lens shading
+polynomials are still read before the setfile load and the rest after it,
+as before. The default (no reads) is unchanged.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit 29f7b8a6900c2b2cf173d60dd54f7bc64afc1249)
+---
+ drivers/media/platform/apple/isp/isp-cam.c | 48 +++++++++++++---------
+ 1 file changed, 29 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 765b929e8e..c4c3bc8a53 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -1223,7 +1223,8 @@ static void isp_setfile_radial_gain(u8 *data, size_t len)
+ /*
+  * Around loading the setfile macOS reads this camera module's own
+  * calibration: the lens shading polynomials of every sensor config, the
+- * sensor NVM and the per-module lens shading before the load; the AWB
++ * sensor NVM and the per-module lens shading around it, once a sensor
++ * config is selected (the NVM read hangs the firmware before); the AWB
+  * calibration matrix, the AWB gains ahead of the CCM and the colour
+  * calibration after it, and the lens limits, distortion, extrinsics and
+  * rotation correction. The driver reads none of it. If the firmware
+@@ -1269,7 +1270,14 @@ static void isp_ch_macos_face_detect(struct apple_isp *isp, u32 ch)
+ 		dev_warn_once(isp->dev, "face detection setup refused: %d\n", err);
+ }
+ 
+-static void isp_ch_macos_cal_reads(struct apple_isp *isp, u32 ch, bool loaded)
++enum isp_cal_phase {
++	ISP_CAL_BEFORE_LOAD,
++	ISP_CAL_AFTER_LOAD,
++	ISP_CAL_AFTER_SELECT,
++};
++
++static void isp_ch_macos_cal_reads(struct apple_isp *isp, u32 ch,
++				   enum isp_cal_phase phase)
+ {
+ 	static const struct {
+ 		u16 opcode;
+@@ -1277,35 +1285,35 @@ static void isp_ch_macos_cal_reads(struct apple_isp *isp, u32 ch, bool loaded)
+ 		u16 word_off;
+ 		u16 count;
+ 		u32 word;
+-		bool after_load;
++		u8 phase;
+ 		bool show;
+ 		const char *name;
+ 		bool all_channels;
+ 	} reads[] = {
+ 		{ CISP_CMD_CH_LSC_POLYNOMIAL_COEFF_GET,
+-		  0x48, 0xc, 13, 0, false, false, "LSC polynomial" },
++		  0x48, 0xc, 13, 0, ISP_CAL_BEFORE_LOAD, false, "LSC polynomial" },
+ 		{ CISP_CMD_CH_SENSOR_NVM_GET,
+-		  0x400, 0x10, 1, 0x1c11, false, false, "sensor NVM" },
++		  0x400, 0x10, 1, 0x1c11, ISP_CAL_AFTER_SELECT, false, "sensor NVM" },
+ 		{ CISP_CMD_CH_SENSOR_PERMODULE_LSC_INFO_GET,
+-		  0x14, 0, 1, 0, false, true, "module LSC info" },
++		  0x14, 0, 1, 0, ISP_CAL_AFTER_SELECT, true, "module LSC info" },
+ 		{ CISP_CMD_CH_SENSOR_PERMODULE_LSC_GRID_GET,
+-		  0x400, 0, 1, 0, false, false, "module LSC grid" },
++		  0x400, 0, 1, 0, ISP_CAL_AFTER_SELECT, false, "module LSC grid" },
+ 		{ CISP_CMD_CH_FOCUS_LIMITS_GET,
+-		  0x10, 0, 1, 0, false, true, "focus limits" },
++		  0x10, 0, 1, 0, ISP_CAL_AFTER_SELECT, true, "focus limits" },
+ 		{ CISP_CMD_CH_MS_SWITCHOVER_ZOOM_FACTOR_GET,
+-		  0x10, 0, 2, 0, true, true, "switchover zoom" },
++		  0x10, 0, 2, 0, ISP_CAL_AFTER_LOAD, true, "switchover zoom" },
+ 		{ CISP_CMD_EXTRINSIC_DATA_GET,
+-		  0x70, 0, 3, 0, true, false, "extrinsics", true },
++		  0x70, 0, 3, 0, ISP_CAL_AFTER_LOAD, false, "extrinsics", true },
+ 		{ CISP_CMD_APPLE_CH_AWB_CALIBRATION_MATRIX_GET,
+-		  0x5c, 0, 1, 0, true, true, "AWB calibration matrix" },
++		  0x5c, 0, 1, 0, ISP_CAL_AFTER_LOAD, true, "AWB calibration matrix" },
+ 		{ CISP_CMD_APPLE_CH_AWB_PRE_CCM_GAIN_GET,
+-		  0x18, 0, 1, 0, true, true, "AWB pre-CCM gains" },
++		  0x18, 0, 1, 0, ISP_CAL_AFTER_LOAD, true, "AWB pre-CCM gains" },
+ 		{ CISP_CMD_CH_DISTORTION_DATA_GET,
+-		  0x400, 0, 1, 0, true, false, "distortion" },
++		  0x400, 0, 1, 0, ISP_CAL_AFTER_LOAD, false, "distortion" },
+ 		{ CISP_CMD_CH_COLOR_CAL_ABS_GET,
+-		  0x18, 0, 1, 0, true, true, "colour calibration" },
++		  0x18, 0, 1, 0, ISP_CAL_AFTER_LOAD, true, "colour calibration" },
+ 		{ CISP_CMD_CH_IMAGE_ROTATION_CORRECTION_GET,
+-		  0x24, 0, 1, 0, true, true, "rotation correction" },
++		  0x24, 0, 1, 0, ISP_CAL_AFTER_LOAD, true, "rotation correction" },
+ 	};
+ 	static bool logged;
+ 	size_t area = ISP_CMD_AREA_SIZE(isp_num_capmeta(isp));
+@@ -1319,7 +1327,7 @@ static void isp_ch_macos_cal_reads(struct apple_isp *isp, u32 ch, bool loaded)
+ 	if (!buf)
+ 		return;
+ 	for (i = 0; i < ARRAY_SIZE(reads); i++) {
+-		if (reads[i].after_load != loaded || reads[i].len > area)
++		if (reads[i].phase != phase || reads[i].len > area)
+ 			continue;
+ 		for (n = 0; n < reads[i].count; n++) {
+ 			u32 word = reads[i].count > 1 ? n : reads[i].word;
+@@ -1344,7 +1352,7 @@ static void isp_ch_macos_cal_reads(struct apple_isp *isp, u32 ch, bool loaded)
+ 					 jhash(buf + 8, reads[i].len - 8, 0));
+ 		}
+ 	}
+-	if (loaded)
++	if (phase == ISP_CAL_AFTER_SELECT)
+ 		logged = true;
+ 	kfree(buf);
+ }
+@@ -1591,11 +1599,11 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
+ 	 * a failed firmware upload must not silently select firmware defaults.
+ 	 * This model-wide tuning is separate from per-module factory data.
+ 	 */
+-	isp_ch_macos_cal_reads(isp, ch, false);
++	isp_ch_macos_cal_reads(isp, ch, ISP_CAL_BEFORE_LOAD);
+ 	err = isp_ch_load_setfile(isp, ch);
+ 	if (err && err != -ENOENT)
+ 		return err;
+-	isp_ch_macos_cal_reads(isp, ch, true);
++	isp_ch_macos_cal_reads(isp, ch, ISP_CAL_AFTER_LOAD);
+ 
+ 	if (isp->hw->lpdp) {
+ 		err = isp_cmd_ch_lpdp_hs_receiver_tuning_set(isp, ch, 1, 15);
+@@ -1615,6 +1623,8 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
+ 	err = isp_cmd_ch_camera_config_select(isp, ch, isp->stream_preset.index);
+ 	if (err)
+ 		return err;
++	/* The sensor NVM can be read only once a sensor config is selected. */
++	isp_ch_macos_cal_reads(isp, ch, ISP_CAL_AFTER_SELECT);
+ 
+ 	err = isp_cmd_ch_buffer_recycle_mode_set(
+ 		isp, ch, CISP_BUFFER_RECYCLE_MODE_EMPTY_ONLY);
+-- 
+2.43.0
+

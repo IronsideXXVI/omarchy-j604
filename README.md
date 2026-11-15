@@ -58,13 +58,13 @@ The J604 builds carried here, as installed on the machine on 2026-11-12 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora`, `linux-aurora-headers` (`linux-aurora-next` 1.929, the same patches, stays installed beside it; the installer image still carries `linux-aurora` 1.928 and gets 1.930 with its next build) | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`da8e1acf3656`, Aurora's tip), 679 patches | `1.930` |
+| `linux-aurora-next`, `linux-aurora-next-headers` (`linux-aurora` 1.930 stays installed beside it; the installer image still carries `linux-aurora` 1.928) | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`da8e1acf3656`, Aurora's tip), 693 patches | `1.932` |
 | `aura` | 1.0.0b13, aurora-silicon/aura (`f0f180afe5`), aurora-silicon/alarm-aurora recipe, 22 patches | `1.615` (replaced `m1n1-aurora` on 2026-11-12) |
 | `uboot-aurora` | 2026.07.aurora11, aurora-silicon/u-boot (`250385f8c8`, the version Aurora packages), 1 patch | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261113, aurora-silicon/mesa (`8f013bf96bd`) | `1.8144` |
 | `alsa-ucm-conf-aurora` | 10.aurora3, aurora-silicon/alsa-ucm-conf-asahi (`b9b2d0c82c`) | `1.605` |
 | `aurora-audio` | 4.1.aurora3, aurora-silicon/asahi-audio (`06aec67a8a`) | `3.612` |
-| `speakersafetyd` | 2.0.1, AsahiLinux/speakersafetyd | `1.605` |
+| `speakersafetyd` | 2.0.1, aurora-silicon/alarm-aurora recipe (`4c7a46fede`) | `1.607` |
 | `asahi-fwextract` | 0.9.2, asahi-alarm/asahi-alarm-installer | `1.609` |
 | `asahi-scripts` | 20261023, asahi-alarm/asahi-scripts, aurora-silicon/alarm-aurora recipe | `9.605` (the Stage 2 trial's guard timer counts from unlock) |
 | `plymouth` | 26.134.222, Plymouth (Arch Linux recipe) | `3.604` |
@@ -74,7 +74,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-12 (checked
 | `avd-fw` | 0.1, AsahiLinux/avd-fw (`v0.1`), omacom recipe (`c1fcff4dec`), 15 patches | `1.604` (aurora-silicon/avd-fw's queue transport and the T8132 SRAM aperture) |
 | `gpu-screen-recorder` | 6.1.7, gpu-screen-recorder (Arch Linux recipe, built for aarch64) | `1.604` (captures monitors on the Apple display controller) |
 | `omarchy-mac-boot` | 20261104, omacom/omarchy-mac-pkgs (`7e50e937b5`) | `1.616` |
-| `omarchy-mac` | 0.2.3, omacom/omarchy-mac-pkgs (`ea0097a523`) | `2.19` (adds the panel line with adaptive sync, Chromium hardware video decode on the J604 (every codec with the J604 Chromium), and a Touch ID start-up race fix) |
+| `omarchy-mac` | 0.2.3, omacom/omarchy-mac-pkgs (`ea0097a523`) | `2.19` (2.33 is installed; its recipe is not synced here yet. 2.19 adds the panel line with adaptive sync, Chromium hardware video decode on the J604 (every codec with the J604 Chromium), and a Touch ID start-up race fix) |
 | `omarchy-dev` | 4.0.0.r7641.gf97d3e7 (edge), omacom/omarchy `quattro` (`f97d3e7dc8`), omacom recipe (`5c7fdeaecf`) | `1.4` (keyboard-backlight patches + the bar declares its strip as its blur region; look unchanged) |
 | `omarchy-settings-dev` | 4.0.0.r7641.gf97d3e7 (edge), omacom/omarchy `quattro` (`f97d3e7dc8`) | `1.2` (keyboard-backlight patches + built-in panel defaults, adaptive sync from the panel line) |
 | `hyprland` | 0.57.2, hyprwm/Hyprland (`v0.57.2`), omacom recipe (`573dd5c7fb`) | `2.607` (Omarchy's three patches + one: blur only inside a surface's declared blur region, so the full-screen bar no longer makes Hyprland blur everything that changes under it; look unchanged) |

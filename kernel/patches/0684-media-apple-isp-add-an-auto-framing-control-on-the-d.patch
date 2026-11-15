@@ -1,0 +1,494 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 10:42:58 +0000
+Subject: [PATCH] media: apple: isp: add an auto framing control on the
+ digital zoom
+
+macOS frames the picture on the people in it (Center Stage) in the host,
+from the firmware's face boxes, by moving the firmware's zoom inside the
+wide view. Do the same in the driver, so that any application gets it
+from one control and no daemon has to run.
+
+With digital_zoom set there is now a driver-private boolean control,
+Auto Framing, off by default as Center Stage is on macOS. On, every
+returned metadata buffer steps a small integer framing loop
+(isp-framing.c) with the frame's face box: the zoom and the view centre
+move toward a view that holds the face at a set size, stay still inside
+a dead zone, start moving only past a wider threshold and stop inside a
+narrower one, change by a capped amount per frame, and go back out to
+the unzoomed view after a while without a face. The zoom is applied from
+the existing work item; the view centre is computed but not applied yet,
+as the pan command is not known.
+
+Where the T8132 firmware puts the face boxes in the metadata is not known
+either, so no box is reported yet and the loop holds the unzoomed view.
+KUnit cases cover the dead zone, the slew limit, convergence without
+overshoot, no oscillation on a jittering box, and the return after a
+lost face.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit 62f7ec9fe6ff1ccc6fb5bc79b7af4a40213b2546)
+---
+ drivers/media/platform/apple/isp/Makefile     |   2 +-
+ drivers/media/platform/apple/isp/isp-drv.h    |  10 ++
+ .../platform/apple/isp/isp-framing-test.c     | 135 ++++++++++++++++++
+ .../media/platform/apple/isp/isp-framing.c    |  94 ++++++++++++
+ .../media/platform/apple/isp/isp-framing.h    |  37 +++++
+ drivers/media/platform/apple/isp/isp-v4l2.c   |  66 ++++++++-
+ 6 files changed, 341 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/media/platform/apple/isp/isp-framing-test.c
+ create mode 100644 drivers/media/platform/apple/isp/isp-framing.c
+ create mode 100644 drivers/media/platform/apple/isp/isp-framing.h
+
+diff --git a/drivers/media/platform/apple/isp/Makefile b/drivers/media/platform/apple/isp/Makefile
+index 847df6050c..b83c71c4b3 100644
+--- a/drivers/media/platform/apple/isp/Makefile
++++ b/drivers/media/platform/apple/isp/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-apple-isp-y := isp-ane.o isp-cam.o isp-cmd.o isp-drv.o isp-fw.o isp-iommu.o isp-ipc.o isp-v4l2.o
++apple-isp-y := isp-ane.o isp-cam.o isp-cmd.o isp-drv.o isp-framing.o isp-fw.o isp-iommu.o isp-ipc.o isp-v4l2.o
+ obj-$(CONFIG_VIDEO_APPLE_ISP) += apple-isp.o
+ obj-$(CONFIG_VIDEO_APPLE_ISP_IPC_LAYOUT_KUNIT_TEST) += isp-ipc-layout-test.o
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 88f22f4a07..5222ff5664 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -18,6 +18,8 @@
+ #include <media/videobuf2-core.h>
+ #include <media/videobuf2-v4l2.h>
+ 
++#include "isp-framing.h"
++
+ #define APPLE_ISP_DEVICE_NAME "apple-isp"
+ #define APPLE_ISP_CARD_NAME "FaceTime HD Camera"
+ 
+@@ -410,6 +412,9 @@ struct isp_format {
+ 	size_t total_size;
+ };
+ 
++/* Driver-private until a control base is reserved for this driver. */
++#define V4L2_CID_APPLE_ISP_AUTO_FRAMING (V4L2_CID_USER_BASE + 0x1240)
++
+ struct apple_isp {
+ 	struct device *dev;
+ 	const struct apple_isp_hw *hw;
+@@ -524,6 +529,11 @@ struct apple_isp {
+ 	u32 zoom_unit;
+ 	u32 zoom_max;
+ 	bool zoom_failed;
++	/* auto framing (with digital_zoom): drives the zoom from face boxes */
++	struct v4l2_ctrl *auto_framing;
++	bool auto_framing_on;
++	bool framing_reset;
++	struct isp_framing_state framing;
+ 
+ 	struct isp_surf *ipc_surf;
+ 	struct isp_surf *extra_surf;
+diff --git a/drivers/media/platform/apple/isp/isp-framing-test.c b/drivers/media/platform/apple/isp/isp-framing-test.c
+new file mode 100644
+index 0000000000..765e69dbf9
+--- /dev/null
++++ b/drivers/media/platform/apple/isp/isp-framing-test.c
+@@ -0,0 +1,135 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Auto framing math: dead zone, slew limit, no overshoot or oscillation. */
++#include <kunit/test.h>
++
++static const struct isp_framing_box isp_test_face_centre = {
++	.x0 = 400, .y0 = 400, .x1 = 600, .y1 = 600,	/* fill 350 -> 175 % */
++};
++
++static void isp_test_framing_still_in_dead_zone(struct kunit *test)
++{
++	const struct isp_framing_params *p = &isp_framing_defaults;
++	struct isp_framing_state st;
++	int i;
++
++	isp_framing_reset(&st);
++	/* A face that wants 100 % +- less than the start threshold. */
++	for (i = 0; i < 200; i++) {
++		int j = (i & 1) ? 1 : -1;
++		struct isp_framing_box b = {
++			.x0 = 500 - 175 + j * 20, .x1 = 500 + 175 + j * 20,
++			.y0 = 500 - 175, .y1 = 500 + 175,
++		};
++
++		isp_framing_step(p, &st, &b);
++		KUNIT_EXPECT_EQ(test, st.zoom, 100);
++		KUNIT_EXPECT_EQ(test, st.cx, 500);
++		KUNIT_EXPECT_EQ(test, st.cy, 500);
++	}
++}
++
++static void isp_test_framing_slew_and_converge(struct kunit *test)
++{
++	const struct isp_framing_params *p = &isp_framing_defaults;
++	struct isp_framing_box b = { .x0 = 600, .y0 = 300, .x1 = 750, .y1 = 450 };
++	struct isp_framing_state st;
++	int i, pz, pcx, pcy, settled = -1;
++
++	isp_framing_reset(&st);
++	for (i = 0; i < 400; i++) {
++		pz = st.zoom;
++		pcx = st.cx;
++		pcy = st.cy;
++		isp_framing_step(p, &st, &b);
++		KUNIT_EXPECT_LE(test, abs(st.zoom - pz), p->slew_zoom);
++		KUNIT_EXPECT_LE(test, abs(st.cx - pcx), p->slew_pan);
++		KUNIT_EXPECT_LE(test, abs(st.cy - pcy), p->slew_pan);
++		/* monotonic toward the target: zoom in, centre right and up */
++		KUNIT_EXPECT_GE(test, st.zoom, pz);
++		KUNIT_EXPECT_GE(test, st.cx, pcx);
++		KUNIT_EXPECT_LE(test, st.cy, pcy);
++		KUNIT_EXPECT_GE(test, st.zoom, 100);
++		KUNIT_EXPECT_LE(test, st.zoom, p->zoom_max);
++		KUNIT_EXPECT_GE(test, st.cx, 500 * 100 / st.zoom);
++		KUNIT_EXPECT_LE(test, st.cx, 1000 - 500 * 100 / st.zoom);
++		if (settled < 0 && !st.moving)
++			settled = i;
++	}
++	KUNIT_EXPECT_GE(test, settled, 0);
++	/* target 200 % (100 * 350 / 150, capped), centre (675, 375) */
++	KUNIT_EXPECT_LE(test, abs(st.zoom - 200), p->dz_stop_zoom);
++	KUNIT_EXPECT_LE(test, abs(st.cx - 675), p->dz_stop_pan);
++	KUNIT_EXPECT_LE(test, abs(st.cy - 375), p->dz_stop_pan);
++}
++
++static void isp_test_framing_no_oscillation(struct kunit *test)
++{
++	const struct isp_framing_params *p = &isp_framing_defaults;
++	struct isp_framing_state st;
++	int i, z, cx, cy;
++
++	isp_framing_reset(&st);
++	for (i = 0; i < 300; i++)
++		isp_framing_step(p, &st, &isp_test_face_centre);
++	KUNIT_EXPECT_FALSE(test, st.moving);
++	z = st.zoom;
++	cx = st.cx;
++	cy = st.cy;
++	/* jitter of the detected box inside the start threshold */
++	for (i = 0; i < 300; i++) {
++		int j = (i % 3) - 1;
++		struct isp_framing_box b = {
++			.x0 = 400 + j * 30, .x1 = 600 + j * 30,
++			.y0 = 400 - j * 30, .y1 = 600 - j * 30,
++		};
++
++		isp_framing_step(p, &st, &b);
++		KUNIT_EXPECT_EQ(test, st.zoom, z);
++		KUNIT_EXPECT_EQ(test, st.cx, cx);
++		KUNIT_EXPECT_EQ(test, st.cy, cy);
++	}
++}
++
++static void isp_test_framing_lost_face(struct kunit *test)
++{
++	const struct isp_framing_params *p = &isp_framing_defaults;
++	struct isp_framing_box empty = { 0 };
++	struct isp_framing_state st;
++	int i, z;
++
++	isp_framing_reset(&st);
++	for (i = 0; i < 300; i++)
++		isp_framing_step(p, &st, &isp_test_face_centre);
++	z = st.zoom;
++	KUNIT_EXPECT_GT(test, z, 100);
++	/* short loss: the view holds */
++	for (i = 0; i < p->lost_steps; i++)
++		isp_framing_step(p, &st, i & 1 ? NULL : &empty);
++	KUNIT_EXPECT_EQ(test, st.zoom, z);
++	/* long loss: back out to the unzoomed view, slew-limited */
++	for (i = 0; i < 300; i++) {
++		int pz = st.zoom;
++
++		isp_framing_step(p, &st, NULL);
++		KUNIT_EXPECT_LE(test, pz - st.zoom, p->slew_zoom);
++		KUNIT_EXPECT_LE(test, st.zoom, pz);
++	}
++	KUNIT_EXPECT_EQ(test, st.zoom, 100);
++	KUNIT_EXPECT_EQ(test, st.cx, 500);
++	KUNIT_EXPECT_EQ(test, st.cy, 500);
++}
++
++static struct kunit_case isp_framing_test_cases[] = {
++	KUNIT_CASE(isp_test_framing_still_in_dead_zone),
++	KUNIT_CASE(isp_test_framing_slew_and_converge),
++	KUNIT_CASE(isp_test_framing_no_oscillation),
++	KUNIT_CASE(isp_test_framing_lost_face),
++	{}
++};
++
++static struct kunit_suite isp_framing_test_suite = {
++	.name = "apple-isp-framing",
++	.test_cases = isp_framing_test_cases,
++};
++
++kunit_test_suite(isp_framing_test_suite);
+diff --git a/drivers/media/platform/apple/isp/isp-framing.c b/drivers/media/platform/apple/isp/isp-framing.c
+new file mode 100644
+index 0000000000..ac82204fdc
+--- /dev/null
++++ b/drivers/media/platform/apple/isp/isp-framing.c
+@@ -0,0 +1,94 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Auto framing for the Apple ISP camera: one step per frame with a face box
++ * (or none) moves the digital zoom and the view centre toward a view that
++ * holds the face at a set size. The view stays still inside a dead zone,
++ * starts moving only past a wider threshold and stops inside a narrower one,
++ * and every step is capped, so it never overshoots or swings back and forth.
++ * Without a face for a while it goes back out to the unzoomed view.
++ */
++#include <linux/kernel.h>
++#include <linux/minmax.h>
++
++#include "isp-framing.h"
++
++const struct isp_framing_params isp_framing_defaults = {
++	.fill = 350,
++	.zoom_max = 200,
++	.dz_start_zoom = 12, .dz_stop_zoom = 3,
++	.dz_start_pan = 60, .dz_stop_pan = 15,
++	.slew_zoom = 2,
++	.slew_pan = 8,
++	.lost_steps = 60,
++};
++
++void isp_framing_reset(struct isp_framing_state *st)
++{
++	st->zoom = 100;
++	st->cx = 500;
++	st->cy = 500;
++	st->lost = 0;
++	st->moving = false;
++}
++
++static int isp_framing_toward(int cur, int target, int slew)
++{
++	return cur + clamp(target - cur, -slew, slew);
++}
++
++/* Keep a view of this zoom inside the unzoomed one. */
++static int isp_framing_clamp_centre(int c, int zoom)
++{
++	int half = 500 * 100 / zoom;
++
++	return clamp(c, half, 1000 - half);
++}
++
++void isp_framing_step(const struct isp_framing_params *p,
++		      struct isp_framing_state *st,
++		      const struct isp_framing_box *box)
++{
++	int tz = 100, tcx = 500, tcy = 500;
++	int size, ez, ec;
++
++	size = box ? max(box->x1 - box->x0, box->y1 - box->y0) : 0;
++	if (size > 0) {
++		st->lost = 0;
++		tz = clamp(100 * p->fill / size, 100, p->zoom_max);
++		tcx = (box->x0 + box->x1) / 2;
++		tcy = (box->y0 + box->y1) / 2;
++	} else if (st->lost < p->lost_steps) {
++		/* Hold the view through short losses of the face. */
++		st->lost++;
++		return;
++	}
++	tcx = isp_framing_clamp_centre(tcx, tz);
++	tcy = isp_framing_clamp_centre(tcy, tz);
++
++	ez = abs(tz - st->zoom);
++	ec = max(abs(tcx - st->cx), abs(tcy - st->cy));
++	if (!st->moving) {
++		if (ez <= p->dz_start_zoom && ec <= p->dz_start_pan)
++			return;
++		st->moving = true;
++	}
++
++	st->zoom = isp_framing_toward(st->zoom, tz, p->slew_zoom);
++	st->cx = isp_framing_clamp_centre(isp_framing_toward(st->cx, tcx,
++							     p->slew_pan),
++					  st->zoom);
++	st->cy = isp_framing_clamp_centre(isp_framing_toward(st->cy, tcy,
++							     p->slew_pan),
++					  st->zoom);
++
++	/* Going back out ends exactly on the unzoomed view. */
++	ez = abs(tz - st->zoom);
++	ec = max(abs(tcx - st->cx), abs(tcy - st->cy));
++	if (size > 0 ? ez <= p->dz_stop_zoom && ec <= p->dz_stop_pan :
++		       !ez && !ec)
++		st->moving = false;
++}
++
++#if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
++#include "isp-framing-test.c"
++#endif
+diff --git a/drivers/media/platform/apple/isp/isp-framing.h b/drivers/media/platform/apple/isp/isp-framing.h
+new file mode 100644
+index 0000000000..1c511d565e
+--- /dev/null
++++ b/drivers/media/platform/apple/isp/isp-framing.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Auto framing math for the Apple ISP: where to point the digital zoom. */
++#ifndef __ISP_FRAMING_H__
++#define __ISP_FRAMING_H__
++
++#include <linux/types.h>
++
++/* A face (or the union of faces) in permille of the unzoomed view. */
++struct isp_framing_box {
++	int x0, y0, x1, y1;
++};
++
++struct isp_framing_params {
++	int fill;	/* face box size wanted, permille of the view */
++	int zoom_max;	/* percent, 100 = the unzoomed view */
++	int dz_start_zoom, dz_stop_zoom;	/* dead zone, percent */
++	int dz_start_pan, dz_stop_pan;	/* dead zone, permille */
++	int slew_zoom;	/* largest zoom change per step, percent */
++	int slew_pan;	/* largest centre move per step, permille */
++	int lost_steps;	/* steps without a face before going back out */
++};
++
++struct isp_framing_state {
++	int zoom;	/* percent */
++	int cx, cy;	/* view centre, permille of the unzoomed view */
++	int lost;
++	bool moving;
++};
++
++extern const struct isp_framing_params isp_framing_defaults;
++
++void isp_framing_reset(struct isp_framing_state *st);
++void isp_framing_step(const struct isp_framing_params *p,
++		      struct isp_framing_state *st,
++		      const struct isp_framing_box *box);
++
++#endif
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index f3b589bda4..18140de198 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -168,6 +168,39 @@ static void isp_meta_snapshot(struct apple_isp *isp, const struct isp_surf *meta
+ 	       min_t(size_t, meta->size, isp->meta_snap.size));
+ }
+ 
++/*
++ * Where the T8132 firmware reports its face boxes in the per-frame
++ * metadata is not known yet (meta_last with and without a face in frame
++ * shows it). Until then no box is reported, and auto framing holds the
++ * unzoomed view.
++ */
++static bool isp_meta_face_box(struct apple_isp *isp,
++			      const struct isp_surf *meta,
++			      struct isp_framing_box *box)
++{
++	return false;
++}
++
++/* One framing step per returned metadata buffer; under buf_lock. */
++static void isp_framing_feed(struct apple_isp *isp,
++			     const struct isp_surf *meta)
++{
++	struct isp_framing_box box;
++	int zoom;
++
++	if (!isp->auto_framing || !READ_ONCE(isp->auto_framing_on))
++		return;
++	if (READ_ONCE(isp->framing_reset)) {
++		isp_framing_reset(&isp->framing);
++		WRITE_ONCE(isp->framing_reset, false);
++	}
++	zoom = isp->framing.zoom;
++	isp_framing_step(&isp_framing_defaults, &isp->framing,
++			 isp_meta_face_box(isp, meta, &box) ? &box : NULL);
++	if (isp->framing.zoom != zoom)
++		schedule_work(&isp->zoom_work);
++}
++
+ void ipc_bt_complete(struct apple_isp *isp)
+ {
+ 	struct isp_buffer *buf, *tmp;
+@@ -230,6 +263,7 @@ int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
+ 					WARN_ON(!meta->submitted);
+ 					isp_meta_read_exposure(isp, meta);
+ 					isp_meta_snapshot(isp, meta);
++					isp_framing_feed(isp, meta);
+ 					if (isp_is_p010(isp))
+ 						__set_bit(j, &isp->meta_returned);
+ 					else
+@@ -1240,7 +1274,10 @@ static void isp_apply_zoom(struct apple_isp *isp)
+ 	    !test_bit(ISP_STATE_STREAMING, &isp->state))
+ 		return;
+ 
+-	pct = v4l2_ctrl_g_ctrl(isp->zoom);
++	if (isp->auto_framing && v4l2_ctrl_g_ctrl(isp->auto_framing))
++		pct = READ_ONCE(isp->framing.zoom);
++	else
++		pct = v4l2_ctrl_g_ctrl(isp->zoom);
+ 	if (!isp->zoom_unit) {
+ 		if (pct == 100)
+ 			return;
+@@ -1281,6 +1318,10 @@ static int isp_s_zoom_ctrl(struct v4l2_ctrl *ctrl)
+ 	struct apple_isp *isp =
+ 		container_of(ctrl->handler, struct apple_isp, ctrl_handler);
+ 
++	if (ctrl->id == V4L2_CID_APPLE_ISP_AUTO_FRAMING) {
++		WRITE_ONCE(isp->framing_reset, true);
++		WRITE_ONCE(isp->auto_framing_on, ctrl->val);
++	}
+ 	schedule_work(&isp->zoom_work);
+ 	return 0;
+ }
+@@ -1289,6 +1330,21 @@ static const struct v4l2_ctrl_ops isp_zoom_ctrl_ops = {
+ 	.s_ctrl = isp_s_zoom_ctrl,
+ };
+ 
++/*
++ * Off by default, as Center Stage on macOS. On, the zoom follows the
++ * firmware's face boxes (isp-framing.c) instead of the zoom control.
++ */
++static const struct v4l2_ctrl_config isp_auto_framing_ctrl = {
++	.ops = &isp_zoom_ctrl_ops,
++	.id = V4L2_CID_APPLE_ISP_AUTO_FRAMING,
++	.name = "Auto Framing",
++	.type = V4L2_CTRL_TYPE_BOOLEAN,
++	.min = 0,
++	.max = 1,
++	.step = 1,
++	.def = 0,
++};
++
+ /*
+  * Auto exposure picks the gain and exposure of each frame. Report the last
+  * frame's values read-only, so that userspace can follow the scene light, for
+@@ -1373,7 +1429,7 @@ int apple_isp_setup_video(struct apple_isp *isp)
+ 	 * priority is the default, so a dark room gets up to 1/15 s as there.
+ 	 */
+ 	INIT_WORK(&isp->zoom_work, isp_zoom_work);
+-	v4l2_ctrl_handler_init(&isp->ctrl_handler, 5);
++	v4l2_ctrl_handler_init(&isp->ctrl_handler, 6);
+ 	isp->exposure_priority =
+ 		v4l2_ctrl_new_std(&isp->ctrl_handler, NULL,
+ 				  V4L2_CID_EXPOSURE_AUTO_PRIORITY, 0, 1, 1,
+@@ -1396,6 +1452,12 @@ int apple_isp_setup_video(struct apple_isp *isp)
+ 		isp->zoom = v4l2_ctrl_new_std(&isp->ctrl_handler, &isp_zoom_ctrl_ops,
+ 					      V4L2_CID_ZOOM_ABSOLUTE, 100, 400, 1,
+ 					      100);
++	if (digital_zoom) {
++		isp_framing_reset(&isp->framing);
++		isp->auto_framing = v4l2_ctrl_new_custom(&isp->ctrl_handler,
++							 &isp_auto_framing_ctrl,
++							 NULL);
++	}
+ 	if (isp->ctrl_handler.error) {
+ 		err = isp->ctrl_handler.error;
+ 		dev_err(isp->dev, "failed to create controls: %d\n", err);
+-- 
+2.43.0
+

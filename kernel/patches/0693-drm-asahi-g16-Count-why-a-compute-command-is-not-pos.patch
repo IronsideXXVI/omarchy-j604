@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 13:25:23 +0000
+Subject: [PATCH] drm/asahi: g16: Count why a compute command is not
+ posted ahead
+
+On the M4 a small compute command posted behind a running one starts
+10-20 us after its predecessor ends, about what macOS shows, yet about
+two thirds of compute.light's commands still reach the firmware only
+after the previous one ended, and the per-command time stays near four
+times macOS's. The stats line "horizon:" already prints stop reasons
+and an ahead depth, but nothing filled them; only the aggregate hold
+count moved.
+
+Fill them: when the engine holds a compute command behind running
+flights, count which condition refused it (horizon off, the depth or
+compute-unit cap, a flight that is not a healthy compute-only one, or
+the queue not registered / frozen), and for each compute command
+posted behind running flights, count it and the flights it found.
+Statistics only; publication is unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 39 +++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index e90c9b6e2b..521fa34459 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -936,6 +936,31 @@ fn ahead_ok(&self, job: &Job) -> bool {
+                 .all(|f| f.computes == 0 && f.renders != 0 && !f.doomed && !f.recovery_suspect)
+     }
+ 
++    /// Why [`Self::ahead_ok`] refuses a compute command behind running flights, for the stats
++    /// line `horizon: stop a/b/c/d`: 0 horizon off (g16_horizon 0 or the UMA overlap rule not
++    /// latched), 1 the depth / compute-unit cap, 2 a flight that is not a healthy compute-only
++    /// one, 3 the compute queue not registered yet or the engine frozen.
++    fn compute_ahead_refusal(&self) -> usize {
++        let n = self.engine.flights.len();
++        let cap = sizes::FLIGHTS
++            .min(params::compute_units())
++            .min(1 + params::horizon_depth() as usize);
++        if !params::horizon() {
++            0
++        } else if n >= cap {
++            1
++        } else if !self
++            .engine
++            .flights
++            .iter()
++            .all(|f| f.renders == 0 && f.computes != 0 && !f.doomed && !f.recovery_suspect)
++        {
++            2
++        } else {
++            3
++        }
++    }
++
+     /// Publishes one command after the preceding command's complete wire receipt. Ordinary
+     /// preparation failures fail the affected job, including after its earlier commands
+     /// retired. A publication marked uncertain denotes potentially visible firmware state
+@@ -973,6 +998,12 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+                 && (job.vm.status.get() != 0 || !self.ahead_ok(&job))
+             {
+                 self.engine.stats.hold[0] += 1;
++                if job.vm.status.get() == 0
++                    && matches!(command(&job, job.progress.sent()), Some(Command::Compute(_)))
++                {
++                    let reason = self.compute_ahead_refusal();
++                    self.engine.stats.hz_stop[reason] += 1;
++                }
+                 break;
+             }
+             if job.vm.status.get() != 0 {
+@@ -1025,8 +1056,16 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+             }
+             self.engine.turn += 1;
+             job.queue.turn.store(self.engine.turn, Ordering::Relaxed);
++            let behind = self.engine.flights.len() as u64;
++            let compute = matches!(command(&job, job.progress.sent()), Some(Command::Compute(_)));
+             match self.publish_prefix(&job, done) {
+                 Ok(()) => {
++                    // Stats: compute commands posted behind running flights, and the flights
++                    // they found (mean depth = ahead / behind).
++                    if compute && behind != 0 {
++                        self.engine.stats.hz_behind += 1;
++                        self.engine.stats.hz_ahead += behind;
++                    }
+                     self.recovery.publication_wait_deadline = None;
+                     if job.progress.sent() == job.progress.count() {
+                         self.engine.unpend(&job); // fully published
+-- 
+2.43.0
+

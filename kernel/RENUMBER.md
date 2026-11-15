@@ -1095,3 +1095,39 @@ New in 1.926: 0646 (`soc: apple: rtkit-helper: say so when the MTP lost its CPU 
 New in 1.928: 0654 (`iommu/apple-dart: don't fail a gated DCP's power-up on a stream the wake set up`), 0655 (`soc: apple: print the CPU range locks at boot and after each sleep`), 0656 (`soc: apple: cpu-locks: survive registers a core lacks; boot lines off`), 0657 (`pmdomain: apple: pmp-report: hold the T8132 GFX power request as macOS does`), 0658 (`pmdomain: apple: pmp-report: T8132 GPU system-cache quota experiment`), 0659 (`thunderbolt: apple: offer the attached-dock sleep owner on the J604 too`), 0660 (`media: apple: isp: add a switch for macOS's camera calibration reads`), 0661 (`media: apple: isp: add a switch for macOS's face and body detection`), 0662 (`media: apple: isp: let another setfile be loaded at run time`), 0663 (`media: apple: isp: ML noise reduction on the neural engine (draft)`), 0664 (`soc: apple: ane-isp: build the link only where the ANE driver provides it`), 0665 (`media: apple: isp: configure ML noise reduction as macOS does on T8132`), 0666 (`pmdomain: apple: pmc: add a runtime floor under the AP's DCS vote`).
 
 New in 1.929: 0667 (`HID: dockchannel: let keyboard input and trackpad clicks wake the system`), 0668 (`drm/asahi: g16: g16_render_patch, macOS render sequence words at runtime`), 0669 (`drm/asahi: g16: retire from a SCHED_FIFO poller after a firmware event`), 0670 (`media: apple: isp: add a digital zoom control`), 0671 (`media: v4l2: Add the P030 pixel format`), 0672 (`media: apple: avd: Decode 10-bit HEVC into P030 on request`), 0673 (`media: apple: avd: Test switches for the 10-bit HEVC output words`), 0674 (`dt-bindings: media: apple,prores: Name the T8132 initialization table`), 0675 (`media: apple: prores: Add the T8132 (M4) engine`), 0676 (`media: apple: prores: Bind the T8132 engine only on request`), 0677 (`iommu/apple-dart: after a deep sleep, put back the streams no table of ours used`), 0678 (`ASoC: tas2764: Bring an SDZ group back from a deep sleep as from power-on`), 0679 (`arm64: dts: apple: t8132: Name the ProRes windows; enable ProRes on the J604`).
+
+
+# Kernel patch numbers: 1.930 to 1.932
+
+Kernel 1.932 keeps the base (`da8e1acf3656`) and patches 0001-0653 of 1.930. Two 1.930 patches left the series: 0654 (`iommu/apple-dart: don't fail a gated DCP's power-up on a stream the wake set up`) and 0677 (`iommu/apple-dart: after a deep sleep, put back the streams no table of ours used`); 1.932's 0678 (`iommu: apple-dart: keep a gated DCP's power-up after a deep sleep`) replaces both. 1.930's other patches from 0655 on move up to close the gaps, and patches 0678-0693 are new in 1.932. `STATUS.md` and `UPSTREAM.md` keep naming patches by the number they had when they were added; this table maps the 1.930 files from 0654 on to the 1.932 files.
+
+| 1.930 | 1.932 |
+| --- | --- |
+| 0654 | not in 1.932 |
+| 0655 | 0654 |
+| 0656 | 0655 |
+| 0657 | 0656 |
+| 0658 | 0657 |
+| 0659 | 0658 |
+| 0660 | 0659 |
+| 0661 | 0660 |
+| 0662 | 0661 |
+| 0663 | 0662 |
+| 0664 | 0663 |
+| 0665 | 0664 |
+| 0666 | 0665 |
+| 0667 | 0666 |
+| 0668 | 0667 |
+| 0669 | 0668 |
+| 0670 | 0669 |
+| 0671 | 0670 |
+| 0672 | 0671 |
+| 0673 | 0672 |
+| 0674 | 0673 |
+| 0675 | 0674 |
+| 0676 | 0675 |
+| 0677 | not in 1.932 |
+| 0678 | 0676 |
+| 0679 | 0677 |
+
+New in 1.932: 0678 (`iommu: apple-dart: keep a gated DCP's power-up after a deep sleep`), 0679 (`ASoC: tas2764: Detect a power-on reset of an SDZ group amp at resume`), 0680 (`soc: apple: sleep: optionally sleep one more SPMI slave on the debug port's bus`), 0681 (`media: apple: isp: keep a debugfs copy of the last frame's metadata`), 0682 (`media: apple: isp: restart a T8132 stream after sleep from a work item`), 0683 (`media: apple: isp: make the rest of macOS's module reads at open`), 0684 (`media: apple: isp: add an auto framing control on the digital zoom`), 0685 (`media: apple: isp: let a debugfs face box drive auto framing`), 0686 (`media: apple: isp: read the sensor NVM once a sensor config is selected`), 0687 (`media: apple: isp: optionally keep the firmware running after a stream`), 0688 (`drm/asahi: g16: Optionally idle the firmware's RTKit at suspend-to-idle`), 0689 (`dt-bindings: soc: apple: sleep: describe power words a machine lacks`), 0690 (`soc: apple: sleep: leave alone the power words a machine lacks`), 0691 (`arm64: dts: apple: t8132-j604: name the power words the J604 lacks`), 0692 (`media: apple: prores: Bind the T8132 engine by default`), 0693 (`drm/asahi: g16: Count why a compute command is not posted ahead`).

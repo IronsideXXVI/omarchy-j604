@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 11:19:59 +0000
+Subject: [PATCH] media: apple: isp: let a debugfs face box drive auto
+ framing
+
+Auto framing cannot be checked on the device yet: the firmware's face
+boxes are not decoded, and a check should not need a person in front of
+the camera anyway.
+
+Add a root-only debugfs file, framing_box. Writing "x0 y0 x1 y1" in
+permille of the unzoomed view makes the framing loop see that box on
+every frame in place of the firmware's; "off" goes back. Reading it
+shows the box and where the loop stands. Each zoom the driver applies is
+also logged at debug level, so a check can follow the ramp. Nothing
+changes unless the file is written.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit a28df9425f2bfe93ce0ffb81ad5bfd22cea9fbab)
+---
+ drivers/media/platform/apple/isp/isp-drv.c  | 60 +++++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-drv.h  |  3 ++
+ drivers/media/platform/apple/isp/isp-v4l2.c |  5 ++
+ 3 files changed, 68 insertions(+)
+
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index d95898fe0a..d02d371b1a 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -521,6 +521,64 @@ static const struct file_operations isp_stream_config_fops = {
+ 	.llseek = default_llseek,
+ };
+ 
++/*
++ * framing_box: "x0 y0 x1 y1" in permille of the unzoomed view stands in
++ * for the firmware's face box, so that auto framing can be checked on the
++ * device with nobody in front of the camera; "off" goes back to the
++ * firmware's boxes. A debugging aid: a step may read a box half written.
++ */
++static ssize_t isp_framing_box_write(struct file *file,
++				     const char __user *ubuf, size_t len,
++				     loff_t *ppos)
++{
++	struct apple_isp *isp = file->private_data;
++	struct isp_framing_box b;
++	char buf[48];
++
++	if (len >= sizeof(buf))
++		return -EINVAL;
++	if (copy_from_user(buf, ubuf, len))
++		return -EFAULT;
++	buf[len] = 0;
++	if (sysfs_streq(buf, "off")) {
++		WRITE_ONCE(isp->framing_dbg_on, false);
++		return len;
++	}
++	if (sscanf(buf, "%d %d %d %d", &b.x0, &b.y0, &b.x1, &b.y1) != 4 ||
++	    b.x0 < 0 || b.y0 < 0 || b.x1 > 1000 || b.y1 > 1000 ||
++	    b.x1 <= b.x0 || b.y1 <= b.y0)
++		return -EINVAL;
++	isp->framing_dbg_box = b;
++	WRITE_ONCE(isp->framing_dbg_on, true);
++	return len;
++}
++
++static ssize_t isp_framing_box_read(struct file *file, char __user *ubuf,
++				    size_t len, loff_t *ppos)
++{
++	struct apple_isp *isp = file->private_data;
++	struct isp_framing_box *b = &isp->framing_dbg_box;
++	char buf[64];
++	int n;
++
++	if (READ_ONCE(isp->framing_dbg_on))
++		n = scnprintf(buf, sizeof(buf), "%d %d %d %d (zoom %d centre %d,%d)\n",
++			      b->x0, b->y0, b->x1, b->y1, isp->framing.zoom,
++			      isp->framing.cx, isp->framing.cy);
++	else
++		n = scnprintf(buf, sizeof(buf), "off (zoom %d)\n",
++			      isp->framing.zoom);
++	return simple_read_from_buffer(ubuf, len, ppos, buf, n);
++}
++
++static const struct file_operations isp_framing_box_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = isp_framing_box_read,
++	.write = isp_framing_box_write,
++	.llseek = default_llseek,
++};
++
+ static void apple_isp_debugfs_init(struct apple_isp *isp)
+ {
+ 	isp->debugfs = debugfs_create_dir(dev_name(isp->dev), NULL);
+@@ -528,6 +586,8 @@ static void apple_isp_debugfs_init(struct apple_isp *isp)
+ 			    &isp_stream_config_fops);
+ 	debugfs_create_u32("extra_frame_rate", 0600, isp->debugfs,
+ 			   &isp->extra_frame_rate);
++	debugfs_create_file("framing_box", 0600, isp->debugfs, isp,
++			    &isp_framing_box_fops);
+ 
+ 	isp->meta_snap.data = devm_kzalloc(isp->dev, ISP_META_SNAP_SIZE,
+ 					   GFP_KERNEL);
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 5222ff5664..67947b48ce 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -534,6 +534,9 @@ struct apple_isp {
+ 	bool auto_framing_on;
+ 	bool framing_reset;
+ 	struct isp_framing_state framing;
++	/* debugfs framing_box: a box given in place of the firmware's */
++	struct isp_framing_box framing_dbg_box;
++	bool framing_dbg_on;
+ 
+ 	struct isp_surf *ipc_surf;
+ 	struct isp_surf *extra_surf;
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index 18140de198..8ecc3b82b4 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -178,6 +178,10 @@ static bool isp_meta_face_box(struct apple_isp *isp,
+ 			      const struct isp_surf *meta,
+ 			      struct isp_framing_box *box)
+ {
++	if (READ_ONCE(isp->framing_dbg_on)) {
++		*box = isp->framing_dbg_box;
++		return true;
++	}
+ 	return false;
+ }
+ 
+@@ -1298,6 +1302,7 @@ static void isp_apply_zoom(struct apple_isp *isp)
+ 	factor = min_t(u64, div_u64((u64)isp->zoom_unit * pct, 100),
+ 		       isp->zoom_max);
+ 	err = isp_cmd_ch_zoom_factor_set(isp, isp->current_ch, factor);
++	dev_dbg(isp->dev, "zoom %u %% -> factor %#x (%d)\n", pct, factor, err);
+ 	if (err)
+ 		dev_warn_ratelimited(isp->dev, "zoom factor %#x refused: %d\n",
+ 				     factor, err);
+-- 
+2.43.0
+
