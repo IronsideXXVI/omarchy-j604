@@ -1,0 +1,489 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ryan Murray <ryan@aurorasilicon.org>
+Date: Mon, 2 Nov 2026 01:38:21 +1100
+Subject: [PATCH] media: apple: isp: ML noise reduction on the neural
+ engine (draft)
+
+On H16-family ISPs (J616s and J700) macOS runs the camera low-light ML
+noise reduction, ISP algorithm 0x143d, on the platform neural engine.
+The ANE driver loads the per-board network into the ANE and both
+firmwares exchange work over a pair of 16 KiB rings. The ISP driver
+allocates the rings, maps them into its IOMMU, passes them to the ANE
+driver and tells its firmware with CISP_CMD_IPC_ENDPOINT_SET2.
+
+Add the ISP side and the in-kernel interface to the ANE driver
+(include/linux/soc/apple/ane-isp.h):
+
+- find the ANE from the "apple,ane" phandle and name the network after
+  the board (apple/ispane-<board>.afpp);
+- after the firmware starts, allocate the ring pair, ask the ANE driver
+  to load the network and set up its endpoint, then send 0x300c;
+- unset the endpoint (0x300d) before the firmware stops;
+- per stream, enable 0x143d only when the endpoint is live. Enabling it
+  without one stalls the stream, so a missing network, ANE or doorbell
+  leaves the camera exactly as before.
+
+The doorbell each side uses to signal the other is not known yet, so no
+SoC sets ane_doorbell_known and nothing changes at runtime until it is.
+
+Assisted-by: LLM
+Signed-off-by: Ryan Murray <ryan@aurorasilicon.org>
+(cherry picked from commit c5b5d15953f00c83e45f9fa4e9a3b38f51023ebe)
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/media/platform/apple/isp/Makefile  |   2 +-
+ drivers/media/platform/apple/isp/isp-ane.c | 126 +++++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-ane.h |  13 +++
+ drivers/media/platform/apple/isp/isp-cam.c |   6 +
+ drivers/media/platform/apple/isp/isp-cmd.c |  34 ++++++
+ drivers/media/platform/apple/isp/isp-cmd.h |  19 ++++
+ drivers/media/platform/apple/isp/isp-drv.c |   7 ++
+ drivers/media/platform/apple/isp/isp-drv.h |  14 +++
+ drivers/media/platform/apple/isp/isp-fw.c  |   5 +
+ include/linux/soc/apple/ane-isp.h          |  62 ++++++++++
+ 10 files changed, 287 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/media/platform/apple/isp/isp-ane.c
+ create mode 100644 drivers/media/platform/apple/isp/isp-ane.h
+ create mode 100644 include/linux/soc/apple/ane-isp.h
+
+diff --git a/drivers/media/platform/apple/isp/Makefile b/drivers/media/platform/apple/isp/Makefile
+index c07e54a522..847df6050c 100644
+--- a/drivers/media/platform/apple/isp/Makefile
++++ b/drivers/media/platform/apple/isp/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-apple-isp-y := isp-cam.o isp-cmd.o isp-drv.o isp-fw.o isp-iommu.o isp-ipc.o isp-v4l2.o
++apple-isp-y := isp-ane.o isp-cam.o isp-cmd.o isp-drv.o isp-fw.o isp-iommu.o isp-ipc.o isp-v4l2.o
+ obj-$(CONFIG_VIDEO_APPLE_ISP) += apple-isp.o
+ obj-$(CONFIG_VIDEO_APPLE_ISP_IPC_LAYOUT_KUNIT_TEST) += isp-ipc-layout-test.o
+diff --git a/drivers/media/platform/apple/isp/isp-ane.c b/drivers/media/platform/apple/isp/isp-ane.c
+new file mode 100644
+index 0000000000..448dbf1c1b
+--- /dev/null
++++ b/drivers/media/platform/apple/isp/isp-ane.c
+@@ -0,0 +1,126 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * ML video noise reduction on the platform neural engine.
++ *
++ * On H16-family ISPs (J616s, J700) the ISP runs its low-light ML noise
++ * reduction (RawMLVNR, algorithm 0x143d) on the ANE. The ANE driver loads
++ * the network into the ANE; the two firmwares exchange work over a pair of
++ * rings this driver allocates and maps into both IOMMUs, and the ISP
++ * firmware learns about them with CISP_CMD_IPC_ENDPOINT_SET2.
++ *
++ * Enabling 0x143d without a live endpoint stalls the stream, so the
++ * algorithm is only enabled once every step here has succeeded. Without
++ * the network or an ANE, the camera works as before.
++ */
++#include <linux/of.h>
++#include <linux/string.h>
++#include <linux/soc/apple/ane-isp.h>
++
++#include "isp-ane.h"
++#include "isp-cmd.h"
++#include "isp-drv.h"
++#include "isp-iommu.h"
++
++#define ISP_ANE_RING_LEN 0x4000
++#define ISP_ALG_RAW_MLVNR 0x143d
++
++int apple_isp_ane_init(struct apple_isp *isp)
++{
++	const char *board, *model;
++	struct device_node *np;
++
++	np = of_parse_phandle(isp->dev->of_node, "apple,ane", 0);
++	if (!np)
++		return 0;
++	/* the network is per board: apple,j700 -> apple/ispane-j700.afpp */
++	if (!of_property_read_string_index(of_root, "compatible", 0, &model)) {
++		board = strchr(model, ',');
++		snprintf(isp->ane_afpp, sizeof(isp->ane_afpp), "apple/ispane-%s.afpp",
++			 board ? board + 1 : model);
++	}
++	isp->ane = ane_isp_link_get(isp->dev, np);
++	of_node_put(np);
++	if (IS_ERR(isp->ane)) {
++		int err = PTR_ERR(isp->ane);
++
++		isp->ane = NULL;
++		if (err == -EPROBE_DEFER)
++			return err;
++		dev_info(isp->dev, "no neural engine link (%d): ML noise reduction off\n", err);
++	}
++	return 0;
++}
++
++void apple_isp_ane_exit(struct apple_isp *isp)
++{
++	apple_isp_ane_stop(isp);
++	if (isp->ane)
++		ane_isp_link_put(isp->ane);
++	isp->ane = NULL;
++}
++
++/* After the firmware has started, before any stream. */
++int apple_isp_ane_start(struct apple_isp *isp)
++{
++	struct ane_isp_endpoint ep = { .ring_len = ISP_ANE_RING_LEN };
++	struct isp_surf *rings;
++	int err;
++
++	if (!isp->ane || isp->ane_rings)
++		return 0;
++	if (!isp->ane_afpp[0] || !isp->hw->ane_doorbell_known)
++		return 0;
++
++	rings = __isp_alloc_surface(isp, 2 * ISP_ANE_RING_LEN, false);
++	if (!rings)
++		return -ENOMEM;
++	err = isp_surf_vmap(isp, rings);
++	if (err)
++		goto free;
++	memset(rings->virt, 0, 2 * ISP_ANE_RING_LEN);
++
++	ep.rings = &rings->sgt;
++	ep.isp_doorbell = isp->hw->ane_isp_doorbell;
++	ep.isp_doorbell_sel = isp->hw->ane_isp_doorbell_sel;
++	err = ane_isp_endpoint_enable(isp->ane, isp->ane_afpp, &ep);
++	if (err) {
++		dev_info(isp->dev, "neural engine endpoint not enabled (%d): ML noise reduction off\n",
++			 err);
++		goto free;
++	}
++
++	err = isp_cmd_ipc_endpoint_set2(isp, rings->iova, ISP_ANE_RING_LEN,
++					rings->iova + ISP_ANE_RING_LEN, ISP_ANE_RING_LEN,
++					ep.ane_doorbell, ep.ane_doorbell_sel);
++	if (err) {
++		dev_err(isp->dev, "ISP endpoint set failed: %d\n", err);
++		ane_isp_endpoint_disable(isp->ane);
++		goto free;
++	}
++	isp->ane_rings = rings;
++	dev_info(isp->dev, "ML noise reduction available\n");
++	return 0;
++
++free:
++	isp_free_surface(isp, rings);
++	return 0; /* the camera works without it */
++}
++
++/* Before the firmware stops: endpoints down before the rings go away. */
++void apple_isp_ane_stop(struct apple_isp *isp)
++{
++	if (!isp->ane_rings)
++		return;
++	isp_cmd_ipc_endpoint_unset2(isp);
++	ane_isp_endpoint_disable(isp->ane);
++	isp_free_surface(isp, isp->ane_rings);
++	isp->ane_rings = NULL;
++}
++
++/* Per stream, before the AE start configuration. */
++int apple_isp_ane_stream_start(struct apple_isp *isp, u32 ch)
++{
++	if (!isp->ane_rings)
++		return 0;
++	return isp_cmd_ch_algorithm_enable(isp, ch, ISP_ALG_RAW_MLVNR, 1);
++}
+diff --git a/drivers/media/platform/apple/isp/isp-ane.h b/drivers/media/platform/apple/isp/isp-ane.h
+new file mode 100644
+index 0000000000..258b3ea4a2
+--- /dev/null
++++ b/drivers/media/platform/apple/isp/isp-ane.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __ISP_ANE_H__
++#define __ISP_ANE_H__
++
++#include "isp-drv.h"
++
++int apple_isp_ane_init(struct apple_isp *isp);
++void apple_isp_ane_exit(struct apple_isp *isp);
++int apple_isp_ane_start(struct apple_isp *isp);
++void apple_isp_ane_stop(struct apple_isp *isp);
++int apple_isp_ane_stream_start(struct apple_isp *isp, u32 ch);
++
++#endif
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 1a3290de51..51391b5244 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -12,6 +12,7 @@
+ #include <linux/unaligned.h>
+ #include <kunit/static_stub.h>
+ 
++#include "isp-ane.h"
+ #include "isp-cam.h"
+ #include "isp-cmd.h"
+ #include "isp-fw.h"
+@@ -1669,6 +1670,11 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
+ 	if (err)
+ 		return err;
+ 
++	/* ML noise reduction, only with a live neural engine endpoint */
++	err = apple_isp_ane_stream_start(isp, ch);
++	if (err)
++		dev_warn(isp->dev, "ML noise reduction not enabled: %d\n", err);
++
+ 	/* Most H17 firmware faults on this face-detection metering setup. */
+ 	if (!h17 || isp->hw->ae_fd_scene_metering) {
+ 		err = isp_cmd_apple_ch_ae_fd_scene_metering_config_set(isp,
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.c b/drivers/media/platform/apple/isp/isp-cmd.c
+index 8ea2f97023..d055b3fdd9 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.c
++++ b/drivers/media/platform/apple/isp/isp-cmd.c
+@@ -486,6 +486,40 @@ int isp_cmd_ch_als_disable(struct apple_isp *isp, u32 chan)
+ 	return CISP_SEND_IN(isp, args);
+ }
+ 
++int isp_cmd_ipc_endpoint_set2(struct apple_isp *isp, u64 rd, u32 rd_len, u64 wr,
++			      u32 wr_len, u64 doorbell, u32 doorbell_sel)
++{
++	struct cmd_ipc_endpoint_set2 args = {
++		.opcode = CISP_OPCODE(CISP_CMD_IPC_ENDPOINT_SET2),
++		.addr1 = rd,
++		.size1 = rd_len,
++		.addr2 = wr,
++		.size2 = wr_len,
++		.regs = doorbell,
++		.unk2 = doorbell_sel,
++	};
++	return CISP_SEND_IN(isp, args);
++}
++
++int isp_cmd_ipc_endpoint_unset2(struct apple_isp *isp)
++{
++	struct cmd_ipc_endpoint_unset2 args = {
++		.opcode = CISP_OPCODE(CISP_CMD_IPC_ENDPOINT_UNSET2),
++	};
++	return CISP_SEND_IN(isp, args);
++}
++
++int isp_cmd_ch_algorithm_enable(struct apple_isp *isp, u32 chan, u32 alg, u32 enable)
++{
++	struct cmd_ch_algorithm_enable args = {
++		.opcode = CISP_OPCODE(CISP_CMD_CH_PROPERTY_WRITE),
++		.chan = chan,
++		.alg = alg,
++		.enable = enable,
++	};
++	return CISP_SEND_IN(isp, args);
++}
++
+ int isp_cmd_ch_cnr_start(struct apple_isp *isp, u32 chan)
+ {
+ 	struct cmd_ch_cnr_start args = {
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.h b/drivers/media/platform/apple/isp/isp-cmd.h
+index 1495f32f05..e42a2070b0 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.h
++++ b/drivers/media/platform/apple/isp/isp-cmd.h
+@@ -289,6 +289,21 @@ struct cmd_ipc_endpoint_set2 {
+ } __packed;
+ static_assert(sizeof(struct cmd_ipc_endpoint_set2) == 0x30);
+ 
++struct cmd_ipc_endpoint_unset2 {
++	u64 opcode;
++	u32 unk;
++} __packed;
++static_assert(sizeof(struct cmd_ipc_endpoint_unset2) == 0xc);
++
++/* Channel algorithm enable: CISP_CMD_CH_PROPERTY_WRITE with a 0x14-byte body */
++struct cmd_ch_algorithm_enable {
++	u64 opcode;
++	u32 chan;
++	u32 alg;
++	u32 enable;
++} __packed;
++static_assert(sizeof(struct cmd_ch_algorithm_enable) == 0x14);
++
+ struct cmd_flicker_sensor_set {
+ 	u64 opcode;
+ 	u32 mode;
+@@ -612,6 +627,10 @@ int isp_cmd_ch_output_config_set(struct apple_isp *isp, u32 chan, u32 width,
+ 				 u32 height, u32 strides[3], u32 colorspace, u32 format);
+ int isp_cmd_ch_preview_stream_set(struct apple_isp *isp, u32 chan, u32 stream);
+ int isp_cmd_ch_als_disable(struct apple_isp *isp, u32 chan);
++int isp_cmd_ipc_endpoint_set2(struct apple_isp *isp, u64 rd, u32 rd_len, u64 wr,
++			      u32 wr_len, u64 doorbell, u32 doorbell_sel);
++int isp_cmd_ipc_endpoint_unset2(struct apple_isp *isp);
++int isp_cmd_ch_algorithm_enable(struct apple_isp *isp, u32 chan, u32 alg, u32 enable);
+ int isp_cmd_ch_cnr_start(struct apple_isp *isp, u32 chan);
+ int isp_cmd_ch_mbnr_enable(struct apple_isp *isp, u32 chan, u32 use_case,
+ 			   u32 mode, u32 enable_chroma);
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index b93de4aaae..89a051c89c 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -20,6 +20,7 @@
+ #include <linux/suspend.h>
+ #include <linux/workqueue.h>
+ 
++#include "isp-ane.h"
+ #include "isp-cam.h"
+ #include "isp-fw.h"
+ #include "isp-iommu.h"
+@@ -892,6 +893,10 @@ static int apple_isp_probe(struct platform_device *pdev)
+ 		goto detach_genpd;
+ 	}
+ 
++	err = apple_isp_ane_init(isp);
++	if (err)
++		goto destroy_wq;
++
+ 	err = apple_isp_init_iommu(isp);
+ 	if (err) {
+ 		dev_err(dev, "failed to init iommu: %d\n", err);
+@@ -946,6 +951,7 @@ static int apple_isp_probe(struct platform_device *pdev)
+ free_iommu:
+ 	apple_isp_free_iommu(isp);
+ destroy_wq:
++	apple_isp_ane_exit(isp);
+ 	destroy_workqueue(isp->wq);
+ detach_genpd:
+ 	apple_isp_detach_genpd(isp);
+@@ -965,6 +971,7 @@ static void apple_isp_remove(struct platform_device *pdev)
+ 	apple_isp_remove_video(isp);
+ 	/* Stop resident firmware before freeing what it may still use. */
+ 	apple_isp_firmware_halt(isp);
++	apple_isp_ane_exit(isp);
+ 	apple_isp_free_video(isp);
+ 	pm_runtime_disable(isp->dev);
+ 	apple_isp_free_firmware_surface(isp);
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 12620083e8..e3d60e7160 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -161,8 +161,17 @@ struct isp_preset {
+ 	bool tall;
+ };
+ 
++struct ane_isp_link;
++
+ struct apple_isp_hw {
+ 	enum isp_generation gen;
++	/*
++	 * How the ANE firmware signals this ISP over the ML noise reduction
++	 * endpoint; the endpoint stays off where it is not known.
++	 */
++	bool ane_doorbell_known;
++	u64 ane_isp_doorbell;
++	u32 ane_isp_doorbell_sel;
+ 	enum isp_fw_abi fw_abi;
+ 	u64 pmu_base;
+ 
+@@ -398,6 +407,11 @@ struct apple_isp {
+ 	enum isp_firmware_version fw_compat;
+ 	u32 platform_id;
+ 	u32 temporal_filter;
++
++	/* ML noise reduction on the neural engine (isp-ane.c) */
++	struct ane_isp_link *ane;
++	struct isp_surf *ane_rings;
++	char ane_afpp[64];
+ 	u32 cam_connections_scheme;
+ 	struct isp_preset *presets;
+ 	int num_presets;
+diff --git a/drivers/media/platform/apple/isp/isp-fw.c b/drivers/media/platform/apple/isp/isp-fw.c
+index 23ecca9dfa..fdda9de3c3 100644
+--- a/drivers/media/platform/apple/isp/isp-fw.c
++++ b/drivers/media/platform/apple/isp/isp-fw.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
+ 
++#include "isp-ane.h"
+ #include "isp-fw.h"
+ #include "isp-ipc-layout.h"
+ 
+@@ -1442,6 +1443,9 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
+ 
+ 	isp->fw_state = ISP_FW_RUNNING;
+ 
++	/* Optional: ML noise reduction needs the neural engine endpoint */
++	apple_isp_ane_start(isp);
++
+ 	return 0;
+ }
+ 
+@@ -1473,6 +1477,7 @@ void apple_isp_firmware_halt(struct apple_isp *isp)
+ 	if (isp->fw_state != ISP_FW_RUNNING)
+ 		return;
+ 
++	apple_isp_ane_stop(isp);
+ 	isp_firmware_shutdown(isp);
+ 	pm_runtime_put_sync(isp->dev);
+ 	isp->ipc_stale = NULL;
+diff --git a/include/linux/soc/apple/ane-isp.h b/include/linux/soc/apple/ane-isp.h
+new file mode 100644
+index 0000000000..0a4430771a
+--- /dev/null
++++ b/include/linux/soc/apple/ane-isp.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/*
++ * Link between the Apple ISP and the platform neural engine (ANE).
++ *
++ * The ISP runs its ML video noise reduction on the ANE. The ANE driver
++ * loads the network package (ispane.afpp) into the ANE and both firmwares
++ * talk over a pair of rings the ISP driver allocates. This header is the
++ * in-kernel interface between the two drivers.
++ */
++#ifndef _LINUX_SOC_APPLE_ANE_ISP_H
++#define _LINUX_SOC_APPLE_ANE_ISP_H
++
++#include <linux/err.h>
++#include <linux/types.h>
++
++struct device;
++struct device_node;
++struct sg_table;
++struct ane_isp_link;
++
++/**
++ * struct ane_isp_endpoint - one ISP<->ANE endpoint
++ * @rings: the read and write ring, @ring_len bytes each, read ring first.
++ *	   Allocated and mapped by the ISP driver; the ANE driver maps the
++ *	   same pages into the ANE DART.
++ * @ring_len: bytes per ring (0x4000 on H16)
++ * @isp_doorbell: in, how the ANE firmware signals the ISP firmware
++ * @isp_doorbell_sel: in, selector for @isp_doorbell
++ * @ane_doorbell: out, how the ISP firmware signals the ANE firmware
++ * @ane_doorbell_sel: out, selector for @ane_doorbell
++ */
++struct ane_isp_endpoint {
++	struct sg_table *rings;
++	u32 ring_len;
++	u64 isp_doorbell;
++	u32 isp_doorbell_sel;
++	u64 ane_doorbell;
++	u32 ane_doorbell_sel;
++};
++
++#if IS_REACHABLE(CONFIG_DRM_ACCEL_ANE)
++struct ane_isp_link *ane_isp_link_get(struct device *isp_dev, struct device_node *ane_np);
++void ane_isp_link_put(struct ane_isp_link *link);
++int ane_isp_endpoint_enable(struct ane_isp_link *link, const char *afpp,
++			    struct ane_isp_endpoint *ep);
++void ane_isp_endpoint_disable(struct ane_isp_link *link);
++#else
++static inline struct ane_isp_link *ane_isp_link_get(struct device *isp_dev,
++						    struct device_node *ane_np)
++{
++	return ERR_PTR(-ENODEV);
++}
++static inline void ane_isp_link_put(struct ane_isp_link *link) {}
++static inline int ane_isp_endpoint_enable(struct ane_isp_link *link, const char *afpp,
++					  struct ane_isp_endpoint *ep)
++{
++	return -ENODEV;
++}
++static inline void ane_isp_endpoint_disable(struct ane_isp_link *link) {}
++#endif
++
++#endif
+-- 
+2.43.0
+

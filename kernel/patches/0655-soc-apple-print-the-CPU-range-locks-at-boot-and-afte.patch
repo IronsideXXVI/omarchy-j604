@@ -1,0 +1,364 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 07:16:34 +0000
+Subject: [PATCH] soc: apple: print the CPU range locks at boot and
+ after each sleep
+
+On M4 and later the boot firmware arms range locks in each core: CTRR_C
+and CTRR_D, physical ranges the core may not write, and CTXR_A to
+CTXR_D, the ranges it may execute from at EL2, with per-cluster copies.
+A core leaving reset takes its locks again, so a core back from a deep
+sleep can hold other locks than it had at boot. Nothing in Linux reads
+them, and the only readers so far were one-off boot instruments.
+
+Print one line per online CPU at boot and after each resume, with the
+locks, the cluster copies, SPRR/GXF, HID4/EHID4 and whether the kernel
+image's text or data lies in a write lock. debugfs apple_cpu_locks gives
+the same on demand. It only reads, with no module load and no text
+patching, so a resumed system can be read without disturbing it. Each
+register is read through an exception table entry, so one a core lacks
+reads as "-" instead of faulting.
+
+The encodings are the ones aura uses (src/cpu_regs.h).
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/soc/apple/Kconfig     |  14 ++
+ drivers/soc/apple/Makefile    |   1 +
+ drivers/soc/apple/cpu-locks.c | 289 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 304 insertions(+)
+ create mode 100644 drivers/soc/apple/cpu-locks.c
+
+diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
+index cecd95a6fc..f6f38f5a43 100644
+--- a/drivers/soc/apple/Kconfig
++++ b/drivers/soc/apple/Kconfig
+@@ -258,6 +258,20 @@ config APPLE_SEP_KEY_RESEARCH
+ 
+ 	  Say N unless you are measuring the enclave on a lab machine.
+ 
++config APPLE_CPU_LOCKS
++	bool "Apple CPU range locks at boot and after each sleep"
++	depends on ARCH_APPLE && DEBUG_FS
++	default y
++	help
++	  Print, for every online CPU, the range locks the boot firmware
++	  arms in each core on M4 and later (CTRR_C/D write locks, CTXR_A-D
++	  execute windows, their cluster copies), SPRR/GXF and HID4/EHID4,
++	  at boot and again after each system resume, and whether the
++	  kernel image lies in a write lock. A core back from a deep sleep
++	  takes its locks again at reset, so they can differ from boot.
++	  Reads only; debugfs apple_cpu_locks gives the same on demand.
++	  apple_cpu_locks.log=0 silences the lines.
++
+ config APPLE_BOOT_CRUMB
+ 	bool "Apple boot crumbs in PMU scratch"
+ 	depends on ARCH_APPLE
+diff --git a/drivers/soc/apple/Makefile b/drivers/soc/apple/Makefile
+index 1ef4c4def0..8816fd6718 100644
+--- a/drivers/soc/apple/Makefile
++++ b/drivers/soc/apple/Makefile
+@@ -69,3 +69,4 @@ apple-regview-y := regview.o
+ 
+ obj-$(CONFIG_APPLE_AURORA_BOOT_SECURITY) += aurora-boot-security.o
+ obj-$(CONFIG_APPLE_BOOT_CRUMB) += boot-crumb.o
++obj-$(CONFIG_APPLE_CPU_LOCKS) += cpu-locks.o
+diff --git a/drivers/soc/apple/cpu-locks.c b/drivers/soc/apple/cpu-locks.c
+new file mode 100644
+index 0000000000..66d6520ae3
+--- /dev/null
++++ b/drivers/soc/apple/cpu-locks.c
+@@ -0,0 +1,289 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/*
++ * Apple CPU range locks, per core, at boot and after every system sleep.
++ *
++ * On M4 and later the boot firmware arms range locks in each core: CTRR_C and
++ * CTRR_D (physical ranges the core may not write) and CTXR_A to CTXR_D (the
++ * ranges it may execute from at EL2), with per-cluster ACC copies. A core
++ * leaving reset takes its locks again, so a core back from a deep sleep can
++ * hold other locks than it had at boot, and nothing in Linux reads them.
++ *
++ * This prints one line per online CPU at boot and after each resume: the
++ * locks, the cluster copies, SPRR/GXF and HID4/EHID4, and whether the kernel
++ * image's text or data lies in a write lock. debugfs apple_cpu_locks gives the
++ * same on demand. Reads only, without loading a module or patching text, so it
++ * can be read on a resumed system that must not be disturbed. Each register is
++ * read fault-safe: one a core lacks shows as "-".
++ */
++
++#define pr_fmt(fmt) "apple-cpu-locks: " fmt
++
++#include <linux/cpu.h>
++#include <linux/debugfs.h>
++#include <linux/init.h>
++#include <linux/moduleparam.h>
++#include <linux/of.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/smp.h>
++#include <linux/suspend.h>
++#include <linux/workqueue.h>
++
++#include <asm/asm-extable.h>
++#include <asm/cputype.h>
++#include <asm/sections.h>
++#include <asm/virt.h>
++
++#undef MODULE_PARAM_PREFIX
++#define MODULE_PARAM_PREFIX "apple_cpu_locks."
++
++static bool log_lines = true;
++module_param_named(log, log_lines, bool, 0644);
++MODULE_PARM_DESC(log, "print the per-CPU lines at boot and after each resume");
++
++#define CL_BAD	(~0ULL)
++
++enum {
++	CL_CTRR_C_LWR,
++	CL_CTRR_C_UPR,
++	CL_CTRR_C_CTL,
++	CL_CTRR_D_LWR,
++	CL_CTRR_D_UPR,
++	CL_CTRR_D_CTL,
++	CL_CTRR_C_LWR2,
++	CL_CTRR_C_UPR2,
++	CL_CTRR_D_LWR2,
++	CL_CTRR_D_UPR2,
++	CL_CTXR_A_LWR,
++	CL_CTXR_A_UPR,
++	CL_CTXR_A_CTL,
++	CL_CTXR_B_LWR,
++	CL_CTXR_B_UPR,
++	CL_CTXR_B_CTL,
++	CL_CTXR_C_LWR,
++	CL_CTXR_C_UPR,
++	CL_CTXR_C_CTL,
++	CL_CTXR_D_LWR,
++	CL_CTXR_D_UPR,
++	CL_CTXR_D_CTL,
++	CL_ACC_CTRR_C_LWR,
++	CL_ACC_CTRR_C_UPR,
++	CL_ACC_CTRR_C_CTL,
++	CL_ACC_CTRR_D_LWR,
++	CL_ACC_CTRR_D_UPR,
++	CL_ACC_CTRR_D_CTL,
++	CL_ACC_CTXR_D_LWR,
++	CL_ACC_CTXR_D_UPR,
++	CL_ACC_CTXR_D_CTL,
++	CL_CTRR_A_CTL,
++	CL_CTRR_B_CTL,
++	CL_SPRR_CONFIG,
++	CL_GXF_CONFIG,
++	CL_HID4,
++	CL_EHID4,
++	CL_NR
++};
++
++struct cl_snap {
++	u64 val[CL_NR];
++	u64 mpidr;
++};
++
++/* A register the core lacks takes an undefined-instruction fault; the fixup zeroes it. */
++#define cl_mrs(enc) ({							\
++	u64 __val;							\
++	int __err = 0;							\
++	asm volatile("1:	mrs	%1, " enc "\n"			\
++		     "2:\n"						\
++		     _ASM_EXTABLE_KACCESS_ERR_ZERO(1b, 2b, %w0, %1)	\
++		     : "+r" (__err), "=r" (__val));			\
++	__err ? CL_BAD : __val;						\
++})
++
++static void cl_read_this_cpu(void *arg)
++{
++	struct cl_snap *s = arg;
++	u64 *v = s->val;
++
++	/* Encodings as in aura src/cpu_regs.h. */
++	v[CL_CTRR_C_LWR] = cl_mrs("s3_0_c11_c0_0");
++	v[CL_CTRR_C_UPR] = cl_mrs("s3_0_c11_c0_1");
++	v[CL_CTRR_C_CTL] = cl_mrs("s3_0_c11_c1_4");
++	v[CL_CTRR_D_LWR] = cl_mrs("s3_0_c11_c0_2");
++	v[CL_CTRR_D_UPR] = cl_mrs("s3_0_c11_c0_3");
++	v[CL_CTRR_D_CTL] = cl_mrs("s3_0_c11_c1_5");
++	v[CL_CTRR_C_LWR2] = cl_mrs("s3_0_c11_c1_0");
++	v[CL_CTRR_C_UPR2] = cl_mrs("s3_0_c11_c1_1");
++	v[CL_CTRR_D_LWR2] = cl_mrs("s3_0_c11_c1_2");
++	v[CL_CTRR_D_UPR2] = cl_mrs("s3_0_c11_c1_3");
++	v[CL_CTXR_A_LWR] = cl_mrs("s3_0_c11_c2_2");
++	v[CL_CTXR_A_UPR] = cl_mrs("s3_0_c11_c2_3");
++	v[CL_CTXR_A_CTL] = cl_mrs("s3_0_c11_c5_2");
++	v[CL_CTXR_B_LWR] = cl_mrs("s3_0_c11_c2_4");
++	v[CL_CTXR_B_UPR] = cl_mrs("s3_0_c11_c2_5");
++	v[CL_CTXR_B_CTL] = cl_mrs("s3_0_c11_c5_3");
++	v[CL_CTXR_C_LWR] = cl_mrs("s3_0_c11_c2_6");
++	v[CL_CTXR_C_UPR] = cl_mrs("s3_0_c11_c2_7");
++	v[CL_CTXR_C_CTL] = cl_mrs("s3_0_c11_c5_4");
++	v[CL_CTXR_D_LWR] = cl_mrs("s3_0_c11_c3_0");
++	v[CL_CTXR_D_UPR] = cl_mrs("s3_0_c11_c3_1");
++	v[CL_CTXR_D_CTL] = cl_mrs("s3_0_c11_c5_5");
++	v[CL_ACC_CTRR_C_LWR] = cl_mrs("s3_0_c11_c6_6");
++	v[CL_ACC_CTRR_C_UPR] = cl_mrs("s3_0_c11_c6_7");
++	v[CL_ACC_CTRR_C_CTL] = cl_mrs("s3_0_c11_c8_2");
++	v[CL_ACC_CTRR_D_LWR] = cl_mrs("s3_0_c11_c7_0");
++	v[CL_ACC_CTRR_D_UPR] = cl_mrs("s3_0_c11_c7_1");
++	v[CL_ACC_CTRR_D_CTL] = cl_mrs("s3_0_c11_c8_3");
++	v[CL_ACC_CTXR_D_LWR] = cl_mrs("s3_0_c11_c8_0");
++	v[CL_ACC_CTXR_D_UPR] = cl_mrs("s3_0_c11_c8_1");
++	v[CL_ACC_CTXR_D_CTL] = cl_mrs("s3_0_c11_c8_7");
++	v[CL_CTRR_A_CTL] = cl_mrs("s3_4_c15_c2_5");
++	v[CL_CTRR_B_CTL] = cl_mrs("s3_4_c15_c2_2");
++	v[CL_SPRR_CONFIG] = cl_mrs("s3_6_c15_c1_0");
++	v[CL_GXF_CONFIG] = cl_mrs("s3_6_c15_c1_2");
++	v[CL_HID4] = cl_mrs("s3_0_c15_c4_0");
++	v[CL_EHID4] = cl_mrs("s3_0_c15_c4_1");
++	s->mpidr = read_cpuid_mpidr() & MPIDR_HWID_BITMASK;
++}
++
++static int cl_v(char *buf, size_t len, u64 val)
++{
++	if (val == CL_BAD)
++		return scnprintf(buf, len, " -");
++	return scnprintf(buf, len, " %llx", val);
++}
++
++/* Whether [lwr, upr + 4K) meets [start, end). Unarmed bounds read as 0. */
++static bool cl_meets(u64 lwr, u64 upr, phys_addr_t start, phys_addr_t end)
++{
++	if (lwr == CL_BAD || upr == CL_BAD || !upr || upr < lwr)
++		return false;
++	return lwr < end && upr + SZ_4K > start;
++}
++
++static int cl_fmt(char *buf, size_t len, const struct cl_snap *s)
++{
++	phys_addr_t text0 = __pa_symbol(_stext), text1 = __pa_symbol(_etext);
++	phys_addr_t data0 = __pa_symbol(_sdata), data1 = __pa_symbol(_end);
++	const u64 *v = s->val;
++	int n = 0;
++
++#define CL_P(fmt, ...) (n += scnprintf(buf + n, len - n, fmt, ##__VA_ARGS__))
++#define CL_V(r) (n += cl_v(buf + n, len - n, v[CL_##r]))
++	CL_P("mpidr %llx CTRR_C", s->mpidr);
++	CL_V(CTRR_C_LWR); CL_V(CTRR_C_UPR); CL_V(CTRR_C_CTL);
++	CL_P(" CTRR_D"); CL_V(CTRR_D_LWR); CL_V(CTRR_D_UPR); CL_V(CTRR_D_CTL);
++	CL_P(" el2 C"); CL_V(CTRR_C_LWR2); CL_V(CTRR_C_UPR2);
++	CL_P(" D"); CL_V(CTRR_D_LWR2); CL_V(CTRR_D_UPR2);
++	CL_P(" CTXR_A"); CL_V(CTXR_A_LWR); CL_V(CTXR_A_UPR); CL_V(CTXR_A_CTL);
++	CL_P(" B"); CL_V(CTXR_B_LWR); CL_V(CTXR_B_UPR); CL_V(CTXR_B_CTL);
++	CL_P(" C"); CL_V(CTXR_C_LWR); CL_V(CTXR_C_UPR); CL_V(CTXR_C_CTL);
++	CL_P(" D"); CL_V(CTXR_D_LWR); CL_V(CTXR_D_UPR); CL_V(CTXR_D_CTL);
++	CL_P(" ACC CTRR_C"); CL_V(ACC_CTRR_C_LWR); CL_V(ACC_CTRR_C_UPR); CL_V(ACC_CTRR_C_CTL);
++	CL_P(" CTRR_D"); CL_V(ACC_CTRR_D_LWR); CL_V(ACC_CTRR_D_UPR); CL_V(ACC_CTRR_D_CTL);
++	CL_P(" CTXR_D"); CL_V(ACC_CTXR_D_LWR); CL_V(ACC_CTXR_D_UPR); CL_V(ACC_CTXR_D_CTL);
++	CL_P(" CTRR_A/B_CTL"); CL_V(CTRR_A_CTL); CL_V(CTRR_B_CTL);
++	CL_P(" SPRR"); CL_V(SPRR_CONFIG); CL_P(" GXF"); CL_V(GXF_CONFIG);
++	CL_P(" HID4"); CL_V(HID4); CL_P(" EHID4"); CL_V(EHID4);
++	CL_P(" | text in C/D %c%c data in C/D %c%c",
++	     cl_meets(v[CL_CTRR_C_LWR], v[CL_CTRR_C_UPR], text0, text1) ? 'Y' : 'n',
++	     cl_meets(v[CL_CTRR_D_LWR], v[CL_CTRR_D_UPR], text0, text1) ? 'Y' : 'n',
++	     cl_meets(v[CL_CTRR_C_LWR], v[CL_CTRR_C_UPR], data0, data1) ? 'Y' : 'n',
++	     cl_meets(v[CL_CTRR_D_LWR], v[CL_CTRR_D_UPR], data0, data1) ? 'Y' : 'n');
++#undef CL_V
++#undef CL_P
++	return n;
++}
++
++/* Reads every online CPU on that CPU; NULL without memory. */
++static struct cl_snap *cl_snap_all(void)
++{
++	struct cl_snap *snaps;
++	unsigned int cpu;
++
++	snaps = kcalloc(nr_cpu_ids, sizeof(*snaps), GFP_KERNEL);
++	if (!snaps)
++		return NULL;
++	for_each_online_cpu(cpu)
++		smp_call_function_single(cpu, cl_read_this_cpu, &snaps[cpu], 1);
++	return snaps;
++}
++
++static void cl_log(const char *when)
++{
++	struct cl_snap *snaps;
++	unsigned int cpu;
++	char *line;
++
++	line = kmalloc(1024, GFP_KERNEL);
++	cpus_read_lock();
++	snaps = cl_snap_all();
++	if (line && snaps) {
++		for_each_online_cpu(cpu) {
++			cl_fmt(line, 1024, &snaps[cpu]);
++			pr_info("%s cpu%u: %s\n", when, cpu, line);
++		}
++	}
++	cpus_read_unlock();
++	kfree(snaps);
++	kfree(line);
++}
++
++static int cl_show(struct seq_file *m, void *unused)
++{
++	struct cl_snap *snaps;
++	unsigned int cpu;
++	char *line;
++	int ret = 0;
++
++	line = kmalloc(1024, GFP_KERNEL);
++	if (!line)
++		return -ENOMEM;
++	cpus_read_lock();
++	snaps = cl_snap_all();
++	if (snaps) {
++		for_each_online_cpu(cpu) {
++			cl_fmt(line, 1024, &snaps[cpu]);
++			seq_printf(m, "cpu%u: %s\n", cpu, line);
++		}
++	} else {
++		ret = -ENOMEM;
++	}
++	cpus_read_unlock();
++	kfree(snaps);
++	kfree(line);
++	return ret;
++}
++DEFINE_SHOW_ATTRIBUTE(cl);
++
++static void cl_resume_work_fn(struct work_struct *work)
++{
++	cl_log("resume");
++}
++
++static DECLARE_WORK(cl_resume_work, cl_resume_work_fn);
++
++static int cl_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
++{
++	if (action == PM_POST_SUSPEND && READ_ONCE(log_lines))
++		schedule_work(&cl_resume_work);
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block cl_pm_nb = {
++	.notifier_call = cl_pm_notify,
++};
++
++static int __init apple_cpu_locks_init(void)
++{
++	/* The locks are EL2 registers: a kernel at EL1 can't see them. */
++	if (!of_machine_is_compatible("apple,arm-platform") || !is_kernel_in_hyp_mode())
++		return 0;
++
++	debugfs_create_file("apple_cpu_locks", 0400, NULL, NULL, &cl_fops);
++	register_pm_notifier(&cl_pm_nb);
++	if (log_lines)
++		cl_log("boot");
++	return 0;
++}
++late_initcall(apple_cpu_locks_init);
+-- 
+2.43.0
+

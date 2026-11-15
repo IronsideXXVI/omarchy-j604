@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 07:42:58 +0000
+Subject: [PATCH] media: apple: isp: add a switch for macOS's face and
+ body detection
+
+At every stream start macOS turns on body detection, body-aware auto
+exposure and face detection (up to 10 faces) on the T8132 camera, also
+when no app asks for faces. Auto exposure then weighs the people in
+frame, and the face boxes are what framing such as Center Stage works
+from. The driver sends none of it.
+
+Add the commands and macos_face_detect, off by default, sent as macOS
+sends them before the channel starts; a refusal is reported once and
+the stream goes on.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/isp/isp-cam.c | 33 ++++++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-cmd.c | 22 +++++++++++++++
+ drivers/media/platform/apple/isp/isp-cmd.h | 20 +++++++++++++
+ 3 files changed, 75 insertions(+)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 4d030519da..8bf328333c 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -1236,6 +1236,37 @@ module_param(macos_cal_reads, bool, 0644);
+ MODULE_PARM_DESC(macos_cal_reads,
+ 		 "Read the camera module calibration around the setfile load as macOS does (default: off)");
+ 
++/*
++ * macOS turns on body and face detection for this camera at every stream
++ * start, also when no app asks for faces: auto exposure weighs the people
++ * in frame, and the face boxes feed framing such as Center Stage. Off by
++ * default (macos_face_detect) until a side-by-side shows its effect.
++ */
++static bool macos_face_detect;
++module_param(macos_face_detect, bool, 0644);
++MODULE_PARM_DESC(macos_face_detect,
++		 "Turn on face and body detection as macOS does on this camera (default: off)");
++
++static void isp_ch_macos_face_detect(struct apple_isp *isp, u32 ch)
++{
++	int err;
++
++	if (!READ_ONCE(macos_face_detect) || !isp->hw->macos_session_settings)
++		return;
++	err = isp_cmd_ch_u32_set(isp, CISP_CMD_CH_BODY_DETECTION_CONTROL, ch, 1);
++	if (!err)
++		err = isp_cmd_ch_u32_set(isp, CISP_CMD_CH_AE_CONTROL_BODY_DETECTION,
++					 ch, 1);
++	if (!err)
++		err = isp_cmd_ch_face_detection_config_set(isp, ch, 0xa, 0, 1);
++	if (!err)
++		err = isp_cmd_ch_u32_set(isp, CISP_CMD_CH_FACE_DETECTION_ENABLE, ch, 1);
++	if (!err)
++		err = isp_cmd_ch_face_detection_start(isp, ch);
++	if (err)
++		dev_warn_once(isp->dev, "face detection setup refused: %d\n", err);
++}
++
+ static void isp_ch_macos_cal_reads(struct apple_isp *isp, u32 ch, bool loaded)
+ {
+ 	static const struct {
+@@ -1647,6 +1678,8 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
+ 			dev_warn_once(isp->dev, "AE integration table refused: %d\n", err);
+ 	}
+ 
++	isp_ch_macos_face_detect(isp, ch);
++
+ 	if (READ_ONCE(macos_be_la) && isp->hw->macos_session_settings) {
+ 		err = isp_cmd_ch_be_lasetting_set(isp, ch, isp_macos_be_la);
+ 		if (err)
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.c b/drivers/media/platform/apple/isp/isp-cmd.c
+index b318d351ce..8ea2f97023 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.c
++++ b/drivers/media/platform/apple/isp/isp-cmd.c
+@@ -508,6 +508,28 @@ int isp_cmd_ch_mbnr_enable(struct apple_isp *isp, u32 chan, u32 use_case,
+ 	return CISP_SEND_IN(isp, args);
+ }
+ 
++int isp_cmd_ch_face_detection_start(struct apple_isp *isp, u32 chan)
++{
++	struct cmd_ch_face_detection_start args = {
++		.opcode = CISP_OPCODE(CISP_CMD_CH_FACE_DETECTION_START),
++		.chan = chan,
++	};
++	return CISP_SEND_IN(isp, args);
++}
++
++int isp_cmd_ch_face_detection_config_set(struct apple_isp *isp, u32 chan,
++					 u32 max_faces, u32 unk_10, u32 unk_14)
++{
++	struct cmd_ch_face_detection_config_set args = {
++		.opcode = CISP_OPCODE(CISP_CMD_CH_FACE_DETECTION_CONFIG_SET),
++		.chan = chan,
++		.max_faces = max_faces,
++		.unk_10 = unk_10,
++		.unk_14 = unk_14,
++	};
++	return CISP_SEND_IN(isp, args);
++}
++
+ /*
+  * A read whose request is built by the caller: the opcode and channel are
+  * filled in here, the reply replaces the request in buf.
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.h b/drivers/media/platform/apple/isp/isp-cmd.h
+index c71a21e26b..1495f32f05 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.h
++++ b/drivers/media/platform/apple/isp/isp-cmd.h
+@@ -93,6 +93,8 @@
+ #define CISP_CMD_CH_FACE_DETECTION_CONFIG_SET		     0x0d03
+ #define CISP_CMD_CH_FACE_DETECTION_DISABLE		     0x0d04
+ #define CISP_CMD_CH_FACE_DETECTION_ENABLE		     0x0d05
++#define CISP_CMD_CH_AE_CONTROL_BODY_DETECTION		     0x0249
++#define CISP_CMD_CH_BODY_DETECTION_CONTROL		     0x5006
+ #define CISP_CMD_CH_LTM_MODE_SET			     0x2004
+ #define CISP_CMD_CH_LTM_GAMMA_SET			     0x200a
+ #define CISP_CMD_CH_FID_START				     0x3000
+@@ -526,6 +528,21 @@ struct cmd_ch_cnr_start {
+ } __packed;
+ static_assert(sizeof(struct cmd_ch_cnr_start) == 0xc);
+ 
++struct cmd_ch_face_detection_start {
++	u64 opcode;
++	u32 chan;
++} __packed;
++static_assert(sizeof(struct cmd_ch_face_detection_start) == 0xc);
++
++struct cmd_ch_face_detection_config_set {
++	u64 opcode;
++	u32 chan;
++	u32 max_faces;
++	u32 unk_10;
++	u32 unk_14;
++} __packed;
++static_assert(sizeof(struct cmd_ch_face_detection_config_set) == 0x18);
++
+ struct cmd_ch_mbnr_enable {
+ 	u64 opcode;
+ 	u32 chan;
+@@ -598,6 +615,9 @@ int isp_cmd_ch_als_disable(struct apple_isp *isp, u32 chan);
+ int isp_cmd_ch_cnr_start(struct apple_isp *isp, u32 chan);
+ int isp_cmd_ch_mbnr_enable(struct apple_isp *isp, u32 chan, u32 use_case,
+ 			   u32 mode, u32 enable_chroma);
++int isp_cmd_ch_face_detection_start(struct apple_isp *isp, u32 chan);
++int isp_cmd_ch_face_detection_config_set(struct apple_isp *isp, u32 chan,
++					 u32 max_faces, u32 unk_10, u32 unk_14);
+ int isp_cmd_ch_raw_get(struct apple_isp *isp, u16 opcode, u32 chan, void *buf,
+ 		       u32 len);
+ int isp_cmd_ch_mbnr_config(struct apple_isp *isp, u32 chan, u32 use_case,
+-- 
+2.43.0
+

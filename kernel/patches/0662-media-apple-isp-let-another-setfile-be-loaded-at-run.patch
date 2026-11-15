@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 08:38:42 +0000
+Subject: [PATCH] media: apple: isp: let another setfile be loaded at
+ run time
+
+The sensor setfile is the camera's tuning, and the driver loads the one
+named in its table, with its own edits. On T8132 the picture turns
+magenta in dim light while macOS's does not, and the setfile macOS hands
+the firmware can differ from the shipped file: it merges this camera
+module's calibration into it before loading.
+
+Add setfile_override, a firmware file name loaded in place of the
+table's setfile, byte for byte: the magic and size are checked as
+before, but none of the driver's edits are applied, since a setfile
+taken from another system already carries that system's. It is read
+at every stream start, so two setfiles can be compared on the same
+scene without a reboot. Empty, the default, changes nothing.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/isp/isp-cam.c | 45 +++++++++++++++++-----
+ 1 file changed, 36 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 8bf328333c..1a3290de51 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -1335,11 +1335,25 @@ static void isp_ch_macos_cal_reads(struct apple_isp *isp, u32 ch, bool loaded)
+ 	kfree(buf);
+ }
+ 
++/*
++ * setfile_override names a firmware file loaded as the sensor setfile in
++ * place of the table's, byte for byte: same magic and size checks, but none
++ * of the host edits below, since a setfile taken from another system already
++ * carries that system's. It is read at every stream start, so two setfiles
++ * can be compared on the same scene without a reboot. Empty by default.
++ */
++static char *setfile_override;
++module_param(setfile_override, charp, 0644);
++MODULE_PARM_DESC(setfile_override,
++		 "Firmware file to load as the sensor setfile, as is (default: none)");
++
+ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
+ {
+ 	struct isp_format *fmt = isp_get_format(isp, ch);
+ 	const struct isp_setfile *setfile = &isp_setfiles[fmt->id];
+ 	size_t len = setfile->file_size ?: setfile->size;
++	const char *path = setfile->path;
++	char override[64] = "";
+ 	const struct firmware *fw;
+ 	u32 magic;
+ 	int err;
+@@ -1349,21 +1363,31 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
+ 	if (WARN_ON_ONCE(setfile->size > isp->data_surf->size))
+ 		return -ENOSPC;
+ 
+-	err = firmware_request_nowarn(&fw, setfile->path, isp->dev);
++	kernel_param_lock(THIS_MODULE);
++	if (setfile_override)
++		strscpy(override, setfile_override, sizeof(override));
++	kernel_param_unlock(THIS_MODULE);
++	strim(override);
++	if (override[0]) {
++		path = override;
++		len = setfile->size;
++	}
++
++	err = firmware_request_nowarn(&fw, path, isp->dev);
+ 	if (err) {
+ 		if (err == -ENOENT)
+ 			dev_warn_once(isp->dev,
+ 				      "setfile '%s' missing, streaming without sensor tuning\n",
+-				      setfile->path);
++				      path);
+ 		else
+ 			dev_err(isp->dev, "failed to read setfile '%s': %d\n",
+-				setfile->path, err);
++				path, err);
+ 		return err;
+ 	}
+ 
+ 	if (fw->size < len) {
+ 		dev_err(isp->dev, "setfile '%s' too small (0x%zx/0x%zx)\n",
+-			setfile->path, fw->size, len);
++			path, fw->size, len);
+ 		release_firmware(fw);
+ 		return -EINVAL;
+ 	}
+@@ -1371,7 +1395,7 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
+ 	magic = get_unaligned_be32(fw->data);
+ 	if (magic != setfile->magic) {
+ 		dev_err(isp->dev, "setfile '%s' has magic 0x%08x, expected 0x%08x\n",
+-			setfile->path, magic, setfile->magic);
++			path, magic, setfile->magic);
+ 		release_firmware(fw);
+ 		return -EINVAL;
+ 	}
+@@ -1379,10 +1403,13 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
+ 	memcpy(isp->data_surf->virt, fw->data, len);
+ 	memset(isp->data_surf->virt + len, 0, setfile->size - len);
+ 	release_firmware(fw);
++	if (override[0])
++		dev_info_once(isp->dev, "using setfile '%s' as is\n", path);
+ 	/* Seen on T6040 only; T8140 runs its setfiles as they are. */
+-	if (isp->hw->gen == ISP_GEN_T6040 || isp->hw->setfile_stride_fixup)
++	if (!override[0] &&
++	    (isp->hw->gen == ISP_GEN_T6040 || isp->hw->setfile_stride_fixup))
+ 		isp_setfile_fixup_h17(isp->data_surf->virt, len);
+-	if (isp->hw->setfile_radial_gain)
++	if (!override[0] && isp->hw->setfile_radial_gain)
+ 		isp_setfile_radial_gain(isp->data_surf->virt, len);
+ 
+ 	if (isp->hw->lsc_ideal_percent) {
+@@ -1396,10 +1423,10 @@ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
+ 				       setfile->size);
+ 	if (err)
+ 		dev_err(isp->dev, "ch %u: setfile '%s' load failed: %d\n",
+-			ch, setfile->path, err);
++			ch, path, err);
+ 	else
+ 		dev_dbg(isp->dev, "ch %u: loaded sensor tuning '%s' (0x%zx bytes)\n",
+-			ch, setfile->path, setfile->size);
++			ch, path, setfile->size);
+ 
+ 	return err;
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 08:38:03 +0000
+Subject: [PATCH] pmdomain: apple: pmp-report: T8132 GPU system-cache
+ quota experiment
+
+macOS 26B123 gives the J604 GPU three memory-cache (MCC) data streams
+while it has work and takes them back after its idle timer. The quota
+goes through the PMP report: MC-DRV-TO-CTRL entries 440..447 hold four
+16-bit lanes each, entry 448 is the command sequence and 449 its
+argument. A hypervisor trace of macOS shows entry 444 = 0x1000200004
+(groups 16, 17 and 18) written before the GPU doorbell and 0 written
+45-220 ms after the last work, each change followed by 449 = 0 and a
+new 448 sequence. Linux never writes these entries, so the GPU runs
+without a system-cache quota of its own.
+
+Let the existing AGX vote engine, fed by the GPU driver's activity
+begin/end calls, drive that quota on T8132 behind t8132_gpu_mcc
+(runtime, default off): a set writes the three lanes with one command,
+a clear writes 0. Off by default until a device A/B shows the speed
+change and that the PMP takes the command.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/pmdomain/apple/pmp-report.c | 85 ++++++++++++++++++++++++++++-
+ 1 file changed, 84 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/pmdomain/apple/pmp-report.c b/drivers/pmdomain/apple/pmp-report.c
+index a1a2554302..52369f0623 100644
+--- a/drivers/pmdomain/apple/pmp-report.c
++++ b/drivers/pmdomain/apple/pmp-report.c
+@@ -523,6 +523,84 @@ static void apple_pmp_report_t8132_gfx_request(struct apple_pmp_report *rep)
+ 			 PMP_T8132_GFX_REQUEST_BIT);
+ }
+ 
++/*
++ * T8132 GPU system-cache (MCC) quota, an A/B experiment (default off). macOS 26B123 takes the GPU's three MCC data
++ * streams while the GPU has work and drops them after its idle timer (AGXAccelerator::ensurePoweredHardware and
++ * idlePowerOffTimer, through AppleMemCacheDataSetsFunction ops 4 and 3). The quota goes through the PMP report:
++ * MC-DRV-TO-CTRL entries 440..447 hold four 16-bit lanes each ((size & 0xfff) | flags << 12), entry 448 is the
++ * command sequence and 449 its argument (ADT ptd-range, mc_quota_req_ptd_count 8, mc_cmd_ptd_count 2). On the J604
++ * (hypervisor trace, list 14) macOS writes entry 444 = 0x1000200004 (groups 16, 17 and 18 = 4, 0x20 and 0x10) before
++ * the GPU doorbell and 0 about 45-220 ms after the last work, each change followed by 449 = 0 and 448 = sequence + 1.
++ * Here the AGX vote engine (GPU activity begin/end, agx_vote_idle_ms) drives it: a set writes the three lanes at once
++ * with one command, a clear writes 0. The update window is not read back; the sequence counts from 1 at boot.
++ */
++#define PMP_T8132_MC_QUOTA_GPU_ENTRY	444
++#define PMP_T8132_MC_CMD_SEQ_ENTRY	448
++#define PMP_T8132_MC_CMD_ARG_ENTRY	449
++#define PMP_T8132_MC_QUOTA_GPU		0x1000200004ULL
++static bool t8132_gpu_mcc;
++/* The quota last written, the command sequence and the engine's last decision; under the T8132 report's lock. */
++static u64 apple_pmp_t8132_mcc_value;
++static u32 apple_pmp_t8132_mcc_seq;
++static bool apple_pmp_t8132_mcc_want;
++
++static void apple_pmp_t8132_mcc_write_locked(struct apple_pmp_report *rep, u64 quota)
++{
++	void __iomem *upd = rep->base + rep->offsets->update;
++
++	lockdep_assert_held(&rep->lock);
++	if (quota == apple_pmp_t8132_mcc_value || rep->defer)
++		return;
++	writeq(quota, upd + 8 * PMP_T8132_MC_QUOTA_GPU_ENTRY);
++	writeq(0, upd + 8 * PMP_T8132_MC_CMD_ARG_ENTRY);
++	writeq(++apple_pmp_t8132_mcc_seq, upd + 8 * PMP_T8132_MC_CMD_SEQ_ENTRY);
++	apple_pmp_t8132_mcc_value = quota;
++}
++
++/* Apply the GPU's busy state to the bound T8132 report: -ENODEV without one, -EAGAIN when the PMP does not run. */
++static int apple_pmp_t8132_mcc_vote(bool busy)
++{
++	struct apple_pmp_report *rep;
++	unsigned long flags;
++	int ret = -ENODEV;
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
++		if (rep->offsets != &apple_pmp_offsets_t8132)
++			continue;
++		spin_lock_irqsave(&rep->lock, flags);
++		WRITE_ONCE(apple_pmp_t8132_mcc_want, busy);
++		if (busy && READ_ONCE(t8132_gpu_mcc) && !apple_pmp_report_running(rep)) {
++			ret = -EAGAIN;
++		} else {
++			apple_pmp_t8132_mcc_write_locked(rep, busy && READ_ONCE(t8132_gpu_mcc) ?
++							 PMP_T8132_MC_QUOTA_GPU : 0);
++			ret = 0;
++		}
++		spin_unlock_irqrestore(&rep->lock, flags);
++		break;
++	}
++	rcu_read_unlock();
++	return ret;
++}
++
++static int apple_pmp_t8132_gpu_mcc_set(const char *val, const struct kernel_param *kp)
++{
++	int ret = param_set_bool(val, kp);
++
++	if (!ret)	/* switching off drops the quota at once; switching on takes it if the GPU is busy now */
++		apple_pmp_t8132_mcc_vote(READ_ONCE(apple_pmp_t8132_mcc_want));
++	return ret;
++}
++
++static const struct kernel_param_ops apple_pmp_t8132_gpu_mcc_ops = {
++	.set = apple_pmp_t8132_gpu_mcc_set,
++	.get = param_get_bool,
++};
++module_param_cb(t8132_gpu_mcc, &apple_pmp_t8132_gpu_mcc_ops, &t8132_gpu_mcc, 0644);
++MODULE_PARM_DESC(t8132_gpu_mcc,
++		 "T8132: take the GPU's system-cache quota while it has work, as macOS does (default off: A/B experiment)");
++
+ /*
+  * T8132 memory bandwidth vote (default off). Under a CPU memory load macOS
+  * writes SOC-DEV-DVFS entries 409 and 411, always as a pair, at main level
+@@ -2835,12 +2913,17 @@ MODULE_PARM_DESC(agx_vote, "T6000/T6001: set the AGX power request in the PMP re
+ module_param(agx_vote_idle_ms, uint, 0644);
+ MODULE_PARM_DESC(agx_vote_idle_ms, "Keep the AGX request this many ms after the last GPU operation ends (default: 250)");
+ 
+-/* Write the AGX request of the bound T6000/T6001 report: -ENODEV without one, -EAGAIN (nothing written) when the PMP does not run. */
++/*
++ * Write the AGX request of the bound T6000/T6001 report: -ENODEV without one, -EAGAIN (nothing written) when the PMP does not run.
++ * On T8132 the vote drives the GPU system-cache quota instead (t8132_gpu_mcc, off by default).
++ */
+ static int apple_pmp_agx_write(bool enable, bool no_ack)
+ {
+ 	struct apple_pmp_report *rep;
+ 	int ret = -ENODEV;
+ 
++	if (of_machine_is_compatible("apple,t8132"))
++		return apple_pmp_t8132_mcc_vote(enable);
+ 	if (!of_machine_is_compatible("apple,t6000") && !of_machine_is_compatible("apple,t6001"))
+ 		return ret;
+ 	rcu_read_lock();
+-- 
+2.43.0
+

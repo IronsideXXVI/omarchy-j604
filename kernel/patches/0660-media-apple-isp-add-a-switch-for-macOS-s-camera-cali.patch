@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 07:42:57 +0000
+Subject: [PATCH] media: apple: isp: add a switch for macOS's camera
+ calibration reads
+
+Around loading the setfile macOS reads the T8132 camera module's own
+calibration: the lens shading polynomials of every sensor config, the
+sensor NVM and the per-module lens shading grid before the load, then
+the AWB calibration matrix, the AWB gains ahead of the CCM and the
+colour calibration. The driver reads none of it, and in dim light the
+picture turns magenta.
+
+If the firmware applies the module calibration only after it has been
+read, the reads alone change the picture; either way the first stream
+logs what they return, the NVM and the grids only as a hash because the
+NVM also holds the module's serial. macOS's per-module luma shading read
+is left out: its request names a macOS buffer address.
+
+Add the reads behind macos_cal_reads, off by default.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/isp/isp-cam.c | 89 ++++++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-cmd.c | 16 ++++
+ drivers/media/platform/apple/isp/isp-cmd.h |  5 ++
+ 3 files changed, 110 insertions(+)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index f456d1ebc1..4d030519da 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -2,6 +2,8 @@
+ /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
+ 
+ #include <linux/firmware.h>
++#include <linux/jhash.h>
++#include <linux/slab.h>
+ #include <linux/moduleparam.h>
+ #include <linux/gcd.h>
+ #include <linux/log2.h>
+@@ -1217,6 +1219,91 @@ static void isp_setfile_radial_gain(u8 *data, size_t len)
+ 	}
+ }
+ 
++/*
++ * Around loading the setfile macOS reads this camera module's own
++ * calibration: the lens shading polynomials of every sensor config, the
++ * sensor NVM and the per-module lens shading before the load; the AWB
++ * calibration matrix, the AWB gains ahead of the CCM and the colour
++ * calibration after it. The driver reads none of it. If the firmware
++ * applies the module calibration only once it has been read, these reads
++ * alone change the picture; in any case the first stream logs what they
++ * return (NVM and grids only as a hash: the NVM also holds the module
++ * serial). macOS's per-module luma shading read is not made: its request
++ * names a macOS buffer address. Off by default (macos_cal_reads).
++ */
++static bool macos_cal_reads;
++module_param(macos_cal_reads, bool, 0644);
++MODULE_PARM_DESC(macos_cal_reads,
++		 "Read the camera module calibration around the setfile load as macOS does (default: off)");
++
++static void isp_ch_macos_cal_reads(struct apple_isp *isp, u32 ch, bool loaded)
++{
++	static const struct {
++		u16 opcode;
++		u16 len;
++		u16 word_off;
++		u16 count;
++		u32 word;
++		bool after_load;
++		bool show;
++		const char *name;
++	} reads[] = {
++		{ CISP_CMD_CH_LSC_POLYNOMIAL_COEFF_GET,
++		  0x48, 0xc, 13, 0, false, false, "LSC polynomial" },
++		{ CISP_CMD_CH_SENSOR_NVM_GET,
++		  0x400, 0x10, 1, 0x1c11, false, false, "sensor NVM" },
++		{ CISP_CMD_CH_SENSOR_PERMODULE_LSC_INFO_GET,
++		  0x14, 0, 1, 0, false, true, "module LSC info" },
++		{ CISP_CMD_CH_SENSOR_PERMODULE_LSC_GRID_GET,
++		  0x400, 0, 1, 0, false, false, "module LSC grid" },
++		{ CISP_CMD_APPLE_CH_AWB_CALIBRATION_MATRIX_GET,
++		  0x5c, 0, 1, 0, true, true, "AWB calibration matrix" },
++		{ CISP_CMD_APPLE_CH_AWB_PRE_CCM_GAIN_GET,
++		  0x18, 0, 1, 0, true, true, "AWB pre-CCM gains" },
++		{ CISP_CMD_CH_COLOR_CAL_ABS_GET,
++		  0x18, 0, 1, 0, true, true, "colour calibration" },
++	};
++	static bool logged;
++	size_t area = ISP_CMD_AREA_SIZE(isp_num_capmeta(isp));
++	unsigned int i, n;
++	u8 *buf;
++	int err;
++
++	if (!READ_ONCE(macos_cal_reads) || !isp->hw->macos_session_settings)
++		return;
++	buf = kzalloc(0x400, GFP_KERNEL);
++	if (!buf)
++		return;
++	for (i = 0; i < ARRAY_SIZE(reads); i++) {
++		if (reads[i].after_load != loaded || reads[i].len > area)
++			continue;
++		for (n = 0; n < reads[i].count; n++) {
++			u32 word = reads[i].count > 1 ? n : reads[i].word;
++
++			memset(buf, 0, reads[i].len);
++			if (reads[i].word_off)
++				memcpy(buf + reads[i].word_off, &word, sizeof(word));
++			err = isp_cmd_ch_raw_get(isp, reads[i].opcode, ch, buf,
++						 reads[i].len);
++			if (logged)
++				continue;
++			if (err)
++				dev_info(isp->dev, "%s %u: read failed: %d\n",
++					 reads[i].name, n, err);
++			else if (reads[i].show)
++				dev_info(isp->dev, "%s: %*ph\n", reads[i].name,
++					 min(reads[i].len - 8, 64), buf + 8);
++			else
++				dev_info(isp->dev, "%s %u: %u bytes, hash %08x\n",
++					 reads[i].name, n, reads[i].len - 8,
++					 jhash(buf + 8, reads[i].len - 8, 0));
++		}
++	}
++	if (loaded)
++		logged = true;
++	kfree(buf);
++}
++
+ static int isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
+ {
+ 	struct isp_format *fmt = isp_get_format(isp, ch);
+@@ -1432,9 +1519,11 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
+ 	 * a failed firmware upload must not silently select firmware defaults.
+ 	 * This model-wide tuning is separate from per-module factory data.
+ 	 */
++	isp_ch_macos_cal_reads(isp, ch, false);
+ 	err = isp_ch_load_setfile(isp, ch);
+ 	if (err && err != -ENOENT)
+ 		return err;
++	isp_ch_macos_cal_reads(isp, ch, true);
+ 
+ 	if (isp->hw->lpdp) {
+ 		err = isp_cmd_ch_lpdp_hs_receiver_tuning_set(isp, ch, 1, 15);
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.c b/drivers/media/platform/apple/isp/isp-cmd.c
+index 5a557136c2..b318d351ce 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.c
++++ b/drivers/media/platform/apple/isp/isp-cmd.c
+@@ -508,6 +508,22 @@ int isp_cmd_ch_mbnr_enable(struct apple_isp *isp, u32 chan, u32 use_case,
+ 	return CISP_SEND_IN(isp, args);
+ }
+ 
++/*
++ * A read whose request is built by the caller: the opcode and channel are
++ * filled in here, the reply replaces the request in buf.
++ */
++int isp_cmd_ch_raw_get(struct apple_isp *isp, u16 opcode, u32 chan, void *buf,
++		       u32 len)
++{
++	u64 op = CISP_OPCODE(opcode);
++
++	if (len < 12)
++		return -EINVAL;
++	memcpy(buf, &op, sizeof(op));
++	memcpy(buf + 8, &chan, sizeof(chan));
++	return cisp_send_read(isp, buf, len, len);
++}
++
+ int isp_cmd_ch_mbnr_config(struct apple_isp *isp, u32 chan, u32 use_case,
+ 			   const u32 config[4])
+ {
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.h b/drivers/media/platform/apple/isp/isp-cmd.h
+index 539924968c..c71a21e26b 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.h
++++ b/drivers/media/platform/apple/isp/isp-cmd.h
+@@ -64,6 +64,7 @@
+ #define CISP_CMD_CH_SENSOR_NVM_GET			     0x0501
+ #define CISP_CMD_CH_SENSOR_PERMODULE_LSC_INFO_GET	     0x0507
+ #define CISP_CMD_CH_SENSOR_PERMODULE_LSC_GRID_GET	     0x0511
++#define CISP_CMD_CH_COLOR_CAL_ABS_GET			     0x0808
+ #define CISP_CMD_CH_LPDP_HS_RECEIVER_TUNING_SET		     0x051b
+ #define CISP_CMD_CH_FOCUS_LIMITS_GET			     0x0701
+ #define CISP_CMD_CH_CROP_GET				     0x0800
+@@ -104,6 +105,8 @@
+ #define CISP_CMD_APPLE_CH_AE_METERING_MODE_SET		     0x8206
+ #define CISP_CMD_APPLE_CH_AE_FD_SCENE_METERING_CONFIG_SET    0x820e
+ #define CISP_CMD_APPLE_CH_AE_FLICKER_FREQ_UPDATE_CURRENT_SET 0x8212
++#define CISP_CMD_APPLE_CH_AWB_PRE_CCM_GAIN_GET		     0x830c
++#define CISP_CMD_APPLE_CH_AWB_CALIBRATION_MATRIX_GET	     0x831b
+ #define CISP_CMD_APPLE_CH_AWB_RGB_COLORSPACE_SET	     0x831d
+ #define CISP_CMD_APPLE_CH_AWB_TEMPORAL_STABILIZER_SET	     0x8327
+ #define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_START		     0xc100
+@@ -595,6 +598,8 @@ int isp_cmd_ch_als_disable(struct apple_isp *isp, u32 chan);
+ int isp_cmd_ch_cnr_start(struct apple_isp *isp, u32 chan);
+ int isp_cmd_ch_mbnr_enable(struct apple_isp *isp, u32 chan, u32 use_case,
+ 			   u32 mode, u32 enable_chroma);
++int isp_cmd_ch_raw_get(struct apple_isp *isp, u16 opcode, u32 chan, void *buf,
++		       u32 len);
+ int isp_cmd_ch_mbnr_config(struct apple_isp *isp, u32 chan, u32 use_case,
+ 			   const u32 config[4]);
+ int isp_cmd_ch_sif_pixel_format_set(struct apple_isp *isp, u32 chan,
+-- 
+2.43.0
+

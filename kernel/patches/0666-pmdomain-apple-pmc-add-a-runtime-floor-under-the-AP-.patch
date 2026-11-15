@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 07:46:05 +0000
+Subject: [PATCH] pmdomain: apple: pmc: add a runtime floor under the
+ AP's DCS vote
+
+The application processor's agent keeps the DRAM controller (DCS) vote
+it had before probe, raised only by the floor domains and capped by a
+thermal limit, while the PMP's vote follows GPU load. Nothing raises
+the DRAM state for CPU-only memory traffic. On the J604 a single-thread
+copy reaches 71-74 GB/s against macOS's 97 GB/s from the same source,
+and AP-to-PMP traffic is not what makes the difference: a loop of PMP
+vote writes, of reads and of sleeps all land within 3 % of nothing.
+
+Add pmc.ap_dcs_floor, a DCS state floor under the AP's vote that
+can be set at run time and is applied at once, so that one kernel can
+measure what a raised AP vote does to CPU memory bandwidth and power.
+A thermal limit still caps it. 0, the default, changes nothing.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/pmdomain/apple/pmc.c | 42 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/pmdomain/apple/pmc.c b/drivers/pmdomain/apple/pmc.c
+index 72a4de75ba..c98a0edd2f 100644
+--- a/drivers/pmdomain/apple/pmc.c
++++ b/drivers/pmdomain/apple/pmc.c
+@@ -461,17 +461,51 @@ static unsigned int apple_pmc_ap_dcs_read(struct apple_pmc *pmc)
+  * agents ask for and the DCS floors held, capped by the limit; without a
+  * limit, the vote the AP's agent had before probe or the floors, if higher.
+  */
++/*
++ * A floor under the AP agent's own DCS vote, by state number (0 = none, the default). The AP's
++ * vote otherwise stays where it was before probe: CPU-only memory traffic doesn't raise the
++ * DRAM controller's state here, while the PMP's vote follows the GPU. Set at run time to
++ * measure what a raised AP vote does to CPU memory bandwidth; a thermal limit still caps it.
++ */
++static unsigned int ap_dcs_floor;
++static struct apple_pmc *apple_pmc_ap_floor_pmc;
++
++static void apple_pmc_dcs_vote(struct apple_pmc *pmc);
++
++static int apple_pmc_ap_dcs_floor_set(const char *val, const struct kernel_param *kp)
++{
++	struct apple_pmc *pmc = READ_ONCE(apple_pmc_ap_floor_pmc);
++	unsigned long flags;
++	int ret = param_set_uint(val, kp);
++
++	if (ret || !pmc)
++		return ret;
++	raw_spin_lock_irqsave(&pmc->lock, flags);
++	apple_pmc_dcs_vote(pmc);
++	raw_spin_unlock_irqrestore(&pmc->lock, flags);
++	return 0;
++}
++
++static const struct kernel_param_ops apple_pmc_ap_dcs_floor_ops = {
++	.set = apple_pmc_ap_dcs_floor_set,
++	.get = param_get_uint,
++};
++module_param_cb(ap_dcs_floor, &apple_pmc_ap_dcs_floor_ops, &ap_dcs_floor, 0644);
++MODULE_PARM_DESC(ap_dcs_floor,
++		 "Floor under the application processor's DRAM controller (DCS) vote, by state (default 0: none)");
++
+ static void apple_pmc_dcs_vote(struct apple_pmc *pmc)
+ {
+ 	const struct apple_pmc_hw *hw = pmc->hw;
+ 	void __iomem *reg = pmc->voters + hw->ap_agent * hw->agent_stride;
+ 	u32 mask = APPLE_PMC_RAIL_MASK(hw->dcs_rail);
+-	unsigned int state = max(pmc->ap_dcs_vote, pmc->dcs_floor);
++	unsigned int floor = max(pmc->dcs_floor, min(READ_ONCE(ap_dcs_floor), hw->dcs_max));
++	unsigned int state = max(pmc->ap_dcs_vote, floor);
+ 	u32 old, val;
+ 
+ 	if (pmc->dcs_state)
+ 		state = min_t(unsigned int,
+-			      max(apple_pmc_dcs_demand(pmc), pmc->dcs_floor),
++			      max(apple_pmc_dcs_demand(pmc), floor),
+ 			      hw->dcs_max - pmc->dcs_state);
+ 
+ 	old = readl(reg);
+@@ -1307,6 +1341,8 @@ static void apple_pmc_release(void *data)
+ 	unsigned long flags;
+ 	unsigned int rail;
+ 
++	if (READ_ONCE(apple_pmc_ap_floor_pmc) == pmc)
++		WRITE_ONCE(apple_pmc_ap_floor_pmc, NULL);
+ 	of_platform_depopulate(pmc->dev);
+ 	debugfs_remove_recursive(pmc->debugfs);
+ 	list_for_each_entry_safe_reverse(dom, tmp, &pmc->domains, list) {
+@@ -1426,6 +1462,8 @@ static int apple_pmc_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	platform_set_drvdata(pdev, pmc);
++	if (pmc->hw->dcs_max)
++		WRITE_ONCE(apple_pmc_ap_floor_pmc, pmc);
+ 	ret = devm_add_action_or_reset(dev, apple_pmc_release, pmc);
+ 	if (ret)
+ 		return ret;
+-- 
+2.43.0
+
