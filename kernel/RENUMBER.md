@@ -1159,3 +1159,10 @@ New in 1.938: 0730 (`sched/fair: Treat a task that runs without sleeping on a sm
 Kernel 1.939 keeps the base (`da8e1acf3656`) and all 736 patches of 1.938 under the same numbers.
 
 New in 1.939: 0737 (`soc: apple: clpc: let the all-core ceiling be set at run time`), 0738 (`soc: apple: clpc: optionally hold an idle cluster at its slowest state`), 0739 (`media: apple: avd: HEVC test switch for the 10-bit packed-format scratch`), 0740 (`drm/asahi: g16: Count why commands wait on their dependencies`), 0741 (`drm/asahi: g16: Latch the render units apart from the resident depth`), 0742 (`drm/asahi: g16: Optionally revive a fail-stopped GPU at the next real wake`), 0743 (`sched/features: Enable MISFIT_RUNTIME`).
+
+
+# Kernel patch numbers: 1.939 to 1.940
+
+Kernel 1.940 keeps the base (`da8e1acf3656`) and all 743 patches of 1.939 under the same numbers.
+
+New in 1.940: 0744 (`hwmon: macsmc: Print voltage and current keys in the debugfs key list`), 0745 (`media: apple: isp: keep the camera firmware up 5 s after a stream`), 0746 (`media: apple: isp: offer 1080p60 by default on T8132`).
