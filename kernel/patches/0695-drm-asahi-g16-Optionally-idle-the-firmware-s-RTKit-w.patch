@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 14:12:10 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally idle the firmware's RTKit
+ when the GPU is idle
+
+On the M4 the GPU never powers off at an idle desktop under this
+driver: its domain reads fully on 100 % of the time, where macOS shows
+it off and gated nearly all the time. macOS's idle static power-off
+gets there from the host: an idle timer, once the device-control ring
+is empty, asks the GPU's RTKit for a lower power state
+(AGXArmFirmware::changePowerStateTo()), and ensurePoweredHardware()
+brings it back before the next work.
+
+Add g16_rt_idle_ms (runtime, default 0). Set, the poll pass that finds
+the engine idle (nothing in flight or pending, no recovery, every
+device-control record consumed) for that many milliseconds puts the
+firmware's RTKit into idle, AP and IOP power state 0x201 with its state
+kept, the same request a suspend-to-idle with g16_s2idle_idle makes.
+While idle, poll passes leave the firmware alone. Publication wakes it
+first and restates the power-assert count in its scratch cell, as the
+s2idle wake does; a failed wake reaches the publish caller, which
+fail-stops the device. A system sleep wakes it before its own path
+runs. Counters are in the stats file ("rt_idle:").
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/channel.rs |  5 ++
+ drivers/gpu/drm/asahi/g16/engine.rs  |  2 +
+ drivers/gpu/drm/asahi/g16/params.rs  | 20 +++++++
+ drivers/gpu/drm/asahi/g16/poll.rs    | 24 +++++++-
+ drivers/gpu/drm/asahi/g16/sleep.rs   | 90 ++++++++++++++++++++++++++++
+ 5 files changed, 140 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/channel.rs b/drivers/gpu/drm/asahi/g16/channel.rs
+index c204c61b48..43208c0e0b 100644
+--- a/drivers/gpu/drm/asahi/g16/channel.rs
++++ b/drivers/gpu/drm/asahi/g16/channel.rs
+@@ -191,6 +191,11 @@ pub(crate) fn devctl_producer(&self) -> u32 {
+         self.devctl_producer
+     }
+ 
++    /// Whether the firmware consumed every posted device-control record.
++    pub(crate) fn devctl_consumed(&self) -> Result<bool> {
++        Ok(self.devctl.read()? == self.devctl_producer)
++    }
++
+     /// Stage the boot NOP before the initdata root is handed to the firmware.
+     pub(crate) fn stage_boot_nop(&mut self, session: &Session, init: &InitData) -> Result {
+         if self.devctl_producer != 0
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 521fa34459..ba8b393a93 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -971,6 +971,8 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+         if self.session.shared.sleeping.load(core::sync::atomic::Ordering::Acquire) {
+             return Ok(());
+         }
++        // A firmware idled at runtime (g16_rt_idle_ms) is woken before anything is published.
++        self.rt_wake()?;
+         self.session.check()?;
+         self.objects.health()?;
+         self.service_power()?;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index bc29eb7eff..7529d5630b 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1173,6 +1173,26 @@ pub(crate) fn s2idle() -> bool {
+     "G16: at suspend-to-idle, drain the GPU (never refusing the sleep) and publish the idle performance floor; poll at resume (default 1; 0: no s2idle callbacks, as before; runtime 0644)"
+ );
+ 
++/// Storage of `g16_rt_idle_ms` (runtime 0644, default 0).
++static RT_IDLE_MS: AtomicU32 = AtomicU32::new(0);
++
++/// Milliseconds the GPU must stay idle (nothing in flight or pending, device control
++/// consumed) before its firmware's RTKit is put into idle (AP and IOP 0x201, state kept)
++/// until the next submission wakes it, as macOS's idle static power-off asks the GPU's RTKit
++/// for a lower power state from its idle timer. 0 never idles the firmware at runtime.
++pub(crate) fn rt_idle_ms() -> u32 {
++    RT_IDLE_MS.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    RT_IDLE_MS_PARAM,
++    RT_IDLE_MS_PARMTYPE,
++    RT_IDLE_MS_PARM,
++    RT_IDLE_MS,
++    "g16_rt_idle_ms",
++    "G16: idle the GPU firmware's RTKit after this many ms with no GPU work, wake it at the next submission (default 0: never at runtime; runtime 0644)"
++);
++
+ /// Storage of `g16_s2idle_idle` (runtime 0644, default 0).
+ static S2IDLE_IDLE: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 2539ccd3a7..0d7b970840 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -109,7 +109,13 @@ pub(crate) fn run_poll(self: Arc<Self>) {
+                         ))
+                     }
+                     // The last pass of this busy period: nothing comes back to drop it later.
+-                    Ok(false) => self.lat_qos(false, true),
++                    // With g16_rt_idle_ms, a pass after that many ms idles the firmware.
++                    Ok(false) => {
++                        self.lat_qos(false, true);
++                        if let Some(ms) = firmware.rt_idle_tick() {
++                            self.mod_poll(kernel::time::msecs_to_jiffies(ms));
++                        }
++                    }
+                     Err(error) => {
+                         self.lat_qos(false, true);
+                         firmware.fail_stop(error, &mut done);
+@@ -274,6 +280,11 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+         if self.recovery.failed().is_some() {
+             return Ok(false);
+         }
++        // The firmware's RTKit is idle (g16_rt_idle_ms): nothing to retire, nothing to touch
++        // until the next submission wakes it.
++        if super::sleep::rt_idled() {
++            return Ok(false);
++        }
+         self.session.check()?;
+         self.objects.health()?;
+         self.service_power()?;
+@@ -1324,6 +1335,17 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             super::sleep::S2IDLE_STATS[2].load(core::sync::atomic::Ordering::Relaxed),
+             super::sleep::S2IDLE_STATS[3].load(core::sync::atomic::Ordering::Relaxed)
+         )?;
++        writeln!(
++            f,
++            "rt_idle: ms {} idled_now {} idles {} refused {} wakes {} wake_failed {} last_wake_us {}",
++            super::params::rt_idle_ms(),
++            u8::from(super::sleep::rt_idled()),
++            super::sleep::RT_IDLE_STATS[0].load(core::sync::atomic::Ordering::Relaxed),
++            super::sleep::RT_IDLE_STATS[1].load(core::sync::atomic::Ordering::Relaxed),
++            super::sleep::RT_IDLE_STATS[2].load(core::sync::atomic::Ordering::Relaxed),
++            super::sleep::RT_IDLE_STATS[3].load(core::sync::atomic::Ordering::Relaxed),
++            super::sleep::RT_IDLE_STATS[4].load(core::sync::atomic::Ordering::Relaxed)
++        )?;
+         writeln!(
+             f,
+             "s2idle_idle: enabled {} idled {} refused {} wake_failed {} last_wake_us {}",
+diff --git a/drivers/gpu/drm/asahi/g16/sleep.rs b/drivers/gpu/drm/asahi/g16/sleep.rs
+index 0f389d6a07..608c4a3c12 100644
+--- a/drivers/gpu/drm/asahi/g16/sleep.rs
++++ b/drivers/gpu/drm/asahi/g16/sleep.rs
+@@ -48,6 +48,25 @@
+     [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+ /// From an s2idle `.prepare` that left the firmware in RTKit idle until the wake at `.complete`.
+ static S2IDLE_IDLED: AtomicBool = AtomicBool::new(false);
++/// Runtime RTKit idle (`g16_rt_idle_ms`), for `aurora-g16/stats` (`rt_idle:`): idles entered,
++/// idles refused (the firmware is then woken at the next submission like an idled one),
++/// wakes, wakes failed, the last wake in us. Changed under the device lock only.
++pub(crate) static RT_IDLE_STATS: [AtomicU64; 5] = [
++    AtomicU64::new(0),
++    AtomicU64::new(0),
++    AtomicU64::new(0),
++    AtomicU64::new(0),
++    AtomicU64::new(0),
++];
++/// The firmware's RTKit was asked to idle at runtime and not woken since (device lock).
++static RT_IDLED: AtomicBool = AtomicBool::new(false);
++/// When the engine was first seen idle with g16_rt_idle_ms set, 0 if not (device lock).
++static RT_IDLE_SINCE: AtomicU64 = AtomicU64::new(0);
++
++/// Whether the firmware's RTKit is idled at runtime (`g16_rt_idle_ms`).
++pub(crate) fn rt_idled() -> bool {
++    RT_IDLED.load(Ordering::Acquire)
++}
+ const DRAIN_TICK_MS: i64 = 2;
+ 
+ extern "C" {
+@@ -66,6 +85,8 @@ fn asahi_g16_commit_prepare(
+ impl Firmware {
+     /// Nothing published, nothing waiting and no recovery under way.
+     fn sleep_quiet(&mut self) -> Result<bool> {
++        // A system sleep starts from an awake firmware, never from a runtime-idled one.
++        self.rt_wake()?;
+         self.drain_rings()?;
+         Ok(self.engine.flights.is_empty()
+             && self.engine.pending.is_empty()
+@@ -73,6 +94,75 @@ fn sleep_quiet(&mut self) -> Result<bool> {
+             && self.recovery_idle()?)
+     }
+ 
++    /// One idle pass with `g16_rt_idle_ms` set, under the device lock: the first sees the
++    /// engine idle and asks for a pass after that many ms; a pass at or after it, with the
++    /// engine still idle and every device-control record consumed, idles the firmware's RTKit
++    /// (AP and IOP 0x201, state kept). Some(ms) = poll again after ms.
++    pub(crate) fn rt_idle_tick(&mut self) -> Option<u32> {
++        let ms = params::rt_idle_ms();
++        if ms == 0 || rt_idled() {
++            RT_IDLE_SINCE.store(0, Ordering::Relaxed);
++            return None;
++        }
++        let idle = self.engine.flights.is_empty()
++            && self.engine.pending.is_empty()
++            && !self.engine.frozen
++            && !self.engine.chan_wait
++            && self.recovery.failed().is_none()
++            && self.recovery_idle().unwrap_or(false);
++        if !idle {
++            RT_IDLE_SINCE.store(0, Ordering::Relaxed);
++            return None;
++        }
++        let now = now_ns();
++        let since = RT_IDLE_SINCE.load(Ordering::Relaxed);
++        if since == 0 {
++            RT_IDLE_SINCE.store(now, Ordering::Relaxed);
++            return Some(ms);
++        }
++        let waited = now.saturating_sub(since) / 1_000_000;
++        if waited < u64::from(ms) {
++            return Some(ms - waited as u32);
++        }
++        if !self.channels.devctl_consumed().unwrap_or(false) {
++            return Some(ms);
++        }
++        RT_IDLE_SINCE.store(0, Ordering::Relaxed);
++        // Marked idled even when the request fails part-way (the AP may be idle already):
++        // the next submission then goes through the full wake handshake.
++        RT_IDLED.store(true, Ordering::Release);
++        match self.session.rtkit.idle() {
++            Ok(()) => {
++                RT_IDLE_STATS[0].fetch_add(1, Ordering::Relaxed);
++            }
++            Err(_) => {
++                RT_IDLE_STATS[1].fetch_add(1, Ordering::Relaxed);
++            }
++        }
++        None
++    }
++
++    /// Wakes a firmware idled at runtime and restates the power-assert count in its SGX
++    /// scratch cell (macOS restores that scratch RAM around the same transition). The error
++    /// of a failed wake goes to the caller, whose failure path fail-stops the device.
++    pub(crate) fn rt_wake(&mut self) -> Result {
++        if !rt_idled() {
++            return Ok(());
++        }
++        let started = now_ns();
++        let result = self.session.rtkit.wake().and_then(|_| {
++            let count = self.channels.devctl_producer();
++            self.session.regs.set_generation(count)
++        });
++        RT_IDLED.store(false, Ordering::Release);
++        RT_IDLE_STATS[2].fetch_add(1, Ordering::Relaxed);
++        RT_IDLE_STATS[4].store(now_ns().saturating_sub(started) / 1000, Ordering::Relaxed);
++        if result.is_err() {
++            RT_IDLE_STATS[3].fetch_add(1, Ordering::Relaxed);
++        }
++        result
++    }
++
+     /// The run bit and the RTKit handshake, with the firmware's state as it was left.
+     fn sleep_restart(&mut self) -> Result {
+         self.session.rtkit.warm_restart()?;
+-- 
+2.43.0
+

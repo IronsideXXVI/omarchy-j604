@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 14:42:02 +0000
+Subject: [PATCH] media: apple: isp: optionally start the firmware when
+ the camera is opened
+
+A cold open-to-first-frame on T8132 is 0.53 s, and 239 ms of it pass
+before the freshly started firmware takes its first command. With the
+firmware kept running (fw_keep_ms) a re-open takes 0.28 s, but the first
+open after a while still pays the full start.
+
+Applications open the camera before they start a stream. Add
+fw_prewarm: opening the video node then starts the firmware in the
+background, from a work item under the video lock, and leaves it running
+as fw_keep_ms does, for at least 10 s; the stream that follows uses it
+as is. Nothing waits on it in open(). Sleep, hibernation, shutdown and
+unbind cancel it. Off by default.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit a357a5e8f6dfc8bef394b67f4c3fe367f91e8f0e)
+---
+ drivers/media/platform/apple/isp/isp-cam.c  | 35 +++++++++++++++++++++
+ drivers/media/platform/apple/isp/isp-cam.h  |  2 ++
+ drivers/media/platform/apple/isp/isp-drv.c  |  5 +++
+ drivers/media/platform/apple/isp/isp-drv.h  |  1 +
+ drivers/media/platform/apple/isp/isp-v4l2.c | 11 ++++++-
+ 5 files changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index 7615f845fb..e6de99dec8 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -1829,6 +1829,41 @@ void apple_isp_fw_cool_work(struct work_struct *work)
+ 				       fw_cool_work));
+ }
+ 
++/*
++ * Applications open the camera some time before they start a stream. With
++ * fw_prewarm, an open starts the firmware in the background and leaves it
++ * running as fw_keep_ms does (at least 10 s), so that the stream that
++ * follows does not wait for the firmware start. Off by default.
++ */
++static bool fw_prewarm;
++module_param(fw_prewarm, bool, 0644);
++MODULE_PARM_DESC(fw_prewarm,
++		 "Start the camera firmware when the video node is opened (default: off)");
++
++void apple_isp_fw_prewarm_work(struct work_struct *work)
++{
++	struct apple_isp *isp = container_of(work, struct apple_isp,
++					      fw_prewarm_work);
++
++	mutex_lock(&isp->video_lock);
++	if (!test_bit(ISP_STATE_STREAMING, &isp->state) && isp->camera_detected &&
++	    !isp->fw_warm && isp->fw_state == ISP_FW_OFF &&
++	    !apple_isp_firmware_boot(isp)) {
++		isp->fw_warm = true;
++		schedule_delayed_work(&isp->fw_cool_work,
++				      msecs_to_jiffies(max(READ_ONCE(fw_keep_ms),
++							   10000U)));
++	}
++	mutex_unlock(&isp->video_lock);
++}
++
++/* From the video node's open: never waits for the firmware. */
++void apple_isp_fw_prewarm(struct apple_isp *isp)
++{
++	if (READ_ONCE(fw_prewarm) && !isp->hw->resident_fw)
++		schedule_work(&isp->fw_prewarm_work);
++}
++
+ int apple_isp_start_camera(struct apple_isp *isp)
+ {
+ 	struct isp_format *fmt = isp_get_current_format(isp);
+diff --git a/drivers/media/platform/apple/isp/isp-cam.h b/drivers/media/platform/apple/isp/isp-cam.h
+index 89224da7e0..abc8a702e8 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.h
++++ b/drivers/media/platform/apple/isp/isp-cam.h
+@@ -25,6 +25,8 @@ int apple_isp_start_camera(struct apple_isp *isp);
+ void apple_isp_stop_camera(struct apple_isp *isp);
+ void apple_isp_fw_cool(struct apple_isp *isp);
+ void apple_isp_fw_cool_work(struct work_struct *work);
++void apple_isp_fw_prewarm(struct apple_isp *isp);
++void apple_isp_fw_prewarm_work(struct work_struct *work);
+ 
+ int apple_isp_start_capture(struct apple_isp *isp);
+ void apple_isp_stop_capture(struct apple_isp *isp);
+diff --git a/drivers/media/platform/apple/isp/isp-drv.c b/drivers/media/platform/apple/isp/isp-drv.c
+index eaf176a4c3..a3e1b2f1ec 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.c
++++ b/drivers/media/platform/apple/isp/isp-drv.c
+@@ -948,6 +948,7 @@ static int apple_isp_probe(struct platform_device *pdev)
+ 	mutex_init(&isp->video_lock);
+ 	INIT_WORK(&isp->resume_work, apple_isp_resume_work);
+ 	INIT_DELAYED_WORK(&isp->fw_cool_work, apple_isp_fw_cool_work);
++	INIT_WORK(&isp->fw_prewarm_work, apple_isp_fw_prewarm_work);
+ 	spin_lock_init(&isp->buf_lock);
+ 	init_waitqueue_head(&isp->wait);
+ 	INIT_LIST_HEAD(&isp->gc);
+@@ -1038,6 +1039,7 @@ static void apple_isp_remove(struct platform_device *pdev)
+ 
+ 	debugfs_remove_recursive(isp->debugfs);
+ 	cancel_work_sync(&isp->resume_work);
++	cancel_work_sync(&isp->fw_prewarm_work);
+ 	cancel_delayed_work_sync(&isp->fw_cool_work);
+ 	apple_isp_fw_cool(isp);
+ 	apple_isp_remove_video(isp);
+@@ -1626,6 +1628,7 @@ static __maybe_unused int apple_isp_suspend(struct device *dev)
+ 	 */
+ 	apple_isp_video_suspend(isp);
+ 	/* Firmware kept running after a stream does not cross a sleep. */
++	cancel_work_sync(&isp->fw_prewarm_work);
+ 	cancel_delayed_work_sync(&isp->fw_cool_work);
+ 	apple_isp_fw_cool(isp);
+ 
+@@ -1646,6 +1649,7 @@ static __maybe_unused int apple_isp_freeze(struct device *dev)
+ 
+ 	apple_isp_video_suspend(isp);
+ 	/* Firmware kept running after a stream does not cross a sleep. */
++	cancel_work_sync(&isp->fw_prewarm_work);
+ 	cancel_delayed_work_sync(&isp->fw_cool_work);
+ 	apple_isp_fw_cool(isp);
+ 
+@@ -1711,6 +1715,7 @@ static void apple_isp_shutdown(struct platform_device *pdev)
+ 	/* A stream that still runs is stopped cleanly first, as for hibernation */
+ 	apple_isp_video_suspend(isp);
+ 	/* Firmware kept running after a stream does not cross a sleep. */
++	cancel_work_sync(&isp->fw_prewarm_work);
+ 	cancel_delayed_work_sync(&isp->fw_cool_work);
+ 	apple_isp_fw_cool(isp);
+ 	mutex_lock(&isp->video_lock);
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 36d063659e..8396c409ba 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -525,6 +525,7 @@ struct apple_isp {
+ 	bool fw_warm;
+ 	bool fw_reused;
+ 	struct delayed_work fw_cool_work;
++	struct work_struct fw_prewarm_work;
+ 
+ 	/* digital zoom in percent (digital_zoom), applied by zoom_work */
+ 	struct v4l2_ctrl *zoom;
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index b14b88f678..1e7dfe5abe 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -1154,9 +1154,18 @@ static const struct v4l2_ioctl_ops isp_v4l2_ioctl_ops = {
+ 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
+ };
+ 
++static int isp_v4l2_open(struct file *file)
++{
++	int err = v4l2_fh_open(file);
++
++	if (!err)
++		apple_isp_fw_prewarm(video_drvdata(file));
++	return err;
++}
++
+ static const struct v4l2_file_operations isp_v4l2_fops = {
+ 	.owner = THIS_MODULE,
+-	.open = v4l2_fh_open,
++	.open = isp_v4l2_open,
+ 	.release = vb2_fop_release,
+ 	.read = vb2_fop_read,
+ 	.poll = vb2_fop_poll,
+-- 
+2.43.0
+

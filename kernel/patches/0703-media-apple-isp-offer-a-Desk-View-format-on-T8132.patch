@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 14:46:33 +0000
+Subject: [PATCH] media: apple: isp: offer a Desk View format on T8132
+
+macOS offers this camera's Desk View as a second device with one 1920x1440
+format: the desk below the screen, taken from the lower part of the wide
+field and dewarped by the ISP firmware's tile GDC, which works from the
+module's own distortion data. The firmware has a desk mode, a tile GDC
+enable and a GDC strength next to the commands this driver already uses.
+
+With the desk_view parameter set, offer a 1920x1440 format cut from the
+lower 4:3 window of sensor config 6 (2560x1920 at 240,960 of its
+3040x2880 array) and stream it with the desk mode and tile GDC on and
+the GDC strength the firmware reports as its maximum, handed back as
+reported. What macOS sends for these three is not known yet, so this is
+off by default.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit 0d6228097c24d3ce521914889adb7214d13b6957)
+---
+ drivers/media/platform/apple/isp/isp-cam.c | 67 +++++++++++++++++++++-
+ drivers/media/platform/apple/isp/isp-cmd.h |  4 ++
+ 2 files changed, 70 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-cam.c b/drivers/media/platform/apple/isp/isp-cam.c
+index e6de99dec8..ffbd7115be 100644
+--- a/drivers/media/platform/apple/isp/isp-cam.c
++++ b/drivers/media/platform/apple/isp/isp-cam.c
+@@ -822,6 +822,31 @@ static const struct coord isp_tall_sizes[] = {
+ 	{ 1328, 1760 }, { 1080, 1920 },
+ };
+ 
++/*
++ * Desk View: macOS offers it as a second camera, 1920x1440, a view of the
++ * desk from the lower part of the wide field that the firmware dewarps with
++ * its tile GDC from the module's own distortion data. With desk_view, a
++ * 1920x1440 format is cut from the lower 4:3 window of config 6 and
++ * streamed with the firmware's desk mode, tile GDC and its maximum GDC
++ * strength. The values of those three are not known from macOS yet.
++ */
++static bool desk_view;
++module_param(desk_view, bool, 0444);
++MODULE_PARM_DESC(desk_view, "T8132: offer a 1920x1440 Desk View format (default: off)");
++
++static const struct isp_preset isp_desk_source = {
++	.index = 6,
++	.input_dim = { 3040, 5760 },
++	.crop_offset = { 240, 960 },
++	.crop_size = { 2560, 1920 },
++	.output_dim = { 1920, 1440 },
++};
++
++static bool isp_desk_size(struct coord dim)
++{
++	return READ_ONCE(desk_view) && dim.x == 1920 && dim.y == 1440;
++}
++
+ int apple_isp_add_wide_presets(struct apple_isp *isp)
+ {
+ 	struct isp_preset *presets, cut;
+@@ -837,7 +862,7 @@ int apple_isp_add_wide_presets(struct apple_isp *isp)
+ 		return 0;
+ 
+ 	presets = devm_kcalloc(isp->dev, num + ARRAY_SIZE(isp_wide_sizes) +
+-			       ARRAY_SIZE(isp_tall_sizes),
++			       ARRAY_SIZE(isp_tall_sizes) + 1,
+ 			       sizeof(*presets), GFP_KERNEL);
+ 	if (!presets)
+ 		return -ENOMEM;
+@@ -869,6 +894,12 @@ int apple_isp_add_wide_presets(struct apple_isp *isp)
+ 		presets[n].tall = true;
+ 		n++;
+ 	}
++	if (READ_ONCE(desk_view) &&
++	    isp_size_from_crop(&isp_desk_source, isp_desk_source.output_dim, &cut)) {
++		presets[n] = cut;
++		presets[n].wide_only = true;
++		n++;
++	}
+ 	isp->presets = presets;
+ 	isp->num_presets = n;
+ 	return 0;
+@@ -881,6 +912,9 @@ static bool isp_cut_wide(const struct isp_preset *preset,
+ 	if (preset->tall)
+ 		return isp_size_from_crop(&isp_tall_source, preset->output_dim,
+ 					  wide);
++	if (isp_desk_size(preset->output_dim))
++		return isp_size_from_crop(&isp_desk_source, preset->output_dim,
++					  wide);
+ 	return isp_size_from_crop(isp_wide_window(), preset->output_dim, wide);
+ }
+ 
+@@ -1275,6 +1309,36 @@ static void isp_ch_ae_gain_min(struct apple_isp *isp, u32 ch)
+ 		dev_info_once(isp->dev, "AE gain floor %u/256 (test)\n", min);
+ }
+ 
++/* The firmware's desk mode for a Desk View stream (desk_view). */
++static void isp_ch_desk_view(struct apple_isp *isp, u32 ch)
++{
++	u32 buf[5] = {};
++	int err;
++
++	if (!isp_desk_size(isp->stream_preset.output_dim))
++		return;
++	err = isp_cmd_ch_u32_set(isp, CISP_CMD_CH_DESKVIEW_MODE_SET, ch, 1);
++	if (!err) {
++		buf[3] = 1;
++		err = isp_cmd_ch_raw_get(isp, CISP_CMD_CH_TILE_GDC_ENABLE, ch, buf,
++					 sizeof(buf));
++	}
++	if (!err) {
++		memset(buf, 0, sizeof(buf));
++		err = isp_cmd_ch_raw_get(isp, CISP_CMD_CH_MAX_GDC_STRENGTH_GET, ch,
++					 buf, sizeof(buf));
++	}
++	/* Hand the strength back in the form the firmware reported it. */
++	if (!err) {
++		dev_info_once(isp->dev, "desk view: max GDC strength %08x %08x\n",
++			      buf[3], buf[4]);
++		err = isp_cmd_ch_raw_get(isp, CISP_CMD_CH_GDC_STRENGTH_SET, ch, buf,
++					 sizeof(buf));
++	}
++	if (err)
++		dev_warn_once(isp->dev, "desk view setup refused: %d\n", err);
++}
++
+ static void isp_ch_macos_face_detect(struct apple_isp *isp, u32 ch)
+ {
+ 	int err;
+@@ -1764,6 +1828,7 @@ static int isp_ch_configure_capture(struct apple_isp *isp, u32 ch)
+ 
+ 	isp_ch_macos_face_detect(isp, ch);
+ 	isp_ch_ae_gain_min(isp, ch);
++	isp_ch_desk_view(isp, ch);
+ 
+ 	if (READ_ONCE(macos_be_la) && isp->hw->macos_session_settings) {
+ 		err = isp_cmd_ch_be_lasetting_set(isp, ch, isp_macos_be_la);
+diff --git a/drivers/media/platform/apple/isp/isp-cmd.h b/drivers/media/platform/apple/isp/isp-cmd.h
+index 4c4ebbd33a..52032c63fd 100644
+--- a/drivers/media/platform/apple/isp/isp-cmd.h
++++ b/drivers/media/platform/apple/isp/isp-cmd.h
+@@ -88,9 +88,13 @@
+ #define CISP_CMD_CH_MBNR_ENABLE				     0x0a3a
+ #define CISP_CMD_CH_MBNR_CONFIG				     0x0a3b
+ #define CISP_CMD_CH_CPP_MODE				     0x0a4b
++#define CISP_CMD_CH_TILE_GDC_ENABLE			     0x0a42
++#define CISP_CMD_CH_MAX_GDC_STRENGTH_GET		     0x0a46
++#define CISP_CMD_CH_GDC_STRENGTH_SET			     0x0a47
+ #define CISP_CMD_CH_LSC_STRENGTH_SET			     0x0a4c
+ #define CISP_CMD_CH_HDRC_ENABLE				     0x0a48
+ #define CISP_CMD_CH_LSC_IDEAL_PERCENT_SET		     0x0a4e
++#define CISP_CMD_CH_DESKVIEW_MODE_SET			     0x0a50
+ #define CISP_CMD_CH_OUTPUT_CONFIG_SET			     0x0b01
+ #define CISP_CMD_CH_OUTPUT_CONFIG_SCL1_SET		     0x0b09
+ #define CISP_CMD_CH_PREVIEW_STREAM_SET			     0x0b0d
+-- 
+2.43.0
+

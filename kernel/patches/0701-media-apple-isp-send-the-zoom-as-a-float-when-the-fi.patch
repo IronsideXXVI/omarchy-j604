@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 14:36:47 +0000
+Subject: [PATCH] media: apple: isp: send the zoom as a float when the
+ firmware reports no factor
+
+On T8132 the digital zoom never moved: CURRENT_ZOOM_FACTOR_GET and
+MAX_ZOOM_FACTOR_GET both answer 0, so the driver took the zoom as
+unusable and sent nothing. The firmware's own log prints the factor it
+is given as a float ("Set Zoom factor [%.2f]").
+
+When the firmware reports no factor, send it as an IEEE 754 single
+(1.75 for 175 %), worked out without floating point; a reported factor
+is still scaled and capped as before. A KUnit case covers both forms,
+including the zero answer.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+(cherry picked from commit 08d07c2dd0435f195690de6e1f6207b3363b6abf)
+---
+ drivers/media/platform/apple/isp/isp-drv.h    |  1 +
+ .../platform/apple/isp/isp-framing-test.c     | 15 ++++++++++++
+ .../media/platform/apple/isp/isp-framing.c    | 24 +++++++++++++++++++
+ .../media/platform/apple/isp/isp-framing.h    |  1 +
+ drivers/media/platform/apple/isp/isp-v4l2.c   | 14 +++++++----
+ 5 files changed, 50 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 63d153e693..36d063659e 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -533,6 +533,7 @@ struct apple_isp {
+ 	u32 zoom_unit;
+ 	u32 zoom_max;
+ 	bool zoom_failed;
++	bool zoom_float;
+ 	/* auto framing (with digital_zoom): drives the zoom from face boxes */
+ 	struct v4l2_ctrl *auto_framing;
+ 	bool auto_framing_on;
+diff --git a/drivers/media/platform/apple/isp/isp-framing-test.c b/drivers/media/platform/apple/isp/isp-framing-test.c
+index 765e69dbf9..9515753457 100644
+--- a/drivers/media/platform/apple/isp/isp-framing-test.c
++++ b/drivers/media/platform/apple/isp/isp-framing-test.c
+@@ -119,11 +119,26 @@ static void isp_test_framing_lost_face(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, st.cy, 500);
+ }
+ 
++/* The 1.931 firmware reported a zoom factor of 0 at 1x (lit hold 18297). */
++static void isp_test_zoom_encode(struct kunit *test)
++{
++	KUNIT_EXPECT_EQ(test, isp_zoom_encode(100, 0, 0), 0x3f800000);
++	KUNIT_EXPECT_EQ(test, isp_zoom_encode(175, 0, 0), 0x3fe00000);
++	KUNIT_EXPECT_EQ(test, isp_zoom_encode(200, 0, 0), 0x40000000);
++	KUNIT_EXPECT_EQ(test, isp_zoom_encode(400, 0, 0), 0x40800000);
++	KUNIT_EXPECT_EQ(test, isp_zoom_encode(150, 0, 0), 0x3fc00000);
++	KUNIT_EXPECT_EQ(test, isp_zoom_encode(50, 0, 0), 0x3f800000);	/* at least 1x */
++	KUNIT_EXPECT_EQ(test, isp_zoom_encode(175, 0x10000, 0x40000), 0x1c000);
++	KUNIT_EXPECT_EQ(test, isp_zoom_encode(400, 0x10000, 0x20000), 0x20000);	/* capped */
++	KUNIT_EXPECT_EQ(test, isp_zoom_encode(150, 0x100, 0), 0x180);
++}
++
+ static struct kunit_case isp_framing_test_cases[] = {
+ 	KUNIT_CASE(isp_test_framing_still_in_dead_zone),
+ 	KUNIT_CASE(isp_test_framing_slew_and_converge),
+ 	KUNIT_CASE(isp_test_framing_no_oscillation),
+ 	KUNIT_CASE(isp_test_framing_lost_face),
++	KUNIT_CASE(isp_test_zoom_encode),
+ 	{}
+ };
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-framing.c b/drivers/media/platform/apple/isp/isp-framing.c
+index ac82204fdc..7c7a8d836c 100644
+--- a/drivers/media/platform/apple/isp/isp-framing.c
++++ b/drivers/media/platform/apple/isp/isp-framing.c
+@@ -8,6 +8,7 @@
+  * Without a face for a while it goes back out to the unzoomed view.
+  */
+ #include <linux/kernel.h>
++#include <linux/math64.h>
+ #include <linux/minmax.h>
+ 
+ #include "isp-framing.h"
+@@ -89,6 +90,29 @@ void isp_framing_step(const struct isp_framing_params *p,
+ 		st->moving = false;
+ }
+ 
++/*
++ * The zoom factor for the firmware: the factor it reported at 1x, scaled
++ * and capped at its maximum; or, when it reported none (0), the factor as
++ * an IEEE 754 single (1.75 -> 0x3fe00000), the form its own log prints.
++ * pct is in percent, 100 = 1x; no floating point is used.
++ */
++u32 isp_zoom_encode(unsigned int pct, u32 unit, u32 max)
++{
++	unsigned int e = 0;
++	u64 mant;
++
++	pct = clamp(pct, 100U, 6400U);
++	if (unit) {
++		u64 f = div_u64((u64)unit * pct, 100);
++
++		return max ? min_t(u64, f, max) : min_t(u64, f, U32_MAX);
++	}
++	while (pct >= (200U << e))
++		e++;
++	mant = div_u64((u64)pct << 23, 100U << e) - (1U << 23);
++	return ((127U + e) << 23) | (u32)mant;
++}
++
+ #if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
+ #include "isp-framing-test.c"
+ #endif
+diff --git a/drivers/media/platform/apple/isp/isp-framing.h b/drivers/media/platform/apple/isp/isp-framing.h
+index 1c511d565e..1e70b45dfc 100644
+--- a/drivers/media/platform/apple/isp/isp-framing.h
++++ b/drivers/media/platform/apple/isp/isp-framing.h
+@@ -30,6 +30,7 @@ struct isp_framing_state {
+ extern const struct isp_framing_params isp_framing_defaults;
+ 
+ void isp_framing_reset(struct isp_framing_state *st);
++u32 isp_zoom_encode(unsigned int pct, u32 unit, u32 max);
+ void isp_framing_step(const struct isp_framing_params *p,
+ 		      struct isp_framing_state *st,
+ 		      const struct isp_framing_box *box);
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index bac330917a..b14b88f678 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -1282,7 +1282,7 @@ static void isp_apply_zoom(struct apple_isp *isp)
+ 		pct = READ_ONCE(isp->framing.zoom);
+ 	else
+ 		pct = v4l2_ctrl_g_ctrl(isp->zoom);
+-	if (!isp->zoom_unit) {
++	if (!isp->zoom_unit && !isp->zoom_float) {
+ 		if (pct == 100)
+ 			return;
+ 		err = isp_cmd_ch_zoom_factor_get(isp, isp->current_ch, false,
+@@ -1292,15 +1292,19 @@ static void isp_apply_zoom(struct apple_isp *isp)
+ 							 true, &isp->zoom_max);
+ 		dev_info(isp->dev, "zoom factor %#x at 1x, max %#x (%d)\n",
+ 			 isp->zoom_unit, isp->zoom_max, err);
+-		if (err || !isp->zoom_unit || isp->zoom_max < isp->zoom_unit) {
+-			isp->zoom_unit = 0;
++		if (err) {
+ 			isp->zoom_failed = true;
+ 			return;
+ 		}
++		/* No factor reported: send it in the float form, see below. */
++		if (!isp->zoom_unit || isp->zoom_max < isp->zoom_unit) {
++			isp->zoom_unit = 0;
++			isp->zoom_max = 0;
++			isp->zoom_float = true;
++		}
+ 	}
+ 
+-	factor = min_t(u64, div_u64((u64)isp->zoom_unit * pct, 100),
+-		       isp->zoom_max);
++	factor = isp_zoom_encode(pct, isp->zoom_unit, isp->zoom_max);
+ 	err = isp_cmd_ch_zoom_factor_set(isp, isp->current_ch, factor);
+ 	dev_dbg(isp->dev, "zoom %u %% -> factor %#x (%d)\n", pct, factor, err);
+ 	if (err)
+-- 
+2.43.0
+
