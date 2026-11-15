@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 04:56:03 +0000
+Subject: [PATCH] drm/asahi: G16: put the render queues on scheduling
+ row 0, as macOS does
+
+Every queue we create carries scheduling row 2 (class 2: +0x30/+0x34 = 2, mask
+0xffff000000000000, +0x48 = 2). macOS 26B123 keeps that row on its compute queues only; its
+render queues carry row 0 (class 0: +0x30/+0x34 = 0, mask 0xffffffffffff0000, +0x40 = 1 and
++0x48 = 1 at our offsets, 4 bytes lower in its layout from +0x44), in every render queue of a
+macOS capture. The firmware recognizes both rows.
+
+Give the render (TA and FS) queues row 0 behind g16_render_row0 (default 1, read when the
+queue graphs are built); 0 keeps row 2.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/fw/graph.rs | 43 +++++++++++++++++++++++----
+ drivers/gpu/drm/asahi/g16/graph.rs    |  5 +++-
+ drivers/gpu/drm/asahi/g16/params.rs   | 18 +++++++++++
+ 3 files changed, 59 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/fw/graph.rs b/drivers/gpu/drm/asahi/g16/fw/graph.rs
+index 344dd3da37..f3e97996da 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/graph.rs
+@@ -2,8 +2,9 @@
+ 
+ //! Queue-info rows, queue state, scheduling contexts, notifiers and the compute UMA manager.
+ //!
+-//! M4 normalized 25G83 firmware ABI. Queue-info scheduling row 2 (class 2, used for render and compute): +0x30 = 2, +0x34 = 2,
+-//! +0x38 = 0xffff000000000000, +0x40 = 0, +0x44 = 0, +0x48 = 2. Notifiers are initialized
++//! M4 normalized 25G83 firmware ABI. Queue-info scheduling row 2 (class 2, compute): +0x30 = 2, +0x34 = 2,
++//! +0x38 = 0xffff000000000000, +0x40 = 0, +0x44 = 0, +0x48 = 2. Row 0 (class 0, render, as macOS 26B123
++//! keeps its render queues): +0x30 = 0, +0x34 = 0, +0x38 = 0xffffffffffff0000, +0x40 = 1, +0x48 = 1. Notifiers are initialized
+ //! once before first exposure and never written by the host again; the threshold is a
+ //! separate host-written uncached cell.
+ 
+@@ -117,29 +118,40 @@ pub(crate) mod pools {
+ 
+ /// The nonzero queue header; the rest of the fresh 0x24c0 object remains zero. Keeping the
+ /// scratch inside this object is part of the M4 ABI, not a separate buffer allocation.
++/// `row0` selects scheduling row 0 (class 0), which macOS 26B123 keeps on its render queues
++/// (list 14: +0x38 = 0xffffffffffff0000, +0x40 = 1 and, 4 bytes lower in its layout, our
++/// +0x48 = 1, +0x30/+0x34 = 0), instead of row 2 (class 2), which it keeps on compute queues.
+ pub(crate) fn queue_image(
+     state: u64,
+     ring: u64,
+     list: u64,
+     queue: u64,
+     context: u64,
++    row0: bool,
+ ) -> [u8; 0xb4] {
+     let mut q = [0; 0xb4];
++    let mask = if row0 {
++        qinfo_row2::ROW0_MASK_VALUE
++    } else {
++        qinfo_row2::MASK_VALUE
++    };
+     for (at, value) in [
+         (0, state),
+         (8, ring),
+         (0x10, list),
+         (0x18, queue + 0xb0),
+-        (0x38, qinfo_row2::MASK_VALUE),
++        (qinfo_row2::MASK, mask),
+         (0xa4, context),
+     ] {
+         q[at..at + 8].copy_from_slice(&value.to_le_bytes());
+     }
++    let (class, unk_40, unk_48) = if row0 { (0, 1, 1) } else { (2u32, 0, 2) };
+     for (at, value) in [
+         (0x2c, u32::MAX),
+-        (0x30, 2u32),
+-        (0x34, 2),
+-        (0x48, 2),
++        (qinfo_row2::CLASS, class),
++        (qinfo_row2::CLASS_B, class),
++        (qinfo_row2::UNK_40, unk_40),
++        (qinfo_row2::UNK_48, unk_48),
+         (0x4c, u32::MAX),
+     ] {
+         q[at..at + 4].copy_from_slice(&value.to_le_bytes());
+@@ -174,6 +186,25 @@ pub(crate) fn queue_image(
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn m4_queue_rows() {
++        let w = |q: &[u8], at: usize| u32::from_le_bytes([q[at], q[at + 1], q[at + 2], q[at + 3]]);
++        let r2 = queue_image(1, 2, 3, 0x1000, 5, false);
++        assert_eq!(
++            (w(&r2, 0x30), w(&r2, 0x34), w(&r2, 0x40), w(&r2, 0x48)),
++            (2, 2, 0, 2)
++        );
++        assert_eq!(&r2[0x38..0x40], &qinfo_row2::MASK_VALUE.to_le_bytes());
++        let r0 = queue_image(1, 2, 3, 0x1000, 5, true);
++        assert_eq!(
++            (w(&r0, 0x30), w(&r0, 0x34), w(&r0, 0x40), w(&r0, 0x48)),
++            (0, 0, 1, 1)
++        );
++        assert_eq!(&r0[0x38..0x40], &qinfo_row2::ROW0_MASK_VALUE.to_le_bytes());
++        assert_eq!(r0[..0x30], r2[..0x30]);
++        assert_eq!(r0[0x4c..], r2[0x4c..]);
++    }
++
+     #[test]
+     fn m4_context() {
+         let s = context_image();
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index 1940518517..8ff77cccdd 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -142,10 +142,11 @@ fn init_queue(
+     ring: &FwObject,
+     list: &FwObject,
+     context: &FwObject,
++    row0: bool,
+ ) -> Result {
+     q.write(
+         0,
+-        &graph::queue_image(state.va, ring.va, list.va, q.va, context.va),
++        &graph::queue_image(state.va, ring.va, list.va, q.va, context.va, row0),
+     )?;
+     state.w32(qstate::CAP, sizes::QUEUE_CAP)
+ }
+@@ -191,6 +192,7 @@ fn init(&self) -> Result {
+             &self.ring,
+             &self.job_list,
+             &self.sched_ctx,
++            false,
+         )?;
+         self.threshold.w64(0, 1)
+     }
+@@ -251,6 +253,7 @@ fn init(&self) -> Result {
+                 &self.ring[e],
+                 &self.job_list[e],
+                 &self.sched_ctx,
++                super::params::render_row0(),
+             )?;
+             self.threshold.w64(e * 8, 2)?;
+         }
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index b0badf5b41..6349f11c1a 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1057,6 +1057,24 @@ pub(crate) fn selectors_macos() -> bool {
+     "G16: performance selectors (default 0: the host utilization governor's state x 100; 1: 1000 as macOS whenever the cooling ceiling allows the top state, else that ceiling; runtime 0644)"
+ );
+ 
++/// Storage of `g16_render_row0` (0644, default 1; read when the queue graphs are built).
++static RENDER_ROW0: AtomicU32 = AtomicU32::new(1);
++
++/// Whether the render (TA and FS) queues carry scheduling row 0 (class 0), as macOS 26B123
++/// keeps its render queues, instead of row 2 (class 2), which it keeps on compute queues.
++pub(crate) fn render_row0() -> bool {
++    RENDER_ROW0.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    RENDER_ROW0_PARAM,
++    RENDER_ROW0_PARMTYPE,
++    RENDER_ROW0_PARM,
++    RENDER_ROW0,
++    "g16_render_row0",
++    "G16: render queues on scheduling row 0 (class 0) as macOS keeps them (default 1; 0: row 2, the compute row, as before; read when the queue graphs are built)"
++);
++
+ /// Storage of `g16_globals_required` (0644, default 1; read when the initdata is built).
+ static GLOBALS_REQUIRED: AtomicU32 = AtomicU32::new(1);
+ 
+-- 
+2.43.0
+

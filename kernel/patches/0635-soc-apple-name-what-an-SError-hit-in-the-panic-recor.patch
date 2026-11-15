@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 04:41:32 +0000
+Subject: [PATCH] soc: apple: name what an SError hit in the panic
+ record
+
+The panic record keeps a hash of the panic message for anything that is
+not an oops. For an SError that message is always the same, so the
+record said "SError on CPU n" and nothing else, while the boot stall on
+the J604 is exactly that: an asynchronous SError on a secondary CPU.
+
+An SError has no fault address, but the CPU that takes it still holds
+two things when arm64_serror_panic() reaches the notifier: the physical
+address the cluster's L2C latched for the access that failed
+(L2C_ERR_ADR, which m1n1 prints on an SError) and the ELR the SError
+interrupted. Record the first when L2C_ERR_STS is set, else the second.
+
+The L2C registers are only read where reading them was tried: T8132
+cores with the kernel at EL2, where a test module read L2C_ERR_STS, ADR
+and INF on all ten CPUs without a trap.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/soc/apple/boot-crumb.c | 52 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/soc/apple/boot-crumb.c b/drivers/soc/apple/boot-crumb.c
+index dacc0eef52..dcf4210c18 100644
+--- a/drivers/soc/apple/boot-crumb.c
++++ b/drivers/soc/apple/boot-crumb.c
+@@ -33,8 +33,11 @@
+ #include <linux/soc/apple/boot-crumb.h>
+ #include <linux/unaligned.h>
+ #include <linux/workqueue.h>
++#include <asm/cputype.h>
+ #include <asm/esr.h>
+ #include <asm/sections.h>
++#include <asm/sysreg.h>
++#include <asm/virt.h>
+ 
+ #define APPLE_CRUMB_MAGIC	0xc6
+ #define APPLE_CRUMB_BEAT_DONE	0xff
+@@ -303,12 +306,24 @@ EXPORT_SYMBOL_GPL(apple_boot_crumb_decode);
+  * The first die or panic of a boot writes what it is to PMU scratch that
+  * survives the reset, through a writer that polls; macsmc-reboot prints it on
+  * the next boot. Unlike the crumbs this runs for the whole boot.
++ *
++ * An SError has no fault address and its panic message is always the same, so
++ * it records what the CPU still holds instead: the physical address the
++ * cluster's L2C latched for the access that failed, where those registers can
++ * be read, else the ELR the SError interrupted.
+  */
+ #define APPLE_CRUMB_PANIC_MAGIC	0xa0
+ #define APPLE_CRUMB_PANIC_OOPS	1
+ #define APPLE_CRUMB_PANIC_SERROR	2
+ #define APPLE_CRUMB_PANIC_OTHER	3
+ #define APPLE_CRUMB_PANIC_BUG	4
++#define APPLE_CRUMB_PANIC_SERROR_PA	5
++
++/* Apple's fabric error registers, as m1n1 prints them on an SError */
++#define APPLE_SYS_L2C_ERR_STS	sys_reg(3, 3, 15, 8, 0)
++#define APPLE_SYS_L2C_ERR_ADR	sys_reg(3, 3, 15, 9, 0)
++#define APPLE_CRUMB_T8132_ECORE	0x052
++#define APPLE_CRUMB_T8132_PCORE	0x053
+ 
+ static apple_boot_crumb_panic_writer_t apple_crumb_panic_writer;
+ static void *apple_crumb_panic_ctx;
+@@ -319,6 +334,7 @@ static const char *const apple_crumb_panic_kinds[] = {
+ 	[APPLE_CRUMB_PANIC_SERROR] = "SError",
+ 	[APPLE_CRUMB_PANIC_OTHER] = "panic",
+ 	[APPLE_CRUMB_PANIC_BUG] = "BUG",
++	[APPLE_CRUMB_PANIC_SERROR_PA] = "SError",
+ };
+ 
+ static u32 apple_crumb_fnv1a(const char *p)
+@@ -361,13 +377,37 @@ static int apple_crumb_die(struct notifier_block *nb, unsigned long action, void
+ 	return NOTIFY_DONE;
+ }
+ 
++/* Only where reading the L2C error registers was tried: T8132 with the kernel at EL2. */
++static bool apple_crumb_l2c_readable(void)
++{
++	u32 midr = read_cpuid_id();
++
++	if (!is_kernel_in_hyp_mode() || MIDR_IMPLEMENTOR(midr) != ARM_CPU_IMP_APPLE)
++		return false;
++	return MIDR_PARTNUM(midr) == APPLE_CRUMB_T8132_ECORE ||
++	       MIDR_PARTNUM(midr) == APPLE_CRUMB_T8132_PCORE;
++}
++
+ static int apple_crumb_panic(struct notifier_block *nb, unsigned long action, void *data)
+ {
+ 	const char *msg = data;
+-	bool serror = msg && strstr(msg, "SError");
++	u64 sts;
+ 
+-	apple_crumb_panic_record(serror ? APPLE_CRUMB_PANIC_SERROR : APPLE_CRUMB_PANIC_OTHER,
+-				 serror ? ESR_ELx_EC_SERROR : 0, apple_crumb_fnv1a(msg));
++	if (!msg || !strstr(msg, "SError")) {
++		apple_crumb_panic_record(APPLE_CRUMB_PANIC_OTHER, 0, apple_crumb_fnv1a(msg));
++		return NOTIFY_DONE;
++	}
++	/* arm64_serror_panic() runs on the CPU that took the SError, which still holds it. */
++	if (apple_crumb_l2c_readable()) {
++		sts = read_sysreg_s(APPLE_SYS_L2C_ERR_STS);
++		if (sts) {
++			apple_crumb_panic_record(APPLE_CRUMB_PANIC_SERROR_PA, sts & 0xff,
++						 (u32)(read_sysreg_s(APPLE_SYS_L2C_ERR_ADR) >> 12));
++			return NOTIFY_DONE;
++		}
++	}
++	apple_crumb_panic_record(APPLE_CRUMB_PANIC_SERROR, ESR_ELx_EC(read_sysreg(esr_el1)),
++				 (u32)(read_sysreg(elr_el1) - (unsigned long)_text));
+ 	return NOTIFY_DONE;
+ }
+ 
+@@ -424,6 +464,12 @@ int apple_boot_crumb_panic_decode(const u8 *rec, size_t len, char *buf, size_t s
+ 	if (kind == APPLE_CRUMB_PANIC_OOPS || kind == APPLE_CRUMB_PANIC_BUG)
+ 		return scnprintf(buf, size, "%s on CPU %u, ESR.EC %#x, PC _text+%#x",
+ 				 apple_crumb_panic_kinds[kind], rec[1], rec[2], value);
++	if (kind == APPLE_CRUMB_PANIC_SERROR_PA)
++		return scnprintf(buf, size, "SError on CPU %u, L2C status %#04x, fabric PA %#llx",
++				 rec[1], rec[2], (u64)value << 12);
++	if (kind == APPLE_CRUMB_PANIC_SERROR)
++		return scnprintf(buf, size, "SError on CPU %u, ESR.EC %#x, ELR _text+%#x",
++				 rec[1], rec[2], value);
+ 	return scnprintf(buf, size, "%s on CPU %u, ESR.EC %#x, message hash %#010x",
+ 			 apple_crumb_panic_kinds[kind], rec[1], rec[2], value);
+ }
+-- 
+2.43.0
+
