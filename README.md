@@ -58,8 +58,8 @@ The J604 builds carried here, as installed on the machine on 2026-11-12 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora-next`, `linux-aurora-next-headers` (`linux-aurora` 1.928 stays installed beside it; the installer image carries `linux-aurora` 1.928, and `linux-aurora` 1.930, the same patches as 1.929, is next) | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`da8e1acf3656`, Aurora's tip), 679 patches | `1.929` |
-| `aura` | 1.0.0b13, aurora-silicon/aura (`f0f180afe5`), aurora-silicon/alarm-aurora recipe, 15 patches | `1.612` (replaced `m1n1-aurora` on 2026-11-12) |
+| `linux-aurora`, `linux-aurora-headers` (`linux-aurora-next` 1.929, the same patches, stays installed beside it; the installer image still carries `linux-aurora` 1.928 and gets 1.930 with its next build) | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`da8e1acf3656`, Aurora's tip), 679 patches | `1.930` |
+| `aura` | 1.0.0b13, aurora-silicon/aura (`f0f180afe5`), aurora-silicon/alarm-aurora recipe, 22 patches | `1.615` (replaced `m1n1-aurora` on 2026-11-12) |
 | `uboot-aurora` | 2026.07.aurora11, aurora-silicon/u-boot (`250385f8c8`, the version Aurora packages), 1 patch | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261113, aurora-silicon/mesa (`8f013bf96bd`) | `1.8144` |
 | `alsa-ucm-conf-aurora` | 10.aurora3, aurora-silicon/alsa-ucm-conf-asahi (`b9b2d0c82c`) | `1.605` |

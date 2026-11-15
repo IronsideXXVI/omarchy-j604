@@ -1,0 +1,85 @@
+From d516275d05c1be13b23c1284017c4d757368ed01 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 11:22:37 +0000
+Subject: [PATCH] nvme: start a T8132 ANS cold when its controller reports a
+ fatal status
+
+A J604 Stage 2 parked with BOOT_STATUS 0xde71ce55, CC 0x470000 and CSTS
+0x2: the firmware had started from off, the controller still reported
+its fatal status, and it never came ready. The fatal status outlives a
+power cycle of ANS's PCIe block (a Stage 2 read CSTS 0x2 at its entry,
+with the CPU stopped) and the warm start: a power cycle that starts ANS
+warm again meets the same status.
+
+When the controller does not come ready with CSTS.CFS set, disable it
+and go straight to the last start of nvme_ans_power_on(): firmware
+stopped, the block powered off, ANS reset through PMGR and started cold,
+as Linux's apple,t8132-nvme-ans2 entry does with a stopped ANS. Without
+the fatal status the power cycle stays as it was.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ src/nvme.c | 29 ++++++++++++++++++++++++-----
+ 1 file changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/src/nvme.c b/src/nvme.c
+index e1c5bbdb..9ee13304 100644
+--- a/src/nvme.c
++++ b/src/nvme.c
+@@ -526,9 +526,10 @@ static bool nvme_ans_start(int try)
+     return poll32(nvme_base + NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, wait) >= 0;
+ }
+ 
+-static bool nvme_ans_power_on(void)
++/* From try first on: NVME_ANS_START_TRIES - 1 is the cold start after a PMGR reset at once. */
++static bool nvme_ans_power_on_from(int first)
+ {
+-    for (int try = 0; try < NVME_ANS_START_TRIES; try++) {
++    for (int try = first; try < NVME_ANS_START_TRIES; try++) {
+         if (nvme_ans_start(try)) {
+             nvme_boot_ticks = get_ticks();
+             printf("nvme: ANS started from off%s\n", try ? " on a retry" : "");
+@@ -542,6 +543,11 @@ static bool nvme_ans_power_on(void)
+     return false;
+ }
+ 
++static bool nvme_ans_power_on(void)
++{
++    return nvme_ans_power_on_from(0);
++}
++
+ /* A write or flush, timed: the Stage 1 log then shows how close a marker spend came. */
+ static bool nvme_exec_io_write(struct nvme_command *cmd, const char *what)
+ {
+@@ -788,11 +794,24 @@ setup_controller:
+          */
+         if (from_off && nvme_type == NVME_T8132 && !nvme_secure_regs &&
+             enable_retries < NVME_ANS_START_TRIES - 1) {
++            bool cfs = read32(nvme_base + NVME_CSTS) & NVME_CSTS_CFS;
++
+             enable_retries++;
+-            printf("nvme: controller not ready after a start from off; ANS power cycle %d/%d\n",
+-                   enable_retries, NVME_ANS_START_TRIES - 1);
+-            if (!nvme_ans_power_off() || !nvme_ans_power_on())
++            printf("nvme: controller not ready after a start from off; ANS power cycle %d/%d%s\n",
++                   enable_retries, NVME_ANS_START_TRIES - 1, cfs ? ", cold: CSTS.CFS set" : "");
++            /*
++             * The fatal status outlives a power cycle of ANS's PCIe block and a warm firmware
++             * start (a Stage 2 read CSTS 0x2 at entry with RUN=0, and again after BOOT_STATUS
++             * read OK), so with it set go straight to the cold start after a PMGR reset; that
++             * path stops the firmware and powers the block off first.
++             */
++            if (cfs) {
++                nvme_ctrl_disable();
++                if (!nvme_ans_power_on_from(NVME_ANS_START_TRIES - 1))
++                    goto out_preserve;
++            } else if (!nvme_ans_power_off() || !nvme_ans_power_on()) {
+                 goto out_preserve;
++            }
+             goto setup_controller;
+         }
+         goto out_disable_ctrl;
+-- 
+2.43.0
+
