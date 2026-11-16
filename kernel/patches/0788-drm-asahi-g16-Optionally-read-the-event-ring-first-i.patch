@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 11:44:13 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally read the event ring first
+ in a poll pass
+
+A poll pass takes the device lock, runs the session check, the object
+health check and the power service, and only then, at the start of
+retirement, consumes the event ring and advances its host READ index.
+The checks read the adopted UAT bindings from the write-combined TTB
+table and take tens of microseconds per pass, so every stage-event
+record the firmware posts at the end of a TA or FS pass stays unread
+for that long after the poll work runs.
+
+Add g16_drain_first (runtime, default 0). With 1, a pass first refuses
+a session already marked crashed, then consumes the event ring, then
+runs the checks and retirement as before. The records are decoded the
+same way; only the moment the firmware sees them read moves earlier.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 20 ++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  9 +++++++++
+ 2 files changed, 29 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index e7971b5700..e0631663ad 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -855,6 +855,26 @@ pub(crate) fn pass_check_once() -> bool {
+     "G16: verify the firmware session and the adopted UAT bindings once per poll pass instead of four times under the same lock (default 0: four; 1: once; runtime 0644)"
+ );
+ 
++/// Storage of `g16_drain_first` (runtime 0644, default 0).
++static DRAIN_FIRST: AtomicU32 = AtomicU32::new(0);
++
++/// Whether a poll pass consumes the event ring (advances its host READ index) right after it
++/// takes the device lock, before the session, object health and power checks, instead of at
++/// the start of retirement after them. The records are decoded the same way; only the moment
++/// the firmware sees them read moves earlier.
++pub(crate) fn drain_first() -> bool {
++    DRAIN_FIRST.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    DRAIN_FIRST_PARAM,
++    DRAIN_FIRST_PARMTYPE,
++    DRAIN_FIRST_PARM,
++    DRAIN_FIRST,
++    "g16_drain_first",
++    "G16: consume the event ring at the start of each poll pass, before the session and health checks, instead of after them (default 0: after; 1: first; runtime 0644)"
++);
++
+ /// Storage of `g16_job_ahead` (runtime 0644, default 0).
+ static JOB_AHEAD: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index cf8297b715..15c585b6ba 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -397,6 +397,15 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+         if self.recovery.failed().is_some() {
+             return Ok(false);
+         }
++        // g16_drain_first: read the event ring before the checks below. The firmware learns
++        // that its stage-event records were read from the READ index, and the checks take
++        // tens of us. Only a session already marked crashed is refused first.
++        if params::drain_first() {
++            self.session.shared.check()?;
++            let mut early = Lap::start();
++            self.drain_events()?;
++            early.lap(&mut self.engine.prof.drain_ns);
++        }
+         let mut pre = Lap::start();
+         self.session.check()?;
+         pre.lap(&mut self.engine.prof.check_ns);
+-- 
+2.43.0
+

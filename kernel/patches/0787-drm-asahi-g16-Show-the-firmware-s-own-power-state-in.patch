@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 11:56:40 +0000
+Subject: [PATCH] drm/asahi: g16: Show the firmware's own power state
+ in debugfs
+
+The M4 GPU never powers down at an idle desktop, while macOS keeps it
+off almost all of the time. The firmware decides that by itself: its
+power state machine (the idle decision, the idle timer, the deferral of
+a power-down while the host is kicking, the power-down itself) keeps
+its state in objects the host allocated, mainly POWER_PERFORMANCE (the
+one Runtime +0x469 points at) and POWER (root +0xb8). Nothing of ours
+reads them, so on the device it cannot be told whether the firmware
+never takes the idle decision, takes it and defers forever, or powers
+down while the domain stays up.
+
+Add aurora-g16/fwpower, one line per read with the firmware's power
+state, its idle sub-state, the deferral flag and counters, the current
+performance state, the root.Control status words and the Globals words
+the firmware checks before a power-down. The file holds its own
+references to the four objects and reads them without the device lock,
+so it can be sampled quickly around a burst of work without stalling
+submission. Nothing is written; the firmware cannot see the reads.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/initdata.rs | 12 +++++
+ drivers/gpu/drm/asahi/g16/mod.rs      |  4 ++
+ drivers/gpu/drm/asahi/g16/poll.rs     | 66 +++++++++++++++++++++++++++
+ 3 files changed, 82 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/initdata.rs b/drivers/gpu/drm/asahi/g16/initdata.rs
+index 06d7ee1aae..c8c9b5a955 100644
+--- a/drivers/gpu/drm/asahi/g16/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/initdata.rs
+@@ -67,6 +67,18 @@ pub(crate) fn halted(&self) -> Result<bool> {
+         Ok(phase == 1 || phase == 3)
+     }
+ 
++    /// The objects behind `aurora-g16/fwpower`: POWER_PERFORMANCE, POWER, the small
++    /// root.Control and Globals, in that order. Shared references; nothing is copied.
++    pub(crate) fn fwpower_objects(&self) -> Option<[Arc<FwObject>; 4]> {
++        let graph = |i: usize| self._graph.get(i).cloned();
++        Some([
++            graph(id::POWER_PERFORMANCE)?,
++            graph(id::POWER)?,
++            self.ready_control.clone()?,
++            self.globals.clone()?,
++        ])
++    }
++
+     /// Firmware's actual READY acknowledgement in the small root.Control object.
+     pub(crate) fn readiness(&self) -> Result<u32> {
+         self.ready_control
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 5bab8907fc..adac5cb372 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -251,6 +251,9 @@ pub(crate) struct Shared {
+     /// The device lock. `None` before boot completes.
+     #[pin]
+     pub(crate) state: Mutex<Option<KBox<Firmware>>>,
++    /// The `aurora-g16/fwpower` file (read-only view of firmware power words), once created.
++    #[pin]
++    pub(crate) fwpower: Mutex<Option<Pin<KBox<kernel::debugfs::File<poll::FwPower>>>>>,
+ }
+ 
+ impl_has_delayed_work! {
+@@ -442,6 +445,7 @@ pub(crate) fn new(
+                 resnap <- HrTimer::new(),
+                 resnap_handle <- new_mutex!(None, "g16::Shared::resnap_handle"),
+                 state <- new_mutex!(None, "g16::Shared::state"),
++                fwpower <- new_mutex!(None, "g16::Shared::fwpower"),
+             }),
+             GFP_KERNEL,
+         )?;
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index be329f754c..cf8297b715 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -32,6 +32,7 @@
+ 
+ use super::channel::Channel;
+ use super::engine::{complete, counter_ticks, now_ns, rmb, Flight, Lap};
++use super::object::FwObject;
+ use super::fw::graph::{notifier, notifier_page, qstate};
+ use super::fw::work::compute;
+ use super::job::{self, Completions, Job};
+@@ -62,6 +63,62 @@ fn run(this: ArcBorrow<'_, Self>, _ctx: HrTimerCallbackContext<'_, Self>) -> HrT
+     }
+ }
+ 
++/// The firmware's own power-state words, read without the device lock: the 25G83 firmware keeps
++/// its GPU power state machine in host memory (CODE, armfw_g16g b000: the power event handler at
++/// 0x3b438 works on the POWER_PERFORMANCE object it finds at Runtime +0x469). Diagnostic only:
++/// nothing here is written, and the firmware cannot see a read.
++pub(crate) struct FwPower {
++    objects: [Arc<FwObject>; 4],
++}
++
++/// The `aurora-g16/fwpower` file: one line per read.
++///
++/// POWER_PERFORMANCE: `state` +0x10 (the firmware power state; 4 = powered down), `mode` +0xc,
++/// `pstate` +0x38 (current state index; the firmware skips every power transition while it is
++/// 0), `act`/`tgt` +0x2c/+0x30, `level` +0x50, `sub` +0x6528 (idle sub-state: 1 early wake, 2 idle
++/// delay, 3 retry), `retry` byte +0x6568 and `retries` +0x6569 (a power-down that was deferred).
++/// POWER: `defer` u64 +0x53c (deferred power-downs), `defer_t` u64 +0x544, `seq` +0x5a0, `veto`
++/// +0x538, `req` +0x664, `hi` +0x66c. Control: +0x8/+0x10/+0x14/+0x18/+0x1c. Globals: +0x30
++/// idle power-off, +0x34, +0x78, +0x7c, +0x80 (the kick tally the firmware compares before it
++/// powers down). `t` is the architectural counter at the read.
++fn fwpower_show(v: &FwPower, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++    let [pp, power, control, globals] = &v.objects;
++    let r = |o: &FwObject, at: usize| o.r32(at).unwrap_or(0xdead_beef);
++    let r64 = |o: &FwObject, at: usize| u64::from(r(o, at)) | (u64::from(r(o, at + 4)) << 32);
++    writeln!(
++        f,
++        "fwpower: t {} state {} mode {} pstate {} act {} tgt {} level {} sub {} retry {} \
++         retries {} defer {} defer_t {} seq {} veto {} req {} hi {} \
++         ctl {:#x}/{:#x}/{:#x}/{:#x}/{:#x} g {}/{}/{}/{}/{}",
++        counter_ticks(),
++        r(pp, 0x10),
++        r(pp, 0xc),
++        r(pp, 0x38),
++        r(pp, 0x2c),
++        r(pp, 0x30),
++        r(pp, 0x50),
++        r(pp, 0x6528),
++        r(pp, 0x6568) & 0xff,
++        r(pp, 0x6569),
++        r64(power, 0x53c),
++        r64(power, 0x544),
++        r(power, 0x5a0),
++        r(power, 0x538),
++        r(power, 0x664),
++        r(power, 0x66c),
++        r(control, 0x8),
++        r(control, 0x10),
++        r(control, 0x14),
++        r(control, 0x18),
++        r(control, 0x1c),
++        r(globals, 0x30),
++        r(globals, 0x34),
++        r(globals, 0x78),
++        r(globals, 0x7c),
++        r(globals, 0x80)
++    )
++}
++
+ /// The `aurora-g16/stats` debugfs file contents.
+ fn stats_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+     let state = shared.state.lock();
+@@ -308,6 +365,15 @@ pub(crate) fn start_engine(self: &Arc<Self>) -> Result {
+         let firmware = state.as_deref_mut().ok_or(ENODEV)?;
+         firmware.engine.shared = Some(self.clone());
+         firmware.engine.debugfs = Some(file);
++        let objects = firmware.init.fwpower_objects();
++        drop(state);
++        if let Some(objects) = objects {
++            let file = KBox::pin_init(
++                dir.read_callback_file(c_str!("fwpower"), FwPower { objects }, &fwpower_show),
++                GFP_KERNEL,
++            )?;
++            *self.fwpower.lock() = Some(file);
++        }
+         Ok(())
+     }
+ }
+-- 
+2.43.0
+

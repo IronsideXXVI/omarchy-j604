@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 10:27:40 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally report GPU work to the
+ CLPC
+
+The T8132 CLPC raises the DRAM controller (DCS) and fabric rails to
+their top while the GPU driver reports work in flight
+(apple_clpc_gpu_set_active); it does not follow GPU power by itself.
+The G17 backend reports its work this way, the G16 backend does not, so
+during GPU-bound work with little CPU load the memory rails stay at the
+level the CPU frequency asks for.
+
+Add g16_clpc_demand (runtime, default 0). With 1, the poll path takes
+the CLPC's GPU input named by the device tree once, reports work while
+commands are in flight and stops reporting after the same busy window
+that ends the CPU latency bound.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/boot.rs   | 22 ++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/mod.rs    | 10 +++++++++
+ drivers/gpu/drm/asahi/g16/params.rs | 19 +++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 32 +++++++++++++++++++++++++++++
+ 4 files changed, 83 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 9f46e84778..63ac9c5f74 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -50,6 +50,11 @@ pub(crate) mod glue {
+         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+         fn asahi_g16_lat_qos(us: core::ffi::c_int) -> core::ffi::c_int;
+         fn asahi_g16_cpu_floor(on: bool) -> core::ffi::c_int;
++        fn asahi_clpc_gpu_get(
++            dev: *mut core::ffi::c_void,
++            out: *mut *mut core::ffi::c_void,
++        ) -> core::ffi::c_int;
++        fn asahi_clpc_gpu_set_active(gpu: *mut core::ffi::c_void, active: bool);
+         fn asahi_g16_rt_start(
+             f: unsafe extern "C" fn(*mut core::ffi::c_void),
+             cookie: *mut core::ffi::c_void,
+@@ -78,6 +83,23 @@ pub(crate) fn cpu_floor(on: bool) -> Result {
+         kernel::error::to_result(unsafe { asahi_g16_cpu_floor(on) })
+     }
+ 
++    /// Takes the CLPC's GPU input for `dev` (DT `apple,clpc`): `Ok(None)` when the device
++    /// tree names no CLPC. The reference is kept until reboot, as the firmware session is.
++    /// Process context.
++    pub(crate) fn clpc_get(dev: &device::Device) -> Result<Option<*mut core::ffi::c_void>> {
++        let mut out = core::ptr::null_mut();
++        // SAFETY: `dev` is a live device and `out` a writable result.
++        let ret = unsafe { asahi_clpc_gpu_get(dev.as_raw().cast(), &mut out) };
++        kernel::error::to_result(ret)?;
++        Ok((!out.is_null()).then_some(out))
++    }
++
++    /// Reports GPU work in flight (`active`) to the CLPC input taken by [`clpc_get`].
++    pub(crate) fn clpc_set_active(gpu: *mut core::ffi::c_void, active: bool) {
++        // SAFETY: `gpu` is the reference returned by `clpc_get`, kept until reboot.
++        unsafe { asahi_clpc_gpu_set_active(gpu, active) };
++    }
++
+     pub(crate) fn lat_qos(us: Option<u32>) -> Result {
+         let us = us.map_or(-1, |us| us.min(i32::MAX as u32) as core::ffi::c_int);
+         // SAFETY: Updates the driver's own CPU latency request only.
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index d923ffaead..5bab8907fc 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -214,6 +214,12 @@ pub(crate) struct Shared {
+     /// `g16_submit_boost` bit 1: the CPU frequency floor is held, and when work was last busy.
+     pub(crate) floor_on: AtomicBool,
+     pub(crate) floor_busy_ns: AtomicU64,
++    /// `g16_clpc_demand`: the CLPC GPU input (NULL until taken), 0 not tried / 1 taken /
++    /// 2 none or refused, whether work is reported now, and when work was last busy.
++    pub(crate) clpc: AtomicPtr<core::ffi::c_void>,
++    pub(crate) clpc_state: AtomicU32,
++    pub(crate) clpc_on: AtomicBool,
++    pub(crate) clpc_busy_ns: AtomicU64,
+     // --- RTKit callback state and a retained failed session. ---
+     /// The first latched error, as a negative errno.
+     pub(crate) error: AtomicI32,
+@@ -419,6 +425,10 @@ pub(crate) fn new(
+                 lat_busy_ns: AtomicU64::new(0),
+                 floor_on: AtomicBool::new(false),
+                 floor_busy_ns: AtomicU64::new(0),
++                clpc: AtomicPtr::new(core::ptr::null_mut()),
++                clpc_state: AtomicU32::new(0),
++                clpc_on: AtomicBool::new(false),
++                clpc_busy_ns: AtomicU64::new(0),
+                 error: AtomicI32::new(0),
+                 started: AtomicBool::new(false),
+                 data,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index bf626644b6..e7971b5700 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -875,6 +875,25 @@ pub(crate) fn job_ahead() -> u32 {
+     "G16: 0 (default) only a job's first command goes behind in-flight work; 1 = also its later compute commands after a compute command; 2 = also meet a wait on compute commands published ahead in the compute queue by its order (needs g16_horizon; runtime 0644)"
+ );
+ 
++/// Storage of `g16_clpc_demand` (runtime 0644, default 0).
++static CLPC_DEMAND: AtomicU32 = AtomicU32::new(0);
++
++/// Whether GPU work in flight is reported to the CLPC (DT `apple,clpc`), which on T8132 raises
++/// the DRAM (DCS) and fabric rails to their top while work is reported, as the G17 backend
++/// does. Released after the busy window without work, like the CPU latency bound.
++pub(crate) fn clpc_demand() -> bool {
++    CLPC_DEMAND.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    CLPC_DEMAND_PARAM,
++    CLPC_DEMAND_PARMTYPE,
++    CLPC_DEMAND_PARM,
++    CLPC_DEMAND,
++    "g16_clpc_demand",
++    "G16: report GPU work in flight to the CLPC, which raises the DRAM and fabric rails while it lasts (default 0: not reported; 1: reported; runtime 0644)"
++);
++
+ /// Storage of `g16_submit_boost` (runtime 0644, default 0).
+ static SUBMIT_BOOST: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index dee9fb3e27..be329f754c 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -200,6 +200,38 @@ fn lat_qos(&self, busy: bool, last: bool) {
+         {
+             self.floor_on.store(false, Ordering::Relaxed);
+         }
++        // g16_clpc_demand: report work in flight to the CLPC, as the G17 backend does, so that
++        // the T8132 CLPC raises the DRAM (DCS) and fabric rails for GPU work.
++        let demand = params::clpc_demand();
++        if demand && self.clpc_state.load(Ordering::Relaxed) == 0 {
++            let state = match super::boot::glue::clpc_get(&self.dev) {
++                Ok(Some(gpu)) => {
++                    self.clpc.store(gpu, Ordering::Relaxed);
++                    1
++                }
++                Err(e) if e == EPROBE_DEFER => 0,
++                _ => 2,
++            };
++            self.clpc_state.store(state, Ordering::Relaxed);
++        }
++        let gpu = self.clpc.load(Ordering::Relaxed);
++        if gpu.is_null() {
++            return;
++        }
++        if busy && demand {
++            self.clpc_busy_ns.store(now, Ordering::Relaxed);
++            if !self.clpc_on.swap(true, Ordering::Relaxed) {
++                super::boot::glue::clpc_set_active(gpu, true);
++            }
++        } else if self.clpc_on.load(Ordering::Relaxed)
++            && (last
++                || !demand
++                || now.saturating_sub(self.clpc_busy_ns.load(Ordering::Relaxed))
++                    >= super::power::policy::WINDOW_NS)
++        {
++            self.clpc_on.store(false, Ordering::Relaxed);
++            super::boot::glue::clpc_set_active(gpu, false);
++        }
+     }
+ 
+     /// Deliver userspace notification outside the device mutex and fence completion path.
+-- 
+2.43.0
+
