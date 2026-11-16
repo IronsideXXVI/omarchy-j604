@@ -1255,3 +1255,10 @@ Kernel 1.1000 is the series of 1.999 unchanged: the same base (`da8e1acf3656`) a
 Kernel 1.1001 keeps the base (`da8e1acf3656`) and all 818 patches of 1.1000 under the same numbers.
 
 New in 1.1001 (none changes what the machine does by default: 0819-0823 are read-only counters and log lines, 0824 and 0825 are switches whose defaults keep the current behaviour): 0819 (`drm/asahi: g16: Time slow render starts against the previous completion`), 0820 (`drm/asahi: g16: Show the PMP's GFX request and acknowledgment words`), 0821 (`drm/asahi: g16: Show the firmware's idle delay and its policy words`), 0822 (`drm/asahi: g16: Name the work around a firmware recovery`), 0823 (`drm/asahi: g16: Count starts into a queue that had gone empty`), 0824 (`drm/asahi: g16: Optionally register a second render queue set`), 0825 (`drm/asahi: g16: Optionally chain a render with a stamp-only wait`).
+
+
+# Kernel patch numbers: 1.1001 to 1.1002
+
+Kernel 1.1002 keeps the base (`da8e1acf3656`) and all 825 patches of 1.1001 under the same numbers.
+
+New in 1.1002 (none changes what the machine does by default: 0826, 0827, 0828 and 0830 are read-only counters and traces, 0829 is a switch that is off by default): 0826 (`drm/asahi: g16: Count firmware log records in the stats file`), 0827 (`drm/asahi: g16: Trace the last render flights in the stats file`), 0828 (`drm/asahi: g16: Count what a lone compute command's retirement waits for`), 0829 (`drm/asahi: g16: Optionally order same-queue commands by queue order alone`), 0830 (`drm/asahi: g16: Add the TA end and FS start to the render flight trace`).

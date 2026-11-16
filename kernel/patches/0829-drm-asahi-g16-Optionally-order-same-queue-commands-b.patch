@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 20:48:32 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally order same-queue commands
+ by queue order alone
+
+A command whose wait names a command still running in its own queue is
+held on the host until that command retires (render), or published
+behind it only with g16_job_ahead 2 (compute); g16_render_chain adds a
+firmware wait for the previous render's FS. macOS writes no dependency
+record at all in the seven command captures we hold, and leaves the
+order to the queue.
+
+Add g16_same_queue_nowait (runtime, default 0). With 1, a command whose
+only unmet wait is on commands already published ahead of it in its own
+queue is published at once with no wait record: compute as
+g16_job_ahead 2, a render without the predecessor barrier. The
+fragment's own wait for its TA stays, and waits on the other engine or
+on another queue are still held on the host. The stats line
+render_chain counts the renders published this way.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |  6 +++++-
+ drivers/gpu/drm/asahi/g16/job.rs    | 11 +++++++++--
+ drivers/gpu/drm/asahi/g16/params.rs | 22 ++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 10 +++++++++-
+ 4 files changed, 45 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 4f31545cd5..b796d7ad02 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -2075,7 +2075,11 @@ fn prefix_render(
+         // g16_render_chain: a render published ahead of a render it waits on starts its TA only
+         // after the previous render's FS stamp (FS event 0x71), as the G15 backend's predecessor
+         // barrier does; the previous render is the last one published (pf.draw).
+-        if params::render_chain() && job.own_wait_pending(job.progress.sent()) {
++        let pending = job.own_wait_pending(job.progress.sent());
++        if params::same_queue_nowait() && pending {
++            // g16_same_queue_nowait: the TA queue's order alone, no predecessor barrier.
++            super::poll::RENDER_NOWAIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
++        } else if params::render_chain() && pending {
+             // g16_render_chain 2: a stamp-only wait, as the FS's own wait for its TA.
+             let ty = if params::render_chain_stamp() {
+                 BarrierType::Stamp
+diff --git a/drivers/gpu/drm/asahi/g16/job.rs b/drivers/gpu/drm/asahi/g16/job.rs
+index 2c5a23aa09..34ed8fdeba 100644
+--- a/drivers/gpu/drm/asahi/g16/job.rs
++++ b/drivers/gpu/drm/asahi/g16/job.rs
+@@ -319,7 +319,14 @@ pub(crate) fn check_command_dependencies(&self, index: u32) -> Result {
+         } else {
+             (super::params::depth() != 0, 1)
+         };
+-        let job_ahead = super::params::job_ahead();
++        // g16_same_queue_nowait: compute as g16_job_ahead 2, render as g16_render_chain
++        // without its predecessor barrier (engine.rs).
++        let nowait = super::params::same_queue_nowait();
++        let job_ahead = if nowait {
++            2
++        } else {
++            super::params::job_ahead()
++        };
+         let compute = order.engine == super::command::COMPUTE;
+         let later = compute
+             && job_ahead >= 1
+@@ -339,7 +346,7 @@ pub(crate) fn check_command_dependencies(&self, index: u32) -> Result {
+             }
+             // g16_render_chain: the same for a render's wait on renders published ahead of it;
+             // the publication then encodes a firmware wait for the previous FS (engine.rs).
+-            let chain = !compute && super::params::render_chain();
++            let chain = !compute && (super::params::render_chain() || nowait);
+             if ((compute && job_ahead >= 2) || chain)
+                 && order.ready_in_queue(completed, published, behind)
+             {
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 26ae01ddc6..ad5febd39d 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1969,6 +1969,28 @@ pub(crate) fn render_queues() -> u32 {
+     "G16: render queue sets registered at the engine start: 1 (default) or 2 (a second set under its own scheduling context on submit channel 3, registered but given no work; set before the GPU starts)"
+ );
+ 
++/// Storage of `g16_same_queue_nowait` (runtime 0644, default 0).
++static SAME_QUEUE_NOWAIT: AtomicU32 = AtomicU32::new(0);
++
++/// Whether a command whose only unmet wait is on commands already published ahead of it in
++/// its own queue is published at once with no wait record, the queue order alone ordering it
++/// (macOS writes no dependency record): compute as `g16_job_ahead` 2, and a render behind
++/// renders of the same queue pair without the predecessor barrier of `g16_render_chain`.
++/// The fragment's own wait for its TA stays. Waits on the other engine or another VM's work
++/// are still held on the host.
++pub(crate) fn same_queue_nowait() -> bool {
++    SAME_QUEUE_NOWAIT.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    SAME_QUEUE_NOWAIT_PARAM,
++    SAME_QUEUE_NOWAIT_PARMTYPE,
++    SAME_QUEUE_NOWAIT_PARM,
++    SAME_QUEUE_NOWAIT,
++    "g16_same_queue_nowait",
++    "G16: publish a command waiting only on commands already published ahead of it in its own queue at once, with no wait record (default 0: host waits; 1: queue order only; runtime 0644)"
++);
++
+ /// Storage of `g16_compute_same_vm` (runtime 0644, default 0).
+ static COMPUTE_SAME_VM: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 81041b1794..cf2f216e1d 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -70,6 +70,9 @@
+ static FLIGHT_TRACE: [[core::sync::atomic::AtomicU64; 6]; FLIGHT_TRACE_N] =
+     [const { [const { core::sync::atomic::AtomicU64::new(0) }; 6] }; FLIGHT_TRACE_N];
+ static FLIGHT_TRACE_HEAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
++/// Renders published behind renders they wait on with no wait record (`g16_same_queue_nowait`).
++pub(crate) static RENDER_NOWAIT: core::sync::atomic::AtomicU64 =
++    core::sync::atomic::AtomicU64::new(0);
+ /// Render commands published ahead of a render they wait on, with the firmware wait for the
+ /// previous FS (`g16_render_chain`).
+ pub(crate) static RENDER_CHAINED: core::sync::atomic::AtomicU64 =
+@@ -1680,7 +1683,12 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             busy(8),
+             busy(9)
+         )?;
+-        writeln!(f, "render_chain: chained {}", RENDER_CHAINED.load(Ordering::Relaxed))?;
++        writeln!(
++            f,
++            "render_chain: chained {} nowait {}",
++            RENDER_CHAINED.load(Ordering::Relaxed),
++            RENDER_NOWAIT.load(Ordering::Relaxed)
++        )?;
+         let w: [u64; 8] = core::array::from_fn(|i| FS_WORDS[i].load(Ordering::Relaxed));
+         writeln!(
+             f,
+-- 
+2.43.0
+

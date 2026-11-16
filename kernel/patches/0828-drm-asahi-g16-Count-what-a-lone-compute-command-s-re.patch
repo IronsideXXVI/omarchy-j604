@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 19:49:01 +0000
+Subject: [PATCH] drm/asahi: g16: Count what a lone compute command's
+ retirement waits for
+
+At depth one a compute command is retired only when its stage stamp, the
+queue and submit pipe cursors, the notifier record and the timestamp pair
+are all in place. Which of these comes last decides whether the host can
+learn of the end any sooner.
+
+Count, for the oldest compute command when it runs alone, the checks that
+left it pending by the first condition still missing, and the time from
+the check that first saw its stamp to the one that retired it. Print both
+on a receipt_wait line in the stats file. Nothing reads them back.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 11 +++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 49 ++++++++++++++++++++++++++++-
+ 2 files changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 5f28eb3c86..4f31545cd5 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -354,6 +354,17 @@ pub(crate) struct Stats {
+     /// empty at that end; from the publication). Diagnostic only.
+     pub(crate) qempty_prev_end: [u64; 3],
+     pub(crate) qempty_hist: [[[u64; 32]; 2]; 3],
++    /// `receipt_wait:` the oldest compute flight alone: checks that left it pending with its
++    /// stage stamp not reached (0), with the stamp reached but the queue or submit pipe
++    /// cursors not passed (1), or with both and the notifier or timestamp words missing (2);
++    /// per retirement, the time from the check that first saw its stamp, and how many
++    /// retired in that same check. Diagnostic only.
++    pub(crate) rwait: [u64; 3],
++    pub(crate) rwait_target: u32,
++    pub(crate) rwait_seen_ns: u64,
++    pub(crate) rwait_lead_ns: u64,
++    pub(crate) rwait_n: u64,
++    pub(crate) rwait_same: u64,
+     /// Retired compute commands whose context-store request / completion words
+     /// (work + 0x89c / 0x8a4) are non-zero, and the last non-zero request word.
+     pub(crate) cstore_req: u64,
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index a7e6ec6449..81041b1794 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -842,6 +842,30 @@ pub(crate) fn queue_receipt_behind(
+         Ok(true)
+     }
+ 
++    /// `receipt_wait:` one check of the oldest compute flight alone left it pending.
++    fn note_rwait(&mut self, stamped: bool, cursors: bool, target: u32) {
++        let s = &mut *self.engine.stats;
++        s.rwait[usize::from(stamped) + usize::from(cursors)] += 1;
++        if stamped && s.rwait_target != target {
++            s.rwait_target = target;
++            s.rwait_seen_ns = now_ns();
++        }
++    }
++
++    /// `receipt_wait:` the oldest compute flight alone has its full receipt.
++    fn note_rwait_retired(&mut self, target: u32) {
++        let s = &mut *self.engine.stats;
++        s.rwait_n += 1;
++        if s.rwait_target == target && s.rwait_seen_ns != 0 {
++            let lead = now_ns().saturating_sub(s.rwait_seen_ns);
++            s.rwait_lead_ns = s.rwait_lead_ns.saturating_add(lead);
++        } else {
++            s.rwait_same += 1;
++        }
++        s.rwait_target = 0;
++        s.rwait_seen_ns = 0;
++    }
++
+     /// A full receipt includes stage and notifier stamps, every physical consumer,
+     /// the private allocator completion and the internal timestamp pair. An aborted
+     /// receipt omits only the writes firmware does not make for an aborted command,
+@@ -864,6 +888,7 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+         // moves the shared stamps, cursors and notifier records past it: prove the oldest by
+         // "reached" then. Its own unit still has to prove completion (counter, ITS pair).
+         let behind = self.engine.flights.len() > 1;
++        let (mut rw_alone, mut rw_stamped, mut rw_target) = (false, false, 0);
+         if f.computes != 0 {
+             let g = &self.graph.compute;
+             let e = &self.engine;
+@@ -879,10 +904,16 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+                         f.rec[2],
+                     )?
+             } else {
+-                g.fw_stamp.r32(0)? == f.target
++                rw_alone = f.renders == 0;
++                rw_target = f.target;
++                rw_stamped = g.fw_stamp.r32(0)? == f.target;
++                rw_stamped
+                     && self.queue_receipt(Channel::Compute, &g.qstate, &g.qinfo, f.head, f.rec[2])?
+             };
+             if !passed {
++                if rw_alone {
++                    self.note_rwait(rw_stamped, false, rw_target);
++                }
+                 return Ok(Retirement::Pending);
+             }
+             let k = f.claims.slot[0] as usize;
+@@ -986,6 +1017,9 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+                 && fs_end > fs_start;
+         }
+         if full {
++            if rw_alone {
++                self.note_rwait_retired(rw_target);
++            }
+             return Ok(Retirement::Full);
+         }
+         if f.recovery_suspect && now_ns().saturating_sub(f.recovery_started_ns) >= 20_000_000 {
+@@ -996,6 +1030,9 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+             }
+             return Ok(Retirement::Aborted);
+         }
++        if rw_alone {
++            self.note_rwait(true, true, rw_target);
++        }
+         Ok(Retirement::Pending)
+     }
+ 
+@@ -1910,6 +1947,16 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.lat_last_bad[2],
+             s.lat_last_bad[3]
+         )?;
++        writeln!(
++            f,
++            "receipt_wait: compute alone checks stamp {} cursors {} notes {} retired {} same {} lead_us {}",
++            s.rwait[0],
++            s.rwait[1],
++            s.rwait[2],
++            s.rwait_n,
++            s.rwait_same,
++            s.rwait_lead_ns / 1000
++        )?;
+         writeln!(
+             f,
+             "tailsplit: n {} other {} fw_us {} wake_us {} lock_us {} pass_us {} loops {} other_us {} sretire {}",
+-- 
+2.43.0
+

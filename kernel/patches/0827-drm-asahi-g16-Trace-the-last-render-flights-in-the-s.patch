@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 19:22:34 +0000
+Subject: [PATCH] drm/asahi: g16: Trace the last render flights in the
+ stats file
+
+The render start statistics are histograms, so the order of events
+around one slow start (publication, TA start, FS end, completion event,
+host lock and retirement, and the next publication) cannot be read back.
+
+With g16_prof set, keep those times for the last 32 retired render
+flights and print them, oldest first, as ftrace: lines in the
+aurora-g16 stats file. Nothing is recorded with g16_prof off.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/poll.rs | 53 +++++++++++++++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index d763cadaa3..a7e6ec6449 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -62,6 +62,14 @@
+ pub(crate) static LAST_EVENT_READ: core::sync::atomic::AtomicU64 =
+     core::sync::atomic::AtomicU64::new(0);
+ static RENDER_PREV_READ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
++
++/// Entries of the render flight trace (g16_prof): the last [`FLIGHT_TRACE_N`] retired
++/// render flights, each publication, TA start, FS end, completion event, lock and retirement
++/// time on the architectural counter (0 when not seen).
++const FLIGHT_TRACE_N: usize = 32;
++static FLIGHT_TRACE: [[core::sync::atomic::AtomicU64; 6]; FLIGHT_TRACE_N] =
++    [const { [const { core::sync::atomic::AtomicU64::new(0) }; 6] }; FLIGHT_TRACE_N];
++static FLIGHT_TRACE_HEAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+ /// Render commands published ahead of a render they wait on, with the firmware wait for the
+ /// previous FS (`g16_render_chain`).
+ pub(crate) static RENDER_CHAINED: core::sync::atomic::AtomicU64 =
+@@ -260,6 +268,39 @@ fn fwpower_show(v: &FwPower, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ }
+ 
+ /// The `aurora-g16/stats` debugfs file contents.
++/// The `ftrace:` lines of the stats file, oldest first: per retired render flight, the times
++/// in ns of TA start, FS end, completion event, lock and retirement after its publication, and
++/// its publication after the previous traced flight's.
++fn write_flight_trace(f: &mut fmt::Formatter<'_>) -> fmt::Result {
++    let freq = super::engine::counter_hz();
++    if freq == 0 {
++        return Ok(());
++    }
++    let ns = |t: u64| super::engine::mul_div(t, 1_000_000_000, freq);
++    let head = FLIGHT_TRACE_HEAD.load(Ordering::Relaxed) as usize;
++    let mut prev = 0;
++    for i in 0..FLIGHT_TRACE_N {
++        let e = &FLIGHT_TRACE[(head + i) % FLIGHT_TRACE_N];
++        let v: [u64; 6] = core::array::from_fn(|k| e[k].load(Ordering::Relaxed));
++        if v[0] == 0 {
++            continue;
++        }
++        let after = |t: u64| if t >= v[0] { ns(t - v[0]) } else { 0 };
++        writeln!(
++            f,
++            "ftrace: pub_gap {} start {} end {} event {} lock {} retire {}",
++            if prev != 0 && v[0] >= prev { ns(v[0] - prev) } else { 0 },
++            after(v[1]),
++            after(v[2]),
++            after(v[3]),
++            after(v[4]),
++            after(v[5])
++        )?;
++        prev = v[0];
++    }
++    Ok(())
++}
++
+ fn stats_show(shared: &Arc<Shared>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+     let state = shared.state.lock();
+     match state.as_deref() {
+@@ -1430,6 +1471,17 @@ fn stat_retire(&mut self, f: &Flight) {
+                     RENDER_PREV_READ.store(read, Ordering::Relaxed);
+                     RENDER_PREV_EV.store(if hi_c <= ev { ev } else { 0 }, Ordering::Relaxed);
+                 }
++                if c == 1 && prof_on {
++                    let slot = (FLIGHT_TRACE_HEAD.fetch_add(1, Ordering::Relaxed) as usize)
++                        % FLIGHT_TRACE_N;
++                    let ev_seen = if hi_c <= ev { ev } else { 0 };
++                    for (cell, v) in FLIGHT_TRACE[slot]
++                        .iter()
++                        .zip([f.published_ticks, lo_c, hi_c, ev_seen, locked, now_ticks])
++                    {
++                        cell.store(v, Ordering::Relaxed);
++                    }
++                }
+                 s.lat_n += 1;
+                 s.start_hist[usize::from(kind != 0)][((start / 10_000) as usize).min(31)] += 1;
+                 let (p200, p1ms) = (hz / 5000, hz / 1000);
+@@ -1607,6 +1659,7 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             w[7] & 0xffff,
+             w[7] >> 16
+         )?;
++        write_flight_trace(f)?;
+         write!(f, "render_tail: after_read_10us")?;
+         for b in RENDER_TAIL.iter().take(16) {
+             write!(f, " {}", b.load(Ordering::Relaxed))?;
+-- 
+2.43.0
+

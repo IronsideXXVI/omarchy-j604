@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 18:54:23 +0000
+Subject: [PATCH] drm/asahi: g16: Count firmware log records in the
+ stats file
+
+The nine firmware log sub-rings are drained by moving the read index
+to the producer, so nothing the firmware logs is ever seen. Slow render
+starts may coincide with firmware work that only shows up there.
+
+Count the records each log sub-ring holds when it is drained, count the
+ktrace records, and keep the first four words of each sub-ring's newest
+record. Print them as an fwlog: line in the aurora-g16 stats file.
+
+The drain itself is unchanged. A sub-ring that wraps between two drains
+is undercounted.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/channel.rs | 60 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs    |  1 +
+ 2 files changed, 61 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/channel.rs b/drivers/gpu/drm/asahi/g16/channel.rs
+index 9416368e67..138b436ec2 100644
+--- a/drivers/gpu/drm/asahi/g16/channel.rs
++++ b/drivers/gpu/drm/asahi/g16/channel.rs
+@@ -7,6 +7,11 @@
+ //! published through SGX+0xd60000 before its producer and the 0x0084 policy doorbell.
+ //! Nine log threads and event/statistics receive records use the M4 0x48-byte ABI.
+ 
++use core::{
++    fmt,
++    sync::atomic::{AtomicU32, AtomicU64, Ordering},
++};
++
+ use kernel::{
+     prelude::*,
+     sync::Arc,
+@@ -244,6 +249,7 @@ pub(crate) fn drain_events(&self, dev: &kernel::device::Device, events: &mut Eve
+     /// statistics are kept in `events`). None of them gates a receipt.
+     pub(crate) fn drain_reports(&self, dev: &kernel::device::Device, events: &mut Events) -> Result {
+         for i in 0..rings::LOG_RINGS {
++            count_log(&self.log, i);
+             Self::drain_one(&self.log, i * 0x30, 256)?;
+         }
+         // Ktrace has twice the capacity of the other receive rings.
+@@ -257,6 +263,7 @@ pub(crate) fn drain_reports(&self, dev: &kernel::device::Device, events: &mut Ev
+             if self.trace.ring.r32(consumer as usize * 0x48)? != 5 {
+                 return Err(super::boot::eproto());
+             }
++            TRACE_RECORDS.fetch_add(1, Ordering::Relaxed);
+             consumer = (consumer + 1) % 512;
+             self.trace.state.w32(STATE_READ, consumer)?;
+             wmb();
+@@ -265,6 +272,59 @@ pub(crate) fn drain_reports(&self, dev: &kernel::device::Device, events: &mut Ev
+     }
+ }
+ 
++/// Records found in each log sub-ring when it is drained, since load.
++static LOG_RECORDS: [AtomicU64; rings::LOG_RINGS] = [const { AtomicU64::new(0) }; rings::LOG_RINGS];
++
++/// The first four words of the newest record of each log sub-ring.
++static LOG_LAST: [[AtomicU32; 4]; rings::LOG_RINGS] =
++    [const { [const { AtomicU32::new(0) }; 4] }; rings::LOG_RINGS];
++
++/// Ktrace records drained since load.
++static TRACE_RECORDS: AtomicU64 = AtomicU64::new(0);
++
++/// Counts the records log sub-ring `i` holds and keeps the head of its newest one. Read only:
++/// the drain itself is unchanged. A sub-ring that wraps between two drains is undercounted.
++fn count_log(log: &Ring, i: usize) {
++    let off = i * 0x30;
++    let (Ok(producer), Ok(consumer)) =
++        (log.state.r32(off + STATE_WRITE), log.state.r32(off + STATE_READ))
++    else {
++        return;
++    };
++    if producer >= 256 || consumer >= 256 || producer == consumer {
++        return;
++    }
++    LOG_RECORDS[i].fetch_add(u64::from((producer + 256 - consumer) % 256), Ordering::Relaxed);
++    let newest = (i * 256 + ((producer + 255) % 256) as usize) * rings::EVENT_RECORD;
++    rmb();
++    for (w, last) in LOG_LAST[i].iter().enumerate() {
++        if let Ok(v) = log.ring.r32(newest + 4 * w) {
++            last.store(v, Ordering::Relaxed);
++        }
++    }
++}
++
++/// The `fwlog:` line of the stats file: records per log sub-ring, ktrace records, and the
++/// first four words of each sub-ring's newest record.
++pub(crate) fn write_log_stats(f: &mut impl fmt::Write) -> fmt::Result {
++    write!(f, "fwlog: records")?;
++    for n in LOG_RECORDS.iter() {
++        write!(f, " {}", n.load(Ordering::Relaxed))?;
++    }
++    write!(f, " trace {} last", TRACE_RECORDS.load(Ordering::Relaxed))?;
++    for l in LOG_LAST.iter() {
++        write!(
++            f,
++            " {:x}/{:x}/{:x}/{:x}",
++            l[0].load(Ordering::Relaxed),
++            l[1].load(Ordering::Relaxed),
++            l[2].load(Ordering::Relaxed),
++            l[3].load(Ordering::Relaxed)
++        )?;
++    }
++    writeln!(f)
++}
++
+ /// Adds one to the Globals power-assert tally for a record the firmware counts, after the record
+ /// and before the producer store (the caller's barrier orders both). The firmware keeps the GPU
+ /// cores powered while its count of drained power-asserting records differs from this tally;
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 4fa7c8ba72..d763cadaa3 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1835,6 +1835,7 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             super::sleep::REVIVE_STATS[1].load(core::sync::atomic::Ordering::Relaxed)
+         )?;
+         self.pools.write_stats(f)?;
++        super::channel::write_log_stats(f)?;
+         writeln!(
+             f,
+             "stage: ta_us {} fs_us {} cdm_us {} span_us {}",
+-- 
+2.43.0
+
