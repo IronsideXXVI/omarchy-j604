@@ -1215,3 +1215,10 @@ Kernel 1.985 keeps the base (`da8e1acf3656`) and all 765 patches of 1.947 under 
 Kernel 1.992 keeps the base (`da8e1acf3656`) and all 785 patches of 1.985 under the same numbers.
 
 1.988 carried the same patches and was never installed (a packaging fault, not a kernel one; see STATUS.md). New in 1.992 (0792 is on by default; the other six are off by default or read-only): 0786 (`drm/asahi: g16: Optionally report GPU work to the CLPC`), 0787 (`drm/asahi: g16: Show the firmware's own power state in debugfs`), 0788 (`drm/asahi: g16: Optionally read the event ring first in a poll pass`), 0789 (`drm/asahi: g16: Count the running performance state while work is in flight`), 0790 (`cpufreq: schedutil: Let the driver set where down_hold_us starts`), 0791 (`cpufreq: apple-soc: Optionally set schedutil's starting values`), 0792 (`drm/asahi: g16: Check the session once per poll pass by default`).
+
+
+# Kernel patch numbers: 1.992 to 1.990
+
+Kernel 1.990 keeps the base (`da8e1acf3656`) and all 792 patches of 1.992 under the same numbers.
+
+1.990 was planned before 1.992 and keeps its number; it carries all of 1.992. New in 1.990 (0796 and 0797 are on by default; the other three are off by default or read-only): 0793 (`drm/asahi: g16: Count compute commands that overlap their queue predecessor`), 0794 (`drm/asahi: g16: Optionally share one UMA pool among a VM's compute units`), 0795 (`nvme-apple: optionally wait longer for the final shutdown notification`), 0796 (`drm/asahi: g16: Boost the submit path by default`), 0797 (`drm/asahi: g16: Keep up to 16 compute commands in flight by default`).

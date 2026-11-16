@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 12:03:02 +0000
+Subject: [PATCH] drm/asahi: g16: Count compute commands that overlap
+ their queue predecessor
+
+All compute commands go into the one firmware compute ring, which the
+firmware runs in order, so a compute command should never start before
+the previous compute command of the same queue has ended. Sharing per
+queue state between in-flight compute commands depends on that.
+
+Add read-only statistics for it. At each compute retirement, read the
+command's stage stamps and count a command whose start is earlier than
+the latest end of its queue's previous compute commands (cq_overlap).
+Also count retired commands whose context store request and completion
+words are non-zero, and keep the last request word, so that a stored
+compute context shows up in the statistics. Nothing is written to the
+firmware and no behaviour changes.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |  9 +++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 40 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/queue.rs  |  3 +++
+ 3 files changed, 52 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 7edc9fb3a7..77de0b6696 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -342,6 +342,15 @@ pub(crate) struct Stats {
+     pub(crate) chain_serial_n: [u64; 2],
+     pub(crate) chain_serial_ns: [u64; 2],
+     pub(crate) chain_ahead_hist: [[u64; 32]; 2],
++    /// Retired compute commands whose context-store request / completion words
++    /// (work + 0x89c / 0x8a4) are non-zero, and the last non-zero request word.
++    pub(crate) cstore_req: u64,
++    pub(crate) cstore_compl: u64,
++    pub(crate) cstore_last: u64,
++    /// Retired compute commands with stage stamps, and those that started before the
++    /// previous compute command of the same queue had ended.
++    pub(crate) cq_n: u64,
++    pub(crate) cq_overlap: u64,
+     /// `g16_subgen`, per submit pipe (TA, FS, compute): cells bumped, bumps that found the
+     /// firmware's mirror equal to the cell (caught up), and failed accesses.
+     pub(crate) subgen_bumps: [u64; 3],
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index e3e36c4e2a..cc82ba9e43 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1097,6 +1097,7 @@ fn stat_retire(&mut self, f: &Flight) {
+             };
+             let c = &arena.compute[f.claims.slot[k] as usize];
+             stage(&c.its, 0, &mut s.cdm_ticks, crate::usage::Engine::Compute);
++            note_compute_order(s, &f.job.queue, c);
+         }
+         if hi > lo {
+             s.span_ticks = s.span_ticks.saturating_add(hi - lo);
+@@ -1554,6 +1555,11 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             }
+             writeln!(f)?;
+         }
++        writeln!(
++            f,
++            "cstore: req {} compl {} last {:#x} cq_n {} cq_overlap {}",
++            s.cstore_req, s.cstore_compl, s.cstore_last, s.cq_n, s.cq_overlap
++        )?;
+         writeln!(
+             f,
+             "subgen: on {} bumps {}/{}/{} caught {}/{}/{} err {}",
+@@ -1704,3 +1710,37 @@ fn pmp_agx_sync(&self) {
+         PMP_AGX_BUSY.store(false, Ordering::Release);
+     }
+ }
++
++/// Statistics only: reads a retired compute command's context-store request / completion
++/// words and its stage stamps, and counts a command that started before the previous compute
++/// command of the same queue had ended. The single compute ring runs in order, so both stay
++/// zero unless the firmware stores a compute context and runs a later command meanwhile.
++fn note_compute_order(
++    s: &mut super::engine::Stats,
++    q: &super::queue::QueueState,
++    c: &super::slots::ComputeSlot,
++) {
++    let word = |o: &super::object::FwObject, off: usize| -> u64 {
++        match (o.r32(off), o.r32(off + 4)) {
++            (Ok(lo), Ok(hi)) => u64::from(hi) << 32 | u64::from(lo),
++            _ => 0,
++        }
++    };
++    let req = word(&c.work, 0x89c);
++    if req != 0 {
++        s.cstore_req += 1;
++        s.cstore_last = req;
++    }
++    if word(&c.work, 0x8a4) != 0 {
++        s.cstore_compl += 1;
++    }
++    let (start, end) = (word(&c.its, 0), word(&c.its, 8));
++    if start == 0 || end < start {
++        return;
++    }
++    s.cq_n += 1;
++    let prev = q.compute_end.fetch_max(end, Ordering::Relaxed);
++    if prev != 0 && start < prev {
++        s.cq_overlap += 1;
++    }
++}
+diff --git a/drivers/gpu/drm/asahi/g16/queue.rs b/drivers/gpu/drm/asahi/g16/queue.rs
+index 134ad1fe17..9ca0dfd996 100644
+--- a/drivers/gpu/drm/asahi/g16/queue.rs
++++ b/drivers/gpu/drm/asahi/g16/queue.rs
+@@ -58,6 +58,8 @@ pub(crate) struct QueueState {
+     /// Highest ordinal published to the firmware, per engine (`g16_depth`). Never behind
+     /// `completed`; only read to let a command go behind its in-flight predecessor.
+     pub(crate) published: [AtomicU64; 2],
++    /// Latest end stamp of a retired compute command of this queue (statistics only).
++    pub(crate) compute_end: AtomicU64,
+     /// Owned-job counts at the queue's last 32 arrivals (compute horizon ahead), recorded by the
+     /// engine when a job arrives.
+     pub(crate) owned: [AtomicU32; 32],
+@@ -144,6 +146,7 @@ pub(crate) fn new(
+                 turn: AtomicU64::new(0),
+                 completed: [const { AtomicU64::new(0) }; 2],
+                 published: [const { AtomicU64::new(0) }; 2],
++                compute_end: AtomicU64::new(0),
+                 owned: [const { AtomicU32::new(0) }; 32],
+                 owned_index: AtomicU32::new(0),
+             },
+-- 
+2.43.0
+
