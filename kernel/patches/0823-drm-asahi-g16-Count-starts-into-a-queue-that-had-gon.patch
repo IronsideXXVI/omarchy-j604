@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 18:41:21 +0000
+Subject: [PATCH] drm/asahi: g16: Count starts into a queue that had
+ gone empty
+
+A share of commands starts about 300 us after its predecessor, and
+switching the GPU between two clients costs about the same per switch.
+Whether those slow starts are commands that found their queue empty
+cannot be told from the chain statistics: they compare a render with
+the end of the previous render's fragment work, not with the end of the
+previous command in the same firmware queue.
+
+For each queue (TA, FS and compute), remember when its last command
+ended. For every retired command, count its start delay in 10 us
+buckets, split by whether it was published before that end (measured
+from the end) or after it, when the queue was empty (measured from the
+publication). The statistics file prints one line per queue and case.
+
+Nothing else changes.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |  6 ++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 48 +++++++++++++++++++++++++++--
+ 2 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 49983a9989..f2d0a44fd6 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -348,6 +348,12 @@ pub(crate) struct Stats {
+     pub(crate) chain_serial_n: [u64; 2],
+     pub(crate) chain_serial_ns: [u64; 2],
+     pub(crate) chain_ahead_hist: [[u64; 32]; 2],
++    /// `qempty:` per queue (TA, FS, compute): the end of its previous command (counter ticks),
++    /// and the start delay of each command in 10 us buckets, split by whether it was published
++    /// before that end (0, continuous: from the end) or after it (1, refill: the queue was
++    /// empty at that end; from the publication). Diagnostic only.
++    pub(crate) qempty_prev_end: [u64; 3],
++    pub(crate) qempty_hist: [[[u64; 32]; 2]; 3],
+     /// Retired compute commands whose context-store request / completion words
+     /// (work + 0x89c / 0x8a4) are non-zero, and the last non-zero request word.
+     pub(crate) cstore_req: u64,
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 28271e93c3..4fa7c8ba72 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1253,13 +1253,16 @@ fn stat_retire(&mut self, f: &Flight) {
+         };
+         let (mut lo, mut hi) = (u64::MAX, 0u64);
+         let (mut first, mut last) = (u64::MAX, 0u64);
++        // Per queue (0 TA, 1 FS, 2 compute): the earliest start and latest end of this flight.
++        let mut qse = [(u64::MAX, 0u64); 3];
+         let s = &mut *self.engine.stats;
+ 
+         // Add one stage interval read from internal timestamp cells (start, end).
+         let mut stage = |o: &super::object::FwObject,
+                          off: usize,
+                          sum: &mut u64,
+-                         engine: crate::usage::Engine| {
++                         engine: crate::usage::Engine,
++                         q: usize| {
+             let (Ok(start_lo), Ok(start_hi), Ok(end_lo), Ok(end_hi)) =
+                 (o.r32(off), o.r32(off + 4), o.r32(off + 8), o.r32(off + 12))
+             else {
+@@ -1277,6 +1280,7 @@ fn stat_retire(&mut self, f: &Flight) {
+             *sum = sum.saturating_add(end - start);
+             lo = lo.min(start);
+             hi = hi.max(end);
++            qse[q] = (qse[q].0.min(start), qse[q].1.max(end));
+         };
+         for k in 0..f.renders as usize {
+             let Some(arena) = f.job.resources.render.as_ref() else {
+@@ -1288,12 +1292,14 @@ fn stat_retire(&mut self, f: &Flight) {
+                 0x600,
+                 &mut s.ta_ticks,
+                 crate::usage::Engine::Vertex,
++                0,
+             );
+             stage(
+                 &p.scene,
+                 0x620,
+                 &mut s.fs_ticks,
+                 crate::usage::Engine::Fragment,
++                1,
+             );
+         }
+         for k in 0..(f.computes as usize).min(f.claims.slot_count as usize) {
+@@ -1301,7 +1307,13 @@ fn stat_retire(&mut self, f: &Flight) {
+                 return;
+             };
+             let c = &arena.compute[f.claims.slot[k] as usize];
+-            stage(&c.its, 0, &mut s.cdm_ticks, crate::usage::Engine::Compute);
++            stage(
++                &c.its,
++                0,
++                &mut s.cdm_ticks,
++                crate::usage::Engine::Compute,
++                2,
++            );
+             note_compute_order(s, &f.job.queue, c);
+         }
+         if hi > lo {
+@@ -1314,6 +1326,29 @@ fn stat_retire(&mut self, f: &Flight) {
+             let hz = super::hw::COMMAND_TIMESTAMP_HZ;
+             let to_counter = |t: u64| super::engine::mul_div(t, freq, hz);
+             let ns = |t: u64| super::engine::mul_div(t, 1_000_000_000, freq);
++            // qempty: did this command find its queue empty (published after the queue's
++            // previous command ended), and how long after the end / publication did it start?
++            for (q, &(qs, qe)) in qse.iter().enumerate() {
++                if qe == 0 || freq == 0 || f.published_ticks == 0 {
++                    continue;
++                }
++                let (start_c, end_c) = (to_counter(qs), to_counter(qe));
++                let prev = s.qempty_prev_end[q];
++                if prev != 0 && start_c >= f.published_ticks {
++                    let (refill, from) = if f.published_ticks > prev {
++                        (1, f.published_ticks)
++                    } else {
++                        (0, prev)
++                    };
++                    let gap = if start_c > from {
++                        ns(start_c - from)
++                    } else {
++                        0
++                    };
++                    s.qempty_hist[q][refill][((gap / 10_000) as usize).min(31)] += 1;
++                }
++                s.qempty_prev_end[q] = s.qempty_prev_end[q].max(end_c);
++            }
+             let (lo_c, hi_c) = (to_counter(lo), to_counter(hi));
+             if f.published_ticks != 0 && freq != 0 && lo_c >= f.published_ticks && hi_c <= now_ticks
+             {
+@@ -1911,6 +1946,15 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             write!(f, " {}", n)?;
+         }
+         writeln!(f)?;
++        for (q, name) in ["ta", "fs", "compute"].iter().enumerate() {
++            for (k, kind) in ["cont", "refill"].iter().enumerate() {
++                write!(f, "qempty {} {}:", name, kind)?;
++                for n in s.qempty_hist[q][k].iter() {
++                    write!(f, " {}", n)?;
++                }
++                writeln!(f)?;
++            }
++        }
+         for (name, h) in [("compute", &s.start_hist[0]), ("render", &s.start_hist[1])] {
+             write!(f, "start_hist_10us {}:", name)?;
+             for n in h.iter() {
+-- 
+2.43.0
+

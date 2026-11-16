@@ -1,0 +1,265 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 18:45:16 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally register a second render
+ queue set
+
+All clients share one TA and FS queue pair under one scheduling
+context. Switching the GPU from one client's renders to another's
+therefore has to drain that pair, and every switch costs about 300 us.
+macOS submits each process on its own queues (its channel records name
+a different queue info per process, with the queue type in their kind
+field and a distinct event per queue) and switches between clients
+without a drain.
+
+As a first step, add g16_render_queues (default 1, read once at the
+engine start). With 2, the engine allocates a second render queue set
+under its own scheduling context and registers its TA queue on submit
+channel 3 the way the first set's is registered: a zero-stamp barrier
+in a new queue, then waiting for the context word and the queue receipt.
+Nothing is published to the second set. A failure is logged and leaves
+the first set as it is.
+
+This shows whether the firmware takes a second context with its own
+queues before any work is routed to one.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/channel.rs |  8 +--
+ drivers/gpu/drm/asahi/g16/engine.rs  | 78 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/graph.rs   | 39 ++++++++++++++
+ drivers/gpu/drm/asahi/g16/params.rs  | 19 +++++++
+ 4 files changed, 141 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/channel.rs b/drivers/gpu/drm/asahi/g16/channel.rs
+index 97e0e8ad28..9416368e67 100644
+--- a/drivers/gpu/drm/asahi/g16/channel.rs
++++ b/drivers/gpu/drm/asahi/g16/channel.rs
+@@ -32,6 +32,8 @@ pub(crate) enum Channel {
+     Ta = 0,
+     Fs = 1,
+     Compute = 2,
++    /// The TA queue of the second render queue set (`g16_render_queues` 2): registration only.
++    Ta2 = 3,
+ }
+ 
+ /// A ring and its state block.
+@@ -69,8 +71,8 @@ pub(crate) struct Channels {
+     pub(crate) stats: Ring,
+     /// Allocated for the firmware; the host never uses it.
+     _fwctl: Ring,
+-    /// Host producers of channels 0 TA, 1 FS, 2 compute.
+-    producer: [u32; 3],
++    /// Host producers of channels 0 TA, 1 FS, 2 compute, 3 the second set's TA.
++    producer: [u32; 4],
+     /// Host producer of the device-control ring.
+     devctl_producer: u32,
+ }
+@@ -117,7 +119,7 @@ pub(crate) fn alloc_submit_and_attach(
+             trace,
+             stats,
+             _fwctl: fwctl,
+-            producer: [0; 3],
++            producer: [0; 4],
+             devctl_producer: 0,
+         })
+     }
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index f2d0a44fd6..18669cd41b 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -872,6 +872,82 @@ pub(crate) fn register_context(&mut self) -> Result {
+         Ok(())
+     }
+ 
++    /// `g16_render_queues` 2: registers the second render queue set's TA queue, under its own
++    /// scheduling context, on submit channel 3, as [`Self::register_context`] registers the
++    /// first set's. Nothing is published to it: this only shows whether the firmware accepts a
++    /// second context with its own queues (the first step toward a firmware queue per VM).
++    pub(crate) fn register_render2(&mut self) -> Result {
++        let r = self.graph.render2.as_ref().ok_or(EINVAL)?;
++        let (barrier, zero, state, info, ring, context) = (
++            r.registration_barrier.clone(),
++            r.legacy_empty.va,
++            r.qstate[0].clone(),
++            r.qinfo[0].clone(),
++            r.ring[0].clone(),
++            r.sched_ctx.clone(),
++        );
++        let mut bytes = [0u8; work::barrier::SIZE];
++        bytes[0..4].copy_from_slice(&4u32.to_le_bytes());
++        bytes[4..12].copy_from_slice(&zero.to_le_bytes());
++        bytes[12..20].copy_from_slice(&zero.to_le_bytes());
++        bytes[0x20..0x24].copy_from_slice(&0x80u32.to_le_bytes());
++        barrier.write(0, &bytes)?;
++        if state.r32(qstate::READ)? != 0
++            || state.r32(qstate::WRITE)? != 0
++            || context.r32(0)? & 0xffffff != 0x00ffff
++            || self.channels.read(Channel::Ta2)? != 0
++            || self.channels.producer(Channel::Ta2) != 0
++        {
++            return Err(super::boot::eproto());
++        }
++        ring.w64(0, barrier.va)?;
++        wmb();
++        state.w32(qstate::WRITE, 1)?;
++        wmb();
++        self.channels.post(
++            Channel::Ta2,
++            &SubmitRecord {
++                unk_0: submit_time(),
++                qinfo: info.va,
++                // The record's kind is the queue type (0 TA), not the channel (macOS 26B123).
++                kind: 0,
++                head: 1,
++                event: 0,
++                new_queue: 1,
++            },
++        )?;
++        self.session.ring(Channel::Ta2)?;
++        let deadline = now_ns().saturating_add(2_000_000_000);
++        let mut stable = None;
++        loop {
++            self.drain_rings()?;
++            let now = now_ns();
++            if now >= deadline {
++                return Err(ETIMEDOUT);
++            }
++            let word = context.r32(0)?;
++            let registered =
++                word & 0xff != 0xff && (word >> 8) & 0xff != 0xff && (word >> 16) & 0xff == 4;
++            if registered && self.queue_receipt(Channel::Ta2, &state, &info, 1, 1)? {
++                let first = *stable.get_or_insert(now);
++                if now - first >= 50_000_000 {
++                    break;
++                }
++            } else {
++                stable = None;
++            }
++            // SAFETY: probe/backend start holds only the sleepable device mutex.
++            unsafe {
++                kernel::bindings::usleep_range_state(
++                    1000,
++                    2000,
++                    kernel::bindings::TASK_UNINTERRUPTIBLE,
++                )
++            };
++        }
++        Ok(())
++    }
++
+     /// The single in-order Finalize frontier for each held M4 event. These cells are never
+     /// reset after first publication, including across client VM switches and recovery.
+     pub(crate) fn recovery_snapshot(&self) -> Result<[u32; 3]> {
+@@ -1671,6 +1747,8 @@ fn publish_prefix_into(
+                         0x71,
+                         !self.engine.render_registered,
+                     ),
++                    // The second render queue set carries no work yet.
++                    Channel::Ta2 => return Err(EINVAL),
+                 };
+                 let record = SubmitRecord {
+                     unk_0: submit_time(),
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index 8ff77cccdd..8f86c59e0f 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -265,19 +265,43 @@ pub(crate) struct Graphs {
+     pub(crate) dev: ARef<device::Device>,
+     pub(crate) compute: ComputeGraph,
+     pub(crate) render: RenderGraph,
++    /// `g16_render_queues` 2: a second render queue set under its own scheduling context.
++    pub(crate) render2: Option<RenderGraph>,
+ }
+ impl Graphs {
+     pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+         let compute = ComputeGraph::new(o)?;
+         let render = RenderGraph::new(o, compute.sched_ctx.clone())?;
++        let render2 = if super::params::render_queues() >= 2 {
++            let context = alloc(o, sched_ctx::SIZE, cmd_fw(), None, 0, false)?;
++            Some(RenderGraph::new(o, context)?)
++        } else {
++            None
++        };
+         Ok(Self {
+             dev: dev.as_ref().as_ref().into(),
+             compute,
+             render,
++            render2,
+         })
+     }
+ }
+ impl Firmware {
++    /// `g16_render_queues` 2: initialises the second render queue set and registers it.
++    fn init_render2(&mut self) -> Result {
++        let r2 = self
++            .graph
++            .render2
++            .as_ref()
++            .ok_or(Error::from_errno(-(kernel::bindings::EINVAL as i32)))?;
++        r2.sched_ctx.write(0, &graph::context_image())?;
++        r2.init()?;
++        if self.channels.read(Channel::Ta2)? != 0 || self.channels.write_cell(Channel::Ta2)? != 0 {
++            return Err(Error::from_errno(-(kernel::bindings::EPROTO as i32)));
++        }
++        self.register_render2()
++    }
++
+     pub(crate) fn init_graphs(&mut self) -> Result {
+         for ch in [Channel::Ta, Channel::Fs, Channel::Compute] {
+             if self.channels.read(ch)? != 0 || self.channels.write_cell(ch)? != 0 {
+@@ -291,6 +315,21 @@ pub(crate) fn init_graphs(&mut self) -> Result {
+         super::engine::wmb();
+         super::uat::tlbi_all();
+         self.register_context()?;
++        if self.graph.render2.is_some() {
++            // A failure leaves the first set alone: the second carries no work.
++            match self.init_render2() {
++                Ok(()) => dev_info!(
++                    self.graph.dev.as_ref(),
++                    "G16: second render queue set registered (context {:#x}, channel 3)\n",
++                    self.graph.render2.as_ref().map_or(0, |r| r.sched_ctx.va)
++                ),
++                Err(e) => dev_warn!(
++                    self.graph.dev.as_ref(),
++                    "G16: second render queue set NOT registered: {:?}\n",
++                    e
++                ),
++            }
++        }
+         dev_info!(
+             self.graph.dev.as_ref(),
+             "G16: M4 queue/resource graphs initialized\n"
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 4a547c2e91..b8049788f7 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1944,6 +1944,25 @@ pub(crate) fn vm_batch_us() -> u32 {
+     "G16: while another VM waits, the VM holding the engine publishes only during this many us of its turn (default 2000; 100..100000; runtime 0644)"
+ );
+ 
++/// Storage of `g16_render_queues` (0644, default 1; read once, at the engine start).
++static RENDER_QUEUES: AtomicU32 = AtomicU32::new(1);
++
++/// Render queue sets registered with the firmware at the engine start: 1 (default), or 2 for
++/// a second set under its own scheduling context on submit channel 3, registered but given no
++/// work (the first step toward a firmware queue per VM).
++pub(crate) fn render_queues() -> u32 {
++    RENDER_QUEUES.load(Ordering::Relaxed).clamp(1, 2)
++}
++
++live_u32_param!(
++    RENDER_QUEUES_PARAM,
++    RENDER_QUEUES_PARMTYPE,
++    RENDER_QUEUES_PARM,
++    RENDER_QUEUES,
++    "g16_render_queues",
++    "G16: render queue sets registered at the engine start: 1 (default) or 2 (a second set under its own scheduling context on submit channel 3, registered but given no work; set before the GPU starts)"
++);
++
+ /// Storage of `g16_compute_same_vm` (runtime 0644, default 0).
+ static COMPUTE_SAME_VM: AtomicU32 = AtomicU32::new(0);
+ 
+-- 
+2.43.0
+

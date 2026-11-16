@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 17:38:37 +0000
+Subject: [PATCH] drm/asahi: g16: Name the work around a firmware
+ recovery
+
+A firmware recovery event the driver survives leaves one line with the
+event words and one when recovery resumes. That does not say which
+command the firmware stopped or what ran just before it, so a fault
+seen once on a busy desktop cannot be traced afterwards.
+
+When the host answers a recovery, also log the snapshot entries the
+firmware names, the fault ASID, every running flight (VM, slot, its
+compute and render counts, its TA, FS and compute stamp ranges and its
+age) and the last eight retirements (VM, class and how long before).
+Nothing else changes; the lines appear only during a recovery.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs   |  6 +++
+ drivers/gpu/drm/asahi/g16/poll.rs     |  4 ++
+ drivers/gpu/drm/asahi/g16/recovery.rs | 55 +++++++++++++++++++++++++++
+ 3 files changed, 65 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index d1ac8923d5..49983a9989 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -567,6 +567,10 @@ pub(crate) struct Engine {
+     pub(crate) holder: Option<u64>,
+     pub(crate) holder_count: u32,
+     pub(crate) holder_start: u64,
++    /// The last retirements, for the recovery log: (VM id, class: 1 compute, 2 render,
++    /// 3 both, when in ns). The newest is at `recent_next - 1`.
++    pub(crate) recent: [(u64, u32, u64); 8],
++    pub(crate) recent_next: usize,
+     /// The device's shared state, for the transport-error latch; set by the first poll or
+     /// submission.
+     pub(crate) shared: Option<Arc<Shared>>,
+@@ -629,6 +633,8 @@ pub(crate) fn new() -> Result<Self> {
+             holder: None,
+             holder_count: 0,
+             holder_start: 0,
++            recent: [(0, 0, 0); 8],
++            recent_next: 0,
+             shared: None,
+             ordinal: 0,
+             draw: 0,
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 4e26d11441..28271e93c3 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1002,6 +1002,10 @@ pub(crate) fn retire_oldest(
+         let Ok(mut f) = self.engine.flights.remove(0) else {
+             return;
+         };
++        let class = u32::from(f.computes != 0) | (u32::from(f.renders != 0) << 1);
++        let slot = self.engine.recent_next % self.engine.recent.len();
++        self.engine.recent[slot] = (f.job.vm.id, class, now_ns());
++        self.engine.recent_next = self.engine.recent_next.wrapping_add(1);
+         let timestamp_claims = f.claims;
+         if result.is_ok() {
+             self.stat_retire(&f);
+diff --git a/drivers/gpu/drm/asahi/g16/recovery.rs b/drivers/gpu/drm/asahi/g16/recovery.rs
+index b255131d47..8a25cd9963 100644
+--- a/drivers/gpu/drm/asahi/g16/recovery.rs
++++ b/drivers/gpu/drm/asahi/g16/recovery.rs
+@@ -375,11 +375,65 @@ fn firmware_generation(&self) -> Result<u64> {
+             let Some(entry) = SnapshotEntry::decode(flags, target) else {
+                 break;
+             };
++            if i < 8 {
++                dev_warn!(
++                    self.dev(),
++                    "M4 recovery snapshot {}: flags {:#x} event {:#x} target {:#x}\n",
++                    i,
++                    entry.flags,
++                    entry.event,
++                    entry.target
++                );
++            }
+             self.recovery_prepare(entry.flags, entry.event, entry.target, stage)?;
+         }
+         self.recovery_prepare_suspects(stage, event, asid)
+     }
+ 
++    /// Names the work around a recovery: the running flights and the last retirements,
++    /// one line each (diagnostic only; nothing here changes the recovery).
++    fn log_recovery(&self, stage: [u32; 3], event: u32, asid: Option<u32>) {
++        let now = now_ns();
++        dev_warn!(
++            self.dev(),
++            "M4 recovery: event {:#x} fault asid {:?} stage {:08x?} flights {}\n",
++            event,
++            asid,
++            stage,
++            self.engine.flights.len()
++        );
++        for (i, f) in self.engine.flights.iter().take(8).enumerate() {
++            dev_warn!(
++                self.dev(),
++                "M4 recovery flight {}: vm {} slot {} c{} r{} ta {:#x}..{:#x} fs {:#x}..{:#x} c {:#x}..{:#x} age {} us\n",
++                i,
++                f.job.vm.id,
++                f.job.vm.slot,
++                f.computes,
++                f.renders,
++                f.ta_start,
++                f.ta_target,
++                f.fs_start,
++                f.fs_target,
++                f.c_start,
++                f.target,
++                now.saturating_sub(f.published_ns) / 1000
++            );
++        }
++        let n = self.engine.recent.len();
++        for k in 1..=n.min(self.engine.recent_next) {
++            let (vm, class, at) = self.engine.recent[(self.engine.recent_next - k) % n];
++            dev_warn!(
++                self.dev(),
++                "M4 recovery retired -{}: vm {} class {} {} us before\n",
++                k,
++                vm,
++                class,
++                now.saturating_sub(at) / 1000
++            );
++        }
++    }
++
+     fn recover(&mut self) -> Result {
+         let start = self.events.recovery_started_ns.unwrap_or_else(now_ns);
+         if !logic::admit(
+@@ -442,6 +496,7 @@ fn recover(&mut self) -> Result {
+                     } else {
+                         u32::MAX
+                     };
++                    self.log_recovery(stage, event, asid);
+                     self.mark_recovery(stage, event, asid)?;
+                     // Snapshot reads and all TPC repairs precede acknowledgement.
+                     barrier();
+-- 
+2.43.0
+
