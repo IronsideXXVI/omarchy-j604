@@ -1262,3 +1262,10 @@ New in 1.1001 (none changes what the machine does by default: 0819-0823 are read
 Kernel 1.1002 keeps the base (`da8e1acf3656`) and all 825 patches of 1.1001 under the same numbers.
 
 New in 1.1002 (none changes what the machine does by default: 0826, 0827, 0828 and 0830 are read-only counters and traces, 0829 is a switch that is off by default): 0826 (`drm/asahi: g16: Count firmware log records in the stats file`), 0827 (`drm/asahi: g16: Trace the last render flights in the stats file`), 0828 (`drm/asahi: g16: Count what a lone compute command's retirement waits for`), 0829 (`drm/asahi: g16: Optionally order same-queue commands by queue order alone`), 0830 (`drm/asahi: g16: Add the TA end and FS start to the render flight trace`).
+
+
+# Kernel patch numbers: 1.1002 to 1.1003
+
+Kernel 1.1003 keeps the base (`da8e1acf3656`) and all 830 patches of 1.1002 under the same numbers.
+
+New in 1.1003 (none changes what the machine does by default: 0831 and 0833 are switches that are off by default, 0832 is a read-only trace): 0831 (`drm/asahi: g16: Optionally configure the firmware's power controllers`), 0832 (`drm/asahi: g16: Trace the last compute flights in the stats file too`), 0833 (`drm/asahi: g16: Optionally set two FS words as macOS does`).

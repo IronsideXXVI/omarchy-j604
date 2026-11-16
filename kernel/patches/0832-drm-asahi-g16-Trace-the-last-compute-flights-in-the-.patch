@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 21:15:55 +0000
+Subject: [PATCH] drm/asahi: g16: Trace the last compute flights in the
+ stats file too
+
+The flight trace records only render flights. compute.light takes about
+61 us per command at depth with under 2 us of dispatch time and no wait
+record between commands, and nothing on file shows where a compute
+command's time goes between its publication and its retirement.
+
+With g16_prof set, keep the last 32 compute flights in a second ring the
+same way: publication, dispatch start and end, the completion event the
+retirement followed, the lock and the retirement. Print them as
+ftrace_c lines after the render trace. Nothing reads them back.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/poll.rs | 53 +++++++++++++++++++++++++------
+ 1 file changed, 43 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 9e8edf7e21..4552b11608 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -70,6 +70,11 @@
+ static FLIGHT_TRACE: [[core::sync::atomic::AtomicU64; 8]; FLIGHT_TRACE_N] =
+     [const { [const { core::sync::atomic::AtomicU64::new(0) }; 8] }; FLIGHT_TRACE_N];
+ static FLIGHT_TRACE_HEAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
++/// The same for the last compute flights (publication, dispatch start and end, event, lock,
++/// retirement; the last two cells stay 0).
++static FLIGHT_TRACE_C: [[core::sync::atomic::AtomicU64; 8]; FLIGHT_TRACE_N] =
++    [const { [const { core::sync::atomic::AtomicU64::new(0) }; 8] }; FLIGHT_TRACE_N];
++static FLIGHT_TRACE_C_HEAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+ /// Renders published behind renders they wait on with no wait record (`g16_same_queue_nowait`).
+ pub(crate) static RENDER_NOWAIT: core::sync::atomic::AtomicU64 =
+     core::sync::atomic::AtomicU64::new(0);
+@@ -273,25 +278,49 @@ fn fwpower_show(v: &FwPower, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ /// The `ftrace:` lines of the stats file, oldest first: per retired render flight, the times
+ /// in ns of TA start, TA end, FS start, FS end, completion event, lock and retirement after its
+ /// publication, and its publication after the previous traced flight's.
+-fn write_flight_trace(f: &mut fmt::Formatter<'_>) -> fmt::Result {
++fn write_flight_trace(
++    f: &mut fmt::Formatter<'_>,
++    trace: &[[core::sync::atomic::AtomicU64; 8]; FLIGHT_TRACE_N],
++    head: &core::sync::atomic::AtomicU64,
++    compute: bool,
++) -> fmt::Result {
+     let freq = super::engine::counter_hz();
+     if freq == 0 {
+         return Ok(());
+     }
+     let ns = |t: u64| super::engine::mul_div(t, 1_000_000_000, freq);
+-    let head = FLIGHT_TRACE_HEAD.load(Ordering::Relaxed) as usize;
++    let head = head.load(Ordering::Relaxed) as usize;
+     let mut prev = 0;
+     for i in 0..FLIGHT_TRACE_N {
+-        let e = &FLIGHT_TRACE[(head + i) % FLIGHT_TRACE_N];
++        let e = &trace[(head + i) % FLIGHT_TRACE_N];
+         let v: [u64; 8] = core::array::from_fn(|k| e[k].load(Ordering::Relaxed));
+         if v[0] == 0 {
+             continue;
+         }
+         let after = |t: u64| if t >= v[0] { ns(t - v[0]) } else { 0 };
++        let gap = if prev != 0 && v[0] >= prev {
++            ns(v[0] - prev)
++        } else {
++            0
++        };
++        prev = v[0];
++        if compute {
++            writeln!(
++                f,
++                "ftrace_c: pub_gap {} start {} end {} event {} lock {} retire {}",
++                gap,
++                after(v[1]),
++                after(v[2]),
++                after(v[3]),
++                after(v[4]),
++                after(v[5])
++            )?;
++            continue;
++        }
+         writeln!(
+             f,
+             "ftrace: pub_gap {} start {} ta_end {} fs_start {} end {} event {} lock {} retire {}",
+-            if prev != 0 && v[0] >= prev { ns(v[0] - prev) } else { 0 },
++            gap,
+             after(v[1]),
+             after(v[6]),
+             after(v[7]),
+@@ -300,7 +329,6 @@ fn write_flight_trace(f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             after(v[4]),
+             after(v[5])
+         )?;
+-        prev = v[0];
+     }
+     Ok(())
+ }
+@@ -1513,14 +1541,18 @@ fn stat_retire(&mut self, f: &Flight) {
+                     RENDER_PREV_READ.store(read, Ordering::Relaxed);
+                     RENDER_PREV_EV.store(if hi_c <= ev { ev } else { 0 }, Ordering::Relaxed);
+                 }
+-                if c == 1 && prof_on {
+-                    let slot = (FLIGHT_TRACE_HEAD.fetch_add(1, Ordering::Relaxed) as usize)
+-                        % FLIGHT_TRACE_N;
++                if prof_on {
++                    let (trace, head) = if c == 1 {
++                        (&FLIGHT_TRACE, &FLIGHT_TRACE_HEAD)
++                    } else {
++                        (&FLIGHT_TRACE_C, &FLIGHT_TRACE_C_HEAD)
++                    };
++                    let slot = (head.fetch_add(1, Ordering::Relaxed) as usize) % FLIGHT_TRACE_N;
+                     let ev_seen = if hi_c <= ev { ev } else { 0 };
+                     // TA end and FS start of this flight's stage stamps (qse: 0 TA, 1 FS).
+                     let ta_end = if qse[0].1 != 0 { to_counter(qse[0].1) } else { 0 };
+                     let fs_start = if qse[1].0 != u64::MAX { to_counter(qse[1].0) } else { 0 };
+-                    for (cell, v) in FLIGHT_TRACE[slot].iter().zip([
++                    for (cell, v) in trace[slot].iter().zip([
+                         f.published_ticks,
+                         lo_c,
+                         hi_c,
+@@ -1715,7 +1747,8 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             w[7] & 0xffff,
+             w[7] >> 16
+         )?;
+-        write_flight_trace(f)?;
++        write_flight_trace(f, &FLIGHT_TRACE, &FLIGHT_TRACE_HEAD, false)?;
++        write_flight_trace(f, &FLIGHT_TRACE_C, &FLIGHT_TRACE_C_HEAD, true)?;
+         write!(f, "render_tail: after_read_10us")?;
+         for b in RENDER_TAIL.iter().take(16) {
+             write!(f, " {}", b.load(Ordering::Relaxed))?;
+-- 
+2.43.0
+

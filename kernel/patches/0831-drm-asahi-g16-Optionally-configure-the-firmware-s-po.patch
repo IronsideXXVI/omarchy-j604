@@ -1,0 +1,399 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 21:18:05 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally configure the firmware's
+ power controllers
+
+The initdata leaves the controller words of POWER_PERFORMANCE zero
+apart from the sample period and the state ceiling: no utilisation
+target, no gains or filters, no maximum power and no thermal enables.
+macOS fills the same constants into its POWER object.
+
+Add g16_fw_controllers (load time, default 0). When set, the initdata
+writes those words the way the Gravity Linux G16 driver builds them in
+g16_power.rs, evaluated for the J604: the ADT's 8 ms sample period and
+turbo controller input, ten performance rows, a maximum power of 36294
+mW and Gravity's defaults for the properties the J604's ADT does not
+carry. The host keeps its S1 startup and then publishes 1000 in the
+selectors whenever the cooling ceiling allows the top state, as with
+g16_selectors=1, so that the firmware picks the state.
+
+Each word was checked against macOS 26B123's own copy of the object at
+INIT; where macOS differs from Gravity's default, macOS's value is used.
+
+The words come from GPL-2.0-only code, so they live in a new
+GPL-2.0-only file, fw/controllers.rs, which credits the Gravity Linux
+contributors.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs         |   4 +
+ drivers/gpu/drm/asahi/g16/fw/controllers.rs | 261 ++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs    |   6 +
+ drivers/gpu/drm/asahi/g16/fw/mod.rs         |   1 +
+ drivers/gpu/drm/asahi/g16/initdata.rs       |   8 +
+ drivers/gpu/drm/asahi/g16/params.rs         |   9 +-
+ 6 files changed, 288 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/fw/controllers.rs
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index c3e62a34c6..49e826e408 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -263,6 +263,10 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 100,
+             description: "G16: completion repoll interval, us",
+         },
++        g16_fw_controllers: u32 {
++            default: 0,
++            description: "G16: configure the firmware power controllers (default 0)",
++        },
+         g16_recovery: u32 {
+             default: 1,
+             description: "G16: answer qualified firmware recovery handshakes",
+diff --git a/drivers/gpu/drm/asahi/g16/fw/controllers.rs b/drivers/gpu/drm/asahi/g16/fw/controllers.rs
+new file mode 100644
+index 0000000000..e1ddfebc20
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/fw/controllers.rs
+@@ -0,0 +1,261 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// The words and their offsets follow g16_power.rs of the Gravity Linux G16 driver
++// (GravityLinux/linux, branch gravity-m4), Copyright The Gravity Linux Contributors,
++// evaluated here for the J604's inputs.
++
++//! The firmware's own power and performance controllers (`g16_fw_controllers`).
++//!
++//! The qualified initdata leaves the controller words of POWER_PERFORMANCE zero apart from
++//! the sample period and the state ceiling: no utilisation target, no gains, no filters, no
++//! maximum power and no thermal enables. These are the words the Gravity driver builds in the
++//! same object (its bundle offset minus 0x5380, the object Runtime +0x469 points to), with the
++//! J604's inputs: the ADT's sgx gpu-pwr-sample-period-aic-clks (200000 clocks, 8 ms) and
++//! gpu-turbo-controller-input (0, present), the J604's ten performance rows (900 for the top
++//! state, 100 for the base), a maximum power of 36294 mW (the value macOS has in Globals at
++//! INIT) and Gravity's defaults for every property the J604's ADT does not carry. Where macOS
++//! fills the same constants into the POWER object they are equal (40, 2.42, 0.135, 11000,
++//! 8000, 120.0, 9600, 300, 1.3, 625, 0.25, 1.2, 15.0, 5.0). Checked word by word against
++//! macOS 26B123's own copy of this object at INIT: where macOS differs from Gravity (the duty
++//! of the 0x21f0 block is 100, not 40) macOS's value is used. macOS's table has eleven rows
++//! (top 1000); the J604's ten rows here make the top 900, and the words derived from it
++//! follow that.
++
++/// The top state's frequency, MHz (Gravity: its eleventh row; here the J604's ceiling row).
++pub(crate) const TOP_FREQUENCY: usize = 0x21fc;
++/// Sixteen rows of 32 signed 16-bit initial power slots, all `i16::MAX`, unaligned.
++pub(crate) const POWER_SLOTS: usize = 0x1bef;
++pub(crate) const POWER_SLOT_COUNT: usize = 16 * 32;
++
++/// Words of the firmware power, performance, PPM, SE, average-power, fast-die and turbo
++/// controllers (offset in POWER_PERFORMANCE, value), 202 entries. Float values are
++/// IEEE-754 single bit patterns.
++pub(crate) const WORDS: [(usize, u32); 202] = [
++    (0x4, 0x00030d40),    // controller period, clocks = 200000
++    (0x8, 0x00030d40),    // controller period, clocks (2) = 200000
++    (0x10, 0x00000004),   // perf block A: 4
++    (0x14, 0x3f800000),   // perf block A: 1.0
++    (0x2c, 0x00000001),   // perf A: 1 (macOS and Gravity)
++    (0x30, 0x00000001),   // perf A: 1 (macOS and Gravity)
++    (0x3c, 0x00000000),   // perf A table [0, base, 1, max][0] = 0
++    (0x40, 0x00000064),   // perf A table [1] = 100
++    (0x44, 0x00000001),   // perf A table [2] = 1
++    (0x48, 0x00000384),   // perf A table [3] = 900
++    (0x50, 0x00000064),   // perf A: 100
++    (0x60, 0x00000004),   // perf block B: 4
++    (0x64, 0x3f800000),   // perf block B: 1.0
++    (0x6c, 0x00000001),   // perf B: 1
++    (0x70, 0x00000001),   // perf B: 1
++    (0x7c, 0x00000000),   // perf B table [0] = 0
++    (0x80, 0x00000064),   // perf B table [1] = 100
++    (0x84, 0x00000001),   // perf B table [2] = 1
++    (0x88, 0x00000384),   // perf B table [3] = 900
++    (0x90, 0x00000064),   // perf B: 100
++    (0xc0, 0x3f828f5c),   // state scale 1.02 (11 words)
++    (0xc4, 0x3f828f5c),
++    (0xc8, 0x3f828f5c),
++    (0xcc, 0x3f828f5c),
++    (0xd0, 0x3f828f5c),
++    (0xd4, 0x3f828f5c),
++    (0xd8, 0x3f828f5c),
++    (0xdc, 0x3f828f5c),
++    (0xe0, 0x3f828f5c),
++    (0xe4, 0x3f828f5c),
++    (0xe8, 0x3f828f5c),
++    (0x9b8, 0x00000271),  // power loop: 625
++    (0x9c4, 0x3f7f2e9f),  // power filter alpha (time constant 313) = 0.9968051
++    (0x9cc, 0x3b516154),  // power filter 1/n = 0.003194888
++    (0x9d4, 0x3ca59586),  // power integral gain = 0.0202129
++    (0x9dc, 0x00000000),  // power integral minimum = 0.0
++    (0x9e0, 0x470dc600),  // maximum power, mW = 36294.0
++    (0x9e4, 0x40a90fdb),  // power proportional gain = 5.2831855
++    (0x9ec, 0xbccb241a),  // -max_scaled / maximum power = -0.02479749
++    (0x9f0, 0x00000028),  // minimum duty cycle = 40
++    (0x9f4, 0x00000384),  // max_scaled = 900
++    (0x9f8, 0x00000384),  // max_scaled = 900
++    (0xa04, 0x00008dc6),  // maximum power, mW = 36294
++    (0xa38, 0x00000384),  // max_scaled = 900
++    (0xa70, 0x00000008),  // PPM filter count x4 (16 ms / 8 ms)
++    (0xa7c, 0x3f000000),  // PPM alpha = 0.5
++    (0xa84, 0x3f000000),  // PPM 1/n = 0.5
++    (0xa8c, 0x3f99999a),  // PPM ki x dt = 1.2
++    (0xa94, 0x00000000),  // PPM minimum = 0.0
++    (0xa98, 0x47800000),  // PPM 65536.0
++    (0xa9c, 0x3e800000),  // PPM kp = 0.25
++    (0xaa8, 0x00000028),  // PPM duty = 40
++    (0xaac, 0x00000384),  // PPM max_scaled = 900
++    (0xabc, 0x00008dc6),  // PPM maximum power = 36294
++    (0xac8, 0x00000010),  // PPM duration, ms = 16
++    (0xad0, 0x0005dc00),  // PPM clocks (u64 low) = 384000
++    (0xad4, 0x00000000),  // PPM clocks (u64 high)
++    (0xb28, 0x00000055),  // performance target utilisation = 85
++    (0xb30, 0x0000005f),  // boost minimum utilisation = 95
++    (0xb34, 0x00000032),  // boost step = 50
++    (0xb38, 0x00000006),  // reset iterations = 6
++    (0xb40, 0x00000006),  // 6
++    (0xb44, 0x00000001),  // 1
++    (0xb48, 0x00000000),  // filter drop threshold = 0
++    (0xb4c, 0x3f4ccccd),  // perf filter alpha (5) = 0.8
++    (0xb50, 0x3f7eb852),  // perf filter 2 alpha (200) = 0.995
++    (0xb54, 0x3e4ccccd),  // perf filter 1/n (5) = 0.2
++    (0xb58, 0x3ba3d70a),  // perf filter 2 1/n (200) = 0.005
++    (0xb5c, 0x3f4c28f6),  // perf integral gain = 0.7975
++    (0xb60, 0x3f4c28f6),  // perf integral gain 2 = 0.7975
++    (0xb64, 0x00000000),  // perf integral minimum = 0.0
++    (0xb68, 0x42be0000),  // 95.0
++    (0xb6c, 0x40accccd),  // perf proportional gain = 5.4
++    (0xb70, 0x40accccd),  // perf proportional gain 2 = 5.4
++    (0xb74, 0x4106bca2),  // (max_scaled - base_scaled) / 95 = 8.421053
++    (0xb78, 0x00000064),  // base_scaled = 100
++    (0xb7c, 0x00000384),  // max_scaled = 900
++    (0xb80, 0x00000064),  // base_scaled = 100
++    (0xb8c, 0x00000055),  // target = 85
++    (0xb94, 0x00000000),  // dead zone = 0
++    (0xbc0, 0x00000064),  // base_scaled = 100
++    (0x21f0, 0x47800000), // 65536.0
++    (0x21f4, 0x42c80000), // duty = 100.0 (macOS; Gravity 40.0)
++    (0x21f8, 0x44610000), // max_scaled = 900.0
++    (0x2210, 0x00000064), // duty = 100 (macOS; Gravity 40)
++    (0x2218, 0x42c80000), // 100.0
++    (0x221c, 0x00000384), // max_scaled = 900
++    (0x2224, 0x3f4ccccd), // alpha (5) = 0.8
++    (0x2228, 0x3e4ccccd), // 1/n (5) = 0.2
++    (0x2268, 0x00006958), // fast-die / thermal controller enable mask (u64 low)
++    (0x226c, 0x00000000), // fast-die / thermal controller enable mask (u64 high)
++    (0x2270, 0x00001f40), // fast-die release temperature, centi-C = 8000
++    (0x2278, 0x00000004), // 4
++    (0x2284, 0x00000000), // 0.0
++    (0x228c, 0x3f800000), // 1.0
++    (0x2294, 0x3fd55554), // fast-die integral gain x dt = 1.6666666 (macOS bits)
++    (0x229c, 0x00000000), // 0.0
++    (0x22a0, 0x47800000), // 65536.0
++    (0x22a4, 0x42f00000), // fast-die proportional gain = 120.0
++    (0x22b0, 0x00000028), // duty = 40
++    (0x22b4, 0x00000384), // max_scaled = 900
++    (0x22b8, 0x00000384), // max_scaled = 900
++    (0x22bc, 0x00000000), // proportional target delta = 0
++    (0x22c4, 0x00002af8), // die temperature limit, centi-C = 11000
++    (0x22f8, 0x00000384), // max_scaled = 900
++    (0x272a, 0x3f7eb852), // turbo alpha (200) = 0.995
++    (0x2732, 0x3ba3d70a), // turbo 1/n = 0.005
++    (0x273a, 0x3fa66666), // turbo ki = 1.3
++    (0x2742, 0x00000000), // 0.0
++    (0x2746, 0x47800000), // 65536.0
++    (0x274a, 0x43960000), // turbo kp = 300.0
++    (0x2752, 0xbac80000), // -100 / 65536
++    (0x2756, 0x00000384), // 900
++    (0x275a, 0x000003e8), // 1000
++    (0x275e, 0x000003e8), // 1000
++    (0x2766, 0x453b8000), // 3000.0
++    (0x276a, 0x00002580), // turbo target = 9600
++    (0x2772, 0x0000012c), // turbo delta = 300
++    (0x279e, 0x000003e8), // 1000
++    (0x27ba, 0x000000c8), // 200
++    (0x27d2, 0x00000000), // turbo threshold = 0
++    (0x27d6, 0x42800000), // 64.0
++    (0x27da, 0x47800000), // 65536.0
++    (0x2870, 0x00000384), // max_scaled = 900
++    (0x28c8, 0x00008dc6), // maximum power = 36294
++    (0x28cc, 0x00008dc6), // maximum power = 36294
++    (0x28d0, 0x00008dc6), // maximum power = 36294
++    (0x28dc, 0x00000000), // average target alpha (1) = 0.0
++    (0x28e0, 0x3f800000), // average target 1/n = 1.0
++    (0x28e4, 0x00000004), // count x4 = 4
++    (0x28e8, 0x00000008), // duration = 8
++    (0x28ec, 0x0002ee00), // clocks (u64 low) = 192000
++    (0x28f0, 0x00000000), // clocks (u64 high)
++    (0x29bc, 0x0000007c), // average power count x4 (31) = 124
++    (0x29c8, 0x3f77bdef), // average alpha = 0.9677419
++    (0x29d0, 0x3d042108), // average 1/n = 0.03225806
++    (0x29d8, 0x3e0a3d71), // average ki x dt = 0.135
++    (0x29e0, 0x00000000), // 0.0
++    (0x29e4, 0x47800000), // 65536.0
++    (0x29e8, 0x401ae148), // average kp = 2.42
++    (0x29f0, 0x00000000), // 0.0
++    (0x29f4, 0x00000028), // average duty = 40
++    (0x29f8, 0x00000384), // max_scaled = 900
++    (0x29fc, 0x00000384), // max_scaled = 900
++    (0x2a04, 0x470dc600), // maximum power = 36294.0
++    (0x2a08, 0x00008dc6), // maximum power = 36294
++    (0x2a14, 0x000000f8), // average duration, ms = 248
++    (0x2a1c, 0x005ad200), // average clocks (u64 low) = 5952000
++    (0x2a20, 0x00000000), // average clocks (u64 high)
++    (0x2a3c, 0x00000384), // max_scaled = 900
++    (0x2b4c, 0x00000032), // SE 50
++    (0x2b50, 0x00000001), // SE 1
++    (0x2b58, 0x3f638e39), // SE alpha (9) = 0.8888889
++    (0x2b5c, 0x3f2aaaab), // SE alpha (3) = 0.6666667
++    (0x2b60, 0x3de38e39), // SE 1/n (9) = 0.1111111
++    (0x2b64, 0x3eaaaaab), // SE 1/n (3) = 0.3333333
++    (0x2b68, 0xbecccccd), // SE ki x dt = -0.4
++    (0x2b6c, 0xbf4ccccd), // SE ki 1 x dt = -0.8
++    (0x2b70, 0x00000000), // 0.0
++    (0x2b74, 0x47800000), // 65536.0
++    (0x2b78, 0xc0a00000), // SE kp = -5.0
++    (0x2b7c, 0xc0a00000), // SE kp 1 = -5.0
++    (0x2b84, 0x00000064), // SE 100
++    (0x2b88, 0x00000384), // max_scaled = 900
++    (0x2b8c, 0x00000064), // base_scaled = 100
++    (0x2b94, 0x45fa0000), // period, us = 8000.0
++    (0x2b98, 0x00000578), // 1400
++    (0x2ba4, 0x00000048), // SE duration = 72
++    (0x2ba8, 0x00000018), // SE duration 1 = 24
++    (0x2bac, 0x001a5e00), // SE clocks (u64 low) = 1728000
++    (0x2bb0, 0x00000000), // SE clocks (u64 high)
++    (0x2bb4, 0x0008ca00), // SE clocks 1 (u64 low) = 576000
++    (0x2bb8, 0x00000000), // SE clocks 1 (u64 high)
++    (0x2bc0, 0x47800000), // 65536.0
++    (0x2be8, 0x00001f40), // period, us = 8000
++    (0x2bec, 0x00000004), // (33 + period / 2) / period = 4
++    (0x2bf0, 0x000009c4), // SE inactive threshold = 2500
++    (0x2bf4, 0x00000258), // SE engagement criteria = 600
++    (0x2bf8, 0x00000002), // SE engagement tolerance = 2
++    (0x2bfc, 0x00000004), // SE reset tolerance = 4
++    (0x2c00, 0x00000032), // SE reset criteria = 50
++    (0x2c30, 0x47800000), // 65536.0
++    (0x2c34, 0x00000000), // 0.0
++    (0x2c40, 0x00000028), // duty = 40
++    (0x2c44, 0x00000384), // max_scaled = 900
++    (0x2e2c, 0x00000004), // 4
++    (0x2e38, 0x3f780000), // alpha (32) = 0.96875
++    (0x2e40, 0x3d000000), // 1/n (32) = 0.03125
++    (0x2e48, 0x40a00000), // 5.0
++    (0x2e50, 0x00000000), // 0.0
++    (0x2e54, 0x47800000), // 65536.0
++    (0x2e58, 0x41700000), // 15.0
++    (0x2e64, 0x00000320), // max_scaled - 100 = 800
++    (0x2e68, 0x00000384), // max_scaled = 900
++    (0x2e6c, 0x00000384), // max_scaled = 900
++    (0x2e78, 0x00000384), // max_scaled = 900
++    (0x2eac, 0x00000384), // max_scaled = 900
++    (0x6320, 0x67305452), // SMC key g0TR
++    (0x6388, 0x67307430), // SMC key g0t0
++    (0x638c, 0x67307431), // SMC key g0t1
++    (0x6390, 0x67304542), // SMC key g0EB
++    (0x6394, 0x6730454c), // SMC key g0EL
++];
++
++/// Byte words: the turbo controller's input is present (1), and it is not mode 1 (0).
++pub(crate) const BYTES: [(usize, u8); 2] = [(0x2518, 1), (0x2519, 0)];
++
++fn put(out: &mut [u8], at: usize, bytes: &[u8]) -> Result<(), ()> {
++    out.get_mut(at..at + bytes.len())
++        .ok_or(())?
++        .copy_from_slice(bytes);
++    Ok(())
++}
++
++/// Writes the controller words into a POWER_PERFORMANCE image; `top_frequency` is the
++/// ceiling row's main frequency, MHz.
++pub(crate) fn encode(pp: &mut [u8], top_frequency: u32) -> Result<(), ()> {
++    for (at, value) in WORDS {
++        put(pp, at, &value.to_le_bytes())?;
++    }
++    for (at, value) in BYTES {
++        put(pp, at, &[value])?;
++    }
++    put(pp, TOP_FREQUENCY, &top_frequency.to_le_bytes())?;
++    for i in 0..POWER_SLOT_COUNT {
++        put(pp, POWER_SLOTS + i * 2, &i16::MAX.to_le_bytes())?;
++    }
++    Ok(())
++}
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index 17290b76b8..57ef7c8385 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -501,6 +501,9 @@ pub(crate) struct Input {
+     pub(crate) idle_power_off: bool,
+     /// Also write [`globals::REQUIRED`] (`g16_globals_required`).
+     pub(crate) globals_required: bool,
++    /// Also write the firmware's own controller words into POWER_PERFORMANCE
++    /// (`g16_fw_controllers`).
++    pub(crate) fw_controllers: bool,
+ }
+ 
+ pub(crate) fn object_va(va: u64, size: usize) -> bool {
+@@ -720,6 +723,9 @@ pub(crate) fn encode(
+     ] {
+         put32(p, at, 100 * ceiling)?;
+     }
++    if input.fw_controllers {
++        super::controllers::encode(p, input.performance.frequency[ceiling as usize])?;
++    }
+     Ok(())
+ }
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/fw/mod.rs b/drivers/gpu/drm/asahi/g16/fw/mod.rs
+index 77984b8cb5..901f226e06 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/mod.rs
+@@ -13,6 +13,7 @@
+ 
+ pub(crate) mod buffer;
+ pub(crate) mod channels;
++pub(crate) mod controllers;
+ pub(crate) mod graph;
+ pub(crate) mod initdata;
+ pub(crate) mod work;
+diff --git a/drivers/gpu/drm/asahi/g16/initdata.rs b/drivers/gpu/drm/asahi/g16/initdata.rs
+index c8c9b5a955..c51e7e4697 100644
+--- a/drivers/gpu/drm/asahi/g16/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/initdata.rs
+@@ -170,7 +170,15 @@ pub(crate) fn build(
+         progress_recovery: 1,
+         idle_power_off: idle_power_off_level != 0,
+         globals_required: super::params::globals_required(),
++        fw_controllers: super::params::fw_controllers(),
+     };
++    if input.fw_controllers {
++        dev_info!(
++            dev,
++            "M4 initdata: {} firmware controller words written (g16_fw_controllers=1)\n",
++            super::fw::controllers::WORDS.len()
++        );
++    }
+     if input.globals_required {
+         dev_info!(
+             dev,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index ad5febd39d..202a8ae533 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1645,7 +1645,14 @@ pub(crate) fn doorbell_tally() -> bool {
+ /// firmware chooses its state) whenever the cooling ceiling allows the top state, instead of
+ /// the host utilization governor's state.
+ pub(crate) fn selectors_macos() -> bool {
+-    SELECTORS.load(Ordering::Relaxed) != 0
++    SELECTORS.load(Ordering::Relaxed) != 0 || fw_controllers()
++}
++
++/// Whether the initdata configures the firmware's own power and performance controllers
++/// (`g16_fw_controllers`, load time). The host then publishes what macOS publishes in the
++/// selectors, as with `g16_selectors=1`, and does not govern the state itself.
++pub(crate) fn fw_controllers() -> bool {
++    module_parameters::g16_fw_controllers.value() != 0
+ }
+ 
+ live_u32_param!(
+-- 
+2.43.0
+
