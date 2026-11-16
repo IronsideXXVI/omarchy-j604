@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 03:29:09 +0000
+Subject: [PATCH] cpufreq: schedutil: Add down_hold_us to keep a
+ frequency through short dips
+
+A memory benchmark on the M4 MacBook Pro starts one worker thread per
+round. Between two rounds the performance cluster has no worker, the
+next update of the shared policy sees little demand and lowers the
+clock, and every new worker then starts below the top frequency: in a
+trace with the start lift on, the clock was below 4464 MHz for 19 % of
+the worker time, all of it in the first 5 ms of a worker, and 16 of
+the 20 drops from the top came while no worker ran on the cluster.
+
+Add the per-policy tunable down_hold_us (default 0: no change). When
+set, the frequency is lowered only after the demand has stayed below
+it for that long; a raise is not delayed.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ kernel/sched/cpufreq_schedutil.c | 57 ++++++++++++++++++++++++++++++--
+ 1 file changed, 55 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/sched/cpufreq_schedutil.c b/kernel/sched/cpufreq_schedutil.c
+index 49ccd6f1c1..a3cd24cba9 100644
+--- a/kernel/sched/cpufreq_schedutil.c
++++ b/kernel/sched/cpufreq_schedutil.c
+@@ -13,6 +13,7 @@
+ struct sugov_tunables {
+ 	struct gov_attr_set	attr_set;
+ 	unsigned int		rate_limit_us;
++	unsigned int		down_hold_us;
+ };
+ 
+ struct sugov_policy {
+@@ -24,6 +25,9 @@ struct sugov_policy {
+ 	raw_spinlock_t		update_lock;
+ 	u64			last_freq_update_time;
+ 	s64			freq_update_delay_ns;
++	/* Last time the demand was at or above the current frequency. */
++	u64			last_demand_time;
++	s64			down_hold_ns;
+ 	unsigned int		next_freq;
+ 	unsigned int		cached_raw_freq;
+ 
+@@ -73,6 +77,11 @@ static void sugov_update_rate_limit_us(struct sugov_policy *sg_policy)
+ 		(s64)sg_policy->tunables->rate_limit_us * NSEC_PER_USEC;
+ }
+ 
++static void sugov_update_down_hold_us(struct sugov_policy *sg_policy)
++{
++	sg_policy->down_hold_ns = (s64)sg_policy->tunables->down_hold_us * NSEC_PER_USEC;
++}
++
+ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
+ {
+ 	s64 delta_ns;
+@@ -136,8 +145,22 @@ static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
+ 		if (sg_policy->next_freq == next_freq &&
+ 		    !cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS))
+ 			return false;
+-	} else if (sg_policy->next_freq == next_freq) {
+-		return false;
++	} else {
++		/*
++		 * down_hold_us: lower the frequency only once the demand has
++		 * stayed below it for that long, so that a CPU-bound task that
++		 * stops and starts again (a worker per round) does not find the
++		 * cluster ramped down at every start.
++		 */
++		if (next_freq >= sg_policy->next_freq) {
++			sg_policy->last_demand_time = time;
++		} else if ((s64)(time - sg_policy->last_demand_time) < sg_policy->down_hold_ns) {
++			/* Make get_next_freq() compute the demand again next time. */
++			sg_policy->cached_raw_freq = 0;
++			return false;
++		}
++		if (sg_policy->next_freq == next_freq)
++			return false;
+ 	}
+ 
+ 	sg_policy->next_freq = next_freq;
+@@ -626,8 +649,36 @@ rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count
+ 
+ static struct governor_attr rate_limit_us = __ATTR_RW(rate_limit_us);
+ 
++static ssize_t down_hold_us_show(struct gov_attr_set *attr_set, char *buf)
++{
++	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
++
++	return sysfs_emit(buf, "%u\n", tunables->down_hold_us);
++}
++
++static ssize_t
++down_hold_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
++{
++	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
++	struct sugov_policy *sg_policy;
++	unsigned int down_hold_us;
++
++	if (kstrtouint(buf, 10, &down_hold_us))
++		return -EINVAL;
++
++	tunables->down_hold_us = down_hold_us;
++
++	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
++		sugov_update_down_hold_us(sg_policy);
++
++	return count;
++}
++
++static struct governor_attr down_hold_us = __ATTR_RW(down_hold_us);
++
+ static struct attribute *sugov_attrs[] = {
+ 	&rate_limit_us.attr,
++	&down_hold_us.attr,
+ 	NULL
+ };
+ ATTRIBUTE_GROUPS(sugov);
+@@ -862,7 +913,9 @@ static int sugov_start(struct cpufreq_policy *policy)
+ 	unsigned int cpu;
+ 
+ 	sugov_update_rate_limit_us(sg_policy);
++	sugov_update_down_hold_us(sg_policy);
+ 	sg_policy->last_freq_update_time	= 0;
++	sg_policy->last_demand_time		= 0;
+ 	sg_policy->next_freq			= 0;
+ 	sg_policy->work_in_progress		= false;
+ 	sg_policy->limits_changed		= false;
+-- 
+2.43.0
+

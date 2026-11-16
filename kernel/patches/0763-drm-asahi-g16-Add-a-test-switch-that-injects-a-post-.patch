@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 03:41:21 +0000
+Subject: [PATCH] drm/asahi: g16: Add a test switch that injects a
+ post-recovery receipt fault
+
+The M4 firmware has not raised a recovery on purpose: a client page
+fault is dropped, a 4 s dispatch completes, and the one recovery seen
+came with an unrelated experiment. So the path after "recovery
+generation N resumed" (the receipt-fault branch of check_hangs, its
+g16_recovery_tolerant variant and the aborted-job ledger) has no test.
+
+Add g16_test_recovery (runtime, default 0, reads 0 once taken). Set to
+1, the next poll pass with work in flight counts one more resumed
+generation, logs it as injected and raises the receipt fault of the
+oldest work, without touching the firmware. With
+g16_recovery_tolerant=0 that is today's fail-stop; with 1 the oldest
+work fails and stays quarantined and the device is kept.
+
+It does not show what the firmware itself does when it aborts work:
+its cursors, a late completion of the aborted command and the recovery
+handshake are not exercised.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/params.rs   | 19 +++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/recovery.rs | 16 +++++++++++++++-
+ 2 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 1ad8760637..5358a9b31c 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -718,6 +718,25 @@ pub(crate) fn revive() -> bool {
+     "G16: after a fail-stop, warm-restart the firmware at the next real wake (default 0: failed until reboot; runtime 0644)"
+ );
+ 
++/// Storage of `g16_test_recovery` (runtime 0644, default 0).
++static TEST_RECOVERY: AtomicU32 = AtomicU32::new(0);
++
++/// Test of the post-recovery path: 1 makes the next poll pass with work in flight act as if a
++/// firmware recovery had just resumed and the oldest receipt could not be proven, without
++/// touching the firmware. Reads back 0 once taken.
++pub(crate) fn take_test_recovery() -> bool {
++    TEST_RECOVERY.swap(0, Ordering::AcqRel) != 0
++}
++
++live_u32_param!(
++    TEST_RECOVERY_PARAM,
++    TEST_RECOVERY_PARMTYPE,
++    TEST_RECOVERY_PARM,
++    TEST_RECOVERY,
++    "g16_test_recovery",
++    "G16: test only: 1 = the next poll pass with work in flight injects a resumed firmware recovery and a receipt fault of the oldest work, without touching the firmware; reads 0 once taken (runtime 0644)"
++);
++
+ /// Storage of `g16_test_failstop` (runtime 0644, default 0).
+ static TEST_FAILSTOP: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/recovery.rs b/drivers/gpu/drm/asahi/g16/recovery.rs
+index 151268364c..db1acc5ee1 100644
+--- a/drivers/gpu/drm/asahi/g16/recovery.rs
++++ b/drivers/gpu/drm/asahi/g16/recovery.rs
+@@ -173,7 +173,7 @@ pub(crate) fn check_hangs(&mut self, done: &mut Completions) -> Result {
+         if let Some(error) = self.recovery.failed {
+             return Err(error);
+         }
+-        let fault = core::mem::take(&mut self.recovery.receipt_fault);
++        let mut fault = core::mem::take(&mut self.recovery.receipt_fault);
+         if let Some(error) = self.transport_error() {
+             self.fail_stop(error, done);
+             return Err(error);
+@@ -189,6 +189,20 @@ pub(crate) fn check_hangs(&mut self, done: &mut Completions) -> Result {
+             }
+             return Ok(());
+         }
++        // g16_test_recovery: the state a resumed firmware recovery leaves behind (one more
++        // generation resumed, the oldest receipt unprovable), injected without touching the
++        // firmware, so the receipt-fault branch below runs on demand.
++        if !fault && !self.engine.flights.is_empty() && params::take_test_recovery() {
++            self.recovery.recoveries += 1;
++            self.recovery.resumed_ns = now_ns();
++            self.recovery.tolerated = 0;
++            dev_warn!(
++                self.dev(),
++                "M4 GPU recovery generation {} resumed (injected by g16_test_recovery)\n",
++                self.recovery.recoveries
++            );
++            fault = true;
++        }
+         if fault {
+             // g16_recovery_tolerant: right after a resumed recovery the firmware may have
+             // aborted the oldest work without its normal receipt. Fail and quarantine that
+-- 
+2.43.0
+

@@ -1194,3 +1194,10 @@ New in 1.945 (all off by default): 0753 (`sched/fair: FORK_BIG only while the ma
 Kernel 1.946 keeps the base (`da8e1acf3656`) and all 757 patches of 1.945 under the same numbers.
 
 New in 1.946 (off by default): 0758 (`sched/fair: No FORK_BIG placement or start lift for a fork burst`).
+
+
+# Kernel patch numbers: 1.946 to 1.947
+
+Kernel 1.947 keeps the base (`da8e1acf3656`) and all 758 patches of 1.946 under the same numbers.
+
+New in 1.947 (0765 is on by default and uses 0762; the other five are off by default): 0759 (`pmdomain: apple: pmp-report: reach a T8132 report the PMP was not running for`), 0760 (`cpufreq: schedutil: Add down_hold_us to keep a frequency through short dips`), 0761 (`drm/asahi: g16: Optionally publish an idle performance selector`), 0762 (`wifi: brcmfmac: Let a chip set the default PM2 sleep return`), 0763 (`drm/asahi: g16: Add a test switch that injects a post-recovery receipt fault`), 0764 (`media: apple: ave: let the client choose the SPS frame_num and POC words`), 0765 (`wifi: brcmfmac: Nap after 20 ms on the BCM4388`).

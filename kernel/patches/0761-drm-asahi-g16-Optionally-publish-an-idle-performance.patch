@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 03:40:15 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally publish an idle
+ performance selector
+
+The three Globals performance selectors keep the last busy value while
+the GPU is idle: the poller stops with nothing in flight, so no
+governor pass lowers them. The firmware may keep the GPU out of its
+power-gated state while a non-zero state is requested; the M4 shows
+0 % off+gated at idle.
+
+Add g16_idle_selector (runtime, default 0 = off). When set to N, the
+poller publishes N - 1 to the selectors as it goes idle with nothing in
+flight or pending, and service_power() restores the busy value before
+the next publication, which already precedes every queue and doorbell
+write. The stats line idle_selector: counts the transitions.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 22 +++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  8 +++++++
+ drivers/gpu/drm/asahi/g16/power.rs  | 37 +++++++++++++++++++++++++++++
+ 3 files changed, 67 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 33c3b7115c..1ad8760637 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -755,6 +755,28 @@ pub(crate) fn recovery_tolerant() -> bool {
+     "G16: after a resumed firmware recovery, fail and quarantine only the oldest work on a receipt fault instead of the fail-stop, at most 2 per recovery (default 0; runtime 0644)"
+ );
+ 
++/// Storage of `g16_idle_selector` (runtime 0644, default 0).
++static IDLE_SELECTOR: AtomicU32 = AtomicU32::new(0);
++
++/// The value published to the three Globals performance selectors while nothing is in
++/// flight or pending, stored plus one: 0 is off (the selectors keep the last busy value),
++/// 1 publishes 0, N publishes N - 1. The busy value returns before the next publication.
++pub(crate) fn idle_selector() -> Option<u32> {
++    match IDLE_SELECTOR.load(Ordering::Relaxed) {
++        0 => None,
++        v => Some(v - 1),
++    }
++}
++
++live_u32_param!(
++    IDLE_SELECTOR_PARAM,
++    IDLE_SELECTOR_PARMTYPE,
++    IDLE_SELECTOR_PARM,
++    IDLE_SELECTOR,
++    "g16_idle_selector",
++    "G16: idle performance selector plus one: with nothing in flight or pending, publish N - 1 to the three Globals selectors; the busy value returns before the next publication (default 0: off; 1: publish 0; runtime 0644)"
++);
++
+ /// Storage of `g16_subgen` (runtime 0644, default 0).
+ static SUBGEN: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index c8fd0d3965..954b97d079 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -293,6 +293,7 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+         if self.engine.flights.is_empty() {
+             self.drain_rings()?;
+             if self.recovery_idle()? && self.engine.pending.is_empty() {
++                self.publish_idle_selector()?;
+                 return Ok(false);
+             }
+         }
+@@ -1144,6 +1145,13 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             self.power.effective, self.power.temperature_mc, self.power.updates,
+             self.power.sensor_errors
+         )?;
++        writeln!(
++            f,
++            "idle_selector: param {:?} selected {} selects {}",
++            params::idle_selector(),
++            u8::from(self.power.idle_selected),
++            self.power.idle_selects
++        )?;
+         writeln!(
+             f,
+             "idle_power_off: published {} requested {} boot_level {} changes {} tally {} counting {} doorbells {} rt {:#x}/{}",
+diff --git a/drivers/gpu/drm/asahi/g16/power.rs b/drivers/gpu/drm/asahi/g16/power.rs
+index 5003d2905f..ebdc6ef48e 100644
+--- a/drivers/gpu/drm/asahi/g16/power.rs
++++ b/drivers/gpu/drm/asahi/g16/power.rs
+@@ -167,6 +167,9 @@ pub(crate) struct Power {
+     pub(crate) budget: u32,
+     sensor_error: Option<Error>,
+     pub(crate) updates: u64,
++    /// `g16_idle_selector`: the idle value is in the selectors, and how often it was put there.
++    pub(crate) idle_selected: bool,
++    pub(crate) idle_selects: u64,
+     pub(crate) sensor_errors: u64,
+     pub(crate) decisions: u64,
+     last_decision: Option<(u32, u32, u32, u32, Option<Error>)>,
+@@ -210,6 +213,8 @@ pub(crate) fn new(dev: &device::Device) -> Result<Self> {
+             budget: COOLING_MAX,
+             sensor_error: None,
+             updates: 0,
++            idle_selected: false,
++            idle_selects: 0,
+             sensor_errors: 0,
+             decisions: 0,
+             last_decision: None,
+@@ -278,6 +283,15 @@ pub(crate) fn service_power(&mut self) -> Result {
+             return Err(error);
+         }
+         self.service_idle_power_off()?;
++        // g16_idle_selector: keep the idle value while idle; once work is in flight or
++        // pending, force the busy value out below, before any publication.
++        if self.power.idle_selected {
++            if self.engine.flights.is_empty() && self.engine.pending.is_empty() {
++                return Ok(());
++            }
++            self.power.idle_selected = false;
++            self.power.effective = u32::MAX;
++        }
+         let now = now_ns();
+         let idle = self.engine.flights.is_empty();
+         let (limit, decision) = self.power.ceiling(now, idle);
+@@ -322,6 +336,29 @@ pub(crate) fn service_power(&mut self) -> Result {
+         Ok(())
+     }
+ 
++    /// `g16_idle_selector`: as the poller goes idle (nothing in flight or pending), publishes
++    /// the idle value to the three Globals selectors. [`Self::service_power`] restores the busy
++    /// value before the next publication.
++    pub(crate) fn publish_idle_selector(&mut self) -> Result {
++        let Some(value) = params::idle_selector() else {
++            return Ok(());
++        };
++        if self.power.idle_selected
++            || !self.engine.flights.is_empty()
++            || !self.engine.pending.is_empty()
++        {
++            return Ok(());
++        }
++        let globals = self.init.globals.as_ref().ok_or(ENODEV)?;
++        for offset in globals::PSTATE_SELECTORS {
++            globals.w32(offset, value)?;
++        }
++        wmb();
++        self.power.idle_selected = true;
++        self.power.idle_selects += 1;
++        Ok(())
++    }
++
+     /// For a suspend-to-idle: publishes the idle floor (bounded by the cooling and user
+     /// ceilings) now, since the governor's windows do not run while the tick is frozen and
+     /// the firmware runs at the published state, busy or not. Returns (before, published).
+-- 
+2.43.0
+

@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 03:27:06 +0000
+Subject: [PATCH] pmdomain: apple: pmp-report: reach a T8132 report the
+ PMP was not running for
+
+The T8132 GFX power request is held at probe only if the PMP already
+runs then. On the M4 MacBook Pro it never does: eight boots in a row
+logged "PMP not running at probe, GFX power request not held", and
+later the report reads running with the request word at 0, so bit 12
+has not been held at all.
+
+The run-time switch for the request was tied to the same check: the
+report pointer was set only on the path that holds the bit at probe,
+so a write of t8132_gfx_request changed the parameter and nothing
+else, without a log line.
+
+Set the pointer for every T8132 report, so a run-time write always
+reaches it. Add t8132_gfx_late (default off): when the PMP is not
+running at probe, poll as the deferred-request path does and hold the
+request once it runs. Clear the pointer when the report goes away.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/pmdomain/apple/pmp-report.c | 46 +++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/drivers/pmdomain/apple/pmp-report.c b/drivers/pmdomain/apple/pmp-report.c
+index 4a8d75cd81..9b726b9e07 100644
+--- a/drivers/pmdomain/apple/pmp-report.c
++++ b/drivers/pmdomain/apple/pmp-report.c
+@@ -139,6 +139,9 @@ struct apple_pmp_report {
+ 	unsigned int bw_applied;
+ 	unsigned int polls;
+ 	struct delayed_work ready_work;
++	/* T8132: hold the GFX power request once the PMP runs (t8132_gfx_late). */
++	unsigned int gfx_polls;
++	struct delayed_work gfx_work;
+ 	/* J613 floor owner, absent on all other report instances. */
+ 	struct j613_floor *j613;
+ };
+@@ -437,11 +440,15 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(apple_pmp_report_status);
+ 
++static void apple_pmp_report_t8132_forget(struct apple_pmp_report *rep);
++
+ static void apple_pmp_report_release(void *data)
+ {
+ 	struct apple_pmp_report *rep = data;
+ 
+ 	cancel_delayed_work_sync(&rep->ready_work);
++	cancel_delayed_work_sync(&rep->gfx_work);
++	apple_pmp_report_t8132_forget(rep);
+ 	/* Withdraw child providers while their power callbacks can still use MMIO. */
+ 	of_platform_depopulate(rep->dev);
+ 	if (rep->offsets == &apple_pmp_offsets_t600x) {
+@@ -528,6 +535,21 @@ module_param_cb(t8132_gfx_request, &apple_pmp_t8132_gfx_request_ops, &t8132_gfx_
+ MODULE_PARM_DESC(t8132_gfx_request,
+ 		 "T8132: hold the GFX power request (PS-REQ bit 12) as macOS does (default on; 0: bit 12 clear, as before; writable at run time)");
+ 
++/*
++ * On the J604 the PMP is not yet running when this driver probes (every boot
++ * of 1.943-1.945 logs "PMP not running at probe"), so bit 12 has not been
++ * held at probe. t8132_gfx_late polls until the PMP runs and holds it then.
++ */
++static bool t8132_gfx_late;
++module_param(t8132_gfx_late, bool, 0444);
++MODULE_PARM_DESC(t8132_gfx_late,
++		 "T8132: if the PMP is not running at probe, hold the GFX power request once it runs (default off)");
++
++static void apple_pmp_report_t8132_forget(struct apple_pmp_report *rep)
++{
++	cmpxchg(&apple_pmp_t8132_rep, rep, NULL);
++}
++
+ static void apple_pmp_report_t8132_gfx_request(struct apple_pmp_report *rep)
+ {
+ 	int ret;
+@@ -546,6 +568,23 @@ static void apple_pmp_report_t8132_gfx_request(struct apple_pmp_report *rep)
+ 			 PMP_T8132_GFX_REQUEST_BIT);
+ }
+ 
++static void apple_pmp_report_t8132_gfx_work(struct work_struct *work)
++{
++	struct apple_pmp_report *rep = container_of(to_delayed_work(work),
++						    struct apple_pmp_report, gfx_work);
++
++	if (!apple_pmp_report_running(rep)) {
++		unsigned int ms = rep->gfx_polls++ < PMP_REPORT_FAST_POLLS ?
++				  PMP_REPORT_POLL_MS : PMP_REPORT_POLL_SLOW_MS;
++
++		queue_delayed_work(system_freezable_power_efficient_wq,
++				   &rep->gfx_work, msecs_to_jiffies(ms));
++		return;
++	}
++	dev_info(rep->dev, "t8132: PMP running after %u polls\n", rep->gfx_polls);
++	apple_pmp_report_t8132_gfx_request(rep);
++}
++
+ /*
+  * T8132 GPU system-cache (MCC) quota, an A/B experiment (default off). macOS 26B123 takes the GPU's three MCC data
+  * streams while the GPU has work and drops them after its idle timer (AGXAccelerator::ensurePoweredHardware and
+@@ -2608,6 +2647,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
+ 			return -ENOMEM;
+ 	}
+ 	INIT_DELAYED_WORK(&rep->ready_work, apple_pmp_report_ready_work);
++	INIT_DELAYED_WORK(&rep->gfx_work, apple_pmp_report_t8132_gfx_work);
+ 	platform_set_drvdata(pdev, rep);
+ 
+ 	ret = apple_pmp_dram_parse(dev_fwnode(dev), &rep->dram);
+@@ -2661,8 +2701,14 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
+ 	else if (t8132_dvfs_entry && rep->offsets == &apple_pmp_offsets_t8132)
+ 		dev_warn(dev, "t8132 DVFS trial: PMP not running at probe, not applied\n");
+ 
++	/* A run-time write of t8132_gfx_request reaches this report from now on. */
++	if (rep->offsets == &apple_pmp_offsets_t8132)
++		WRITE_ONCE(apple_pmp_t8132_rep, rep);
+ 	if (!rep->defer && apple_pmp_report_running(rep))
+ 		apple_pmp_report_t8132_gfx_request(rep);
++	else if (t8132_gfx_request && rep->offsets == &apple_pmp_offsets_t8132 && t8132_gfx_late)
++		queue_delayed_work(system_freezable_power_efficient_wq, &rep->gfx_work,
++				   msecs_to_jiffies(PMP_REPORT_POLL_MS));
+ 	else if (t8132_gfx_request && rep->offsets == &apple_pmp_offsets_t8132)
+ 		dev_warn(dev, "t8132: PMP not running at probe, GFX power request not held\n");
+ 
+-- 
+2.43.0
+

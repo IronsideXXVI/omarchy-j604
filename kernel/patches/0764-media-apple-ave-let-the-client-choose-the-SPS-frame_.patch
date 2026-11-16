@@ -1,0 +1,502 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 03:42:24 +0000
+Subject: [PATCH] media: apple: ave: let the client choose the SPS
+ frame_num and POC words
+
+A VA-API client writes its own sequence parameter set into the container
+header (avcC, hvcC) and expects the encoder's in-band one to match. FFmpeg
+codes log2_max_frame_num_minus4 = 4 and, without B-frames,
+pic_order_cnt_type = 2 (HEVC: log2_max_pic_order_cnt_lsb_minus4 = 8), while
+the 9003.78.0 firmware writes the macOS constants 1, 0 and 2 (HEVC 7):
+Matroska muxing then refuses the stream and players decode it with the
+wrong slice header widths.
+
+On 9003.78.0 the H.264 sequence block sits 0xdc98 bytes below the 6070
+one (profile, level, max_num_ref_frames and the picture size all match),
+and the stream the firmware writes carries Start +0x2d34, +0x2d38 and
++0x2d3c as log2_max_frame_num_minus4, pic_order_cnt_type and
+log2_max_pic_order_cnt_lsb_minus4. The layout had none of them, so the
+existing writes of these words only reached the 6070 build.
+
+Add four driver-private integer controls, offered only on a build whose
+layout knows the word. -1, the default, keeps the firmware value as macOS
+sets it, so a client that does not set them gets a byte-identical Start;
+otherwise the syntax element value goes into the word.
+
+Add a test-only sps_probe parameter that sets raw Start words inside the
+codec's sequence block, so the firmware's use of neighbouring words can be
+swept on the hardware. It is empty by default and logs each word it sets.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ .../media/platform/apple/ave/ave-abi-test.c   | 106 +++++++++++++++++
+ drivers/media/platform/apple/ave/ave-layout.c |  26 +++++
+ drivers/media/platform/apple/ave/ave-layout.h |  11 ++
+ drivers/media/platform/apple/ave/ave-sess.c   |   7 ++
+ drivers/media/platform/apple/ave/ave-v4l2.c   |  33 ++++++
+ drivers/media/platform/apple/ave/ave-writer.c | 108 ++++++++++++++++++
+ drivers/media/platform/apple/ave/ave.h        |  26 +++++
+ 7 files changed, 317 insertions(+)
+
+diff --git a/drivers/media/platform/apple/ave/ave-abi-test.c b/drivers/media/platform/apple/ave/ave-abi-test.c
+index 67c496da6c..db1887d456 100644
+--- a/drivers/media/platform/apple/ave/ave-abi-test.c
++++ b/drivers/media/platform/apple/ave/ave-abi-test.c
+@@ -336,6 +336,111 @@ static void ave_9003_speed(struct kunit *test)
+ 	}
+ }
+ 
++/*
++ * Client sequence words on 9003: unset, Start keeps the macOS constants
++ * (1, 0, 2; HEVC 7) byte for byte; set, only those words change. The test
++ * probe parser takes aligned words inside the sequence block only.
++ */
++static void ave_9003_client_sps(struct kunit *test)
++{
++	static const u32 h264_off[] = { 0x2d34, 0x2d38, 0x2d3c };
++	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
++	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
++	struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
++	u8 *base = kunit_kzalloc(test, 0x14000, GFP_KERNEL);
++	u8 *set = kunit_kzalloc(test, 0x14000, GFP_KERNEL);
++	u32 off[AVE_SPS_PROBE_MAX], val[AVE_SPS_PROBE_MAX];
++
++	KUNIT_ASSERT_NOT_NULL(test, ave);
++	KUNIT_ASSERT_NOT_NULL(test, ctx);
++	KUNIT_ASSERT_NOT_NULL(test, sess);
++	KUNIT_ASSERT_NOT_NULL(test, base);
++	KUNIT_ASSERT_NOT_NULL(test, set);
++	ave->layout = &ave_layout_9003_78_0;
++	ctx->ave = ave;
++	ctx->sess = sess;
++
++	for (enum ave_codec codec = AVE_CODEC_H264; codec <= AVE_CODEC_HEVC; codec++) {
++		size_t len = ave->layout->bytes[codec - 1][AVE_IMAGE_START];
++		bool h264 = codec == AVE_CODEC_H264;
++
++		ave_test_session(sess, codec, 1920, 1080, false);
++		memset(base, 0, len);
++		KUNIT_ASSERT_EQ(test, ave_build_start(ctx, base, len), 0);
++		ave_test_session(sess, codec, 1920, 1080, false);
++		sess->p.sps_set = BIT(AVE_SPS_COUNT) - 1;
++		sess->p.sps_val[AVE_SPS_H264_LOG2_MAX_FRAME_NUM_MINUS4] = 4;
++		sess->p.sps_val[AVE_SPS_H264_POC_TYPE] = 2;
++		sess->p.sps_val[AVE_SPS_H264_LOG2_MAX_POC_LSB_MINUS4] = 3;
++		sess->p.sps_val[AVE_SPS_HEVC_LOG2_MAX_POC_LSB_MINUS4] = 8;
++		memset(set, 0, len);
++		KUNIT_ASSERT_EQ(test, ave_build_start(ctx, set, len), 0);
++		if (h264) {
++			KUNIT_EXPECT_EQ(test, get_unaligned_le32(base + 0x2d34), 1);
++			KUNIT_EXPECT_EQ(test, get_unaligned_le32(base + 0x2d38), 0);
++			KUNIT_EXPECT_EQ(test, get_unaligned_le32(base + 0x2d3c), 2);
++			KUNIT_EXPECT_EQ(test, get_unaligned_le32(set + 0x2d34), 4);
++			KUNIT_EXPECT_EQ(test, get_unaligned_le32(set + 0x2d38), 2);
++			KUNIT_EXPECT_EQ(test, get_unaligned_le32(set + 0x2d3c), 3);
++		} else {
++			KUNIT_EXPECT_EQ(test, get_unaligned_le32(base + 0x5ae0), 7);
++			KUNIT_EXPECT_EQ(test, get_unaligned_le32(set + 0x5ae0), 8);
++		}
++		for (size_t o = 0; o < len; o += 4) {
++			bool expected = !h264 && o == 0x5ae0;
++
++			for (unsigned int i = 0; h264 && i < ARRAY_SIZE(h264_off); i++)
++				expected |= o == h264_off[i];
++			if (!expected)
++				KUNIT_EXPECT_EQ_MSG(test, get_unaligned_le32(base + o),
++						    get_unaligned_le32(set + o),
++						    "codec %d word +%#zx", codec, o);
++		}
++	}
++
++	/* Controls are offered only where the words are known. */
++	KUNIT_EXPECT_EQ(test, ave_sps_offset(&ave_layout_9003_78_0,
++					     AVE_SPS_H264_POC_TYPE), 0x2d38);
++	KUNIT_EXPECT_EQ(test, ave_sps_offset(&ave_layout_9003_78_0,
++					     AVE_SPS_HEVC_LOG2_MAX_POC_LSB_MINUS4), 0x5ae0);
++	KUNIT_EXPECT_EQ(test, ave_sps_offset(&ave_layout_6070_11_1,
++					     AVE_SPS_H264_POC_TYPE), 0);
++	KUNIT_EXPECT_EQ(test, ave_sps_offset(&ave_layout_26a428,
++					     AVE_SPS_H264_POC_TYPE), 0);
++	KUNIT_EXPECT_EQ(test, ave_sps_offset(NULL, AVE_SPS_H264_POC_TYPE), 0);
++
++	KUNIT_EXPECT_EQ(test, ave_sps_probe_parse("", 0x2900, 0x3060, off, val), 0);
++	KUNIT_EXPECT_EQ(test, ave_sps_probe_parse("\n", 0x2900, 0x3060, off, val), 0);
++	KUNIT_EXPECT_EQ(test, ave_sps_probe_parse("0x2d3c=4\n", 0x2900, 0x3060,
++						  off, val), 1);
++	KUNIT_EXPECT_EQ(test, val[0], 4);
++	KUNIT_ASSERT_EQ(test, ave_sps_probe_parse("0x2d34=4,0x2d38=2", 0x2900,
++						  0x3060, off, val), 2);
++	KUNIT_EXPECT_EQ(test, off[0], 0x2d34);
++	KUNIT_EXPECT_EQ(test, val[0], 4);
++	KUNIT_EXPECT_EQ(test, off[1], 0x2d38);
++	KUNIT_EXPECT_EQ(test, val[1], 2);
++	KUNIT_EXPECT_EQ(test, ave_sps_probe_parse("0x305c=1", 0x2900, 0x3060,
++						  off, val), 1);
++	KUNIT_EXPECT_EQ(test, ave_sps_probe_parse("0x3060=1", 0x2900, 0x3060,
++						  off, val), -EINVAL);
++	KUNIT_EXPECT_EQ(test, ave_sps_probe_parse("0x2d35=1", 0x2900, 0x3060,
++						  off, val), -EINVAL);
++	KUNIT_EXPECT_EQ(test, ave_sps_probe_parse("0x10=1", 0x2900, 0x3060,
++						  off, val), -EINVAL);
++	KUNIT_EXPECT_EQ(test, ave_sps_probe_parse("0x2d34", 0x2900, 0x3060,
++						  off, val), -EINVAL);
++	KUNIT_EXPECT_EQ(test, ave_sps_probe_parse("0x2d34=x", 0x2900, 0x3060,
++						  off, val), -EINVAL);
++	KUNIT_EXPECT_EQ(test, ave_sps_probe_parse("0x2d34=1,", 0x2900, 0x3060,
++						  off, val), -EINVAL);
++	KUNIT_EXPECT_EQ(test,
++			ave_sps_probe_parse("0x2d00=1,0x2d04=1,0x2d08=1,0x2d0c=1,"
++					    "0x2d10=1,0x2d14=1,0x2d18=1,0x2d1c=1,"
++					    "0x2d20=1",
++					    0x2900, 0x3060, off, val), -EINVAL);
++}
++
+ /* Constant quality uses the measured macOS table: anchors and shape. */
+ static void ave_cq_table(struct kunit *test)
+ {
+@@ -1497,6 +1602,7 @@ static struct kunit_case ave_abi_cases[] = {
+ 	KUNIT_CASE(ave_t6041_text_boot_word),
+ 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
+ 	KUNIT_CASE(ave_9003_speed),	    KUNIT_CASE(ave_cq_table),
++	KUNIT_CASE(ave_9003_client_sps),
+ 	KUNIT_CASE(ave_6070_images),
+ 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_frame_result),
+ 	KUNIT_CASE(ave_6070_split_surfaces),
+diff --git a/drivers/media/platform/apple/ave/ave-layout.c b/drivers/media/platform/apple/ave/ave-layout.c
+index 0d72319cf1..34b170ce1a 100644
+--- a/drivers/media/platform/apple/ave/ave-layout.c
++++ b/drivers/media/platform/apple/ave/ave-layout.c
+@@ -112,6 +112,19 @@ const struct ave_fw_layout ave_layout_9003_78_0 = {
+ 			.hevc_dpb_minus1 = 0x5b00,
+ 			.hevc_reorder = 0x5b04,
+ 			.hevc_reorder_on = 0x95fc,
++			/*
++			 * The sequence block is the 6070 one 0xdc98 bytes lower
++			 * (profile, level, max_refs, picture size all match);
++			 * the in-band SPS carries 0x2d34, 0x2d38 and 0x2d3c as
++			 * log2_max_frame_num_minus4, pic_order_cnt_type and
++			 * log2_max_pic_order_cnt_lsb_minus4.
++			 */
++			.sps_h264_log2_max_frame_num_minus4 = 0x2d34,
++			.sps_h264_poc_type = 0x2d38,
++			.sps_h264_log2_max_poc_lsb_minus4 = 0x2d3c,
++			.sps_hevc_log2_max_poc_lsb_minus4 = 0x5ae0,
++			.sps_probe_lo = 0x2900,
++			.sps_probe_hi = 0x3060,
+ 		},
+ 		[1] = {
+ 			.header = AVE_SURFACE(0x48, 0x10),
+@@ -211,6 +224,19 @@ const struct ave_fw_layout ave_layout_9003_78_0 = {
+ 			.hevc_dpb_minus1 = 0x5b00,
+ 			.hevc_reorder = 0x5b04,
+ 			.hevc_reorder_on = 0x95fc,
++			/*
++			 * The sequence block is the 6070 one 0xdc98 bytes lower
++			 * (profile, level, max_refs, picture size all match);
++			 * the in-band SPS carries 0x2d34, 0x2d38 and 0x2d3c as
++			 * log2_max_frame_num_minus4, pic_order_cnt_type and
++			 * log2_max_pic_order_cnt_lsb_minus4.
++			 */
++			.sps_h264_log2_max_frame_num_minus4 = 0x2d34,
++			.sps_h264_poc_type = 0x2d38,
++			.sps_h264_log2_max_poc_lsb_minus4 = 0x2d3c,
++			.sps_hevc_log2_max_poc_lsb_minus4 = 0x5ae0,
++			.sps_probe_lo = 0x5900,
++			.sps_probe_hi = 0x5c00,
+ 		},
+ 	},
+ 	.process = {
+diff --git a/drivers/media/platform/apple/ave/ave-layout.h b/drivers/media/platform/apple/ave/ave-layout.h
+index 6731d634da..3d909a4940 100644
+--- a/drivers/media/platform/apple/ave/ave-layout.h
++++ b/drivers/media/platform/apple/ave/ave-layout.h
+@@ -254,6 +254,17 @@ struct ave_start_layout {
+ 	u32 hevc_depth_luma;
+ 	u32 hevc_depth_chroma;
+ 	u32 hevc_log2_max_poc_lsb_minus4;
++	/*
++	 * Sequence words a client may choose (enum ave_sps_word), written
++	 * only when it sets them: the macOS constant stays otherwise. Zero
++	 * means the word is not known on this firmware build.
++	 */
++	u32 sps_h264_log2_max_frame_num_minus4;
++	u32 sps_h264_poc_type;
++	u32 sps_h264_log2_max_poc_lsb_minus4;
++	u32 sps_hevc_log2_max_poc_lsb_minus4;
++	/* Start words the sps_probe test parameter may set: [lo, hi) */
++	u32 sps_probe_lo, sps_probe_hi;
+ 	u32 hevc_refs;
+ 	u32 hevc_reorder_copy;
+ 	u32 hevc_dpb_minus1;
+diff --git a/drivers/media/platform/apple/ave/ave-sess.c b/drivers/media/platform/apple/ave/ave-sess.c
+index cbe8341d21..7654c8c68a 100644
+--- a/drivers/media/platform/apple/ave/ave-sess.c
++++ b/drivers/media/platform/apple/ave/ave-sess.c
+@@ -242,6 +242,13 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
+ 		   !ctx->ave->layout->counted &&
+ 		   p->width * p->height > 1280 * 720;
+ 	p->gop = ctx->gop_size ?: 120;
++	p->sps_set = 0;
++	for (unsigned int i = 0; i < AVE_SPS_COUNT; i++) {
++		if (ctx->sps_ctl[i] < 0)
++			continue;
++		p->sps_set |= BIT(i);
++		p->sps_val[i] = ctx->sps_ctl[i];
++	}
+ 
+ 	p->bitrate = ctx->bitrate;
+ 	if (ctx->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CQ) {
+diff --git a/drivers/media/platform/apple/ave/ave-v4l2.c b/drivers/media/platform/apple/ave/ave-v4l2.c
+index 755e073f8e..9137763056 100644
+--- a/drivers/media/platform/apple/ave/ave-v4l2.c
++++ b/drivers/media/platform/apple/ave/ave-v4l2.c
+@@ -536,6 +536,13 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
+ 	case V4L2_CID_APPLE_AVE_PRIORITIZE_SPEED:
+ 		ctx->prioritize_speed = ctrl->val;
+ 		break;
++	case V4L2_CID_APPLE_AVE_H264_LOG2_MAX_FRAME_NUM_MINUS4:
++	case V4L2_CID_APPLE_AVE_H264_POC_TYPE:
++	case V4L2_CID_APPLE_AVE_H264_LOG2_MAX_POC_LSB_MINUS4:
++	case V4L2_CID_APPLE_AVE_HEVC_LOG2_MAX_POC_LSB_MINUS4:
++		ctx->sps_ctl[ctrl->id - V4L2_CID_APPLE_AVE_H264_LOG2_MAX_FRAME_NUM_MINUS4] =
++			ctrl->val;
++		break;
+ 	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
+ 	case V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE:
+ 	case V4L2_CID_MIN_BUFFERS_FOR_OUTPUT:
+@@ -560,6 +567,26 @@ static const struct v4l2_ctrl_config ave_ctrl_prioritize_speed = {
+ 	.def = 1,
+ };
+ 
++/* Ranges from H.264 7.4.2.1.1 and H.265 7.4.3.2.1; -1 keeps the firmware value. */
++#define AVE_SPS_CTRL(_id, _name, _max)					\
++	{ .ops = &ave_ctrl_ops, .id = (_id), .name = (_name),		\
++	  .type = V4L2_CTRL_TYPE_INTEGER, .min = -1, .max = (_max),	\
++	  .step = 1, .def = -1 }
++
++static const struct v4l2_ctrl_config ave_ctrl_sps[AVE_SPS_COUNT] = {
++	[AVE_SPS_H264_LOG2_MAX_FRAME_NUM_MINUS4] =
++		AVE_SPS_CTRL(V4L2_CID_APPLE_AVE_H264_LOG2_MAX_FRAME_NUM_MINUS4,
++			     "H264 Log2 Max Frame Num Minus4", 12),
++	[AVE_SPS_H264_POC_TYPE] =
++		AVE_SPS_CTRL(V4L2_CID_APPLE_AVE_H264_POC_TYPE, "H264 POC Type", 2),
++	[AVE_SPS_H264_LOG2_MAX_POC_LSB_MINUS4] =
++		AVE_SPS_CTRL(V4L2_CID_APPLE_AVE_H264_LOG2_MAX_POC_LSB_MINUS4,
++			     "H264 Log2 Max POC LSB Minus4", 12),
++	[AVE_SPS_HEVC_LOG2_MAX_POC_LSB_MINUS4] =
++		AVE_SPS_CTRL(V4L2_CID_APPLE_AVE_HEVC_LOG2_MAX_POC_LSB_MINUS4,
++			     "HEVC Log2 Max POC LSB Minus4", 12),
++};
++
+ static int ave_init_ctrls(struct ave_ctx *ctx)
+ {
+ 	struct v4l2_ctrl_handler *hdl = &ctx->hdl;
+@@ -640,6 +667,12 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
+ 	/* Off by default: macOS also codes for quality unless asked. */
+ 	v4l2_ctrl_new_custom(hdl, &ave_ctrl_prioritize_speed, NULL);
+ 
++	for (unsigned int i = 0; i < AVE_SPS_COUNT; i++) {
++		ctx->sps_ctl[i] = -1;
++		if (ave_sps_offset(ctx->ave->layout, i))
++			v4l2_ctrl_new_custom(hdl, &ave_ctrl_sps[i], NULL);
++	}
++
+ 	/* The firmware holds up to five frames; one more keeps it fed. */
+ 	c = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MIN_BUFFERS_FOR_OUTPUT, 1, 32, 1,
+ 			      AVE_MAX_SLOTS + 1);
+diff --git a/drivers/media/platform/apple/ave/ave-writer.c b/drivers/media/platform/apple/ave/ave-writer.c
+index 8699f78c6f..5df4e02965 100644
+--- a/drivers/media/platform/apple/ave/ave-writer.c
++++ b/drivers/media/platform/apple/ave/ave-writer.c
+@@ -10,6 +10,8 @@
+  */
+ #include <linux/device.h>
+ #include <linux/math64.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
+ #include <linux/sizes.h>
+ #include <linux/string.h>
+ #include <linux/unaligned.h>
+@@ -437,6 +439,111 @@ static void ave_start_put8(u8 *cmd, u32 off, u8 val)
+ 		cmd[off] = val;
+ }
+ 
++/*
++ * Test only: raw Start words for sweeping the firmware's sequence fields.
++ * The words must lie inside the codec's sequence block on this firmware
++ * build; each session that applies them logs them.
++ */
++static char sps_probe[96];
++module_param_string(sps_probe, sps_probe, sizeof(sps_probe), 0644);
++MODULE_PARM_DESC(sps_probe, "Test only: raw Start words \"off=val[,off=val]\" inside the sequence block, for sessions started from now on (default empty: none)");
++
++static enum ave_codec ave_sps_codec(enum ave_sps_word word)
++{
++	return word == AVE_SPS_HEVC_LOG2_MAX_POC_LSB_MINUS4 ? AVE_CODEC_HEVC :
++							      AVE_CODEC_H264;
++}
++
++/* Where @word sits in this build's Start command for its codec; 0: unknown. */
++u32 ave_sps_offset(const struct ave_fw_layout *fw, enum ave_sps_word word)
++{
++	const struct ave_start_layout *l;
++
++	if (!fw || fw->kind == AVE_LAYOUT_6070 || fw->counted)
++		return 0;
++	l = &fw->start[ave_sps_codec(word) - 1];
++	switch (word) {
++	case AVE_SPS_H264_LOG2_MAX_FRAME_NUM_MINUS4:
++		return l->sps_h264_log2_max_frame_num_minus4;
++	case AVE_SPS_H264_POC_TYPE:
++		return l->sps_h264_poc_type;
++	case AVE_SPS_H264_LOG2_MAX_POC_LSB_MINUS4:
++		return l->sps_h264_log2_max_poc_lsb_minus4;
++	case AVE_SPS_HEVC_LOG2_MAX_POC_LSB_MINUS4:
++		return l->sps_hevc_log2_max_poc_lsb_minus4;
++	default:
++		return 0;
++	}
++}
++
++/*
++ * Parse "off=val[,off=val]" (each number in C notation) into at most
++ * AVE_SPS_PROBE_MAX pairs of aligned words inside [@lo, @hi). Surrounding
++ * white space (the newline a sysfs write brings) is ignored, and a blank
++ * string is no words. Returns the number of pairs, or -EINVAL.
++ */
++int ave_sps_probe_parse(const char *spec, u32 lo, u32 hi, u32 *off, u32 *val)
++{
++	char buf[sizeof(sps_probe)], *s, *tok;
++	int n = 0;
++
++	if (strscpy(buf, spec, sizeof(buf)) < 0)
++		return -EINVAL;
++	s = strim(buf);
++	if (!*s)
++		return 0;
++	while ((tok = strsep(&s, ",")) != NULL) {
++		char *eq = strchr(tok, '=');
++
++		if (!eq || n == AVE_SPS_PROBE_MAX)
++			return -EINVAL;
++		*eq = '\0';
++		if (kstrtou32(tok, 0, &off[n]) || kstrtou32(eq + 1, 0, &val[n]))
++			return -EINVAL;
++		if (!IS_ALIGNED(off[n], 4) || off[n] < lo || off[n] >= hi ||
++		    hi - off[n] < 4)
++			return -EINVAL;
++		n++;
++	}
++	return n;
++}
++
++/* The client's sequence words, then any test probe words. */
++static void ave_start_client_sps(struct ave_ctx *ctx, u8 *cmd, size_t len)
++{
++	const struct ave_params *p = &ctx->sess->p;
++	const struct ave_fw_layout *fw = ctx->ave->layout;
++	const struct ave_start_layout *l = &fw->start[p->codec - 1];
++	u32 off[AVE_SPS_PROBE_MAX], val[AVE_SPS_PROBE_MAX];
++	char spec[sizeof(sps_probe)];
++	int n;
++
++	for (unsigned int i = 0; i < AVE_SPS_COUNT; i++) {
++		u32 o = ave_sps_offset(fw, i);
++
++		if ((p->sps_set & BIT(i)) && o && ave_sps_codec(i) == p->codec &&
++		    o + 4 <= len)
++			ave_put32(cmd, o, p->sps_val[i]);
++	}
++
++	if (!l->sps_probe_hi || l->sps_probe_hi > len)
++		return;
++	kernel_param_lock(THIS_MODULE);
++	strscpy(spec, sps_probe, sizeof(spec));
++	kernel_param_unlock(THIS_MODULE);
++	n = ave_sps_probe_parse(spec, l->sps_probe_lo, l->sps_probe_hi, off, val);
++	if (n < 0) {
++		dev_warn(ctx->ave->dev, "sps_probe \"%s\" refused: words in [%#x, %#x)\n",
++			 strim(spec), l->sps_probe_lo, l->sps_probe_hi);
++		return;
++	}
++	for (int i = 0; i < n; i++) {
++		dev_info(ctx->ave->dev, "sps_probe: Start +%#x = %#x (was %#x)\n",
++			 off[i], val[i], get_unaligned_le32(cmd + off[i]));
++		ave_put32(cmd, off[i], val[i]);
++	}
++}
++
+ /* 6070 Process state copied from the session's codec object. */
+ #define AVE_6070_AVC_STATE_BYTES	0x984
+ #define AVE_6070_HEVC_SLICE_BYTES	0x5570
+@@ -1095,6 +1202,7 @@ int ave_build_start(struct ave_ctx *ctx, u8 *cmd, size_t len)
+ 	if (ave_start_surfaces(sess, cmd, fw))
+ 		return -EINVAL;
+ 	ave_start_config(p, cmd, fw);
++	ave_start_client_sps(ctx, cmd, len);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/media/platform/apple/ave/ave.h b/drivers/media/platform/apple/ave/ave.h
+index de9f2ce852..679f19d22b 100644
+--- a/drivers/media/platform/apple/ave/ave.h
++++ b/drivers/media/platform/apple/ave/ave.h
+@@ -162,6 +162,26 @@ enum ave_opcode {
+  */
+ #define V4L2_CID_APPLE_AVE_BASE (V4L2_CTRL_CLASS_CODEC | 0x1200)
+ #define V4L2_CID_APPLE_AVE_PRIORITIZE_SPEED (V4L2_CID_APPLE_AVE_BASE + 0)
++/*
++ * Sequence parameter set words a client chooses, so that the parameter sets
++ * the encoder writes in band match the ones the client builds itself (a
++ * VA-API client writes its own into the container header). -1, the
++ * default, keeps the firmware's own value, as macOS sets it; otherwise the
++ * syntax element value is used. Offered only on firmware builds where the
++ * word is known; read when streaming starts.
++ */
++#define V4L2_CID_APPLE_AVE_H264_LOG2_MAX_FRAME_NUM_MINUS4 (V4L2_CID_APPLE_AVE_BASE + 1)
++#define V4L2_CID_APPLE_AVE_H264_POC_TYPE (V4L2_CID_APPLE_AVE_BASE + 2)
++#define V4L2_CID_APPLE_AVE_H264_LOG2_MAX_POC_LSB_MINUS4 (V4L2_CID_APPLE_AVE_BASE + 3)
++#define V4L2_CID_APPLE_AVE_HEVC_LOG2_MAX_POC_LSB_MINUS4 (V4L2_CID_APPLE_AVE_BASE + 4)
++
++enum ave_sps_word {
++	AVE_SPS_H264_LOG2_MAX_FRAME_NUM_MINUS4,
++	AVE_SPS_H264_POC_TYPE,
++	AVE_SPS_H264_LOG2_MAX_POC_LSB_MINUS4,
++	AVE_SPS_HEVC_LOG2_MAX_POC_LSB_MINUS4,
++	AVE_SPS_COUNT,
++};
+ 
+ /* The firmware build whose command layouts the driver generates */
+ #define AVE_FW_TEXT_CRC_9003_78_0 0x69c54454
+@@ -390,6 +410,8 @@ struct ave_params {
+ 	u32 bit_depth; /* zero also means the existing 8-bit API */
+ 	u32 initial_qp; /* CQ only; bit-rate modes use 26 */
+ 	bool speed; /* prioritize encoding speed over quality */
++	u8 sps_set; /* BIT(enum ave_sps_word): the client chose that word */
++	u8 sps_val[AVE_SPS_COUNT];
+ };
+ 
+ struct ave_slot {
+@@ -523,6 +545,7 @@ struct ave_ctx {
+ 	u32 hevc_max_qp;
+ 	bool force_key_frame;
+ 	bool prioritize_speed;
++	s32 sps_ctl[AVE_SPS_COUNT]; /* -1: keep the firmware's value */
+ 
+ 	struct ave_session *sess;
+ 	bool mctf; /* an MCTF context, on the MCTF video device */
+@@ -604,6 +627,9 @@ void ave_write_surface(const struct ave_fw_layout *fw, u8 *cmd,
+ 		       const struct ave_surface_layout *l, unsigned int index,
+ 		       dma_addr_t addr, u32 size);
+ int ave_build_start(struct ave_ctx *ctx, u8 *cmd, size_t len);
++u32 ave_sps_offset(const struct ave_fw_layout *fw, enum ave_sps_word word);
++#define AVE_SPS_PROBE_MAX 8
++int ave_sps_probe_parse(const char *spec, u32 lo, u32 hi, u32 *off, u32 *val);
+ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
+ 		      unsigned int slot, dma_addr_t input, u32 bitrate,
+ 		      bool force_key, bool last);
+-- 
+2.43.0
+
