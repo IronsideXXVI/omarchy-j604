@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 02:08:23 +0000
+Subject: [PATCH] sched/fair: No FORK_BIG placement or start lift for a
+ fork burst
+
+FORK_BIG with fork_big_lift brings a single unhinted memory thread on the
+M4 MacBook Pro from 61-70 to 93-95 GB/s, but a shell loop that runs
+/bin/true 2000 times took 826 ms with it against 698-726 ms without:
+every child of the loop was started on an idle CPU of the highest
+capacity and lifted to its spare capacity, although it lives for a
+fraction of a millisecond.
+
+Add the debugfs knob fork_big_gap_ns (default 0: no change). When it is
+set, a fork that follows the parent's previous fork by less than the
+gap is part of a burst: the child is placed by the usual slow path,
+does not get the start lift, and neither does its exec. A task that
+forks one worker at a time, every few milliseconds or more, keeps
+both.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ include/linux/sched.h |  3 +++
+ kernel/sched/core.c   |  2 ++
+ kernel/sched/debug.c  |  1 +
+ kernel/sched/fair.c   | 35 ++++++++++++++++++++++++++++++++++-
+ kernel/sched/sched.h  |  1 +
+ 5 files changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 562bcca2cc..86a1c9621d 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -943,6 +943,9 @@ struct task_struct {
+ 	u64				misfit_runtime;
+ 	/* Runtime at the last wakeup or migration, for MISFIT_RUNTIME. */
+ 	u64				burst_runtime;
++	/* Time of this task's last fork, and whether that fork was a burst. */
++	u64				fork_big_last;
++	bool				fork_big_burst;
+ 	int				nr_cpus_allowed;
+ 	const cpumask_t			*cpus_ptr;
+ 	cpumask_t			*user_cpus_ptr;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 00a3b6615a..821dff7840 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4666,6 +4666,8 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
+ 	p->se.sum_exec_runtime		= 0;
+ 	p->misfit_runtime		= 0;
+ 	p->burst_runtime		= 0;
++	p->fork_big_last		= 0;
++	p->fork_big_burst		= false;
+ 	p->se.prev_sum_exec_runtime	= 0;
+ 	p->se.nr_migrations		= 0;
+ 	p->se.vruntime			= 0;
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 5f28fbaaff..7dac34d102 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -731,6 +731,7 @@ static __init int sched_init_debug(void)
+ 	debugfs_create_u32("nr_migrate", 0644, debugfs_sched, &sysctl_sched_nr_migrate);
+ 	debugfs_create_u32("misfit_runtime_ns", 0644, debugfs_sched, &sysctl_sched_misfit_runtime);
+ 	debugfs_create_u32("fork_big_lift", 0644, debugfs_sched, &sysctl_sched_fork_big_lift);
++	debugfs_create_u32("fork_big_gap_ns", 0644, debugfs_sched, &sysctl_sched_fork_big_gap);
+ 
+ 	sched_domains_mutex_lock();
+ 	update_sched_domain_debugfs();
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 6e2a23137e..78ccae6e33 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -101,6 +101,14 @@ __read_mostly unsigned int sysctl_sched_misfit_runtime	= 8000000UL;
+  */
+ __read_mostly unsigned int sysctl_sched_fork_big_lift;
+ 
++/*
++ * fork_big_gap_ns: a fork that follows the parent's previous fork by less
++ * than this is part of a burst (a shell loop, a process pool) and gets
++ * neither FORK_BIG placement nor fork_big_lift; neither does the exec of a
++ * task forked in a burst. (default: 0 = no burst rule, units: nanoseconds)
++ */
++__read_mostly unsigned int sysctl_sched_fork_big_gap;
++
+ static int __init setup_sched_thermal_decay_shift(char *str)
+ {
+ 	pr_warn("Ignoring the deprecated sched_thermal_decay_shift= option\n");
+@@ -1385,6 +1393,8 @@ void post_init_entity_util_avg(struct task_struct *p)
+ 	long cpu_scale = arch_scale_cpu_capacity(cpu_of(rq_of(cfs_rq)));
+ 	long cap = (long)(cpu_scale - cfs_rq->avg.util_avg) / 2;
+ 
++	p->fork_big_burst = current->fork_big_burst;
++
+ 	if (p->sched_class != &fair_sched_class) {
+ 		/*
+ 		 * For !fair tasks do:
+@@ -1418,7 +1428,7 @@ void post_init_entity_util_avg(struct task_struct *p)
+ 	 * does not ramp a CPU-bound new task up over tens of milliseconds.
+ 	 */
+ 	if (READ_ONCE(sysctl_sched_fork_big_lift) && sched_asym_cpucap_active() && cap > 0 &&
+-	    !(p->flags & PF_KTHREAD) &&
++	    !(p->flags & PF_KTHREAD) && !p->fork_big_burst &&
+ 	    cpu_scale == (long)p->max_allowed_capacity)
+ 		sa->util_avg = 2 * cap;
+ 
+@@ -10020,8 +10030,29 @@ static bool fork_big_narrow(struct task_struct *p)
+ 	return nr_running() < big;
+ }
+ 
++/*
++ * Called for every fork, in the parent: note whether the fork follows the
++ * parent's previous one by less than fork_big_gap_ns.
++ */
++static void fork_big_note_fork(void)
++{
++	unsigned int gap = READ_ONCE(sysctl_sched_fork_big_gap);
++	u64 now;
++
++	if (!gap) {
++		current->fork_big_burst = false;
++		return;
++	}
++	now = local_clock();
++	current->fork_big_burst = now - current->fork_big_last < gap;
++	current->fork_big_last = now;
++}
++
+ static inline bool fork_big_candidate(struct task_struct *p, int wake_flags)
+ {
++	if ((wake_flags & (WF_FORK | WF_EXEC)) && current->fork_big_burst)
++		return false;
++
+ 	return (wake_flags & (WF_FORK | WF_EXEC)) && sched_feat(FORK_BIG) &&
+ 	       sched_asym_cpucap_active() && !(p->flags & PF_KTHREAD) &&
+ 	       !task_has_idle_policy(p) &&
+@@ -10044,6 +10075,8 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ 	 * required for stable ->cpus_allowed
+ 	 */
+ 	lockdep_assert_held(&p->pi_lock);
++	if (wake_flags & WF_FORK)
++		fork_big_note_fork();
+ 	if (fork_big_candidate(p, wake_flags)) {
+ 		new_cpu = select_idle_biggest(p);
+ 		if (new_cpu >= 0)
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 8948249996..f72b12bf1b 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -3160,6 +3160,7 @@ extern __read_mostly unsigned int sysctl_sched_nr_migrate;
+ extern __read_mostly unsigned int sysctl_sched_migration_cost;
+ extern __read_mostly unsigned int sysctl_sched_misfit_runtime;
+ extern __read_mostly unsigned int sysctl_sched_fork_big_lift;
++extern __read_mostly unsigned int sysctl_sched_fork_big_gap;
+ 
+ extern unsigned int sysctl_sched_base_slice;
+ 
+-- 
+2.43.0
+

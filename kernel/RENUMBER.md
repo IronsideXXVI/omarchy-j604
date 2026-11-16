@@ -1187,3 +1187,10 @@ New in 1.943: 0751 (`Revert "drm/asahi: g16: Keep up to 16 render commands resid
 Kernel 1.945 keeps the base (`da8e1acf3656`) and all 752 patches of 1.943 under the same numbers. 1.944 was started once as an experiment and not kept, so it is not published.
 
 New in 1.945 (all off by default): 0753 (`sched/fair: FORK_BIG only while the machine is narrow; optional start lift`), 0754 (`pmdomain: apple: pmp-report: let t8132_gfx_request change at run time`), 0755 (`drm/asahi: g16: Optionally keep the device after a recovery's receipt fault`), 0756 (`drm/asahi: g16: Keep a recovered job's later receipts off the full chain`), 0757 (`media: apple: isp: zoom by the stream crop where the firmware has no zoom factor`).
+
+
+# Kernel patch numbers: 1.945 to 1.946
+
+Kernel 1.946 keeps the base (`da8e1acf3656`) and all 757 patches of 1.945 under the same numbers.
+
+New in 1.946 (off by default): 0758 (`sched/fair: No FORK_BIG placement or start lift for a fork burst`).

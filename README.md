@@ -83,7 +83,7 @@ Each line compares this machine under Omarchy with macOS on the same machine. PA
 | 34 | Neural engine | PARITY | 1.926 | - |
 | 35 | Video decode HEVC10 4K | SHORT | 1.917 | - |
 | 36 | Video decode H.264 / AV1 | PARITY (H.264) / SHORT (AV1) | - | - |
-| 37 | Video encode H.264 / HEVC | Corrected 2026-11-16 03:04 UTC. With libva-v4l2_request-avd 1.610 (since 01:53 UTC) a stock app encoding H.264 or HEVC from CPU frames through VA-API into Matroska no longer crashes, and FFmpeg and mpv play the files (30 of 30 frames). But the container header the driver now lets FFmpeg write does not match the stream, so a player that sets up from the header alone fails: H.264 in Matroska 9 of 30 frames, HEVC in Matroska 0 of 30, H.264 in MP4 9 of 30, the screen recorder's MP4 18 of 116 (measured). With 1.608 MP4 headers were correct and Matroska crashed. The next build goes back to the 1.608 driver for now. The kernel encoder: v4l2-ctl encodes a frame in 16.28 ms, as on macOS, and FFmpeg's h264_v4l2m2m reaches 55 fps (on 1.922) | 1.916 | - |
+| 37 | Video encode H.264 / HEVC | Since 2026-11-16 03:45 UTC (kernel 1.946) the VA-API driver is back on its earlier version (libva-v4l2_request-avd 1.611, the 1.608 content). Hardware H.264 from CPU frames into MP4 and raw streams writes all 10 test frames and they decode back (checked on the installed driver at its first start); the MP4 header comes from the encoder's own first packet again, so it matches the stream, and the stock screen recorder's MP4 is correct again. Matroska output from the VA-API encoder crashes again and writes 0 bytes, until the proper fix lands: the encoder writing the sequence parameters the app puts in the file header. 1.610 (on 1.945) avoided that crash, but its header did not match the stream, and players that read only the header got 9 of 30 frames (H.264 Matroska), 0 of 30 (HEVC Matroska) and 9 of 30 (MP4) (measured). The kernel encoder: v4l2-ctl encodes a frame in 16.28 ms, as on macOS, and FFmpeg's h264_v4l2m2m reaches 55 fps (on 1.922) | 1.916 | - |
 | 38 | JPEG engine | BETTER | - | - |
 | 39 | ProRes | BETTER (4:2:2 encode, measured on 1.930) | - | bound by default since 1.932; no stock application uses it yet |
 | 40 | Scaler | N/A (Omarchy) | - | - |
@@ -143,7 +143,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-12 (checked
 
 | Package | Official base | Local pkgrel |
 | --- | --- | --- |
-| `linux-aurora-next`, `linux-aurora-next-headers` (`linux-aurora` 1.943 stays installed beside it; the installer image still carries `linux-aurora` 1.928) | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`da8e1acf3656`, Aurora's tip), 757 patches | `1.945` |
+| `linux-aurora`, `linux-aurora-headers` (`linux-aurora-next` 1.945 stays installed beside it; the installer image still carries `linux-aurora` 1.928) | 7.3.0.aurora1, aurora-silicon/linux `integration/aurora` (`da8e1acf3656`, Aurora's tip), 758 patches | `1.946` |
 | `aura` | 1.0.0b13, aurora-silicon/aura (`f0f180afe5`), aurora-silicon/alarm-aurora recipe, 22 patches | `1.615` (replaced `m1n1-aurora` on 2026-11-12) |
 | `uboot-aurora` | 2026.07.aurora11, aurora-silicon/u-boot (`250385f8c8`, the version Aurora packages), 1 patch | `1.604` |
 | `mesa-aurora`, `vulkan-aurora` | 1:26.3.0_devel.20261113, aurora-silicon/mesa (`8f013bf96bd`) | `1.8144` |
@@ -154,7 +154,7 @@ The J604 builds carried here, as installed on the machine on 2026-11-12 (checked
 | `asahi-scripts` | 20261023, asahi-alarm/asahi-scripts, aurora-silicon/alarm-aurora recipe | `9.605` (the Stage 2 trial's guard timer counts from unlock) |
 | `plymouth` | 26.134.222, Plymouth (Arch Linux recipe) | `3.604` |
 | `libfprint-git` | 1:1.94.100.r10.g6f9479c, libfprint (`6f9479c3d5`), omacom recipe | `5.604` (accepts Secure Enclave interface v4 and v5) |
-| `libva-v4l2_request-avd` | 1.3.r11.r169.gc653eaa, omacom/libva-v4l2_request (`c653eaa623`), omacom recipe | `1.610` (adds the `aurora_drv_video.so` alias, VA-API H.264/HEVC encoding on the Apple video encoder, AV1 10-bit decoding up to 7680x4320, the VP9 maximum frame size from the kernel, up to 16 bitstream buffers in flight (1.608) and packed sequence headers, so FFmpeg can write VA-API H.264/HEVC into Matroska (1.610; that header does not match the stream, so players that read only the header fail, see STATUS.md; the next build returns to 1.608); the alias is open as [omacom/omarchy-pkgs#2375](https://github.com/omacom/omarchy-pkgs/pull/2375), and its official `-2` will replace this build) |
+| `libva-v4l2_request-avd` | 1.3.r11.r169.gc653eaa, omacom/libva-v4l2_request (`c653eaa623`), omacom recipe | `1.611` (the 1.608 content again since 1.946: adds the `aurora_drv_video.so` alias, VA-API H.264/HEVC encoding on the Apple video encoder, AV1 10-bit decoding up to 7680x4320, the VP9 maximum frame size from the kernel and up to 16 bitstream buffers in flight; 1.610's packed sequence headers are out again because their file header did not match the stream, so VA-API encoding into Matroska crashes until the proper fix, see STATUS.md; the alias is open as [omacom/omarchy-pkgs#2375](https://github.com/omacom/omarchy-pkgs/pull/2375), and its official `-2` will replace this build) |
 | `chromium` | 156.0.8078.79, Arch Linux ARM recipe (`6227c4d28b`) | `1.608` (patches for hardware video on the Apple decoder: 10-bit P010 frames, BT.709 colours, decoder errors reported, HEVC only with Annex-B, frame errors, HDR metadata, capture buffers sized for the renderer; with `omarchy-mac` 2.19 Chromium decodes 10-bit VP9, AV1 and HEVC on the decoder; since 1.608 also the V4L2 video encoder, used only with Chromium's AcceleratedVideoEncoder feature, off by default) |
 | `avd-fw` | 0.1, AsahiLinux/avd-fw (`v0.1`), omacom recipe (`c1fcff4dec`), 15 patches | `1.604` (aurora-silicon/avd-fw's queue transport and the T8132 SRAM aperture) |
 | `gpu-screen-recorder` | 6.1.7, gpu-screen-recorder (Arch Linux recipe, built for aarch64) | `1.604` (captures monitors on the Apple display controller) |
@@ -181,7 +181,7 @@ Since 2026-11-12 the Mac boots through Aurora's aura boot loader: the Stage 2 on
 | `speakersafetyd/` | J604 speaker protection profile | AsahiLinux/speakersafetyd | MIT |
 | `asahi-fwextract/` | camera tuning firmware extraction for the J604; keeps the BCM4388 rev C2 Wi-Fi firmware | asahi-alarm/asahi-alarm-installer | MIT |
 | `libfprint-git/` | Touch ID on the 7.3 kernel: the Apple Secure Enclave driver accepts biometric interface v4 and v5 (two upstream Aurora patches as one) | libfprint (omacom recipe) | LGPL-2.1-or-later |
-| `libva-v4l2_request-avd/` | VA-API on the 7.3 kernel: the recipe adds the `aurora_drv_video.so` alias (upstream aurora-silicon/alarm-aurora aedcf240ca91). `patches/` holds that recipe diff and, since 1.605, a driver patch that adds VA-API H.264 and HEVC encoding on V4L2 stateful encoders such as the Apple video encoder, since 1.606 a second one that sizes surfaces exported before their first decode for 10-bit AV1 and VP9, since 1.607 the VP9 maximum frame size, since 1.608 up to 16 bitstream buffers in flight, and since 1.610 packed sequence headers | omacom/omarchy-pkgs recipe, omacom/libva-v4l2_request | GPL-3.0-or-later |
+| `libva-v4l2_request-avd/` | VA-API on the 7.3 kernel: the recipe adds the `aurora_drv_video.so` alias (upstream aurora-silicon/alarm-aurora aedcf240ca91). `patches/` holds that recipe diff and, since 1.605, a driver patch that adds VA-API H.264 and HEVC encoding on V4L2 stateful encoders such as the Apple video encoder, since 1.606 a second one that sizes surfaces exported before their first decode for 10-bit AV1 and VP9, since 1.607 the VP9 maximum frame size, and since 1.608 up to 16 bitstream buffers in flight (1.610's packed sequence headers were taken out again in 1.611) | omacom/omarchy-pkgs recipe, omacom/libva-v4l2_request | GPL-3.0-or-later |
 | `gpu-screen-recorder/` | the stock recorder captures monitors on the Apple display controller (a KMS-only device with no render node, handled like DisplayLink's) | gpu-screen-recorder (Arch Linux recipe) | GPL-3.0-only |
 | `asahi-scripts/` | Aurora's recipe (its `update-m1n1` writes aura's Stage 2 as a trial and commits it after a good boot) + our two patches that add the `apple_nvmem_spmi` and `dwc3-apple` modules to the initramfs | asahi-alarm/asahi-scripts (aurora-silicon/alarm-aurora recipe) | MIT |
 | `avd-fw/` | the open Apple Video Decoder firmware with aurora-silicon/avd-fw's queue transport and the T8132 SRAM aperture | AsahiLinux/avd-fw (omacom recipe) | MIT |
@@ -211,7 +211,7 @@ No Apple firmware, binaries or device dumps are in this repository. The firmware
 
 What goes to which upstream, in what order, and what's already open is in [`UPSTREAM.md`](UPSTREAM.md).<!-- front:prs:begin (generated by front-page.py from the PR ledger; do not edit by hand) -->
 
-Open pull requests from this work (40, kernel 1.945, measured 2026-11-16 02:01 UTC):
+Open pull requests from this work (41, kernel 1.945, measured 2026-11-16 02:01 UTC):
 
 - [aurora-silicon/alarm-aurora#320](https://github.com/aurora-silicon/alarm-aurora/pull/320): speakersafetyd 2.0.1-1.3: add the J604 board file
 - [aurora-silicon/aura#266](https://github.com/aurora-silicon/aura/pull/266): T8132: recover a failed ANS start from off, set up each PCIe root port's DBI at its own device, arm the watchdog in an ESP Stage 2
@@ -252,6 +252,7 @@ Open pull requests from this work (40, kernel 1.945, measured 2026-11-16 02:01 U
 - [omacom/omarchy-mac-pkgs#134](https://github.com/omacom/omarchy-mac-pkgs/pull/134) (draft): Name the 14-inch MacBook Pro M4 panel: 10-bit, Display P3
 - [omacom/omarchy-mac-pkgs#142](https://github.com/omacom/omarchy-mac-pkgs/pull/142): J604: display and keyboard brightness follow the room light as macOS does
 - [omacom/omarchy-mac-pkgs#143](https://github.com/omacom/omarchy-mac-pkgs/pull/143): omarchy-mac: give Apple Silicon power profiles the CPU frequency floor
+- [omacom/omarchy-mac-pkgs#147](https://github.com/omacom/omarchy-mac-pkgs/pull/147): omarchy-mac: wait for the udev queue before speaker safety starts
 - [omacom/omarchy-pkgs#2758](https://github.com/omacom/omarchy-pkgs/pull/2758): omarchy-power-profiles-daemon: Apple Silicon CPU profiles as macOS runs them
 
 <!-- front:prs:end -->
