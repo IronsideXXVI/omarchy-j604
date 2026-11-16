@@ -1180,3 +1180,10 @@ New in 1.942: 0747 (`sched/fair: Optionally place a new task on an idle CPU of t
 Kernel 1.943 keeps the base (`da8e1acf3656`) and all 750 patches of 1.942 under the same numbers; 0751 reverts 0750.
 
 New in 1.943: 0751 (`Revert "drm/asahi: g16: Keep up to 16 render commands resident by default"`), 0752 (`drm/asahi: g16: Stop a fail-stopped firmware at the commit before a revive`).
+
+
+# Kernel patch numbers: 1.943 to 1.945
+
+Kernel 1.945 keeps the base (`da8e1acf3656`) and all 752 patches of 1.943 under the same numbers. 1.944 was started once as an experiment and not kept, so it is not published.
+
+New in 1.945 (all off by default): 0753 (`sched/fair: FORK_BIG only while the machine is narrow; optional start lift`), 0754 (`pmdomain: apple: pmp-report: let t8132_gfx_request change at run time`), 0755 (`drm/asahi: g16: Optionally keep the device after a recovery's receipt fault`), 0756 (`drm/asahi: g16: Keep a recovered job's later receipts off the full chain`), 0757 (`media: apple: isp: zoom by the stream crop where the firmware has no zoom factor`).

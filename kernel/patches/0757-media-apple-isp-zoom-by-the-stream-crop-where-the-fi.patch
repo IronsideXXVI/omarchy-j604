@@ -1,0 +1,251 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 00:13:13 +0000
+Subject: [PATCH] media: apple: isp: zoom by the stream crop where the
+ firmware has no zoom factor
+
+The T8132 firmware answers CURRENT_ZOOM_FACTOR_GET and
+MAX_ZOOM_FACTOR_GET with 0. The driver then sent the zoom factor as a
+float, which the firmware takes without an error but without changing
+the picture: a J604 run stepped the zoom to 172 % and back in 73
+accepted steps, and the frames kept their 1x scale.
+
+Where no factor is reported, zoom by the crop instead: send CROP_SET
+with the stream's view divided by the zoom, centred where auto framing
+points (the middle for the zoom control), and let the scaler bring it
+back to the output size. 100 % sends the stream's own view again. Sizes
+stay multiples of 8 and offsets even. A refused crop stops the zoom for
+that module load. Firmware that reports a factor keeps the factor path.
+
+The digital zoom stays behind digital_zoom (default: off).
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+Assisted-by: LLM
+---
+ drivers/media/platform/apple/isp/isp-drv.h    |  2 +-
+ .../platform/apple/isp/isp-framing-test.c     | 55 +++++++++++++++++++
+ .../media/platform/apple/isp/isp-framing.c    | 31 +++++++++++
+ .../media/platform/apple/isp/isp-framing.h    |  8 +++
+ drivers/media/platform/apple/isp/isp-v4l2.c   | 34 ++++++++++--
+ 5 files changed, 124 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/media/platform/apple/isp/isp-drv.h b/drivers/media/platform/apple/isp/isp-drv.h
+index 1899e2a842..757aefda2b 100644
+--- a/drivers/media/platform/apple/isp/isp-drv.h
++++ b/drivers/media/platform/apple/isp/isp-drv.h
+@@ -536,7 +536,7 @@ struct apple_isp {
+ 	u32 zoom_unit;
+ 	u32 zoom_max;
+ 	bool zoom_failed;
+-	bool zoom_float;
++	bool zoom_crop;
+ 	/* auto framing (with digital_zoom): drives the zoom from face boxes */
+ 	struct v4l2_ctrl *auto_framing;
+ 	bool auto_framing_on;
+diff --git a/drivers/media/platform/apple/isp/isp-framing-test.c b/drivers/media/platform/apple/isp/isp-framing-test.c
+index 9515753457..a24ba2847e 100644
+--- a/drivers/media/platform/apple/isp/isp-framing-test.c
++++ b/drivers/media/platform/apple/isp/isp-framing-test.c
+@@ -133,12 +133,67 @@ static void isp_test_zoom_encode(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, isp_zoom_encode(150, 0x100, 0), 0x180);
+ }
+ 
++static void isp_test_zoom_crop(struct kunit *test)
++{
++	/* a 16:9 view cut from the middle of the sensor, as the 1080p presets */
++	const struct isp_zoom_rect v = { .x = 176, .y = 684, .w = 2688, .h = 1512 };
++	static const int pcts[] = { 50, 100, 101, 150, 175, 200, 333, 400, 1000 };
++	static const int cs[] = { -50, 0, 250, 500, 999, 1000, 2000 };
++	struct isp_zoom_rect r;
++	int i, j;
++
++	isp_zoom_crop(&v, 100, 900, 100, &r);
++	KUNIT_EXPECT_EQ(test, r.x, v.x);
++	KUNIT_EXPECT_EQ(test, r.y, v.y);
++	KUNIT_EXPECT_EQ(test, r.w, v.w);
++	KUNIT_EXPECT_EQ(test, r.h, v.h);
++
++	/* 2x on the centre: half the size, the middle quarter */
++	isp_zoom_crop(&v, 200, 500, 500, &r);
++	KUNIT_EXPECT_EQ(test, r.w, 1344U);
++	KUNIT_EXPECT_EQ(test, r.h, 752U);
++	KUNIT_EXPECT_EQ(test, r.x, 176U + 1344 - 672);
++	KUNIT_EXPECT_EQ(test, r.y, 684U + 756 - 376);
++
++	/* 175 %, the framing check's target */
++	isp_zoom_crop(&v, 175, 500, 500, &r);
++	KUNIT_EXPECT_EQ(test, r.w, 1536U);
++	KUNIT_EXPECT_EQ(test, r.h, 864U);
++
++	/* a centre at an edge is held so the window stays in the view */
++	isp_zoom_crop(&v, 200, 0, 1000, &r);
++	KUNIT_EXPECT_EQ(test, r.x, v.x);
++	KUNIT_EXPECT_EQ(test, r.y, v.y + v.h - r.h);
++
++	/* out-of-range zooms clamp to 100..400 % */
++	isp_zoom_crop(&v, 50, 500, 500, &r);
++	KUNIT_EXPECT_EQ(test, r.w, v.w);
++	isp_zoom_crop(&v, 1000, 500, 500, &r);
++	KUNIT_EXPECT_EQ(test, r.w, 672U);
++
++	for (i = 0; i < ARRAY_SIZE(pcts); i++) {
++		for (j = 0; j < ARRAY_SIZE(cs); j++) {
++			isp_zoom_crop(&v, pcts[i], cs[j], cs[ARRAY_SIZE(cs) - 1 - j], &r);
++			KUNIT_EXPECT_GE(test, r.x, v.x);
++			KUNIT_EXPECT_GE(test, r.y, v.y);
++			KUNIT_EXPECT_LE(test, r.x + r.w, v.x + v.w);
++			KUNIT_EXPECT_LE(test, r.y + r.h, v.y + v.h);
++			KUNIT_EXPECT_EQ(test, r.x & 1, 0U);
++			KUNIT_EXPECT_EQ(test, r.y & 1, 0U);
++			KUNIT_EXPECT_EQ(test, r.w % 8, 0U);
++			KUNIT_EXPECT_EQ(test, r.h % 8, 0U);
++			KUNIT_EXPECT_GE(test, r.w, 8U);
++		}
++	}
++}
++
+ static struct kunit_case isp_framing_test_cases[] = {
+ 	KUNIT_CASE(isp_test_framing_still_in_dead_zone),
+ 	KUNIT_CASE(isp_test_framing_slew_and_converge),
+ 	KUNIT_CASE(isp_test_framing_no_oscillation),
+ 	KUNIT_CASE(isp_test_framing_lost_face),
+ 	KUNIT_CASE(isp_test_zoom_encode),
++	KUNIT_CASE(isp_test_zoom_crop),
+ 	{}
+ };
+ 
+diff --git a/drivers/media/platform/apple/isp/isp-framing.c b/drivers/media/platform/apple/isp/isp-framing.c
+index 7c7a8d836c..34a8bf8d49 100644
+--- a/drivers/media/platform/apple/isp/isp-framing.c
++++ b/drivers/media/platform/apple/isp/isp-framing.c
+@@ -113,6 +113,37 @@ u32 isp_zoom_encode(unsigned int pct, u32 unit, u32 max)
+ 	return ((127U + e) << 23) | (u32)mant;
+ }
+ 
++/*
++ * The crop window for a zoom of pct percent into the view a stream starts
++ * with: the view's size divided by the zoom, centred on (cx, cy) in permille
++ * of the view and kept inside it. Sizes are multiples of 8 and offsets
++ * even, so the NV12 chroma planes stay aligned. 100 % is the view itself.
++ */
++void isp_zoom_crop(const struct isp_zoom_rect *view, unsigned int pct,
++		   int cx, int cy, struct isp_zoom_rect *out)
++{
++	u32 w, h;
++	s64 x, y;
++
++	pct = clamp(pct, 100U, 400U);
++	if (pct == 100) {
++		*out = *view;
++		return;
++	}
++	w = max_t(u32, ALIGN_DOWN(view->w * 100 / pct, 8), 8);
++	h = max_t(u32, ALIGN_DOWN(view->h * 100 / pct, 8), 8);
++	cx = clamp(cx, 0, 1000);
++	cy = clamp(cy, 0, 1000);
++	x = view->x + div_s64((s64)view->w * cx, 1000) - w / 2;
++	y = view->y + div_s64((s64)view->h * cy, 1000) - h / 2;
++	x = clamp_t(s64, x, view->x, view->x + view->w - w);
++	y = clamp_t(s64, y, view->y, view->y + view->h - h);
++	out->x = x & ~1LL;
++	out->y = y & ~1LL;
++	out->w = w;
++	out->h = h;
++}
++
+ #if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
+ #include "isp-framing-test.c"
+ #endif
+diff --git a/drivers/media/platform/apple/isp/isp-framing.h b/drivers/media/platform/apple/isp/isp-framing.h
+index 1e70b45dfc..15baa3138d 100644
+--- a/drivers/media/platform/apple/isp/isp-framing.h
++++ b/drivers/media/platform/apple/isp/isp-framing.h
+@@ -31,6 +31,14 @@ extern const struct isp_framing_params isp_framing_defaults;
+ 
+ void isp_framing_reset(struct isp_framing_state *st);
+ u32 isp_zoom_encode(unsigned int pct, u32 unit, u32 max);
++
++/* A crop window in sensor pixels, as CROP_SET takes it: offset and size. */
++struct isp_zoom_rect {
++	u32 x, y, w, h;
++};
++
++void isp_zoom_crop(const struct isp_zoom_rect *view, unsigned int pct,
++		   int cx, int cy, struct isp_zoom_rect *out);
+ void isp_framing_step(const struct isp_framing_params *p,
+ 		      struct isp_framing_state *st,
+ 		      const struct isp_framing_box *box);
+diff --git a/drivers/media/platform/apple/isp/isp-v4l2.c b/drivers/media/platform/apple/isp/isp-v4l2.c
+index 6715d45387..60b97fb081 100644
+--- a/drivers/media/platform/apple/isp/isp-v4l2.c
++++ b/drivers/media/platform/apple/isp/isp-v4l2.c
+@@ -1290,10 +1290,16 @@ MODULE_PARM_DESC(digital_zoom,
+  * not documented: the factor it reports before the first change is taken as
+  * 1x, and the zoom control (in percent) scales it, up to the firmware's
+  * maximum. The default of 100 sends nothing, so the view stays as before.
+- * Called with video_lock held.
++ *
++ * The T8132 firmware reports 0 for both, and takes a zoom factor without
++ * changing the picture. There the zoom is a smaller crop of the stream's
++ * view instead, centred where auto framing points, and the scaler brings it
++ * back to the output size. Called with video_lock held.
+  */
+ static void isp_apply_zoom(struct apple_isp *isp)
+ {
++	struct isp_zoom_rect view, r;
++	bool framing;
+ 	u32 pct, factor;
+ 	int err;
+ 
+@@ -1301,11 +1307,12 @@ static void isp_apply_zoom(struct apple_isp *isp)
+ 	    !test_bit(ISP_STATE_STREAMING, &isp->state))
+ 		return;
+ 
+-	if (isp->auto_framing && v4l2_ctrl_g_ctrl(isp->auto_framing))
++	framing = isp->auto_framing && v4l2_ctrl_g_ctrl(isp->auto_framing);
++	if (framing)
+ 		pct = READ_ONCE(isp->framing.zoom);
+ 	else
+ 		pct = v4l2_ctrl_g_ctrl(isp->zoom);
+-	if (!isp->zoom_unit && !isp->zoom_float) {
++	if (!isp->zoom_unit && !isp->zoom_crop) {
+ 		if (pct == 100)
+ 			return;
+ 		err = isp_cmd_ch_zoom_factor_get(isp, isp->current_ch, false,
+@@ -1319,14 +1326,31 @@ static void isp_apply_zoom(struct apple_isp *isp)
+ 			isp->zoom_failed = true;
+ 			return;
+ 		}
+-		/* No factor reported: send it in the float form, see below. */
++		/* No factor reported: zoom by the crop, see above. */
+ 		if (!isp->zoom_unit || isp->zoom_max < isp->zoom_unit) {
+ 			isp->zoom_unit = 0;
+ 			isp->zoom_max = 0;
+-			isp->zoom_float = true;
++			isp->zoom_crop = true;
+ 		}
+ 	}
+ 
++	if (isp->zoom_crop) {
++		view.x = isp->stream_preset.crop_offset.x;
++		view.y = isp->stream_preset.crop_offset.y;
++		view.w = isp->stream_preset.crop_size.x;
++		view.h = isp->stream_preset.crop_size.y;
++		isp_zoom_crop(&view, pct, framing ? READ_ONCE(isp->framing.cx) : 500,
++			      framing ? READ_ONCE(isp->framing.cy) : 500, &r);
++		err = isp_cmd_ch_crop_set(isp, isp->current_ch, r.x, r.y, r.w, r.h);
++		dev_dbg(isp->dev, "zoom %u %% -> crop %u,%u %ux%u (%d)\n", pct,
++			r.x, r.y, r.w, r.h, err);
++		if (err) {
++			dev_warn(isp->dev, "zoom crop refused: %d\n", err);
++			isp->zoom_failed = true;
++		}
++		return;
++	}
++
+ 	factor = isp_zoom_encode(pct, isp->zoom_unit, isp->zoom_max);
+ 	err = isp_cmd_ch_zoom_factor_set(isp, isp->current_ch, factor);
+ 	dev_dbg(isp->dev, "zoom %u %% -> factor %#x (%d)\n", pct, factor, err);
+-- 
+2.43.0
+

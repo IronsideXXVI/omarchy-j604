@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 01:07:44 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally keep the device after a
+ recovery's receipt fault
+
+When the M4 firmware raises a recovery event, the driver acknowledges
+it and the firmware resumes. The receipt check of the next poll can
+then fail, because the firmware aborted work without its normal
+receipt, and that one inconsistent receipt fail-stops the whole device
+until reboot. On the J604 one such event took every client's GPU
+(the compositor included) although the recovery itself had resumed.
+
+Add g16_recovery_tolerant (runtime, default 0). With it, a receipt fault
+within 2 s of a resumed recovery fails and quarantines only the oldest
+work, as a passed abort already is (storage retained until reboot,
+never reused), and the device carries on. At most two per recovery;
+past that, and for any other receipt fault, the fail-stop as before.
+A "recovery_tolerant:" stats line counts them.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/params.rs   | 19 +++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs     |  8 ++++++
+ drivers/gpu/drm/asahi/g16/recovery.rs | 40 +++++++++++++++++++++++++++
+ 3 files changed, 67 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 987e2c1cb9..33c3b7115c 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -736,6 +736,25 @@ pub(crate) fn take_test_failstop() -> bool {
+     "G16: test only: 1 = the next GPU submission fail-stops the device (ETIMEDOUT) without touching the firmware; reads 0 once taken (runtime 0644)"
+ );
+ 
++/// Storage of `g16_recovery_tolerant` (runtime 0644, default 0).
++static RECOVERY_TOLERANT: AtomicU32 = AtomicU32::new(0);
++
++/// Whether a receipt fault right after a resumed firmware recovery fails and quarantines only
++/// the oldest work instead of fail-stopping the device: at most two per recovery, within 2 s
++/// of the resume; beyond that, the fail-stop as before.
++pub(crate) fn recovery_tolerant() -> bool {
++    RECOVERY_TOLERANT.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    RECOVERY_TOLERANT_PARAM,
++    RECOVERY_TOLERANT_PARMTYPE,
++    RECOVERY_TOLERANT_PARM,
++    RECOVERY_TOLERANT,
++    "g16_recovery_tolerant",
++    "G16: after a resumed firmware recovery, fail and quarantine only the oldest work on a receipt fault instead of the fail-stop, at most 2 per recovery (default 0; runtime 0644)"
++);
++
+ /// Storage of `g16_subgen` (runtime 0644, default 0).
+ static SUBGEN: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 07b540d0b1..75db584a78 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1283,6 +1283,14 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.dep_wait[0][1],
+             s.dep_wait[0][2]
+         )?;
++        writeln!(
++            f,
++            "recovery_tolerant: enabled {} recoveries {} tolerated {} aborted {}",
++            u8::from(super::params::recovery_tolerant()),
++            self.recovery.recoveries,
++            self.recovery.tolerated_total,
++            self.recovery.aborted_receipts
++        )?;
+         writeln!(
+             f,
+             "pmp_agx: wanted {} held {} releases {} takes {} errors {}",
+diff --git a/drivers/gpu/drm/asahi/g16/recovery.rs b/drivers/gpu/drm/asahi/g16/recovery.rs
+index b0fc2ed969..d7cfd6f3b7 100644
+--- a/drivers/gpu/drm/asahi/g16/recovery.rs
++++ b/drivers/gpu/drm/asahi/g16/recovery.rs
+@@ -45,6 +45,11 @@ pub(crate) fn push_completion(done: &mut Completions, job: &Arc<Job>, result: Re
+     done.push(job, result);
+ }
+ 
++/// g16_recovery_tolerant: how long after a resumed recovery a receipt fault counts as its
++/// after-effect, and how many such faults one recovery may cost before the fail-stop.
++const TOLERANT_WINDOW_NS: u64 = 2_000_000_000;
++const TOLERANT_MAX: u32 = 2;
++
+ pub(crate) struct Recovery {
+     pub(crate) deadline_ns: u64,
+     pub(crate) compute_deadline_ns: u64,
+@@ -69,6 +74,11 @@ pub(crate) struct Recovery {
+     window_ns: u64,
+     window_count: u32,
+     running: bool,
++    /// When the last recovery resumed (g16_recovery_tolerant's window), receipt faults
++    /// tolerated since then, and in all.
++    pub(crate) resumed_ns: u64,
++    pub(crate) tolerated: u32,
++    pub(crate) tolerated_total: u64,
+ }
+ 
+ impl Recovery {
+@@ -92,6 +102,9 @@ pub(crate) fn new() -> Self {
+             window_ns: 0,
+             window_count: 0,
+             running: false,
++            resumed_ns: 0,
++            tolerated: 0,
++            tolerated_total: 0,
+         }
+     }
+ 
+@@ -177,6 +190,31 @@ pub(crate) fn check_hangs(&mut self, done: &mut Completions) -> Result {
+             return Ok(());
+         }
+         if fault {
++            // g16_recovery_tolerant: right after a resumed recovery the firmware may have
++            // aborted the oldest work without its normal receipt. Fail and quarantine that
++            // work as a passed abort (storage retained until reboot, never reused) and keep
++            // the device, a bounded number of times per recovery.
++            if params::recovery_tolerant()
++                && self.recovery.recoveries != 0
++                && now_ns().saturating_sub(self.recovery.resumed_ns) <= TOLERANT_WINDOW_NS
++                && self.recovery.tolerated < TOLERANT_MAX
++                && !self.engine.flights.is_empty()
++            {
++                self.recovery.tolerated += 1;
++                self.recovery.tolerated_total += 1;
++                if let Some(f) = self.engine.flights.first_mut() {
++                    f.doomed = true;
++                }
++                let outcome = self.retire_outcome(Retirement::Aborted);
++                self.retire_oldest(Retirement::Aborted, outcome, done);
++                dev_warn!(
++                    self.dev(),
++                    "M4 GPU receipt fault after recovery: oldest work failed and quarantined, device kept ({}/{})\n",
++                    self.recovery.tolerated,
++                    TOLERANT_MAX
++                );
++                return Ok(());
++            }
+             self.fail_stop(EIO, done);
+             return Err(EIO);
+         }
+@@ -382,6 +420,8 @@ fn recover(&mut self) -> Result {
+                     self.firmware_w32(logic::PHASE, 0)?;
+                     barrier();
+                     self.recovery.recoveries += 1;
++                    self.recovery.resumed_ns = now_ns();
++                    self.recovery.tolerated = 0;
+                     self.recovery.errors_seen = self.events.errors;
+                     self.recovery.statistics_seen = self.events.recovery_statistics;
+                     self.events.recovery_started_ns = None;
+-- 
+2.43.0
+

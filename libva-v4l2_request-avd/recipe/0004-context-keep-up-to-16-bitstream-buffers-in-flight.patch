@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 12 Nov 2026 22:25:39 +0000
+Subject: [PATCH] context: keep up to 16 bitstream buffers in flight
+
+The OUTPUT ring held 4 bitstream buffers, so at most three requests
+were queued while the next picture was being filled, and the fourth
+picture waited for the oldest one to be dequeued. The Apple Video
+Decoder's kernel driver keeps up to 16 frames in flight in the
+firmware's queue, one per frame-parameter slot, so a client that does
+not sync every picture (ffmpeg, GStreamer, a browser decoding ahead)
+left the decoder idle between pictures.
+
+Make the ring 16 buffers deep. The queued masks are 32 bits wide, and
+a decoder that keeps fewer frames in flight holds the extra requests in
+its own queue as before. Each buffer is still created at the decoder's
+sizeimage and grown on demand.
+
+The failure-cleanup model's capture-queue case now cycles one ring of
+synced surfaces twice instead of creating a surface per picture, so a
+16-deep ring stays inside the model's 32 CAPTURE indices.
+---
+ src/v4l2_request.h      | 2 +-
+ tests/failure-cleanup.c | 9 +++++++--
+ 2 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/src/v4l2_request.h b/src/v4l2_request.h
+index b14090b..a3d45d4 100644
+--- a/src/v4l2_request.h
++++ b/src/v4l2_request.h
+@@ -61,7 +61,7 @@ static inline uint64_t v4l2r_now_ns(void)
+ #define V4L2R_MAX_PIXELFORMATS		16
+ 
+ /* Number of OUTPUT (bitstream) buffers in the per-context circular queue. */
+-#define V4L2R_OUTPUT_BUFFERS		4
++#define V4L2R_OUTPUT_BUFFERS		16
+ /* Largest CAPTURE buffer count we can track in the queued bitmask. With a
+  * per-frame buffer pool the count reaches roughly the client's live surface
+  * count plus the pipeline depth, so keep headroom up to the 64-bit bitmask. */
+diff --git a/tests/failure-cleanup.c b/tests/failure-cleanup.c
+index a4c92a3..f3a8711 100644
+--- a/tests/failure-cleanup.c
++++ b/tests/failure-cleanup.c
+@@ -865,9 +865,14 @@ int main(int argc, char **argv)
+         armed = false; failed_surface(sid);
+         if (!strcmp(test, "capture-queue")) {
+             /* An idle request can be reinitialized. Exercise a full ring
+-             * twice: without release the stranded OUTPUT slot times out. */
++             * twice: without release the stranded OUTPUT slot times out.
++             * Each picture is synced, so one ring of surfaces is cycled
++             * twice and the model's 32 CAPTURE indices are not outgrown. */
++            VASurfaceID ring[V4L2R_OUTPUT_BUFFERS];
++            for (unsigned int n = 0; n < V4L2R_OUTPUT_BUFFERS; n++)
++                ring[n] = surface();
+             for (unsigned int n = 0; n < 2 * V4L2R_OUTPUT_BUFFERS; n++) {
+-                VASurfaceID next = surface();
++                VASurfaceID next = ring[n % V4L2R_OUTPUT_BUFFERS];
+                 assert(picture(id, next) == VA_STATUS_SUCCESS);
+                 assert(table.vaSyncSurface(&va, next) == VA_STATUS_SUCCESS);
+             }
+-- 
+2.43.0
+

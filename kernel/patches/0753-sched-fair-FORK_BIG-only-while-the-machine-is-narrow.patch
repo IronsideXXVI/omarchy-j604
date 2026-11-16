@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 23:32:06 +0000
+Subject: [PATCH] sched/fair: FORK_BIG only while the machine is
+ narrow; optional start lift
+
+FORK_BIG starts a new task on an idle CPU of the highest capacity. On the
+M4 MacBook Pro this brings a single unhinted memory copy thread from
+61-77 to 93-94.5 GB/s, but a 10-thread fixed-time CPU test lost 7 points
+with it, and the single-thread triad stayed at 72 GB/s against 96 with a
+uclamp_min hint on the same P cores.
+
+Apply FORK_BIG only while fewer tasks run than there are CPUs of the
+highest capacity, so a wide fork is spread by the usual slow path.
+
+Add the debugfs knob fork_big_lift (default 0; not a sched feature: the
+feature mask is full): a new task that starts on a CPU of the highest
+capacity it may use starts with that CPU's whole spare capacity as its
+utilization instead of half of it, so schedutil asks for the top clock
+at once instead of ramping over the task's first tens of milliseconds.
+
+FORK_BIG and fork_big_lift are both off by default.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ kernel/sched/debug.c |  1 +
+ kernel/sched/fair.c  | 37 ++++++++++++++++++++++++++++++++++++-
+ kernel/sched/sched.h |  1 +
+ 3 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 806d90e304..5f28fbaaff 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -730,6 +730,7 @@ static __init int sched_init_debug(void)
+ 	debugfs_create_u32("migration_cost_ns", 0644, debugfs_sched, &sysctl_sched_migration_cost);
+ 	debugfs_create_u32("nr_migrate", 0644, debugfs_sched, &sysctl_sched_nr_migrate);
+ 	debugfs_create_u32("misfit_runtime_ns", 0644, debugfs_sched, &sysctl_sched_misfit_runtime);
++	debugfs_create_u32("fork_big_lift", 0644, debugfs_sched, &sysctl_sched_fork_big_lift);
+ 
+ 	sched_domains_mutex_lock();
+ 	update_sched_domain_debugfs();
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 98d4719523..6e2a23137e 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -93,6 +93,14 @@ __read_mostly unsigned int sysctl_sched_migration_cost	= 500000UL;
+  */
+ __read_mostly unsigned int sysctl_sched_misfit_runtime	= 8000000UL;
+ 
++/*
++ * fork_big_lift: a new task that starts on a CPU of the highest capacity it
++ * may use starts with that CPU's spare capacity as its utilization, not half
++ * of it. (default: 0 = off; a debugfs knob, not a sched feature, because the
++ * feature mask is full)
++ */
++__read_mostly unsigned int sysctl_sched_fork_big_lift;
++
+ static int __init setup_sched_thermal_decay_shift(char *str)
+ {
+ 	pr_warn("Ignoring the deprecated sched_thermal_decay_shift= option\n");
+@@ -1404,6 +1412,16 @@ void post_init_entity_util_avg(struct task_struct *p)
+ 		}
+ 	}
+ 
++	/*
++	 * fork_big_lift: on a CPU of the highest capacity the task may use, start
++	 * from the CPU's whole spare capacity, so that the frequency governor
++	 * does not ramp a CPU-bound new task up over tens of milliseconds.
++	 */
++	if (READ_ONCE(sysctl_sched_fork_big_lift) && sched_asym_cpucap_active() && cap > 0 &&
++	    !(p->flags & PF_KTHREAD) &&
++	    cpu_scale == (long)p->max_allowed_capacity)
++		sa->util_avg = 2 * cap;
++
+ 	sa->runnable_avg = sa->util_avg;
+ }
+ 
+@@ -9986,12 +10004,29 @@ static int select_idle_biggest(struct task_struct *p)
+ 	return -1;
+ }
+ 
++/*
++ * Only while the machine is narrow: fewer tasks run than there are CPUs of
++ * the highest capacity. A wide fork (a pool of workers) is then spread by
++ * the usual slow path instead of being started on the big CPUs first.
++ */
++static bool fork_big_narrow(struct task_struct *p)
++{
++	unsigned int big = 0;
++	int cpu;
++
++	for_each_cpu_and(cpu, p->cpus_ptr, cpu_active_mask)
++		if (arch_scale_cpu_capacity(cpu) == p->max_allowed_capacity)
++			big++;
++	return nr_running() < big;
++}
++
+ static inline bool fork_big_candidate(struct task_struct *p, int wake_flags)
+ {
+ 	return (wake_flags & (WF_FORK | WF_EXEC)) && sched_feat(FORK_BIG) &&
+ 	       sched_asym_cpucap_active() && !(p->flags & PF_KTHREAD) &&
+ 	       !task_has_idle_policy(p) &&
+-	       uclamp_eff_value(p, UCLAMP_MAX) >= p->max_allowed_capacity;
++	       uclamp_eff_value(p, UCLAMP_MAX) >= p->max_allowed_capacity &&
++	       fork_big_narrow(p);
+ }
+ 
+ static int
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index a0b694dafa..8948249996 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -3159,6 +3159,7 @@ static inline void attach_one_task(struct rq *rq, struct task_struct *p)
+ extern __read_mostly unsigned int sysctl_sched_nr_migrate;
+ extern __read_mostly unsigned int sysctl_sched_migration_cost;
+ extern __read_mostly unsigned int sysctl_sched_misfit_runtime;
++extern __read_mostly unsigned int sysctl_sched_fork_big_lift;
+ 
+ extern unsigned int sysctl_sched_base_slice;
+ 
+-- 
+2.43.0
+
