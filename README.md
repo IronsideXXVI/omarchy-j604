@@ -100,12 +100,12 @@ Each line compares this machine under Omarchy with macOS on the same machine. PA
 | 50 | Storage: SD reader | PARITY (from the code) | 1.926 | - |
 | 51 | Keyboard + backlight | PARITY | - | - |
 | 52 | Trackpad + haptics | UNTESTED | 1.929 | - |
-| 53 | Sleep: asleep draw (deep sleep vs macOS sleep, 10 min) | UNTESTED (ours measured, macOS not measured yet) | 1.945 | ours 173-179 mW in deep sleep; the macOS number is not measured yet |
+| 53 | Sleep: asleep draw (deep sleep vs macOS sleep, 10 min) | UNTESTED (ours measured, macOS not measured yet) | 1.945 | ours 166 mW in deep sleep (160-171 mW over 600 s asleep, read from the battery charge counter); the macOS number is not measured yet |
 | 54 | Camera: open-to-first-frame + frame pacing | SHORT (cold first open) / BETTER (re-open, fw_keep_ms default-on in 1.940) / PARITY (30 fps pacing) | 1.940 | - |
 | 55 | Camera: formats + stills | PARITY (video) / BETTER (1080p60, default-on in 1.940) / SHORT (Desk View) | 1.940 | - |
 | 56 | Wake sources (keyboard / trackpad, lid, power button) | UNTESTED (armed) | 1.929 | armed in the kernel; only the RTC alarm wake is measured on deep sleep; lid, key and power-button wakes not tested (on the hands list) |
 | 57 | Input + sensors after a deep wake | PARITY (firmware side) / UNTESTED (typing, Touch ID) | 1.929 | - |
-| 58 | Wi-Fi idle power | SHORT (the Wi-Fi chip draws 2-4 times what macOS draws idle) | 1.945 | - |
+| 58 | Wi-Fi idle power | SHORT (the Wi-Fi chip draws 2-4 times what macOS draws idle) | 1.945 | idle desktop with power save off (the stock setting): 477 mW on the Wi-Fi rail against 118 mW on macOS; power save on with a 20 ms sleep return read 114 mW, with average ping 12.4 ms instead of 6.6; not shipped yet |
 
 <!-- front:parity:end -->
 
