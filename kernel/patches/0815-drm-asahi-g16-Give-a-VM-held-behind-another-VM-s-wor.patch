@@ -1,0 +1,327 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 17:11:22 +0000
+Subject: [PATCH] drm/asahi: g16: Give a VM held behind another VM's
+ work the next turn
+
+With g16_behind_initbm, a render of another VM is not published behind
+running renders. But publish() advances the queue's service turn before
+it tries the command, so the held queue counts as just served. The next
+pass picks the running VM's queue, whose command may still go behind its
+own flights, and the flights never drain while that client keeps work
+queued. A second client then waits for seconds, or for as long as the
+first one floods, and the compositor's first frame comes over a second
+late.
+
+Hold such a command in the publish loop before its turn advances, and
+remember its queue. While that queue waits and flights are running,
+publish nothing at all, whatever the queue priorities. When the flights
+have retired, publish that queue's command first if it is ready. Turns
+then alternate, as pick() serves the least recently served queue.
+
+A turn is a batch. With no queue waiting nothing changes and a client
+alone keeps its full depth. While a queue waits, the VM holding the
+engine may publish up to g16_vm_batch commands (default 8, one resident
+window, so a turn keeps its pipelining) within g16_vm_batch_us of its
+turn (default 2000), then nothing more until its flights retire. The
+waiting VM's wait is thus bounded by one batch and one drain. A waiting
+queue served later than its bound plus 20 ms is counted as a scheduler
+fault, independently of the other VM's publications.
+
+Use the same rule for compute behind another VM's compute under the new
+g16_compute_same_vm (default 0, runtime 0644). The rhorizon line ends
+"vmturn held/served/late/max_wait_us".
+
+Fixes: 7411f533c122 ("drm/asahi: g16: Keep InitBM and other VMs out from behind running renders")
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 118 +++++++++++++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/params.rs |  59 +++++++++++++-
+ drivers/gpu/drm/asahi/g16/poll.rs   |  13 ++-
+ 3 files changed, 185 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index e71cd4ad30..6e5d4174a8 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -439,6 +439,10 @@ pub(crate) struct Stats {
+     /// Why ready jobs stayed unpublished: both flights published, a channel record unconsumed,
+     /// no free slot.
+     pub(crate) hold: [u64; 3],
++    /// `vmturn:` fair turns between VMs: queues held for another VM's running flights, held
++    /// queues then served first, of those served later than the batch bound plus a drain
++    /// (a scheduler fault), and the longest wait in us.
++    pub(crate) vm_turn: [u64; 4],
+     /// `arrival:` per job the scheduler hands over: how many jobs of its queue the engine
+     /// already owned (published or pending, 15 = 15 or more), and the gap since the previous
+     /// arrival of any queue in 10 us bins (31 = 310 us or more). Diagnostic only.
+@@ -553,6 +557,16 @@ pub(crate) struct Engine {
+     pub(crate) frozen: bool,
+     /// Service turn counter for the least-recently-served pick.
+     pub(crate) turn: u64,
++    /// Fair turns between VMs: the queue whose next command waits for another VM's
++    /// running flights. While it is set and flights run, nothing is published.
++    pub(crate) vm_turn: Option<Arc<super::queue::QueueState>>,
++    /// When `vm_turn` was set (ns): the waiting queue's own wait.
++    pub(crate) vm_turn_since: u64,
++    /// The VM whose commands were published last, how many since its turn began, and when
++    /// its turn began (ns): its batch (`g16_vm_batch`, `g16_vm_batch_us`).
++    pub(crate) holder: Option<u64>,
++    pub(crate) holder_count: u32,
++    pub(crate) holder_start: u64,
+     /// The device's shared state, for the transport-error latch; set by the first poll or
+     /// submission.
+     pub(crate) shared: Option<Arc<Shared>>,
+@@ -610,6 +624,11 @@ pub(crate) fn new() -> Result<Self> {
+             retained: KVec::new(),
+             frozen: false,
+             turn: 0,
++            vm_turn: None,
++            vm_turn_since: 0,
++            holder: None,
++            holder_count: 0,
++            holder_start: 0,
+             shared: None,
+             ordinal: 0,
+             draw: 0,
+@@ -657,8 +676,16 @@ fn queue_published(&self, job: &Job) -> u32 {
+     /// `DRM_ASAHI_PRIORITY_REALTIME - priority` as `file.rs` passes it, so a smaller value
+     /// outranks.
+     fn pick(&self) -> Option<usize> {
++        self.pick_in(None)
++    }
++
++    /// [`Self::pick`] among the jobs of VM `vm` only, if one is given.
++    fn pick_in(&self, vm: Option<u64>) -> Option<usize> {
+         let mut best: Option<usize> = None;
+         for (i, job) in self.pending.iter().enumerate() {
++            if vm.is_some_and(|v| v != job.vm.id) {
++                continue;
++            }
+             // Exact per-command predecessors may retire before their entire job. Let the
+             // predecessor job advance rather than idling behind a waiting younger job.
+             if matches!(job.check_command_dependencies(job.progress.sent()), Err(e) if e == EAGAIN)
+@@ -963,6 +990,24 @@ pub(crate) fn enqueue(&mut self, job: Arc<Job>) -> Result {
+         Ok(())
+     }
+ 
++    /// Fair turns between VMs: whether `job` must wait because a running flight is of
++    /// another VM (`g16_behind_initbm` for render, `g16_compute_same_vm` for compute).
++    fn other_vm_running(&self, job: &Job) -> bool {
++        let on = match command(job, job.progress.sent()) {
++            Some(Command::Render(_)) => params::behind_initbm(),
++            _ => params::compute_same_vm(),
++        };
++        on && self.engine.flights.iter().any(|f| f.job.vm.id != job.vm.id)
++    }
++
++    /// Whether the VM holding the engine may still publish while another VM waits: its
++    /// batch since its turn began is below `g16_vm_batch` commands and `g16_vm_batch_us`.
++    fn batch_open(&self) -> bool {
++        self.engine.holder_count < params::vm_batch()
++            && now_ns().saturating_sub(self.engine.holder_start)
++                < u64::from(params::vm_batch_us()) * 1000
++    }
++
+     /// `g16_behind_initbm`: whether render `job` on unit `k` may go behind the running
+     /// flights: all of them are of its VM and unit `k` still leases a PB manager of that VM,
+     /// so no InitBM enters the TA ring behind running TA work.
+@@ -1087,7 +1132,7 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+             && !self.engine.frozen
+             && !self.engine.pending.is_empty()
+         {
+-            let Some(index) = self.engine.pick() else {
++            let Some(mut index) = self.engine.pick() else {
+                 let wait = self
+                     .engine
+                     .pending
+@@ -1098,7 +1143,71 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+                 }
+                 break;
+             };
++            // Fair turns between VMs, a batch each: once a queue waits for another VM's
++            // running flights, the VM holding the engine may finish its batch and then
++            // publishes nothing more, whatever the priorities, until its flights retire. The
++            // waiting queue then goes first if its next command is ready and starts its own
++            // batch. With no queue waiting nothing is bounded.
++            if let Some(q) = self.engine.vm_turn.clone() {
++                match self
++                    .engine
++                    .pending
++                    .iter()
++                    .position(|j| Arc::ptr_eq(&j.queue, &q))
++                {
++                    None => self.engine.vm_turn = None,
++                    Some(_) if !self.engine.flights.is_empty() => {
++                        let next = if self.batch_open() {
++                            self.engine.pick_in(self.engine.holder)
++                        } else {
++                            None
++                        };
++                        match next {
++                            Some(h) => index = h,
++                            None => {
++                                self.engine.stats.hold[0] += 1;
++                                break;
++                            }
++                        }
++                    }
++                    Some(i) => {
++                        // A waiting queue served later than its bound (the holder's batch time
++                        // plus a drain of up to RENDER_UNITS long commands) is a scheduler
++                        // fault: counted, never hidden by the other VM's publications.
++                        const DRAIN_US: u64 = 20_000;
++                        self.engine.vm_turn = None;
++                        let wait = now_ns().saturating_sub(self.engine.vm_turn_since) / 1000;
++                        let s = &mut self.engine.stats;
++                        s.vm_turn[1] += 1;
++                        s.vm_turn[3] = s.vm_turn[3].max(wait);
++                        if wait > u64::from(params::vm_batch_us()) + DRAIN_US {
++                            s.vm_turn[2] += 1;
++                        }
++                        let first = &self.engine.pending[i];
++                        if !matches!(
++                            first.check_command_dependencies(first.progress.sent()),
++                            Err(e) if e == EAGAIN
++                        ) {
++                            index = i;
++                        }
++                    }
++                }
++            }
+             let job = self.engine.pending[index].clone();
++            // Held before its queue's turn advances, so the held queue stays the least
++            // recently served one.
++            if !self.engine.flights.is_empty()
++                && job.vm.status.get() == 0
++                && self.other_vm_running(&job)
++            {
++                if self.engine.vm_turn.is_none() {
++                    self.engine.vm_turn = Some(job.queue.clone());
++                    self.engine.vm_turn_since = now_ns();
++                    self.engine.stats.vm_turn[0] += 1;
++                }
++                self.engine.stats.hold[0] += 1;
++                break;
++            }
+             // Even a failed job may have an earlier command in flight. An aggregate
+             // error fence must not race that command's access to user buffers: a job of
+             // a failed VM waits until nothing is in flight. Otherwise a render command may
+@@ -1180,6 +1289,13 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+             let own_prior = job.own_prior(job.progress.sent());
+             match self.publish_prefix(&job, done) {
+                 Ok(()) => {
++                    // A new VM on the engine begins its turn (its batch).
++                    if self.engine.holder != Some(job.vm.id) {
++                        self.engine.holder = Some(job.vm.id);
++                        self.engine.holder_count = 0;
++                        self.engine.holder_start = now_ns();
++                    }
++                    self.engine.holder_count = self.engine.holder_count.saturating_add(1);
+                     self.engine.stats.prior[usize::from(compute)][own_prior] += 1;
+                     // Stats: compute commands posted behind running flights, and the flights
+                     // they found (mean depth = ahead / behind).
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index f136fd4b52..4a547c2e91 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1893,7 +1893,9 @@ pub(crate) fn pb_reuse() -> bool {
+ 
+ /// Whether a render command goes behind running flights only when every running flight is
+ /// of its own VM and its unit still leases that VM's PB manager, so that no InitBM enters
+-/// the TA ring behind running TA work (1, default; 0: as `g16_resident` allows).
++/// the TA ring behind running TA work (1, default; 0: as `g16_resident` allows). A render
++/// held for another VM's flights stops all further publication until they retire, and is
++/// then published first (fair turns between VMs).
+ pub(crate) fn behind_initbm() -> bool {
+     BEHIND_INITBM.load(Ordering::Relaxed) != 0
+ }
+@@ -1904,7 +1906,60 @@ pub(crate) fn behind_initbm() -> bool {
+     BEHIND_INITBM_PARM,
+     BEHIND_INITBM,
+     "g16_behind_initbm",
+-    "G16: publish a render behind running renders only if they are all of its VM and its unit needs no new InitBM; otherwise it waits for them to retire (default 1; 0: as g16_resident allows; runtime 0644)"
++    "G16: publish a render behind running renders only if they are all of its VM and its unit needs no new InitBM; otherwise it waits for them to retire, nothing else is published meanwhile, and it goes first (default 1; 0: as g16_resident allows; runtime 0644)"
++);
++
++/// Storage of `g16_vm_batch` (runtime 0644, default 8).
++static VM_BATCH: AtomicU32 = AtomicU32::new(8);
++
++/// Commands the VM holding the engine may publish in its turn while another VM waits: 8 is
++/// one full resident window, so a turn keeps its pipelining (1..=64).
++pub(crate) fn vm_batch() -> u32 {
++    VM_BATCH.load(Ordering::Relaxed).clamp(1, 64)
++}
++
++live_u32_param!(
++    VM_BATCH_PARAM,
++    VM_BATCH_PARMTYPE,
++    VM_BATCH_PARM,
++    VM_BATCH,
++    "g16_vm_batch",
++    "G16: while another VM waits, the VM holding the engine publishes at most this many commands in its turn (default 8; 1..64; runtime 0644)"
++);
++
++/// Storage of `g16_vm_batch_us` (runtime 0644, default 2000).
++static VM_BATCH_US: AtomicU32 = AtomicU32::new(2000);
++
++/// Microseconds a turn may keep publishing while another VM waits (100..=100000).
++pub(crate) fn vm_batch_us() -> u32 {
++    VM_BATCH_US.load(Ordering::Relaxed).clamp(100, 100_000)
++}
++
++live_u32_param!(
++    VM_BATCH_US_PARAM,
++    VM_BATCH_US_PARMTYPE,
++    VM_BATCH_US_PARM,
++    VM_BATCH_US,
++    "g16_vm_batch_us",
++    "G16: while another VM waits, the VM holding the engine publishes only during this many us of its turn (default 2000; 100..100000; runtime 0644)"
++);
++
++/// Storage of `g16_compute_same_vm` (runtime 0644, default 0).
++static COMPUTE_SAME_VM: AtomicU32 = AtomicU32::new(0);
++
++/// Whether a compute command waits for running flights of another VM to retire, with the
++/// same fair turns as render under `g16_behind_initbm` (0, default: as g16_horizon allows).
++pub(crate) fn compute_same_vm() -> bool {
++    COMPUTE_SAME_VM.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    COMPUTE_SAME_VM_PARAM,
++    COMPUTE_SAME_VM_PARMTYPE,
++    COMPUTE_SAME_VM_PARM,
++    COMPUTE_SAME_VM,
++    "g16_compute_same_vm",
++    "G16: a compute command waits for running flights of another VM to retire, nothing else is published meanwhile, and it goes first (default 0: as g16_horizon allows; runtime 0644)"
+ );
+ 
+ /// Fragment-only dependency publication has not been qualified on this backend.
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 16a5c85873..87fd110216 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1618,8 +1618,17 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         )?;
+         writeln!(
+             f,
+-            "rhorizon: stop {}/{}/{}/{} behind {} ahead {}",
+-            s.rz_stop[0], s.rz_stop[1], s.rz_stop[2], s.rz_stop[3], s.rz_behind, s.rz_ahead
++            "rhorizon: stop {}/{}/{}/{} behind {} ahead {} vmturn {}/{}/{}/{}",
++            s.rz_stop[0],
++            s.rz_stop[1],
++            s.rz_stop[2],
++            s.rz_stop[3],
++            s.rz_behind,
++            s.rz_ahead,
++            s.vm_turn[0],
++            s.vm_turn[1],
++            s.vm_turn[2],
++            s.vm_turn[3]
+         )?;
+         writeln!(
+             f,
+-- 
+2.43.0
+

@@ -1236,3 +1236,10 @@ Kernel 1.997 keeps the base (`da8e1acf3656`) and all 797 patches of 1.990 under 
 Kernel 1.998 keeps the base (`da8e1acf3656`) and all 808 patches of 1.997 under the same numbers.
 
 New in 1.998 (0814 turns on 0809, the fix for a GPU stall; the other four are off by default or read-only): 0809 (`drm/asahi: g16: Keep InitBM and other VMs out from behind running renders`), 0810 (`drm/asahi: g16: Optionally re-poll sooner while work waits for a retirement`), 0811 (`drm/asahi: g16: Optionally take completed receipts when work is submitted`), 0812 (`drm/asahi: g16: Optionally write the tile-buffer sample size in the FS record`), 0813 (`drm/asahi: g16: Show the GFX power-state word in fwpower`), 0814 (`drm/asahi: g16: Keep other VMs out from behind running renders by default`).
+
+
+# Kernel patch numbers: 1.998 to 1.999
+
+Kernel 1.999 keeps the base (`da8e1acf3656`) and all 814 patches of 1.998 under the same numbers.
+
+New in 1.999 (0815, fair GPU turns between apps, is on by default; 0816 and 0817 are read-only; 0818 is off by default): 0815 (`drm/asahi: g16: Give a VM held behind another VM's work the next turn`), 0816 (`drm/asahi: g16: Show the coprocessor CPU status and ring activity`), 0817 (`drm/asahi: g16: Show the last render's tile-buffer words in the stats`), 0818 (`soc: apple: mcc: add a T8132 switch to replay macOS's controller setup`).

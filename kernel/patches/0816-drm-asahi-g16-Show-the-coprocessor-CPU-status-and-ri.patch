@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 16:18:41 +0000
+Subject: [PATCH] drm/asahi: g16: Show the coprocessor CPU status and
+ ring activity
+
+With the firmware reporting its GPU powered down and none of the
+host's idle activity running, the GPU power domain can still stay
+fully on. What is left to tell apart is whether the GPU coprocessor's
+own CPU ever reaches WFI, and whether the firmware keeps writing
+records to the host while it claims to be idle.
+
+Add both to aurora-g16/fwpower: `cpu`, the ASC CPU status word (the
+word after the control word: bit 5 idle, bit 1 stopped), read through
+a second read-only mapping of the ASC page; and `rx`, the producer
+indices of the event ring, the nine log sub-rings (summed), ktrace and
+the statistics ring. Nothing is written. Reading `cpu` reaches the GPU
+block itself, so a measurement of the domain's idle share should read
+the file slowly.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/poll.rs | 34 ++++++++++++++++++++++++++++---
+ drivers/gpu/drm/asahi/g16/regs.rs | 14 +++++++++++++
+ 2 files changed, 45 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 87fd110216..632beb58dc 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -95,6 +95,10 @@ pub(crate) struct FwPower {
+     private: Option<super::regs::Mapping>,
+     /// The GPU device, for the PMGR GFX power-state word (`ps`).
+     dev: kernel::sync::aref::ARef<kernel::device::Device>,
++    /// A second read-only view of the ASC page, for the CPU status word (`cpu`).
++    asc: Option<super::regs::Mapping>,
++    /// The event, log (nine sub-rings 0x30 apart), ktrace and statistics ring states (`rx`).
++    rx: [Arc<FwObject>; 4],
+ }
+ 
+ /// The loaded DATA segment starts at firmware VA 0x60000 (the boot owner writes the loader
+@@ -125,7 +129,10 @@ pub(crate) struct FwPower {
+ /// power budget +0xaf0). `ps`: the GFX domain's PMGR power-state word, read through the PMGR
+ /// regmap (bit 28 automatic power management, 27:24 its lowest state, 11 busy, 9:8 sticky history,
+ /// 7:4 actual, 3:0 target); `0xdeadbeef` when it can't be read. `t` is the architectural counter
+-/// at the read.
++/// at the read. `cpu`: the ASC CPU status word (asc +0x48): bit 5 idle (the CPU in WFI), bit 1
++/// stopped; the read itself reaches the GPU block, so read the file slowly while the domain's idle
++/// share is measured. `rx`: the producer indices of the event ring, the nine log sub-rings
++/// (summed), ktrace and statistics; any of them moving at idle means the firmware writes records.
+ fn fwpower_show(v: &FwPower, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+     let [pp, power, control, globals] = &v.objects;
+     let r = |o: &FwObject, at: usize| o.r32(at).unwrap_or(0xdead_beef);
+@@ -147,6 +154,12 @@ fn fwpower_show(v: &FwPower, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+     let b = |o: usize| p(0x14_5c48 + o);
+     let q2 = (b(0) | b(8) | b(0x10) | b(0x18)) | (b(0x60) & b(0x110)) | (b(0x68) & b(0x118));
+     let ps = super::boot::glue::power_domain_state(&v.dev).map_or(0xdead_beef, |(_, w)| w);
++    let cpu = v.asc.as_ref().map_or(0xdead_beef, |m| {
++        kernel::io::Io::try_read32(m.io(), super::regs::ASC_STATUS).unwrap_or(0xdead_beef)
++    });
++    let [rx_event, rx_log, rx_trace, rx_stats] = &v.rx;
++    let produced = |o: &FwObject, at: usize| r(o, at + super::fw::channels::STATE_WRITE);
++    let logs = (0..9).fold(0u32, |n, i| n.wrapping_add(produced(rx_log, i * 0x30)));
+     let pending = v
+         .rings
+         .iter()
+@@ -159,7 +172,7 @@ fn fwpower_show(v: &FwPower, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+          retries {} defer {} defer_t {} seq {} veto {} req {} hi {} \
+          ctl {:#x}/{:#x}/{:#x}/{:#x}/{:#x} g {}/{}/{}/{}/{} rings {:#x} \
+          fw {:#x}/{:#x}/{:#x}/{:#x} st {:#x} ipo {:#x} q {:#x}/{:#x} \
+-         floor {}/{} cap {}/{} ps {:#x}",
++         floor {}/{} cap {}/{} ps {:#x} cpu {:#x} rx {}/{}/{}/{}",
+         counter_ticks(),
+         r(pp, 0x10),
+         r(pp, 0xc),
+@@ -199,7 +212,12 @@ fn fwpower_show(v: &FwPower, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         r(pp, 0x40),
+         r(pp, 0x44),
+         r(pp, 0x48),
+-        ps
++        ps,
++        cpu,
++        produced(rx_event, 0),
++        logs,
++        produced(rx_trace, 0),
++        produced(rx_stats, 0)
+     )
+ }
+ 
+@@ -469,6 +487,14 @@ pub(crate) fn start_engine(self: &Arc<Self>) -> Result {
+             rings.push(ring.state.clone(), GFP_KERNEL)?;
+         }
+         rings.push(firmware.channels.devctl.state.clone(), GFP_KERNEL)?;
++        let rx = [
++            firmware.channels.event.state.clone(),
++            firmware.channels.log.state.clone(),
++            firmware.channels.trace.state.clone(),
++            firmware.channels.stats.state.clone(),
++        ];
++        // Read only; without the view the `cpu` field prints 0xdeadbeef.
++        let asc = firmware.session.regs.asc_view().ok();
+         let data = firmware.session.adt.data.clone();
+         drop(state);
+         // Read only; a DATA segment too small for the view leaves the `fw` fields at all ones.
+@@ -485,6 +511,8 @@ pub(crate) fn start_engine(self: &Arc<Self>) -> Result {
+                 rings,
+                 private,
+                 dev: self.dev.clone(),
++                asc,
++                rx,
+             };
+             let file = KBox::pin_init(
+                 dir.read_callback_file(c_str!("fwpower"), view, &fwpower_show),
+diff --git a/drivers/gpu/drm/asahi/g16/regs.rs b/drivers/gpu/drm/asahi/g16/regs.rs
+index fc09250a53..ec09e0c26b 100644
+--- a/drivers/gpu/drm/asahi/g16/regs.rs
++++ b/drivers/gpu/drm/asahi/g16/regs.rs
+@@ -175,6 +175,8 @@ pub(crate) struct Regs {
+     pub(crate) res: G16Resources,
+     /// ASC control (`asc`, 0x4000).
+     asc: Mapping,
++    /// Whether `asc` is a non-posted resource (for [`Regs::asc_view`]).
++    asc_np: bool,
+     /// SGX status window (`sgx + 0xc000`, 0x4000).
+     status: Mapping,
+     /// Host-owned generation register page (SGX +0xd60000).
+@@ -197,8 +199,13 @@ pub(crate) fn new(pdev: &platform::Device<Core<'_>>, res: G16Resources) -> Resul
+             }
+             Mapping::device(r.start() + offset, WINDOW, nonposted)
+         };
++        let asc_np = pdev.resource_by_name(c_str!("asc")).is_some_and(|r| {
++            r.flags()
++                .contains(kernel::io::resource::Flags::IORESOURCE_MEM_NONPOSTED)
++        });
+         Ok(Self {
+             asc: window(c_str!("asc"), 0)?,
++            asc_np,
+             status: window(c_str!("sgx"), SGX_STATUS as u64)?,
+             generation: window(c_str!("sgx"), 0xd60000)?,
+             generation_mirror: window(c_str!("sgx"), 0xd64000)?,
+@@ -257,6 +264,11 @@ pub(crate) fn set_generation(&self, value: u32) -> Result {
+         Ok(())
+     }
+ 
++    /// A second, read-only view of the first ASC page, for diagnostics (fwpower `cpu`).
++    pub(crate) fn asc_view(&self) -> Result<Mapping> {
++        Mapping::device(self.asc.phys, 0x1000, self.asc_np)
++    }
++
+     /// ASC control word (`asc + 0x44`).
+     pub(crate) fn asc_control(&self) -> Result<u32> {
+         self.asc.io().try_read32(ASC_CONTROL)
+@@ -302,3 +314,5 @@ pub(crate) fn engine_state(&self) -> Result<EngineState> {
+ pub(crate) const SGX_STATUS: usize = 0xc000;
+ pub(crate) const ASC_CONTROL: usize = 0x44;
+ pub(crate) const ASC_RUN: u32 = 1 << 4;
++/// ASC CPU status, the word after the control word: bit 5 idle (the CPU in WFI), bit 1 stopped.
++pub(crate) const ASC_STATUS: usize = ASC_CONTROL + 4;
+-- 
+2.43.0
+

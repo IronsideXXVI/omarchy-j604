@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 16:34:19 +0000
+Subject: [PATCH] drm/asahi: g16: Show the last render's tile-buffer
+ words in the stats
+
+render.heavy runs its fragment stage at two thirds of the macOS rate
+at the same clock. How many tiles a core keeps in flight is set by
+the FS record's tile-buffer words, which come from the submission:
+the tilebuffer control (blocks per tile from the sample size, the
+utile size and the samples), the tile mode, the ISP control, the ZLS
+control and the PPP multisample control.
+
+Add a stats line, fswords:, with those words for the last render
+published, so a hold can record what a bench actually sends and
+compare it word for word with a capture of the same bench on macOS.
+
+The line only reads values the command already carries. Nothing is
+written to the GPU and no behaviour changes, so no switch.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 10 ++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 38 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 6e5d4174a8..d1ac8923d5 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1871,6 +1871,16 @@ fn prefix_render(
+         let p = &job.resources.render()?.passes[k];
+         let pass = p.refs();
+         let geometry = Geometry::new(&cmd.cmd, pass.heap_gva);
++        super::poll::note_fs_words([
++            u64::from(geometry.tilebuffer_control),
++            u64::from(geometry.tile_mode),
++            u64::from(geometry.isp_control),
++            u64::from(geometry.utile_config),
++            u64::from(cmd.cmd.sample_size_B) | u64::from(cmd.cmd.samples) << 8,
++            cmd.cmd.zls_ctrl,
++            cmd.cmd.ppp_multisamplectl,
++            u64::from(cmd.cmd.width_px) | u64::from(cmd.cmd.height_px) << 16,
++        ]);
+         geometry.validate_capacity(p.tpc.size as u64, p.tilemap.size as u64)?;
+         job.resources
+             .render()?
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 632beb58dc..442f4ecc74 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -44,6 +44,19 @@
+ pub(crate) const TAIL_WINDOW_NS: u64 = 300_000;
+ /// End of the current `g16_tail_us` window (`now_ns()`), 0 for none.
+ static TAIL_UNTIL_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
++/// The tile-buffer words of the last render published, for the stats line `fswords:`: the
++/// FS record's tilebuffer control, tile mode and ISP control, the utile config, sample size
++/// and samples, ZLS control, PPP multisample control and the framebuffer size.
++static FS_WORDS: [core::sync::atomic::AtomicU64; 8] =
++    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
++
++/// Records the tile-buffer words of the render being published (`fswords:`). Read only:
++/// nothing reads them back into a command.
++pub(crate) fn note_fs_words(words: [u64; 8]) {
++    for (cell, word) in FS_WORDS.iter().zip(words) {
++        cell.store(word, Ordering::Relaxed);
++    }
++}
+ /// Counter time of the last poll pass that read stage events from the event ring, and that time
+ /// as it stood when the previous render command retired (profiling only, `g16_prof`).
+ pub(crate) static LAST_EVENT_READ: core::sync::atomic::AtomicU64 =
+@@ -1500,6 +1513,21 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             busy(9)
+         )?;
+         writeln!(f, "render_chain: chained {}", RENDER_CHAINED.load(Ordering::Relaxed))?;
++        let w: [u64; 8] = core::array::from_fn(|i| FS_WORDS[i].load(Ordering::Relaxed));
++        writeln!(
++            f,
++            "fswords: tib {:#x} tile_mode {:#x} isp {:#x} utile {:#x} sample_size_B {} samples {} zls {:#x} ppp_ms {:#x} size {}x{}",
++            w[0],
++            w[1],
++            w[2],
++            w[3],
++            w[4] & 0xff,
++            w[4] >> 8,
++            w[5],
++            w[6],
++            w[7] & 0xffff,
++            w[7] >> 16
++        )?;
+         write!(f, "render_tail: after_read_10us")?;
+         for b in RENDER_TAIL.iter().take(16) {
+             write!(f, " {}", b.load(Ordering::Relaxed))?;
+-- 
+2.43.0
+
