@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 23:00:17 +0000
+Subject: [PATCH] drm/asahi: g16: Stop a fail-stopped firmware at the
+ commit before a revive
+
+g16_revive warm-restarted a fail-stopped GPU after a real wake, but the
+sleep that preceded the wake took the crashed branch of sleep_down(),
+which only lowers the domain. The firmware was never stopped at the
+commit as every other sleep stops it, and the warm handshake after the
+wake timed out: on the J604 "revive failed (ETIME)" after a test
+fail-stop and one deep sleep.
+
+With g16_revive set and a fail-stop from a host-side timeout (ETIMEDOUT
+or ETIME, the firmware itself not reported crashed), leave the stop to
+the commit as any sleep does. If that cannot be arranged, lower the
+domain as before; the sleep is never refused. After a real wake, revive
+only a firmware the commit stopped; otherwise count a failed revive and
+leave the device failed.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/sleep.rs | 38 ++++++++++++++++++++++++++----
+ 1 file changed, 33 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/sleep.rs b/drivers/gpu/drm/asahi/g16/sleep.rs
+index 838bd5f63e..e693ae090c 100644
+--- a/drivers/gpu/drm/asahi/g16/sleep.rs
++++ b/drivers/gpu/drm/asahi/g16/sleep.rs
+@@ -170,6 +170,13 @@ fn wait_quiet(self: &Arc<Self>, deadline: u64) -> Result {
+     }
+ 
+     /// Leaves the stop to the sleep's commit. False, with the reason logged, if it can't be.
++    /// Whether the latched fail-stop is a host-side timeout (a submission or wake that timed
++    /// out), after which the firmware itself may still be stopped and warm-restarted.
++    fn revivable(&self) -> bool {
++        let error = self.error.load(Ordering::Acquire);
++        error == ETIMEDOUT.to_errno() || error == ETIME.to_errno()
++    }
++
+     fn leave_for_commit(&self, firmware: &mut Firmware) -> bool {
+         // SAFETY: `dev` is the live GPU device. The RTKit handle lasts until reboot, and
+         // `.complete` frees the result.
+@@ -215,10 +222,22 @@ fn sleep_down(self: &Arc<Self>) -> Result {
+             return Ok(());
+         }
+         if self.crashed.load(Ordering::Acquire) {
+-            // Nothing to save: the domain only has to be off for the sleep.
+             self.sleeping.store(true, Ordering::Release);
+             self.join_workers();
+-            self.lower_domain();
++            // g16_revive: a host-side timeout left the firmware alive, so stop it at the commit as
++            // any sleep does; the warm restart after the wake needs that stop. Otherwise (or if
++            // the stop cannot be left to the commit) nothing to save: the domain only has to be
++            // off for the sleep. The sleep is never refused here.
++            let left = params::revive() && self.revivable() && {
++                let mut state = self.state.lock();
++                match state.as_deref_mut() {
++                    Some(firmware) => self.leave_for_commit(firmware),
++                    None => false,
++                }
++            };
++            if !left {
++                self.lower_domain();
++            }
+             return Ok(());
+         }
+         self.wait_quiet(now_ns().saturating_add(DRAIN_NS))?;
+@@ -406,7 +425,8 @@ fn sleep_complete(&self) {
+         }
+         // SAFETY: Reads a global flag word.
+         let real = unsafe { bindings::pm_resume_via_firmware() };
+-        if self.shared.sleep_commit_finish() == Some(false) && !real {
++        let stopped = self.shared.sleep_commit_finish();
++        if stopped == Some(false) && !real {
+             dev_info!(
+                 self.shared.dev.as_ref(),
+                 "sleep ended before its commit (refused elsewhere): GPU firmware left running\n"
+@@ -419,8 +439,16 @@ fn sleep_complete(&self) {
+             return;
+         }
+         if real && params::revive() && self.shared.crashed.load(Ordering::Acquire) {
+-            let _ = self.shared.revive_up();
+-            return;
++            // Only a firmware the commit stopped restarts warm; otherwise it stays failed.
++            if stopped == Some(true) {
++                let _ = self.shared.revive_up();
++                return;
++            }
++            REVIVE_STATS[1].fetch_add(1, Ordering::Relaxed);
++            dev_err!(
++                self.shared.dev.as_ref(),
++                "G16: no revive: the firmware was not stopped at the commit; GPU unusable until reboot\n"
++            );
+         }
+         let _ = self.shared.sleep_up();
+     }
+-- 
+2.43.0
+
