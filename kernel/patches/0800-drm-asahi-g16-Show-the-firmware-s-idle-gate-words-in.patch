@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 13:10:42 +0000
+Subject: [PATCH] drm/asahi: g16: Show the firmware's idle gate words
+ in fwpower
+
+Before it takes its idle decision the firmware also checks words that
+live only in its own loaded DATA segment: the scheduler and power
+thread event words, a gate word whose bit 6 blocks the decision, its
+private copy of the idle power-off policy, and per-queue busy bitmaps.
+If one of them never clears, the GPU stays powered with every ring
+drained and nothing in flight, and none of the host-visible objects
+shows why.
+
+The host already writes the loader table into that segment, so its
+layout relative to the firmware's addresses is known. Map the part of
+it that holds these words read-only and add them to
+aurora-g16/fwpower, together with the reason and value of the
+performance floor and ceiling the firmware chose last, so a GPU that
+runs below its top state under load names the limit that holds it.
+A value the firmware still holds in its own cache can read late; the
+line is a diagnostic, nothing is written.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/poll.rs | 70 ++++++++++++++++++++++++++++---
+ 1 file changed, 65 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 0b53df2965..f25a4eebbf 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -76,8 +76,18 @@ pub(crate) struct FwPower {
+     /// The 12 submit channel states and the device-control state: before it raises its idle
+     /// decision the firmware requires READ (+0x0) == WRITE (+0x20) on every one (0x908c, 0x9208).
+     rings: KVec<Arc<FwObject>>,
++    /// A read-only view of the loaded firmware DATA segment from the firmware VA
++    /// [`PRIVATE_VA`] on: the words the firmware's idle decision tests (25G83 b000).
++    private: Option<super::regs::Mapping>,
+ }
+ 
++/// The loaded DATA segment starts at firmware VA 0x60000 (the boot owner writes the loader
++/// table at DATA + 0x1332f0, which the firmware reads at VA 0x1932f0). The view starts at
++/// VA 0x145000 and ends after VA 0x192e00.
++const PRIVATE_VA: usize = 0x14_5000;
++const PRIVATE_DATA_OFFSET: u64 = 0x14_5000 - 0x6_0000;
++const PRIVATE_SIZE: usize = 0x4_e000;
++
+ /// The `aurora-g16/fwpower` file: one line per read.
+ ///
+ /// POWER_PERFORMANCE: `state` +0x10 (the firmware power state; 4 = powered down), `mode` +0xc,
+@@ -88,12 +98,35 @@ pub(crate) struct FwPower {
+ /// +0x538, `req` +0x664, `hi` +0x66c. Control: +0x8/+0x10/+0x14/+0x18/+0x1c. Globals: +0x30
+ /// idle power-off, +0x34, +0x78, +0x7c, +0x80 (the kick tally the firmware compares before it
+ /// powers down). `rings`: bit i set while submit channel i has READ != WRITE (bit 12: the
+-/// device-control ring), the firmware's own "work pending" test. `t` is the architectural
+-/// counter at the read.
++/// device-control ring), the firmware's own "work pending" test. `fw`: the firmware's own words
++/// (DATA, read through a host mapping, so a value still in the firmware's cache can read late):
++/// the two scheduler event words (VA 0x192898, 0x192908) and the power thread's (0x192998,
++/// deferred set 0x1929a8), the gate word 0x192900 (bit 6 set: no idle decision), its private
++/// idle power-off word 0x192de0, and `q` = the two queue-busy terms of its work-pending test
++/// (0x9208 over the bitmaps at 0x145c38). `floor` / `cap`: the reason code and value (state x 100)
++/// of the performance floor and ceiling the firmware chose last (POWER_PERFORMANCE +0x3c/+0x40,
++/// +0x44/+0x48, written by 0x1605c: 2, 3, 4, 8, 0x10, 0xc name the limiter that binds; 8 is the
++/// power budget +0xaf0). `t` is the architectural counter at the read.
+ fn fwpower_show(v: &FwPower, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+     let [pp, power, control, globals] = &v.objects;
+     let r = |o: &FwObject, at: usize| o.r32(at).unwrap_or(0xdead_beef);
+     let r64 = |o: &FwObject, at: usize| u64::from(r(o, at)) | (u64::from(r(o, at + 4)) << 32);
++    let p = |va: usize| -> u64 {
++        let Some(m) = v.private.as_ref() else {
++            return u64::MAX;
++        };
++        let at = va - PRIVATE_VA;
++        let rd = |o: usize| kernel::io::Io::try_read32(m.io(), o);
++        match (rd(at), rd(at + 4)) {
++            (Ok(lo), Ok(hi)) => u64::from(lo) | (u64::from(hi) << 32),
++            _ => u64::MAX,
++        }
++    };
++    let a = |o: usize| p(0x14_5c38 + o);
++    let q1 = ((a(0x60) | a(0x70) | a(0x80)) & (a(0) | a(0x30)))
++        | ((a(0x68) | a(0x78) | a(0x88)) & (a(8) | a(0x38)));
++    let b = |o: usize| p(0x14_5c48 + o);
++    let q2 = (b(0) | b(8) | b(0x10) | b(0x18)) | (b(0x60) & b(0x110)) | (b(0x68) & b(0x118));
+     let pending = v
+         .rings
+         .iter()
+@@ -104,7 +137,9 @@ fn fwpower_show(v: &FwPower, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         f,
+         "fwpower: t {} state {} mode {} pstate {} act {} tgt {} level {} sub {} retry {} \
+          retries {} defer {} defer_t {} seq {} veto {} req {} hi {} \
+-         ctl {:#x}/{:#x}/{:#x}/{:#x}/{:#x} g {}/{}/{}/{}/{} rings {:#x}",
++         ctl {:#x}/{:#x}/{:#x}/{:#x}/{:#x} g {}/{}/{}/{}/{} rings {:#x} \
++         fw {:#x}/{:#x}/{:#x}/{:#x} st {:#x} ipo {:#x} q {:#x}/{:#x} \
++         floor {}/{} cap {}/{}",
+         counter_ticks(),
+         r(pp, 0x10),
+         r(pp, 0xc),
+@@ -131,7 +166,19 @@ fn fwpower_show(v: &FwPower, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         r(globals, 0x78),
+         r(globals, 0x7c),
+         r(globals, 0x80),
+-        pending
++        pending,
++        p(0x19_2898),
++        p(0x19_2908),
++        p(0x19_2998),
++        p(0x19_29a8),
++        p(0x19_2900) & 0xffff_ffff,
++        p(0x19_2de0) & 0xffff_ffff,
++        q1,
++        q2,
++        r(pp, 0x3c),
++        r(pp, 0x40),
++        r(pp, 0x44),
++        r(pp, 0x48)
+     )
+ }
+ 
+@@ -387,9 +434,22 @@ pub(crate) fn start_engine(self: &Arc<Self>) -> Result {
+             rings.push(ring.state.clone(), GFP_KERNEL)?;
+         }
+         rings.push(firmware.channels.devctl.state.clone(), GFP_KERNEL)?;
++        let data = firmware.session.adt.data.clone();
+         drop(state);
++        // Read only; a DATA segment too small for the view leaves the `fw` fields at all ones.
++        let fits = data.end.saturating_sub(data.start) >= PRIVATE_DATA_OFFSET + PRIVATE_SIZE as u64;
++        let private = if fits {
++            let at = data.start + PRIVATE_DATA_OFFSET;
++            super::regs::Mapping::write_combined(at, PRIVATE_SIZE).ok()
++        } else {
++            None
++        };
+         if let Some(objects) = objects {
+-            let view = FwPower { objects, rings };
++            let view = FwPower {
++                objects,
++                rings,
++                private,
++            };
+             let file = KBox::pin_init(
+                 dir.read_callback_file(c_str!("fwpower"), view, &fwpower_show),
+                 GFP_KERNEL,
+-- 
+2.43.0
+

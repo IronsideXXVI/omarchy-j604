@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 13:18:29 +0000
+Subject: [PATCH] drm/asahi: g16: Count when slow render starts follow
+ the host's event read
+
+About one in nine render commands queued behind running work starts
+some 300 us after the previous command ended, while most start within
+20 us. Whether those slow starts wait for the host to read the
+previous command's stage events cannot be told from the existing gap
+histogram.
+
+While profiling is on (g16_prof or debug bit 49), remember when a poll
+pass last read stage events from the event ring and, at each render
+retirement, the read that preceded it. For every queued render that
+starts 100 us or more after the previous end, count the time from that
+read to its start in 10 us bins, or whether it started before it. The
+counts are printed as a "render_tail:" line in the stats file. With
+profiling off nothing is recorded.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/channel.rs | 13 +++++++++-
+ drivers/gpu/drm/asahi/g16/poll.rs    | 37 ++++++++++++++++++++++++++++
+ 2 files changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/channel.rs b/drivers/gpu/drm/asahi/g16/channel.rs
+index c204c61b48..97e0e8ad28 100644
+--- a/drivers/gpu/drm/asahi/g16/channel.rs
++++ b/drivers/gpu/drm/asahi/g16/channel.rs
+@@ -398,7 +398,18 @@ pub(crate) fn drain_rings(&mut self) -> Result {
+     /// Drains the event ring only (retirement's loop).
+     pub(crate) fn drain_events(&mut self) -> Result {
+         let dev = self.session.dev.clone();
+-        self.channels.drain_events(&dev, &mut self.events)
++        let before = self.events.stage_events;
++        let result = self.channels.drain_events(&dev, &mut self.events);
++        if self.events.stage_events != before
++            && (crate::debug::debug_enabled(crate::debug::DebugFlags::Debug1)
++                || super::params::prof())
++        {
++            super::poll::LAST_EVENT_READ.store(
++                super::engine::counter_ticks(),
++                core::sync::atomic::Ordering::Relaxed,
++            );
++        }
++        result
+     }
+ 
+     /// Drains log, ktrace and statistics (after retirement).
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index f25a4eebbf..c76186de59 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -44,6 +44,16 @@
+ pub(crate) const TAIL_WINDOW_NS: u64 = 300_000;
+ /// End of the current `g16_tail_us` window (`now_ns()`), 0 for none.
+ static TAIL_UNTIL_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
++/// Counter time of the last poll pass that read stage events from the event ring, and that time
++/// as it stood when the previous render command retired (profiling only, `g16_prof`).
++pub(crate) static LAST_EVENT_READ: core::sync::atomic::AtomicU64 =
++    core::sync::atomic::AtomicU64::new(0);
++static RENDER_PREV_READ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
++/// Render commands queued behind work whose start came 100 us or more after the previous command's
++/// end: bins 0-15 = 10 us steps from the host's event read that preceded the previous retirement to
++/// this start, 16 = started before that read, 17 = no read recorded.
++static RENDER_TAIL: [core::sync::atomic::AtomicU64; 18] =
++    [const { core::sync::atomic::AtomicU64::new(0) }; 18];
+ /// Poll passes with work in flight, by the firmware's running performance state (rows S0-S9),
+ /// counted only while profiling is on (`g16_prof`); the row frequencies are in the boot log.
+ static PSTATE_BUSY: [core::sync::atomic::AtomicU64; 10] =
+@@ -1218,6 +1228,8 @@ fn stat_retire(&mut self, f: &Flight) {
+                 }
+                 let c = usize::from(kind != 0);
+                 let prev = s.chain_prev_end[c];
++                let prof_on = crate::debug::debug_enabled(crate::debug::DebugFlags::Debug1)
++                    || params::prof();
+                 if prev != 0 {
+                     if f.published_ticks < prev {
+                         s.chain_ahead_n[c] += 1;
+@@ -1228,6 +1240,17 @@ fn stat_retire(&mut self, f: &Flight) {
+                             let gap = ns(lo_c - prev);
+                             s.chain_ahead_ns[c] = s.chain_ahead_ns[c].saturating_add(gap);
+                             s.chain_ahead_hist[c][((gap / 10_000) as usize).min(31)] += 1;
++                            if c == 1 && gap >= 100_000 && prof_on {
++                                let read = RENDER_PREV_READ.load(Ordering::Relaxed);
++                                let bin = if read == 0 {
++                                    17
++                                } else if lo_c < read {
++                                    16
++                                } else {
++                                    ((ns(lo_c - read) / 10_000) as usize).min(15)
++                                };
++                                RENDER_TAIL[bin].fetch_add(1, Ordering::Relaxed);
++                            }
+                         }
+                     } else if lo_c >= prev {
+                         s.chain_serial_n[c] += 1;
+@@ -1235,6 +1258,10 @@ fn stat_retire(&mut self, f: &Flight) {
+                     }
+                 }
+                 s.chain_prev_end[c] = s.chain_prev_end[c].max(hi_c);
++                if c == 1 && prof_on {
++                    let read = LAST_EVENT_READ.load(Ordering::Relaxed);
++                    RENDER_PREV_READ.store(read, Ordering::Relaxed);
++                }
+                 s.lat_n += 1;
+                 s.start_hist[usize::from(kind != 0)][((start / 10_000) as usize).min(31)] += 1;
+                 let (p200, p1ms) = (hz / 5000, hz / 1000);
+@@ -1396,6 +1423,16 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             busy(8),
+             busy(9)
+         )?;
++        write!(f, "render_tail: after_read_10us")?;
++        for b in RENDER_TAIL.iter().take(16) {
++            write!(f, " {}", b.load(Ordering::Relaxed))?;
++        }
++        writeln!(
++            f,
++            " before_read {} no_read {}",
++            RENDER_TAIL[16].load(Ordering::Relaxed),
++            RENDER_TAIL[17].load(Ordering::Relaxed)
++        )?;
+         writeln!(
+             f,
+             "idle_selector: param {:?} selected {} selects {}",
+-- 
+2.43.0
+

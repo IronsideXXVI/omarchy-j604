@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 14:01:07 +0000
+Subject: [PATCH] nvme-apple: optionally keep the final shutdown
+ notification's result
+
+The final shutdown notification is printed after the journal has
+stopped, and the kernel log does not survive the reset, so a reboot
+test cannot read how long the controller took to complete it.
+
+With shn_record set, the final shutdown writes two bytes to the nvmem
+cell "shn-record", which the J604 maps to two free bytes of PMU
+scratch that are kept across the reset: whether the notification
+completed, and its time in 32 ms steps (512 ms above 8 s). The next
+boot prints them 30 s after probe, so that the PMU's nvmem provider
+has bound, and clears them. The record is read on every boot, as the
+boot that wrote it may have set the parameter at run time; nothing is
+written unless the parameter was set or a record was found. The
+reboot notifiers that clear the boot crumbs run before device
+shutdown, so they do not clear it.
+
+Default off.
+
+Assisted-by: LLM
+---
+ arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi |  9 ++
+ drivers/nvme/host/apple.c                     | 82 ++++++++++++++++++-
+ 2 files changed, 90 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi b/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
+index 416aa11b96..caf6f20bc6 100644
+--- a/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
++++ b/arch/arm64/boot/dts/apple/t8132-j604-lab.dtsi
+@@ -230,6 +230,13 @@ shutdown_flag: shutdown-flag@f80f,3 {
+ 					reg = <0xf80f 0x01>;
+ 					bits = <0x03 0x01>;
+ 				};
++				/*
++				 * The NVMe final shutdown notification: its result and time, for
++				 * the next boot to print; only with nvme_apple.shn_record=1.
++				 */
++				nvme_shn_record: nvme-shn-record@f81c {
++					reg = <0xf81c 0x02>;
++				};
+ 			};
+ 		};
+ 	};
+@@ -260,6 +267,8 @@ nvme: nvme@4c5cc0000 {
+ 		power-domain-names = "ans", "apcie0";
+ 		resets = <&ps_ans>;
+ 		apple,sart = <&sart>;
++		nvmem-cells = <&nvme_shn_record>;
++		nvmem-cell-names = "shn-record";
+ 		status = "okay";
+ 	};
+ 	cpu_ctrl: cpu-ctrl@380734000 {
+diff --git a/drivers/nvme/host/apple.c b/drivers/nvme/host/apple.c
+index 09f4fe909d..afab639656 100644
+--- a/drivers/nvme/host/apple.c
++++ b/drivers/nvme/host/apple.c
+@@ -32,6 +32,7 @@
+ #include <linux/overflow.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/nvmem-consumer.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+@@ -249,6 +250,11 @@ struct apple_nvme {
+ 	bool recover_to_live;
+ 	bool suspended;
+ 	bool final_shutdown;
++	/* The final shutdown notification, for shn_record. */
++	bool shn_timed;
++	bool shn_complete;
++	s64 shn_ms;
++	struct delayed_work shn_work;
+ 	/* This suspend is firmware-driven: ANS will lose power at its end. */
+ 	bool sleep_stop;
+ 	bool sleep_idled;
+@@ -340,6 +346,11 @@ module_param(final_shn_wait_s, uint, 0644);
+ MODULE_PARM_DESC(final_shn_wait_s,
+ 		 "Post-M4, final system shutdown: wait up to this many seconds for the shutdown notification to complete (CSTS.SHST) before CC.EN is cleared, and log how long it took (0: the controller's own shutdown timeout, default)");
+ 
++static bool shn_record;
++module_param(shn_record, bool, 0644);
++MODULE_PARM_DESC(shn_record,
++		 "Keep the final SHN result and time in PMU scratch for the next boot (default: off)");
++
+ static_assert(sizeof(struct nvme_command) == 64);
+ static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
+ 
+@@ -1398,6 +1409,9 @@ static int apple_nvme_disable_locked(struct apple_nvme *anv, bool shutdown)
+ 		if (wait > anv->ctrl.shutdown_timeout)
+ 			anv->ctrl.shutdown_timeout = wait;
+ 		ret = nvme_disable_ctrl(&anv->ctrl, true);
++		anv->shn_ms = ktime_ms_delta(ktime_get(), start);
++		anv->shn_complete = !ret;
++		anv->shn_timed = true;
+ 		if (ret)
+ 			dev_warn(anv->dev, "shutdown notification failed: %d\n", ret);
+ 		if (wait)
+@@ -2720,6 +2734,64 @@ static int apple_nvme_sleep_last_stop(void *data)
+ 	return ret ? 1 : 0;
+ }
+ 
++/*
++ * shn_record: two bytes in PMU scratch, kept across the reset. Byte 0 is 0xa0, bit 0 set when the
++ * notification completed, bit 1 when byte 1 counts 512 ms steps instead of 32 ms ones.
++ */
++#define APPLE_NVME_SHN_MAGIC	0xa0
++
++static void apple_nvme_shn_store(struct apple_nvme *anv)
++{
++	struct nvmem_cell *cell;
++	bool coarse;
++	u8 rec[2];
++
++	if (!READ_ONCE(shn_record) || !anv->shn_timed)
++		return;
++	cell = nvmem_cell_get(anv->dev, "shn-record");
++	if (IS_ERR(cell))
++		return;
++	coarse = anv->shn_ms >= 256 * 32;
++	rec[0] = APPLE_NVME_SHN_MAGIC | anv->shn_complete | coarse << 1;
++	rec[1] = min_t(s64, anv->shn_ms / (coarse ? 512 : 32), 255);
++	nvmem_cell_write(cell, rec, sizeof(rec));
++	nvmem_cell_put(cell);
++}
++
++static void apple_nvme_shn_report(struct work_struct *work)
++{
++	struct apple_nvme *anv =
++		container_of(to_delayed_work(work), struct apple_nvme, shn_work);
++	struct nvmem_cell *cell;
++	u8 zero[2] = {};
++	unsigned int step;
++	size_t len;
++	u8 *rec;
++
++	/* Read every boot, as the boot that wrote it may have set shn_record at run time. */
++	cell = nvmem_cell_get(anv->dev, "shn-record");
++	if (IS_ERR(cell))
++		return;
++	rec = nvmem_cell_read(cell, &len);
++	if (IS_ERR(rec)) {
++		nvmem_cell_put(cell);
++		return;
++	}
++	if (len >= 2 && (rec[0] & 0xfc) == APPLE_NVME_SHN_MAGIC) {
++		step = rec[0] & 2 ? 512 : 32;
++		dev_info(anv->dev, "previous shutdown: notification %s after %s%u ms\n",
++			 rec[0] & 1 ? "complete" : "NOT complete",
++			 rec[1] == 255 ? "at least " : "about ",
++			 rec[1] * step + (rec[1] == 255 ? 0 : step / 2));
++		nvmem_cell_write(cell, zero, sizeof(zero));
++	} else if (READ_ONCE(shn_record)) {
++		dev_info(anv->dev, "previous shutdown: no record (%*phN)\n",
++			 (int)min_t(size_t, len, 2), rec);
++	}
++	kfree(rec);
++	nvmem_cell_put(cell);
++}
++
+ static int apple_nvme_probe(struct platform_device *pdev)
+ {
+ 	struct apple_nvme *anv;
+@@ -2747,6 +2819,8 @@ static int apple_nvme_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	INIT_DELAYED_WORK(&anv->flush_dwork, apple_nvme_flush_work);
++	/* Later, so that the PMU's nvmem provider has bound: nothing here waits for it. */
++	INIT_DELAYED_WORK(&anv->shn_work, apple_nvme_shn_report);
+ 
+ 	if (anv->hw->sleep_traced) {
+ 		anv->sleep_registered =
+@@ -2764,6 +2838,7 @@ static int apple_nvme_probe(struct platform_device *pdev)
+ 	apple_nvme_set_reset_ready(anv, true);
+ 	nvme_reset_ctrl(&anv->ctrl);
+ 	async_schedule(apple_nvme_async_probe, anv);
++	schedule_delayed_work(&anv->shn_work, 30 * HZ);
+ 
+ 	return 0;
+ 
+@@ -2788,6 +2863,7 @@ static void apple_nvme_remove(struct platform_device *pdev)
+ 	cancel_work_sync(&anv->ctrl.reset_work);
+ 	nvme_stop_ctrl(&anv->ctrl);
+ 	cancel_delayed_work_sync(&anv->flush_dwork);
++	cancel_delayed_work_sync(&anv->shn_work);
+ 	nvme_remove_namespaces(&anv->ctrl);
+ 	/* A quarantined controller keeps everything it may still DMA into. */
+ 	if (apple_nvme_disable(anv, true))
+@@ -2817,12 +2893,16 @@ static void apple_nvme_remove(struct platform_device *pdev)
+ static void apple_nvme_shutdown(struct platform_device *pdev)
+ {
+ 	struct apple_nvme *anv = platform_get_drvdata(pdev);
++	int ret;
+ 
+ 	WRITE_ONCE(anv->removing, true);
+ 	WRITE_ONCE(anv->final_shutdown, true);
++	cancel_delayed_work_sync(&anv->shn_work);
+ 	apple_nvme_set_reset_ready(anv, false);
+ 	flush_delayed_work(&anv->flush_dwork);
+-	if (apple_nvme_disable(anv, true))
++	ret = apple_nvme_disable(anv, true);
++	apple_nvme_shn_store(anv);
++	if (ret)
+ 		return;
+ 	cancel_work_sync(&anv->recovery_work);
+ 	cancel_work_sync(&anv->ctrl.reset_work);
+-- 
+2.43.0
+

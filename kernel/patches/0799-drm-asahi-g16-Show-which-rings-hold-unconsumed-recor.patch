@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 13:04:18 +0000
+Subject: [PATCH] drm/asahi: g16: Show which rings hold unconsumed
+ records in fwpower
+
+The firmware takes its idle decision only once every submit ring and
+the device-control ring have been drained: the read index it advances
+must have reached the write index the host published, on all of them.
+A ring that keeps one record the firmware never consumes therefore
+keeps the GPU powered for as long as the system is idle, with no work
+in flight on the host side.
+
+Add the ring states to aurora-g16/fwpower: a `rings` mask with bit i
+set while submit ring i has READ != WRITE, and bit 12 for the
+device-control ring. The file holds its own references to the ring
+state objects and reads them without the device lock, like the rest of
+the line. Nothing is written.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/poll.rs | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 4c46ac2f4e..0b53df2965 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -73,6 +73,9 @@ fn run(this: ArcBorrow<'_, Self>, _ctx: HrTimerCallbackContext<'_, Self>) -> HrT
+ /// nothing here is written, and the firmware cannot see a read.
+ pub(crate) struct FwPower {
+     objects: [Arc<FwObject>; 4],
++    /// The 12 submit channel states and the device-control state: before it raises its idle
++    /// decision the firmware requires READ (+0x0) == WRITE (+0x20) on every one (0x908c, 0x9208).
++    rings: KVec<Arc<FwObject>>,
+ }
+ 
+ /// The `aurora-g16/fwpower` file: one line per read.
+@@ -84,16 +87,24 @@ pub(crate) struct FwPower {
+ /// POWER: `defer` u64 +0x53c (deferred power-downs), `defer_t` u64 +0x544, `seq` +0x5a0, `veto`
+ /// +0x538, `req` +0x664, `hi` +0x66c. Control: +0x8/+0x10/+0x14/+0x18/+0x1c. Globals: +0x30
+ /// idle power-off, +0x34, +0x78, +0x7c, +0x80 (the kick tally the firmware compares before it
+-/// powers down). `t` is the architectural counter at the read.
++/// powers down). `rings`: bit i set while submit channel i has READ != WRITE (bit 12: the
++/// device-control ring), the firmware's own "work pending" test. `t` is the architectural
++/// counter at the read.
+ fn fwpower_show(v: &FwPower, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+     let [pp, power, control, globals] = &v.objects;
+     let r = |o: &FwObject, at: usize| o.r32(at).unwrap_or(0xdead_beef);
+     let r64 = |o: &FwObject, at: usize| u64::from(r(o, at)) | (u64::from(r(o, at + 4)) << 32);
++    let pending = v
++        .rings
++        .iter()
++        .enumerate()
++        .filter(|(_, s)| r(s, 0) != r(s, 0x20))
++        .fold(0u32, |m, (i, _)| m | (1 << i));
+     writeln!(
+         f,
+         "fwpower: t {} state {} mode {} pstate {} act {} tgt {} level {} sub {} retry {} \
+          retries {} defer {} defer_t {} seq {} veto {} req {} hi {} \
+-         ctl {:#x}/{:#x}/{:#x}/{:#x}/{:#x} g {}/{}/{}/{}/{}",
++         ctl {:#x}/{:#x}/{:#x}/{:#x}/{:#x} g {}/{}/{}/{}/{} rings {:#x}",
+         counter_ticks(),
+         r(pp, 0x10),
+         r(pp, 0xc),
+@@ -119,7 +130,8 @@ fn fwpower_show(v: &FwPower, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         r(globals, 0x34),
+         r(globals, 0x78),
+         r(globals, 0x7c),
+-        r(globals, 0x80)
++        r(globals, 0x80),
++        pending
+     )
+ }
+ 
+@@ -370,10 +382,16 @@ pub(crate) fn start_engine(self: &Arc<Self>) -> Result {
+         firmware.engine.shared = Some(self.clone());
+         firmware.engine.debugfs = Some(file);
+         let objects = firmware.init.fwpower_objects();
++        let mut rings = KVec::with_capacity(firmware.channels.submit.len() + 1, GFP_KERNEL)?;
++        for ring in firmware.channels.submit.iter() {
++            rings.push(ring.state.clone(), GFP_KERNEL)?;
++        }
++        rings.push(firmware.channels.devctl.state.clone(), GFP_KERNEL)?;
+         drop(state);
+         if let Some(objects) = objects {
++            let view = FwPower { objects, rings };
+             let file = KBox::pin_init(
+-                dir.read_callback_file(c_str!("fwpower"), FwPower { objects }, &fwpower_show),
++                dir.read_callback_file(c_str!("fwpower"), view, &fwpower_show),
+                 GFP_KERNEL,
+             )?;
+             *self.fwpower.lock() = Some(file);
+-- 
+2.43.0
+

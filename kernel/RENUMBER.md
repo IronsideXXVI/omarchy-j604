@@ -1222,3 +1222,10 @@ Kernel 1.992 keeps the base (`da8e1acf3656`) and all 785 patches of 1.985 under 
 Kernel 1.990 keeps the base (`da8e1acf3656`) and all 792 patches of 1.992 under the same numbers.
 
 1.990 was planned before 1.992 and keeps its number; it carries all of 1.992. New in 1.990 (0796 and 0797 are on by default; the other three are off by default or read-only): 0793 (`drm/asahi: g16: Count compute commands that overlap their queue predecessor`), 0794 (`drm/asahi: g16: Optionally share one UMA pool among a VM's compute units`), 0795 (`nvme-apple: optionally wait longer for the final shutdown notification`), 0796 (`drm/asahi: g16: Boost the submit path by default`), 0797 (`drm/asahi: g16: Keep up to 16 compute commands in flight by default`).
+
+
+# Kernel patch numbers: 1.990 to 1.997
+
+Kernel 1.997 keeps the base (`da8e1acf3656`) and all 797 patches of 1.990 under the same numbers.
+
+1.993 and 1.995 were test builds that did not become the default and are not published; 1.997 carries their changes. New in 1.997 (0802 and 0803 are on by default; 0798 removes a test switch; the others are off by default, read-only, or print only when the GPU stalls): 0798 (`drm/asahi: g16: Remove the FS completion event switch`), 0799 (`drm/asahi: g16: Show which rings hold unconsumed records in fwpower`), 0800 (`drm/asahi: g16: Show the firmware's idle gate words in fwpower`), 0801 (`drm/asahi: g16: Count when slow render starts follow the host's event read`), 0802 (`sched/fair: Enable misfit_new_ns at 1 ms`), 0803 (`media: apple: isp: start the camera firmware at open by default`), 0804 (`drm/asahi: g16: Optionally let the firmware order chained renders`), 0805 (`drm/asahi: g16: Allow up to 32 compute units with a shared UMA pool`), 0806 (`drm/asahi: g16: Optionally serve events that arrive during a poll pass`), 0807 (`nvme-apple: optionally keep the final shutdown notification's result`), 0808 (`drm/asahi: g16: Name a command stall at fail-stop`).

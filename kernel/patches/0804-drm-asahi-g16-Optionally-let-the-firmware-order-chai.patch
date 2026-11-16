@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 13:45:58 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally let the firmware order
+ chained renders
+
+A render command that waits on the previous render of its queue (as
+Mesa's timestamped command buffers do for about half of them) is held
+on the host until that render has retired, which costs a full answer
+path of firmware completion, host wake and poll pass per command. The
+G15 backend instead puts a predecessor barrier on the TA queue, so the
+TA waits for the previous FS stamp in the firmware.
+
+Add g16_render_chain (runtime, default 0). With 1, such a render goes
+behind the renders already published ahead of it, under the existing
+resident depth, and its TA queue entry is preceded by a barrier on the
+previous render's FS stamp (FS event 0x71). Waits on other engines and
+on fences are still met on the host before publication. A
+"render_chain:" stats line counts the renders published this way.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/command.rs |  3 ++-
+ drivers/gpu/drm/asahi/g16/engine.rs  | 17 +++++++++++++++++
+ drivers/gpu/drm/asahi/g16/job.rs     | 17 ++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/params.rs  | 20 ++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs    |  5 +++++
+ 5 files changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/command.rs b/drivers/gpu/drm/asahi/g16/command.rs
+index 14782bdd52..720c30e965 100644
+--- a/drivers/gpu/drm/asahi/g16/command.rs
++++ b/drivers/gpu/drm/asahi/g16/command.rs
+@@ -139,7 +139,8 @@ pub(crate) fn ready_in_flight(
+ 
+     /// [`Self::ready_in_flight`], except that a wait on this command's own engine is met by
+     /// any command already published ahead of it in that engine's queue (`g16_job_ahead` = 2,
+-    /// compute only: the queue runs its commands in ring order, one at a time).
++    /// compute: the queue runs its commands in ring order, one at a time; render with
++    /// `g16_render_chain`: the TA waits for the previous FS in the firmware).
+     pub(crate) fn ready_in_queue(
+         &self,
+         completed: [u64; 2],
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index bdbc6ccb85..93a371f56f 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1810,6 +1810,23 @@ fn prefix_render(
+             BarrierType::Stamp,
+         );
+         p.own_barrier.write(0, &own)?;
++        // g16_render_chain: a render published ahead of a render it waits on starts its TA only
++        // after the previous render's FS stamp (FS event 0x71), as the G15 backend's predecessor
++        // barrier does; the previous render is the last one published (pf.draw).
++        if params::render_chain() && job.own_wait_pending(job.progress.sent()) {
++            let prev = encode::barrier(
++                r.fw_stamp[1].va,
++                encode::stamp(pf.draw),
++                0x71,
++                target,
++                refs.uuid,
++                BarrierType::Hold,
++            );
++            p.prev_barrier.write(0, &prev)?;
++            r.ring[0].w64(8 * pf.ta_head as usize, p.prev_barrier.va)?;
++            pf.ta_head = (pf.ta_head + 1) % cap;
++            super::poll::RENDER_CHAINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
++        }
+         r.ring[0].w64(8 * pf.ta_head as usize, p.ta_work.va)?;
+         pf.ta_head = (pf.ta_head + 1) % cap;
+         r.ring[1].w64(8 * pf.fs_head as usize, p.own_barrier.va)?;
+diff --git a/drivers/gpu/drm/asahi/g16/job.rs b/drivers/gpu/drm/asahi/g16/job.rs
+index ba7707c531..2c5a23aa09 100644
+--- a/drivers/gpu/drm/asahi/g16/job.rs
++++ b/drivers/gpu/drm/asahi/g16/job.rs
+@@ -337,13 +337,28 @@ pub(crate) fn check_command_dependencies(&self, index: u32) -> Result {
+             if order.ready_in_flight(completed, published, behind) {
+                 return Ok(());
+             }
+-            if compute && job_ahead >= 2 && order.ready_in_queue(completed, published, behind) {
++            // g16_render_chain: the same for a render's wait on renders published ahead of it;
++            // the publication then encodes a firmware wait for the previous FS (engine.rs).
++            let chain = !compute && super::params::render_chain();
++            if ((compute && job_ahead >= 2) || chain)
++                && order.ready_in_queue(completed, published, behind)
++            {
+                 return Ok(());
+             }
+         }
+         Err(EAGAIN)
+     }
+ 
++    /// Whether the command at `index` waits on a command of its own engine that has not yet
++    /// retired (it was published ahead by the queue-order rule).
++    pub(crate) fn own_wait_pending(&self, index: u32) -> bool {
++        let Some(order) = self.orders.get(index as usize) else {
++            return false;
++        };
++        let done = self.queue.completed[order.engine].load(Ordering::Acquire);
++        order.wait_through[order.engine].is_some_and(|last| done < last)
++    }
++
+     /// For the stats line `depwait:`: how the command at `index` names its own engine's
+     /// predecessors: 0 not at all, 1 an older prefix, 2 its immediate predecessor (a barrier or
+     /// historical prior that chains it behind the previous command's completion).
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 82e91c1fa8..daf698db1e 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -895,6 +895,26 @@ pub(crate) fn drain_first() -> bool {
+     "G16: consume the event ring at the start of each poll pass, before the session and health checks, instead of after them (default 0: after; 1: first; runtime 0644)"
+ );
+ 
++/// Storage of `g16_render_chain` (runtime 0644, default 0).
++static RENDER_CHAIN: AtomicU32 = AtomicU32::new(0);
++
++/// Whether a render command whose only unmet wait is on render commands already published
++/// ahead of it may be published behind them; its TA then waits in the firmware for the
++/// previous render's FS stamp (a predecessor barrier on the TA queue, as the G15 backend
++/// encodes every render) instead of the host holding it until that render retired.
++pub(crate) fn render_chain() -> bool {
++    RENDER_CHAIN.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    RENDER_CHAIN_PARAM,
++    RENDER_CHAIN_PARMTYPE,
++    RENDER_CHAIN_PARM,
++    RENDER_CHAIN,
++    "g16_render_chain",
++    "G16: publish a render whose wait is on renders already published ahead of it, behind them, with a firmware wait for the previous FS (default 0: the host waits for their retirement; 1: firmware wait; runtime 0644)"
++);
++
+ /// Storage of `g16_job_ahead` (runtime 0644, default 0).
+ static JOB_AHEAD: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index c76186de59..96971dd553 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -49,6 +49,10 @@
+ pub(crate) static LAST_EVENT_READ: core::sync::atomic::AtomicU64 =
+     core::sync::atomic::AtomicU64::new(0);
+ static RENDER_PREV_READ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
++/// Render commands published ahead of a render they wait on, with the firmware wait for the
++/// previous FS (`g16_render_chain`).
++pub(crate) static RENDER_CHAINED: core::sync::atomic::AtomicU64 =
++    core::sync::atomic::AtomicU64::new(0);
+ /// Render commands queued behind work whose start came 100 us or more after the previous command's
+ /// end: bins 0-15 = 10 us steps from the host's event read that preceded the previous retirement to
+ /// this start, 16 = started before that read, 17 = no read recorded.
+@@ -1423,6 +1427,7 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             busy(8),
+             busy(9)
+         )?;
++        writeln!(f, "render_chain: chained {}", RENDER_CHAINED.load(Ordering::Relaxed))?;
+         write!(f, "render_tail: after_read_10us")?;
+         for b in RENDER_TAIL.iter().take(16) {
+             write!(f, " {}", b.load(Ordering::Relaxed))?;
+-- 
+2.43.0
+

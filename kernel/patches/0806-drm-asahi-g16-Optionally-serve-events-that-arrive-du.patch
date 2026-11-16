@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 13:56:32 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally serve events that arrive
+ during a poll pass
+
+A firmware event queues the poll work. When the work is already running,
+the event waits for that pass to end and for the work to be run again,
+and with many compute commands in flight the passes run back to back, so
+this wait grows with the depth: at 16 in flight the time from the event
+to the start of the pass that retires it rose from about 22 us to 80 us.
+
+Add g16_pass_loop: after publishing, a pass that sees an event flagged
+while it ran retires what completed and publishes again, under the same
+lock, up to the given number of extra rounds. The extra rounds are
+counted on the tailsplit statistics line. The default of 0 keeps the
+current behaviour.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |  2 ++
+ drivers/gpu/drm/asahi/g16/params.rs | 18 ++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 28 +++++++++++++++++++++++++---
+ 3 files changed, 45 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 3e3ec1c59a..1a3490a001 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -325,6 +325,8 @@ pub(crate) struct Stats {
+     pub(crate) locked_ticks: u64,
+     pub(crate) tsplit_n: u64,
+     pub(crate) tsplit_other: u64,
++    /// Extra retire/publish rounds inside a pass for events that arrived during it.
++    pub(crate) pass_loops: u64,
+     pub(crate) tsplit_fw: u64,
+     pub(crate) tsplit_wake: u64,
+     pub(crate) tsplit_lock: u64,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 96afc91ba7..d20b82bce1 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1404,6 +1404,24 @@ pub(crate) fn prof() -> bool {
+     "G16: with g16_uma_split latched on, release a render/compute owner at completion and let two be in flight on their own UMA slots (default 1, needed by g16_resident; 0: displacement ledger, one at a time; no effect without the split; runtime 0644)"
+ );
+ 
++/// Storage of `g16_pass_loop` (runtime 0644, default 0).
++static PASS_LOOP: AtomicU32 = AtomicU32::new(0);
++
++/// Extra retire/publish rounds a poll pass may run for firmware events that arrived during
++/// it (0..=4).
++pub(crate) fn pass_loop() -> u32 {
++    PASS_LOOP.load(Ordering::Relaxed).min(4)
++}
++
++live_u32_param!(
++    PASS_LOOP_PARAM,
++    PASS_LOOP_PARMTYPE,
++    PASS_LOOP_PARM,
++    PASS_LOOP,
++    "g16_pass_loop",
++    "G16: extra retire and publish rounds a poll pass runs for firmware events that arrived during it, instead of waiting for the next pass (default 0: none; 1..4; runtime 0644)"
++);
++
+ /// Storage of `g16_lat_qos_us` (runtime 0644, default 0).
+ static LAT_QOS_US: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 96971dd553..7cfb88b0c4 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -541,9 +541,30 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+         self.check_hangs(done)?;
+         lap.lap(&mut self.engine.prof.hangs_ns);
+         self.engine.pass_checked = once;
+-        let published = self.publish(done);
++        let mut published = self.publish(done);
+         // Not left set when publish() returned before taking it (system sleep).
+         self.engine.pass_checked = false;
++        // g16_pass_loop: a firmware event that arrived while this pass ran would otherwise wait
++        // for this pass to end and the poll work to be run again. Serve it here, under the same
++        // lock: retire what completed, then publish into the units it freed.
++        let mut loops = params::pass_loop();
++        while loops > 0
++            && published.is_ok()
++            && !self.engine.flights.is_empty()
++            && self
++                .engine
++                .shared
++                .as_ref()
++                .is_some_and(|sh| sh.evented.swap(false, Ordering::AcqRel))
++        {
++            loops -= 1;
++            self.engine.stats.pass_loops += 1;
++            self.retire(true, done)?;
++            self.check_hangs(done)?;
++            self.engine.pass_checked = once;
++            published = self.publish(done);
++            self.engine.pass_checked = false;
++        }
+         lap.lap(&mut self.engine.prof.publish_ns);
+         let s = &mut *self.engine.stats;
+         if self.engine.flights.is_empty() && s.idle_from_ns != 0 {
+@@ -1651,13 +1672,14 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         )?;
+         writeln!(
+             f,
+-            "tailsplit: n {} other {} fw_us {} wake_us {} lock_us {} pass_us {}",
++            "tailsplit: n {} other {} fw_us {} wake_us {} lock_us {} pass_us {} loops {}",
+             s.tsplit_n,
+             s.tsplit_other,
+             s.tsplit_fw / 1000,
+             s.tsplit_wake / 1000,
+             s.tsplit_lock / 1000,
+-            s.tsplit_pass / 1000
++            s.tsplit_pass / 1000,
++            s.pass_loops
+         )?;
+         for (c, name) in ["compute", "render"].iter().enumerate() {
+             write!(
+-- 
+2.43.0
+
