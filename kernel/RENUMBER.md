@@ -1243,3 +1243,8 @@ New in 1.998 (0814 turns on 0809, the fix for a GPU stall; the other four are of
 Kernel 1.999 keeps the base (`da8e1acf3656`) and all 814 patches of 1.998 under the same numbers.
 
 New in 1.999 (0815, fair GPU turns between apps, is on by default; 0816 and 0817 are read-only; 0818 is off by default): 0815 (`drm/asahi: g16: Give a VM held behind another VM's work the next turn`), 0816 (`drm/asahi: g16: Show the coprocessor CPU status and ring activity`), 0817 (`drm/asahi: g16: Show the last render's tile-buffer words in the stats`), 0818 (`soc: apple: mcc: add a T8132 switch to replay macOS's controller setup`).
+
+
+# Kernel patch numbers: 1.999 to 1.1000
+
+Kernel 1.1000 is the series of 1.999 unchanged: the same base (`da8e1acf3656`) and the same 818 patches under the same numbers, built as `linux-aurora`. Its number has four digits after the dot and comes after 1.999, as pacman compares versions (999, then 1000).

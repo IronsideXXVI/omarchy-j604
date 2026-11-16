@@ -1,0 +1,324 @@
+From a0ee7825fa2ce0fe8633f4006c6f9e5290ada61d Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 07:07:09 +0000
+Subject: [PATCH] stage2: keep a progress crumb that survives a watchdog reset
+
+A Stage 2 that hangs is reset by its watchdog, and its console log is a
+RAM page the reset loses, so the next boot cannot tell where it stopped.
+Record the step reached (entry, payload search, NVMe, kboot, PCIe and
+its result, no payload, jump) in eight free bytes of the PMU's legacy
+scratch (+0x28..+0x2f, after the kernel's own cells). At entry, a
+record that never reached the jump is copied to the second half, so the
+boot after a stall still shows where that one stopped. Only the ESP
+Stage 2 writes it; Stage 1 has no room and gets empty inlines. Every
+failure is ignored.
+
+Assisted-by: LLM
+---
+ Makefile          |  2 +-
+ src/kboot.c       |  4 ++++
+ src/main.c        |  9 ++++++++
+ src/nvme.c        |  2 ++
+ src/pmu_counter.c | 36 ++++++++++++++++++++++++++++++++
+ src/pmu_counter.h |  3 +++
+ src/stage_crumb.c | 52 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/stage_crumb.h | 34 +++++++++++++++++++++++++++++++
+ 8 files changed, 141 insertions(+), 1 deletion(-)
+ create mode 100644 src/stage_crumb.c
+ create mode 100644 src/stage_crumb.h
+
+diff --git a/Makefile b/Makefile
+index 7c644980..68ae50b2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -245,7 +245,7 @@ OBJECTS := \
+ 	smc.o \
+ 	ctxr_exec.o \
+ 	smp.o \
+-	spmi.o pmu_counter.o ace3.o \
++	spmi.o pmu_counter.o stage_crumb.o ace3.o \
+ 	start.o \
+ 	startup.o \
+ 	string.o \
+diff --git a/src/kboot.c b/src/kboot.c
+index 27553862..86de6ed0 100644
+--- a/src/kboot.c
++++ b/src/kboot.c
+@@ -47,6 +47,7 @@
+ #include "usb_dwc3.h"
+ #include "utils.h"
+ #include "vsprintf.h"
++#include "stage_crumb.h"
+ #include "xnuboot.h"
+ 
+ #include "libfdt/libfdt.h"
+@@ -11780,6 +11781,7 @@ static int dt_finish_j614s_aop(void *tree, bool ready)
+ 
+ int kboot_boot(void *kernel)
+ {
++    stage_crumb(STAGE_CRUMB_KBOOT, 0);
+     if (!ctxr_exec_os_may_start()) {
+         next_stage.entry = NULL;
+         return -1;
+@@ -11803,6 +11805,7 @@ int kboot_boot(void *kernel)
+         printf("kboot: normal USB init skipped on T8140\n");
+     else
+         usb_init();
++    stage_crumb(STAGE_CRUMB_PCIE, 0);
+     int described = chip_id == T8132 ? pcie_prepare_fdt(dt) : 0;
+     bool radio = chip_id == T8132 && pcie_radio_board_fdt(dt);
+     if (described < 0) {
+@@ -11812,6 +11815,7 @@ int kboot_boot(void *kernel)
+         ret = 0;
+     } else {
+         ret = pcie_init();
++        stage_crumb(STAGE_CRUMB_PCIE_DONE, (u8)((described & 0xf) | ((ret & 0xf) << 4)));
+         if (chip_id == T8132 && ((ret && described) || pcie_handoff_fdt(dt) < 0)) {
+             if (!radio || dt_disable_j713_pcie())
+                 return -1;
+diff --git a/src/main.c b/src/main.c
+index bafb7ae7..d6029c36 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -39,6 +39,7 @@
+ #include "usb.h"
+ #include "usb_cdc.h"
+ #include "utils.h"
++#include "stage_crumb.h"
+ #include "wdt.h"
+ #include "xnuboot.h"
+ 
+@@ -255,6 +256,8 @@ void run_actions(void)
+ #endif
+ #endif
+ 
++    stage_crumb(STAGE_CRUMB_PAYLOADS, 0);
++
+     printf("Checking for payloads...\n");
+ 
+     bool payload_valid = payload_run() == 0;
+@@ -266,6 +269,8 @@ void run_actions(void)
+     }
+     fb_set_active(true);
+ 
++    stage_crumb(STAGE_CRUMB_NOPAYLOAD, 0);
++
+     printf("No valid payload found\n");
+     /*
+      * An aura-try trial that cannot start its payload must not stop here: nobody may be at the
+@@ -382,12 +387,14 @@ static void j873g_run_proxy(void)
+     const bool check_payloads = !aura_proxy_enabled();
+ #endif
+     if (check_payloads) {
++        stage_crumb(STAGE_CRUMB_PAYLOADS, 0);
+         printf("Checking for payloads...\n");
+         if (payload_run() == 0) {
+             printf("Valid payload found\n");
+             j873g_debugport_check();
+             return;
+         }
++        stage_crumb(STAGE_CRUMB_NOPAYLOAD, 0);
+         printf("No valid payload found\n");
+     }
+ #ifdef SECBOOT_SECURE_FLAVOUR
+@@ -437,6 +444,7 @@ void aura_main(void)
+     else if (!aura_trial_enabled())
+         printf("WDT: boot watchdog armed (%u s)\n", WDT_BOOT_SECONDS);
+ #endif
++    stage_crumb_begin();
+ #ifndef BRINGUP
+     if (pmgr_init() && chip_id == T8140)
+         panic("T8140 PMGR initialization failed\n");
+@@ -531,6 +539,7 @@ next_stage:
+     else if (wdt_boot_watchdog_armed() && wdt_arm_boot())
+         printf("WDT: could not arm the boot watchdog for the next stage\n");
+ #endif
++    stage_crumb(STAGE_CRUMB_JUMP, 0);
+     printf("Vectoring to next stage...\n");
+ #if defined(CHAINLOADING) && !defined(ESP_STAGE2)
+     stage1_log_flush();
+diff --git a/src/nvme.c b/src/nvme.c
+index 9ee13304..930b0576 100644
+--- a/src/nvme.c
++++ b/src/nvme.c
+@@ -11,6 +11,7 @@
+ #include "rtkit.h"
+ #include "sart.h"
+ #include "string.h"
++#include "stage_crumb.h"
+ #include "utils.h"
+ 
+ #define NVME_TIMEOUT 1000000
+@@ -567,6 +568,7 @@ bool nvme_io_failed(void)
+ 
+ bool nvme_init(void)
+ {
++    stage_crumb(STAGE_CRUMB_NVME, 0);
+     if (nvme_reboot_required) {
+         printf("nvme: setup failed; reboot required before initialization\n");
+         return false;
+diff --git a/src/pmu_counter.c b/src/pmu_counter.c
+index e2382973..325fc9c9 100644
+--- a/src/pmu_counter.c
++++ b/src/pmu_counter.c
+@@ -4,6 +4,7 @@
+ #include "adt.h"
+ #include "soc.h"
+ #include "spmi.h"
++#include "../build/build_cfg.h"
+ #include "string.h"
+ #include "utils.h"
+ 
+@@ -110,3 +111,38 @@ int pmu_read_boot_record(u8 *counts, u8 *error_stage)
+     *error_stage = record[1];
+     return 0;
+ }
++
++#ifdef ESP_STAGE2
++/* Bytes of the PMU's legacy scratch (offset from info-leg_scrpad), for records that must survive a reset. */
++static char pmu_scr_path[64];
++static u8 pmu_scr_addr;
++static u16 pmu_scr_base;
++static int pmu_scr_state; /* 0 unknown, 1 found, -1 none */
++
++static spmi_dev_t *pmu_scratch_open(void)
++{
++    if (!pmu_scr_state)
++        pmu_scr_state = pmu_find_scratchpad(pmu_scr_path, sizeof(pmu_scr_path), &pmu_scr_addr, &pmu_scr_base) ? -1 : 1;
++    return pmu_scr_state > 0 ? spmi_init(pmu_scr_path) : NULL;
++}
++
++int pmu_scratch_read(u16 off, u8 *buf, size_t len)
++{
++    spmi_dev_t *spmi = pmu_scratch_open();
++    if (!spmi)
++        return -1;
++    int ret = spmi_ext_read_long(spmi, pmu_scr_addr, pmu_scr_base + off, buf, len);
++    spmi_shutdown(spmi);
++    return ret ? -1 : 0;
++}
++
++int pmu_scratch_write(u16 off, const u8 *buf, size_t len)
++{
++    spmi_dev_t *spmi = pmu_scratch_open();
++    if (!spmi)
++        return -1;
++    int ret = spmi_ext_write_long(spmi, pmu_scr_addr, pmu_scr_base + off, buf, len);
++    spmi_shutdown(spmi);
++    return ret ? -1 : 0;
++}
++#endif /* ESP_STAGE2 */
+diff --git a/src/pmu_counter.h b/src/pmu_counter.h
+index 6958b09d..1835c498 100644
+--- a/src/pmu_counter.h
++++ b/src/pmu_counter.h
+@@ -7,5 +7,8 @@
+ 
+ int pmu_clear_panic_counter(void);
+ int pmu_read_boot_record(u8 *counts, u8 *error_stage);
++/* ESP Stage 2 only (stage_crumb.c). */
++int pmu_scratch_read(u16 off, u8 *buf, size_t len);
++int pmu_scratch_write(u16 off, const u8 *buf, size_t len);
+ 
+ #endif
+diff --git a/src/stage_crumb.c b/src/stage_crumb.c
+new file mode 100644
+index 00000000..89712e5e
+--- /dev/null
++++ b/src/stage_crumb.c
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: MIT */
++
++/*
++ * Stage 2 progress crumb (J604, Nov 16 2026). A Stage 2 that hangs is reset by its watchdog and its
++ * console, a RAM page, does not survive the reset, so the next boot cannot say where it stopped.
++ * This keeps a few bytes in the PMU's legacy scratch, which do survive (scratch + 0x28..0x2f, free
++ * and backed on T8132; the kernel's cells end at +0x27):
++ *   +0x28 0xa5  +0x29 step  +0x2a sub  +0x2b boot sequence    (this boot, updated as it goes)
++ *   +0x2c 0xa6  +0x2d step  +0x2e sub  +0x2f its sequence      (the last boot that never jumped)
++ * At entry, a record whose step is not STAGE_CRUMB_JUMP belongs to a boot that stopped: it is
++ * copied to the second half before this boot starts writing. Linux reads both through nvmem.
++ * Only the ESP Stage 2 writes it; every failure is ignored (a crumb never stops a boot).
++ */
++
++#include "stage_crumb.h"
++#include "pmu_counter.h"
++#include "types.h"
++
++#ifdef ESP_STAGE2
++
++#define CRUMB_OFF  0x28
++#define CRUMB_LEN  8
++#define CRUMB_CUR  0xa5
++#define CRUMB_PREV 0xa6
++
++static bool crumb_on;
++
++void stage_crumb_begin(void)
++{
++    u8 r[CRUMB_LEN];
++
++    crumb_on = false;
++    if (pmu_scratch_read(CRUMB_OFF, r, CRUMB_LEN))
++        return;
++    bool had = r[0] == CRUMB_CUR;
++    if (had && r[1] != STAGE_CRUMB_JUMP && r[1] != 0) {
++        u8 p[4] = {CRUMB_PREV, r[1], r[2], r[3]};
++        pmu_scratch_write(CRUMB_OFF + 4, p, 4);
++    }
++    u8 c[4] = {CRUMB_CUR, STAGE_CRUMB_ENTRY, 0, (u8)(had ? r[3] + 1 : 1)};
++    crumb_on = !pmu_scratch_write(CRUMB_OFF, c, 4);
++}
++
++void stage_crumb(u8 step, u8 sub)
++{
++    if (!crumb_on)
++        return;
++    u8 s[2] = {step, sub};
++    pmu_scratch_write(CRUMB_OFF + 1, s, 2);
++}
++
++#endif /* ESP_STAGE2 */
+diff --git a/src/stage_crumb.h b/src/stage_crumb.h
+new file mode 100644
+index 00000000..5768734a
+--- /dev/null
++++ b/src/stage_crumb.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: MIT */
++
++#ifndef STAGE_CRUMB_H
++#define STAGE_CRUMB_H
++
++#include "../build/build_cfg.h"
++#include "types.h"
++
++/* Steps of an ESP Stage 2, in the order a good boot passes them. */
++#define STAGE_CRUMB_ENTRY     0x01 /* watchdog armed, crumb started */
++#define STAGE_CRUMB_PAYLOADS  0x02 /* "Checking for payloads" */
++#define STAGE_CRUMB_NVME      0x03 /* nvme_init entered (sub: 1 = it returned false) */
++#define STAGE_CRUMB_KBOOT     0x04 /* kboot_boot entered */
++#define STAGE_CRUMB_PCIE      0x05 /* PCIe prepare/init about to run */
++#define STAGE_CRUMB_PCIE_DONE 0x06 /* sub: pcie_prepare_fdt result | pcie_init result << 4 (low bits) */
++#define STAGE_CRUMB_NOPAYLOAD 0x0e /* "No valid payload found": the proxy follows */
++#define STAGE_CRUMB_JUMP      0x0f /* "Vectoring to next stage" */
++
++#ifdef ESP_STAGE2
++void stage_crumb_begin(void);
++void stage_crumb(u8 step, u8 sub);
++#else
++/* Stage 1 has no room for it (its image must end before the DCP log buffer). */
++static inline void stage_crumb_begin(void)
++{
++}
++static inline void stage_crumb(u8 step, u8 sub)
++{
++    (void)step;
++    (void)sub;
++}
++#endif
++
++#endif
+-- 
+2.43.0
+

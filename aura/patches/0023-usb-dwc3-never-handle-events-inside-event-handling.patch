@@ -1,0 +1,138 @@
+From 9b2e13cf4b4df9c7e4e1b343d8bf13a63c39a650 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 03:44:39 +0000
+Subject: [PATCH] usb: dwc3: never handle events inside event handling
+
+The CDC class request handler logs "ACM device opened" or "closed" with
+debug_printf. When the request is serviced from the proxy's read or
+write loop, that print goes to the console, and the console includes
+CDC pipe 0: usb_dwc3_queue() then calls usb_dwc3_handle_events() again
+until the text and the console backlog fit in the ring. That nested
+call can take the host's next setup packet before the first request's
+status stage has started, so the host times the first one out and EP0
+can stop taking setup packets at all. A Linux host that opens and closes
+both ports within milliseconds of enumeration (an stty on each) hits it.
+
+Let only one CPU handle events at a time and never nest: a call from
+inside returns at once, and the loops that would wait on it (queue,
+putbyte, getbyte, read, flush) return short instead of spinning.
+
+Assisted-by: LLM
+(cherry picked from commit 1d4776ff68a79f12b5a8552630e9ac432729673b)
+---
+ src/usb_dwc3_impl.inc | 46 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/src/usb_dwc3_impl.inc b/src/usb_dwc3_impl.inc
+index 504c5699..37622046 100644
+--- a/src/usb_dwc3_impl.inc
++++ b/src/usb_dwc3_impl.inc
+@@ -27,6 +27,7 @@
+ #include "usb_dwc3_regs.h"
+ #include "usb_types.h"
+ #include "utils.h"
++#include "smp.h"
+ 
+ #define MAX_ENDPOINTS     16
+ #define CDC_BUFFER_SIZE   SZ_1M
+@@ -181,6 +182,8 @@ typedef struct dwc3_dev {
+     struct usb_cdc_recovery recovery;
+ #endif
+ 
++    /* CPU (smp_id + 1) inside usb_dwc3_handle_events, 0 = none: event handling never nests or overlaps */
++    int events_owner;
+ } dwc3_dev_t;
+ 
+ static const struct usb_string_descriptor str_manufacturer =
+@@ -1763,10 +1766,43 @@ static void usb_dwc3_maybe_reannounce(dwc3_dev_t *dev)
+ }
+ #endif
+ 
++/*
++ * The EP0 class handler logs "ACM device opened/closed" with debug_printf. Reached from the proxy's read or write loop
++ * (iodev_read/iodev_write do not set in_iodev), that printf goes to the console, whose iodevs include USB pipe 0, and
++ * usb_dwc3_queue() calls usb_dwc3_handle_events() again until the text and the console backlog (up to 8 KiB) fit in the
++ * ring. That nested call can take the host's NEXT setup packet while the first one's status stage has not started, so
++ * the host times the first one out (5 s) and EP0 may never take a setup again: the silent gadget starts the M1 sees
++ * when udev's stty opens and closes ACM0 and ACM1 within milliseconds of enumeration.
++ * So event handling never nests: a CPU already inside it returns at once, and the loops that would spin on it
++ * (queue, putbyte, getbyte, read, flush) return short instead of waiting. A second CPU arriving while one is inside
++ * returns too; the owner services the events.
++ */
++static u32 usb_dwc3_nested_calls;
++
++static inline bool usb_dwc3_in_events(dwc3_dev_t *dev)
++{
++    return dev && __atomic_load_n(&dev->events_owner, __ATOMIC_ACQUIRE) == (int)smp_id() + 1;
++}
++
++static void usb_dwc3_handle_events_once(dwc3_dev_t *dev);
++
+ void usb_dwc3_handle_events(dwc3_dev_t *dev)
+ {
++    int none = 0;
++
+     if (!dev || dev->failed)
+         return;
++    if (!__atomic_compare_exchange_n(&dev->events_owner, &none, (int)smp_id() + 1, false, __ATOMIC_ACQUIRE,
++                                     __ATOMIC_RELAXED)) {
++        usb_dwc3_nested_calls++;
++        return;
++    }
++    usb_dwc3_handle_events_once(dev);
++    __atomic_store_n(&dev->events_owner, 0, __ATOMIC_RELEASE);
++}
++
++static void usb_dwc3_handle_events_once(dwc3_dev_t *dev)
++{
+ 
+     u32 count = read32(dev->regs + DWC3_GEVNTCOUNT(0)) & DWC3_GEVNTCOUNT_MASK;
+     if (!count) {
+@@ -2126,6 +2162,8 @@ u8 usb_dwc3_getbyte(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
+ 
+     u8 c;
+     while (ringbuffer_read(&c, 1, host2device) < 1) {
++        if (usb_dwc3_in_events(dev))
++            return 0;
+ #if USB_DWC3_SUPERSPEED
+         if (!dev->pipe[pipe].ready)
+             return 0;
+@@ -2145,6 +2183,8 @@ void usb_dwc3_putbyte(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, u8 byte)
+     u8 ep = dev->pipe[pipe].ep_in;
+ 
+     while (ringbuffer_write(&byte, 1, device2host) < 1) {
++        if (usb_dwc3_in_events(dev))
++            return;
+ #if USB_DWC3_SUPERSPEED
+         if (!dev->pipe[pipe].ready)
+             return;
+@@ -2181,6 +2221,8 @@ size_t usb_dwc3_queue(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, const void *buf,
+         count -= wrote;
+         p += wrote;
+         sent += wrote;
++        if (count && usb_dwc3_in_events(dev))
++            break; /* inside event handling: what fits, never wait */
+         if (count) {
+ #if USB_DWC3_SUPERSPEED
+             if (ticks_to_msecs(get_ticks() - last_progress) >= CDC_IO_TIMEOUT_MS)
+@@ -2234,6 +2276,8 @@ size_t usb_dwc3_read(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe, void *buf, size_t
+         count -= read;
+         p += read;
+         recvd += read;
++        if (count && usb_dwc3_in_events(dev))
++            break;
+ #if USB_DWC3_SUPERSPEED
+         if (count && recvd && ticks_to_msecs(get_ticks() - last_progress) >= CDC_IO_TIMEOUT_MS)
+             break;
+@@ -2291,6 +2335,8 @@ void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
+            (ringbuffer_get_used(device2host) != 0 || dev->endpoints[ep].xfer_in_progress)) {
+         if (bounded && ticks_to_msecs(get_ticks() - start) >= 3000)
+             return;
++        if (usb_dwc3_in_events(dev))
++            return;
+         usb_dwc3_handle_events(dev);
+ #if !USB_DWC3_SUPERSPEED
+         usb_dwc3_cdc_start_bulk_in_xfer(dev, ep);
+-- 
+2.43.0
+
