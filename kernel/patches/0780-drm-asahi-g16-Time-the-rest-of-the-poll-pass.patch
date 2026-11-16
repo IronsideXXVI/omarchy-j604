@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 08:16:30 +0000
+Subject: [PATCH] drm/asahi: g16: Time the rest of the poll pass
+
+The prof: line times a poll pass's drain and retirement and the whole
+pass from retirement on, but not what runs before retirement (the
+session check, the object health check and the power service) nor how
+the remainder splits between hang checks and publication. The span
+from taking the device lock to a command's retirement is about 54 us
+per completion event, of which retirement is a small part.
+
+Add check_us, health_us, power_us, hangs_us and publish_us to the
+prof: line. Like the existing timers they run only with g16_prof=1 or
+debug_flags bit 49; nothing is timed otherwise.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |  8 ++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 15 +++++++++++++--
+ 2 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 5c0a91b1fb..b41f8485bb 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -454,6 +454,14 @@ pub(crate) struct Prof {
+     pub(crate) drain_ns: u64,
+     pub(crate) retire_ns: u64,
+     pub(crate) poll_ns: u64,
++    /// Per poll pass, before retirement: the session check, the object health check (both
++    /// verify the adopted UAT bindings) and the power service.
++    pub(crate) check_ns: u64,
++    pub(crate) health_ns: u64,
++    pub(crate) power_ns: u64,
++    /// Per poll pass, after retirement: growth answers and hang checks, then publication.
++    pub(crate) hangs_ns: u64,
++    pub(crate) publish_ns: u64,
+ }
+ 
+ /// A phase timer: reads the clock only while profiling is on.
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 98d51bb306..687d91b4ae 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -299,9 +299,13 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+         if self.recovery.failed().is_some() {
+             return Ok(false);
+         }
++        let mut pre = Lap::start();
+         self.session.check()?;
++        pre.lap(&mut self.engine.prof.check_ns);
+         self.objects.health()?;
++        pre.lap(&mut self.engine.prof.health_ns);
+         self.service_power()?;
++        pre.lap(&mut self.engine.prof.power_ns);
+         // With nothing published only a pending firmware recovery notification needs this
+         // pass: one that arrived after its prefix's receipts is answered
+         // here (the firmware halted and waits for the resume) instead of being taken for a
+@@ -321,7 +325,9 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+         lap.lap(&mut self.engine.prof.retire_ns);
+         self.answer_growth()?;
+         self.check_hangs(done)?;
++        lap.lap(&mut self.engine.prof.hangs_ns);
+         let published = self.publish(done);
++        lap.lap(&mut self.engine.prof.publish_ns);
+         let s = &mut self.engine.stats;
+         if self.engine.flights.is_empty() && s.idle_from_ns != 0 {
+             // Idle with nothing ready is not a gap: the clients are late.
+@@ -1491,7 +1497,7 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         let p = &self.engine.prof;
+         writeln!(
+             f,
+-            "prof: prefixes {} select_us {} encode_us {} claim_us {} write_us {} post_us {} polls {} drain_us {} retire_us {} poll_us {} flushes {} flush_us {}",
++            "prof: prefixes {} select_us {} encode_us {} claim_us {} write_us {} post_us {} polls {} drain_us {} retire_us {} poll_us {} flushes {} flush_us {} check_us {} health_us {} power_us {} hangs_us {} publish_us {}",
+             p.prefixes,
+             us(p.select_ns),
+             us(p.encode_ns),
+@@ -1503,7 +1509,12 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             us(p.retire_ns),
+             us(p.poll_ns),
+             slots.flushes,
+-            us(slots.flush_ns)
++            us(slots.flush_ns),
++            us(p.check_ns),
++            us(p.health_ns),
++            us(p.power_ns),
++            us(p.hangs_ns),
++            us(p.publish_ns)
+         )
+     }
+ }
+-- 
+2.43.0
+

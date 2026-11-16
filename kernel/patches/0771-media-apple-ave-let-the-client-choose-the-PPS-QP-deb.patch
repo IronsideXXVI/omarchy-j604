@@ -1,0 +1,281 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 05:49:53 +0000
+Subject: [PATCH] media: apple: ave: let the client choose the PPS QP,
+ deblocking and scaling words
+
+A VA-API client puts its own parameter sets in the container header, and
+the slices the encoder writes are decoded against them by a player that
+sets up from that header. With the frame_num and POC words matched, H.264
+still decodes to different pictures: FFmpeg's PPS carries
+pic_init_qp_minus26 = -6 (CQP at its default quality 20) while the encoder
+codes slice_qp_delta against 26, so every macroblock is dequantized six
+steps off without a parse error. HEVC also differs in
+scaling_list_enabled_flag (encoder 1, FFmpeg 0), which changes the
+pictures the same silent way.
+
+On 9003.78.0 the H.264 picture block is the 6070 one 0xdc90 lower (cabac
+and transform_8x8 match), which puts pic_init_qp_minus26 at Start +0x2ff8
+and deblocking_filter_control_present_flag at byte +0x3020; the HEVC
+sequence block is 0x1ee1c lower (picture size, crop, bit depths and
+transform depths match), which puts scaling_list_enabled_flag at byte
++0x5b54. The macOS constants at all three equal the values its stream
+carries (0, 1, 1).
+
+Add three more client controls on the same rule: -1, the default, keeps
+the firmware's value. The QP control takes the QP itself and the firmware
+word gets pic_init_qp_minus26; the two flags are written as single bytes
+so their neighbours (transform_8x8 at +0x3023) are kept. Widen the test
+probe window for HEVC to the picture and +0x9600 blocks, where the
+remaining words (entropy_coding_sync, init_qp, cu_qp_delta) are to be
+located.
+
+Assisted-by: LLM
+---
+ .../media/platform/apple/ave/ave-abi-test.c   | 24 ++++++++++++++--
+ drivers/media/platform/apple/ave/ave-layout.c | 23 ++++++++++++++-
+ drivers/media/platform/apple/ave/ave-layout.h |  3 ++
+ drivers/media/platform/apple/ave/ave-v4l2.c   | 11 ++++++++
+ drivers/media/platform/apple/ave/ave-writer.c | 28 ++++++++++++++++---
+ drivers/media/platform/apple/ave/ave.h        | 13 ++++++++-
+ 6 files changed, 94 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/media/platform/apple/ave/ave-abi-test.c b/drivers/media/platform/apple/ave/ave-abi-test.c
+index db1887d456..a174874f65 100644
+--- a/drivers/media/platform/apple/ave/ave-abi-test.c
++++ b/drivers/media/platform/apple/ave/ave-abi-test.c
+@@ -343,7 +343,7 @@ static void ave_9003_speed(struct kunit *test)
+  */
+ static void ave_9003_client_sps(struct kunit *test)
+ {
+-	static const u32 h264_off[] = { 0x2d34, 0x2d38, 0x2d3c };
++	static const u32 h264_off[] = { 0x2d34, 0x2d38, 0x2d3c, 0x2ff8, 0x3020 };
+ 	struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+ 	struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+ 	struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+@@ -373,6 +373,9 @@ static void ave_9003_client_sps(struct kunit *test)
+ 		sess->p.sps_val[AVE_SPS_H264_POC_TYPE] = 2;
+ 		sess->p.sps_val[AVE_SPS_H264_LOG2_MAX_POC_LSB_MINUS4] = 3;
+ 		sess->p.sps_val[AVE_SPS_HEVC_LOG2_MAX_POC_LSB_MINUS4] = 8;
++		sess->p.sps_val[AVE_SPS_H264_PIC_INIT_QP] = 20;
++		sess->p.sps_val[AVE_SPS_H264_DEBLOCKING_CONTROL_PRESENT] = 0;
++		sess->p.sps_val[AVE_SPS_HEVC_SCALING_LIST_ENABLED] = 0;
+ 		memset(set, 0, len);
+ 		KUNIT_ASSERT_EQ(test, ave_build_start(ctx, set, len), 0);
+ 		if (h264) {
+@@ -382,12 +385,22 @@ static void ave_9003_client_sps(struct kunit *test)
+ 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(set + 0x2d34), 4);
+ 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(set + 0x2d38), 2);
+ 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(set + 0x2d3c), 3);
++			/* pic_init_qp 20 -> minus26 -6; only the deblocking byte of +0x3020 */
++			KUNIT_EXPECT_EQ(test, get_unaligned_le32(base + 0x2ff8), 0);
++			KUNIT_EXPECT_EQ(test, (s32)get_unaligned_le32(set + 0x2ff8), -6);
++			KUNIT_EXPECT_EQ(test, base[0x3020], 1);
++			KUNIT_EXPECT_EQ(test, set[0x3020], 0);
++			KUNIT_EXPECT_EQ(test, set[0x3021], base[0x3021]);
++			KUNIT_EXPECT_EQ(test, set[0x3022], base[0x3022]);
++			KUNIT_EXPECT_EQ(test, set[0x3023], base[0x3023]);
+ 		} else {
+ 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(base + 0x5ae0), 7);
+ 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(set + 0x5ae0), 8);
++			KUNIT_EXPECT_EQ(test, base[0x5b54], 1);
++			KUNIT_EXPECT_EQ(test, set[0x5b54], 0);
+ 		}
+ 		for (size_t o = 0; o < len; o += 4) {
+-			bool expected = !h264 && o == 0x5ae0;
++			bool expected = !h264 && (o == 0x5ae0 || o == 0x5b54);
+ 
+ 			for (unsigned int i = 0; h264 && i < ARRAY_SIZE(h264_off); i++)
+ 				expected |= o == h264_off[i];
+@@ -408,6 +421,13 @@ static void ave_9003_client_sps(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, ave_sps_offset(&ave_layout_26a428,
+ 					     AVE_SPS_H264_POC_TYPE), 0);
+ 	KUNIT_EXPECT_EQ(test, ave_sps_offset(NULL, AVE_SPS_H264_POC_TYPE), 0);
++	KUNIT_EXPECT_EQ(test, ave_sps_offset(&ave_layout_9003_78_0,
++					     AVE_SPS_H264_PIC_INIT_QP), 0x2ff8);
++	KUNIT_EXPECT_EQ(test, ave_sps_offset(&ave_layout_9003_78_0,
++					     AVE_SPS_HEVC_SCALING_LIST_ENABLED), 0x5b54);
++	/* The HEVC window reaches the +0x9600 block */
++	KUNIT_EXPECT_EQ(test, ave_sps_probe_parse("0x96d0=0", 0x5900, 0xa000,
++						  off, val), 1);
+ 
+ 	KUNIT_EXPECT_EQ(test, ave_sps_probe_parse("", 0x2900, 0x3060, off, val), 0);
+ 	KUNIT_EXPECT_EQ(test, ave_sps_probe_parse("\n", 0x2900, 0x3060, off, val), 0);
+diff --git a/drivers/media/platform/apple/ave/ave-layout.c b/drivers/media/platform/apple/ave/ave-layout.c
+index 34b170ce1a..133f1550e8 100644
+--- a/drivers/media/platform/apple/ave/ave-layout.c
++++ b/drivers/media/platform/apple/ave/ave-layout.c
+@@ -123,6 +123,16 @@ const struct ave_fw_layout ave_layout_9003_78_0 = {
+ 			.sps_h264_poc_type = 0x2d38,
+ 			.sps_h264_log2_max_poc_lsb_minus4 = 0x2d3c,
+ 			.sps_hevc_log2_max_poc_lsb_minus4 = 0x5ae0,
++			/*
++			 * The H.264 picture block is the 6070 one 0xdc90 lower (cabac,
++			 * transform_8x8 match); the HEVC sequence block 0x1ee1c lower
++			 * (size, crop, depths match). The macOS constants there equal
++			 * the in-band values: pic_init_qp_minus26 0, deblocking control
++			 * present 1, scaling_list_enabled 1.
++			 */
++			.sps_h264_pic_init_qp_minus26 = 0x2ff8,
++			.sps_h264_deblocking_control_present = 0x3020,
++			.sps_hevc_scaling_list_enabled = 0x5b54,
+ 			.sps_probe_lo = 0x2900,
+ 			.sps_probe_hi = 0x3060,
+ 		},
+@@ -235,8 +245,19 @@ const struct ave_fw_layout ave_layout_9003_78_0 = {
+ 			.sps_h264_poc_type = 0x2d38,
+ 			.sps_h264_log2_max_poc_lsb_minus4 = 0x2d3c,
+ 			.sps_hevc_log2_max_poc_lsb_minus4 = 0x5ae0,
++			/*
++			 * The H.264 picture block is the 6070 one 0xdc90 lower (cabac,
++			 * transform_8x8 match); the HEVC sequence block 0x1ee1c lower
++			 * (size, crop, depths match). The macOS constants there equal
++			 * the in-band values: pic_init_qp_minus26 0, deblocking control
++			 * present 1, scaling_list_enabled 1.
++			 */
++			.sps_h264_pic_init_qp_minus26 = 0x2ff8,
++			.sps_h264_deblocking_control_present = 0x3020,
++			.sps_hevc_scaling_list_enabled = 0x5b54,
++			/* Sequence, picture (+0x7400) and +0x9600 blocks */
+ 			.sps_probe_lo = 0x5900,
+-			.sps_probe_hi = 0x5c00,
++			.sps_probe_hi = 0xa000,
+ 		},
+ 	},
+ 	.process = {
+diff --git a/drivers/media/platform/apple/ave/ave-layout.h b/drivers/media/platform/apple/ave/ave-layout.h
+index 3d909a4940..1f94363691 100644
+--- a/drivers/media/platform/apple/ave/ave-layout.h
++++ b/drivers/media/platform/apple/ave/ave-layout.h
+@@ -263,6 +263,9 @@ struct ave_start_layout {
+ 	u32 sps_h264_poc_type;
+ 	u32 sps_h264_log2_max_poc_lsb_minus4;
+ 	u32 sps_hevc_log2_max_poc_lsb_minus4;
++	u32 sps_h264_pic_init_qp_minus26;
++	u32 sps_h264_deblocking_control_present; /* byte */
++	u32 sps_hevc_scaling_list_enabled; /* byte */
+ 	/* Start words the sps_probe test parameter may set: [lo, hi) */
+ 	u32 sps_probe_lo, sps_probe_hi;
+ 	u32 hevc_refs;
+diff --git a/drivers/media/platform/apple/ave/ave-v4l2.c b/drivers/media/platform/apple/ave/ave-v4l2.c
+index 9137763056..801c8ca5d4 100644
+--- a/drivers/media/platform/apple/ave/ave-v4l2.c
++++ b/drivers/media/platform/apple/ave/ave-v4l2.c
+@@ -540,6 +540,9 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
+ 	case V4L2_CID_APPLE_AVE_H264_POC_TYPE:
+ 	case V4L2_CID_APPLE_AVE_H264_LOG2_MAX_POC_LSB_MINUS4:
+ 	case V4L2_CID_APPLE_AVE_HEVC_LOG2_MAX_POC_LSB_MINUS4:
++	case V4L2_CID_APPLE_AVE_H264_PIC_INIT_QP:
++	case V4L2_CID_APPLE_AVE_H264_DEBLOCKING_CONTROL_PRESENT:
++	case V4L2_CID_APPLE_AVE_HEVC_SCALING_LIST_ENABLED:
+ 		ctx->sps_ctl[ctrl->id - V4L2_CID_APPLE_AVE_H264_LOG2_MAX_FRAME_NUM_MINUS4] =
+ 			ctrl->val;
+ 		break;
+@@ -585,6 +588,14 @@ static const struct v4l2_ctrl_config ave_ctrl_sps[AVE_SPS_COUNT] = {
+ 	[AVE_SPS_HEVC_LOG2_MAX_POC_LSB_MINUS4] =
+ 		AVE_SPS_CTRL(V4L2_CID_APPLE_AVE_HEVC_LOG2_MAX_POC_LSB_MINUS4,
+ 			     "HEVC Log2 Max POC LSB Minus4", 12),
++	[AVE_SPS_H264_PIC_INIT_QP] =
++		AVE_SPS_CTRL(V4L2_CID_APPLE_AVE_H264_PIC_INIT_QP, "H264 PIC Init QP", 51),
++	[AVE_SPS_H264_DEBLOCKING_CONTROL_PRESENT] =
++		AVE_SPS_CTRL(V4L2_CID_APPLE_AVE_H264_DEBLOCKING_CONTROL_PRESENT,
++			     "H264 Deblocking Control Present", 1),
++	[AVE_SPS_HEVC_SCALING_LIST_ENABLED] =
++		AVE_SPS_CTRL(V4L2_CID_APPLE_AVE_HEVC_SCALING_LIST_ENABLED,
++			     "HEVC Scaling List Enabled", 1),
+ };
+ 
+ static int ave_init_ctrls(struct ave_ctx *ctx)
+diff --git a/drivers/media/platform/apple/ave/ave-writer.c b/drivers/media/platform/apple/ave/ave-writer.c
+index 5df4e02965..d0e36e8cd9 100644
+--- a/drivers/media/platform/apple/ave/ave-writer.c
++++ b/drivers/media/platform/apple/ave/ave-writer.c
+@@ -450,8 +450,16 @@ MODULE_PARM_DESC(sps_probe, "Test only: raw Start words \"off=val[,off=val]\" in
+ 
+ static enum ave_codec ave_sps_codec(enum ave_sps_word word)
+ {
+-	return word == AVE_SPS_HEVC_LOG2_MAX_POC_LSB_MINUS4 ? AVE_CODEC_HEVC :
+-							      AVE_CODEC_H264;
++	return word == AVE_SPS_HEVC_LOG2_MAX_POC_LSB_MINUS4 ||
++	       word == AVE_SPS_HEVC_SCALING_LIST_ENABLED ? AVE_CODEC_HEVC :
++							   AVE_CODEC_H264;
++}
++
++/* Flags stored as one byte in the firmware's structure */
++static bool ave_sps_byte(enum ave_sps_word word)
++{
++	return word == AVE_SPS_H264_DEBLOCKING_CONTROL_PRESENT ||
++	       word == AVE_SPS_HEVC_SCALING_LIST_ENABLED;
+ }
+ 
+ /* Where @word sits in this build's Start command for its codec; 0: unknown. */
+@@ -471,6 +479,12 @@ u32 ave_sps_offset(const struct ave_fw_layout *fw, enum ave_sps_word word)
+ 		return l->sps_h264_log2_max_poc_lsb_minus4;
+ 	case AVE_SPS_HEVC_LOG2_MAX_POC_LSB_MINUS4:
+ 		return l->sps_hevc_log2_max_poc_lsb_minus4;
++	case AVE_SPS_H264_PIC_INIT_QP:
++		return l->sps_h264_pic_init_qp_minus26;
++	case AVE_SPS_H264_DEBLOCKING_CONTROL_PRESENT:
++		return l->sps_h264_deblocking_control_present;
++	case AVE_SPS_HEVC_SCALING_LIST_ENABLED:
++		return l->sps_hevc_scaling_list_enabled;
+ 	default:
+ 		return 0;
+ 	}
+@@ -521,8 +535,14 @@ static void ave_start_client_sps(struct ave_ctx *ctx, u8 *cmd, size_t len)
+ 	for (unsigned int i = 0; i < AVE_SPS_COUNT; i++) {
+ 		u32 o = ave_sps_offset(fw, i);
+ 
+-		if ((p->sps_set & BIT(i)) && o && ave_sps_codec(i) == p->codec &&
+-		    o + 4 <= len)
++		if (!(p->sps_set & BIT(i)) || !o || ave_sps_codec(i) != p->codec ||
++		    o + 4 > len)
++			continue;
++		if (ave_sps_byte(i))
++			cmd[o] = p->sps_val[i];
++		else if (i == AVE_SPS_H264_PIC_INIT_QP)
++			ave_put32(cmd, o, (u32)(p->sps_val[i] - 26));
++		else
+ 			ave_put32(cmd, o, p->sps_val[i]);
+ 	}
+ 
+diff --git a/drivers/media/platform/apple/ave/ave.h b/drivers/media/platform/apple/ave/ave.h
+index 679f19d22b..c1e2c802bd 100644
+--- a/drivers/media/platform/apple/ave/ave.h
++++ b/drivers/media/platform/apple/ave/ave.h
+@@ -174,12 +174,23 @@ enum ave_opcode {
+ #define V4L2_CID_APPLE_AVE_H264_POC_TYPE (V4L2_CID_APPLE_AVE_BASE + 2)
+ #define V4L2_CID_APPLE_AVE_H264_LOG2_MAX_POC_LSB_MINUS4 (V4L2_CID_APPLE_AVE_BASE + 3)
+ #define V4L2_CID_APPLE_AVE_HEVC_LOG2_MAX_POC_LSB_MINUS4 (V4L2_CID_APPLE_AVE_BASE + 4)
++/*
++ * Picture parameter set words, same rule: -1 keeps the firmware's value.
++ * PIC_INIT_QP is the QP itself (pic_init_qp_minus26 + 26), 0-51; the
++ * firmware codes slice_qp_delta against it.
++ */
++#define V4L2_CID_APPLE_AVE_H264_PIC_INIT_QP (V4L2_CID_APPLE_AVE_BASE + 5)
++#define V4L2_CID_APPLE_AVE_H264_DEBLOCKING_CONTROL_PRESENT (V4L2_CID_APPLE_AVE_BASE + 6)
++#define V4L2_CID_APPLE_AVE_HEVC_SCALING_LIST_ENABLED (V4L2_CID_APPLE_AVE_BASE + 7)
+ 
+ enum ave_sps_word {
+ 	AVE_SPS_H264_LOG2_MAX_FRAME_NUM_MINUS4,
+ 	AVE_SPS_H264_POC_TYPE,
+ 	AVE_SPS_H264_LOG2_MAX_POC_LSB_MINUS4,
+ 	AVE_SPS_HEVC_LOG2_MAX_POC_LSB_MINUS4,
++	AVE_SPS_H264_PIC_INIT_QP,
++	AVE_SPS_H264_DEBLOCKING_CONTROL_PRESENT,
++	AVE_SPS_HEVC_SCALING_LIST_ENABLED,
+ 	AVE_SPS_COUNT,
+ };
+ 
+@@ -411,7 +422,7 @@ struct ave_params {
+ 	u32 initial_qp; /* CQ only; bit-rate modes use 26 */
+ 	bool speed; /* prioritize encoding speed over quality */
+ 	u8 sps_set; /* BIT(enum ave_sps_word): the client chose that word */
+-	u8 sps_val[AVE_SPS_COUNT];
++	s32 sps_val[AVE_SPS_COUNT];
+ };
+ 
+ struct ave_slot {
+-- 
+2.43.0
+

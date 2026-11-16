@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 05:59:43 +0000
+Subject: [PATCH] sched/fair: Move a new CPU-bound task to a big CPU
+ after a short first run
+
+FORK_BIG starts every new task on an idle CPU of the highest capacity.
+On the M4 MacBook Pro that brings a single unhinted memory thread from
+65-70 to 93-94 GB/s, but a shell loop of 2000 short children then takes
+about 150 ms longer (870-895 ms against 720-745 ms), because every
+child is sent to, and wakes, an idle big CPU. Starting the lift alone,
+without the placement, gives nothing (68.5 / 66.4 GB/s against 64.6-71.3
+off): the gain is the placement.
+
+Place after the fact instead. Add the debugfs knob misfit_new_ns
+(default 0: no change). A task that has not slept since it was forked
+counts as a misfit after running that long on a smaller CPU, instead of
+misfit_runtime_ns, and the MISFIT_RUNTIME tick push moves it to an idle
+big CPU. On that first move its utilization starts at the new CPU's
+spare capacity, as fork_big_lift does at fork, so the clock does not
+ramp from the small CPU's level. A child that exits within the window
+is never moved.
+
+Assisted-by: LLM
+---
+ include/linux/sched.h |  2 ++
+ kernel/sched/core.c   |  1 +
+ kernel/sched/debug.c  |  1 +
+ kernel/sched/fair.c   | 33 ++++++++++++++++++++++++++++++++-
+ kernel/sched/sched.h  |  1 +
+ 5 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 86a1c9621d..d1739e893b 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -946,6 +946,8 @@ struct task_struct {
+ 	/* Time of this task's last fork, and whether that fork was a burst. */
+ 	u64				fork_big_last;
+ 	bool				fork_big_burst;
++	/* Has not slept since it was forked (misfit_new_ns). */
++	bool				misfit_fresh;
+ 	int				nr_cpus_allowed;
+ 	const cpumask_t			*cpus_ptr;
+ 	cpumask_t			*user_cpus_ptr;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 821dff7840..4d4884b9a4 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4668,6 +4668,7 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
+ 	p->burst_runtime		= 0;
+ 	p->fork_big_last		= 0;
+ 	p->fork_big_burst		= false;
++	p->misfit_fresh			= false;
+ 	p->se.prev_sum_exec_runtime	= 0;
+ 	p->se.nr_migrations		= 0;
+ 	p->se.vruntime			= 0;
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 7dac34d102..ce09352d83 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -732,6 +732,7 @@ static __init int sched_init_debug(void)
+ 	debugfs_create_u32("misfit_runtime_ns", 0644, debugfs_sched, &sysctl_sched_misfit_runtime);
+ 	debugfs_create_u32("fork_big_lift", 0644, debugfs_sched, &sysctl_sched_fork_big_lift);
+ 	debugfs_create_u32("fork_big_gap_ns", 0644, debugfs_sched, &sysctl_sched_fork_big_gap);
++	debugfs_create_u32("misfit_new_ns", 0644, debugfs_sched, &sysctl_sched_misfit_new);
+ 
+ 	sched_domains_mutex_lock();
+ 	update_sched_domain_debugfs();
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 78ccae6e33..a2b8070fae 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -109,6 +109,16 @@ __read_mostly unsigned int sysctl_sched_fork_big_lift;
+  */
+ __read_mostly unsigned int sysctl_sched_fork_big_gap;
+ 
++/*
++ * misfit_new_ns: a task that has not slept since it was forked counts as a
++ * misfit after running this long on a smaller CPU (instead of
++ * misfit_runtime_ns), and its first move to a CPU of the highest capacity
++ * starts it at that CPU's spare capacity. A fork burst of short children
++ * never reaches it; a CPU-bound new thread gets the big CPU within it.
++ * (default: 0 = off, units: nanoseconds)
++ */
++__read_mostly unsigned int sysctl_sched_misfit_new;
++
+ static int __init setup_sched_thermal_decay_shift(char *str)
+ {
+ 	pr_warn("Ignoring the deprecated sched_thermal_decay_shift= option\n");
+@@ -1394,6 +1404,7 @@ void post_init_entity_util_avg(struct task_struct *p)
+ 	long cap = (long)(cpu_scale - cfs_rq->avg.util_avg) / 2;
+ 
+ 	p->fork_big_burst = current->fork_big_burst;
++	p->misfit_fresh = !(p->flags & PF_KTHREAD);
+ 
+ 	if (p->sched_class != &fair_sched_class) {
+ 		/*
+@@ -6393,7 +6404,9 @@ static inline bool task_misfit_runtime(struct task_struct *p, int cpu)
+ 		return false;
+ 
+ 	return p->se.sum_exec_runtime - p->burst_runtime >=
+-	       sysctl_sched_misfit_runtime;
++	       (p->misfit_fresh && READ_ONCE(sysctl_sched_misfit_new) ?
++		min(READ_ONCE(sysctl_sched_misfit_new), sysctl_sched_misfit_runtime) :
++		sysctl_sched_misfit_runtime);
+ }
+ 
+ static inline bool task_is_misfit(struct task_struct *p, int cpu)
+@@ -8288,6 +8301,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 	if (flags & ENQUEUE_WAKEUP) {
+ 		p->misfit_runtime = se->sum_exec_runtime;
+ 		p->burst_runtime = se->sum_exec_runtime;
++		p->misfit_fresh = false;
+ 	}
+ 
+ 	if (task_is_throttled(p) && enqueue_throttled_task(p))
+@@ -10149,6 +10163,23 @@ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
+ 	p->misfit_runtime = se->sum_exec_runtime;
+ 	p->burst_runtime = se->sum_exec_runtime;
+ 
++	/*
++	 * misfit_new_ns: a running task that has not slept since its fork moves
++	 * to a CPU of the highest capacity it may use. Its utilization has left
++	 * the old CPU (dequeue detached it) and is attached to the new one from
++	 * util_avg, so raise it to the new CPU's spare capacity here, once.
++	 */
++	if (p->misfit_fresh && READ_ONCE(sysctl_sched_misfit_new) &&
++	    task_on_rq_migrating(p) && sched_asym_cpucap_active() &&
++	    arch_scale_cpu_capacity(new_cpu) == p->max_allowed_capacity) {
++		unsigned long cap = arch_scale_cpu_capacity(new_cpu);
++		unsigned long used = min(cpu_util_cfs(new_cpu), cap);
++
++		se->avg.util_avg = max(se->avg.util_avg, cap - used);
++		se->avg.runnable_avg = max(se->avg.runnable_avg, se->avg.util_avg);
++		p->misfit_fresh = false;
++	}
++
+ 	if (!task_on_rq_migrating(p)) {
+ 		remove_entity_load_avg(se);
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index f72b12bf1b..f9908fccbb 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -3161,6 +3161,7 @@ extern __read_mostly unsigned int sysctl_sched_migration_cost;
+ extern __read_mostly unsigned int sysctl_sched_misfit_runtime;
+ extern __read_mostly unsigned int sysctl_sched_fork_big_lift;
+ extern __read_mostly unsigned int sysctl_sched_fork_big_gap;
++extern __read_mostly unsigned int sysctl_sched_misfit_new;
+ 
+ extern unsigned int sysctl_sched_base_slice;
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 05:43:59 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally notify the host only for
+ renders to an idle pair
+
+Every TA and FS completion block sets the word at +0x1c, which the
+G17 backend documents as first_kick: set on every kick, the firmware
+also notifies the host of each pass's completion, which no retirement
+needs. On the J604 a render.light command raises 1.29 receive-ring
+service messages against 0.057 per command on macOS.
+
+Add g16_first_kick_idle (runtime, default 0). Set to 1, the word is
+cleared for a render published behind running work, whose receipts the
+poller proves from the stamps; a render published to an idle pair keeps
+it, which G17 found needed (without it such a render completes later).
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |  9 +++++++++
+ drivers/gpu/drm/asahi/g16/params.rs | 20 ++++++++++++++++++++
+ 2 files changed, 29 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 7733ff787a..b31c88da78 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1695,6 +1695,7 @@ fn prefix_render(
+         job.resources
+             .render()?
+             .set_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes)?;
++        let behind = !self.engine.flights.is_empty();
+         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
+         encode::encode_ta(
+             &refs,
+@@ -1721,6 +1722,14 @@ fn prefix_render(
+             image(&mut scratch.fs)?,
+             &mut scratch.fss[..],
+         );
++        // g16_first_kick_idle: a render queued behind running work needs no per-pass
++        // notification; its receipts are proven from the stamps (TA block at +0x878, FS block
++        // at +0xbc0, the word at +0x1c of each, see encode::render metadata()).
++        if behind && params::first_kick_idle() {
++            for (v, at) in [(&mut scratch.ta, 0x878 + 0x1c), (&mut scratch.fs, 0xbc0 + 0x1c)] {
++                v.get_mut(at..at + 4).ok_or(EINVAL)?.fill(0);
++            }
++        }
+         encode::render_attachments(&mut scratch.tas[..], 0, &cmd.vertex_attachments);
+         encode::render_attachments(&mut scratch.fss[..], 1, &cmd.fragment_attachments);
+         params::render_patch_apply(&mut scratch.tas[..], &mut scratch.fss[..]);
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 5358a9b31c..d138b9ff41 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -796,6 +796,26 @@ pub(crate) fn idle_selector() -> Option<u32> {
+     "G16: idle performance selector plus one: with nothing in flight or pending, publish N - 1 to the three Globals selectors; the busy value returns before the next publication (default 0: off; 1: publish 0; runtime 0644)"
+ );
+ 
++/// Storage of `g16_first_kick_idle` (runtime 0644, default 0).
++static FIRST_KICK_IDLE: AtomicU32 = AtomicU32::new(0);
++
++/// Whether the word at +0x1c of the TA and FS completion blocks (the G17 descriptor's
++/// `first_kick`: "set on every kick, the firmware also notifies the host of each pass's
++/// completion, which no retirement needs") is set only for a render published with nothing
++/// in flight, instead of for every render.
++pub(crate) fn first_kick_idle() -> bool {
++    FIRST_KICK_IDLE.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    FIRST_KICK_IDLE_PARAM,
++    FIRST_KICK_IDLE_PARMTYPE,
++    FIRST_KICK_IDLE_PARM,
++    FIRST_KICK_IDLE,
++    "g16_first_kick_idle",
++    "G16: ask for the per-pass host notification (+0x1c of the TA/FS completion blocks) only for a render published with nothing in flight, as G17 does (default 0: every render; 1: idle only; runtime 0644)"
++);
++
+ /// Storage of `g16_subgen` (runtime 0644, default 0).
+ static SUBGEN: AtomicU32 = AtomicU32::new(0);
+ 
+-- 
+2.43.0
+

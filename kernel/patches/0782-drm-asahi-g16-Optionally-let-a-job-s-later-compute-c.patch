@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 08:48:06 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally let a job's later compute
+ commands go ahead
+
+Only a job's first command may be published behind in-flight work.
+A job's later command waits until its predecessor in the job has been
+retired by the host, which guarantees that the predecessor finished
+and that a failed command leaves the rest of its job unpublished.
+
+With two compute commands per submission, as an application that
+timestamps every command buffer produces, every second command is
+then published only after a full completion round trip, and half of
+the stream runs serially.
+
+Add g16_job_ahead (runtime, default 0). With 1, a later compute command
+that follows a compute command of its job may go behind in-flight
+work like a first command. The single compute queue runs its commands
+in ring order, one at a time, so it still starts after its
+predecessor; explicit waits are still checked; and a failure latches
+the VM, dooms the job's later flights and holds its terminal fence
+until every flight of the job has retired. With 2, a compute
+command's wait on compute commands that are already published ahead
+of it in the compute queue is met by the queue order rather than by
+their completion.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/command.rs | 23 +++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/job.rs     | 28 +++++++++++++++++++++++++---
+ drivers/gpu/drm/asahi/g16/params.rs  | 20 ++++++++++++++++++++
+ 3 files changed, 68 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/command.rs b/drivers/gpu/drm/asahi/g16/command.rs
+index 914274ed8d..14782bdd52 100644
+--- a/drivers/gpu/drm/asahi/g16/command.rs
++++ b/drivers/gpu/drm/asahi/g16/command.rs
+@@ -137,6 +137,29 @@ pub(crate) fn ready_in_flight(
+                 .all(|(prefix, observed)| prefix.is_none_or(|last| observed >= last))
+     }
+ 
++    /// [`Self::ready_in_flight`], except that a wait on this command's own engine is met by
++    /// any command already published ahead of it in that engine's queue (`g16_job_ahead` = 2,
++    /// compute only: the queue runs its commands in ring order, one at a time).
++    pub(crate) fn ready_in_queue(
++        &self,
++        completed: [u64; 2],
++        published: [u64; 2],
++        behind: u64,
++    ) -> bool {
++        let e = self.engine;
++        published[e].checked_add(1) == Some(self.sequence)
++            && published[e] > completed[e]
++            && published[e] - completed[e] <= behind.max(1)
++            && self
++                .wait_through
++                .iter()
++                .zip(completed)
++                .enumerate()
++                .all(|(i, (prefix, observed))| {
++                    prefix.is_none_or(|last| observed >= last || (i == e && last <= published[e]))
++                })
++    }
++
+     pub(crate) fn ready(&self, completed: [u64; 2]) -> bool {
+         completed[self.engine].checked_add(1) == Some(self.sequence)
+             && self
+diff --git a/drivers/gpu/drm/asahi/g16/job.rs b/drivers/gpu/drm/asahi/g16/job.rs
+index 3cf9ef4bd5..ba7707c531 100644
+--- a/drivers/gpu/drm/asahi/g16/job.rs
++++ b/drivers/gpu/drm/asahi/g16/job.rs
+@@ -299,8 +299,18 @@ pub(crate) fn check_command_dependencies(&self, index: u32) -> Result {
+             return Ok(());
+         }
+         // Only a job's first command goes behind in-flight predecessors (of earlier jobs):
+-        // one job never occupies two flights. Render with g16_depth (one) or g16_resident
+-        // (resident depth - 1), compute with g16_horizon (up to its depth).
++        // one job never occupies two flights, so a job's command k + 1 is published only
++        // after command k retired (its own predecessor finished, and a failed k leaves k + 1
++        // unpublished). Render with g16_depth (one) or g16_resident (resident depth - 1),
++        // compute with g16_horizon (up to its depth).
++        //
++        // g16_job_ahead >= 1: a later compute command whose job's previous command is also a
++        // compute command may go behind in-flight work too. The single compute queue runs its
++        // commands in ring order, one at a time, so k + 1 still starts after k; explicit
++        // waits are still checked, and a failure of k latches the VM, dooms its later
++        // flights and defers the job's terminal fence until every flight of it retired.
++        // g16_job_ahead >= 2: a compute command's wait on compute commands already published
++        // ahead of it in that queue is satisfied by the queue order instead of a completion.
+         let resident = super::params::resident();
+         let (ahead, behind) = if order.engine == super::command::COMPUTE {
+             (super::params::horizon(), super::params::horizon_depth())
+@@ -309,7 +319,16 @@ pub(crate) fn check_command_dependencies(&self, index: u32) -> Result {
+         } else {
+             (super::params::depth() != 0, 1)
+         };
+-        if ahead && index == 0 {
++        let job_ahead = super::params::job_ahead();
++        let compute = order.engine == super::command::COMPUTE;
++        let later = compute
++            && job_ahead >= 1
++            && index > 0
++            && self
++                .orders
++                .get(index as usize - 1)
++                .is_some_and(|prev| prev.engine == super::command::COMPUTE);
++        if ahead && (index == 0 || later) {
+             let published = self
+                 .queue
+                 .published
+@@ -318,6 +337,9 @@ pub(crate) fn check_command_dependencies(&self, index: u32) -> Result {
+             if order.ready_in_flight(completed, published, behind) {
+                 return Ok(());
+             }
++            if compute && job_ahead >= 2 && order.ready_in_queue(completed, published, behind) {
++                return Ok(());
++            }
+         }
+         Err(EAGAIN)
+     }
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 820334c7eb..bf626644b6 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -855,6 +855,26 @@ pub(crate) fn pass_check_once() -> bool {
+     "G16: verify the firmware session and the adopted UAT bindings once per poll pass instead of four times under the same lock (default 0: four; 1: once; runtime 0644)"
+ );
+ 
++/// Storage of `g16_job_ahead` (runtime 0644, default 0).
++static JOB_AHEAD: AtomicU32 = AtomicU32::new(0);
++
++/// How far a job's compute commands may go behind in-flight work: 0 (default) only a job's
++/// first command; 1 also a later compute command that follows a compute command of its job;
++/// 2 also lets a wait on compute commands already published ahead in the compute queue be
++/// met by the queue order. Levels above 2 are treated as 2.
++pub(crate) fn job_ahead() -> u32 {
++    JOB_AHEAD.load(Ordering::Relaxed).min(2)
++}
++
++live_u32_param!(
++    JOB_AHEAD_PARAM,
++    JOB_AHEAD_PARMTYPE,
++    JOB_AHEAD_PARM,
++    JOB_AHEAD,
++    "g16_job_ahead",
++    "G16: 0 (default) only a job's first command goes behind in-flight work; 1 = also its later compute commands after a compute command; 2 = also meet a wait on compute commands published ahead in the compute queue by its order (needs g16_horizon; runtime 0644)"
++);
++
+ /// Storage of `g16_submit_boost` (runtime 0644, default 0).
+ static SUBMIT_BOOST: AtomicU32 = AtomicU32::new(0);
+ 
+-- 
+2.43.0
+

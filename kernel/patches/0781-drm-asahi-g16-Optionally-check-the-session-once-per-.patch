@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 08:48:06 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally check the session once per
+ poll pass
+
+A poll pass verifies the firmware session and the adopted UAT bindings
+four times under the same device lock: in the session check and the
+object health check before retirement, and again in both checks at the
+start of the publication it runs. Each binding check reads both roots
+of all 64 contexts from the write-combined TTB table, so a pass makes
+about 512 uncached reads before and after retiring a command.
+
+Add g16_pass_check_once (runtime, default 0). With 1, a poll pass makes
+the session check (which includes the binding check) once, the object
+health check without repeating the binding check, and its publication
+relies on both. Publications outside a poll pass still check in full.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 10 ++++++++--
+ drivers/gpu/drm/asahi/g16/object.rs |  9 +++++++++
+ drivers/gpu/drm/asahi/g16/params.rs | 20 ++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 11 ++++++++++-
+ 4 files changed, 47 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index b41f8485bb..78f84e6f9d 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -553,6 +553,9 @@ pub(crate) struct Engine {
+     pub(crate) ta_registered: bool,
+     /// A ready prefix waits only for a record's consumption: repoll sooner.
+     pub(crate) chan_wait: bool,
++    /// `g16_pass_check_once`: the poll pass calling [`Firmware::publish`] has just made the
++    /// session and health checks under this device lock. Taken by publish().
++    pub(crate) pass_checked: bool,
+     /// Progress tracking of the oldest prefix.
+     pub(crate) progress_flight: u64,
+     pub(crate) progress: [Option<u32>; 3],
+@@ -596,6 +599,7 @@ pub(crate) fn new() -> Result<Self> {
+             render_registered: false,
+             ta_registered: false,
+             chan_wait: false,
++            pass_checked: false,
+             progress_flight: 0,
+             progress: [None; 3],
+             stats: Stats::default(),
+@@ -1030,8 +1034,10 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+         if self.session.shared.sleeping.load(core::sync::atomic::Ordering::Acquire) {
+             return Ok(());
+         }
+-        self.session.check()?;
+-        self.objects.health()?;
++        if !core::mem::take(&mut self.engine.pass_checked) {
++            self.session.check()?;
++            self.objects.health()?;
++        }
+         self.service_power()?;
+         self.drain_rings()?;
+         self.check_hangs(done)?;
+diff --git a/drivers/gpu/drm/asahi/g16/object.rs b/drivers/gpu/drm/asahi/g16/object.rs
+index 0f26cb3276..e3fcd000e0 100644
+--- a/drivers/gpu/drm/asahi/g16/object.rs
++++ b/drivers/gpu/drm/asahi/g16/object.rs
+@@ -545,6 +545,15 @@ pub(crate) fn health(&mut self) -> Result {
+         self.uat.check_adopted_bindings()
+     }
+ 
++    /// [`Self::health`] without the adopted-binding check, for a caller that has just made
++    /// it under the same device lock (`g16_pass_check_once`).
++    pub(crate) fn health_window(&mut self) -> Result {
++        if let Some(error) = self.error {
++            return Err(error);
++        }
++        self.window.lock().check()
++    }
++
+     /// Allocates and maps a zeroed firmware object.
+     pub(crate) fn alloc(&mut self, req: Request) -> Result<Arc<FwObject>> {
+         self.alloc_split(req, None)
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index f3777b2877..820334c7eb 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -835,6 +835,26 @@ pub(crate) fn fs_event0() -> bool {
+     "G16: write the FS completion block's producing event (+0x14) as 0, as macOS does, instead of 0x71, which no barrier waits on (default 0: 0x71; 1: 0; runtime 0644)"
+ );
+ 
++/// Storage of `g16_pass_check_once` (runtime 0644, default 0).
++static PASS_CHECK_ONCE: AtomicU32 = AtomicU32::new(0);
++
++/// Whether a poll pass verifies the session and the adopted UAT bindings once, instead of
++/// once in the session check, again in the object health check and twice more in the
++/// publication it runs, all under the same device lock. Each binding check reads both
++/// roots of all 64 contexts from the write-combined TTB table.
++pub(crate) fn pass_check_once() -> bool {
++    PASS_CHECK_ONCE.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    PASS_CHECK_ONCE_PARAM,
++    PASS_CHECK_ONCE_PARMTYPE,
++    PASS_CHECK_ONCE_PARM,
++    PASS_CHECK_ONCE,
++    "g16_pass_check_once",
++    "G16: verify the firmware session and the adopted UAT bindings once per poll pass instead of four times under the same lock (default 0: four; 1: once; runtime 0644)"
++);
++
+ /// Storage of `g16_submit_boost` (runtime 0644, default 0).
+ static SUBMIT_BOOST: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 687d91b4ae..9f61263b43 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -302,7 +302,13 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+         let mut pre = Lap::start();
+         self.session.check()?;
+         pre.lap(&mut self.engine.prof.check_ns);
+-        self.objects.health()?;
++        // g16_pass_check_once: session.check() just verified the adopted UAT bindings.
++        let once = params::pass_check_once();
++        if once {
++            self.objects.health_window()?;
++        } else {
++            self.objects.health()?;
++        }
+         pre.lap(&mut self.engine.prof.health_ns);
+         self.service_power()?;
+         pre.lap(&mut self.engine.prof.power_ns);
+@@ -326,7 +332,10 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+         self.answer_growth()?;
+         self.check_hangs(done)?;
+         lap.lap(&mut self.engine.prof.hangs_ns);
++        self.engine.pass_checked = once;
+         let published = self.publish(done);
++        // Not left set when publish() returned before taking it (system sleep).
++        self.engine.pass_checked = false;
+         lap.lap(&mut self.engine.prof.publish_ns);
+         let s = &mut self.engine.stats;
+         if self.engine.flights.is_empty() && s.idle_from_ns != 0 {
+-- 
+2.43.0
+

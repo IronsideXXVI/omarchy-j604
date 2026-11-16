@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 03:49:43 +0000
+Subject: [PATCH] soc: apple: clpc: Optionally cap the E cluster while
+ P cores are busy
+
+On the J604 the E cluster stays in its 2808 MHz state at the same
+903 mV once any P core is busy, but it draws 14-17 % less power and
+delivers well below that clock. With all ten cores busy it delivers
+about 1840-1900 MHz, and macOS 26B123 does the same. The power goes
+into holding a voltage for a clock the cluster does not get.
+
+Add e_cap_khz: while a faster cluster has an all-core busy CPU, hold
+the slowest cluster at the nearest table step at or below it. It is
+off by default (0), so nothing changes until it is measured.
+
+Assisted-by: LLM
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/soc/apple/clpc.c | 40 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/drivers/soc/apple/clpc.c b/drivers/soc/apple/clpc.c
+index 4d97e64d38..1b09b0ae2c 100644
+--- a/drivers/soc/apple/clpc.c
++++ b/drivers/soc/apple/clpc.c
+@@ -291,6 +291,19 @@ MODULE_PARM_DESC(all_core_override,
+  * evaluation (APPLE_CLPC_POWER_MS); macOS idles its P cluster at its slowest state
+  * where schedutil's headroom keeps one step up. 0, the default, holds nothing.
+  */
++/*
++ * e_cap_khz: outside the low-power profile, while any CPU of a faster cluster is
++ * all-core busy, hold the slowest cluster at or below this frequency (the nearest
++ * table step at or below it). On the J604 the E cluster stays in its 2808 MHz state
++ * at the same voltage once P cores are busy, but delivers well below that clock,
++ * on macOS too; a lower state may deliver the same at a lower voltage. 0, the
++ * default, holds nothing.
++ */
++static unsigned int e_cap_khz;
++module_param(e_cap_khz, uint, 0644);
++MODULE_PARM_DESC(e_cap_khz,
++		 "While a faster cluster has an all-core busy CPU, hold the slowest cluster at or below this kHz (0 = off, default)");
++
+ static unsigned int idle_cap_pct;
+ module_param(idle_cap_pct, uint, 0644);
+ MODULE_PARM_DESC(idle_cap_pct,
+@@ -1141,6 +1154,31 @@ static unsigned int apple_clpc_all_core_khz(struct apple_clpc *clpc,
+  * busy stays at hw->all_core_khz where the SoC has one, as macOS's clamp holds
+  * it, and has no ceiling otherwise.
+  */
++/* e_cap_khz: the slowest cluster's ceiling while another cluster is busy */
++static void apple_clpc_e_cap(struct apple_clpc *clpc,
++			     struct cpufreq_policy **policy)
++{
++	unsigned int cap = READ_ONCE(e_cap_khz), i, slow = 0, khz;
++	bool busy = false;
++
++	if (!cap || clpc->nr_clusters < 2)
++		return;
++	for (i = 0; i < clpc->nr_clusters; i++) {
++		if (!policy[i])
++			return;
++		if (policy[i]->cpuinfo.max_freq < policy[slow]->cpuinfo.max_freq)
++			slow = i;
++	}
++	for (i = 0; i < clpc->nr_clusters; i++)
++		if (i != slow && clpc->clusters[i].nbusy)
++			busy = true;
++	khz = apple_clpc_step_khz(policy[slow], cap + 1, false);
++	if (!busy || khz > cap)
++		return;
++	if (!clpc->clusters[slow].max_khz || khz < clpc->clusters[slow].max_khz)
++		clpc->clusters[slow].max_khz = khz;
++}
++
+ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
+ {
+ 	bool low = READ_ONCE(clpc->low_power);
+@@ -1204,6 +1242,8 @@ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
+ 	}
+ 	if (pick >= 0)
+ 		clpc->clusters[pick].max_khz = pick_khz;
++	if (!low)
++		apple_clpc_e_cap(clpc, policy);
+ 	for (i = 0; i < clpc->nr_clusters; i++) {
+ 		struct apple_clpc_cluster *cl = &clpc->clusters[i];
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,279 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 07:17:13 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally boost the submit path
+ while work is in flight
+
+A light render or compute stream keeps 64 submissions in flight, yet a
+command finds fewer than two others queued at the firmware when it
+starts: the work between the scheduler and the firmware arrives late.
+That work runs on drm_sched's ordered, normal-priority workqueue and
+on whatever CPU and clock the governor gives short kernel work, which
+on the J604 is often an efficiency core near 0.9 GHz.
+
+Add g16_submit_boost (runtime, default 0). Bit 0: queues created from
+then on run their scheduler work on a high-priority ordered reclaim
+workqueue (new OwnedQueue::new_ordered_reclaim_highpri). Bit 1: every
+cpufreq policy gets a minimum-frequency request at its top frequency
+from the first command in flight until the busy period ends (the same
+window as g16_lat_qos_us, also dropped at fail-stop), so idle power
+does not change. A performance-core cpumask is not set: an ordered
+workqueue's attributes cannot be changed, and a module cannot apply
+workqueue attributes.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/boot.rs   |  7 ++++
+ drivers/gpu/drm/asahi/g16/glue.c    | 52 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/job.rs    | 12 ++++++-
+ drivers/gpu/drm/asahi/g16/mod.rs    |  5 +++
+ drivers/gpu/drm/asahi/g16/params.rs | 19 +++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 18 ++++++++++
+ rust/kernel/workqueue.rs            | 11 +++++-
+ 7 files changed, 122 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 0d370ecccc..9f46e84778 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -49,6 +49,7 @@ pub(crate) mod glue {
+         fn asahi_g16_perf_rows() -> core::ffi::c_uint;
+         fn asahi_g16_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+         fn asahi_g16_lat_qos(us: core::ffi::c_int) -> core::ffi::c_int;
++        fn asahi_g16_cpu_floor(on: bool) -> core::ffi::c_int;
+         fn asahi_g16_rt_start(
+             f: unsafe extern "C" fn(*mut core::ffi::c_void),
+             cookie: *mut core::ffi::c_void,
+@@ -71,6 +72,12 @@ fn asahi_g16_reserved_region(
+     }
+ 
+     /// Sets the CPU wake-latency bound to `us`, or drops it for `None`. Process context.
++    /// Holds (`on`) or releases every cpufreq policy's top-frequency floor. Process context.
++    pub(crate) fn cpu_floor(on: bool) -> Result {
++        // SAFETY: Updates the driver's own frequency requests only.
++        kernel::error::to_result(unsafe { asahi_g16_cpu_floor(on) })
++    }
++
+     pub(crate) fn lat_qos(us: Option<u32>) -> Result {
+         let us = us.map_or(-1, |us| us.min(i32::MAX as u32) as core::ffi::c_int);
+         // SAFETY: Updates the driver's own CPU latency request only.
+diff --git a/drivers/gpu/drm/asahi/g16/glue.c b/drivers/gpu/drm/asahi/g16/glue.c
+index 2aee732c7a..c37c0df4c1 100644
+--- a/drivers/gpu/drm/asahi/g16/glue.c
++++ b/drivers/gpu/drm/asahi/g16/glue.c
+@@ -5,6 +5,7 @@
+  */
+ #include <linux/device.h>
+ #include <linux/atomic.h>
++#include <linux/cpufreq.h>
+ #include <linux/dma-map-ops.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+@@ -36,6 +37,7 @@ bool asahi_g16_j604_board(void);
+ int asahi_g16_display_prepare(struct device *dev);
+ int asahi_g16_hold_power(struct device *dev);
+ int asahi_g16_lat_qos(int us);
++int asahi_g16_cpu_floor(bool on);
+ int asahi_g16_rt_start(void (*fn)(void *cookie), void *cookie);
+ bool asahi_g16_rt_kick(void);
+ bool asahi_g16_ram_disjoint(u64 start, u64 size);
+@@ -482,6 +484,56 @@ bool asahi_g16_rt_kick(void)
+  * drops it. Called under the G16 state lock, in process context. The request is
+  * allocated once and never freed, so it stays valid however the driver goes.
+  */
++/*
++ * g16_submit_boost bit 1: one minimum-frequency request per cpufreq policy, at the policy's
++ * top frequency while GPU commands are in flight and at the default (no floor) otherwise.
++ * Called under the G16 state mutex (process context); the requests stay registered.
++ */
++#define ASAHI_G16_FLOOR_POLICIES 4
++static struct freq_qos_request asahi_g16_floor_req[ASAHI_G16_FLOOR_POLICIES];
++static struct cpufreq_policy *asahi_g16_floor_pol[ASAHI_G16_FLOOR_POLICIES];
++
++int asahi_g16_cpu_floor(bool on)
++{
++	unsigned int cpu, n = 0;
++	int ret = 0;
++
++	for_each_possible_cpu(cpu) {
++		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
++		unsigned int i;
++
++		if (!policy)
++			continue;
++		if (cpu != cpumask_first(policy->related_cpus) || n >= ASAHI_G16_FLOOR_POLICIES) {
++			cpufreq_cpu_put(policy);
++			continue;
++		}
++		i = n++;
++		if (!asahi_g16_floor_pol[i]) {
++			if (!on) {
++				cpufreq_cpu_put(policy);
++				continue;
++			}
++			ret = freq_qos_add_request(&policy->constraints, &asahi_g16_floor_req[i],
++						   FREQ_QOS_MIN, policy->cpuinfo.max_freq);
++			if (ret < 0) {
++				cpufreq_cpu_put(policy);
++				break;
++			}
++			/* The policy reference is kept while its request is registered. */
++			asahi_g16_floor_pol[i] = policy;
++			continue;
++		}
++		ret = freq_qos_update_request(&asahi_g16_floor_req[i],
++					      on ? policy->cpuinfo.max_freq :
++					      FREQ_QOS_MIN_DEFAULT_VALUE);
++		cpufreq_cpu_put(policy);
++		if (ret < 0)
++			break;
++	}
++	return ret < 0 ? ret : 0;
++}
++
+ int asahi_g16_lat_qos(int us)
+ {
+ 	static struct pm_qos_request *req;
+diff --git a/drivers/gpu/drm/asahi/g16/job.rs b/drivers/gpu/drm/asahi/g16/job.rs
+index 9f3822e3fd..3cf9ef4bd5 100644
+--- a/drivers/gpu/drm/asahi/g16/job.rs
++++ b/drivers/gpu/drm/asahi/g16/job.rs
+@@ -543,13 +543,23 @@ pub(crate) struct Scheduler {
+ 
+ impl Scheduler {
+     pub(crate) fn new(dev: &device::Device) -> Result<Self> {
+-        let scheduler = sched::Scheduler::new(
++        // g16_submit_boost bit 0: run-job and free-job on high-priority workers.
++        let submit_wq = if super::params::submit_boost() & 1 != 0 {
++            Some(kernel::workqueue::OwnedQueue::new_ordered_reclaim_highpri(
++                c_str!("aurora_g16_hi"),
++            )?)
++        } else {
++            None
++        };
++        let scheduler = sched::Scheduler::new_with_queues(
+             dev,
+             1,
+             super::params::resident_credits(),
+             0,
+             hw::tuning::SCHED_TIMEOUT_MS,
+             c_str!("aurora_g16"),
++            submit_wq,
++            None,
+         )?;
+         // With one run queue, only the kernel priority is valid.
+         let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index ad044ee5bd..d923ffaead 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -211,6 +211,9 @@ pub(crate) struct Shared {
+     pub(crate) lat_us: AtomicU32,
+     /// When the last pass saw commands in flight, `now_ns()`.
+     pub(crate) lat_busy_ns: AtomicU64,
++    /// `g16_submit_boost` bit 1: the CPU frequency floor is held, and when work was last busy.
++    pub(crate) floor_on: AtomicBool,
++    pub(crate) floor_busy_ns: AtomicU64,
+     // --- RTKit callback state and a retained failed session. ---
+     /// The first latched error, as a negative errno.
+     pub(crate) error: AtomicI32,
+@@ -414,6 +417,8 @@ pub(crate) fn new(
+                 work_ticks: AtomicU64::new(0),
+                 lat_us: AtomicU32::new(0),
+                 lat_busy_ns: AtomicU64::new(0),
++                floor_on: AtomicBool::new(false),
++                floor_busy_ns: AtomicU64::new(0),
+                 error: AtomicI32::new(0),
+                 started: AtomicBool::new(false),
+                 data,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index d138b9ff41..5f6434e8f8 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -816,6 +816,25 @@ pub(crate) fn first_kick_idle() -> bool {
+     "G16: ask for the per-pass host notification (+0x1c of the TA/FS completion blocks) only for a render published with nothing in flight, as G17 does (default 0: every render; 1: idle only; runtime 0644)"
+ );
+ 
++/// Storage of `g16_submit_boost` (runtime 0644, default 0).
++static SUBMIT_BOOST: AtomicU32 = AtomicU32::new(0);
++
++/// Bit 0: queues created from now on run their scheduler work on a high-priority ordered
++/// workqueue. Bit 1: every cpufreq policy is held at its top frequency while commands are in
++/// flight, and released after the last one (with the g16_lat_qos_us window).
++pub(crate) fn submit_boost() -> u32 {
++    SUBMIT_BOOST.load(Ordering::Relaxed) & 3
++}
++
++live_u32_param!(
++    SUBMIT_BOOST_PARAM,
++    SUBMIT_BOOST_PARMTYPE,
++    SUBMIT_BOOST_PARM,
++    SUBMIT_BOOST,
++    "g16_submit_boost",
++    "G16: bit 0: queues created from now on submit on a high-priority ordered workqueue; bit 1: hold the CPU clusters at their top frequency while commands are in flight, released at idle (default 0: off; runtime 0644)"
++);
++
+ /// Storage of `g16_subgen` (runtime 0644, default 0).
+ static SUBGEN: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 155d5b68a8..98d51bb306 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -182,6 +182,24 @@ fn lat_qos(&self, busy: bool, last: bool) {
+         {
+             self.lat_us.store(0, Ordering::Relaxed);
+         }
++        // g16_submit_boost bit 1: the CPU clusters at their top clock for the same busy period.
++        let floor = params::submit_boost() & 2 != 0;
++        if busy && floor {
++            self.floor_busy_ns.store(now, Ordering::Relaxed);
++            if !self.floor_on.load(Ordering::Relaxed)
++                && super::boot::glue::cpu_floor(true).is_ok()
++            {
++                self.floor_on.store(true, Ordering::Relaxed);
++            }
++        } else if self.floor_on.load(Ordering::Relaxed)
++            && (last
++                || !floor
++                || now.saturating_sub(self.floor_busy_ns.load(Ordering::Relaxed))
++                    >= super::power::policy::WINDOW_NS)
++            && super::boot::glue::cpu_floor(false).is_ok()
++        {
++            self.floor_on.store(false, Ordering::Relaxed);
++        }
+     }
+ 
+     /// Deliver userspace notification outside the device mutex and fence completion path.
+diff --git a/rust/kernel/workqueue.rs b/rust/kernel/workqueue.rs
+index 3e4d975830..bcc7648e56 100644
+--- a/rust/kernel/workqueue.rs
++++ b/rust/kernel/workqueue.rs
+@@ -484,6 +484,15 @@ pub fn new_ordered_reclaim(name: &CStr) -> Result<Self> {
+         Self::ordered(name, bindings::wq_flags_WQ_MEM_RECLAIM)
+     }
+ 
++    /// Allocates an ordered workqueue named `name` with high-priority workers that may be used on
++    /// the memory reclaim path (`WQ_MEM_RECLAIM | WQ_HIGHPRI`).
++    pub fn new_ordered_reclaim_highpri(name: &CStr) -> Result<Self> {
++        Self::ordered(
++            name,
++            bindings::wq_flags_WQ_MEM_RECLAIM | bindings::wq_flags_WQ_HIGHPRI,
++        )
++    }
++
+     fn ordered(name: &CStr, flags: u32) -> Result<Self> {
+         // SAFETY: `name` is a valid NUL-terminated string; the C side copies it.
+         let ptr = unsafe { bindings::alloc_ordered_workqueue(name.as_char_ptr(), flags) };
+@@ -493,7 +502,7 @@ fn ordered(name: &CStr, flags: u32) -> Result<Self> {
+             queue: NonNull::new(ptr).ok_or(ENOMEM)?,
+             ordered: true,
+             unbound: true,
+-            highpri: false,
++            highpri: flags & bindings::wq_flags_WQ_HIGHPRI != 0,
+         })
+     }
+ 
+-- 
+2.43.0
+

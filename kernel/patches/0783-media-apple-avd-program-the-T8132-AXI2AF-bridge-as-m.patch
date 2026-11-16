@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 08:41:58 +0000
+Subject: [PATCH] media: apple: avd: program the T8132 AXI2AF bridge as
+ macOS does (test switch)
+
+10-bit HEVC and AV1 decode into 16-bit P010 runs at 80 % and 73-75 % of
+macOS on the same M4 silicon, while 8-bit is at parity. macOS writes the
+same 16-bit layout uncompressed (its log: "Compressed buffers disabled!
+luma depth 10", kIOSurfaceCompressionTypeNone) at the 8-bit rate, and its
+per-picture header, output and stride words for that layout equal ours.
+What it does that we do not is program the decoder's AXI-to-fabric bridge
+from the AP after every power-up: AppleAVD's loadTunables writes and reads
+back the upstream command and data flow-control credits (bulk read, bulk
+write, low latency, VCP), the downstream tokens, the bulk and low-latency
+transaction limits and the upstream arbiter. Linux leaves the bridge at its
+reset values; the 10-bit output writes twice the bytes of 8-bit.
+
+Add those 34 register values (offsets, masks and values as macOS's tables
+give them, relative to the start of the decoder block, whose ctrl window is
+at +0x1100000) behind a test parameter, default off, applied at each
+firmware boot with each entry read back, for T8132 only. No device tree
+change: the window is derived from the ctrl resource. With the parameter
+off nothing is mapped into use and the driver behaves exactly as before.
+
+Assisted-by: LLM
+---
+ .../platform/apple/avd/avd-backend-open.c     |   1 +
+ drivers/media/platform/apple/avd/avd-drv.c    |   3 +
+ .../media/platform/apple/avd/avd-pm-test.c    |  22 ++++
+ drivers/media/platform/apple/avd/avd-pm.c     | 105 ++++++++++++++++++
+ drivers/media/platform/apple/avd/avd-pm.h     |   6 +
+ 5 files changed, 137 insertions(+)
+
+diff --git a/drivers/media/platform/apple/avd/avd-backend-open.c b/drivers/media/platform/apple/avd/avd-backend-open.c
+index d2054d06f9..ea7c4af8a3 100644
+--- a/drivers/media/platform/apple/avd/avd-backend-open.c
++++ b/drivers/media/platform/apple/avd/avd-backend-open.c
+@@ -260,6 +260,7 @@ int avd_backend_boot(struct avd_dev *avd)
+ {
+ 	int ret;
+ 
++	avd_pm_apply_axi_tunables(avd);
+ 	if (!avd_backend_is_apple(avd)) {
+ 		avd_pm_prepare_piodma(avd);
+ 		avd_qfw_prepare_boot(avd);
+diff --git a/drivers/media/platform/apple/avd/avd-drv.c b/drivers/media/platform/apple/avd/avd-drv.c
+index ecdedbe022..e9b2050366 100644
+--- a/drivers/media/platform/apple/avd/avd-drv.c
++++ b/drivers/media/platform/apple/avd/avd-drv.c
+@@ -724,6 +724,9 @@ static int avd_probe(struct platform_device *pdev)
+ 	if (IS_ERR(avd->ctrl))
+ 		return PTR_ERR(avd->ctrl);
+ 	ret = avd_pm_map_piodma(avd);
++	if (ret)
++		return ret;
++	ret = avd_pm_map_axi2af(avd);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/media/platform/apple/avd/avd-pm-test.c b/drivers/media/platform/apple/avd/avd-pm-test.c
+index 61b911e51c..237412fd4d 100644
+--- a/drivers/media/platform/apple/avd/avd-pm-test.c
++++ b/drivers/media/platform/apple/avd/avd-pm-test.c
+@@ -384,6 +384,27 @@ static void avd_pm_test_exit(struct kunit *test)
+ 		cancel_delayed_work_sync(&fixture->avd.queue_work);
+ }
+ 
++/* macOS's AXI2AF values land under their masks; other bits are kept. */
++static void avd_pm_axi_tunables_test(struct kunit *test)
++{
++	void __iomem *base = (__force void __iomem *)kunit_kzalloc(test, 0x4020, GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, (__force void *)base);
++	writel(0xffffffff, base + 0x748);
++	writel(0xffffffff, base + 0x4008);
++	writel(0x00000006, base + 0x108);
++	KUNIT_EXPECT_EQ(test, avd_pm_write_axi_tunables(base), AVD_AXI_TUNABLES);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x0), 0x8000001aU);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x8), 0x800b000cU);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x20), 0x8014000cU);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x848), 0x00400018U);
++	/* Only bits 26:16 and 10:0 are the limit; the rest stays as it was. */
++	KUNIT_EXPECT_EQ(test, readl(base + 0x748), 0xf830f800U);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x4008), 0xfffffffeU);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x108), 0U);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x401c), 1U);
++}
++
+ static struct kunit_case avd_pm_test_cases[] = {
+ 	KUNIT_CASE(avd_pm_suspend_gate_test),
+ 	KUNIT_CASE(avd_pm_resume_order_test),
+@@ -396,6 +417,7 @@ static struct kunit_case avd_pm_test_cases[] = {
+ 	KUNIT_CASE(avd_pm_recovery_dart_gate_test),
+ 	KUNIT_CASE(avd_pm_recovery_boot_test),
+ 	KUNIT_CASE(avd_pm_parked_resume_test),
++	KUNIT_CASE(avd_pm_axi_tunables_test),
+ 	{}
+ };
+ 
+diff --git a/drivers/media/platform/apple/avd/avd-pm.c b/drivers/media/platform/apple/avd/avd-pm.c
+index d6b45ba78e..d8e3c2d9f6 100644
+--- a/drivers/media/platform/apple/avd/avd-pm.c
++++ b/drivers/media/platform/apple/avd/avd-pm.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only OR MIT
+ #include <linux/delay.h>
++#include <linux/moduleparam.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/io.h>
+ #include <linux/limits.h>
+@@ -227,6 +228,110 @@ int avd_pm_map_piodma(struct avd_dev *avd)
+ 	return 0;
+ }
+ 
++/*
++ * The decoder's AXI-to-fabric bridge (AXI2AF) sits at the start of the AVD
++ * block, whose "ctrl" window is at +0x1100000. macOS (AppleAVD
++ * loadTunables, writeNCheckTunables) programs it from the AP after every
++ * power-up and reads each entry back: the upstream command/data flow-control
++ * credits (bulk read, bulk write, low-latency, VCP), the downstream tokens,
++ * the bulk and low-latency transaction limits and the upstream arbiter.
++ * Linux leaves the bridge at its reset values. Test switch, default off, so
++ * a hold can time decode with and without macOS's values (the 10-bit output
++ * writes twice the bytes of 8-bit and is the slow case).
++ */
++static bool axi_tunables;
++module_param(axi_tunables, bool, 0644);
++MODULE_PARM_DESC(axi_tunables,
++		 "Test only: program the T8132 decoder's AXI2AF bridge as macOS does at each power-up (default off)");
++
++#define AVD_AXI2AF_CTRL_OFFSET	0x1100000
++#define AVD_AXI2AF_SIZE		0x4020
++
++struct avd_tunable {
++	u16 off;
++	u32 mask;
++	u32 val;
++};
++
++/* macOS's table order: upstream flow control, downstream, then the bridge. */
++static const struct avd_tunable avd_t8132_axi2af[AVD_AXI_TUNABLES] = {
++	{ 0x0000, 0x800000ff, 0x8000001a }, /* FLOW_CTRL_UP_CMD_CREDIT_GS_ALLOC */
++	{ 0x0004, 0x80ff00ff, 0x800b000c }, /* .._UP_CMD_CREDIT_BULKRD_REQ0_ALLOC */
++	{ 0x0008, 0x80ff00ff, 0x800b000c }, /* .._UP_CMD_CREDIT_BULKWR_REQ0_ALLOC */
++	{ 0x000c, 0x80ff00ff, 0x800b000c }, /* .._UP_CMD_CREDIT_LLT_REQ0_ALLOC */
++	{ 0x0010, 0x80ff00ff, 0x80000003 }, /* .._UP_CMD_CREDIT_VCP_REQ1_ALLOC */
++	{ 0x0014, 0x80ff00ff, 0x80000003 }, /* .._UP_CMD_CREDIT_VCP_CPL_ALLOC */
++	{ 0x0018, 0x800000ff, 0x8000000f }, /* .._UP_CMD_TOKEN_ALLOC */
++	{ 0x001c, 0x800000ff, 0x80000020 }, /* .._UP_DATA_CREDIT_GS_ALLOC */
++	{ 0x0020, 0x80ff00ff, 0x8014000c }, /* .._UP_DATA_CREDIT_BULKWR_REQ0_ALLOC */
++	{ 0x0024, 0x80ff00ff, 0x801a0006 }, /* .._UP_DATA_CREDIT_LLT_REQ0_ALLOC */
++	{ 0x0028, 0x80ff00ff, 0x80090003 }, /* .._UP_DATA_CREDIT_VCP_REQ1_ALLOC */
++	{ 0x002c, 0x80ff00ff, 0x80090003 }, /* .._UP_DATA_CREDIT_VCP_CPL_ALLOC */
++	{ 0x0030, 0x800000ff, 0x80000013 }, /* .._UP_DATA_TOKEN_ALLOC */
++	{ 0x0034, 0x800000ff, 0x8000000d }, /* FLOW_CTRL_DN_CMD_FLOW_TOKEN_ALLOC */
++	{ 0x0038, 0x800000ff, 0x8000000d }, /* FLOW_CTRL_DN_PULL_TOKEN_ALLOC */
++	{ 0x0100, 0x000000ff, 0x000000ff }, /* LINK_MGMT_CPG_CG_ENA */
++	{ 0x0108, 0x00000006, 0x00000000 }, /* LINK_MGMT_CPG_LINK_TEARDOWN */
++	{ 0x0304, 0x3f3f0000, 0x04040000 }, /* AIU_UP_ARB_RESOURCE_THRESHOLD_A */
++	{ 0x0314, 0x80000000, 0x80000000 }, /* AIU_UP_ARB_M_LLT_AW_WEIGHT */
++	{ 0x031c, 0x80000000, 0x80000000 }, /* AIU_UP_ARB_M_BULK_AW_WEIGHT */
++	{ 0x0408, 0xffff0020, 0x00100020 }, /* AIU_DN_ARB_PULL_CFG */
++	{ 0x0700, 0x00000400, 0x00000400 }, /* AXI_M_LLT_CFG */
++	{ 0x0748, 0x07ff07ff, 0x00300000 }, /* AXI_M_LLT_TLIMIT */
++	{ 0x0800, 0x00000400, 0x00000400 }, /* AXI_M_BULK_CFG */
++	{ 0x0848, 0x07ff07ff, 0x00400018 }, /* AXI_M_BULK_TLIMIT */
++	{ 0x0a00, 0xffffffff, 0x7fffffff }, /* DEBUG_CG_ENA */
++	{ 0x0a04, 0x00000100, 0x00000100 }, /* DEBUG_ERROR_CNTL */
++	{ 0x0330, 0xffffffff, 0x0000ffff }, /* AIU_UP_ARB_SHARED_TLIMIT0 */
++	{ 0x0334, 0xffffffff, 0x0000ffff }, /* AIU_UP_ARB_SHARED_TLIMIT1 */
++	{ 0x4008, 0x00000001, 0x00000000 }, /* KEEP_ALIVE_AGENT_FLOOR_ENA */
++	{ 0x400c, 0x00000001, 0x00000000 }, /* KEEP_ALIVE_AF_LINK_FLOOR_ENA */
++	{ 0x4014, 0x00000001, 0x00000000 }, /* KEEP_ALIVE_AGENT_PERF_POWER_ENA */
++	{ 0x4018, 0x00000001, 0x00000000 }, /* KEEP_ALIVE_AGENT_OUTSTANDING_ENA */
++	{ 0x401c, 0x00000001, 0x00000001 }, /* KEEP_ALIVE_AXI2AF_OUTSTANDING_ENA */
++};
++
++unsigned int avd_pm_write_axi_tunables(void __iomem *base)
++{
++	unsigned int ok = 0;
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(avd_t8132_axi2af); i++) {
++		const struct avd_tunable *t = &avd_t8132_axi2af[i];
++		u32 v = readl(base + t->off);
++
++		writel((v & ~t->mask) | (t->val & t->mask), base + t->off);
++		if ((readl(base + t->off) & t->mask) == (t->val & t->mask))
++			ok++;
++	}
++	return ok;
++}
++
++int avd_pm_map_axi2af(struct avd_dev *avd)
++{
++	struct resource *ctrl;
++
++	if (!of_device_is_compatible(avd->dev->of_node, "apple,t8132-avd"))
++		return 0;
++	ctrl = platform_get_resource_byname(avd->pdev, IORESOURCE_MEM, "ctrl");
++	if (!ctrl || ctrl->start < AVD_AXI2AF_CTRL_OFFSET)
++		return 0;
++	avd->pm.axi2af = devm_ioremap(avd->dev, ctrl->start - AVD_AXI2AF_CTRL_OFFSET,
++				      AVD_AXI2AF_SIZE);
++	return avd->pm.axi2af ? 0 : -ENOMEM;
++}
++
++/* At every firmware boot, i.e. after each power-up, like macOS. */
++void avd_pm_apply_axi_tunables(struct avd_dev *avd)
++{
++	unsigned int ok;
++
++	if (!avd->pm.axi2af || !READ_ONCE(axi_tunables))
++		return;
++	ok = avd_pm_write_axi_tunables(avd->pm.axi2af);
++	dev_info_ratelimited(avd->dev, "AXI2AF tunables applied: %u of %u read back\n",
++			     ok, AVD_AXI_TUNABLES);
++}
++
+ void avd_pm_prepare_piodma(struct avd_dev *avd)
+ {
+ 	/* Public CM3 boot ABI: replay the SRAM base after every power loss/reset. */
+diff --git a/drivers/media/platform/apple/avd/avd-pm.h b/drivers/media/platform/apple/avd/avd-pm.h
+index 10e3a0ffbe..2acbe4b5a7 100644
+--- a/drivers/media/platform/apple/avd/avd-pm.h
++++ b/drivers/media/platform/apple/avd/avd-pm.h
+@@ -44,6 +44,7 @@ struct avd_pm {
+ 	bool hw_on;
+ 	unsigned int irq_gen;
+ 	void __iomem *piodma;
++	void __iomem *axi2af; /* T8132: the decoder's AXI-to-fabric bridge */
+ 	phys_addr_t sram_phys;
+ 	wait_queue_head_t idle_wait;
+ 	/* Protected by queue_lock; counts drain operations, not stopped streams. */
+@@ -59,6 +60,11 @@ void avd_pm_init(struct avd_dev *avd, const struct avd_backend_ops *backend,
+ void avd_pm_enable(struct avd_dev *avd);
+ int avd_pm_map_piodma(struct avd_dev *avd);
+ void avd_pm_prepare_piodma(struct avd_dev *avd);
++int avd_pm_map_axi2af(struct avd_dev *avd);
++void avd_pm_apply_axi_tunables(struct avd_dev *avd);
++/* Exposed for KUnit: program @base, return how many entries read back. */
++unsigned int avd_pm_write_axi_tunables(void __iomem *base);
++#define AVD_AXI_TUNABLES 34
+ /* After queue cleanup: release deferred DMA mappings before the final off. */
+ void avd_pm_disable(struct avd_dev *avd);
+ /* Called in process context, after the last frame has retired its mapping. */
+-- 
+2.43.0
+
