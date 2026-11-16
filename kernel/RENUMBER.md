@@ -1229,3 +1229,10 @@ Kernel 1.990 keeps the base (`da8e1acf3656`) and all 792 patches of 1.992 under 
 Kernel 1.997 keeps the base (`da8e1acf3656`) and all 797 patches of 1.990 under the same numbers.
 
 1.993 and 1.995 were test builds that did not become the default and are not published; 1.997 carries their changes. New in 1.997 (0802 and 0803 are on by default; 0798 removes a test switch; the others are off by default, read-only, or print only when the GPU stalls): 0798 (`drm/asahi: g16: Remove the FS completion event switch`), 0799 (`drm/asahi: g16: Show which rings hold unconsumed records in fwpower`), 0800 (`drm/asahi: g16: Show the firmware's idle gate words in fwpower`), 0801 (`drm/asahi: g16: Count when slow render starts follow the host's event read`), 0802 (`sched/fair: Enable misfit_new_ns at 1 ms`), 0803 (`media: apple: isp: start the camera firmware at open by default`), 0804 (`drm/asahi: g16: Optionally let the firmware order chained renders`), 0805 (`drm/asahi: g16: Allow up to 32 compute units with a shared UMA pool`), 0806 (`drm/asahi: g16: Optionally serve events that arrive during a poll pass`), 0807 (`nvme-apple: optionally keep the final shutdown notification's result`), 0808 (`drm/asahi: g16: Name a command stall at fail-stop`).
+
+
+# Kernel patch numbers: 1.997 to 1.998
+
+Kernel 1.998 keeps the base (`da8e1acf3656`) and all 808 patches of 1.997 under the same numbers.
+
+New in 1.998 (0814 turns on 0809, the fix for a GPU stall; the other four are off by default or read-only): 0809 (`drm/asahi: g16: Keep InitBM and other VMs out from behind running renders`), 0810 (`drm/asahi: g16: Optionally re-poll sooner while work waits for a retirement`), 0811 (`drm/asahi: g16: Optionally take completed receipts when work is submitted`), 0812 (`drm/asahi: g16: Optionally write the tile-buffer sample size in the FS record`), 0813 (`drm/asahi: g16: Show the GFX power-state word in fwpower`), 0814 (`drm/asahi: g16: Keep other VMs out from behind running renders by default`).

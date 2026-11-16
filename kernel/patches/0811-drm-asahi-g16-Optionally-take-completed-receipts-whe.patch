@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 14:39:02 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally take completed receipts
+ when work is submitted
+
+A compute command keeps its unit until the host retires it, and the
+host retires on the firmware's ring-service event or on the completion
+re-poll. At 16 commands in flight about 244 us pass between the end of
+a command and that event, while about a third of the retirements are
+taken earlier by the re-poll, so the receipt is often complete well
+before the event. macOS receives a ring-service event for only about
+one in eighteen commands.
+
+Add g16_submit_retire: with 1, a submission first retires what has
+completed since the last poll pass and then publishes, so the units
+those commands held serve the new submission without waiting for the
+event. The number of such submissions is counted on the tailsplit
+statistics line. The default of 0 keeps the current behaviour.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |  2 ++
+ drivers/gpu/drm/asahi/g16/params.rs | 17 +++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 17 ++++++++++++++---
+ 3 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 882480c084..b36cccae6e 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -329,6 +329,8 @@ pub(crate) struct Stats {
+     pub(crate) tsplit_other_ns: u64,
+     /// Extra retire/publish rounds inside a pass for events that arrived during it.
+     pub(crate) pass_loops: u64,
++    /// Submissions that took completed receipts before publishing (`g16_submit_retire`).
++    pub(crate) submit_retires: u64,
+     pub(crate) tsplit_fw: u64,
+     pub(crate) tsplit_wake: u64,
+     pub(crate) tsplit_lock: u64,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 9d274099b4..8119163b39 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1443,6 +1443,23 @@ pub(crate) fn window_poll_us() -> u32 {
+     "G16: completion repoll interval while ready work waits behind running flights for a retirement, us (default 0: g16_resnap_us; 10..100; runtime 0644)"
+ );
+ 
++/// Storage of `g16_submit_retire` (runtime 0644, default 0).
++static SUBMIT_RETIRE: AtomicU32 = AtomicU32::new(0);
++
++/// Whether a submission first retires the receipts that completed since the last poll pass.
++pub(crate) fn submit_retire() -> bool {
++    SUBMIT_RETIRE.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    SUBMIT_RETIRE_PARAM,
++    SUBMIT_RETIRE_PARMTYPE,
++    SUBMIT_RETIRE_PARM,
++    SUBMIT_RETIRE,
++    "g16_submit_retire",
++    "G16: 1 = a submission first retires the commands that completed since the last poll pass, without waiting for the firmware's event, then publishes (default 0: off; runtime 0644)"
++);
++
+ /// Storage of `g16_lat_qos_us` (runtime 0644, default 0).
+ static LAT_QOS_US: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index ecec482484..4ffd15c875 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -278,7 +278,17 @@ pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+             }
+             let accepted = firmware.enqueue(job);
+             if accepted.is_ok() {
+-                if let Err(error) = firmware.publish(&mut done) {
++                // g16_submit_retire: take the receipts that completed since the last pass
++                // first, without waiting for the firmware's event, so that the units they
++                // free serve this submission.
++                let take = super::params::submit_retire() && !firmware.engine.flights.is_empty();
++                let retired = if take {
++                    firmware.engine.stats.submit_retires += 1;
++                    firmware.retire(false, &mut done)
++                } else {
++                    Ok(())
++                };
++                if let Err(error) = retired.and_then(|()| firmware.publish(&mut done)) {
+                     firmware.fail_stop(error, &mut done);
+                     self.fail_stop(error);
+                 }
+@@ -1677,7 +1687,7 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         )?;
+         writeln!(
+             f,
+-            "tailsplit: n {} other {} fw_us {} wake_us {} lock_us {} pass_us {} loops {} other_us {}",
++            "tailsplit: n {} other {} fw_us {} wake_us {} lock_us {} pass_us {} loops {} other_us {} sretire {}",
+             s.tsplit_n,
+             s.tsplit_other,
+             s.tsplit_fw / 1000,
+@@ -1685,7 +1695,8 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.tsplit_lock / 1000,
+             s.tsplit_pass / 1000,
+             s.pass_loops,
+-            s.tsplit_other_ns / 1000
++            s.tsplit_other_ns / 1000,
++            s.submit_retires
+         )?;
+         for (c, name) in ["compute", "render"].iter().enumerate() {
+             write!(
+-- 
+2.43.0
+

@@ -1,0 +1,169 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 13:56:32 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally re-poll sooner while work
+ waits for a retirement
+
+With the compute window full, the next command can only be published
+after a running one is retired, and the host notices completions on
+the firmware's event or on the completion re-poll, every 100 us. A
+retirement taken on the re-poll already shows that a receipt can be
+complete before the event arrives, so while ready work is held behind
+running flights the re-poll interval decides how long a finished
+command keeps its unit.
+
+Add g16_window_poll_us: when the last publication pass left work
+pending behind running flights, the next completion re-poll is armed
+at this interval (10 to 100 us) instead of g16_resnap_us. The default
+of 0 keeps the current behaviour. Also sum, for retirements not taken
+on the event path, the time from the command's end to its retirement,
+printed as other_us on the tailsplit statistics line, so the interval
+can be judged against the event path's fw_us.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |  8 ++++++++
+ drivers/gpu/drm/asahi/g16/params.rs | 21 +++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 16 +++++++++++-----
+ 3 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 71d00ee5a5..882480c084 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -325,6 +325,8 @@ pub(crate) struct Stats {
+     pub(crate) locked_ticks: u64,
+     pub(crate) tsplit_n: u64,
+     pub(crate) tsplit_other: u64,
++    /// Retirements not taken on the event path: command end to retirement, summed.
++    pub(crate) tsplit_other_ns: u64,
+     /// Extra retire/publish rounds inside a pass for events that arrived during it.
+     pub(crate) pass_loops: u64,
+     pub(crate) tsplit_fw: u64,
+@@ -571,6 +573,8 @@ pub(crate) struct Engine {
+     pub(crate) ta_registered: bool,
+     /// A ready prefix waits only for a record's consumption: repoll sooner.
+     pub(crate) chan_wait: bool,
++    /// Ready work waits for a running command to retire (`g16_window_poll_us`).
++    pub(crate) window_wait: bool,
+     /// `g16_pass_check_once`: the poll pass calling [`Firmware::publish`] has just made the
+     /// session and health checks under this device lock. Taken by publish().
+     pub(crate) pass_checked: bool,
+@@ -619,6 +623,7 @@ pub(crate) fn new() -> Result<Self> {
+             render_registered: false,
+             ta_registered: false,
+             chan_wait: false,
++            window_wait: false,
+             pass_checked: false,
+             progress_flight: 0,
+             progress: [None; 3],
+@@ -1234,6 +1239,9 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+                 }
+             }
+         }
++        // Work left pending behind running flights waits for one of them to retire.
++        self.engine.window_wait =
++            !self.engine.pending.is_empty() && !self.engine.flights.is_empty();
+         if !self.engine.chan_wait {
+             self.recovery.publication_wait_deadline = None;
+         }
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 24e410088f..9d274099b4 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1422,6 +1422,27 @@ pub(crate) fn pass_loop() -> u32 {
+     "G16: extra retire and publish rounds a poll pass runs for firmware events that arrived during it, instead of waiting for the next pass (default 0: none; 1..4; runtime 0644)"
+ );
+ 
++/// Storage of `g16_window_poll_us` (runtime 0644, default 0).
++static WINDOW_POLL_US: AtomicU32 = AtomicU32::new(0);
++
++/// Completion repoll interval, us, while ready work waits behind running flights for a
++/// retirement; 0 keeps `g16_resnap_us`. Clamped to 10..=100.
++pub(crate) fn window_poll_us() -> u32 {
++    match WINDOW_POLL_US.load(Ordering::Relaxed) {
++        0 => 0,
++        v => v.clamp(10, 100),
++    }
++}
++
++live_u32_param!(
++    WINDOW_POLL_US_PARAM,
++    WINDOW_POLL_US_PARMTYPE,
++    WINDOW_POLL_US_PARM,
++    WINDOW_POLL_US,
++    "g16_window_poll_us",
++    "G16: completion repoll interval while ready work waits behind running flights for a retirement, us (default 0: g16_resnap_us; 10..100; runtime 0644)"
++);
++
+ /// Storage of `g16_lat_qos_us` (runtime 0644, default 0).
+ static LAT_QOS_US: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 7cfb88b0c4..ecec482484 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -228,7 +228,7 @@ pub(crate) fn run_poll(self: Arc<Self>) {
+                 match result {
+                     Ok(true) => {
+                         self.lat_qos(busy, false);
+-                        self.rearm(firmware.engine.chan_wait)
++                        self.rearm(firmware.engine.chan_wait, firmware.engine.window_wait)
+                     }
+                     // Idle: one more pass after a window gives the state back. A failed
+                     // engine's poll no longer services power, so it has nothing to give back.
+@@ -284,7 +284,7 @@ pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+                 }
+                 if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
+                     self.lat_qos(!firmware.engine.flights.is_empty(), false);
+-                    self.rearm(firmware.engine.chan_wait);
++                    self.rearm(firmware.engine.chan_wait, firmware.engine.window_wait);
+                 }
+             }
+             accepted
+@@ -408,11 +408,15 @@ fn mod_poll(self: &Arc<Self>, delay: Jiffies) {
+ 
+     /// Re-checks a published command soon: hrtimer, with a one-jiffy backup; sooner while a
+     /// ready prefix waits for a channel record's consumption.
+-    pub(crate) fn rearm(self: &Arc<Self>, chan_wait: bool) {
++    pub(crate) fn rearm(self: &Arc<Self>, chan_wait: bool, window_wait: bool) {
+         let mut us = params::resnap_us();
+         if chan_wait && module_parameters::g16_repoll_us.value() != 0 {
+             // Record consumption raises no event: this one stays a short re-poll.
+             us = params::repoll_us();
++        } else if window_wait && params::window_poll_us() != 0 {
++            // Ready work waits for a retirement (`g16_window_poll_us`): the receipt is
++            // often complete before the firmware's event, so look sooner than resnap.
++            us = params::window_poll_us();
+         } else if params::irq_only() {
+             // The ring-service event retires the flights; this only catches a lost one.
+             us = params::watchdog_us();
+@@ -1250,6 +1254,7 @@ fn stat_retire(&mut self, f: &Flight) {
+                     s.tsplit_pass = s.tsplit_pass.saturating_add(ns(now_ticks - locked));
+                 } else {
+                     s.tsplit_other += 1;
++                    s.tsplit_other_ns = s.tsplit_other_ns.saturating_add(ns(now_ticks - hi_c));
+                 }
+                 let c = usize::from(kind != 0);
+                 let prev = s.chain_prev_end[c];
+@@ -1672,14 +1677,15 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         )?;
+         writeln!(
+             f,
+-            "tailsplit: n {} other {} fw_us {} wake_us {} lock_us {} pass_us {} loops {}",
++            "tailsplit: n {} other {} fw_us {} wake_us {} lock_us {} pass_us {} loops {} other_us {}",
+             s.tsplit_n,
+             s.tsplit_other,
+             s.tsplit_fw / 1000,
+             s.tsplit_wake / 1000,
+             s.tsplit_lock / 1000,
+             s.tsplit_pass / 1000,
+-            s.pass_loops
++            s.pass_loops,
++            s.tsplit_other_ns / 1000
+         )?;
+         for (c, name) in ["compute", "render"].iter().enumerate() {
+             write!(
+-- 
+2.43.0
+

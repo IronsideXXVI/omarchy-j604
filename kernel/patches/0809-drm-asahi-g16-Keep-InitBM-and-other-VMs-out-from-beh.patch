@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 15:45:16 +0000
+Subject: [PATCH] drm/asahi: g16: Keep InitBM and other VMs out from
+ behind running renders
+
+With the resident render depth, a render command may be published
+behind running render commands of any VM. A render whose pass unit
+no longer leases a PB manager of its own VM also writes an InitBM
+entry into the shared TA ring, right behind the running TA work.
+
+A client that keeps four or more renders in flight never needs that:
+its units keep its own managers. A second client does: after a
+minute idle, every unit last ran the busy client, so its first render
+takes a unit from another VM and posts an InitBM behind the running
+TA commands. On J604 that is the GPU stall seen when the desktop
+redraws while a client floods the render queue: the firmware raises
+a recovery event, or the oldest command stops without one.
+
+Add g16_behind_initbm. With 1, a render goes behind running flights
+only if every running flight is of its own VM and its unit still
+leases a PB manager of that VM. Otherwise it waits until the running
+flights retire and is then published alone, as with g16_resident 0
+but for that one command. The check runs before the unit is claimed
+or anything is written, at the point that already returns EAGAIN
+when no unit is free.
+
+The default 0 keeps today's behaviour. Runtime 0644.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 14 ++++++++++++++
+ drivers/gpu/drm/asahi/g16/params.rs | 19 +++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/pools.rs  | 11 +++++++++++
+ 3 files changed, 44 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 1a3490a001..71d00ee5a5 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -956,6 +956,15 @@ pub(crate) fn enqueue(&mut self, job: Arc<Job>) -> Result {
+         Ok(())
+     }
+ 
++    /// `g16_behind_initbm`: whether render `job` on unit `k` may go behind the running
++    /// flights: all of them are of its VM and unit `k` still leases a PB manager of that VM,
++    /// so no InitBM enters the TA ring behind running TA work.
++    fn behind_safe(&self, job: &Job, k: usize) -> bool {
++        params::pb_reuse()
++            && self.engine.flights.iter().all(|f| f.job.vm.id == job.vm.id)
++            && self.pools.would_reuse(k, &job.vm)
++    }
++
+     /// Whether `job`'s next command may be published behind the flights now running
+     /// (`g16_flights` = 2): it is a render command, every running flight is a healthy
+     /// render-only prefix, the render allocators are past their priming prefix, and a
+@@ -1418,6 +1427,11 @@ fn publish_prefix_into(
+                     .slots
+                     .pick_pass(job.resources.render()?, &geometry, 0)
+                     .ok_or(EAGAIN)?;
++                // g16_behind_initbm: behind running flights, a render of another VM, or one
++                // whose unit needs a new InitBM on the TA ring, waits for them to retire.
++                if ahead && params::behind_initbm() && !self.behind_safe(job, k) {
++                    return Err(EAGAIN);
++                }
+                 f.claims.pass[0] = k as u32;
+                 f.claims.pass_mask = 1 << k;
+                 self.slots.pass_busy |= 1 << k;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index d20b82bce1..24e410088f 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1832,6 +1832,25 @@ pub(crate) fn pb_reuse() -> bool {
+     "G16: let a render command reuse the PB manager its pass slot still leases from a fully retired command of the same VM, without a new InitBM (default 1; 0 = a fresh manager and InitBM for every command; runtime 0644)"
+ );
+ 
++/// Storage of `g16_behind_initbm` (runtime 0644, default 0).
++static BEHIND_INITBM: AtomicU32 = AtomicU32::new(0);
++
++/// Whether a render command goes behind running flights only when every running flight is
++/// of its own VM and its unit still leases that VM's PB manager, so that no InitBM enters
++/// the TA ring behind running TA work (0, default: as `g16_resident` allows).
++pub(crate) fn behind_initbm() -> bool {
++    BEHIND_INITBM.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    BEHIND_INITBM_PARAM,
++    BEHIND_INITBM_PARMTYPE,
++    BEHIND_INITBM_PARM,
++    BEHIND_INITBM,
++    "g16_behind_initbm",
++    "G16: publish a render behind running renders only if they are all of its VM and its unit needs no new InitBM; otherwise it waits for them to retire (default 0; runtime 0644)"
++);
++
+ /// Fragment-only dependency publication has not been qualified on this backend.
+ pub(crate) fn early_tiling() -> bool {
+     false
+diff --git a/drivers/gpu/drm/asahi/g16/pools.rs b/drivers/gpu/drm/asahi/g16/pools.rs
+index fd87682e5e..da4e4f55a3 100644
+--- a/drivers/gpu/drm/asahi/g16/pools.rs
++++ b/drivers/gpu/drm/asahi/g16/pools.rs
+@@ -335,6 +335,17 @@ pub(crate) fn reusable(
+         self.stats.reused += 1;
+         Some(epoch.clone())
+     }
++    /// Whether [`Self::reusable`] would return unit `k`'s leased manager for `vm`, so that
++    /// no InitBM is needed, without counting it (`g16_behind_initbm`).
++    pub(crate) fn would_reuse(&self, k: usize, vm: &Arc<super::vm::VmState>) -> bool {
++        let Some(epoch) = self.owners.get(k).and_then(Option::as_ref) else {
++            return false;
++        };
++        epoch.same_vm(vm)
++            && epoch.check_assignment(k).is_ok()
++            && epoch.is_exposed()
++            && epoch.ring_words().is_ok_and(|w| w[0] == w[1])
++    }
+     pub(crate) fn retire_binding(&mut self, k: usize, epoch: &Arc<PbEpoch>) -> Result {
+         *self.owners.get_mut(k).ok_or(EINVAL)? = Some(epoch.clone());
+         Ok(())
+-- 
+2.43.0
+
