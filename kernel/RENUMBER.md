@@ -1313,3 +1313,7 @@ The base remains da8e1acf3656. Published 0001–0871 are unchanged; 0872–0907 
 # Kernel patch numbers: 1.1017 to 1.1022
 
 The base remains da8e1acf3656. Published 0001–0907 are unchanged. 0908 keeps only the compute arena in a compute lease, and 0909 releases a closed VM's compute leases once the VM has retired, so GPU memory of a finished compute-using program is returned. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1018 to 1.1021 were test kernels and are not published.
+
+# Kernel patch numbers: 1.1022 to 1.1024
+
+The base remains da8e1acf3656. Published 0001–0909 are unchanged. 0910 adds `g16_pb_lazy` (off by default): the full render units keep their parameter-buffer address window but back it on demand. Applied source differs from the installed build only in the same nine comment lines as before. Version 1.1023 was a test kernel and is not published.

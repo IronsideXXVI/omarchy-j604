@@ -1,0 +1,488 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 19:23:18 +0000
+Subject: [PATCH] drm/asahi: g16: Back the full units' parameter buffer
+ on demand
+
+Every rendering VM backs two full render units with a 256 MiB PB heap
+each at creation, about 512 of the ~930 MiB a rendering client costs,
+while the macOS driver starts its parameter buffer at about 8 MiB and
+grows it with use. The firmware only ever receives the page and block
+records of a manager's seeded blocks, counted from the heap's start, so
+the blocks above a manager's seed need no backing while it is live.
+
+Add g16_pb_lazy (default 0, latched at its first read). With N set, a
+full unit keeps its whole heap window and address but backs only its
+first N blocks (1 means 256 blocks, 32 MiB). The in-flight free-block
+ring samples that g16_pb_size takes are also kept per VM; in SUBMIT,
+under the VM's resource lock, each unit's backing grows to three times
+the widest distance its VM was seen at, or to the whole window once a
+render held three quarters of its manager. Growth only appends, in at
+most eight steps, and raises the backed count after the new blocks are
+mapped and published. Managers are seeded at publication within the
+backed count, so no manager is handed an unmapped block, and InitBM
+takes the manager's own count. Backing is never released before the
+unit itself.
+
+The M4 firmware has no growth protocol: a render that outgrows its
+manager still faults, as with g16_pb_blocks. Growth follows the
+samples, so it protects the next command, not the one in flight. The
+stats file gains a pb_lazy line.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs    |   4 +-
+ drivers/gpu/drm/asahi/g16/params.rs    |  47 ++++++
+ drivers/gpu/drm/asahi/g16/poll.rs      |   3 +-
+ drivers/gpu/drm/asahi/g16/pools.rs     | 195 ++++++++++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/resources.rs |  26 +++-
+ 5 files changed, 263 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index bc5d3d6223..cfbe7a80d1 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1616,7 +1616,9 @@ fn render_refs(
+             a.parameter_id = slot as u32;
+             a.init_blocks = arena.heap_blocks(slot)?;
+         }
+-        if params::pb_size() != 0 {
++        // g16_pb_lazy: the backing can grow between this command's allocator references and
++        // its manager's seeding, so InitBM always takes the manager's own count.
++        if params::pb_size() != 0 || params::pb_lazy().is_some() {
+             a.init_blocks = epoch.seeded_blocks();
+         }
+         a.mgr_misc = epoch.misc.va;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 0fcb5482f6..37f031e64a 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1418,6 +1418,53 @@ pub(crate) fn pb_heap16() -> bool {
+     "G16: back the PB heap of the full render units 0 and 1 with 16 MiB (128 blocks) as the compact units, instead of 256 MiB each (default 0; latched at the first render unit built, set it as a module option)"
+ );
+ 
++/// Storage of `g16_pb_lazy` (0644, default 0; latched at its first read).
++static PB_LAZY: AtomicU32 = AtomicU32::new(0);
++/// 0 until latched, then the latched value plus one.
++static PB_LAZY_LATCH: AtomicU32 = AtomicU32::new(0);
++
++/// The floor, in blocks, of a lazily backed PB heap, if `g16_pb_lazy` is set: the full render
++/// units keep their whole PB heap window (its address and size) but back only its first
++/// `floor` blocks when built, and map more of it, in SUBMIT, when the blocks their renders were
++/// seen holding ask for it (three times the in-flight free-block ring distance, as macOS sizes
++/// its parameter buffer), or the whole window once a render held three quarters of its
++/// manager's blocks. A manager is never seeded with more blocks than are backed. The firmware
++/// is still given each manager's whole heap up front and has no growth protocol, so a render
++/// that outgrows its manager faults as with `g16_pb_blocks`. 1 means 256 blocks (32 MiB); other
++/// values are rounded up to 16 blocks and kept within the manager's limits.
++pub(crate) fn pb_lazy() -> Option<u32> {
++    let mut l = PB_LAZY_LATCH.load(Ordering::Acquire);
++    if l == 0 {
++        let v = PB_LAZY.load(Ordering::Relaxed);
++        let _ = PB_LAZY_LATCH.compare_exchange(
++            0,
++            v.saturating_add(1),
++            Ordering::AcqRel,
++            Ordering::Acquire,
++        );
++        l = PB_LAZY_LATCH.load(Ordering::Acquire);
++    }
++    match l.wrapping_sub(1) {
++        0 => None,
++        1 => Some(256),
++        v => Some(
++            (v.clamp(super::fw::buffer::MIN_BLOCKS, super::fw::buffer::MAX_BLOCKS)
++                .div_ceil(16)
++                * 16)
++                .min(super::fw::buffer::MAX_BLOCKS),
++        ),
++    }
++}
++
++live_u32_param!(
++    PB_LAZY_PARAM,
++    PB_LAZY_PARMTYPE,
++    PB_LAZY_PARM,
++    PB_LAZY,
++    "g16_pb_lazy",
++    "G16: back the full render units' PB heap lazily from a floor of N blocks (128 KiB each; 1 = 256 = 32 MiB) and grow it in SUBMIT to three times the blocks in use, or to the whole window once a render held 3/4 of its manager (default 0: whole heap at build; latched at the first read, set it as a module option)"
++);
++
+ /// Storage of `g16_cwork_pack` (0644, default 0; latched at its first read).
+ static CWORK_PACK: AtomicU32 = AtomicU32::new(1);
+ /// 0 until latched, then 1 (off) or 2 (on).
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index fa0f55bb79..63c4d9dab4 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -745,7 +745,7 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+                 }
+             }
+         }
+-        if params::pb_size() != 0 {
++        if params::pb_size() != 0 || params::pb_lazy().is_some() {
+             for f in self.engine.flights.iter().filter(|f| f.renders != 0) {
+                 if let Some(epoch) = f.pb_used.as_ref() {
+                     let _ = epoch.size_sample();
+@@ -1857,6 +1857,7 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         }
+         writeln!(f)?;
+         super::pools::write_size_stats(f)?;
++        super::pools::write_lazy_stats(f)?;
+         let forms = &super::engine::FS_FORMS;
+         writeln!(
+             f,
+diff --git a/drivers/gpu/drm/asahi/g16/pools.rs b/drivers/gpu/drm/asahi/g16/pools.rs
+index ffb6e58015..e16173be3d 100644
+--- a/drivers/gpu/drm/asahi/g16/pools.rs
++++ b/drivers/gpu/drm/asahi/g16/pools.rs
+@@ -21,9 +21,79 @@
+ use kernel::{
+     device,
+     prelude::*,
+-    sync::{aref::ARef, Arc},
++    sync::{aref::ARef, Arc, SetOnce},
+ };
+ 
++/// `g16_pb_lazy`: most growth steps of one unit's PB heap; the last one maps the rest of it.
++const GROW_STEPS: usize = 8;
++
++/// `g16_pb_lazy`: [0] growth steps mapped, [1] blocks they mapped, [2] steps that failed,
++/// [3] unit slots latched to the whole window (a render held 3/4 of its manager), [4] total
++/// and [5] longest nanoseconds a step took in SUBMIT.
++pub(crate) static LAZY_PB: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
++
++/// `g16_pb_lazy` stats line.
++pub(crate) fn write_lazy_stats(f: &mut impl fmt::Write) -> fmt::Result {
++    writeln!(
++        f,
++        "pb_lazy: floor {} grows {} grown_blocks {} fails {} near_full {} total_us {} max_us {}",
++        super::params::pb_lazy().unwrap_or(0),
++        LAZY_PB[0].load(Ordering::Relaxed),
++        LAZY_PB[1].load(Ordering::Relaxed),
++        LAZY_PB[2].load(Ordering::Relaxed),
++        LAZY_PB[3].load(Ordering::Relaxed),
++        LAZY_PB[4].load(Ordering::Relaxed) / 1000,
++        LAZY_PB[5].load(Ordering::Relaxed) / 1000
++    )
++}
++
++/// `g16_pb_lazy`: what one VM's renders were seen holding, per PB slot. Kept by the VM's render
++/// arena and handed to each of its PB managers, which update it from the in-flight samples.
++pub(crate) struct LazyHint {
++    /// The widest free-block ring distance a manager on this slot was seen at.
++    hw: [AtomicU32; super::hw::sizes::RENDER_UNITS],
++    /// A manager on this slot was seen holding 3/4 of its seeded blocks.
++    near: [AtomicBool; super::hw::sizes::RENDER_UNITS],
++}
++impl LazyHint {
++    pub(crate) fn new() -> Result<Arc<Self>> {
++        Ok(Arc::new(
++            Self {
++                hw: [const { AtomicU32::new(0) }; super::hw::sizes::RENDER_UNITS],
++                near: [const { AtomicBool::new(false) }; super::hw::sizes::RENDER_UNITS],
++            },
++            GFP_KERNEL,
++        )?)
++    }
++    /// The blocks unit `k`'s heap should have backed: three times its high water, or every
++    /// block once it was near full (the allocator caps this at its window).
++    pub(crate) fn want(&self, k: usize) -> u32 {
++        match (self.near.get(k), self.hw.get(k)) {
++            (Some(near), _) if near.load(Ordering::Relaxed) => u32::MAX,
++            (_, Some(hw)) => size_want(hw.load(Ordering::Relaxed)),
++            _ => 0,
++        }
++    }
++    fn sample(&self, slot: usize, used: u32, seeded: u32) {
++        if let Some(hw) = self.hw.get(slot) {
++            hw.fetch_max(used, Ordering::Relaxed);
++        }
++        if seeded != 0 && used.saturating_mul(4) >= seeded.saturating_mul(3) {
++            if let Some(near) = self.near.get(slot) {
++                if !near.swap(true, Ordering::Relaxed) {
++                    LAZY_PB[3].fetch_add(1, Ordering::Relaxed);
++                }
++            }
++        }
++    }
++}
++
++/// One `g16_pb_lazy` growth step: the blocks it maps and the objects that map them.
++struct Growth {
++    _heap: Arc<FwObject>,
++    _objects: Objects,
++}
++
+ #[derive(Copy, Clone, Default)]
+ pub(crate) struct AllocatorRefs {
+     pub(crate) uma_mgr: [u64; 2],
+@@ -59,8 +129,18 @@ pub(crate) struct Allocator {
+     id: u32,
+     /// The firmware UMA slot this allocator's descriptor binds (lifetime::uma_slot).
+     uma_slot: u32,
+-    /// PB heap blocks: buffer::MAX_BLOCKS, 128 for a compact resident unit, or `g16_pb_blocks`.
+-    blocks: u32,
++    /// Backed PB heap blocks, from the heap's start: buffer::MAX_BLOCKS, 128 for a compact
++    /// resident unit, or `g16_pb_blocks`; with `g16_pb_lazy` it starts at the floor and only
++    /// grows, after the blocks are mapped.
++    backed: AtomicU32,
++    /// The heap window's blocks: what `backed` would be without `g16_pb_lazy`.
++    window: u32,
++    /// Client GVA of the heap window's first block.
++    heap_va: u64,
++    /// `g16_pb_lazy` applies to this unit (a full unit, switch on).
++    lazy: bool,
++    /// `g16_pb_lazy` growth steps, in order; dropped with the unit, after the leases.
++    grown: [SetOnce<KBox<Growth>>; GROW_STEPS],
+ }
+ 
+ #[derive(Default)]
+@@ -297,7 +377,20 @@ fn new(o: &mut Objects, k: u64, compact: bool) -> Result<Self> {
+             true,
+         )?;
+         let submitted = alloc(o, 0x40, Class::Fw, None, true)?;
+-        let heap = alloc(o, heap_size as usize, Class::Shared, nc(heap_va), false)?;
++        // g16_pb_lazy: a full unit backs only the floor of its window now (see Self::grow).
++        let window = (heap_size / buffer::BLOCK_BYTES) as u32;
++        let lazy = !compact && super::params::pb_lazy().is_some();
++        let first = match super::params::pb_lazy() {
++            Some(floor) if lazy => floor.min(window),
++            _ => window,
++        };
++        let heap = alloc(
++            o,
++            (u64::from(first) * buffer::BLOCK_BYTES) as usize,
++            Class::Shared,
++            nc(heap_va),
++            false,
++        )?;
+         let scene_list = alloc(
+             o,
+             buffer::SCENE_LIST_SIZE,
+@@ -329,7 +422,11 @@ fn new(o: &mut Objects, k: u64, compact: bool) -> Result<Self> {
+             published: AtomicBool::new(false),
+             id: k as u32,
+             uma_slot,
+-            blocks: (heap_size / buffer::BLOCK_BYTES) as u32,
++            backed: AtomicU32::new(first),
++            window,
++            heap_va,
++            lazy,
++            grown: [const { SetOnce::new() }; GROW_STEPS],
+         })
+     }
+     fn refs(&self) -> Result<AllocatorRefs> {
+@@ -345,7 +442,7 @@ fn refs(&self) -> Result<AllocatorRefs> {
+             pb_mgr: 0,
+             scene_list: gva(&self.scene_list)?,
+             mgr_misc: 0,
+-            init_blocks: self.blocks,
++            init_blocks: self.backed.load(Ordering::Acquire),
+             parameter_id: self.id,
+             submitted_fw: self.submitted.va,
+             counter_completed_fw: self.descriptor.va + 0x54,
+@@ -386,7 +483,80 @@ pub(crate) fn heap_gva_unit(&self) -> Result<u64> {
+         gva(&self.heap)
+     }
+     pub(crate) fn heap_blocks_unit(&self) -> u32 {
+-        self.blocks
++        self.backed.load(Ordering::Acquire)
++    }
++    /// `g16_pb_lazy`: maps more of this unit's heap window, from the last backed block, so
++    /// that `want` blocks (rounded up to 16, at most the window; the whole window on the last
++    /// step) are backed. Called only in SUBMIT under the VM's resource lock, so growth steps
++    /// of one unit never race. Managers are seeded from `heap_blocks_unit` at publication, so
++    /// none is ever handed a block before it is mapped: the new blocks are published to the
++    /// firmware's view and the client VM first, and `backed` is raised after that.
++    pub(crate) fn grow(
++        &self,
++        factory: &super::object::Factory,
++        vm: &crate::mmu::Vm,
++        want: u32,
++    ) -> Result {
++        if !self.lazy {
++            return Ok(());
++        }
++        let backed = self.backed.load(Ordering::Acquire);
++        let mut target = (want.min(self.window).div_ceil(16) * 16).min(self.window);
++        if target <= backed {
++            return Ok(());
++        }
++        let Some(step) = self.grown.iter().position(|g| g.as_ref().is_none()) else {
++            return Err(ENOSPC);
++        };
++        if step + 1 == GROW_STEPS {
++            target = self.window;
++        }
++        let start = super::engine::now_ns();
++        if let Err(e) = self.map_step(factory, vm, step, backed, target) {
++            LAZY_PB[2].fetch_add(1, Ordering::Relaxed);
++            return Err(e);
++        }
++        self.backed.store(target, Ordering::Release);
++        let ns = super::engine::now_ns().wrapping_sub(start);
++        LAZY_PB[0].fetch_add(1, Ordering::Relaxed);
++        LAZY_PB[1].fetch_add(u64::from(target - backed), Ordering::Relaxed);
++        LAZY_PB[4].fetch_add(ns, Ordering::Relaxed);
++        LAZY_PB[5].fetch_max(ns, Ordering::Relaxed);
++        Ok(())
++    }
++    /// One growth step of [`Self::grow`]: blocks `from..to` of the window, mapped into the
++    /// firmware's view and the client VM at their window address and published.
++    fn map_step(
++        &self,
++        factory: &super::object::Factory,
++        vm: &crate::mmu::Vm,
++        step: usize,
++        from: u32,
++        to: u32,
++    ) -> Result {
++        let mut o = factory.objects(vm);
++        let heap = alloc(
++            &mut o,
++            (u64::from(to - from) * buffer::BLOCK_BYTES) as usize,
++            Class::Shared,
++            Some((
++                self.heap_va + u64::from(from) * buffer::BLOCK_BYTES,
++                pte::LEAF_NC,
++            )),
++            false,
++        )?;
++        o.finish_private()?;
++        let growth = KBox::new(
++            Growth {
++                _heap: heap,
++                _objects: o,
++            },
++            GFP_KERNEL,
++        )?;
++        if !self.grown.get(step).ok_or(EINVAL)?.populate(growth) {
++            return Err(EBUSY);
++        }
++        Ok(())
+     }
+ }
+ impl PoolSet {
+@@ -594,6 +764,8 @@ pub(crate) struct PbEpochInner {
+     exposed: AtomicBool,
+     /// The manager image as seeded (`g16_pb_probe` compares against it).
+     seed: [AtomicU32; MGR_WORDS],
++    /// `g16_pb_lazy`: the VM's per-slot record of the blocks its renders were seen holding.
++    hint: Option<Arc<LazyHint>>,
+     // Unmap private records before releasing the VM's aliases and ASID.
+     _objects: Objects,
+     _vm: Arc<super::vm::VmState>,
+@@ -605,6 +777,7 @@ pub(crate) fn new(
+         factory: &super::object::Factory,
+         vm: &Arc<super::vm::VmState>,
+         permit: super::budget::Permit,
++        hint: Option<Arc<LazyHint>>,
+     ) -> Result<Arc<Self>> {
+         let mut o = factory.objects(&vm.vm);
+         let records = alloc(&mut o, 0x500, Class::Fw, None, true)?;
+@@ -621,6 +794,7 @@ pub(crate) fn new(
+             capacity: AtomicU32::new(0),
+             exposed: AtomicBool::new(false),
+             seed: [const { AtomicU32::new(0) }; MGR_WORDS],
++            hint,
+             _objects: o,
+             _vm: vm.clone(),
+             _permit: permit,
+@@ -751,9 +925,14 @@ pub(crate) fn size_sample(&self) -> Result {
+         let used = a.abs_diff(b).min(self.seeded_blocks());
+         SIZE[0].fetch_add(1, Ordering::Relaxed);
+         SIZE[4].fetch_max(u64::from(used), Ordering::Relaxed);
+-        if let Some(hw) = SIZE_HW.get(self.assigned.load(Ordering::Acquire) as usize) {
++        let slot = self.assigned.load(Ordering::Acquire) as usize;
++        if let Some(hw) = SIZE_HW.get(slot) {
+             hw.fetch_max(used, Ordering::Relaxed);
+         }
++        // g16_pb_lazy: the VM's own record, which sizes its heap backing in SUBMIT.
++        if let Some(hint) = self.hint.as_ref() {
++            hint.sample(slot, used, self.seeded_blocks());
++        }
+         Ok(())
+     }
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 83352d621d..699c8943c9 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -8,7 +8,7 @@
+ use super::{
+     command::Command,
+     object::{Factory, FwObject, Objects},
+-    pools::{Allocator, AllocatorRefs, PbEpoch, PoolSet},
++    pools::{Allocator, AllocatorRefs, LazyHint, PbEpoch, PoolSet},
+     slots::{ComputeSlot, PassSlot},
+     vm::VmState,
+ };
+@@ -171,6 +171,8 @@ pub(crate) struct RenderInner {
+     building: AtomicBool,
+     pub(crate) tpc_dirty: [AtomicU64; super::hw::sizes::RENDER_UNITS],
+     pub(crate) tilemap_dirty: [AtomicU64; super::hw::sizes::RENDER_UNITS],
++    /// `g16_pb_lazy`: the blocks this VM's renders were seen holding, per PB slot.
++    pub(crate) pb_hint: Arc<LazyHint>,
+     _objects: Objects,
+     _bind: mmu::VmBind,
+     _live: Arc<super::vm::LiveToken>,
+@@ -220,6 +222,7 @@ fn new(
+                 building: AtomicBool::new(false),
+                 tpc_dirty: [const { AtomicU64::new(0) }; super::hw::sizes::RENDER_UNITS],
+                 tilemap_dirty: [const { AtomicU64::new(0) }; super::hw::sizes::RENDER_UNITS],
++                pb_hint: LazyHint::new()?,
+                 _objects: objects,
+                 _bind: bind.clone(),
+                 _live: live.clone(),
+@@ -308,6 +311,16 @@ pub(crate) fn heap_gva(&self, k: usize) -> Result<u64> {
+     pub(crate) fn heap_blocks(&self, k: usize) -> Result<u32> {
+         Ok(self.alloc_unit(k)?.heap_blocks_unit())
+     }
++    /// `g16_pb_lazy`: backs each built unit's PB heap up to what this VM's renders were seen
++    /// holding (in SUBMIT, under the VM's resource lock). A failed step leaves the backing as
++    /// it was; managers are then seeded within it.
++    fn grow_pb(&self, factory: &Factory, vm: &mmu::Vm) {
++        for k in 0..self.unit_count() {
++            if let Ok(unit) = self.alloc_unit(k) {
++                let _ = unit.grow(factory, vm, self.pb_hint.want(k));
++            }
++        }
++    }
+ }
+ 
+ #[derive(Default)]
+@@ -433,6 +446,9 @@ pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<
+                 } else if want && !arena.building.load(Ordering::Acquire) {
+                     let _ = arena.extend(&self.factory, &vm.vm, built);
+                 }
++                if super::params::pb_lazy().is_some() {
++                    arena.grow_pb(&self.factory, &vm.vm);
++                }
+             }
+             // A concurrent fault retains even newly constructed backing in this VM cache.
+             if vm.status.get() != 0 || vm.vm.is_closed() {
+@@ -443,13 +459,19 @@ pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<
+                 if render { ready.render.clone() } else { None },
+             )
+         };
++        let hint = render.as_ref().map(|r| r.pb_hint.clone());
+         let mut pb = KVec::with_capacity(commands.len(), GFP_KERNEL)?;
+         for command in commands {
+             pb.push(
+                 if matches!(command, Command::Render(_)) {
+                     match pooled.pop() {
+                         Some(epoch) => Some(epoch),
+-                        None => Some(PbEpoch::new(&self.factory, vm, epochs.take()?)?),
++                        None => Some(PbEpoch::new(
++                            &self.factory,
++                            vm,
++                            epochs.take()?,
++                            hint.clone(),
++                        )?),
+                     }
+                 } else {
+                     None
+-- 
+2.43.0
+
