@@ -1,0 +1,605 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 02:49:08 +0000
+Subject: [PATCH] drm/asahi: g16: add g16_resident_lazy to build
+ compact render units on demand
+
+With the default g16_resident=8 every render VM builds all eight of its
+render units at its first render: two full units and six compact ones,
+about 931 MiB per VM, held for as long as the VM lives even when the
+client never queues more than one or two renders.
+
+g16_resident_lazy=1 builds only the two full units at the first render.
+Each further unit is built in SUBMIT, one at a time and in index order,
+when the VM has more render commands outstanding than units built, up to
+the resident depth in effect, and is then kept for the life of the VM
+like the others. An idle or shallow
+client stays near 625 MiB per VM; a deep client grows to the full set.
+A failed build leaves the units already built in use.
+
+The units built later live in a per-unit slot next to the first ones and
+are reached through accessors (pass, unit_count, units, pool_prepare,
+pool_publish, pool_retired, heap_gva, heap_blocks), so the submit, poll
+and slot paths do not depend on how many units a VM built at its first
+render. The lazy_units stats line reports the builds, their total time in
+SUBMIT and the longest one, which is the first-use stall.
+
+The default of 0 keeps the current behaviour: all units at the first
+render.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs    |  17 ++--
+ drivers/gpu/drm/asahi/g16/params.rs    |  18 ++++
+ drivers/gpu/drm/asahi/g16/poll.rs      |  29 +++---
+ drivers/gpu/drm/asahi/g16/pools.rs     |  72 +++++++++-----
+ drivers/gpu/drm/asahi/g16/resources.rs | 129 +++++++++++++++++++++++--
+ drivers/gpu/drm/asahi/g16/slots.rs     |  12 ++-
+ 6 files changed, 223 insertions(+), 54 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index a2429ba42a..7b0114633f 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1094,7 +1094,7 @@ pub(crate) fn recovery_prepare(
+             && !super::poll::stamp_reached(stage[0], f.ta_target, ta_tail)
+         {
+             let k = f.claims.pass[0] as usize;
+-            let pass = f.job.resources.render()?.passes.get(k).ok_or(EINVAL)?;
++            let pass = f.job.resources.render()?.pass(k).ok_or(EINVAL)?;
+             let bytes = pass.ta_work.r64(work::ta::TPC_BYTES)?;
+             if bytes == 0 || bytes > pass.tpc.size as u64 {
+                 return Err(ERANGE);
+@@ -1575,7 +1575,8 @@ fn render_refs(
+     ) -> Result<(RenderRefs, bool)> {
+         let generation = job.vm.generation;
+         let arena = job.resources.render()?;
+-        let mut a = arena.pools.prepare(k, draw)?;
++        let _ = draw;
++        let mut a = arena.pool_prepare(k)?;
+         // g16_pb_reuse: the manager slot k still leases from a fully retired command of
+         // this VM, without a new InitBM; otherwise the command's own fresh manager.
+         // g16_pb_shared: every render of the VM binds the one manager of PB slot 0 on unit
+@@ -1597,15 +1598,15 @@ fn render_refs(
+             }
+             None => {
+                 let epoch = job.resources.pb(job.progress.sent() as usize)?;
+-                let blocks = arena.pools.heap_blocks(slot)?;
+-                epoch.prepare(slot, arena.pools.heap_gva(slot)?, blocks)?;
++                let blocks = arena.heap_blocks(slot)?;
++                epoch.prepare(slot, arena.heap_gva(slot)?, blocks)?;
+                 epoch.clone()
+             }
+         };
+         a.pb_mgr = epoch.manager.va;
+         if shared {
+             a.parameter_id = slot as u32;
+-            a.init_blocks = arena.pools.heap_blocks(slot)?;
++            a.init_blocks = arena.heap_blocks(slot)?;
+         }
+         a.mgr_misc = epoch.misc.va;
+         *pb_used = Some(epoch);
+@@ -1744,7 +1745,7 @@ fn publish_prefix_into(
+             Command::Compute(c) => self.prefix_compute(job, c, &mut prefix, f, false)?,
+             Command::Render(r) => {
+                 let geometry = Geometry::new(&r.cmd, 0);
+-                if job.resources.render()?.passes.iter().all(|slot| {
++                if job.resources.render()?.units().all(|slot| {
+                     geometry
+                         .validate_capacity(slot.tpc.size as u64, slot.tilemap.size as u64)
+                         .is_err()
+@@ -1810,7 +1811,7 @@ fn publish_prefix_into(
+                 if params::pb_shared() {
+                     self.pools.set_shared(epoch);
+                 }
+-                job.resources.render()?.pools.publish(k, f.uma_submitted)?;
++                job.resources.render()?.pool_publish(k, f.uma_submitted)?;
+                 // Notifier service dereferences u32 counters; the host ordering ledger
+                 // remains u64. Eight-byte spacing is retained allocation padding.
+                 self.graph.render.threshold.w32(0, prefix.draw as u32)?;
+@@ -2078,7 +2079,7 @@ fn prefix_render(
+         self.slots.claim_pass(job.resources.render()?, k)?;
+         self.slots.hold_vm(&f.claims, &job.vm)?;
+         let (refs, init_buffer) = self.render_refs(k, job, draw, &mut f.pb_used)?;
+-        let p = &job.resources.render()?.passes[k];
++        let p = job.resources.render()?.pass(k).ok_or(EINVAL)?;
+         let pass = p.refs();
+         let geometry = Geometry::new(&cmd.cmd, pass.heap_gva);
+         super::poll::note_fs_words([
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index abc23fda2d..0fcce7e8fd 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2255,6 +2255,24 @@ fn resident_latch() -> u32 {
+     RESIDENT_LATCH.load(Ordering::Acquire)
+ }
+ 
++/// Storage of `g16_resident_lazy` (0644, default 0; read when a VM builds its render units).
++static RESIDENT_LAZY: AtomicU32 = AtomicU32::new(0);
++
++/// A VM's first render builds only the two full render units; the compact ones are built in
++/// SUBMIT, one at a time, when the VM has more render commands outstanding than units.
++pub(crate) fn resident_lazy() -> bool {
++    RESIDENT_LAZY.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    RESIDENT_LAZY_PARAM,
++    RESIDENT_LAZY_PARMTYPE,
++    RESIDENT_LAZY_PARM,
++    RESIDENT_LAZY,
++    "g16_resident_lazy",
++    "G16: a VM's first render builds only its two full render units; the others are built when it queues deeper (default 0: all at the first render; set at module load)"
++);
++
+ /// Storage of `g16_resident_units` (0644, default 0; read once, at the latch).
+ static RESIDENT_UNITS: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index ade944bd1a..4fb16847d1 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1058,7 +1058,7 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+                 return Ok(Retirement::Pending);
+             }
+             let k = f.claims.pass[0] as usize;
+-            let unit = f.job.resources.render()?.passes.get(k).ok_or(EINVAL)?;
++            let unit = f.job.resources.render()?.pass(k).ok_or(EINVAL)?;
+             let ta_start = unit.scene.r64(0x600)?;
+             let ta_end = unit.scene.r64(0x608)?;
+             let fs_start = unit.scene.r64(0x620)?;
+@@ -1067,7 +1067,7 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+             let fs_note = g.notifier.r32(notifier_page::FS_STAMP)?;
+             full &= stamp_reached(ta_note, f.ta_target, e.ta_target)
+                 && stamp_reached(fs_note, f.fs_target, e.fs_target)
+-                && f.job.resources.render()?.pools.retired(k)?
++                && f.job.resources.render()?.pool_retired(k)?
+                 && ta_start != 0
+                 && ta_end > ta_start
+                 && fs_start != 0
+@@ -1094,7 +1094,7 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+                 return Ok(Retirement::Pending);
+             }
+             let k = f.claims.pass[0] as usize;
+-            let unit = f.job.resources.render()?.passes.get(k).ok_or(EINVAL)?;
++            let unit = f.job.resources.render()?.pass(k).ok_or(EINVAL)?;
+             let ta_start = unit.scene.r64(0x600)?;
+             let ta_end = unit.scene.r64(0x608)?;
+             let fs_start = unit.scene.r64(0x620)?;
+@@ -1105,7 +1105,7 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+                 && g.notifier
+                     .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
+                     == f.job.vm.slot
+-                && f.job.resources.render()?.pools.retired(k)?
++                && f.job.resources.render()?.pool_retired(k)?
+                 && ta_start != 0
+                 && ta_end > ta_start
+                 && fs_start != 0
+@@ -1389,13 +1389,7 @@ fn publish_timestamps(&self, flight: &Flight, claims: &super::slots::Claims) ->
+                 }
+                 super::command::Command::Render(command) => {
+                     let index = *passes.get(render).ok_or(EINVAL)? as usize;
+-                    let pass = flight
+-                        .job
+-                        .resources
+-                        .render()?
+-                        .passes
+-                        .get(index)
+-                        .ok_or(EINVAL)?;
++                    let pass = flight.job.resources.render()?.pass(index).ok_or(EINVAL)?;
+                     let ticks = [
+                         pass.scene.r64(0x600)?,
+                         pass.scene.r64(0x608)?,
+@@ -1459,7 +1453,9 @@ fn stat_retire(&mut self, f: &Flight) {
+             let Some(arena) = f.job.resources.render.as_ref() else {
+                 return;
+             };
+-            let p = &arena.passes[f.claims.pass[k] as usize];
++            let Some(p) = arena.pass(f.claims.pass[k] as usize) else {
++                continue;
++            };
+             stage(
+                 &p.scene,
+                 0x600,
+@@ -1805,6 +1801,15 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             params::rekick_us(),
+             self.session.shared.irq_bells.load(Ordering::Relaxed)
+         )?;
++        let lazy = &super::resources::LAZY_STATS;
++        writeln!(
++            f,
++            "lazy_units: on {} builds {} total_us {} max_us {}",
++            u32::from(params::resident_lazy()),
++            lazy[0].load(Ordering::Relaxed),
++            lazy[1].load(Ordering::Relaxed) / 1000,
++            lazy[2].load(Ordering::Relaxed) / 1000
++        )?;
+         let w: [u64; 8] = core::array::from_fn(|i| FS_WORDS[i].load(Ordering::Relaxed));
+         writeln!(
+             f,
+diff --git a/drivers/gpu/drm/asahi/g16/pools.rs b/drivers/gpu/drm/asahi/g16/pools.rs
+index df68f53320..4c59fd9e72 100644
+--- a/drivers/gpu/drm/asahi/g16/pools.rs
++++ b/drivers/gpu/drm/asahi/g16/pools.rs
+@@ -43,7 +43,7 @@ pub(crate) struct AllocatorRefs {
+     pub(crate) init_buffer: bool,
+ }
+ 
+-struct Allocator {
++pub(crate) struct Allocator {
+     descriptor: Arc<FwObject>,
+     auxiliary: Arc<FwObject>,
+     #[allow(dead_code)]
+@@ -244,13 +244,51 @@ fn refs(&self) -> Result<AllocatorRefs> {
+             init_buffer: true,
+         })
+     }
+-    fn retired(&self) -> Result<bool> {
++    pub(crate) fn retired(&self) -> Result<bool> {
+         let submitted = read64(&self.submitted, 0)?;
+         let completed = read64(&self.descriptor, uma_manager::COMPLETED)?;
+         Ok(submitted != 0 && submitted == completed)
+     }
++    /// The checks and references of [`PoolSet::prepare`] for this unit.
++    pub(crate) fn prepare_unit(&self) -> Result<AllocatorRefs> {
++        if self.published.load(Ordering::Acquire) && !self.retired()? {
++            return Err(EBUSY);
++        }
++        // Descriptor pointer/counter and slot must still identify this exact retained unit.
++        if read64(&self.descriptor, 0)? != self.descriptor.va
++            || self.descriptor.r32(8)? != self.uma_slot
++            || read64(&self.descriptor, 0x4c)? != self.submitted.va
++        {
++            return Err(EINVAL);
++        }
++        self.refs()
++    }
++    /// [`PoolSet::publish`] for this unit.
++    pub(crate) fn publish_unit(&self, submitted: u64) -> Result {
++        let next = read64(&self.submitted, 0)?;
++        if submitted != next.checked_add(2).ok_or(EOVERFLOW)? {
++            return Err(EINVAL);
++        }
++        self.submitted.w64(0, submitted)?;
++        self.published.store(true, Ordering::Release);
++        Ok(())
++    }
++    pub(crate) fn heap_gva_unit(&self) -> Result<u64> {
++        gva(&self.heap)
++    }
++    pub(crate) fn heap_blocks_unit(&self) -> u32 {
++        self.blocks
++    }
+ }
+ impl PoolSet {
++    /// Unit `k`'s allocator, if this set holds it.
++    pub(crate) fn get(&self, k: usize) -> Option<&Allocator> {
++        self.units.get(k)
++    }
++    /// One allocator for unit `k`, built outside a set (`g16_resident_lazy`).
++    pub(crate) fn build_unit(o: &mut Objects, k: usize, compact: bool) -> Result<Allocator> {
++        Allocator::new(o, k as u64, compact)
++    }
+     pub(crate) fn new(o: &mut Objects, count: usize, compact: bool) -> Result<Self> {
+         let count = count.clamp(2, super::hw::sizes::RENDER_UNITS);
+         let mut units = KVec::with_capacity(count, GFP_KERNEL)?;
+@@ -263,38 +301,26 @@ pub(crate) fn new(o: &mut Objects, count: usize, compact: bool) -> Result<Self>
+     pub(crate) fn allocator_refs_for(&self, k: usize) -> Result<AllocatorRefs> {
+         self.units.get(k).ok_or(EINVAL)?.refs()
+     }
++    #[allow(dead_code)]
+     pub(crate) fn prepare(&self, k: usize, _draw: u64) -> Result<AllocatorRefs> {
+-        let u = self.units.get(k).ok_or(EINVAL)?;
+-        if u.published.load(Ordering::Acquire) && !u.retired()? {
+-            return Err(EBUSY);
+-        }
+-        // Descriptor pointer/counter and slot must still identify this exact retained unit.
+-        if read64(&u.descriptor, 0)? != u.descriptor.va
+-            || u.descriptor.r32(8)? != u.uma_slot
+-            || read64(&u.descriptor, 0x4c)? != u.submitted.va
+-        {
+-            return Err(EINVAL);
+-        }
+-        u.refs()
++        self.units.get(k).ok_or(EINVAL)?.prepare_unit()
+     }
++    #[allow(dead_code)]
+     pub(crate) fn publish(&self, k: usize, submitted: u64) -> Result {
+-        let u = self.units.get(k).ok_or(EINVAL)?;
+-        if submitted != read64(&u.submitted, 0)?.checked_add(2).ok_or(EOVERFLOW)? {
+-            return Err(EINVAL);
+-        }
+-        u.submitted.w64(0, submitted)?;
+-        u.published.store(true, Ordering::Release);
+-        Ok(())
++        self.units.get(k).ok_or(EINVAL)?.publish_unit(submitted)
+     }
++    #[allow(dead_code)]
+     pub(crate) fn retired(&self, k: usize) -> Result<bool> {
+         self.units.get(k).ok_or(EINVAL)?.retired()
+     }
++    #[allow(dead_code)]
+     pub(crate) fn heap_gva(&self, k: usize) -> Result<u64> {
+-        gva(&self.units.get(k).ok_or(EINVAL)?.heap)
++        self.units.get(k).ok_or(EINVAL)?.heap_gva_unit()
+     }
+     /// Blocks of unit `k`'s PB heap (the count its PB managers and InitBM are seeded with).
++    #[allow(dead_code)]
+     pub(crate) fn heap_blocks(&self, k: usize) -> Result<u32> {
+-        Ok(self.units.get(k).ok_or(EINVAL)?.blocks)
++        Ok(self.units.get(k).ok_or(EINVAL)?.heap_blocks_unit())
+     }
+ }
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 5b535d8471..1a85585525 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -8,18 +8,30 @@
+ use super::{
+     command::Command,
+     object::{Factory, Objects},
+-    pools::{PbEpoch, PoolSet},
++    pools::{Allocator, AllocatorRefs, PbEpoch, PoolSet},
+     slots::{ComputeSlot, PassSlot},
+     vm::VmState,
+ };
+ use crate::mmu;
+-use core::sync::atomic::{AtomicU64, Ordering};
++use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+ use kernel::{
+     new_mutex, new_spinlock,
+     prelude::*,
+-    sync::{Arc, Mutex, SpinLock},
++    sync::{Arc, Mutex, SetOnce, SpinLock},
+ };
+ 
++/// `g16_resident_lazy`: render units built after a VM's first render, the nanoseconds those
++/// builds took in SUBMIT, and the longest one (the first-use stall).
++pub(crate) static LAZY_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
++
++/// A render unit built after the VM's first render (`g16_resident_lazy`): its pass slot, its
++/// UMA pool and PB heap, and the objects that map them.
++pub(crate) struct ExtUnit {
++    pass: PassSlot,
++    alloc: Allocator,
++    _objects: Objects,
++}
++
+ /// Most PB managers a VM keeps for reuse (`g16_pb_pool` is clamped to it).
+ pub(crate) const PB_POOL_MAX: usize = 16;
+ 
+@@ -85,6 +97,8 @@ fn deref(&self) -> &Self::Target {
+ pub(crate) struct RenderInner {
+     pub(crate) passes: KVec<PassSlot>,
+     pub(crate) pools: PoolSet,
++    /// Units built later (`g16_resident_lazy`), at their unit index; dropped before the bind.
++    ext: [SetOnce<KBox<ExtUnit>>; super::hw::sizes::RENDER_UNITS],
+     pub(crate) tpc_dirty: [AtomicU64; super::hw::sizes::RENDER_UNITS],
+     pub(crate) tilemap_dirty: [AtomicU64; super::hw::sizes::RENDER_UNITS],
+     _objects: Objects,
+@@ -99,8 +113,13 @@ fn new(
+         live: &Arc<super::vm::LiveToken>,
+     ) -> Result<Arc<Self>> {
+         let mut objects = factory.objects(vm);
+-        // Two pass units, or the latched resident units (g16_resident >= 3 at load).
+-        let units = super::params::resident_units();
++        // Two pass units, or the latched resident units (g16_resident >= 3 at load);
++        // with g16_resident_lazy only the two full ones now, the rest when demanded.
++        let units = if super::params::resident_lazy() {
++            super::params::resident_units().min(2)
++        } else {
++            super::params::resident_units()
++        };
+         let compact = super::params::resident_compact();
+         let mut passes = KVec::with_capacity(units, GFP_KERNEL)?;
+         for k in 0..units {
+@@ -112,6 +131,7 @@ fn new(
+             Self(crate::cleanup::Deferred::new(RenderInner {
+                 passes,
+                 pools,
++                ext: [const { SetOnce::new() }; super::hw::sizes::RENDER_UNITS],
+                 tpc_dirty: [const { AtomicU64::new(0) }; super::hw::sizes::RENDER_UNITS],
+                 tilemap_dirty: [const { AtomicU64::new(0) }; super::hw::sizes::RENDER_UNITS],
+                 _objects: objects,
+@@ -121,8 +141,37 @@ fn new(
+             GFP_KERNEL,
+         )?)
+     }
++    /// `g16_resident_lazy`: builds unit `k` (the next one) in SUBMIT. Called under the VM's
++    /// resource lock, so units are built one at a time and in order.
++    fn extend(&self, factory: &Factory, vm: &mmu::Vm, k: usize) -> Result {
++        if k < self.passes.len() || k >= self.ext.len() || self.ext[k].as_ref().is_some() {
++            return Err(EINVAL);
++        }
++        let start = super::engine::now_ns();
++        let compact = super::params::resident_compact();
++        let mut objects = factory.objects(vm);
++        let pass = PassSlot::new(&mut objects, k as u64, 1, compact)?;
++        let alloc = PoolSet::build_unit(&mut objects, k, compact)?;
++        objects.finish_private()?;
++        let unit = KBox::new(
++            ExtUnit {
++                pass,
++                alloc,
++                _objects: objects,
++            },
++            GFP_KERNEL,
++        )?;
++        if !self.ext[k].populate(unit) {
++            return Err(EBUSY);
++        }
++        let ns = super::engine::now_ns().wrapping_sub(start);
++        LAZY_STATS[0].fetch_add(1, Ordering::Relaxed);
++        LAZY_STATS[1].fetch_add(ns, Ordering::Relaxed);
++        LAZY_STATS[2].fetch_max(ns, Ordering::Relaxed);
++        Ok(())
++    }
+     pub(crate) fn set_dirty(&self, k: usize, tpc: u64, tilemap: u64) -> Result {
+-        let pass = self.passes.get(k).ok_or(EINVAL)?;
++        let pass = self.pass(k).ok_or(EINVAL)?;
+         if tpc > pass.tpc.size as u64 || tilemap > pass.tilemap.size as u64 {
+             return Err(E2BIG);
+         }
+@@ -132,6 +181,48 @@ pub(crate) fn set_dirty(&self, k: usize, tpc: u64, tilemap: u64) -> Result {
+     }
+ }
+ 
++impl RenderInner {
++    /// Units this VM has built: the first ones plus those built later, in order.
++    pub(crate) fn unit_count(&self) -> usize {
++        let mut n = self.passes.len();
++        while n < self.ext.len() && self.ext[n].as_ref().is_some() {
++            n += 1;
++        }
++        n
++    }
++    /// Unit `k`'s pass slot, if built.
++    pub(crate) fn pass(&self, k: usize) -> Option<&PassSlot> {
++        self.passes
++            .get(k)
++            .or_else(|| self.ext.get(k)?.as_ref().map(|u| &u.pass))
++    }
++    /// Every built unit's pass slot.
++    pub(crate) fn units(&self) -> impl Iterator<Item = &PassSlot> {
++        (0..self.unit_count()).filter_map(move |k| self.pass(k))
++    }
++    fn alloc_unit(&self, k: usize) -> Result<&Allocator> {
++        self.pools
++            .get(k)
++            .or_else(|| self.ext.get(k)?.as_ref().map(|u| &u.alloc))
++            .ok_or(EINVAL)
++    }
++    pub(crate) fn pool_prepare(&self, k: usize) -> Result<AllocatorRefs> {
++        self.alloc_unit(k)?.prepare_unit()
++    }
++    pub(crate) fn pool_publish(&self, k: usize, submitted: u64) -> Result {
++        self.alloc_unit(k)?.publish_unit(submitted)
++    }
++    pub(crate) fn pool_retired(&self, k: usize) -> Result<bool> {
++        self.alloc_unit(k)?.retired()
++    }
++    pub(crate) fn heap_gva(&self, k: usize) -> Result<u64> {
++        self.alloc_unit(k)?.heap_gva_unit()
++    }
++    pub(crate) fn heap_blocks(&self, k: usize) -> Result<u32> {
++        Ok(self.alloc_unit(k)?.heap_blocks_unit())
++    }
++}
++
+ #[derive(Default)]
+ struct Ready {
+     compute: Option<Arc<ComputeArena>>,
+@@ -146,6 +237,8 @@ pub(crate) struct Cache {
+     live: Arc<super::vm::LiveToken>,
+     budget: Arc<super::budget::Budget>,
+     pool: Arc<SpinLock<EpochPool>>,
++    /// Render commands accepted and not yet dropped (`g16_resident_lazy` demand).
++    render_out: Arc<AtomicU32>,
+ }
+ impl Cache {
+     pub(crate) fn new(
+@@ -159,9 +252,10 @@ pub(crate) fn new(
+             new_spinlock!(EpochPool { items, closed: false }, "g16::pb_pool"),
+             GFP_KERNEL,
+         )?;
++        let render_out = Arc::new(AtomicU32::new(0), GFP_KERNEL)?;
+         Arc::pin_init(
+             pin_init!(Self { ready <- new_mutex!(Ready::default(), "g16::resources"),
+-            factory, bind, live, budget, pool }),
++            factory, bind, live, budget, pool, render_out }),
+             GFP_KERNEL,
+         )
+     }
+@@ -223,6 +317,20 @@ pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<
+                     &self.live,
+                 )?);
+             }
++            // g16_resident_lazy: one more unit when this VM has more render commands
++            // outstanding than units built, up to the resident depth in effect (the latched
++            // units when that is off). A failed build leaves the built units in use.
++            if let (true, Some(arena)) = (render, ready.render.as_ref()) {
++                let built = arena.unit_count();
++                let demand = self.render_out.load(Ordering::Relaxed) as usize + render_count;
++                let cap = match super::params::resident() {
++                    0 => super::params::resident_units(),
++                    depth => depth,
++                };
++                if super::params::resident_lazy() && demand > built && built < cap {
++                    let _ = arena.extend(&self.factory, &vm.vm, built);
++                }
++            }
+             // A concurrent fault retains even newly constructed backing in this VM cache.
+             if vm.status.get() != 0 || vm.vm.is_closed() {
+                 return Err(EIO);
+@@ -249,11 +357,14 @@ pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<
+         if vm.status.get() != 0 || vm.vm.is_closed() {
+             return Err(EIO);
+         }
++        let renders = render_count as u32;
++        self.render_out.fetch_add(renders, Ordering::Relaxed);
+         Ok(Prepared {
+             compute,
+             render,
+             pb,
+             pool: Some(self.pool.clone()),
++            render_out: Some((self.render_out.clone(), renders)),
+         })
+     }
+ }
+@@ -264,6 +375,7 @@ pub(crate) struct Prepared {
+     pub(crate) render: Option<Arc<RenderArena>>,
+     pb: KVec<Option<Arc<PbEpoch>>>,
+     pool: Option<Arc<SpinLock<EpochPool>>>,
++    render_out: Option<(Arc<AtomicU32>, u32)>,
+ }
+ impl Drop for Prepared {
+     /// Returns the job's PB managers the firmware never saw to the VM's pool (bounded by
+@@ -271,6 +383,9 @@ impl Drop for Prepared {
+     /// unexposed manager has no other holder: a flight keeps only an exposed one or the
+     /// leased one it reused, and the PB-slot lease takes exposed managers only.
+     fn drop(&mut self) {
++        if let Some((out, renders)) = self.render_out.take() {
++            out.fetch_sub(renders, Ordering::Relaxed);
++        }
+         let Some(pool) = self.pool.take() else {
+             return;
+         };
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index d92d6d312e..9b6f0bac5f 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -520,10 +520,12 @@ pub(crate) fn pick_pass(
+         // again. Rotating through all units displaces a closed VM's leases within one turn
+         // of commands from any live client, so its arena is freed; restricting the rotation
+         // left units above the current depth holding closed VMs' arenas until reboot.
+-        let units = self.pass_lifetime.units().min(arena.passes.len());
++        let units = self.pass_lifetime.units().min(arena.unit_count());
+         for i in 0..units {
+             let k = (self.pass_cursor as usize + i) % units;
+-            let p = &arena.passes[k];
++            let Some(p) = arena.pass(k) else {
++                continue;
++            };
+             if (self.pass_busy | picked) & (1 << k) == 0
+                 && self.pass_lifetime.available(k)
+                 && geo.tpc_bytes <= p.tpc.size as u64
+@@ -535,11 +537,13 @@ pub(crate) fn pick_pass(
+         None
+     }
+     pub(crate) fn claim_pass(&mut self, arena: &super::resources::RenderArena, k: usize) -> Result {
+-        if k >= arena.passes.len() || !self.pass_lifetime.claim(k) {
++        let Some(p) = arena.pass(k) else {
++            return Err(EBUSY);
++        };
++        if !self.pass_lifetime.claim(k) {
+             return Err(EBUSY);
+         }
+         // Only a retired displaced owner may reach here; no in-flight storage is reset.
+-        let p = &arena.passes[k];
+         if let Err(e) = p.scrub(
+             1,
+             arena.tpc_dirty[k].load(Ordering::Relaxed),
+-- 
+2.43.0
+

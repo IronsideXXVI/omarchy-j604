@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 03:02:40 +0000
+Subject: [PATCH] drm/asahi: g16: let g16_resident_lazy=2 build render
+ units in a worker
+
+g16_resident_lazy=1 builds a VM's later render units in SUBMIT, under
+the VM's resource lock, so the submit that first needs a unit waits for
+its objects to be allocated and mapped.
+
+With g16_resident_lazy=2 that build runs on the unbound system workqueue
+instead, one at a time per VM, and SUBMIT returns at once. Until the unit
+exists the command waits for a free unit, as it does at full depth.
+
+The worker holds the render arena, the object factory and the VM handle
+for the build, so the VM cannot go away under it. A build that loses a
+race for the same unit fails to populate it and is dropped before it is
+ever published.
+
+The lazy_units stats line gains the number of builds handed to the
+worker. Values 0 and 1 behave as before.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/params.rs    |  8 ++++++-
+ drivers/gpu/drm/asahi/g16/poll.rs      |  7 +++---
+ drivers/gpu/drm/asahi/g16/resources.rs | 33 +++++++++++++++++++++-----
+ 3 files changed, 38 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 0fcce7e8fd..56562e6b4c 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2264,13 +2264,19 @@ pub(crate) fn resident_lazy() -> bool {
+     RESIDENT_LAZY.load(Ordering::Relaxed) != 0
+ }
+ 
++/// `g16_resident_lazy` 2: those units are built by a worker instead, so SUBMIT never waits
++/// for a build; until the unit exists the command waits for a free one, as at full depth.
++pub(crate) fn resident_lazy_async() -> bool {
++    RESIDENT_LAZY.load(Ordering::Relaxed) == 2
++}
++
+ live_u32_param!(
+     RESIDENT_LAZY_PARAM,
+     RESIDENT_LAZY_PARMTYPE,
+     RESIDENT_LAZY_PARM,
+     RESIDENT_LAZY,
+     "g16_resident_lazy",
+-    "G16: a VM's first render builds only its two full render units; the others are built when it queues deeper (default 0: all at the first render; set at module load)"
++    "G16: a VM's first render builds only its two full render units; the others are built when it queues deeper: 1 in SUBMIT, 2 by a worker (default 0: all at the first render; read when a VM builds units)"
+ );
+ 
+ /// Storage of `g16_resident_units` (0644, default 0; read once, at the latch).
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 4fb16847d1..3851eb8364 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1804,11 +1804,12 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         let lazy = &super::resources::LAZY_STATS;
+         writeln!(
+             f,
+-            "lazy_units: on {} builds {} total_us {} max_us {}",
+-            u32::from(params::resident_lazy()),
++            "lazy_units: on {} builds {} total_us {} max_us {} worker {}",
++            params::resident_lazy_async() as u32 + u32::from(params::resident_lazy()),
+             lazy[0].load(Ordering::Relaxed),
+             lazy[1].load(Ordering::Relaxed) / 1000,
+-            lazy[2].load(Ordering::Relaxed) / 1000
++            lazy[2].load(Ordering::Relaxed) / 1000,
++            lazy[3].load(Ordering::Relaxed)
+         )?;
+         let w: [u64; 8] = core::array::from_fn(|i| FS_WORDS[i].load(Ordering::Relaxed));
+         writeln!(
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 1a85585525..382879a026 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -13,7 +13,7 @@
+     vm::VmState,
+ };
+ use crate::mmu;
+-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
++use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+ use kernel::{
+     new_mutex, new_spinlock,
+     prelude::*,
+@@ -21,8 +21,9 @@
+ };
+ 
+ /// `g16_resident_lazy`: render units built after a VM's first render, the nanoseconds those
+-/// builds took in SUBMIT, and the longest one (the first-use stall).
+-pub(crate) static LAZY_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
++/// builds took, the longest one (the first-use stall when built in SUBMIT), and the builds
++/// handed to a worker (`g16_resident_lazy` 2).
++pub(crate) static LAZY_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+ 
+ /// A render unit built after the VM's first render (`g16_resident_lazy`): its pass slot, its
+ /// UMA pool and PB heap, and the objects that map them.
+@@ -99,6 +100,8 @@ pub(crate) struct RenderInner {
+     pub(crate) pools: PoolSet,
+     /// Units built later (`g16_resident_lazy`), at their unit index; dropped before the bind.
+     ext: [SetOnce<KBox<ExtUnit>>; super::hw::sizes::RENDER_UNITS],
++    /// A worker is building the next unit (`g16_resident_lazy` 2).
++    building: AtomicBool,
+     pub(crate) tpc_dirty: [AtomicU64; super::hw::sizes::RENDER_UNITS],
+     pub(crate) tilemap_dirty: [AtomicU64; super::hw::sizes::RENDER_UNITS],
+     _objects: Objects,
+@@ -132,6 +135,7 @@ fn new(
+                 passes,
+                 pools,
+                 ext: [const { SetOnce::new() }; super::hw::sizes::RENDER_UNITS],
++                building: AtomicBool::new(false),
+                 tpc_dirty: [const { AtomicU64::new(0) }; super::hw::sizes::RENDER_UNITS],
+                 tilemap_dirty: [const { AtomicU64::new(0) }; super::hw::sizes::RENDER_UNITS],
+                 _objects: objects,
+@@ -141,8 +145,9 @@ fn new(
+             GFP_KERNEL,
+         )?)
+     }
+-    /// `g16_resident_lazy`: builds unit `k` (the next one) in SUBMIT. Called under the VM's
+-    /// resource lock, so units are built one at a time and in order.
++    /// `g16_resident_lazy`: builds unit `k` (the next one), in SUBMIT under the VM's resource
++    /// lock, or by the one worker `building` admits; a racing second build of the same unit
++    /// fails to populate and is dropped unpublished.
+     fn extend(&self, factory: &Factory, vm: &mmu::Vm, k: usize) -> Result {
+         if k < self.passes.len() || k >= self.ext.len() || self.ext[k].as_ref().is_some() {
+             return Err(EINVAL);
+@@ -327,7 +332,23 @@ pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<
+                     0 => super::params::resident_units(),
+                     depth => depth,
+                 };
+-                if super::params::resident_lazy() && demand > built && built < cap {
++                let want = super::params::resident_lazy() && demand > built && built < cap;
++                if want && super::params::resident_lazy_async() {
++                    if !arena.building.swap(true, Ordering::AcqRel) {
++                        let (a, factory, handle) =
++                            (arena.clone(), self.factory.clone(), vm.vm.clone());
++                        let spawned =
++                            kernel::workqueue::system_unbound().try_spawn(GFP_KERNEL, move || {
++                                let _ = a.extend(&factory, &handle, built);
++                                a.building.store(false, Ordering::Release);
++                            });
++                        if spawned.is_ok() {
++                            LAZY_STATS[3].fetch_add(1, Ordering::Relaxed);
++                        } else {
++                            arena.building.store(false, Ordering::Release);
++                        }
++                    }
++                } else if want && !arena.building.load(Ordering::Acquire) {
+                     let _ = arena.extend(&self.factory, &vm.vm, built);
+                 }
+             }
+-- 
+2.43.0
+

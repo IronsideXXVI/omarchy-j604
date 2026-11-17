@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 02:19:18 +0000
+Subject: [PATCH] soc: apple: sleep: Reach spmi_sleep_extra's slave
+ without a debug port
+
+spmi_sleep_extra sends its slave SLEEP and WAKEUP on the debug port
+controller's SPMI bus, and silently sends nothing on a machine without
+one. The J604 is such a machine: its port controllers are not on SPMI,
+so the parameter has never acted there.
+
+Map the bus named by apple,spmi-extra-bus and use it for the extra
+slave when it is present. Without the property, or with the parameter
+at 0, nothing changes. The wake line now names the bus it used.
+
+Assisted-by: LLM
+---
+ drivers/soc/apple/sleep.c | 25 ++++++++++++++++++++++---
+ 1 file changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/soc/apple/sleep.c b/drivers/soc/apple/sleep.c
+index a345109e00..aac0e85fd0 100644
+--- a/drivers/soc/apple/sleep.c
++++ b/drivers/soc/apple/sleep.c
+@@ -603,6 +603,8 @@ struct apple_sleep {
+ 	void __iomem *ps_aon;
+ 	void __iomem *spmi_a0;
+ 	void __iomem *hpm_spmi;
++	/* apple,spmi-extra-bus: where spmi_sleep_extra's slave is, if not on hpm_spmi's bus */
++	void __iomem *extra_spmi;
+ 	/* The port controller whose cold reset ends the debug link. */
+ 	struct device_node *hpm_np;
+ 	u64 siq_cfg;
+@@ -2228,9 +2230,12 @@ MODULE_PARM_DESC(spmi_sleep_extra,
+ 
+ static int sleep_spmi_extra(struct apple_sleep *s, u32 sid, u32 op)
+ {
++	void __iomem *keep_bus = s->hpm_spmi;
+ 	u32 keep = s->hpm_sid, enable;
+ 	int ret;
+ 
++	if (s->extra_spmi)
++		s->hpm_spmi = s->extra_spmi;
+ 	enable = readl(s->hpm_spmi + SPMI_NOTIFY_ENABLE);
+ 	writel(enable & ~SPMI_NOTIFY_REPLY, s->hpm_spmi + SPMI_NOTIFY_ENABLE);
+ 	s->hpm_sid = sid;
+@@ -2238,6 +2243,7 @@ static int sleep_spmi_extra(struct apple_sleep *s, u32 sid, u32 op)
+ 	s->hpm_sid = keep;
+ 	writel(1, s->hpm_spmi + SPMI_NOTIFY_ACK);
+ 	writel(enable, s->hpm_spmi + SPMI_NOTIFY_ENABLE);
++	s->hpm_spmi = keep_bus;
+ 	return ret;
+ }
+ 
+@@ -4116,7 +4122,8 @@ static int apple_sleep_enter(suspend_state_t state)
+ 	apple_sleep_usb_down(s);
+ 	/* Past every stop: the commit and so apple_sleep_report() follow, which sends WAKEUP. */
+ 	s->spmi_extra_sid = READ_ONCE(spmi_sleep_extra);
+-	if (s->spmi_extra_sid > 15 || s->spmi_extra_sid == s->hpm_sid || !s->hpm_spmi)
++	if (s->spmi_extra_sid > 15 ||
++	    (s->extra_spmi ? false : !s->hpm_spmi || s->spmi_extra_sid == s->hpm_sid))
+ 		s->spmi_extra_sid = 0;
+ 	if (s->spmi_extra_sid)
+ 		s->spmi_extra_sleep_ret = sleep_spmi_extra(s, s->spmi_extra_sid, SPMI_OP_SLEEP);
+@@ -4455,8 +4462,9 @@ static void apple_sleep_report(void)
+ 	s->smc_woke_alone = apple_sleep_smc_woke_alone(s);
+ 	if (s->spmi_extra_sid) {
+ 		s->spmi_extra_wake_ret = sleep_spmi_extra(s, s->spmi_extra_sid, SPMI_OP_WAKEUP);
+-		dev_info(s->dev, "SPMI SID%u on the debug port's bus: sleep %d, wakeup %d\n",
+-			 s->spmi_extra_sid, s->spmi_extra_sleep_ret, s->spmi_extra_wake_ret);
++		dev_info(s->dev, "SPMI SID%u on the %s bus: sleep %d, wakeup %d\n",
++			 s->spmi_extra_sid, s->extra_spmi ? "extra" : "debug port's",
++			 s->spmi_extra_sleep_ret, s->spmi_extra_wake_ret);
+ 		s->spmi_extra_sid = 0;
+ 	}
+ 
+@@ -4871,6 +4879,16 @@ static void apple_sleep_map_debug_port(struct apple_sleep *s)
+ 	s->hpm_np = np;
+ }
+ 
++static void apple_sleep_map_spmi_extra_bus(struct apple_sleep *s)
++{
++	struct device_node *bus = of_parse_phandle(s->dev->of_node, "apple,spmi-extra-bus", 0);
++
++	if (!bus)
++		return;
++	s->extra_spmi = of_iomap(bus, 0);
++	of_node_put(bus);
++}
++
+ /*
+  * apple,ps-absent and apple,ps-aon-absent: words of the SoC's lists (taken from one machine's ADT)
+  * that this machine's ADT has no power state for. They are not read at the commit, not raised or
+@@ -4989,6 +5007,7 @@ static int apple_sleep_probe(struct platform_device *pdev)
+ 	apple_sleep_map_apcie(s);
+ 	apple_sleep_map_pins(s);
+ 	apple_sleep_map_debug_port(s);
++	apple_sleep_map_spmi_extra_bus(s);
+ 
+ 	platform_set_drvdata(pdev, s);
+ 
+-- 
+2.43.0
+
