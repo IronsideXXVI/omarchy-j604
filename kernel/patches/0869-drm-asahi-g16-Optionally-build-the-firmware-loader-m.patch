@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 04:48:19 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally build the firmware loader
+ map as macOS does
+
+Decoded with each firmware's own slot names (the index table the
+loader-copy loop walks), macOS 26B123's loader map and ours fill the
+same 19 windows with the same PA, length, requested size, tag and mode.
+Three things differ:
+
+- macOS writes mode 2 into 17 named slots that have no window (and one
+  unnamed slot); we leave them zero. The firmware skips a slot whose PA
+  is 0, so this only makes the bytes equal.
+- macOS starts every window on a 0x8000 boundary after its guard page;
+  we pack them one guard page apart. Same order, different VAs.
+- macOS leaves FenderRegsDFenderPowerTransG16G unmapped (VA 0) at
+  init and it is filled in later; we map it at once.
+
+Add g16_loader_macos (default 0, read when initdata is built), one bit
+per difference, to boot macOS's map piece by piece.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs | 22 +++++++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/initdata.rs    | 17 +++++++++++++++++
+ drivers/gpu/drm/asahi/g16/object.rs      | 13 +++++++++++++
+ drivers/gpu/drm/asahi/g16/params.rs      | 18 ++++++++++++++++++
+ 4 files changed, 69 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index b71accba8a..0afe9dd383 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -484,6 +484,16 @@ fn put64(out: &mut [u8], at: usize, value: u64) -> Result<(), ()> {
+     Ok(())
+ }
+ 
++/// `g16_loader_macos` bit 0: the 25G83 slots whose macOS 26B123 counterpart (matched by the
++/// firmware's own slot name) holds mode 2 with no window; slot 46 is unnamed in both builds
++/// (26B123's unnamed 52). The firmware skips a slot whose PA is 0: this only makes the bytes equal.
++pub(crate) const MACOS_EMPTY_MODE2: [usize; 18] =
++    [2, 5, 6, 7, 8, 30, 33, 34, 35, 37, 38, 42, 43, 46, 47, 48, 49, 52];
++/// `g16_loader_macos` bit 2: FenderRegsDFenderPowerTransG16G, unmapped (VA 0) at init on macOS.
++pub(crate) const POWER_TRANS_SLOT: usize = 36;
++/// `g16_loader_macos` bit 1: macOS starts each window on a 0x8000 boundary (after its guard page).
++pub(crate) const MACOS_WINDOW_ALIGN: u64 = 0x8000;
++
+ pub(crate) fn loader_encode(slot: usize, va: u64, record: &mut [u8]) -> Result<(), ()> {
+     let e = LOADERS.get(slot).ok_or(())?;
+     let out = record.get_mut(..LOADER_STRIDE).ok_or(())?;
+@@ -496,7 +506,8 @@ pub(crate) fn loader_encode(slot: usize, va: u64, record: &mut [u8]) -> Result<(
+     }
+     let offset = e.pa & (PAGE - 1);
+     let span = (offset + u64::from(e.length) + PAGE - 1) & !(PAGE - 1);
+-    if !(HOST_START..HOST_END).contains(&va)
++    let unmapped = va == 0 && slot == POWER_TRANS_SLOT;
++    if !unmapped && !(HOST_START..HOST_END).contains(&va)
+         || va & (PAGE - 1) != offset
+         || span > HOST_END - (va - offset)
+     {
+@@ -589,6 +600,8 @@ pub(crate) struct Input {
+     pub(crate) cores: u32,
+     /// [`main_macos::WORDS`] index range to write (`g16_main_macos`); eleven-row table only.
+     pub(crate) main_macos: Option<(usize, usize)>,
++    /// `g16_loader_macos` bits (empty-slot mode 2, VA packing, PowerTrans unmapped).
++    pub(crate) loader_macos: u32,
+     /// `g16_main_poke` pairs (offset, value), written last.
+     pub(crate) poke: [(u32, u32); 32],
+     pub(crate) poke_n: usize,
+@@ -819,6 +832,13 @@ pub(crate) fn encode(
+             &mut main[0x640 + slot * LOADER_STRIDE..],
+         )?;
+     }
++    if input.loader_macos & 1 != 0 {
++        for slot in MACOS_EMPTY_MODE2 {
++            if LOADERS.get(slot).is_none_or(|e| e.length == 0) {
++                put32(main, 0x640 + slot * LOADER_STRIDE + 0x20, 2)?;
++            }
++        }
++    }
+     if let Some((from, to)) = input.main_macos {
+         for &(at, value) in main_macos::WORDS.iter().take(to.saturating_add(1)).skip(from) {
+             if main_macos::SKIP.contains(&at) {
+diff --git a/drivers/gpu/drm/asahi/g16/initdata.rs b/drivers/gpu/drm/asahi/g16/initdata.rs
+index aa76dbeb61..5a84ede985 100644
+--- a/drivers/gpu/drm/asahi/g16/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/initdata.rs
+@@ -281,10 +281,21 @@ pub(crate) fn build(
+         main_nap: super::params::main_nap(),
+         cores: super::params::main_cores(),
+         main_macos: None,
++        loader_macos: super::params::loader_macos(),
+         poke: [(0, 0); 32],
+         poke_n: 0,
+         fw_thermal: super::params::fw_thermal(),
+     };
++    if input.loader_macos != 0 {
++        dev_info!(
++            dev,
++            "M4 initdata: g16_loader_macos={:#x}: mode2 {} packing {} powertrans-unmapped {}\n",
++            input.loader_macos,
++            input.loader_macos & 1,
++            (input.loader_macos >> 1) & 1,
++            (input.loader_macos >> 2) & 1
++        );
++    }
+     if input.fw_controllers {
+         dev_info!(
+             dev,
+@@ -383,6 +394,12 @@ pub(crate) fn build(
+         if entry.length == 0 {
+             continue;
+         }
++        if input.loader_macos & 4 != 0 && slot == wire::POWER_TRANS_SLOT {
++            continue;
++        }
++        if input.loader_macos & 2 != 0 {
++            objects.align_io(wire::MACOS_WINDOW_ALIGN)?;
++        }
+         let offset = entry.pa & (wire::PAGE - 1);
+         let at =
+             objects.reserve_io((offset + u64::from(entry.length)).next_multiple_of(wire::PAGE))?;
+diff --git a/drivers/gpu/drm/asahi/g16/object.rs b/drivers/gpu/drm/asahi/g16/object.rs
+index e3fcd000e0..b934ee75b4 100644
+--- a/drivers/gpu/drm/asahi/g16/object.rs
++++ b/drivers/gpu/drm/asahi/g16/object.rs
+@@ -753,6 +753,19 @@ pub(super) fn alloc_split(
+ 
+     /// Reserves a page-aligned loader aperture followed by an unmapped guard. This advances
+     /// the same cursor as firmware objects, including holes in discontiguous loader entries.
++    /// Skips firmware VA up to the next multiple of `align`, as macOS packs its loader windows.
++    pub(crate) fn align_io(&mut self, align: u64) -> Result {
++        if self.sealed {
++            return Err(EBUSY);
++        }
++        let next = self.fw_next.checked_next_multiple_of(align).ok_or(EOVERFLOW)?;
++        if next > hw::va::FW_ALLOC.end {
++            return Err(ENOSPC);
++        }
++        self.fw_next = next;
++        Ok(())
++    }
++
+     pub(crate) fn reserve_io(&mut self, size: u64) -> Result<u64> {
+         if self.sealed {
+             return Err(EBUSY);
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index dc1318ae8c..9488454539 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2295,6 +2295,24 @@ pub(crate) fn resident_lazy_async() -> bool {
+     "G16: a VM's first render builds only its two full render units; the others are built when it queues deeper: 1 in SUBMIT, 2 by a worker (default 0: all at the first render; read when a VM builds units)"
+ );
+ 
++/// Storage of `g16_loader_macos` (0644, default 0; read once, when initdata is built).
++static LOADER_MACOS: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_loader_macos`: build the loader map as macOS 26B123 does (bit 0 empty-slot mode 2, bit 1
++/// VA packing on 0x8000, bit 2 PowerTrans unmapped at init).
++pub(crate) fn loader_macos() -> u32 {
++    LOADER_MACOS.load(Ordering::Relaxed) & 7
++}
++
++live_u32_param!(
++    LOADER_MACOS_PARAM,
++    LOADER_MACOS_PARMTYPE,
++    LOADER_MACOS_PARM,
++    LOADER_MACOS,
++    "g16_loader_macos",
++    "G16: build the firmware loader map as macOS 26B123 does: bit 0 mode 2 in its empty slots, bit 1 its VA packing, bit 2 PowerTrans left unmapped at init (default 0; read once, at initdata build)"
++);
++
+ /// Storage of `g16_replay` (runtime 0644, default 0).
+ static REPLAY: AtomicU32 = AtomicU32::new(0);
+ 
+-- 
+2.43.0
+

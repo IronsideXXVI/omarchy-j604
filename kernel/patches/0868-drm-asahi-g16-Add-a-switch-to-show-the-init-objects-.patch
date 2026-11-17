@@ -1,0 +1,277 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 04:25:54 +0000
+Subject: [PATCH] drm/asahi: g16: Add a switch to show the init objects
+ in debugfs
+
+The firmware's init objects (Main, Globals, Runtime, the power and
+performance object, the activity objects and the rest of the 31) are
+built by the host before the firmware starts, and the firmware then
+updates some of them. To compare them byte for byte with what macOS
+hands the same firmware, both versions are needed, and nothing exposes
+either today.
+
+Add the load-time parameter g16_init_dump. When it is set, the driver
+keeps the encoder's private images of the 31 objects and creates the
+read-only debugfs file aurora-g16/initdata. It prints each object's id,
+name, GPU address and size, then every non-zero 32-byte row of the
+encoded image and of the live bytes. The log entry and data objects
+print their header line only. The default, 0, keeps nothing and creates
+no file.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs   |   4 +
+ drivers/gpu/drm/asahi/g16/initdata.rs | 116 ++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/mod.rs      |   4 +
+ drivers/gpu/drm/asahi/g16/params.rs   |   8 ++
+ drivers/gpu/drm/asahi/g16/poll.rs     |   8 ++
+ 5 files changed, 140 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index 954ba8fbf8..e9d7026bad 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -283,6 +283,10 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 0,
+             description: "G16: Main +0xf38 = 1 and +0x2568 = core count, as macOS (default 0)",
+         },
++        g16_init_dump: u32 {
++            default: 0,
++            description: "G16: show the init objects in debugfs aurora-g16/initdata (default 0)",
++        },
+         g16_ktrace_mask: u32 {
+             default: 0,
+             description: "G16: firmware trace mask written to CONTROL+0 at init (default 0: none)",
+diff --git a/drivers/gpu/drm/asahi/g16/initdata.rs b/drivers/gpu/drm/asahi/g16/initdata.rs
+index 154dacce45..aa76dbeb61 100644
+--- a/drivers/gpu/drm/asahi/g16/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/initdata.rs
+@@ -5,6 +5,8 @@
+ //! the boot owner publishes a root or loader address. Firmware-reachable
+ //! backing and mappings are retained by `Objects` until reboot.
+ 
++use core::fmt;
++
+ use kernel::{device, prelude::*, sync::Arc};
+ 
+ use super::adt::GpuAdt;
+@@ -49,6 +51,9 @@ pub(crate) struct InitData {
+     loader: KBox<[u8; wire::LOADER_BYTES]>,
+     /// The complete inventory, including firmware-only log and retention data.
+     _graph: KVec<Arc<FwObject>>,
++    /// `g16_init_dump`: the encoder's images (the host's bytes before the firmware starts),
++    /// taken once by the `aurora-g16/initdata` file. `None` when the switch is off.
++    encoded: Option<KVec<KVVec<u8>>>,
+ }
+ 
+ impl InitData {
+@@ -79,6 +84,19 @@ pub(crate) fn halted(&self) -> Result<bool> {
+         ])
+     }
+ 
++    /// The `aurora-g16/initdata` view (`g16_init_dump`): every inventory object with its encoded
++    /// image. `None` when the switch is off or the view was already taken.
++    pub(crate) fn take_dump(&mut self) -> Result<Option<InitDump>> {
++        let Some(encoded) = self.encoded.take() else {
++            return Ok(None);
++        };
++        let mut objects = KVec::with_capacity(self._graph.len(), GFP_KERNEL)?;
++        for object in self._graph.iter() {
++            objects.push(object.clone(), GFP_KERNEL)?;
++        }
++        Ok(Some(InitDump { objects, encoded }))
++    }
++
+     /// Firmware's actual READY acknowledgement in the small root.Control object.
+     pub(crate) fn readiness(&self) -> Result<u32> {
+         self.ready_control
+@@ -88,6 +106,94 @@ pub(crate) fn readiness(&self) -> Result<u32> {
+     }
+ }
+ 
++/// The `aurora-g16/initdata` file (`g16_init_dump`): the 31 init objects, read only.
++pub(crate) struct InitDump {
++    objects: KVec<Arc<FwObject>>,
++    encoded: KVec<KVVec<u8>>,
++}
++
++/// Inventory names, in [`id`] order.
++const NAMES: [&str; wire::OBJECT_COUNT] = [
++    "root",
++    "brn",
++    "runtime",
++    "globals",
++    "control",
++    "firmware_data",
++    "power",
++    "dynamic",
++    "main",
++    "power_performance",
++    "timer",
++    "activity_tiler",
++    "activity_fragment",
++    "activity_compute",
++    "activity_recovery",
++    "log_state",
++    "log_entries",
++    "log_data",
++    "fwctl",
++    "devctrl_state",
++    "devctrl_ring",
++    "ktrace_state",
++    "ktrace_data",
++    "statistics_state",
++    "statistics_data",
++    "temperature",
++    "event_state",
++    "event_data",
++    "retention",
++    "uma",
++    "parameter",
++];
++
++/// Objects above this size (the log entries and data) print their header line only.
++const DUMP_MAX: usize = 0x10000;
++
++/// One `obj` line per object (id, name, GPU VA, size), then its non-zero 32-byte rows: `e`
++/// rows are the encoder's image (what the host wrote, before the firmware started), `l` rows
++/// the live bytes at the read. A row left out is all zero. Nothing is written.
++pub(crate) fn dump_show(v: &InitDump, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++    writeln!(
++        f,
++        "initdata: {} objects, e = encoded, l = live",
++        v.objects.len()
++    )?;
++    for (i, object) in v.objects.iter().enumerate() {
++        let size = wire::OBJECT_SIZE[i];
++        writeln!(
++            f,
++            "obj {} {} va {:#x} size {:#x}",
++            i, NAMES[i], object.va, size
++        )?;
++        if size > DUMP_MAX {
++            continue;
++        }
++        let encoded = v.encoded.get(i);
++        for at in (0..size).step_by(32) {
++            let n = core::cmp::min(32, size - at);
++            let mut live = [0u8; 32];
++            let live = match object.read(at, &mut live[..n]) {
++                Ok(()) => Some(&live[..n]),
++                Err(_) => None,
++            };
++            let image = encoded.and_then(|e| e.get(at..at + n));
++            for (tag, row) in [("e", image), ("l", live)] {
++                let Some(row) = row else { continue };
++                if row.iter().all(|&b| b == 0) {
++                    continue;
++                }
++                write!(f, "{} {} +{:#06x}:", tag, i, at)?;
++                for b in row {
++                    write!(f, " {:02x}", b)?;
++                }
++                writeln!(f)?;
++            }
++        }
++    }
++    Ok(())
++}
++
+ fn pair(graph: &[Arc<FwObject>], state: usize, ring: usize) -> Ring {
+     Ring {
+         state: graph[state].clone(),
+@@ -316,6 +422,15 @@ pub(crate) fn build(
+     for i in 0..wire::OBJECT_COUNT {
+         graph[i].write(0, &images[i])?;
+     }
++    let encoded = if super::params::init_dump() {
++        dev_info!(
++            dev,
++            "M4 initdata: g16_init_dump=1: images kept for aurora-g16/initdata\n"
++        );
++        Some(images)
++    } else {
++        None
++    };
+ 
+     dev_info!(
+         dev,
+@@ -342,6 +457,7 @@ pub(crate) fn build(
+             idle_power_off_changes: 0,
+             loader,
+             _graph: graph,
++            encoded,
+         },
+         channels,
+         max_khz,
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index d0ddbfac21..88bd475ab2 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -271,6 +271,9 @@ pub(crate) struct Shared {
+     /// The `aurora-g16/replay` file (`g16_replay` template), once created.
+     #[pin]
+     pub(crate) replay: Mutex<Option<Pin<KBox<kernel::debugfs::File<encode::replay::ReplayView>>>>>,
++    /// The `aurora-g16/initdata` file (`g16_init_dump`), once created.
++    #[pin]
++    pub(crate) initdump: Mutex<Option<Pin<KBox<kernel::debugfs::File<initdata::InitDump>>>>>,
+ }
+ 
+ impl_has_delayed_work! {
+@@ -519,6 +522,7 @@ pub(crate) fn new(
+                 fwpower <- new_mutex!(None, "g16::Shared::fwpower"),
+                 ktrace <- new_mutex!(None, "g16::Shared::ktrace"),
+                 replay <- new_mutex!(None, "g16::Shared::replay"),
++                initdump <- new_mutex!(None, "g16::Shared::initdump"),
+             }),
+             GFP_KERNEL,
+         )?;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 3f5008df8f..dc1318ae8c 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -666,6 +666,14 @@ pub(crate) fn ktrace_mask() -> u32 {
+     module_parameters::g16_ktrace_mask.value()
+ }
+ 
++/// `g16_init_dump` (load time): keep the encoder's images of the 31 init objects (the host's
++/// own bytes, before the firmware starts) and serve them with the live bytes, read only, in
++/// debugfs `aurora-g16/initdata`, for a byte compare with the macOS bundle. 0 (the default):
++/// nothing is kept and the file does not exist.
++pub(crate) fn init_dump() -> bool {
++    module_parameters::g16_init_dump.value() != 0
++}
++
+ /// Enabled GPU cores, from the identity read at power-up (0 before it).
+ static CORES: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index c8f585d8ac..aeecc772f1 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -623,6 +623,7 @@ pub(crate) fn start_engine(self: &Arc<Self>) -> Result {
+         firmware.engine.shared = Some(self.clone());
+         firmware.engine.debugfs = Some(file);
+         let objects = firmware.init.fwpower_objects();
++        let dump = firmware.init.take_dump()?;
+         let mut rings = KVec::with_capacity(firmware.channels.submit.len() + 1, GFP_KERNEL)?;
+         for ring in firmware.channels.submit.iter() {
+             rings.push(ring.state.clone(), GFP_KERNEL)?;
+@@ -661,6 +662,13 @@ pub(crate) fn start_engine(self: &Arc<Self>) -> Result {
+             )?;
+             *self.fwpower.lock() = Some(file);
+         }
++        if let Some(view) = dump {
++            let file = KBox::pin_init(
++                dir.read_callback_file(c_str!("initdata"), view, &super::initdata::dump_show),
++                GFP_KERNEL,
++            )?;
++            *self.initdump.lock() = Some(file);
++        }
+         Ok(())
+     }
+ }
+-- 
+2.43.0
+

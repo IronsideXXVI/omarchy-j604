@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 04:27:24 +0000
+Subject: [PATCH] drm/asahi: g16: Enable the GPU-to-fabric bridge
+ before the firmware runs
+
+macOS 26B123 starts the J604 GPU by reading the two GPU-to-fabric
+bridge control words at sgx + 0x1000104 and + 0x1000108 (0x10000 and
+0x41330, as iBoot leaves them) and setting bit 0 of each (0x10001,
+0x41331) just before ASC RUN; a hypervisor trace shows the same pair in
+five of five boots. We never wrote them. With the bits clear the GFX
+domain never powers off at an idle desktop; with them set by hand the
+PMGR takes it fully off (idle-off 0 % -> 100 %, rows unchanged, sleep
+and wake clean). A deep sleep returns both words to iBoot's values.
+
+Set bit 0 of both words, as macOS does, after the GFX domain is on and
+before ASC RUN at start, again before RUN on the warm restart after a
+deep sleep, and after a suspend-to-idle. g16_bridge=0 leaves the words
+as found and only logs them.
+
+Revert: aurora.g16_bridge=0
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/boot.rs   | 26 ++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/params.rs | 17 +++++++++++++++++
+ drivers/gpu/drm/asahi/g16/regs.rs   | 29 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/sleep.rs  |  5 +++++
+ 4 files changed, 77 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 5fc2e327e7..83399114b9 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -915,6 +915,31 @@ fn run(
+     Ok(())
+ }
+ 
++/// `g16_bridge` (default 1): enable the GPU-to-fabric bridge as macOS's host does, after the
++/// GFX domain is on and before ASC RUN, at start and at every wake. Without it the GFX domain
++/// never powers off at idle. 0 leaves the words as found and only logs them.
++pub(crate) fn bridge_on(d: &device::Device, regs: &regs::Regs, at: &str) {
++    if super::params::bridge() == 0 {
++        if let Ok([a, b]) = regs.bridge() {
++            dev_info!(d, "M4 power: fabric bridge left {:#x} / {:#x} ({})\n", a, b, at);
++        }
++        return;
++    }
++    match regs.bridge_enable() {
++        Ok(([a, b], [a1, b1])) if a != a1 || b != b1 => dev_info!(
++            d,
++            "M4 power: fabric bridge enabled ({}): {:#x} -> {:#x}, {:#x} -> {:#x}\n",
++            at,
++            a,
++            a1,
++            b,
++            b1
++        ),
++        Ok(_) => {}
++        Err(e) => dev_warn!(d, "M4 power: fabric bridge not enabled ({}): {:?}\n", at, e),
++    }
++}
++
+ /// Brings the firmware to READY.
+ #[inline(never)]
+ pub(crate) fn start(
+@@ -1025,6 +1050,7 @@ pub(crate) fn start(
+         if session.regs.asc_control()? & regs::ASC_RUN != 0 {
+             return Err(EBUSY);
+         }
++        bridge_on(&d, &session.regs, "start");
+         shared.started.store(true, Ordering::Release);
+         session.regs.set_asc_control(control | regs::ASC_RUN)?;
+         regs::mb();
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 9488454539..1a55a79eab 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2271,6 +2271,23 @@ fn resident_latch() -> u32 {
+     RESIDENT_LATCH.load(Ordering::Acquire)
+ }
+ 
++/// Storage of `g16_bridge` (0644, default 1; read at start and at every wake).
++static BRIDGE: AtomicU32 = AtomicU32::new(1);
++
++/// `g16_bridge`: enable the GPU-to-fabric bridge before the firmware runs (default 1).
++pub(crate) fn bridge() -> u32 {
++    BRIDGE.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    BRIDGE_PARAM,
++    BRIDGE_PARMTYPE,
++    BRIDGE_PARM,
++    BRIDGE,
++    "g16_bridge",
++    "G16: enable the GPU-to-fabric bridge before the firmware runs, at start and at every wake, as macOS does (default 1; 0 leaves iBoot's values: the GFX domain then never powers off at idle)"
++);
++
+ /// Storage of `g16_resident_lazy` (0644, default 0; read when a VM builds its render units).
+ static RESIDENT_LAZY: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/regs.rs b/drivers/gpu/drm/asahi/g16/regs.rs
+index a0b3c3009b..17a33bbb5a 100644
+--- a/drivers/gpu/drm/asahi/g16/regs.rs
++++ b/drivers/gpu/drm/asahi/g16/regs.rs
+@@ -184,6 +184,8 @@ pub(crate) struct Regs {
+     /// The firmware's mirror of the generation cells (SGX +0xd64000, cell c at +2 * c;
+     /// J604-measured under macOS 26B123). Read only, for `g16_subgen`.
+     generation_mirror: Mapping,
++    /// The GPU-to-fabric bridge control page (sgx + 0x1000000), if the resource reaches it.
++    bridge: Option<Mapping>,
+ }
+ 
+ impl Regs {
+@@ -209,6 +211,7 @@ pub(crate) fn new(pdev: &platform::Device<Core<'_>>, res: G16Resources) -> Resul
+             status: window(c_str!("sgx"), SGX_STATUS as u64)?,
+             generation: window(c_str!("sgx"), 0xd60000)?,
+             generation_mirror: window(c_str!("sgx"), 0xd64000)?,
++            bridge: window(c_str!("sgx"), BRIDGE_PAGE as u64).ok(),
+             res,
+         })
+     }
+@@ -275,6 +278,26 @@ pub(crate) fn asc_control(&self) -> Result<u32> {
+         self.asc.io().try_read32(ASC_CONTROL)
+     }
+ 
++    /// The two GPU-to-fabric bridge control words (sgx + 0x1000104 / + 0x1000108).
++    pub(crate) fn bridge(&self) -> Result<[u32; 2]> {
++        let io = self.bridge.as_ref().ok_or(ENODEV)?.io();
++        Ok([io.try_read32(BRIDGE[0])?, io.try_read32(BRIDGE[1])?])
++    }
++
++    /// Sets bit 0 (enable) of both bridge words where it is clear, read-modify-write, in
++    /// macOS's order. Returns the words before and after.
++    pub(crate) fn bridge_enable(&self) -> Result<([u32; 2], [u32; 2])> {
++        let io = self.bridge.as_ref().ok_or(ENODEV)?.io();
++        let before = self.bridge()?;
++        for (at, v) in BRIDGE.into_iter().zip(before) {
++            if v & BRIDGE_ENABLE == 0 {
++                io.try_write32(v | BRIDGE_ENABLE, at)?;
++            }
++        }
++        mb();
++        Ok((before, self.bridge()?))
++    }
++
+     /// Writes the ASC control word (`asc + 0x44`).
+     pub(crate) fn set_asc_control(&self, value: u32) -> Result {
+         self.asc.io().try_write32(value, ASC_CONTROL)
+@@ -308,6 +331,12 @@ pub(crate) fn engine_state(&self) -> Result<EngineState> {
+ 
+ /// Size of each MMIO window mapped here.
+ const WINDOW: usize = 0x4000;
++/// The bridge page in the sgx resource, its two control words and their enable bit. macOS
++/// 26B123 reads 0x10000 / 0x41330 and writes 0x10001 / 0x41331 just before ASC RUN; a deep
++/// sleep returns both to the values read.
++const BRIDGE_PAGE: usize = 0x1000000;
++const BRIDGE: [usize; 2] = [0x104, 0x108];
++const BRIDGE_ENABLE: u32 = 1;
+ 
+ pub(crate) const SGX_ID: usize = 0xd04000;
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/sleep.rs b/drivers/gpu/drm/asahi/g16/sleep.rs
+index e693ae090c..2f0042bf70 100644
+--- a/drivers/gpu/drm/asahi/g16/sleep.rs
++++ b/drivers/gpu/drm/asahi/g16/sleep.rs
+@@ -90,6 +90,8 @@ fn sleep_restart(&mut self) -> Result {
+             note
+         );
+         self.session.rtkit.warm_restart()?;
++        // A deep sleep returns the bridge words to iBoot's values.
++        super::boot::bridge_on(&self.session.dev, &self.session.regs, "wake");
+         let control = self.session.regs.asc_control()?;
+         self.session.regs.set_asc_control(control | ASC_RUN)?;
+         regs::mb();
+@@ -417,6 +419,9 @@ fn s2idle_prepare(&self) {
+     /// Called after every device resumed, whether or not the sleep reached the hardware.
+     fn sleep_complete(&self) {
+         if S2IDLE_ACTIVE.swap(false, Ordering::AcqRel) {
++            if let Some(firmware) = self.shared.state.lock().as_deref() {
++                super::boot::bridge_on(&firmware.session.dev, &firmware.session.regs, "s2idle");
++            }
+             // The governor raises the state again with the first work.
+             self.shared.poll_now();
+         }
+-- 
+2.43.0
+

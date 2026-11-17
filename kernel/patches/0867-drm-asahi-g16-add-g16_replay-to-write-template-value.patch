@@ -1,0 +1,332 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 04:33:15 +0000
+Subject: [PATCH] drm/asahi: g16: add g16_replay to write template
+ values into compute records
+
+To find which bytes of a compute command make another driver's commands
+run differently from ours, it helps to submit our commands with that
+driver's values in selected fields and change one group of fields at a
+time.
+
+Add a write-only template, the aurora-g16/replay debugfs file, which takes
+a small blob of (record, piece, offset, width, value, step) entries for the
+compute sequence record, and a runtime mask, g16_replay. While a piece's
+bit is set, every compute command's sequence record takes the template
+value for that piece's fields, or value + step * n for counter fields,
+after this driver has filled it; the embedded copy in the work object
+gets the same bytes. Clearing one bit removes one piece without a reload.
+
+Fields this driver fills with an address are refused when the blob is
+written, so addresses always stay this driver's, and a malformed blob is
+refused and leaves nothing armed. The stats file gains a replay line with
+the mask, the entries, the commands written and the blobs refused.
+
+The default of 0 writes nothing.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/encode.rs         | 194 ++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/encode/compute.rs |   1 +
+ drivers/gpu/drm/asahi/g16/mod.rs            |   4 +
+ drivers/gpu/drm/asahi/g16/params.rs         |  18 ++
+ drivers/gpu/drm/asahi/g16/poll.rs           |  11 ++
+ 5 files changed, 228 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/encode.rs b/drivers/gpu/drm/asahi/g16/encode.rs
+index 420a647767..01bf02f4c4 100644
+--- a/drivers/gpu/drm/asahi/g16/encode.rs
++++ b/drivers/gpu/drm/asahi/g16/encode.rs
+@@ -299,3 +299,197 @@ pub(crate) fn barrier(
+     append_fs_timestamp_copies, encode_fs, encode_ta, fill_scene, initbm, render_attachments,
+     scene, scene_render, PassRefs, RenderRefs,
+ };
++
++/// `g16_replay`: replay of another driver's per-command record values, for comparison.
++///
++/// A template of field values is written to the `aurora-g16/replay` debugfs file as a
++/// "GRP1" blob: a 4-byte magic, a u16 version (1), a u16 entry count, then entries of 24
++/// bytes: kind u8, piece u8, width u8, mode u8, offset u16, reserved u16, value u64,
++/// step u64. Kind 1 is the compute sequence record. Mode 0 writes `value`; mode 1 writes
++/// `value + step * n`, n being the commands replayed since the blob was written.
++///
++/// `g16_replay` is a mask of pieces: an entry is applied only while its piece bit is set,
++/// so one piece is removed by clearing its bit. Entries that overlap a field this driver
++/// fills with an address are refused at write time: addresses always stay this driver's.
++/// Nothing is applied with the mask at 0 (the default) or without a blob.
++pub(crate) mod replay {
++    use core::fmt;
++    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
++
++    use kernel::prelude::*;
++    use kernel::uaccess::UserSliceReader;
++
++    use super::compute;
++
++    /// Most entries a blob may carry.
++    const MAX_ENTRIES: usize = 256;
++    /// Bytes of one entry.
++    const ENTRY_SIZE: usize = 24;
++    /// Bytes of the blob header.
++    const HEADER_SIZE: usize = 8;
++    /// Record kind: the compute sequence record.
++    pub(crate) const KIND_COMPUTE_SEQ: u8 = 1;
++
++    /// The fields of the compute sequence record this driver fills with an address, as
++    /// (offset, bytes): the 64-bit firmware and GPU addresses, the attachment table and the
++    /// unaligned pair of the finalize record.
++    const COMPUTE_SEQ_ADDRESSES: [(usize, usize); 33] = [
++        (0x14, 8),
++        (0x1c, 8),
++        (0x24, 8),
++        (0x44, 8),
++        (
++            compute::ATTACHMENTS,
++            compute::MAX_ATTACHMENTS * compute::ATTACHMENT_STRIDE,
++        ),
++        (0x160, 8),
++        (0x178, 8),
++        (0x188, 8),
++        (0x190, 8),
++        (0x198, 8),
++        (0x1a0, 8),
++        (0x1a8, 8),
++        (compute::TS_START + 4, 8),
++        (compute::TS_START + 0xc, 8),
++        (compute::TS_START + 0x14, 8),
++        (compute::TS_START + 0x1c, 8),
++        (compute::TS_START + 0x24, 8),
++        (compute::TS_START + 0x2c, 8),
++        (compute::TS_START + 0x34, 8),
++        (compute::TS_END + 4, 8),
++        (compute::TS_END + 0xc, 8),
++        (compute::TS_END + 0x14, 8),
++        (compute::TS_END + 0x1c, 8),
++        (compute::TS_END + 0x24, 8),
++        (compute::TS_END + 0x2c, 8),
++        (compute::TS_END + 0x34, 8),
++        (compute::FINALIZE + 4, 8),
++        (compute::FINALIZE + 0xc, 8),
++        (compute::FINALIZE + 0x18, 8),
++        (compute::FINALIZE + 0x2c, 8),
++        (compute::FINALIZE + 0x5c, 8),
++        (compute::FINALIZE + 0x69, 8),
++        (compute::FINALIZE + 0x71, 8),
++    ];
++
++    /// Packed entries: meta (kind | piece << 8 | width << 16 | mode << 24 | offset << 32),
++    /// value, step.
++    static ENTRIES: [[AtomicU64; 3]; MAX_ENTRIES] =
++        [const { [const { AtomicU64::new(0) }; 3] }; MAX_ENTRIES];
++    /// Valid entries; 0 while a blob is being written.
++    static COUNT: AtomicU32 = AtomicU32::new(0);
++    /// Commands replayed since the blob was written (n of the counter mode).
++    static APPLIED: AtomicU64 = AtomicU64::new(0);
++    /// Blobs refused.
++    static REFUSED: AtomicU32 = AtomicU32::new(0);
++
++    /// The `aurora-g16/replay` file.
++    pub(crate) struct ReplayView;
++
++    fn overlaps(off: usize, width: usize, fields: &[(usize, usize)]) -> bool {
++        fields.iter().any(|&(o, n)| off < o + n && o < off + width)
++    }
++
++    fn parse(blob: &[u8]) -> Result<KVec<[u64; 3]>> {
++        if blob.len() < HEADER_SIZE || &blob[0..4] != b"GRP1" {
++            return Err(EINVAL);
++        }
++        let version = u16::from_le_bytes([blob[4], blob[5]]);
++        let count = u16::from_le_bytes([blob[6], blob[7]]) as usize;
++        if version != 1 || count > MAX_ENTRIES || blob.len() != HEADER_SIZE + count * ENTRY_SIZE {
++            return Err(EINVAL);
++        }
++        let mut out = KVec::with_capacity(count, GFP_KERNEL)?;
++        for i in 0..count {
++            let e = &blob[HEADER_SIZE + i * ENTRY_SIZE..HEADER_SIZE + (i + 1) * ENTRY_SIZE];
++            let (kind, piece, width, mode) = (e[0], e[1], e[2] as usize, e[3]);
++            let off = u16::from_le_bytes([e[4], e[5]]) as usize;
++            let value = u64::from_le_bytes(e[8..16].try_into().map_err(|_| EINVAL)?);
++            let step = u64::from_le_bytes(e[16..24].try_into().map_err(|_| EINVAL)?);
++            if kind != KIND_COMPUTE_SEQ
++                || piece >= 32
++                || !matches!(width, 1 | 2 | 4 | 8)
++                || mode > 1
++                || off + width > compute::END
++                || overlaps(off, width, &COMPUTE_SEQ_ADDRESSES)
++            {
++                return Err(EINVAL);
++            }
++            let meta = u64::from(kind)
++                | u64::from(piece) << 8
++                | (width as u64) << 16
++                | u64::from(mode) << 24
++                | (off as u64) << 32;
++            out.push([meta, value, step], GFP_KERNEL)?;
++        }
++        Ok(out)
++    }
++
++    /// Writes a blob: it replaces the previous one, or disarms on any error.
++    pub(crate) fn replay_write(_v: &ReplayView, reader: &mut UserSliceReader) -> Result {
++        COUNT.store(0, Ordering::Release);
++        let len = reader.len();
++        if len > HEADER_SIZE + MAX_ENTRIES * ENTRY_SIZE {
++            REFUSED.fetch_add(1, Ordering::Relaxed);
++            return Err(E2BIG);
++        }
++        let mut blob = KVec::from_elem(0u8, len, GFP_KERNEL)?;
++        reader.read_slice(&mut blob)?;
++        let entries = match parse(&blob) {
++            Ok(e) => e,
++            Err(e) => {
++                REFUSED.fetch_add(1, Ordering::Relaxed);
++                return Err(e);
++            }
++        };
++        for (slot, e) in ENTRIES.iter().zip(entries.iter()) {
++            for (s, &v) in slot.iter().zip(e.iter()) {
++                s.store(v, Ordering::Relaxed);
++            }
++        }
++        APPLIED.store(0, Ordering::Relaxed);
++        COUNT.store(entries.len() as u32, Ordering::Release);
++        Ok(())
++    }
++
++    /// One line: mask, entries, commands replayed, blobs refused.
++    pub(crate) fn replay_show(_v: &ReplayView, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        stats(f)
++    }
++
++    /// The `replay:` line of the stats file (same keys as the replay file).
++    pub(crate) fn stats(f: &mut impl fmt::Write) -> fmt::Result {
++        writeln!(
++            f,
++            "replay: mask {:#x} entries {} applied {} refused {}",
++            super::super::params::replay(),
++            COUNT.load(Ordering::Acquire),
++            APPLIED.load(Ordering::Relaxed),
++            REFUSED.load(Ordering::Relaxed)
++        )
++    }
++
++    /// Overwrites the enabled pieces of a compute sequence record with the template values.
++    pub(crate) fn apply_compute_seq(q: &mut [u8; compute::SEQ_SIZE]) {
++        let mask = super::super::params::replay();
++        let count = (COUNT.load(Ordering::Acquire) as usize).min(MAX_ENTRIES);
++        if mask == 0 || count == 0 {
++            return;
++        }
++        let n = APPLIED.fetch_add(1, Ordering::Relaxed);
++        for slot in &ENTRIES[..count] {
++            let meta = slot[0].load(Ordering::Relaxed);
++            let (kind, piece) = (meta as u8, (meta >> 8) as u8);
++            let (width, mode) = ((meta >> 16) as u8 as usize, (meta >> 24) as u8);
++            let off = (meta >> 32) as u16 as usize;
++            if kind != KIND_COMPUTE_SEQ || mask & (1 << piece) == 0 || off + width > q.len() {
++                continue;
++            }
++            let mut v = slot[1].load(Ordering::Relaxed);
++            if mode == 1 {
++                v = v.wrapping_add(slot[2].load(Ordering::Relaxed).wrapping_mul(n));
++            }
++            q[off..off + width].copy_from_slice(&v.to_le_bytes()[..width]);
++        }
++    }
++}
+diff --git a/drivers/gpu/drm/asahi/g16/encode/compute.rs b/drivers/gpu/drm/asahi/g16/encode/compute.rs
+index a80225c1a3..f3e57cc060 100644
+--- a/drivers/gpu/drm/asahi/g16/encode/compute.rs
++++ b/drivers/gpu/drm/asahi/g16/encode/compute.rs
+@@ -371,6 +371,7 @@ pub(crate) fn encode_compute(
+     put64(q, f + 0x69, r.work + 0x8ac);
+     put64(q, f + 0x71, r.work + 0x88c);
+     put32(q, compute::END, 0x40000002);
++    super::replay::apply_compute_seq(q);
+     w[compute::SEQ_EMBEDDED..compute::SEQ_EMBEDDED + compute::SEQ_SIZE].copy_from_slice(q);
+ 
+     let no = compute::NOTIFIER;
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index fa2238a8f9..d0ddbfac21 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -268,6 +268,9 @@ pub(crate) struct Shared {
+     /// The `aurora-g16/ktrace` file (the kept firmware ktrace records), once created.
+     #[pin]
+     pub(crate) ktrace: Mutex<Option<Pin<KBox<kernel::debugfs::File<channel::KtraceView>>>>>,
++    /// The `aurora-g16/replay` file (`g16_replay` template), once created.
++    #[pin]
++    pub(crate) replay: Mutex<Option<Pin<KBox<kernel::debugfs::File<encode::replay::ReplayView>>>>>,
+ }
+ 
+ impl_has_delayed_work! {
+@@ -515,6 +518,7 @@ pub(crate) fn new(
+                 state <- new_mutex!(None, "g16::Shared::state"),
+                 fwpower <- new_mutex!(None, "g16::Shared::fwpower"),
+                 ktrace <- new_mutex!(None, "g16::Shared::ktrace"),
++                replay <- new_mutex!(None, "g16::Shared::replay"),
+             }),
+             GFP_KERNEL,
+         )?;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 35bbaa6f93..3f5008df8f 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2287,6 +2287,24 @@ pub(crate) fn resident_lazy_async() -> bool {
+     "G16: a VM's first render builds only its two full render units; the others are built when it queues deeper: 1 in SUBMIT, 2 by a worker (default 0: all at the first render; read when a VM builds units)"
+ );
+ 
++/// Storage of `g16_replay` (runtime 0644, default 0).
++static REPLAY: AtomicU32 = AtomicU32::new(0);
++
++/// The pieces of the `aurora-g16/replay` template applied to each compute command: bit k
++/// applies the template entries of piece k (0: none, the default).
++pub(crate) fn replay() -> u32 {
++    REPLAY.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    REPLAY_PARAM,
++    REPLAY_PARMTYPE,
++    REPLAY_PARM,
++    REPLAY,
++    "g16_replay",
++    "G16: mask of template pieces (aurora-g16/replay) written into each compute command's sequence record over this driver's values; addresses are never replaced (default 0: none; runtime 0644)"
++);
++
+ /// Storage of `g16_resident_units` (0644, default 0; read once, at the latch).
+ static RESIDENT_UNITS: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 3851eb8364..c8f585d8ac 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -608,6 +608,16 @@ pub(crate) fn start_engine(self: &Arc<Self>) -> Result {
+             GFP_KERNEL,
+         )?;
+         *self.ktrace.lock() = Some(ktrace);
++        let replay = KBox::pin_init(
++            dir.read_write_callback_file(
++                c_str!("replay"),
++                super::encode::replay::ReplayView,
++                &super::encode::replay::replay_show,
++                &super::encode::replay::replay_write,
++            ),
++            GFP_KERNEL,
++        )?;
++        *self.replay.lock() = Some(replay);
+         let mut state = self.state.lock();
+         let firmware = state.as_deref_mut().ok_or(ENODEV)?;
+         firmware.engine.shared = Some(self.clone());
+@@ -1801,6 +1811,7 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             params::rekick_us(),
+             self.session.shared.irq_bells.load(Ordering::Relaxed)
+         )?;
++        super::encode::replay::stats(f)?;
+         let lazy = &super::resources::LAZY_STATS;
+         writeln!(
+             f,
+-- 
+2.43.0
+

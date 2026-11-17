@@ -1297,3 +1297,10 @@ New in 1.1007 (0856 turns on the eleven-row GPU power table by default, revert w
 Kernel 1.1009 (1.1008 was a trial build that did not pass its install check and is not published) keeps the base (`da8e1acf3656`) and all 856 patches of 1.1007 under the same numbers.
 
 New in 1.1009 (0866 turns on the shared compute pool by default, revert with aurora.g16_compute_shared_pool=0; 0857 writes one Main word as macOS does; 0858-0860 change nothing by default; 0861-0865 are experiment switches that are off by default): 0857 (`drm/asahi: g16: Count the J604's eleven-row states in Main as macOS does`), 0858 (`dt-bindings: soc: apple: sleep: Add apple,spmi-extra-bus`), 0859 (`soc: apple: sleep: Reach spmi_sleep_extra's slave without a debug port`), 0860 (`arm64: dts: apple: t8132-j604: Name the bus of the SPMI slave macOS sleeps`), 0861 (`drm/asahi: g16: Optionally give the full render units 16 MiB PB heaps`), 0862 (`drm/asahi: g16: add g16_resident_lazy to build compact render units on demand`), 0863 (`drm/asahi: g16: let g16_resident_lazy=2 build render units in a worker`), 0864 (`drm/asahi: g16: Optionally write a firmware trace mask`), 0865 (`drm/asahi: g16: Leave Main +0xea0 out of the macOS Main table`), 0866 (`drm/asahi: g16: Share one UMA pool between a VM's compute units by default`).
+
+
+# Kernel patch numbers: 1.1009 to 1.1010
+
+Kernel 1.1010 keeps the base (`da8e1acf3656`) and all 866 patches of 1.1009 under the same numbers.
+
+New in 1.1010 (0871 enables the GPU-to-fabric bridge before the GPU firmware runs, on by default, revert with aurora.g16_bridge=0; 0867-0869 are experiment switches that are off by default, not user options; 0870 corrects the table of the g16_main_macos switch, also off by default): 0867 (`drm/asahi: g16: add g16_replay to write template values into compute records`), 0868 (`drm/asahi: g16: Add a switch to show the init objects in debugfs`), 0869 (`drm/asahi: g16: Optionally build the firmware loader map as macOS does`), 0870 (`drm/asahi: g16: Map the macOS Main words through both firmware layouts`), 0871 (`drm/asahi: g16: Enable the GPU-to-fabric bridge before the firmware runs`).
