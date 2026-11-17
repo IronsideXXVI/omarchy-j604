@@ -1,0 +1,293 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 06:30:39 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally stop the firmware at
+ reboot and power-off
+
+The G16 driver has no shutdown path: the module is retained, and on a
+reboot or power-off the firmware keeps running, the GFX domain stays
+on and the GPU-to-fabric bridge stays linked until the reset. macOS
+powers the GPU down at shutdown, and its PMGR driver unlinks the bridge
+on that software power-down.
+
+Register a reboot notifier for the G16 device. With g16_shutdown_stop
+set (default 0) it closes publication and joins the poll worker as a
+deep sleep does, then runs the same stop as the sleep's commit: the
+firmware idled by polling, mailbox and run bit off, the bridge unlinked
+when g16_bridge is set, the domain lowered. The waits are polled and
+bounded. The stop is shared with the commit through one mapping helper.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/driver.rs     |  1 +
+ drivers/gpu/drm/asahi/g16/glue.c    | 25 ++++++++++++
+ drivers/gpu/drm/asahi/g16/mod.rs    |  1 +
+ drivers/gpu/drm/asahi/g16/params.rs | 17 ++++++++
+ drivers/gpu/drm/asahi/g16/sleep.rs  | 54 +++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g17/sleep.c   | 61 ++++++++++++++++++++++-------
+ drivers/gpu/drm/asahi/g17/sleep.h   |  1 +
+ 7 files changed, 145 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/driver.rs b/drivers/gpu/drm/asahi/driver.rs
+index 44206cf86b..398aa3c8c1 100644
+--- a/drivers/gpu/drm/asahi/driver.rs
++++ b/drivers/gpu/drm/asahi/driver.rs
+@@ -674,6 +674,7 @@ pub(crate) fn probe_g16<'bound>(
+         // probe errors drop this local owner while the bound callback is live.
+         let binding = unsafe { crate::binding::Owner::new(pdev.as_ref(), &drm)? };
+         let gpu = crate::g16::Gpu::new(pdev, &drm, cfg, res)?;
++        crate::g16::register_reboot(pdev.as_ref());
+         let data_gpu = gpu.clone() as Arc<dyn gpu::Gpu>;
+         let data = try_pin_init!(AsahiDrmRegistrationData {
+             gpu: data_gpu,
+diff --git a/drivers/gpu/drm/asahi/g16/glue.c b/drivers/gpu/drm/asahi/g16/glue.c
+index c37c0df4c1..1e169b0523 100644
+--- a/drivers/gpu/drm/asahi/g16/glue.c
++++ b/drivers/gpu/drm/asahi/g16/glue.c
+@@ -21,6 +21,7 @@
+ #include <linux/of_reserved_mem.h>
+ #include <linux/pm_qos.h>
+ #include <linux/pm_runtime.h>
++#include <linux/reboot.h>
+ #include <linux/slab.h>
+ #include <linux/soc/apple/clpc.h>
+ #include <linux/soc/apple/display.h>
+@@ -283,6 +284,30 @@ int asahi_g16_hold_power(struct device *dev)
+ 	return dev->pm_domain ? 0 : -EINVAL;
+ }
+ 
++/* g16_shutdown_stop: one reboot / power-off callback for the (single) G16 device. */
++static struct {
++	struct notifier_block nb;
++	void (*fn)(void *cookie);
++	void *cookie;
++} asahi_g16_reboot;
++
++static int asahi_g16_reboot_call(struct notifier_block *nb, unsigned long action, void *data)
++{
++	asahi_g16_reboot.fn(asahi_g16_reboot.cookie);
++	return NOTIFY_DONE;
++}
++
++int asahi_g16_reboot_register(struct device *dev, void (*fn)(void *cookie), void *cookie);
++int asahi_g16_reboot_register(struct device *dev, void (*fn)(void *cookie), void *cookie)
++{
++	if (asahi_g16_reboot.fn)
++		return -EBUSY;
++	asahi_g16_reboot.fn = fn;
++	asahi_g16_reboot.cookie = cookie;
++	asahi_g16_reboot.nb.notifier_call = asahi_g16_reboot_call;
++	return devm_register_reboot_notifier(dev, &asahi_g16_reboot.nb);
++}
++
+ /* The range is disjoint from System RAM (ADT region admission). */
+ bool asahi_g16_ram_disjoint(u64 start, u64 size)
+ {
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 88bd475ab2..a1c616d26c 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -68,6 +68,7 @@
+ mod regs;
+ mod resources;
+ mod sleep;
++pub(crate) use sleep::register_reboot;
+ mod slots;
+ mod timestamp;
+ mod uat;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index b740592419..6c540c9581 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2791,3 +2791,20 @@ pub(crate) fn bridge_clear() -> u32 {
+     "g16_bridge_clear",
+     "G16: unlink the GPU-to-fabric bridge at the deep-sleep stop, before the GFX domain is lowered, as macOS does (default 0: the hardware clears it in the sleep; read when the sleep's commit is prepared)"
+ );
++
++/// Storage of `g16_shutdown_stop` (0644, default 0; read at reboot / power-off).
++static SHUTDOWN_STOP: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_shutdown_stop`: stop the firmware at reboot / power-off as the deep sleep does.
++pub(crate) fn shutdown_stop() -> u32 {
++    SHUTDOWN_STOP.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    SHUTDOWN_STOP_PARAM,
++    SHUTDOWN_STOP_PARMTYPE,
++    SHUTDOWN_STOP_PARM,
++    SHUTDOWN_STOP,
++    "g16_shutdown_stop",
++    "G16: at reboot / power-off, stop the firmware as the deep sleep does: idle, run bit off, bridge unlinked (with g16_bridge), domain lowered (default 0: the GPU runs into the reset)"
++);
+diff --git a/drivers/gpu/drm/asahi/g16/sleep.rs b/drivers/gpu/drm/asahi/g16/sleep.rs
+index 92b99a305c..5e290209aa 100644
+--- a/drivers/gpu/drm/asahi/g16/sleep.rs
++++ b/drivers/gpu/drm/asahi/g16/sleep.rs
+@@ -56,6 +56,16 @@ fn asahi_g16_commit_prepare(
+         bridge: bool,
+     ) -> *mut core::ffi::c_void;
+     fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
++    fn asahi_g16_shutdown_stop(
++        dev: *mut core::ffi::c_void,
++        rtk: *mut bindings::apple_rtkit,
++        bridge: bool,
++    ) -> core::ffi::c_int;
++    fn asahi_g16_reboot_register(
++        dev: *mut core::ffi::c_void,
++        f: unsafe extern "C" fn(*mut core::ffi::c_void),
++        cookie: *mut core::ffi::c_void,
++    ) -> core::ffi::c_int;
+     fn asahi_g17_power_auto_off(dev: *mut core::ffi::c_void, saved: *mut u32) -> core::ffi::c_int;
+     fn asahi_g17_power_lower(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+     fn asahi_g17_power_raise(dev: *mut core::ffi::c_void, saved: u32) -> core::ffi::c_int;
+@@ -515,3 +525,47 @@ unsafe fn sleep_gpu<'a>(dev: *mut bindings::device) -> Option<&'a Arc<Gpu>> {
+ pub(super) fn ops() -> &'static bindings::dev_pm_ops {
+     &SLEEP_OPS.0
+ }
++
++impl Gpu {
++    /// `g16_shutdown_stop`: at reboot or power-off, stop the firmware as the deep sleep's commit
++    /// does (macOS powers the GPU down at shutdown; we left it running).
++    fn reboot_stop(&self) {
++        if params::shutdown_stop() == 0 {
++            return;
++        }
++        let shared = &self.shared;
++        shared.sleeping.store(true, Ordering::Release);
++        shared.join_workers();
++        let state = shared.state.lock();
++        if let Some(firmware) = state.as_deref() {
++            // SAFETY: the bound device and the session's RTKit handle (retained until reboot);
++            // the stop polls with bounded waits.
++            let ret = unsafe {
++                asahi_g16_shutdown_stop(
++                    shared.dev.as_raw().cast(),
++                    firmware.session.rtkit.as_raw(),
++                    params::bridge() != 0,
++                )
++            };
++            dev_info!(shared.dev.as_ref(), "G16: g16_shutdown_stop: {}\n", ret);
++        }
++    }
++}
++
++/// The reboot notifier's callback; `cookie` is the bound GPU device.
++unsafe extern "C" fn reboot_notify(cookie: *mut core::ffi::c_void) {
++    // SAFETY: registered with the bound device as cookie; the device stays bound until reboot.
++    if let Some(gpu) = unsafe { sleep_gpu(cookie.cast()) } {
++        gpu.reboot_stop();
++    }
++}
++
++/// Registers the reboot / power-off callback behind `g16_shutdown_stop` (checked when it runs).
++pub(crate) fn register_reboot(dev: &kernel::device::Device) {
++    let raw = dev.as_raw().cast();
++    // SAFETY: `dev` is the bound GPU device; the notifier is device-managed.
++    let ret = unsafe { asahi_g16_reboot_register(raw, reboot_notify, raw) };
++    if ret != 0 {
++        dev_warn!(dev, "G16: reboot callback not registered: {}\n", ret);
++    }
++}
+diff --git a/drivers/gpu/drm/asahi/g17/sleep.c b/drivers/gpu/drm/asahi/g17/sleep.c
+index e3bf9e7a42..b6b8bd663f 100644
+--- a/drivers/gpu/drm/asahi/g17/sleep.c
++++ b/drivers/gpu/drm/asahi/g17/sleep.c
+@@ -344,17 +344,13 @@ bool asahi_g17_commit_required(void)
+  * The same stop for G16: one firmware instance, whose control registers are the ASC's own, no
+  * bridge and no PMP request to withdraw, as its vote stays through the sleep.
+  */
+-/*
+- * @bridge: also unlink the GPU-to-fabric bridge at the stop, before the domain is lowered, as
+- * macOS's PMGR does on a software power-down (G16 has no gating hold).
+- */
+-struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk,
+-						  bool bridge)
++/* What the G16 stop touches: the ASC control, the GFX power state and, with @bridge, the bridge. */
++static struct asahi_g17_commit *asahi_g16_commit_map(struct device *dev, struct apple_rtkit *rtk,
++						     bool bridge)
+ {
+ 	struct asahi_g17_commit *c;
+ 	struct device_node *np;
+ 	u32 offset;
+-	int ret;
+ 
+ 	c = kzalloc_obj(*c);
+ 	if (!c)
+@@ -363,18 +359,53 @@ struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct app
+ 	c->rtk[0] = rtk;
+ 	c->count = 1;
+ 
+-	ret = -ENODEV;
+ 	c->cpu[0] = asahi_g17_map(dev->of_node, "asc", 0, ASC_CPU_CONTROL, 8);
+ 	np = of_parse_phandle(dev->of_node, "power-domains", 0);
+-	if (!np)
+-		goto err;
+-	if (!of_property_read_u32(np, "reg", &offset) && np->parent)
+-		c->ps = asahi_g17_map(np->parent, NULL, 0, offset, 4);
+-	of_node_put(np);
+-	if (!c->cpu[0] || !c->ps)
+-		goto err;
++	if (np) {
++		if (!of_property_read_u32(np, "reg", &offset) && np->parent)
++			c->ps = asahi_g17_map(np->parent, NULL, 0, offset, 4);
++		of_node_put(np);
++	}
++	if (!c->cpu[0] || !c->ps) {
++		asahi_g17_commit_free(c);
++		return ERR_PTR(-ENODEV);
++	}
+ 	if (bridge)
+ 		c->bridge = asahi_g17_map(dev->of_node, "sgx", 0, SGX_BRIDGE, 4 * SGX_BRIDGE_WORDS);
++	return c;
++}
++
++/*
++ * Reboot or power-off (g16_shutdown_stop): the same stop as the deep sleep's commit, without the
++ * sleep driver: the firmware idled by polling, mailbox and run bit off, with @bridge the bridge
++ * unlinked, the domain lowered. Polled, bounded waits only.
++ */
++int asahi_g16_shutdown_stop(struct device *dev, struct apple_rtkit *rtk, bool bridge)
++{
++	struct asahi_g17_commit *c = asahi_g16_commit_map(dev, rtk, bridge);
++	int ret;
++
++	if (IS_ERR(c))
++		return PTR_ERR(c);
++	ret = asahi_g17_commit_stop(c);
++	dev_info(dev, "GPU stopped for the reboot: idle %d, domain %#x -> %#x (%d), bridge %#x %#x\n",
++		 c->idle[0], c->saved, c->lowered, c->lower_ret, c->words[0], c->words[1]);
++	asahi_g17_commit_free(c);
++	return ret;
++}
++
++/*
++ * @bridge: also unlink the GPU-to-fabric bridge at the stop, before the domain is lowered, as
++ * macOS's PMGR does on a software power-down (G16 has no gating hold).
++ */
++struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk,
++						  bool bridge)
++{
++	struct asahi_g17_commit *c = asahi_g16_commit_map(dev, rtk, bridge);
++	int ret;
++
++	if (IS_ERR(c))
++		return c;
+ 
+ 	ret = apple_sleep_coproc_register_first(dev, asahi_g17_commit_stop, c);
+ 	if (ret)
+diff --git a/drivers/gpu/drm/asahi/g17/sleep.h b/drivers/gpu/drm/asahi/g17/sleep.h
+index 19f54dd85b..89b68d0a03 100644
+--- a/drivers/gpu/drm/asahi/g17/sleep.h
++++ b/drivers/gpu/drm/asahi/g17/sleep.h
+@@ -16,6 +16,7 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
+ 						  struct apple_mbox *secondary_mbox, bool bridge);
+ struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk,
+ 						  bool bridge);
++int asahi_g16_shutdown_stop(struct device *dev, struct apple_rtkit *rtk, bool bridge);
+ bool asahi_g17_commit_finish(struct asahi_g17_commit *c, u32 *saved);
+ bool asahi_g17_commit_required(void);
+ int asahi_g17_power_auto_off(struct device *dev, u32 *saved);
+-- 
+2.43.0
+

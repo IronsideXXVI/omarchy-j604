@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 09:31:29 +0000
+Subject: [PATCH] asahi: add opt-in G16 shared negative-zero clamp experiment
+
+Keep the f32 saturated adds unchanged and materialize one negative-zero GPR per block instead of each eligible uniform operand. Separate g16link logging exposes successful linked parts and bytes. Both flags default off; include the experiment in compiler cache keys. Test captured blend NIR, default and experimental lowering, and operand boundaries.
+
+Assisted-by: LLM
+---
+ src/asahi/compiler/agx_compile.c              |   2 +
+ src/asahi/compiler/agx_debug.h                |   2 +
+ .../compiler/agx_lower_uniform_sources.c      |  26 ++++
+ .../test/test-native-form-regressions.cpp     | 113 ++++++++++++++++++
+ src/asahi/lib/agx_linker.c                    |  10 +-
+ src/asahi/vulkan/hk_shader.c                  |   3 +-
+ 6 files changed, 153 insertions(+), 3 deletions(-)
+
+diff --git a/src/asahi/compiler/agx_compile.c b/src/asahi/compiler/agx_compile.c
+index 433a1e4febb..8e369458773 100644
+--- a/src/asahi/compiler/agx_compile.c
++++ b/src/asahi/compiler/agx_compile.c
+@@ -55,6 +55,8 @@ static const struct debug_named_value agx_debug_options[] = {
+    {"nopromote", AGX_DBG_NOPROMOTE, "Do not promote constants to uniforms"},
+    {"latecov",   AGX_DBG_LATECOV,   "Keep G17P coverage updates at the end of the fragment"},
+    {"refuse",    AGX_DBG_REFUSE,    "Name refused instructions, without dumping shaders"},
++   {"g16nz", AGX_DBG_G16_NZ, "Experiment: share negative zero for G16 uniform clamps"},
++   {"g16link", AGX_DBG_G16_LINK, "Dump G16 linked shader bytes"},
+    DEBUG_NAMED_VALUE_END
+ };
+ /* clang-format on */
+diff --git a/src/asahi/compiler/agx_debug.h b/src/asahi/compiler/agx_debug.h
+index 2b72f917bb4..500beab90a8 100644
+--- a/src/asahi/compiler/agx_debug.h
++++ b/src/asahi/compiler/agx_debug.h
+@@ -32,6 +32,8 @@ enum agx_compiler_dbg {
+    AGX_DBG_LATECOV     = BITFIELD_BIT(13),
+    AGX_DBG_REFUSE      = BITFIELD_BIT(14),
+    AGX_DBG_BINARIES    = BITFIELD_BIT(15),
++   AGX_DBG_G16_NZ      = BITFIELD_BIT(16),
++   AGX_DBG_G16_LINK    = BITFIELD_BIT(17),
+ };
+ /* clang-format on */
+ 
+diff --git a/src/asahi/compiler/agx_lower_uniform_sources.c b/src/asahi/compiler/agx_lower_uniform_sources.c
+index a66cb9a2cbe..b5eb826c882 100644
+--- a/src/asahi/compiler/agx_lower_uniform_sources.c
++++ b/src/asahi/compiler/agx_lower_uniform_sources.c
+@@ -678,6 +678,32 @@ m5_native_isel_uniform(const agx_context *ctx, const agx_instr *I)
+ void
+ agx_lower_uniform_sources(agx_context *ctx)
+ {
++   /* Preserve the exact f32 add and saturation. Only change which operand
++    * satisfies the existing mixed uniform/GPR encoding contract. */
++   if (ctx->key->dev.chip == AGX_CHIP_G16G && !ctx->is_preamble &&
++       (agx_get_compiler_debug() & AGX_DBG_G16_NZ)) {
++      agx_foreach_block(ctx, block) {
++         agx_index zero = agx_null();
++         agx_foreach_instr_in_block_safe(block, I) {
++            if (I->op != AGX_OPCODE_FADD || !I->saturate ||
++                I->nr_dests != 1 || I->nr_srcs != 2 ||
++                I->dest[0].size != AGX_SIZE_32 ||
++                I->src[0].type != AGX_INDEX_UNIFORM ||
++                I->src[0].size != AGX_SIZE_32 ||
++                I->src[0].value >= 256 || (I->src[0].value & 1) ||
++                I->src[0].abs || I->src[0].neg ||
++                !agx_is_equiv(I->src[1], agx_negzero()) ||
++                I->src[1].abs || I->src[1].neg)
++               continue;
++            if (agx_is_null(zero)) {
++               agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
++               zero = agx_mov_imm(&b, 32, 0x80000000);
++            }
++            I->src[1] = zero;
++         }
++      }
++   }
++
+    agx_foreach_instr_global_safe(ctx, I) {
+       agx3_lower_m5_modified_fma_immediates(ctx, I);
+ 
+diff --git a/src/asahi/compiler/test/test-native-form-regressions.cpp b/src/asahi/compiler/test/test-native-form-regressions.cpp
+index c86aab1b375..d2d184c25a7 100644
+--- a/src/asahi/compiler/test/test-native-form-regressions.cpp
++++ b/src/asahi/compiler/test/test-native-form-regressions.cpp
+@@ -6295,3 +6295,116 @@ TEST(NativeForms, G17PMeshPayloadReadIsUndefined)
+    nir_validate_shader(b.shader, "gen1 mesh payload read");
+    ralloc_free(b.shader);
+ }
++
++TEST(NativeForms, G16SharedNegativeZero)
++{
++   void *mem = ralloc_context(NULL);
++   agx_builder *b = agx_test_builder(mem);
++   agx_shader_key key = {};
++   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
++   key.dev.chip = AGX_CHIP_G16G;
++   b->shader->key = &key;
++   agx_instr *adds[4];
++   for (unsigned c = 0; c < 4; ++c) {
++      adds[c] = agx_fadd_to(b, agx_temp(b->shader, AGX_SIZE_32),
++                          agx_uniform(16 + 2*c, AGX_SIZE_32), agx_negzero());
++      adds[c]->saturate = true;
++   }
++   agx_lower_uniform_sources(b->shader);
++   bool enabled = agx_get_compiler_debug() & AGX_DBG_G16_NZ;
++   for (unsigned c = 0; c < 4; ++c) {
++      EXPECT_TRUE(adds[c]->saturate);
++      EXPECT_EQ(adds[c]->op, AGX_OPCODE_FADD);
++      EXPECT_EQ(adds[c]->dest[0].size, AGX_SIZE_32);
++      if (enabled) {
++         EXPECT_EQ(adds[c]->src[0].type, AGX_INDEX_UNIFORM);
++         EXPECT_EQ(adds[c]->src[1].size, AGX_SIZE_32);
++         EXPECT_TRUE(agx_is_equiv(adds[c]->src[1], adds[0]->src[1]));
++      } else {
++         EXPECT_EQ(adds[c]->src[0].type, AGX_INDEX_NORMAL);
++         EXPECT_TRUE(agx_is_equiv(adds[c]->src[1], agx_negzero()));
++      }
++   }
++   unsigned zeros = 0;
++   agx_foreach_instr_global(b->shader, I) {
++      if (I->op == AGX_OPCODE_MOV_IMM && I->imm == 0x80000000) zeros++;
++   }
++   EXPECT_EQ(zeros, enabled ? 1u : 0u);
++   ralloc_free(mem);
++}
++
++TEST(NativeForms, G16CapturedBlend)
++{
++   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
++      &agx_nir_options, "G16 captured RGBA8 blend");
++   nir_def *mask = nir_imm_intN_t(&b, 255, 16);
++   nir_def *dst = nir_load_local_pixel_agx(&b, 4, 32, mask);
++   nir_intrinsic_instr *ld = nir_def_as_intrinsic(dst);
++   nir_intrinsic_set_format(ld, PIPE_FORMAT_R8_UNORM);
++   nir_def *src = agx_test_load_preamble(&b, 4, 32, 16);
++   nir_def *a = nir_fsat(&b, nir_channel(&b, src, 3));
++   nir_def *inv = nir_fsub(&b, nir_imm_float(&b, 1), a);
++   nir_def *v[4];
++   for (unsigned i=0; i<3; i++)
++      v[i] = nir_ffma(&b, nir_fsat(&b, nir_channel(&b, src, i)), a,
++                        nir_fmul(&b, nir_channel(&b, dst, i), inv));
++   v[3] = nir_ffma(&b, nir_channel(&b, dst, 3), inv, a);
++   agx_test_store_local_pixel_agx(&b, nir_vec4(&b,v[0],v[1],v[2],v[3]), mask,
++      nir_undef(&b,2,16),0,15,PIPE_FORMAT_R8_UNORM);
++   b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
++   b.shader->info.outputs_read = BITFIELD64_BIT(FRAG_RESULT_DATA0);
++   b.shader->info.fs.uses_fbfetch_output = true;
++   b.shader->info.io_lowered = true;
++   agx_shader_key key = {};
++   key.dev.encoding=AGX_ISA_ENCODING_AGX3B;
++   key.dev.chip=AGX_CHIP_G16G;
++   key.no_preamble=true;
++   key.reserved_preamble=24;
++   key.fs.nr_samples=1;
++   agx_shader_part part={};
++   ASSERT_TRUE(agx_compile_shader_nir(b.shader,&key,&part));
++   bool enabled = agx_get_compiler_debug() & AGX_DBG_G16_NZ;
++   EXPECT_EQ(part.info.stats.instrs, enabled ? 22u : 25u);
++   EXPECT_EQ(part.info.binary_size, enabled ? 170u : 178u);
++   fprintf(stderr,"G16 CAPTURED: instructions=%u bytes=%u gprs=%u spills=%u\n",
++      part.info.stats.instrs,part.info.binary_size,part.info.nr_gprs,part.info.stats.spills);
++   free(part.binary);
++   ralloc_free(b.shader);
++}
++
++TEST(NativeForms, G16NegativeZeroBoundaries)
++{
++   for (bool saturate : {false,true}) {
++      for (unsigned imm : {0u,0x80u,0x38u}) {
++         void *mem=ralloc_context(NULL);
++         agx_builder *b=agx_test_builder(mem);
++         agx_shader_key key={};
++         key.dev.chip=AGX_CHIP_G16G;
++         key.dev.encoding=AGX_ISA_ENCODING_AGX3B;
++         b->shader->key=&key;
++         agx_instr *I=agx_fadd_to(b,agx_temp(b->shader,AGX_SIZE_32),
++                                agx_uniform(16,AGX_SIZE_32),agx_immediate(imm));
++         I->saturate=saturate;
++         agx_lower_uniform_sources(b->shader);
++         bool eligible=saturate && imm==0x80 &&
++                       (agx_get_compiler_debug() & AGX_DBG_G16_NZ);
++         EXPECT_EQ(I->src[0].type,eligible ? AGX_INDEX_UNIFORM : AGX_INDEX_NORMAL);
++         EXPECT_EQ(I->saturate,saturate);
++         EXPECT_EQ(I->op,AGX_OPCODE_FADD);
++         ralloc_free(mem);
++      }
++   }
++   /* Materialization preserves the negative-zero operand bit-for-bit.
++    * Include NaNs, both zero signs, subnormals, infinities and clamp edges.
++    * This host check does not claim GPU NaN/denormal qualification. */
++   for (uint32_t bits : {0u,0x80000000u,1u,0x80000001u,0x7fc12345u,
++                         0x7f800000u,0xff800000u,0x3f7fffffu,0x3f800001u}) {
++      float input; memcpy(&input,&bits,4);
++      uint32_t nz=0x80000000u; float reg;memcpy(&reg,&nz,4);
++      volatile float x=input;
++      volatile float a=x + -0.0f;
++      volatile float b=x + reg;
++      float aa=a,bb=b;uint32_t ab,bbits;memcpy(&ab,&aa,4);memcpy(&bbits,&bb,4);
++      EXPECT_EQ(ab,bbits);
++   }
++}
+diff --git a/src/asahi/lib/agx_linker.c b/src/asahi/lib/agx_linker.c
+index 18b0f22e685..eb49f5b51ef 100644
+--- a/src/asahi/lib/agx_linker.c
++++ b/src/asahi/lib/agx_linker.c
+@@ -772,8 +772,14 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
+    }
+ 
+    /* The linked program is what runs; its parts are dumped at compile. */
+-   if ((agx_get_compiler_debug() & AGX_DBG_SHADERS) &&
+-       (dev->chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->chip))) {
++   if (((agx_get_compiler_debug() & AGX_DBG_SHADERS) &&
++        (dev->chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->chip))) ||
++       ((agx_get_compiler_debug() & AGX_DBG_G16_LINK) &&
++        dev->chip == AGX_CHIP_G16G)) {
++      fprintf(stderr, "AGX3 link parts: fragment=%u prolog=%u main=%u epilog=%u fused=%u\n",
++              fragment, prolog ? prolog->info.main_size : 0,
++              main->info.main_size, epilog ? epilog->info.main_size : 0,
++              colour_fused);
+       fprintf(stderr, "AGX3 linked: fragment=%u size=%zu hex=", fragment, size);
+       for (size_t i = 0; i < size; ++i)
+          fprintf(stderr, "%02x", linked_map[i]);
+diff --git a/src/asahi/vulkan/hk_shader.c b/src/asahi/vulkan/hk_shader.c
+index e74c61b85bb..732996a62b8 100644
+--- a/src/asahi/vulkan/hk_shader.c
++++ b/src/asahi/vulkan/hk_shader.c
+@@ -195,7 +195,8 @@ hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
+ {
+    /* This could be optimized but it doesn't matter. */
+    return pdev->dev.debug |
+-          hk_fs_structure_key_bits();
++          hk_fs_structure_key_bits() |
++          ((uint64_t)!!(agx_get_compiler_debug() & AGX_DBG_G16_NZ) << 31);
+ }
+ 
+ const nir_shader_compiler_options *
+-- 
+2.43.0
+

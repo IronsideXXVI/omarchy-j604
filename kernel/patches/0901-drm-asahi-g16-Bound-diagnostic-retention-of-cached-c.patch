@@ -1,0 +1,218 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 09:55:31 +0000
+Subject: [PATCH] drm/asahi: g16: Bound diagnostic retention of cached
+ compute arenas
+
+Cached private mapping destruction marks the adopted UAT failed. A clean
+serial compute test can therefore poison later clients when its arena is
+released, without a stale-data fault.
+
+Add default-off g16_cwork_retain for experiments with compute cache bit 2.
+Keep a complete arena reference, including every alias and VM binding,
+until reboot. Reserve at most four arenas before construction, enforce a
+1 GiB backing limit per reservation before allocation, and report actual
+retained bytes. Failed construction keeps its reservation and existing
+failure handling. Pin the module through the existing retention API.
+
+This is bounded diagnostic retention, not a reclamation protocol. No
+PPL, mapping failure guard, cache maintenance or recovery path changes.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs    |  4 +++
+ drivers/gpu/drm/asahi/g16/object.rs    | 27 ++++++++++++++
+ drivers/gpu/drm/asahi/g16/params.rs    |  6 ++++
+ drivers/gpu/drm/asahi/g16/resources.rs | 49 ++++++++++++++++++++++++--
+ 4 files changed, 84 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index a46de82822..dbc5e1fbc3 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -283,6 +283,10 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 0,
+             description: "G16: Main +0xf38 = 1 and +0x2568 = core count, as macOS (default 0)",
+         },
++        g16_cwork_retain: u32 {
++            default: 0,
++            description: "G16: bounded cached compute arena retention until reboot (diagnostic)",
++        },
+         g16_fw_cached: u32 {
+             default: 0,
+             description: "G16: cached kinds: 1 queue 2 compute 4 TA 8 FS 16 ring (default 0)",
+diff --git a/drivers/gpu/drm/asahi/g16/object.rs b/drivers/gpu/drm/asahi/g16/object.rs
+index 6afbb1ef0d..b4aa7b2b8d 100644
+--- a/drivers/gpu/drm/asahi/g16/object.rs
++++ b/drivers/gpu/drm/asahi/g16/object.rs
+@@ -314,6 +314,8 @@ pub(crate) fn objects(&self, vm: &mmu::Vm) -> Objects {
+             mappings: KVec::new(),
+             error: None,
+             pages: 0,
++            backing_limit: usize::MAX,
++            backing_charged: 0,
+         }
+     }
+ }
+@@ -340,6 +342,8 @@ pub(crate) struct Objects {
+     error: Option<Error>,
+     /// Host-window pages backed by objects.
+     pages: usize,
++    backing_limit: usize,
++    backing_charged: usize,
+ }
+ 
+ impl Objects {
+@@ -360,6 +364,8 @@ pub(crate) fn new(
+             mappings: KVec::new(),
+             error: None,
+             pages: 0,
++            backing_limit: usize::MAX,
++            backing_charged: 0,
+         })
+     }
+ 
+@@ -422,6 +428,12 @@ fn alloc_private_in(
+             & !(hw::PAGE as usize - 1);
+         self.retained.reserve(1, GFP_KERNEL)?;
+         self.mappings.reserve(3, GFP_KERNEL)?;
++        let charge = self.backing_charged.checked_add(bytes).ok_or(EOVERFLOW)?;
++        if charge > self.backing_limit {
++            return Err(ENOSPC);
++        }
++        // Keep failed allocation attempts charged: a partial mapping may be retained.
++        self.backing_charged = charge;
+         let mut backing = gem::new_kernel_object_wc(&self.dev, bytes)?;
+         let registered = self.dev.registration_guard().ok_or(ENODEV)?;
+         let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
+@@ -535,6 +547,15 @@ pub(crate) fn clients(&self) -> &[Arc<FwObject>] {
+         &self.clients
+     }
+ 
++    /// Bound diagnostic backing before any allocation or firmware mapping.
++    pub(crate) fn limit_backing(&mut self, bytes: usize) -> Result {
++        if self.backing_charged != 0 || !self.mappings.is_empty() {
++            return Err(EINVAL);
++        }
++        self.backing_limit = bytes;
++        Ok(())
++    }
++
+     /// Host-window pages backed by firmware objects.
+     #[allow(dead_code)]
+     pub(crate) fn pages(&self) -> usize {
+@@ -632,6 +653,12 @@ pub(super) fn alloc_split(
+ 
+         // Populate and DMA-map first: this cleans the zeroed pages' cacheable alias to the
+         // point of coherency before any write-combined access.
++        let charge = self.backing_charged.checked_add(bytes).ok_or(EOVERFLOW)?;
++        if charge > self.backing_limit {
++            return Err(ENOSPC);
++        }
++        // Keep failed allocation attempts charged: a partial mapping may be retained.
++        self.backing_charged = charge;
+         let mut backing = gem::new_kernel_object_wc(&self.dev, bytes)?;
+         // SAFETY: allocation runs during platform probe or under the bound G16
+         // owner's admission lock. Its session and supplier remain retained.
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index d431c648d8..41495ff4cf 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -658,6 +658,12 @@ pub(crate) fn main_nap() -> bool {
+     module_parameters::g16_main_nap.value() != 0
+ }
+ 
++/// Diagnostic only: keep complete cached compute arenas until reboot.
++pub(crate) fn cwork_retain() -> bool {
++    module_parameters::g16_cwork_retain.value() == 1
++        && module_parameters::g16_fw_cached.value() & 2 != 0
++}
++
+ /// `g16_fw_cached` (load time): a bitmask of command-object kinds (`hw::tuning::FWC_*`) that use
+ /// the ASC-cached classes instead of AttrIndex 2, as the macOS driver maps its queue objects, job
+ /// blocks and work records. 25G83 cleans and invalidates queue info and scheduler contexts when a
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 5efcabca87..b6de0c8a3f 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -47,6 +47,27 @@ pub(crate) struct EpochPool {
+     closed: bool,
+ }
+ 
++// Diagnostic lifetime budget: at most four 1-GiB backing reservations per boot.
++// Failed construction keeps its reservation; no cached teardown is attempted here.
++const RETAIN_ARENA_BYTES: usize = 1 << 30;
++static RETAIN_ARENAS: AtomicU32 = AtomicU32::new(0);
++static RETAIN_BYTES: AtomicU64 = AtomicU64::new(0);
++static RETAIN_MODULE: AtomicBool = AtomicBool::new(false);
++
++fn reserve_retained_arena() -> Result<u32> {
++    crate::retain::retain_module(&RETAIN_MODULE)?;
++    RETAIN_ARENAS
++        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
++            if n < 4 {
++                Some(n + 1)
++            } else {
++                None
++            }
++        })
++        .map(|n| n + 1)
++        .map_err(|_| ENOSPC)
++}
++
+ pub(crate) struct ComputeArena(crate::cleanup::Deferred<ComputeInner>);
+ impl core::ops::Deref for ComputeArena {
+     type Target = ComputeInner;
+@@ -68,7 +89,17 @@ fn new(
+         vm: &mmu::Vm,
+         live: &Arc<super::vm::LiveToken>,
+     ) -> Result<Arc<Self>> {
++        let retain = super::params::cwork_retain();
++        let ticket = if retain { reserve_retained_arena()? } else { 0 };
+         let mut objects = factory.objects(vm);
++        if retain {
++            objects.limit_backing(RETAIN_ARENA_BYTES)?;
++            pr_info!(
++                "G16: cached compute reserve {} bytes={} before construction\n",
++                ticket,
++                RETAIN_ARENA_BYTES
++            );
++        }
+         let units = super::params::compute_units();
+         let mut compute = KVec::with_capacity(units, GFP_KERNEL)?;
+         let pack = if super::params::cwork_pack() {
+@@ -87,7 +118,8 @@ fn new(
+             compute.push(unit, GFP_KERNEL)?;
+         }
+         objects.finish_private()?;
+-        Ok(Arc::new(
++        let bytes = objects.pages() as u64 * super::hw::PAGE;
++        let arena = Arc::new(
+             Self(crate::cleanup::Deferred::new(ComputeInner {
+                 compute,
+                 _objects: objects,
+@@ -95,7 +127,20 @@ fn new(
+                 _live: live.clone(),
+             })?),
+             GFP_KERNEL,
+-        )?)
++        )?;
++        if retain {
++            let total = RETAIN_BYTES.fetch_add(bytes, Ordering::AcqRel) + bytes;
++            // Keep the ENTIRE arena: backing, aliases, VM binding and live token.
++            // No destructor, unmap, physical reuse or firmware acknowledgment is invented.
++            core::mem::forget(arena.clone());
++            pr_info!(
++                "G16: cached compute retained {} bytes={} total={} until reboot\n",
++                ticket,
++                bytes,
++                total
++            );
++        }
++        Ok(arena)
+     }
+ }
+ 
+-- 
+2.43.0
+

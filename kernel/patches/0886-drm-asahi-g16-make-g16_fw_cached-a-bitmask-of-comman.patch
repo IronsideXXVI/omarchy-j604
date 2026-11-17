@@ -1,0 +1,334 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 07:38:59 +0000
+Subject: [PATCH] drm/asahi: g16: make g16_fw_cached a bitmask of
+ command-object kinds
+
+The macOS driver maps its queue objects, job blocks and work records
+cacheable for the firmware. g16_fw_cached switched every command object
+at once, so a boot that went wrong could not say which kind did it.
+
+Make it a bitmask of kinds: 0x1 queue objects (queue info, scheduler
+contexts, job lists, the registration barrier), 0x2 compute commands
+(work image, sequence object, barrier), 0x4 render TA (work image,
+sequence), 0x8 render FS (work image, sequence, the pass slot's
+barriers) and 0x10 the queues' work rings. The receipt reads only the
+uncached cursors when queue objects are cached, as it did before for the
+whole switch.
+
+The value 1 now selects queue objects only. The default of 0 keeps every
+kind uncached.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs    |  2 +-
+ drivers/gpu/drm/asahi/g16/graph.rs     | 50 ++++++++++++++++++--------
+ drivers/gpu/drm/asahi/g16/hw.rs        | 21 ++++++++---
+ drivers/gpu/drm/asahi/g16/params.rs    | 14 ++++----
+ drivers/gpu/drm/asahi/g16/poll.rs      |  4 +--
+ drivers/gpu/drm/asahi/g16/resources.rs |  1 +
+ drivers/gpu/drm/asahi/g16/slots.rs     | 33 ++++++++++++-----
+ 7 files changed, 88 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index 1a9df02947..119e42a89c 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -285,7 +285,7 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+         },
+         g16_fw_cached: u32 {
+             default: 0,
+-            description: "G16: command objects ASC-cached (default 0: uncached)",
++            description: "G16: cached kinds: 1 queue 2 compute 4 TA 8 FS 16 ring (default 0)",
+         },
+         g16_init_dump: u32 {
+             default: 0,
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index 23aa2b46b0..4bfef2f926 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -18,15 +18,15 @@
+ use super::Firmware;
+ use crate::driver::AsahiDrmDevice;
+ 
+-pub(crate) fn cmd_fw() -> Class {
+-    if tuning::fw_cached() {
++pub(crate) fn cmd_fw(kind: u32) -> Class {
++    if tuning::fw_cached(kind) {
+         Class::FwCached
+     } else {
+         Class::Fw
+     }
+ }
+-pub(crate) fn cmd_shared() -> Class {
+-    if tuning::fw_cached() {
++pub(crate) fn cmd_shared(kind: u32) -> Class {
++    if tuning::fw_cached(kind) {
+         Class::SharedCached
+     } else {
+         Class::Shared
+@@ -42,7 +42,7 @@ pub(crate) const fn manager_class(class: Class) -> Class {
+ }
+ #[allow(dead_code)]
+ pub(crate) fn queue_scratch() -> Class {
+-    cmd_fw()
++    cmd_fw(tuning::FWC_QUEUE)
+ }
+ 
+ /// A private client alias uses the working M4 driver's AttrIndex-2 NC policy.
+@@ -88,10 +88,11 @@ pub(crate) fn alloc_work(
+     size: usize,
+     lower: u64,
+     offset: usize,
++    kind: u32,
+ ) -> Result<Arc<FwObject>> {
+     objects.alloc(Request {
+         size,
+-        class: cmd_shared(),
++        class: cmd_shared(kind),
+         placement: Placement::Anywhere,
+         offset,
+         client: None,
+@@ -127,9 +128,16 @@ struct QueueObjects {
+ impl QueueObjects {
+     fn new(o: &mut Objects) -> Result<Self> {
+         Ok(Self {
+-            qinfo: alloc(o, qinfo::SIZE, cmd_fw(), None, 0, false)?,
++            qinfo: alloc(o, qinfo::SIZE, cmd_fw(tuning::FWC_QUEUE), None, 0, false)?,
+             qstate: alloc(o, qstate::SIZE, Class::Fw, None, 0, false)?,
+-            ring: alloc(o, sizes::QUEUE_CAP as usize * 8, cmd_fw(), None, 0, false)?,
++            ring: alloc(
++                o,
++                sizes::QUEUE_CAP as usize * 8,
++                cmd_fw(tuning::FWC_RING),
++                None,
++                0,
++                false,
++            )?,
+             user_stamp: alloc(o, 8, Class::Shared, None, 0, false)?,
+             fw_stamp: alloc(o, 8, Class::Shared, None, 0, false)?,
+         })
+@@ -168,10 +176,17 @@ impl ComputeGraph {
+     fn new(o: &mut Objects) -> Result<Self> {
+         let q = QueueObjects::new(o)?;
+         Ok(Self {
+-            sched_ctx: alloc(o, sched_ctx::SIZE, cmd_fw(), None, 0, false)?,
++            sched_ctx: alloc(
++                o,
++                sched_ctx::SIZE,
++                cmd_fw(tuning::FWC_QUEUE),
++                None,
++                0,
++                false,
++            )?,
+             notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
+             threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
+-            job_list: alloc(o, job_list::SIZE, cmd_fw(), None, 0, false)?,
++            job_list: alloc(o, job_list::SIZE, cmd_fw(tuning::FWC_QUEUE), None, 0, false)?,
+             qscratch: q.qinfo.clone(),
+             qinfo: q.qinfo,
+             qstate: q.qstate,
+@@ -229,14 +244,14 @@ fn new(o: &mut Objects, context: Arc<FwObject>) -> Result<Self> {
+             notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
+             threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
+             job_list: [
+-                alloc(o, job_list::SIZE, cmd_fw(), None, 0, false)?,
+-                alloc(o, job_list::SIZE, cmd_fw(), None, 0, false)?,
++                alloc(o, job_list::SIZE, cmd_fw(tuning::FWC_QUEUE), None, 0, false)?,
++                alloc(o, job_list::SIZE, cmd_fw(tuning::FWC_QUEUE), None, 0, false)?,
+             ],
+             legacy_empty: alloc(o, 0x40, Class::Shared, None, 0, false)?,
+             registration_barrier: alloc(
+                 o,
+                 super::fw::work::barrier::SIZE,
+-                cmd_fw(),
++                cmd_fw(tuning::FWC_QUEUE),
+                 None,
+                 0,
+                 false,
+@@ -277,7 +292,14 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+         let compute = ComputeGraph::new(o)?;
+         let render = RenderGraph::new(o, compute.sched_ctx.clone())?;
+         let render2 = if super::params::render_queues() >= 2 {
+-            let context = alloc(o, sched_ctx::SIZE, cmd_fw(), None, 0, false)?;
++            let context = alloc(
++                o,
++                sched_ctx::SIZE,
++                cmd_fw(tuning::FWC_QUEUE),
++                None,
++                0,
++                false,
++            )?;
+             Some(RenderGraph::new(o, context)?)
+         } else {
+             None
+diff --git a/drivers/gpu/drm/asahi/g16/hw.rs b/drivers/gpu/drm/asahi/g16/hw.rs
+index 79d0640978..8aa796c629 100644
+--- a/drivers/gpu/drm/asahi/g16/hw.rs
++++ b/drivers/gpu/drm/asahi/g16/hw.rs
+@@ -495,11 +495,22 @@ pub(crate) mod engine {
+ /// Active M4 policy. Protocol fields and cache attributes live in their wire builders;
+ /// unsupported G15 batching, clustering and recovery controls are deliberately absent.
+ pub(crate) mod tuning {
+-    /// Whether command objects use the ASC-cached classes (`g16_fw_cached`, default no: uncached
+-    /// mappings from creation, including work images, microsequences and the embedded compute
+-    /// manager). Session-global initdata keeps its own explicit cache classes.
+-    pub(crate) fn fw_cached() -> bool {
+-        super::super::params::fw_cached()
++    /// `g16_fw_cached` kinds. Queue objects: queue info, scheduler contexts, job lists and the
++    /// registration barrier (and the receipt then reads the uncached cursors only).
++    pub(crate) const FWC_QUEUE: u32 = 0x1;
++    /// Compute commands: the work image, its sequence object and barrier.
++    pub(crate) const FWC_COMPUTE: u32 = 0x2;
++    /// Render TA: the TA work image and sequence.
++    pub(crate) const FWC_TA: u32 = 0x4;
++    /// Render FS: the FS work image, sequence and the pass slot's barriers.
++    pub(crate) const FWC_FS: u32 = 0x8;
++    /// The queues' work rings (written by the host for every command).
++    pub(crate) const FWC_RING: u32 = 0x10;
++    /// Whether the command objects of `kind` use the ASC-cached classes (`g16_fw_cached`,
++    /// default none: uncached mappings from creation). Session-global initdata keeps its own
++    /// explicit cache classes.
++    pub(crate) fn fw_cached(kind: u32) -> bool {
++        super::super::params::fw_cached(kind)
+     }
+     /// Handle EP 0x20 drain requests in the mailbox interrupt.
+     pub(crate) const EARLY_WAKE: bool = true;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 163cca9294..98cbfd304c 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -658,12 +658,14 @@ pub(crate) fn main_nap() -> bool {
+     module_parameters::g16_main_nap.value() != 0
+ }
+ 
+-/// `g16_fw_cached` (load time): command objects (work images, microsequences, barriers, queue
+-/// info, rings, scheduler contexts) use the ASC-cached classes instead of AttrIndex 2. 25G83
+-/// cleans and invalidates such objects by VA range (0x3e8c8) before it reads them. 0 (the
+-/// default) keeps today's uncached classes.
+-pub(crate) fn fw_cached() -> bool {
+-    module_parameters::g16_fw_cached.value() != 0
++/// `g16_fw_cached` (load time): a bitmask of command-object kinds (`hw::tuning::FWC_*`) that use
++/// the ASC-cached classes instead of AttrIndex 2, as the macOS driver maps its queue objects, job
++/// blocks and work records. 25G83 cleans and invalidates queue info and scheduler contexts when a
++/// queue registers, and cleans each work block after its command; it does not invalidate work
++/// images, sequences or barriers before reading them. Whether every bit in `kind` is set. 0 (the
++/// default) keeps today's uncached classes for every kind.
++pub(crate) fn fw_cached(kind: u32) -> bool {
++    kind != 0 && module_parameters::g16_fw_cached.value() & kind == kind
+ }
+ 
+ /// `g16_ktrace_mask` (load time): the word written to CONTROL+0 at init. 25G83 copies it into
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 5ad0ffd79f..58a943c4c5 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -901,7 +901,7 @@ pub(crate) fn queue_receipt(
+                 return Ok(false);
+             }
+         }
+-        if !super::hw::tuning::fw_cached() {
++        if !super::hw::tuning::fw_cached(super::hw::tuning::FWC_QUEUE) {
+             for offset in [0x20, 0x24, 0x28] {
+                 if info.r32(offset)? != head {
+                     return Ok(false);
+@@ -944,7 +944,7 @@ pub(crate) fn queue_receipt_behind(
+                 return Ok(false);
+             }
+         }
+-        if !super::hw::tuning::fw_cached() {
++        if !super::hw::tuning::fw_cached(super::hw::tuning::FWC_QUEUE) {
+             for offset in [0x20, 0x24, 0x28] {
+                 if !ring_passed(info.r32(offset)?, start, head, tail, m) {
+                     return Ok(false);
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 542e8950ca..8e908a4b06 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -77,6 +77,7 @@ fn new(
+                 super::hw::client::CWORK_PACK_SIZE as usize,
+                 super::hw::client::CWORK_PACK,
+                 0,
++                super::hw::tuning::FWC_COMPUTE,
+             )?)
+         } else {
+             None
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index df5653ae18..a77ac76afd 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -13,7 +13,7 @@
+ use super::encode::{Geometry, PassRefs};
+ use super::fw::work::{barrier, compute, fs, ta};
+ use super::graph::{alloc, alloc_work, cmd_fw, Client};
+-use super::hw::{client, sizes};
++use super::hw::{client, sizes, tuning};
+ use super::object::{Class, FwObject, Objects};
+ use super::pools::lifetime::Lifetime;
+ 
+@@ -85,9 +85,22 @@ pub(crate) fn new(
+                 0,
+                 false,
+             )?,
+-            work: alloc_work(o, 0x2000, client::WORK_PAGE + k * client::CWORK_STRIDE, 0)?,
+-            seq: alloc(o, 0x300, cmd_fw(), None, 0, false)?,
+-            barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
++            work: alloc_work(
++                o,
++                0x2000,
++                client::WORK_PAGE + k * client::CWORK_STRIDE,
++                0,
++                tuning::FWC_COMPUTE,
++            )?,
++            seq: alloc(o, 0x300, cmd_fw(tuning::FWC_COMPUTE), None, 0, false)?,
++            barrier: alloc(
++                o,
++                barrier::SIZE,
++                cmd_fw(tuning::FWC_COMPUTE),
++                None,
++                0,
++                false,
++            )?,
+             pool: match shared {
+                 Some(f) => f.pool.clone(),
+                 None => o.alloc(super::object::Request {
+@@ -297,12 +310,14 @@ pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32, compact: bool) -> R
+             fs::WORK_SIZE,
+             client::FS_WORK_PAGE + ws,
+             client::FS_WORK_OFF as usize,
++            tuning::FWC_FS,
+         )?;
+         let ta_work = alloc_work(
+             o,
+             ta::WORK_SIZE,
+             client::TA_WORK_PAGE + ws,
+             client::TA_WORK_OFF as usize,
++            tuning::FWC_TA,
+         )?;
+         Ok(Self {
+             aux,
+@@ -314,16 +329,16 @@ pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32, compact: bool) -> R
+             fs_scratch,
+             fs_work,
+             ta_work,
+-            ta_seq: alloc(o, ta::SEQ_OBJECT, cmd_fw(), None, 0, false)?,
+-            fs_seq: alloc(o, fs::SEQ_OBJECT, cmd_fw(), None, 0, false)?,
++            ta_seq: alloc(o, ta::SEQ_OBJECT, cmd_fw(tuning::FWC_TA), None, 0, false)?,
++            fs_seq: alloc(o, fs::SEQ_OBJECT, cmd_fw(tuning::FWC_FS), None, 0, false)?,
+             ta_scratch: alloc(o, 0x10000, sh, None, 0, false)?,
+             scene: alloc(o, super::fw::work::scene::SIZE, sh, None, 0, false)?,
+             // Internal TA start/end, FS start/end; legacy user cells likewise.
+             its: alloc(o, 32, sh, None, 0, false)?,
+             _uts: alloc(o, 32, Class::Fw, None, 0, false)?,
+-            own_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
+-            prev_barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
+-            fs_dep: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
++            own_barrier: alloc(o, barrier::SIZE, cmd_fw(tuning::FWC_FS), None, 0, false)?,
++            prev_barrier: alloc(o, barrier::SIZE, cmd_fw(tuning::FWC_FS), None, 0, false)?,
++            fs_dep: alloc(o, barrier::SIZE, cmd_fw(tuning::FWC_FS), None, 0, false)?,
+         })
+     }
+ 
+-- 
+2.43.0
+

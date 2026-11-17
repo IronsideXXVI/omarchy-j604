@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 06:30:39 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally unlink the fabric bridge
+ at the deep-sleep stop
+
+macOS 26B123's PMGR driver keys the GPU-to-fabric bridge on the GFX
+power state: it sets bit 0 of both bridge words when the domain powers
+up and clears them on a software power-down, before the domain is
+lowered. We set them at start and after every wake (g16_bridge); the
+only software power-down of GFX on our host is the deep-sleep stop at
+the commit, which lowers the domain with the bridge still linked and
+leaves the clearing to the hardware.
+
+Let the G16 commit map the two bridge words and clear their enable bit
+after the firmware is stopped and before the domain is lowered, as the
+G17 commit already does, behind g16_bridge_clear (default 0). G16 has
+no gating hold, so the G17-only gating access is skipped when it is not
+mapped.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 18 ++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/sleep.rs  |  7 ++++++-
+ drivers/gpu/drm/asahi/g17/sleep.c   | 13 ++++++++++---
+ drivers/gpu/drm/asahi/g17/sleep.h   |  3 ++-
+ 4 files changed, 36 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index e5767d15b6..b740592419 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2773,3 +2773,21 @@ pub(crate) fn fill(gpu: &Gpu, params: &mut uapi::drm_asahi_params_global) -> Res
+     }
+     Ok(())
+ }
++
++/// Storage of `g16_bridge_clear` (0644, default 0; read when a sleep's commit is prepared).
++static BRIDGE_CLEAR: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_bridge_clear`: unlink the GPU-to-fabric bridge at the deep-sleep stop, before the GFX
++/// domain is lowered, as macOS's PMGR does on a software power-down (with `g16_bridge` set).
++pub(crate) fn bridge_clear() -> u32 {
++    BRIDGE_CLEAR.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    BRIDGE_CLEAR_PARAM,
++    BRIDGE_CLEAR_PARMTYPE,
++    BRIDGE_CLEAR_PARM,
++    BRIDGE_CLEAR,
++    "g16_bridge_clear",
++    "G16: unlink the GPU-to-fabric bridge at the deep-sleep stop, before the GFX domain is lowered, as macOS does (default 0: the hardware clears it in the sleep; read when the sleep's commit is prepared)"
++);
+diff --git a/drivers/gpu/drm/asahi/g16/sleep.rs b/drivers/gpu/drm/asahi/g16/sleep.rs
+index 2f0042bf70..92b99a305c 100644
+--- a/drivers/gpu/drm/asahi/g16/sleep.rs
++++ b/drivers/gpu/drm/asahi/g16/sleep.rs
+@@ -53,6 +53,7 @@
+     fn asahi_g16_commit_prepare(
+         dev: *mut core::ffi::c_void,
+         rtk: *mut bindings::apple_rtkit,
++        bridge: bool,
+     ) -> *mut core::ffi::c_void;
+     fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
+     fn asahi_g17_power_auto_off(dev: *mut core::ffi::c_void, saved: *mut u32) -> core::ffi::c_int;
+@@ -183,7 +184,11 @@ fn leave_for_commit(&self, firmware: &mut Firmware) -> bool {
+         // SAFETY: `dev` is the live GPU device. The RTKit handle lasts until reboot, and
+         // `.complete` frees the result.
+         let commit = unsafe {
+-            asahi_g16_commit_prepare(self.dev.as_raw().cast(), firmware.session.rtkit.as_raw())
++            asahi_g16_commit_prepare(
++                self.dev.as_raw().cast(),
++                firmware.session.rtkit.as_raw(),
++                params::bridge_clear() != 0 && params::bridge() != 0,
++            )
+         };
+         match kernel::error::from_err_ptr(commit) {
+             Ok(commit) => {
+diff --git a/drivers/gpu/drm/asahi/g17/sleep.c b/drivers/gpu/drm/asahi/g17/sleep.c
+index 2aebc75d21..e3bf9e7a42 100644
+--- a/drivers/gpu/drm/asahi/g17/sleep.c
++++ b/drivers/gpu/drm/asahi/g17/sleep.c
+@@ -213,7 +213,7 @@ static int asahi_g17_commit_stop(void *data)
+ 			apple_mbox_ascwrap_v6_stop_cpu_atomic(c->mbox[i]);
+ 		else
+ 			writel(readl(c->cpu[i]) & ~ASC_CPU_CONTROL_RUN, c->cpu[i]);
+-		if (!i && c->bridge)
++		if (!i && c->bridge && c->gating)
+ 			writel(readl(c->gating) | SGX_GATING_HOLD, c->gating);
+ 	}
+ 	c->request_ret = c->request ? apple_pmp_report_entry_withdraw_polled(c->request) : 0;
+@@ -223,7 +223,7 @@ static int asahi_g17_commit_stop(void *data)
+ 	if (c->bridge) {
+ 		for (i = 0; i < SGX_BRIDGE_WORDS; i++)
+ 			c->words[i] = readl(c->bridge + 4 * i);
+-		c->words[i] = readl(c->gating);
++		c->words[i] = c->gating ? readl(c->gating) : 0;
+ 		for (i = 0; i < SGX_BRIDGE_WORDS; i++)
+ 			writel(c->words[i] & ~SGX_BRIDGE_ENABLE, c->bridge + 4 * i);
+ 	}
+@@ -344,7 +344,12 @@ bool asahi_g17_commit_required(void)
+  * The same stop for G16: one firmware instance, whose control registers are the ASC's own, no
+  * bridge and no PMP request to withdraw, as its vote stays through the sleep.
+  */
+-struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk)
++/*
++ * @bridge: also unlink the GPU-to-fabric bridge at the stop, before the domain is lowered, as
++ * macOS's PMGR does on a software power-down (G16 has no gating hold).
++ */
++struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk,
++						  bool bridge)
+ {
+ 	struct asahi_g17_commit *c;
+ 	struct device_node *np;
+@@ -368,6 +373,8 @@ struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct app
+ 	of_node_put(np);
+ 	if (!c->cpu[0] || !c->ps)
+ 		goto err;
++	if (bridge)
++		c->bridge = asahi_g17_map(dev->of_node, "sgx", 0, SGX_BRIDGE, 4 * SGX_BRIDGE_WORDS);
+ 
+ 	ret = apple_sleep_coproc_register_first(dev, asahi_g17_commit_stop, c);
+ 	if (ret)
+diff --git a/drivers/gpu/drm/asahi/g17/sleep.h b/drivers/gpu/drm/asahi/g17/sleep.h
+index a3c3a8fbfe..19f54dd85b 100644
+--- a/drivers/gpu/drm/asahi/g17/sleep.h
++++ b/drivers/gpu/drm/asahi/g17/sleep.h
+@@ -14,7 +14,8 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
+ 						  struct apple_mbox *primary_mbox,
+ 						  struct apple_rtkit *secondary_rtk,
+ 						  struct apple_mbox *secondary_mbox, bool bridge);
+-struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk);
++struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk,
++						  bool bridge);
+ bool asahi_g17_commit_finish(struct asahi_g17_commit *c, u32 *saved);
+ bool asahi_g17_commit_required(void);
+ int asahi_g17_power_auto_off(struct device *dev, u32 *saved);
+-- 
+2.43.0
+

@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 12:44:39 +0000
+Subject: [PATCH] drm/asahi: g16: Retain submitter identity in host
+ records
+
+Capture initial-namespace TGID and TID in the synchronous SUBMIT path
+and carry the scalar identity with Job to preparation records. Never
+substitute a scheduler worker identity. Include the submit ID for
+correlation; opener PID remains explicitly unavailable.
+
+Version records as G16RAW2. Queue seeds and channel records carry an
+unavailable source; their owner fields retain their original meaning.
+Keep recording disabled by default and preserve record and data caps.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs       |  7 ++-
+ drivers/gpu/drm/asahi/g16/host_records.rs | 72 ++++++++++++++++++++---
+ drivers/gpu/drm/asahi/g16/job.rs          |  3 +
+ drivers/gpu/drm/asahi/g16/queue.rs        |  3 +
+ 4 files changed, 74 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 1bda9682db..f4b792a473 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -2048,7 +2048,9 @@ fn prefix_compute(
+             image(&mut scratch.cq)?,
+         )
+         .map_err(|_| EINVAL)?;
+-        super::host_records::capture("compute-encoded-prefix", s.work.va, g.qinfo.va, n, &w[..0x1000]);
++        super::host_records::capture_submit(
++            "compute-encoded-prefix", s.work.va, g.qinfo.va, n, &w[..0x1000], job.host_identity,
++        );
+         if before != 0 {
+             // Slots::claim_compute proved a different fully retired unit displaced this
+             // descriptor in the same hardware slot. Keep every firmware-mutated byte.
+@@ -2064,12 +2066,13 @@ fn prefix_compute(
+         }
+         // Immutable encoder scratch under the existing firmware owner; no GEM readback.
+ 
+-        super::host_records::capture(
++        super::host_records::capture_submit(
+             "compute-ring-entry",
+             g.ring.va + 8 * pf.c_head as u64,
+             g.qinfo.va,
+             n,
+             &s.block_va().to_le_bytes(),
++            job.host_identity,
+         );
+         s.write_work(w)?;
+         f.uma_submitted = submitted;
+diff --git a/drivers/gpu/drm/asahi/g16/host_records.rs b/drivers/gpu/drm/asahi/g16/host_records.rs
+index fc71738da6..aa666b70ec 100644
+--- a/drivers/gpu/drm/asahi/g16/host_records.rs
++++ b/drivers/gpu/drm/asahi/g16/host_records.rs
+@@ -7,6 +7,31 @@
+ use core::sync::atomic::{AtomicUsize, Ordering};
+ use kernel::prelude::*;
+ 
++/// IDs in the initial PID namespace, captured synchronously in the SUBMIT ioctl.
++/// Zero source means unavailable. DRM opener identity is not available here.
++#[derive(Clone, Copy, Default)]
++pub(crate) struct Identity {
++    source: u32,
++    tgid: i32,
++    tid: i32,
++    submit_id: u64,
++}
++
++impl Identity {
++    pub(crate) fn submit(id: u64) -> Self {
++        if !super::params::host_records() {
++            return Self::default();
++        }
++        let task = kernel::current!();
++        Self {
++            source: 1,
++            tgid: task.tgid(),
++            tid: task.pid(),
++            submit_id: id,
++        }
++    }
++}
++
+ static RECORDS: AtomicUsize = AtomicUsize::new(0);
+ static BYTES: AtomicUsize = AtomicUsize::new(0);
+ 
+@@ -16,11 +41,26 @@ pub(crate) fn capture(kind: &str, va: u64, owner: u64, ordinal: u64, data: &[u8]
+     if !super::params::host_records() {
+         return;
+     }
+-    capture_on(kind, va, owner, ordinal, data);
++    capture_on(kind, va, owner, ordinal, data, Identity::default());
++}
++
++/// Submitter metadata propagated by Job, never sampled from the preparation worker.
++pub(crate) fn capture_submit(
++    kind: &str,
++    va: u64,
++    owner: u64,
++    ordinal: u64,
++    data: &[u8],
++    identity: Identity,
++) {
++    if !super::params::host_records() {
++        return;
++    }
++    capture_on(kind, va, owner, ordinal, data, identity);
+ }
+ 
+ #[inline(never)]
+-fn capture_on(kind: &str, va: u64, owner: u64, ordinal: u64, data: &[u8]) {
++fn capture_on(kind: &str, va: u64, owner: u64, ordinal: u64, data: &[u8], who: Identity) {
+     if data.len() > 0x1000 {
+         return;
+     }
+@@ -29,15 +69,29 @@ fn capture_on(kind: &str, va: u64, owner: u64, ordinal: u64, data: &[u8]) {
+     }) else {
+         return;
+     };
+-    if BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+-        n.checked_add(data.len()).filter(|v| *v <= 0x8000)
+-    }).is_err() {
++    if BYTES
++        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
++            n.checked_add(data.len()).filter(|v| *v <= 0x8000)
++        })
++        .is_err()
++    {
+         return;
+     }
+-    pr_info!("G16RAW1 BEGIN {} {} {:#x} {:#x} {} {}\n",
+-             id, kind, va, owner, ordinal, data.len());
++    pr_info!(
++        "G16RAW2 BEGIN {} {} {:#x} {:#x} {} {} {} {} {} 0 {}\n",
++        id,
++        kind,
++        va,
++        owner,
++        ordinal,
++        data.len(),
++        who.source,
++        who.tgid,
++        who.tid,
++        who.submit_id
++    );
+     for (i, chunk) in data.chunks(32).enumerate() {
+-        pr_info!("G16RAW1 DATA {} {} {:02x?}\n", id, i * 32, chunk);
++        pr_info!("G16RAW2 DATA {} {} {:02x?}\n", id, i * 32, chunk);
+     }
+-    pr_info!("G16RAW1 END {}\n", id);
++    pr_info!("G16RAW2 END {}\n", id);
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/job.rs b/drivers/gpu/drm/asahi/g16/job.rs
+index 34ed8fdeba..c18e647c6a 100644
+--- a/drivers/gpu/drm/asahi/g16/job.rs
++++ b/drivers/gpu/drm/asahi/g16/job.rs
+@@ -88,6 +88,7 @@ const fn new() -> Self {
+ pub(crate) struct Job {
+     /// Submission ID (debugging).
+     pub(crate) id: u64,
++    pub(crate) host_identity: super::host_records::Identity,
+     /// The submitting queue (priority, service turn, horizon history).
+     pub(crate) queue: Arc<QueueState>,
+     /// The job's VM (TTBAT slot, status).
+@@ -131,6 +132,7 @@ impl Job {
+     )]
+     pub(crate) fn new(
+         id: u64,
++        host_identity: super::host_records::Identity,
+         queue: Arc<QueueState>,
+         vm: Arc<VmState>,
+         commands: KVec<Command>,
+@@ -151,6 +153,7 @@ pub(crate) fn new(
+         Arc::pin_init(
+             try_pin_init!(Self {
+                 id,
++                host_identity,
+                 queue,
+                 vm,
+                 commands,
+diff --git a/drivers/gpu/drm/asahi/g16/queue.rs b/drivers/gpu/drm/asahi/g16/queue.rs
+index 9ca0dfd996..aff2abba08 100644
+--- a/drivers/gpu/drm/asahi/g16/queue.rs
++++ b/drivers/gpu/drm/asahi/g16/queue.rs
+@@ -233,8 +233,11 @@ fn submit_job(
+             .ok_or(EIO)?
+             .prepare(&self.vm, &submission.commands)?;
+         let fence = self.timeline.next()?;
++        // file::submit -> Queue::submit -> submit_job is synchronous ioctl context.
++        let identity = super::host_records::Identity::submit(id);
+         let job = Job::new(
+             id,
++            identity,
+             self.state.clone(),
+             self.vm.clone(),
+             submission.commands,
+-- 
+2.43.0
+

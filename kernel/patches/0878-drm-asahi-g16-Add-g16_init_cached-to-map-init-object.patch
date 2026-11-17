@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 06:37:23 +0000
+Subject: [PATCH] drm/asahi: g16: Add g16_init_cached to map init
+ objects as macOS does
+
+macOS 26B123 maps every object in the firmware-VA block that holds
+Runtime and Main with attribute index 0 (ASC-cached), the class of
+Class::FwCached. This driver already gives that class to Runtime, Main
+and the three engine activities, but maps POWER_PERFORMANCE, Timer,
+the recovery activity and g16_init_macos's counter table, which macOS
+places in the same block, uncached.
+
+Add a load-time bit mask, default 0, that moves them, one bit each:
+
+  0x1  POWER_PERFORMANCE
+  0x2  Timer
+  0x4  the recovery activity
+  0x8  the counter table (with g16_init_macos 0x4)
+
+The host writes none of these after the firmware starts. The debugfs
+views that read POWER_PERFORMANCE back can show stale firmware words
+while it is cached. Init objects in macOS's other block (Root, Globals,
+the rings and the rest) keep their class.
+
+With 0 the mappings are unchanged.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs      |  4 ++++
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs | 29 ++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/initdata.rs    | 21 +++++++++++++++--
+ drivers/gpu/drm/asahi/g16/params.rs      |  6 +++++
+ 4 files changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index 7bf24faa31..1a9df02947 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -307,6 +307,10 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 0,
+             description: "G16: macOS INIT words outside Main, bit mask (default 0: none)",
+         },
++        g16_init_cached: u32 {
++            default: 0,
++            description: "G16: init objects ASC-cached as on macOS, bit mask (default 0: none)",
++        },
+         g16_recovery: u32 {
+             default: 1,
+             description: "G16: answer qualified firmware recovery handshakes",
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index eb32e9a585..22fd65ac77 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -453,6 +453,35 @@ const fn within(words: &[(usize, u32)], size: usize) -> bool {
+     const _: () = assert!(RUNTIME_STATS_MASK + 4 <= OBJECT_SIZE[id::RUNTIME]);
+ }
+ 
++/// Init objects macOS 26B123 maps with attribute index 0 (ASC-cached) on the J604 and this
++/// driver maps with index 2, one `g16_init_cached` bit each. All sit in macOS's firmware-VA
++/// block that holds Runtime and Main, whose 414 leaves are one class, the class of
++/// `pte::FW_CACHED`. The host writes none of them after the firmware starts. Bit 0 (the
++/// default) moves none.
++pub(crate) mod init_cached {
++    use super::id;
++
++    /// POWER_PERFORMANCE.
++    pub(crate) const POWER_PERFORMANCE: u32 = 1 << 0;
++    /// Timer (Runtime +0x10).
++    pub(crate) const TIMER: u32 = 1 << 1;
++    /// The recovery activity object (Runtime +0x26c).
++    pub(crate) const ACTIVITY_RECOVERY: u32 = 1 << 2;
++    /// `g16_init_macos`'s counter table (Runtime +0x2c8).
++    pub(crate) const COUNT_TABLE: u32 = 1 << 3;
++    pub(crate) const ALL: u32 = 0xf;
++
++    /// Whether `bits` moves init object `object` to the ASC-cached class.
++    pub(crate) const fn object(bits: u32, object: usize) -> bool {
++        match object {
++            id::POWER_PERFORMANCE => bits & POWER_PERFORMANCE != 0,
++            id::TIMER => bits & TIMER != 0,
++            id::ACTIVITY_RECOVERY => bits & ACTIVITY_RECOVERY != 0,
++            _ => false,
++        }
++    }
++}
++
+ /// One logical loader record, including its page offset and exact PTE class.
+ #[derive(Clone, Copy, Debug)]
+ pub(crate) struct Loader {
+diff --git a/drivers/gpu/drm/asahi/g16/initdata.rs b/drivers/gpu/drm/asahi/g16/initdata.rs
+index 1df9a011f3..f8d34214ff 100644
+--- a/drivers/gpu/drm/asahi/g16/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/initdata.rs
+@@ -215,6 +215,18 @@ pub(crate) fn build(
+     // The top row: S9 on J713, S10 on J773g.
+     let ceiling = performance.count as u32 - 1;
+     let max_khz = performance.frequency[ceiling as usize] * 1000;
++    let cached = super::params::init_cached();
++    if cached != 0 {
++        dev_info!(
++            dev,
++            "M4 initdata: g16_init_cached={:#x}: power_performance {} timer {} recovery {} count-table {} ASC-cached\n",
++            cached,
++            cached & 1,
++            (cached >> 1) & 1,
++            (cached >> 2) & 1,
++            (cached >> 3) & 1
++        );
++    }
+     let mut graph = KVec::with_capacity(wire::OBJECT_COUNT, GFP_KERNEL)?;
+     for (i, size) in wire::OBJECT_SIZE.iter().copied().enumerate() {
+         let lower = match i {
+@@ -234,7 +246,8 @@ pub(crate) fn build(
+                 | id::ACTIVITY_TILER
+                 | id::ACTIVITY_FRAGMENT
+                 | id::ACTIVITY_COMPUTE
+-        ) {
++        ) || wire::init_cached::object(cached, i)
++        {
+             Class::FwCached
+         } else {
+             Class::Fw
+@@ -320,7 +333,11 @@ pub(crate) fn build(
+     if input.init_macos & wire::init_macos::COUNT_TABLE != 0 {
+         let table = objects.alloc(Request {
+             size: wire::init_macos::COUNT_TABLE_SIZE,
+-            class: Class::Fw,
++            class: if cached & wire::init_cached::COUNT_TABLE != 0 {
++                Class::FwCached
++            } else {
++                Class::Fw
++            },
+             placement: Placement::Anywhere,
+             offset: 0,
+             client: None,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 2ff5ef1d7c..059ba84028 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2113,6 +2113,12 @@ pub(crate) fn fw_controllers_mode() -> u32 {
+     module_parameters::g16_fw_controllers.value()
+ }
+ 
++/// `g16_init_cached` (load time): the [`super::fw::initdata::init_cached`] bits; unknown bits
++/// are dropped.
++pub(crate) fn init_cached() -> u32 {
++    module_parameters::g16_init_cached.value() & super::fw::initdata::init_cached::ALL
++}
++
+ /// `g16_init_macos` (load time): the [`super::fw::initdata::init_macos`] bits; unknown bits
+ /// are dropped.
+ pub(crate) fn init_macos() -> u32 {
+-- 
+2.43.0
+

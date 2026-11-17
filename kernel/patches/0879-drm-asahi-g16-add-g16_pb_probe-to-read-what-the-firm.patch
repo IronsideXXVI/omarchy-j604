@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 06:13:29 +0000
+Subject: [PATCH] drm/asahi: g16: add g16_pb_probe to read what the
+ firmware does to a PB manager
+
+The parameter buffer is sized from a fixed heap per render unit. Sizing it
+by use, as the macOS driver does (it grows the buffer before a submission
+to three times the blocks in use and shrinks it when idle), needs to know
+how many blocks a render takes and where the firmware reports it.
+
+With g16_pb_probe=1 the driver reads, at each render retirement, the
+words of the bound PB manager and of its counter record and notes which
+of them differ from what was seeded, and while renders are in flight it
+reads the two words of the manager's free-block ring and keeps the
+widest distance seen. The stats file shows these on its pb_probe lines.
+
+The probe only reads the firmware's records; nothing is written. The
+manager image the driver seeds is kept with the manager for the
+comparison. The default of 0 reads nothing.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 19 +++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 31 +++++++++++
+ drivers/gpu/drm/asahi/g16/pools.rs  | 85 ++++++++++++++++++++++++-----
+ 3 files changed, 121 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 059ba84028..e7afab2cdd 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2485,6 +2485,25 @@ pub(crate) fn pb_reuse() -> bool {
+     "G16: let a render command reuse the PB manager its pass slot still leases from a fully retired command of the same VM, without a new InitBM (default 1; 0 = a fresh manager and InitBM for every command; runtime 0644)"
+ );
+ 
++/// Storage of `g16_pb_probe` (runtime 0644, default 0).
++static PB_PROBE: AtomicU32 = AtomicU32::new(0);
++
++/// Read-only PB manager probe: at each render retirement, the manager and counter words the
++/// firmware changed from their seed; while renders are in flight, the free-block ring words.
++/// Measurement only: nothing is written to the firmware's records.
++pub(crate) fn pb_probe() -> bool {
++    PB_PROBE.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    PB_PROBE_PARAM,
++    PB_PROBE_PARMTYPE,
++    PB_PROBE_PARM,
++    PB_PROBE,
++    "g16_pb_probe",
++    "G16: read the PB manager and counter words at each render retirement and the free-block ring words while renders run, into the stats file; reads only (default 0; runtime 0644)"
++);
++
+ /// Storage of `g16_pb_shared` (0644, default 0; latched at its first read).
+ static PB_SHARED: AtomicU32 = AtomicU32::new(0);
+ /// 0 until latched, then 1 (off) or 2 (on).
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index bceb1a3f83..5ad0ffd79f 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -738,6 +738,13 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+                 return Ok(false);
+             }
+         }
++        if params::pb_probe() {
++            for f in self.engine.flights.iter().filter(|f| f.renders != 0) {
++                if let Some(epoch) = f.pb_used.as_ref() {
++                    let _ = epoch.probe_flight();
++                }
++            }
++        }
+         let mut lap = Lap::start();
+         let start = lap.on().then(now_ns);
+         self.retire(evented, done)?;
+@@ -1214,6 +1221,9 @@ pub(crate) fn retire_oldest(
+                 self.recovery.last_retired[1] = Some(f.ta_target);
+                 self.recovery.last_retired[2] = Some(f.fs_target);
+                 let committed = f.pb_used.as_ref().ok_or(EINVAL).and_then(|epoch| {
++                    if params::pb_probe() {
++                        let _ = epoch.probe_retired();
++                    }
+                     let slot = super::params::pb_slot(timestamp_claims.pass[0] as usize);
+                     self.pools.retire_binding(slot, epoch)
+                 });
+@@ -1818,6 +1828,27 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             self.session.shared.irq_bells.load(Ordering::Relaxed)
+         )?;
+         super::encode::replay::stats(f)?;
++        let probe = &super::pools::PROBE;
++        writeln!(
++            f,
++            "pb_probe: on {} retires {} mgr_changed {:#x} ctr_changed {:#x} samples {} ring_max {} ring_at_max {:#x}",
++            u32::from(params::pb_probe()),
++            probe[0].load(Ordering::Relaxed),
++            probe[1].load(Ordering::Relaxed),
++            probe[2].load(Ordering::Relaxed),
++            probe[3].load(Ordering::Relaxed),
++            probe[4].load(Ordering::Relaxed),
++            probe[5].load(Ordering::Relaxed)
++        )?;
++        write!(f, "pb_probe_mgr:")?;
++        for w in &super::pools::PROBE_MGR {
++            write!(f, " {:x}", w.load(Ordering::Relaxed))?;
++        }
++        write!(f, "\npb_probe_ctr:")?;
++        for w in &super::pools::PROBE_CTR {
++            write!(f, " {:x}", w.load(Ordering::Relaxed))?;
++        }
++        writeln!(f)?;
+         let forms = &super::engine::FS_FORMS;
+         writeln!(
+             f,
+diff --git a/drivers/gpu/drm/asahi/g16/pools.rs b/drivers/gpu/drm/asahi/g16/pools.rs
+index 4c59fd9e72..2bd4dfa39d 100644
+--- a/drivers/gpu/drm/asahi/g16/pools.rs
++++ b/drivers/gpu/drm/asahi/g16/pools.rs
+@@ -16,7 +16,7 @@
+ use crate::driver::AsahiDrmDevice;
+ use core::{
+     fmt,
+-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
++    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+ };
+ use kernel::{
+     device,
+@@ -83,6 +83,20 @@ pub(crate) struct PoolSet {
+     units: KVec<Allocator>,
+ }
+ 
++/// Words of the PB manager image and of its counter record.
++const MGR_WORDS: usize = buffer::pb_manager::SIZE / 4;
++const CTR_WORDS: usize = 0x40 / 4;
++
++/// `g16_pb_probe`: [0] render retirements probed, [1] manager words (one bit per u32) found
++/// different from their seed at a retirement, [2] the same for the counter record, [3]
++/// in-flight samples, [4] the widest free-block ring distance a sample saw, [5] that
++/// sample's two ring words (first << 32 | second).
++pub(crate) static PROBE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
++/// The manager words of the last probed retirement.
++pub(crate) static PROBE_MGR: [AtomicU32; MGR_WORDS] = [const { AtomicU32::new(0) }; MGR_WORDS];
++/// The counter words of the last probed retirement.
++pub(crate) static PROBE_CTR: [AtomicU32; CTR_WORDS] = [const { AtomicU32::new(0) }; CTR_WORDS];
++
+ fn alloc(
+     o: &mut Objects,
+     size: usize,
+@@ -458,6 +472,8 @@ pub(crate) struct PbEpochInner {
+     pub(crate) initbm: Arc<FwObject>,
+     assigned: AtomicU32,
+     exposed: AtomicBool,
++    /// The manager image as seeded (`g16_pb_probe` compares against it).
++    seed: [AtomicU32; MGR_WORDS],
+     // Unmap private records before releasing the VM's aliases and ASID.
+     _objects: Objects,
+     _vm: Arc<super::vm::VmState>,
+@@ -482,6 +498,7 @@ pub(crate) fn new(
+             initbm: FwObject::view(&records, 0x400, 0x20)?,
+             assigned: AtomicU32::new(u32::MAX),
+             exposed: AtomicBool::new(false),
++            seed: [const { AtomicU32::new(0) }; MGR_WORDS],
+             _objects: o,
+             _vm: vm.clone(),
+             _permit: permit,
+@@ -514,19 +531,23 @@ pub(crate) fn prepare(&self, k: usize, heap: u64, blocks: u32) -> Result {
+         self.ring.w32(0, blocks)?;
+         self.ring.w32(4, blocks)?;
+         self.counter.w64(0, 1)?;
+-        self.manager.write(
+-            0,
+-            &buffer::pb_manager_image(
+-                k as u32,
+-                self.pages.va,
+-                gva(&self.pages)?,
+-                self.blocks.va,
+-                self.ring.va,
+-                self.counter.va,
+-                pages,
+-                blocks,
+-            ),
+-        )?;
++        let image = buffer::pb_manager_image(
++            k as u32,
++            self.pages.va,
++            gva(&self.pages)?,
++            self.blocks.va,
++            self.ring.va,
++            self.counter.va,
++            pages,
++            blocks,
++        );
++        self.manager.write(0, &image)?;
++        for (word, seed) in image.chunks_exact(4).zip(self.seed.iter()) {
++            seed.store(
++                u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
++                Ordering::Relaxed,
++            );
++        }
+         self.assigned.store(k as u32, Ordering::Release);
+         Ok(())
+     }
+@@ -550,6 +571,42 @@ pub(crate) fn same_vm(&self, vm: &Arc<super::vm::VmState>) -> bool {
+     pub(crate) fn ring_words(&self) -> Result<[u32; 2]> {
+         Ok([self.ring.r32(0)?, self.ring.r32(4)?])
+     }
++    /// `g16_pb_probe` at a render retirement: the manager and counter words that differ from
++    /// their seed, and their values. Reads only.
++    pub(crate) fn probe_retired(&self) -> Result {
++        let mut changed = 0u64;
++        for (i, seed) in self.seed.iter().enumerate() {
++            let v = self.manager.r32(i * 4)?;
++            PROBE_MGR[i].store(v, Ordering::Relaxed);
++            if v != seed.load(Ordering::Relaxed) {
++                changed |= 1 << i;
++            }
++        }
++        // The counter record is seeded with the u64 1.
++        let mut counter = 0u64;
++        for (i, last) in PROBE_CTR.iter().enumerate() {
++            let v = self.counter.r32(i * 4)?;
++            last.store(v, Ordering::Relaxed);
++            if v != u32::from(i == 0) {
++                counter |= 1 << i;
++            }
++        }
++        PROBE[0].fetch_add(1, Ordering::Relaxed);
++        PROBE[1].fetch_or(changed, Ordering::Relaxed);
++        PROBE[2].fetch_or(counter, Ordering::Relaxed);
++        Ok(())
++    }
++    /// `g16_pb_probe` while a render binding this manager is in flight: the distance between
++    /// the two free-block ring words. Reads only.
++    pub(crate) fn probe_flight(&self) -> Result {
++        let [a, b] = self.ring_words()?;
++        let distance = u64::from(a.abs_diff(b));
++        PROBE[3].fetch_add(1, Ordering::Relaxed);
++        if PROBE[4].fetch_max(distance, Ordering::Relaxed) < distance {
++            PROBE[5].store(u64::from(a) << 32 | u64::from(b), Ordering::Relaxed);
++        }
++        Ok(())
++    }
+ }
+ 
+ impl Firmware {
+-- 
+2.43.0
+

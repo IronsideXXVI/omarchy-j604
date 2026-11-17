@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 05:54:33 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally map command objects
+ ASC-cached
+
+The M4 backend maps its command objects (work images, microsequences,
+barriers, queue info, rings and scheduler contexts) uncached for the
+GPU firmware, through a compile-time constant. The 25G83 firmware
+cleans and invalidates such objects by address range before it reads
+them, and the G15 backend maps the same objects cached.
+
+Turn the constant into the g16_fw_cached module parameter (load time,
+default 0), so a boot can try the cached classes. The default keeps
+today's uncached classes and behaviour.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs |  4 ++++
+ drivers/gpu/drm/asahi/g16/graph.rs  | 10 +++++-----
+ drivers/gpu/drm/asahi/g16/hw.rs     | 10 ++++++----
+ drivers/gpu/drm/asahi/g16/params.rs |  8 ++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  4 ++--
+ 5 files changed, 25 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index 7192814106..11cc0dcf58 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -283,6 +283,10 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 0,
+             description: "G16: Main +0xf38 = 1 and +0x2568 = core count, as macOS (default 0)",
+         },
++        g16_fw_cached: u32 {
++            default: 0,
++            description: "G16: command objects ASC-cached (default 0: uncached)",
++        },
+         g16_init_dump: u32 {
+             default: 0,
+             description: "G16: show the init objects in debugfs aurora-g16/initdata (default 0)",
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index a994532c89..23aa2b46b0 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -18,15 +18,15 @@
+ use super::Firmware;
+ use crate::driver::AsahiDrmDevice;
+ 
+-pub(crate) const fn cmd_fw() -> Class {
+-    if tuning::FW_CACHED {
++pub(crate) fn cmd_fw() -> Class {
++    if tuning::fw_cached() {
+         Class::FwCached
+     } else {
+         Class::Fw
+     }
+ }
+-pub(crate) const fn cmd_shared() -> Class {
+-    if tuning::FW_CACHED {
++pub(crate) fn cmd_shared() -> Class {
++    if tuning::fw_cached() {
+         Class::SharedCached
+     } else {
+         Class::Shared
+@@ -41,7 +41,7 @@ pub(crate) const fn manager_class(class: Class) -> Class {
+     class
+ }
+ #[allow(dead_code)]
+-pub(crate) const fn queue_scratch() -> Class {
++pub(crate) fn queue_scratch() -> Class {
+     cmd_fw()
+ }
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/hw.rs b/drivers/gpu/drm/asahi/g16/hw.rs
+index fff459d002..733334a069 100644
+--- a/drivers/gpu/drm/asahi/g16/hw.rs
++++ b/drivers/gpu/drm/asahi/g16/hw.rs
+@@ -487,10 +487,12 @@ pub(crate) mod engine {
+ /// Active M4 policy. Protocol fields and cache attributes live in their wire builders;
+ /// unsupported G15 batching, clustering and recovery controls are deliberately absent.
+ pub(crate) mod tuning {
+-    /// Command objects use uncached mappings from creation, including work images,
+-    /// microsequences and the embedded compute manager. Session-global initdata
+-    /// keeps its own explicit cache classes.
+-    pub(crate) const FW_CACHED: bool = false;
++    /// Whether command objects use the ASC-cached classes (`g16_fw_cached`, default no: uncached
++    /// mappings from creation, including work images, microsequences and the embedded compute
++    /// manager). Session-global initdata keeps its own explicit cache classes.
++    pub(crate) fn fw_cached() -> bool {
++        super::super::params::fw_cached()
++    }
+     /// Handle EP 0x20 drain requests in the mailbox interrupt.
+     pub(crate) const EARLY_WAKE: bool = true;
+     /// Scheduler timeout per job, ms; the engine's deadlines own failure (always "no hang").
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 30413e8e35..2ff5ef1d7c 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -658,6 +658,14 @@ pub(crate) fn main_nap() -> bool {
+     module_parameters::g16_main_nap.value() != 0
+ }
+ 
++/// `g16_fw_cached` (load time): command objects (work images, microsequences, barriers, queue
++/// info, rings, scheduler contexts) use the ASC-cached classes instead of AttrIndex 2. 25G83
++/// cleans and invalidates such objects by VA range (0x3e8c8) before it reads them. 0 (the
++/// default) keeps today's uncached classes.
++pub(crate) fn fw_cached() -> bool {
++    module_parameters::g16_fw_cached.value() != 0
++}
++
+ /// `g16_ktrace_mask` (load time): the word written to CONTROL+0 at init. 25G83 copies it into
+ /// its trace gate (0x192db4) from fn 0x3350, which INIT points at CONTROL through init-block
+ /// +0xa8. Bit 0 enables the event-handler trace points, bit 1 the scheduler ones, bit 2 the power
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index aab22f42a4..bceb1a3f83 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -894,7 +894,7 @@ pub(crate) fn queue_receipt(
+                 return Ok(false);
+             }
+         }
+-        if !super::hw::tuning::FW_CACHED {
++        if !super::hw::tuning::fw_cached() {
+             for offset in [0x20, 0x24, 0x28] {
+                 if info.r32(offset)? != head {
+                     return Ok(false);
+@@ -937,7 +937,7 @@ pub(crate) fn queue_receipt_behind(
+                 return Ok(false);
+             }
+         }
+-        if !super::hw::tuning::FW_CACHED {
++        if !super::hw::tuning::fw_cached() {
+             for offset in [0x20, 0x24, 0x28] {
+                 if !ring_passed(info.r32(offset)?, start, head, tail, m) {
+                     return Ok(false);
+-- 
+2.43.0
+

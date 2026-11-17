@@ -1,0 +1,255 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 07:47:41 +0000
+Subject: [PATCH] drm/asahi: g16: Add the AON PTD sensor feed to
+ g16_init_macos
+
+The firmware reads the GPU's temperature sensors through an AON PTD
+device it opens at init from a table of sensor rows whose address is in
+POWER_PERFORMANCE +0x6318 (0x3bcd0, 0x3c750). This driver leaves the
+address 0, so the firmware has no device: its per-key read loop logs
+"Invalid AON PTD Dev Instance" or, with no enable mask, "AON PTD Enable
+mask is 0", and the sensor values it keeps stay 0. macOS 26B123 gives
+it a table of five rows of the ADT's aon-ptd ptd_data_table and sets
+the keys and masks next to the pointer.
+
+Add three default-off bits:
+
+  0x40000   a 19-row table of the five J604 rows, its VA at +0x6318
+  0x80000   +0x6320 = RT0g and the u64 enable mask +0x6360 = 1
+  0x100000  four more keys at +0x6388 .. +0x6394, mask +0x6398 = 0xf
+
+All offsets are 26B123's less 0x28; every one has a reader in both
+builds at that distance. Unlike the other POWER_PERFORMANCE words of
+g16_init_macos these do not need g16_fw_controllers; with it, the keys
+equal the controller words.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs | 85 +++++++++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/initdata.rs    | 36 ++++++++++
+ 2 files changed, 119 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index 2232f99273..5a1b537cc9 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -403,7 +403,16 @@ pub(crate) mod init_macos {
+     pub(crate) const PP_THERMAL_WORDS: u32 = 1 << 16;
+     /// [`MAIN_ALL_ONES`]: twelve Main words macOS sets to all ones after the init-copied ones.
+     pub(crate) const MAIN_ALL_ONES_WORDS: u32 = 1 << 17;
+-    pub(crate) const ALL: u32 = 0x3ffff;
++    /// POWER_PERFORMANCE +0x6318 = the VA of a table of [`AON_PTD_ROWS`]. With it the
++    /// firmware counts the rows and opens its AON PTD sensor device (25G83 0x3bcd0, 0x3c750);
++    /// with 0 it has no device and every sensor read fails.
++    pub(crate) const AON_PTD_TABLE: u32 = 1 << 18;
++    /// [`AON_PTD_ENABLE`]: the sensor key and the enable mask of the firmware's per-key
++    /// read loop (25G83 0x312ac, "AON PTD Enable mask").
++    pub(crate) const AON_PTD_ENABLE_WORDS: u32 = 1 << 19;
++    /// [`AON_PTD_SENSORS`]: four more sensor keys and their mask (25G83 0x27638).
++    pub(crate) const AON_PTD_SENSOR_WORDS: u32 = 1 << 20;
++    pub(crate) const ALL: u32 = 0x1fffff;
+ 
+     pub(crate) const RUNTIME_LOG: usize = 0x250;
+     pub(crate) const RUNTIME_TIMER_COPY: usize = 0x8;
+@@ -412,6 +421,30 @@ pub(crate) mod init_macos {
+     pub(crate) const RUNTIME_STATS_MASK: usize = 0x3d8;
+     pub(crate) const RUNTIME_COUNT_TABLE: usize = 0x2c8;
+     pub(crate) const COUNT_TABLE_SIZE: usize = 0x800;
++    pub(crate) const PP_AON_PTD_TABLE: usize = 0x6318;
++    /// The firmware reads up to 19 twelve-byte rows (25G83 0x3c568 .. 0x3c7d4).
++    pub(crate) const AON_PTD_SIZE: usize = 19 * 12;
++    /// The J604 rows macOS 26B123 writes there at INIT, in its order: entries of the ADT's
++    /// `/arm-io/aon-ptd` `ptd_data_table` (key, then two words), byte for byte.
++    pub(crate) const AON_PTD_ROWS: [[u32; 3]; 5] = [
++        [0x67305452, 0x00280001, 0x00001401],
++        [0x67307430, 0x002d0001, 0x0000ff01],
++        [0x67307431, 0x002e0001, 0x0000ff01],
++        [0x67304542, 0x00260001, 0x0000ff01],
++        [0x6730454c, 0x00240001, 0x0000ff01],
++    ];
++    /// 26B123 POWER_PERFORMANCE +0x6348 and +0x6388 (a u64 mask, bit 0 = the one key), 0x28
++    /// lower in this firmware as both readers place them.
++    pub(crate) const AON_PTD_ENABLE: [(usize, u32); 3] =
++        [(0x6320, 0x67305452), (0x6360, 1), (0x6364, 0)];
++    /// 26B123 POWER_PERFORMANCE +0x63b0 .. +0x63c0: four keys and their mask.
++    pub(crate) const AON_PTD_SENSORS: [(usize, u32); 5] = [
++        (0x6388, 0x67307430),
++        (0x638c, 0x67307431),
++        (0x6390, 0x67304542),
++        (0x6394, 0x6730454c),
++        (0x6398, 0xf),
++    ];
+ 
+     /// Power (Root +0xb8) at offsets equal in 25G83 and 26B123. +0x128 is left out: macOS
+     /// has 1 there at INIT and 0 later, and while it is set the firmware skips its power
+@@ -552,6 +585,10 @@ const fn within(words: &[(usize, u32)], size: usize) -> bool {
+     const _: () = assert!(MAIN_ALL_ONES_AT + 4 * MAIN_ALL_ONES_COUNT <= 0x2604);
+     const _: () = assert!(MAIN_RETENTION + 8 <= OBJECT_SIZE[id::MAIN]);
+     const _: () = assert!(RUNTIME_STATS_MASK + 4 <= OBJECT_SIZE[id::RUNTIME]);
++    const _: () = assert!(PP_AON_PTD_TABLE + 8 <= OBJECT_SIZE[id::POWER_PERFORMANCE]);
++    const _: () = assert!(within(&AON_PTD_ENABLE, OBJECT_SIZE[id::POWER_PERFORMANCE]));
++    const _: () = assert!(within(&AON_PTD_SENSORS, OBJECT_SIZE[id::POWER_PERFORMANCE]));
++    const _: () = assert!(AON_PTD_ROWS.len() * 12 <= AON_PTD_SIZE);
+ }
+ 
+ /// Init objects macOS 26B123 maps with attribute index 0 (ASC-cached) on the J604 and this
+@@ -920,6 +957,8 @@ pub(crate) struct Input {
+     pub(crate) init_macos: u32,
+     /// With [`init_macos::COUNT_TABLE`]: the zeroed counter table's VA.
+     pub(crate) count_table: u64,
++    /// With [`init_macos::AON_PTD_TABLE`]: the VA of the [`init_macos::AON_PTD_ROWS`] table.
++    pub(crate) aon_ptd: u64,
+ }
+ 
+ pub(crate) fn object_va(va: u64, size: usize) -> bool {
+@@ -1006,6 +1045,8 @@ pub(crate) fn encode(
+             && input.lower_parameter < input.lower_uma + 0x8000)
+         || (input.init_macos & init_macos::COUNT_TABLE != 0
+             && !object_va(input.count_table, init_macos::COUNT_TABLE_SIZE))
++        || (input.init_macos & init_macos::AON_PTD_TABLE != 0
++            && !object_va(input.aon_ptd, init_macos::AON_PTD_SIZE))
+     {
+         return Err(());
+     }
+@@ -1242,6 +1283,13 @@ pub(crate) fn encode(
+             )?;
+         }
+     }
++    if bits & init_macos::AON_PTD_TABLE != 0 {
++        put64(
++            objects[id::POWER_PERFORMANCE],
++            init_macos::PP_AON_PTD_TABLE,
++            input.aon_ptd,
++        )?;
++    }
+     let mut groups = [
+         (init_macos::POWER_WORDS, id::POWER, &init_macos::POWER[..]),
+         (
+@@ -1279,6 +1327,18 @@ pub(crate) fn encode(
+             id::POWER_PERFORMANCE,
+             &init_macos::PP_TAIL[..],
+         ),
++        // The sensor feed is an input, not a controller setting: also without
++        // g16_fw_controllers.
++        (
++            init_macos::AON_PTD_ENABLE_WORDS,
++            id::POWER_PERFORMANCE,
++            &init_macos::AON_PTD_ENABLE[..],
++        ),
++        (
++            init_macos::AON_PTD_SENSOR_WORDS,
++            id::POWER_PERFORMANCE,
++            &init_macos::AON_PTD_SENSORS[..],
++        ),
+     ];
+     if !input.fw_controllers {
+         // The POWER_PERFORMANCE groups: the thermal pair, PP and the PP tail.
+@@ -1356,7 +1416,28 @@ fn the_init_macos_words_miss_the_controller_words() {
+                 .iter()
+                 .any(|(c, _)| c == at));
+         }
+-        assert_eq!(init_macos::ALL, (init_macos::MAIN_ALL_ONES_WORDS << 1) - 1);
++        assert_eq!(init_macos::ALL, (init_macos::AON_PTD_SENSOR_WORDS << 1) - 1);
++        // The sensor keys the controller words also write agree, and they are the table's.
++        for (at, value) in init_macos::AON_PTD_ENABLE
++            .iter()
++            .chain(init_macos::AON_PTD_SENSORS.iter())
++        {
++            for (c, v) in super::super::controllers::WORDS.iter() {
++                if c == at {
++                    assert_eq!(v, value);
++                }
++            }
++        }
++        assert_eq!(
++            init_macos::AON_PTD_ENABLE[0].1,
++            init_macos::AON_PTD_ROWS[0][0]
++        );
++        for i in 0..4 {
++            assert_eq!(
++                init_macos::AON_PTD_SENSORS[i].1,
++                init_macos::AON_PTD_ROWS[i + 1][0]
++            );
++        }
+         // The three Power sub-bits together are exactly POWER_WORDS's words.
+         let parts = init_macos::POWER_FLOOR.len()
+             + init_macos::POWER_FILTER.len()
+diff --git a/drivers/gpu/drm/asahi/g16/initdata.rs b/drivers/gpu/drm/asahi/g16/initdata.rs
+index 4b85319dab..68dfacd57e 100644
+--- a/drivers/gpu/drm/asahi/g16/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/initdata.rs
+@@ -57,6 +57,9 @@ pub(crate) struct InitData {
+     /// `g16_init_macos` COUNT_TABLE: the firmware's counter table (Runtime +0x2c8), kept for
+     /// the life of the firmware. `None` when the bit is off.
+     _count_table: Option<Arc<FwObject>>,
++    /// `g16_init_macos` AON_PTD_TABLE: the sensor table (POWER_PERFORMANCE +0x6318), kept
++    /// for the life of the firmware. `None` when the bit is off.
++    _aon_ptd: Option<Arc<FwObject>>,
+ }
+ 
+ impl InitData {
+@@ -303,6 +306,7 @@ pub(crate) fn build(
+         fw_thermal: super::params::fw_thermal(),
+         init_macos: super::params::init_macos(),
+         count_table: 0,
++        aon_ptd: 0,
+     };
+     if input.init_macos != 0 {
+         let m = input.init_macos;
+@@ -341,6 +345,15 @@ pub(crate) fn build(
+                 (m >> 17) & 1
+             );
+         }
++        if m >> 18 != 0 {
++            dev_info!(
++                dev,
++                "M4 initdata: g16_init_macos: aon-ptd table {} enable {} sensors {}\n",
++                (m >> 18) & 1,
++                (m >> 19) & 1,
++                (m >> 20) & 1
++            );
++        }
+         if m & (wire::init_macos::PP_WORDS
+             | wire::init_macos::PP_TAIL_WORDS
+             | wire::init_macos::PP_THERMAL_WORDS)
+@@ -376,6 +389,28 @@ pub(crate) fn build(
+         input.count_table = table.va;
+         count_table = Some(table);
+     }
++    let mut aon_ptd = None;
++    if input.init_macos & wire::init_macos::AON_PTD_TABLE != 0 {
++        let table = objects.alloc(Request {
++            size: wire::init_macos::AON_PTD_SIZE,
++            class: Class::Fw,
++            placement: Placement::Anywhere,
++            offset: 0,
++            client: None,
++            lower: None,
++            cpu: true,
++        })?;
++        let mut rows = KVVec::from_elem(0u8, wire::init_macos::AON_PTD_SIZE, GFP_KERNEL)?;
++        for (i, row) in wire::init_macos::AON_PTD_ROWS.iter().enumerate() {
++            for (j, word) in row.iter().enumerate() {
++                let at = 12 * i + 4 * j;
++                rows[at..at + 4].copy_from_slice(&word.to_le_bytes());
++            }
++        }
++        table.write(0, &rows)?;
++        input.aon_ptd = table.va;
++        aon_ptd = Some(table);
++    }
+     if input.loader_macos != 0 {
+         dev_info!(
+             dev,
+@@ -572,6 +607,7 @@ pub(crate) fn build(
+             _graph: graph,
+             encoded,
+             _count_table: count_table,
++            _aon_ptd: aon_ptd,
+         },
+         channels,
+         max_khz,
+-- 
+2.43.0
+

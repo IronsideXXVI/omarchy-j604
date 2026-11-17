@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 05:18:51 +0000
+Subject: [PATCH] drm/asahi: g16: add g16_fs_short to drop unused
+ fragment timestamp records
+
+Every fragment sequence this driver encodes carries a start and an end
+timestamp record, even for a render whose submission asked for no
+timestamp outputs. The macOS driver leaves both records out of such a
+command: its fragment sequence then has the one-word record that sits
+between them followed by the finalize record, which moves up by the
+0x98 bytes of the two records, and ends 0x98 bytes earlier.
+
+With g16_fs_short=1, a render without timestamp outputs gets that short
+sequence, and its work record gives the shorter sequence length.
+
+Nothing else reads the fragment timestamps of such a render except the
+retirement check, which required the start and end words the records
+fill in the pass scene. A short render records that fact in its flight,
+and its retirement relies on the stamps, notifier words and queue
+receipts that already have to agree, as for every other render. Flight
+traces of short renders carry no fragment start or end.
+
+The stats file counts the renders encoded with each form on its
+fs_short line, so a run can show its renders took the short form.
+
+The default of 0 keeps both records on every render.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/encode/render.rs | 29 ++++++++++++++--------
+ drivers/gpu/drm/asahi/g16/engine.rs        | 12 +++++++++
+ drivers/gpu/drm/asahi/g16/params.rs        | 18 ++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs          | 14 ++++++++---
+ drivers/gpu/drm/asahi/timestamp.rs         |  6 +++++
+ 5 files changed, 65 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/encode/render.rs b/drivers/gpu/drm/asahi/g16/encode/render.rs
+index 088f343127..ae01cd0950 100644
+--- a/drivers/gpu/drm/asahi/g16/encode/render.rs
++++ b/drivers/gpu/drm/asahi/g16/encode/render.rs
+@@ -304,6 +304,7 @@ pub(crate) fn encode_fs(
+     _n: u64,
+     target: u32,
+     geo: &Geometry,
++    short: bool,
+     w: &mut [u8; fs::WORK_SIZE],
+     q: &mut [u8],
+ ) {
+@@ -483,16 +484,24 @@ pub(crate) fn encode_fs(
+     put64(q, 0x84, work + 0xbf0);
+     put32(q, 0xa0, r.uuid);
+     inline_uma(q, 0x1b0, r, 1);
+-    timestamps(
+-        q,
+-        0x1ec,
+-        work,
+-        r.qinfo[1],
+-        ts_va[2] != 0 || ts_va[3] != 0,
+-        r.uuid,
+-        1,
+-    );
+-    let f = 0x288;
++    // `short` (g16_fs_short): no timestamp records, only the one-word record between them,
++    // so the finalize record moves up by their 0x98 bytes and the sequence ends at 0x2ac.
++    let f = if short {
++        put32(q, 0x1ec, 1);
++        put32(w, 0x1c, 0x2b0);
++        0x1f0
++    } else {
++        timestamps(
++            q,
++            0x1ec,
++            work,
++            r.qinfo[1],
++            ts_va[2] != 0 || ts_va[3] != 0,
++            r.uuid,
++            1,
++        );
++        0x288
++    };
+     put32(q, f, 8);
+     put32(q, f + 4, r.uuid);
+     put64(q, f + 0xc, r.fw_stamp[1]);
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 7b0114633f..b6259f0c54 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -25,6 +25,9 @@
+ use super::slots::Claims;
+ use super::{params, Firmware, Shared};
+ 
++/// Renders encoded with the long fragment sequence ([0]) and the short one ([1], `g16_fs_short`).
++pub(crate) static FS_FORMS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
++
+ /// `wmb()`: `dsb st` (a full fence on other architectures).
+ #[inline(always)]
+ pub(crate) fn wmb() {
+@@ -202,6 +205,8 @@ pub(crate) struct Flight {
+     pub(crate) target: u32,
+     pub(crate) head: u32,
+     pub(crate) c_start: u32,
++    /// The render's fragment sequence has no timestamp records (`g16_fs_short`).
++    pub(crate) fs_short: bool,
+     /// Render: final TA/FS stamps, ring ends and ring positions before the prefix.
+     pub(crate) ta_target: u32,
+     pub(crate) fs_target: u32,
+@@ -244,6 +249,7 @@ fn new(job: Arc<Job>) -> Self {
+             target: 0,
+             head: 0,
+             c_start: 0,
++            fs_short: false,
+             ta_target: 0,
+             fs_target: 0,
+             ta_head: 0,
+@@ -2097,6 +2103,11 @@ fn prefix_render(
+             .render()?
+             .set_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes)?;
+         let behind = !self.engine.flights.is_empty();
++        // Without timestamp outputs nothing reads the fragment timestamp records but the
++        // retirement check, which then relies on the stamps and receipts alone.
++        let short = params::fs_short() && cmd.timestamp_outputs.is_empty();
++        f.fs_short = short;
++        FS_FORMS[usize::from(short)].fetch_add(1, Ordering::Relaxed);
+         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
+         encode::encode_ta(
+             &refs,
+@@ -2120,6 +2131,7 @@ fn prefix_render(
+             draw,
+             target,
+             &geometry,
++            short,
+             image(&mut scratch.fs)?,
+             &mut scratch.fss[..],
+         );
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index b903204e41..30413e8e35 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2354,6 +2354,24 @@ pub(crate) fn replay() -> u32 {
+     "G16: mask of template pieces (aurora-g16/replay) written into each compute command's sequence record over this driver's values; addresses are never replaced (default 0: none; runtime 0644)"
+ );
+ 
++/// Storage of `g16_fs_short` (runtime 0644, default 0).
++static FS_SHORT: AtomicU32 = AtomicU32::new(0);
++
++/// A render with no timestamp outputs gets the fragment sequence without its two timestamp
++/// records, as the macOS driver encodes such a fragment command.
++pub(crate) fn fs_short() -> bool {
++    FS_SHORT.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    FS_SHORT_PARAM,
++    FS_SHORT_PARMTYPE,
++    FS_SHORT_PARM,
++    FS_SHORT,
++    "g16_fs_short",
++    "G16: a render without timestamp outputs gets the fragment sequence without its timestamp records (default 0: always both records; runtime 0644)"
++);
++
+ /// Storage of `g16_resident_units` (0644, default 0; read once, at the latch).
+ static RESIDENT_UNITS: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index aeecc772f1..aab22f42a4 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1088,8 +1088,7 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+                 && f.job.resources.render()?.pool_retired(k)?
+                 && ta_start != 0
+                 && ta_end > ta_start
+-                && fs_start != 0
+-                && fs_end > fs_start;
++                && (f.fs_short || (fs_start != 0 && fs_end > fs_start));
+         } else if f.renders != 0 {
+             let g = &self.graph.render;
+             if g.fw_stamp[0].r32(0)? != f.ta_target
+@@ -1126,8 +1125,7 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+                 && f.job.resources.render()?.pool_retired(k)?
+                 && ta_start != 0
+                 && ta_end > ta_start
+-                && fs_start != 0
+-                && fs_end > fs_start;
++                && (f.fs_short || (fs_start != 0 && fs_end > fs_start));
+         }
+         if full {
+             if rw_alone {
+@@ -1820,6 +1818,14 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             self.session.shared.irq_bells.load(Ordering::Relaxed)
+         )?;
+         super::encode::replay::stats(f)?;
++        let forms = &super::engine::FS_FORMS;
++        writeln!(
++            f,
++            "fs_short: on {} short {} long {}",
++            u32::from(params::fs_short()),
++            forms[1].load(Ordering::Relaxed),
++            forms[0].load(Ordering::Relaxed)
++        )?;
+         let lazy = &super::resources::LAZY_STATS;
+         writeln!(
+             f,
+diff --git a/drivers/gpu/drm/asahi/timestamp.rs b/drivers/gpu/drm/asahi/timestamp.rs
+index 2a18ebbeb5..2c8eeda709 100644
+--- a/drivers/gpu/drm/asahi/timestamp.rs
++++ b/drivers/gpu/drm/asahi/timestamp.rs
+@@ -244,6 +244,12 @@ fn resolve_inner(
+         Ok(Self(retained))
+     }
+ 
++    /// No destination was given: nothing will be published.
++    #[cfg(CONFIG_DRM_ASAHI_G16)]
++    pub(crate) fn is_empty(&self) -> bool {
++        self.0.is_none()
++    }
++
+     /// Publish measured timestamps before signalling completion or releasing dependent work.
+     pub(crate) fn publish(&self, ticks: [u64; 4], frequency_hz: u64) {
+         for (destination, ticks) in self.iter().zip(ticks) {
+-- 
+2.43.0
+

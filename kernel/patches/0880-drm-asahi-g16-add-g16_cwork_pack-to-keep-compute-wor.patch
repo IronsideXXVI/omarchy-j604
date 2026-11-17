@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 06:09:16 +0000
+Subject: [PATCH] drm/asahi: g16: add g16_cwork_pack to keep compute
+ work blocks 0x900 apart
+
+Each compute unit has its own 0x2000 work page: the fields its records
+point into fill the first 0x900 bytes, followed by a copy of the
+sequence, a notifier image and the unit's descriptor. The macOS driver
+keeps only those first 0x900 bytes per command and lays them back to
+back in one buffer, so consecutive commands touch adjacent memory.
+
+With g16_cwork_pack=1 a VM's compute units keep their work blocks in
+one buffer, 0x900 apart, above the per-unit work pages. Every record
+pointer into a block names the packed copy. The remainder of the work
+image stays in the unit's own page at the same offsets, and the
+pointers to the descriptor and the notifier follow it there. The
+encoder checks a packed block's client address for 0x100 alignment
+instead of a whole page.
+
+The switch is read once, when the first compute units are built, so
+every VM of a boot is laid out the same way. The default of 0 keeps
+the per-unit pages and writes the same bytes as before.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/encode/compute.rs  | 19 ++++++---
+ drivers/gpu/drm/asahi/g16/engine.rs          |  9 +++--
+ drivers/gpu/drm/asahi/g16/fw/work/compute.rs |  3 ++
+ drivers/gpu/drm/asahi/g16/hw.rs              |  8 ++++
+ drivers/gpu/drm/asahi/g16/params.rs          | 33 +++++++++++++++
+ drivers/gpu/drm/asahi/g16/resources.rs       | 12 +++++-
+ drivers/gpu/drm/asahi/g16/slots.rs           | 42 ++++++++++++++++++--
+ 7 files changed, 113 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/encode/compute.rs b/drivers/gpu/drm/asahi/g16/encode/compute.rs
+index f3e57cc060..c464e7914c 100644
+--- a/drivers/gpu/drm/asahi/g16/encode/compute.rs
++++ b/drivers/gpu/drm/asahi/g16/encode/compute.rs
+@@ -27,6 +27,9 @@ pub(crate) struct ComputeRefs {
+     pub(crate) fw_stamp: u64,
+     pub(crate) work: u64,
+     pub(crate) work_gva: u64,
++    /// The object holding the work image from 0x900 on (descriptor, notifier): `work` itself,
++    /// or the unit's own page when its block is packed (`g16_cwork_pack`).
++    pub(crate) tail: u64,
+     pub(crate) seq: u64,
+     pub(crate) preempt_gva: u64,
+     pub(crate) its: u64,
+@@ -173,7 +176,8 @@ pub(crate) fn encode_compute(
+     {
+         return Err(ComputeEncodeError::Chronology);
+     }
+-    if !fw(r.work, compute::WORK_SIZE as u64)
++    if !fw(r.work, compute::BLOCK as u64)
++        || !fw(r.tail, compute::WORK_SIZE as u64)
+         || !fw(r.seq, compute::SEQ_SIZE as u64)
+         || !fw(r.qinfo, 0x24c0)
+         || !fw(r.stats_fw, 0xe10)
+@@ -184,7 +188,12 @@ pub(crate) fn encode_compute(
+         || !fw(r.fw_stamp, 8)
+         || !fw(r.its, 16)
+         || (r.record_fw != 0 && !fw(r.record_fw, 0x118))
+-        || !gpu(r.work_gva, 0x4000, 0x4000)
++        || !(if r.tail == r.work {
++            gpu(r.work_gva, 0x4000, 0x4000)
++        } else {
++            // A packed block (g16_cwork_pack) sits at k x 0x900 in its buffer.
++            gpu(r.work_gva, compute::BLOCK as u64, 0x100)
++        })
+         || !gpu(r.preempt_gva, compute::PREEMPT_SIZE as u64, 8)
+         || !gpu(r.auxiliary_gva, compute::AUX_SIZE as u64, 0x4000)
+         || !gpu(
+@@ -317,7 +326,7 @@ pub(crate) fn encode_compute(
+     put64(w, 0x83c, r.its + 8);
+     put64(w, 0x844, ts_va[0]);
+     put64(w, 0x84c, ts_va[1]);
+-    put64(w, 0x86a, r.work + compute::DESCRIPTOR as u64);
++    put64(w, 0x86a, r.tail + compute::DESCRIPTOR as u64);
+     put8(w, 0x872, 1);
+     put64(w, 0x873, 0x1588000);
+     put64(w, 0x87b, 0xef8000);
+@@ -344,7 +353,7 @@ pub(crate) fn encode_compute(
+         put16(q, off + 0xe, 1);
+     }
+     put32(q, 0x158, att.len() as u32);
+-    put64(q, 0x160, r.work + compute::DESCRIPTOR as u64);
++    put64(q, 0x160, r.tail + compute::DESCRIPTOR as u64);
+     put64(q, 0x178, r.auxiliary_gva);
+     put64(q, 0x188, r.context_store_gva);
+     put64(q, 0x190, r.context_store_gva + 0xf400);
+@@ -375,7 +384,7 @@ pub(crate) fn encode_compute(
+     w[compute::SEQ_EMBEDDED..compute::SEQ_EMBEDDED + compute::SEQ_SIZE].copy_from_slice(q);
+ 
+     let no = compute::NOTIFIER;
+-    put64(w, no, r.work + 0xf00);
++    put64(w, no, r.tail + 0xf00);
+     put32(w, no + 0x10, 0x50);
+     put32(w, no + 0x24, ctx);
+     put64(w, no + 0xa8, u64::MAX);
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index fcc99ccca2..172ff99ba6 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -2000,8 +2000,9 @@ fn prefix_compute(
+             qinfo: g.qinfo.va,
+             user_stamp: g.notifier.va + notifier_page::COMPUTE_STAMP as u64,
+             fw_stamp: g.fw_stamp.va,
+-            work: s.work.va,
+-            work_gva: s.work.lower_gva.ok_or(EINVAL)?,
++            work: s.block_va(),
++            work_gva: s.block_gva()?,
++            tail: s.work.va,
+             // Exact embedded sequence: every self-reference then matches the 25G83 layout.
+             seq: s.work.va + 0x900,
+             preempt_gva: s.preempt.gva.ok_or(EINVAL)?,
+@@ -2055,10 +2056,10 @@ fn prefix_compute(
+                 return Err(EIO);
+             }
+         }
+-        s.work.write(0, w)?;
++        s.write_work(w)?;
+         f.uma_submitted = submitted;
+         wmb();
+-        g.ring.w64(8 * pf.c_head as usize, s.work.va)?;
++        g.ring.w64(8 * pf.c_head as usize, s.block_va())?;
+         pf.c_head = (pf.c_head + 1) % sizes::QUEUE_CAP;
+         f.cstamp[0] = target;
+         f.cwait[0] = 0;
+diff --git a/drivers/gpu/drm/asahi/g16/fw/work/compute.rs b/drivers/gpu/drm/asahi/g16/fw/work/compute.rs
+index af960d415e..028dc316a7 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/work/compute.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/work/compute.rs
+@@ -7,6 +7,9 @@
+ pub(crate) const SEQ_OBJECT: usize = 0x1000;
+ pub(crate) const REGS: usize = 0x20;
+ pub(crate) const SEQ_EMBEDDED: usize = 0x900;
++/// The work fields a command's records point into end before the embedded sequence; the
++/// macOS driver keeps exactly these bytes per command, 0x900 apart (`g16_cwork_pack`).
++pub(crate) const BLOCK: usize = SEQ_EMBEDDED;
+ pub(crate) const ATTACHMENTS: usize = 0x58;
+ pub(crate) const ATTACHMENT_STRIDE: usize = 16;
+ pub(crate) const MAX_ATTACHMENTS: usize = 16;
+diff --git a/drivers/gpu/drm/asahi/g16/hw.rs b/drivers/gpu/drm/asahi/g16/hw.rs
+index 733334a069..79d0640978 100644
+--- a/drivers/gpu/drm/asahi/g16/hw.rs
++++ b/drivers/gpu/drm/asahi/g16/hw.rs
+@@ -270,6 +270,10 @@ pub(crate) const fn compute_small(k: u64) -> u64 {
+     pub(crate) const WORK_PAGE: u64 = 0x7000100000;
+     pub(crate) const WORK_OFF: u64 = 0;
+     pub(crate) const CWORK_STRIDE: u64 = 0x4000;
++    /// `g16_cwork_pack`: the compute work blocks of a VM's units, 0x900 apart, above the
++    /// per-unit work pages of all 32 units.
++    pub(crate) const CWORK_PACK: u64 = WORK_PAGE + 32 * CWORK_STRIDE;
++    pub(crate) const CWORK_PACK_SIZE: u64 = 0x14000;
+ 
+     // Render allocator units contain one 32 MiB UMA pool and its persistent lists. Units
+     // 0 and 1 keep the qualified placement; resident units (k >= 2, `g16_resident`) place
+@@ -422,6 +426,10 @@ pub(crate) mod sizes {
+     const _: () = assert!(
+         COMPUTE_UNITS_MAX <= 32
+             && super::client::WORK_PAGE + COMPUTE_UNITS_MAX as u64 * super::client::CWORK_STRIDE
++                <= super::client::CWORK_PACK
++            && COMPUTE_UNITS_MAX as u64 * super::super::fw::work::compute::BLOCK as u64
++                <= super::client::CWORK_PACK_SIZE
++            && super::client::CWORK_PACK + super::client::CWORK_PACK_SIZE
+                 <= super::client::COMPUTE_SMALL_BASE
+             && super::client::compute_small(COMPUTE_UNITS_MAX as u64 - 1)
+                 + super::client::COMPUTE_SMALL_STRIDE
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index e7afab2cdd..e5767d15b6 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1338,6 +1338,39 @@ pub(crate) fn pb_heap16() -> bool {
+     "G16: back the PB heap of the full render units 0 and 1 with 16 MiB (128 blocks) as the compact units, instead of 256 MiB each (default 0; latched at the first render unit built, set it as a module option)"
+ );
+ 
++/// Storage of `g16_cwork_pack` (0644, default 0; latched at its first read).
++static CWORK_PACK: AtomicU32 = AtomicU32::new(0);
++/// 0 until latched, then 1 (off) or 2 (on).
++static CWORK_PACK_LATCH: AtomicU32 = AtomicU32::new(0);
++
++/// Whether a VM's compute units keep their work blocks (the first 0x900 bytes of the work
++/// image, which their records point into) back to back in one buffer, 0x900 apart, as the
++/// macOS driver lays out its compute commands. The rest of each unit's work image (sequence
++/// copy, notifier, descriptor) stays in its own page. Read once, at the first compute units a
++/// VM builds, so every VM of the boot is built the same way.
++pub(crate) fn cwork_pack() -> bool {
++    let l = CWORK_PACK_LATCH.load(Ordering::Acquire);
++    if l != 0 {
++        return l == 2;
++    }
++    let v = if CWORK_PACK.load(Ordering::Relaxed) != 0 {
++        2
++    } else {
++        1
++    };
++    let _ = CWORK_PACK_LATCH.compare_exchange(0, v, Ordering::AcqRel, Ordering::Acquire);
++    CWORK_PACK_LATCH.load(Ordering::Acquire) == 2
++}
++
++live_u32_param!(
++    CWORK_PACK_PARAM,
++    CWORK_PACK_PARMTYPE,
++    CWORK_PACK_PARM,
++    CWORK_PACK,
++    "g16_cwork_pack",
++    "G16: keep the compute units' work blocks 0x900 apart in one buffer, as macOS lays out its compute commands (default 0; latched at the first compute units built, set it as a module option)"
++);
++
+ /// Storage of `g16_ktrace_keep` (runtime 0644, default 0).
+ static KTRACE_KEEP: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 382879a026..542e8950ca 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -71,8 +71,18 @@ fn new(
+         let mut objects = factory.objects(vm);
+         let units = super::params::compute_units();
+         let mut compute = KVec::with_capacity(units, GFP_KERNEL)?;
++        let pack = if super::params::cwork_pack() {
++            Some(super::graph::alloc_work(
++                &mut objects,
++                super::hw::client::CWORK_PACK_SIZE as usize,
++                super::hw::client::CWORK_PACK,
++                0,
++            )?)
++        } else {
++            None
++        };
+         for k in 0..units as u64 {
+-            let unit = ComputeSlot::new(&mut objects, k, compute.first())?;
++            let unit = ComputeSlot::new(&mut objects, k, compute.first(), pack.as_ref())?;
+             compute.push(unit, GFP_KERNEL)?;
+         }
+         objects.finish_private()?;
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index 9b6f0bac5f..df5653ae18 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -11,7 +11,7 @@
+ use kernel::{prelude::*, sync::Arc};
+ 
+ use super::encode::{Geometry, PassRefs};
+-use super::fw::work::{barrier, fs, ta};
++use super::fw::work::{barrier, compute, fs, ta};
+ use super::graph::{alloc, alloc_work, cmd_fw, Client};
+ use super::hw::{client, sizes};
+ use super::object::{Class, FwObject, Objects};
+@@ -19,6 +19,9 @@
+ 
+ /// One immutable allocation set. Mutable firmware pool cursors survive successful reuse.
+ pub(crate) struct ComputeSlot {
++    /// `g16_cwork_pack`: the shared buffer and offset of this unit's work block; the block
++    /// is then not the first 0x900 bytes of `work`.
++    pub(crate) block: Option<(Arc<FwObject>, usize)>,
+     pub(crate) its: Arc<FwObject>,
+     pub(crate) preempt: Arc<FwObject>,
+     pub(crate) work: Arc<FwObject>,
+@@ -55,8 +58,14 @@ pub(crate) fn init_uma_pool(state: &FwObject, list: &FwObject, pool: u64) -> Res
+ impl ComputeSlot {
+     /// Unit `k` of a VM. With `g16_compute_shared_pool` every unit after the first takes unit
+     /// 0's pool, state and list (`first`) instead of its own; units from
+-    /// [`sizes::COMPUTE_SLOTS`] on exist only in that mode.
+-    pub(crate) fn new(o: &mut Objects, k: u64, first: Option<&ComputeSlot>) -> Result<Self> {
++    /// [`sizes::COMPUTE_SLOTS`] on exist only in that mode. With `g16_cwork_pack` its work
++    /// block is at `k` x 0x900 in `pack`.
++    pub(crate) fn new(
++        o: &mut Objects,
++        k: u64,
++        first: Option<&ComputeSlot>,
++        pack: Option<&Arc<FwObject>>,
++    ) -> Result<Self> {
+         let sh = Class::Shared;
+         let shared = if k >= sizes::COMPUTE_SLOTS as u64
+             || (k > 0 && super::params::compute_shared_pool())
+@@ -66,6 +75,7 @@ pub(crate) fn new(o: &mut Objects, k: u64, first: Option<&ComputeSlot>) -> Resul
+             None
+         };
+         let unit = Self {
++            block: pack.map(|p| (p.clone(), k as usize * compute::BLOCK)),
+             its: alloc(o, 16, sh, None, 0, false)?,
+             preempt: alloc(
+                 o,
+@@ -125,6 +135,32 @@ pub(crate) fn new(o: &mut Objects, k: u64, first: Option<&ComputeSlot>) -> Resul
+         }
+         Ok(unit)
+     }
++    /// Firmware VA of the work block the unit's records point into.
++    pub(crate) fn block_va(&self) -> u64 {
++        match &self.block {
++            Some((pack, at)) => pack.va + *at as u64,
++            None => self.work.va,
++        }
++    }
++    /// Client VA of the same block.
++    pub(crate) fn block_gva(&self) -> Result<u64> {
++        match &self.block {
++            Some((pack, at)) => Ok(pack.lower_gva.ok_or(EINVAL)? + *at as u64),
++            None => self.work.lower_gva.ok_or(EINVAL),
++        }
++    }
++    /// Writes a whole work image: the block where the records find it, the rest in `work`.
++    pub(crate) fn write_work(&self, image: &[u8]) -> Result {
++        match &self.block {
++            Some((pack, at)) => {
++                let block = image.get(..compute::BLOCK).ok_or(EINVAL)?;
++                let rest = image.get(compute::BLOCK..).ok_or(EINVAL)?;
++                pack.write(*at, block)?;
++                self.work.write(compute::BLOCK, rest)
++            }
++            None => self.work.write(0, image),
++        }
++    }
+     /// Only command-local scratch is reset. Pool/list/counter/descriptor state is preserved.
+     fn scrub(&self) -> Result {
+         self.its.fill(0, 0, 16)?;
+-- 
+2.43.0
+

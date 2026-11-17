@@ -1,0 +1,343 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 06:27:47 +0000
+Subject: [PATCH] drm/asahi: g16: add g16_rwork_pack to keep render
+ work blocks back to back
+
+Each render pass slot has its TA work block and its FS work block in
+pages of their own, one pass slot window apart. The macOS driver keeps
+the TA work blocks of consecutive render commands 0x940 apart and the
+FS work blocks 0xcc0 apart (the 0xca0 block rounded up to 64 bytes),
+each kind in one buffer.
+
+With g16_rwork_pack=1 a VM's render units keep their TA and FS work
+blocks that way in one buffer after the compute work blocks of
+g16_cwork_pack, one TA block and one FS block per unit, units built
+later included. The work rings, the records and the per-use scrub name
+the packed blocks; the per-slot pages are left unused.
+
+The switch is read once, when the first render units are built, so
+every VM of a boot is laid out the same way. The default of 0 keeps
+the per-slot pages.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs    |  9 ++-
+ drivers/gpu/drm/asahi/g16/hw.rs        | 14 ++++-
+ drivers/gpu/drm/asahi/g16/params.rs    | 32 ++++++++++
+ drivers/gpu/drm/asahi/g16/resources.rs | 23 ++++++-
+ drivers/gpu/drm/asahi/g16/slots.rs     | 85 +++++++++++++++++++++++---
+ 5 files changed, 147 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 172ff99ba6..78e38032e8 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1101,7 +1101,7 @@ pub(crate) fn recovery_prepare(
+         {
+             let k = f.claims.pass[0] as usize;
+             let pass = f.job.resources.render()?.pass(k).ok_or(EINVAL)?;
+-            let bytes = pass.ta_work.r64(work::ta::TPC_BYTES)?;
++            let bytes = pass.ta_r64(work::ta::TPC_BYTES)?;
+             if bytes == 0 || bytes > pass.tpc.size as u64 {
+                 return Err(ERANGE);
+             }
+@@ -2203,8 +2203,7 @@ fn prefix_render(
+             init_buffer,
+             &mut scratch.scene[..],
+         );
+-        p.ta_work.write(0, &scratch.ta[..])?;
+-        p.fs_work.write(0, &scratch.fs[..])?;
++        p.write_work(&scratch.ta[..], &scratch.fs[..])?;
+         p.ta_seq.write(0, &scratch.tas[..])?;
+         p.fs_seq.write(0, &scratch.fss[..])?;
+         p.scene.write(0, &scratch.scene[..])?;
+@@ -2259,7 +2258,7 @@ fn prefix_render(
+             pf.ta_head = (pf.ta_head + 1) % cap;
+             super::poll::RENDER_CHAINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+         }
+-        r.ring[0].w64(8 * pf.ta_head as usize, p.ta_work.va)?;
++        r.ring[0].w64(8 * pf.ta_head as usize, p.ta_va())?;
+         pf.ta_head = (pf.ta_head + 1) % cap;
+         // g16_render_quiet 2: no FS-ring barrier record; the FS follows its TA by the
+         // firmware's own pairing, as macOS's records have no such record.
+@@ -2267,7 +2266,7 @@ fn prefix_render(
+             r.ring[1].w64(8 * pf.fs_head as usize, p.own_barrier.va)?;
+             pf.fs_head = (pf.fs_head + 1) % cap;
+         }
+-        r.ring[1].w64(8 * pf.fs_head as usize, p.fs_work.va)?;
++        r.ring[1].w64(8 * pf.fs_head as usize, p.fs_va())?;
+         pf.fs_head = (pf.fs_head + 1) % cap;
+         pf.renders = 1;
+         pf.draw = draw;
+diff --git a/drivers/gpu/drm/asahi/g16/hw.rs b/drivers/gpu/drm/asahi/g16/hw.rs
+index 8aa796c629..27290e5572 100644
+--- a/drivers/gpu/drm/asahi/g16/hw.rs
++++ b/drivers/gpu/drm/asahi/g16/hw.rs
+@@ -274,6 +274,13 @@ pub(crate) const fn compute_small(k: u64) -> u64 {
+     /// per-unit work pages of all 32 units.
+     pub(crate) const CWORK_PACK: u64 = WORK_PAGE + 32 * CWORK_STRIDE;
+     pub(crate) const CWORK_PACK_SIZE: u64 = 0x14000;
++    /// `g16_rwork_pack`: every render unit's TA work block (`RWORK_TA_STRIDE` apart) and FS work
++    /// block (`RWORK_FS_STRIDE` apart, from `RWORK_FS_OFF`), after the compute pack.
++    pub(crate) const RWORK_PACK: u64 = CWORK_PACK + CWORK_PACK_SIZE;
++    pub(crate) const RWORK_PACK_SIZE: u64 = 0x1c000;
++    pub(crate) const RWORK_TA_STRIDE: usize = 0x940;
++    pub(crate) const RWORK_FS_OFF: usize = 0xa700;
++    pub(crate) const RWORK_FS_STRIDE: usize = 0xcc0;
+ 
+     // Render allocator units contain one 32 MiB UMA pool and its persistent lists. Units
+     // 0 and 1 keep the qualified placement; resident units (k >= 2, `g16_resident`) place
+@@ -429,8 +436,13 @@ pub(crate) mod sizes {
+                 <= super::client::CWORK_PACK
+             && COMPUTE_UNITS_MAX as u64 * super::super::fw::work::compute::BLOCK as u64
+                 <= super::client::CWORK_PACK_SIZE
+-            && super::client::CWORK_PACK + super::client::CWORK_PACK_SIZE
++            && super::client::RWORK_PACK + super::client::RWORK_PACK_SIZE
+                 <= super::client::COMPUTE_SMALL_BASE
++            && RENDER_UNITS * super::client::RWORK_TA_STRIDE <= super::client::RWORK_FS_OFF
++            && super::client::RWORK_FS_OFF + RENDER_UNITS * super::client::RWORK_FS_STRIDE
++                <= super::client::RWORK_PACK_SIZE as usize
++            && super::super::fw::work::ta::WORK_SIZE <= super::client::RWORK_TA_STRIDE
++            && super::super::fw::work::fs::WORK_SIZE <= super::client::RWORK_FS_STRIDE
+             && super::client::compute_small(COMPUTE_UNITS_MAX as u64 - 1)
+                 + super::client::COMPUTE_SMALL_STRIDE
+                 <= super::client::compute_base(0)
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 98cbfd304c..aa8e3b418a 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1373,6 +1373,38 @@ pub(crate) fn cwork_pack() -> bool {
+     "G16: keep the compute units' work blocks 0x900 apart in one buffer, as macOS lays out its compute commands (default 0; latched at the first compute units built, set it as a module option)"
+ );
+ 
++/// Storage of `g16_rwork_pack` (0644, default 0; latched at its first read).
++static RWORK_PACK: AtomicU32 = AtomicU32::new(0);
++/// 0 until latched, then 1 (off) or 2 (on).
++static RWORK_PACK_LATCH: AtomicU32 = AtomicU32::new(0);
++
++/// Whether a VM's render units keep their TA work blocks 0x940 apart and their FS work blocks
++/// 0xcc0 apart in one buffer, as the macOS driver lays out its render commands, instead of a
++/// page per pass slot. Read once, at the first render units a VM builds, so every VM of the
++/// boot is built the same way.
++pub(crate) fn rwork_pack() -> bool {
++    let l = RWORK_PACK_LATCH.load(Ordering::Acquire);
++    if l != 0 {
++        return l == 2;
++    }
++    let v = if RWORK_PACK.load(Ordering::Relaxed) != 0 {
++        2
++    } else {
++        1
++    };
++    let _ = RWORK_PACK_LATCH.compare_exchange(0, v, Ordering::AcqRel, Ordering::Acquire);
++    RWORK_PACK_LATCH.load(Ordering::Acquire) == 2
++}
++
++live_u32_param!(
++    RWORK_PACK_PARAM,
++    RWORK_PACK_PARMTYPE,
++    RWORK_PACK_PARM,
++    RWORK_PACK,
++    "g16_rwork_pack",
++    "G16: keep the render units' TA and FS work blocks back to back in one buffer, as macOS lays out its render commands (default 0; latched at the first render units built, set it as a module option)"
++);
++
+ /// Storage of `g16_ktrace_keep` (runtime 0644, default 0).
+ static KTRACE_KEEP: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 8e908a4b06..5efcabca87 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -7,7 +7,7 @@
+ 
+ use super::{
+     command::Command,
+-    object::{Factory, Objects},
++    object::{Factory, FwObject, Objects},
+     pools::{Allocator, AllocatorRefs, PbEpoch, PoolSet},
+     slots::{ComputeSlot, PassSlot},
+     vm::VmState,
+@@ -109,6 +109,8 @@ fn deref(&self) -> &Self::Target {
+ pub(crate) struct RenderInner {
+     pub(crate) passes: KVec<PassSlot>,
+     pub(crate) pools: PoolSet,
++    /// `g16_rwork_pack`: the units' TA and FS work blocks, later units' included.
++    work_pack: Option<Arc<FwObject>>,
+     /// Units built later (`g16_resident_lazy`), at their unit index; dropped before the bind.
+     ext: [SetOnce<KBox<ExtUnit>>; super::hw::sizes::RENDER_UNITS],
+     /// A worker is building the next unit (`g16_resident_lazy` 2).
+@@ -135,9 +137,23 @@ fn new(
+             super::params::resident_units()
+         };
+         let compact = super::params::resident_compact();
++        let work_pack = if super::params::rwork_pack() {
++            Some(super::graph::alloc_work(
++                &mut objects,
++                super::hw::client::RWORK_PACK_SIZE as usize,
++                super::hw::client::RWORK_PACK,
++                0,
++                super::hw::tuning::FWC_TA | super::hw::tuning::FWC_FS,
++            )?)
++        } else {
++            None
++        };
+         let mut passes = KVec::with_capacity(units, GFP_KERNEL)?;
+         for k in 0..units {
+-            passes.push(PassSlot::new(&mut objects, k as u64, 1, compact)?, GFP_KERNEL)?;
++            passes.push(
++                PassSlot::new(&mut objects, k as u64, 1, compact, work_pack.as_ref())?,
++                GFP_KERNEL,
++            )?;
+         }
+         let pools = PoolSet::new(&mut objects, units, compact)?;
+         objects.finish_private()?;
+@@ -145,6 +161,7 @@ fn new(
+             Self(crate::cleanup::Deferred::new(RenderInner {
+                 passes,
+                 pools,
++                work_pack,
+                 ext: [const { SetOnce::new() }; super::hw::sizes::RENDER_UNITS],
+                 building: AtomicBool::new(false),
+                 tpc_dirty: [const { AtomicU64::new(0) }; super::hw::sizes::RENDER_UNITS],
+@@ -166,7 +183,7 @@ fn extend(&self, factory: &Factory, vm: &mmu::Vm, k: usize) -> Result {
+         let start = super::engine::now_ns();
+         let compact = super::params::resident_compact();
+         let mut objects = factory.objects(vm);
+-        let pass = PassSlot::new(&mut objects, k as u64, 1, compact)?;
++        let pass = PassSlot::new(&mut objects, k as u64, 1, compact, self.work_pack.as_ref())?;
+         let alloc = PoolSet::build_unit(&mut objects, k, compact)?;
+         objects.finish_private()?;
+         let unit = KBox::new(
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index a77ac76afd..eee7129e69 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -186,6 +186,9 @@ fn scrub(&self) -> Result {
+ 
+ /// One render pass slot.
+ pub(crate) struct PassSlot {
++    /// `g16_rwork_pack`: the shared buffer and the offsets of this slot's TA and FS work
++    /// blocks; `ta_work` / `fs_work` are then unused.
++    pub(crate) work_pack: Option<(Arc<FwObject>, usize, usize)>,
+     pub(crate) aux: Arc<FwObject>,
+     pub(crate) pre: KVec<Arc<FwObject>>,
+     pub(crate) tpc: Arc<FwObject>,
+@@ -211,7 +214,13 @@ pub(crate) struct PassSlot {
+ 
+ impl PassSlot {
+     /// Allocates pass slot `i`'s objects, with their client leaf classes.
+-    pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32, compact: bool) -> Result<Self> {
++    pub(crate) fn new(
++        o: &mut Objects,
++        i: u64,
++        pre_records: u32,
++        compact: bool,
++        pack: Option<&Arc<FwObject>>,
++    ) -> Result<Self> {
+         let sh = Class::Shared;
+         // Qualified slots 0/1 at i strides; resident slots (i >= 2) in their own window, a
+         // compact one (g16_resident_compact) with a 1 MiB TPC and a 1 MiB tilemap.
+@@ -319,7 +328,15 @@ pub(crate) fn new(o: &mut Objects, i: u64, pre_records: u32, compact: bool) -> R
+             client::TA_WORK_OFF as usize,
+             tuning::FWC_TA,
+         )?;
++        let at = i as usize;
+         Ok(Self {
++            work_pack: pack.map(|p| {
++                (
++                    p.clone(),
++                    at * client::RWORK_TA_STRIDE,
++                    client::RWORK_FS_OFF + at * client::RWORK_FS_STRIDE,
++                )
++            }),
+             aux,
+             pre,
+             tpc,
+@@ -355,8 +372,16 @@ fn scrub(
+     ) -> Result {
+         let _ = pre_records;
+ 
+-        self.ta_work.fill(0, 0, ta::WORK_SIZE)?;
+-        self.fs_work.fill(0, 0, fs::WORK_SIZE)?;
++        match &self.work_pack {
++            Some((pack, ta_at, fs_at)) => {
++                pack.fill(*ta_at, 0, ta::WORK_SIZE)?;
++                pack.fill(*fs_at, 0, fs::WORK_SIZE)?;
++            }
++            None => {
++                self.ta_work.fill(0, 0, ta::WORK_SIZE)?;
++                self.fs_work.fill(0, 0, fs::WORK_SIZE)?;
++            }
++        }
+         self.ta_seq.fill(0, 0, ta::SEQ_OBJECT)?;
+         self.fs_seq.fill(0, 0, fs::SEQ_OBJECT)?;
+         self.ta_scratch.fill(0, 0, 0x10000)?;
+@@ -377,13 +402,59 @@ fn scrub(
+         Ok(())
+     }
+ 
++    /// Firmware VA of the TA work block.
++    pub(crate) fn ta_va(&self) -> u64 {
++        match &self.work_pack {
++            Some((pack, ta_at, _)) => pack.va + *ta_at as u64,
++            None => self.ta_work.va,
++        }
++    }
++    /// Firmware VA of the FS work block.
++    pub(crate) fn fs_va(&self) -> u64 {
++        match &self.work_pack {
++            Some((pack, _, fs_at)) => pack.va + *fs_at as u64,
++            None => self.fs_work.va,
++        }
++    }
++    fn ta_gva(&self) -> u64 {
++        match &self.work_pack {
++            Some((pack, ta_at, _)) => pack.lower_gva.map_or(0, |g| g + *ta_at as u64),
++            None => self.ta_work.lower_gva.unwrap_or(0),
++        }
++    }
++    fn fs_gva(&self) -> u64 {
++        match &self.work_pack {
++            Some((pack, _, fs_at)) => pack.lower_gva.map_or(0, |g| g + *fs_at as u64),
++            None => self.fs_work.lower_gva.unwrap_or(0),
++        }
++    }
++    /// Writes the TA and FS work images where the slot's records find them.
++    pub(crate) fn write_work(&self, ta_image: &[u8], fs_image: &[u8]) -> Result {
++        match &self.work_pack {
++            Some((pack, ta_at, fs_at)) => {
++                pack.write(*ta_at, ta_image)?;
++                pack.write(*fs_at, fs_image)
++            }
++            None => {
++                self.ta_work.write(0, ta_image)?;
++                self.fs_work.write(0, fs_image)
++            }
++        }
++    }
++    /// A u64 of the TA work block.
++    pub(crate) fn ta_r64(&self, offset: usize) -> Result<u64> {
++        match &self.work_pack {
++            Some((pack, ta_at, _)) => pack.r64(*ta_at + offset),
++            None => self.ta_work.r64(offset),
++        }
++    }
+     /// The addresses the render encoders name.
+     pub(crate) fn refs(&self) -> PassRefs {
+         PassRefs {
+-            ta_work: self.ta_work.va,
+-            ta_work_gva: self.ta_work.lower_gva.unwrap_or(0),
+-            fs_work: self.fs_work.va,
+-            fs_work_gva: self.fs_work.lower_gva.unwrap_or(0),
++            ta_work: self.ta_va(),
++            ta_work_gva: self.ta_gva(),
++            fs_work: self.fs_va(),
++            fs_work_gva: self.fs_gva(),
+             ta_seq: self.ta_seq.va,
+             fs_seq: self.fs_seq.va,
+             scene: self.scene.va,
+-- 
+2.43.0
+

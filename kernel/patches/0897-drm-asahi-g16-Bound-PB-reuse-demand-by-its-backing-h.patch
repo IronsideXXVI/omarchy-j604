@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 08:13:02 +0000
+Subject: [PATCH] drm/asahi: g16: Bound PB reuse demand by its backing
+ heap
+
+Record each prepared PB manager backing capacity and cap the reuse demand at that capacity, as fresh sizing already does. A 128-block heap with 43 blocks observed in use must not rebuild the same 128-block manager on every reuse. Keep the current-size, VM, assignment, exposure and ring checks intact. The g16_pb_size experiment remains default off; this does not implement overflow recovery.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |  5 +++--
+ drivers/gpu/drm/asahi/g16/pools.rs  | 25 ++++++++++++++++++-------
+ 2 files changed, 21 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 0a1d0a430d..0cf0ecc5fa 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1605,8 +1605,9 @@ fn render_refs(
+             None => {
+                 let epoch = job.resources.pb(job.progress.sent() as usize)?;
+                 // g16_pb_size: the slot's size from the blocks its renders were seen holding.
+-                let blocks = super::pools::sized_blocks(slot, arena.heap_blocks(slot)?);
+-                epoch.prepare(slot, arena.heap_gva(slot)?, blocks)?;
++                let capacity = arena.heap_blocks(slot)?;
++                let blocks = super::pools::sized_blocks(slot, capacity);
++                epoch.prepare(slot, arena.heap_gva(slot)?, blocks, capacity)?;
+                 epoch.clone()
+             }
+         };
+diff --git a/drivers/gpu/drm/asahi/g16/pools.rs b/drivers/gpu/drm/asahi/g16/pools.rs
+index 25ae3c62d4..6a86d3f4cd 100644
+--- a/drivers/gpu/drm/asahi/g16/pools.rs
++++ b/drivers/gpu/drm/asahi/g16/pools.rs
+@@ -157,15 +157,17 @@ pub(crate) fn sized_blocks(slot: usize, unit: u32) -> u32 {
+ /// `g16_pb_size`: whether a leased manager seeded with `seeded` blocks may be reused on slot
+ /// `slot`: it has the slot's current size (a manager seeded before the slot was sized, or for
+ /// another size, is replaced) and still holds three times the widest ring distance seen there
+-/// (grow before submit).
+-fn size_holds(slot: usize, seeded: u32) -> bool {
++/// (grow before submit), capped at this manager's backing heap. A full heap
++/// cannot grow further; refusing it would rebuild an identically sized manager.
++fn size_holds(slot: usize, seeded: u32, capacity: u32) -> bool {
+     if super::params::pb_size() == 0 {
+         return true;
+     }
+     let (Some(hw), Some(now)) = (SIZE_HW.get(slot), SIZE_NOW.get(slot)) else {
+         return true;
+     };
+-    seeded == now.load(Ordering::Relaxed) && size_want(hw.load(Ordering::Relaxed)) <= seeded
++    seeded == now.load(Ordering::Relaxed)
++        && size_want(hw.load(Ordering::Relaxed)).min(capacity) <= seeded
+ }
+ 
+ /// `g16_pb_size` stats line: samples, grows, shrinks, reuses refused, the widest ring distance
+@@ -474,7 +476,7 @@ pub(crate) fn shared(
+             self.stats.ring_busy += 1;
+             return None;
+         }
+-        if !size_holds(0, epoch.seeded_blocks()) {
++        if !size_holds(0, epoch.seeded_blocks(), epoch.capacity_blocks()) {
+             SIZE[3].fetch_add(1, Ordering::Relaxed);
+             self.stats.fresh += 1;
+             return None;
+@@ -516,7 +518,7 @@ pub(crate) fn reusable(
+             self.stats.ring_busy += 1;
+             return None;
+         }
+-        if !size_holds(k, epoch.seeded_blocks()) {
++        if !size_holds(k, epoch.seeded_blocks(), epoch.capacity_blocks()) {
+             SIZE[3].fetch_add(1, Ordering::Relaxed);
+             self.stats.fresh += 1;
+             return None;
+@@ -534,7 +536,7 @@ pub(crate) fn would_reuse(&self, k: usize, vm: &Arc<super::vm::VmState>) -> bool
+             && epoch.check_assignment(k).is_ok()
+             && epoch.is_exposed()
+             && epoch.ring_words().is_ok_and(|w| w[0] == w[1])
+-            && size_holds(k, epoch.seeded_blocks())
++            && size_holds(k, epoch.seeded_blocks(), epoch.capacity_blocks())
+     }
+     pub(crate) fn retire_binding(&mut self, k: usize, epoch: &Arc<PbEpoch>) -> Result {
+         *self.owners.get_mut(k).ok_or(EINVAL)? = Some(epoch.clone());
+@@ -577,6 +579,8 @@ pub(crate) struct PbEpochInner {
+     assigned: AtomicU32,
+     /// The block count [`PbEpoch::prepare`] seeded the manager with.
+     seeded: AtomicU32,
++    /// Backing heap limit of this manager, independent of the physical slot's next owner.
++    capacity: AtomicU32,
+     exposed: AtomicBool,
+     /// The manager image as seeded (`g16_pb_probe` compares against it).
+     seed: [AtomicU32; MGR_WORDS],
+@@ -604,6 +608,7 @@ pub(crate) fn new(
+             initbm: FwObject::view(&records, 0x400, 0x20)?,
+             assigned: AtomicU32::new(u32::MAX),
+             seeded: AtomicU32::new(0),
++            capacity: AtomicU32::new(0),
+             exposed: AtomicBool::new(false),
+             seed: [const { AtomicU32::new(0) }; MGR_WORDS],
+             _objects: o,
+@@ -621,9 +626,10 @@ pub(crate) fn new(
+     /// exposure neither the manager nor any of its firmware-mutated lists is reset.
+     /// `blocks` is the heap's block count: buffer::MAX_BLOCKS (the qualified manager), or
+     /// fewer (a compact resident unit; at least buffer::MIN_BLOCKS).
+-    pub(crate) fn prepare(&self, k: usize, heap: u64, blocks: u32) -> Result {
++    pub(crate) fn prepare(&self, k: usize, heap: u64, blocks: u32, capacity: u32) -> Result {
+         if k >= super::hw::sizes::RENDER_UNITS
+             || !(buffer::MIN_BLOCKS..=buffer::MAX_BLOCKS).contains(&blocks)
++            || !(blocks..=buffer::MAX_BLOCKS).contains(&capacity)
+             || self.exposed.load(Ordering::Acquire)
+         {
+             return Err(EINVAL);
+@@ -655,6 +661,7 @@ pub(crate) fn prepare(&self, k: usize, heap: u64, blocks: u32) -> Result {
+                 Ordering::Relaxed,
+             );
+         }
++        self.capacity.store(capacity, Ordering::Relaxed);
+         self.seeded.store(blocks, Ordering::Relaxed);
+         self.assigned.store(k as u32, Ordering::Release);
+         Ok(())
+@@ -663,6 +670,10 @@ pub(crate) fn prepare(&self, k: usize, heap: u64, blocks: u32) -> Result {
+     pub(crate) fn seeded_blocks(&self) -> u32 {
+         self.seeded.load(Ordering::Relaxed)
+     }
++    /// Backed blocks available when this manager was prepared.
++    pub(crate) fn capacity_blocks(&self) -> u32 {
++        self.capacity.load(Ordering::Relaxed)
++    }
+     pub(crate) fn check_assignment(&self, k: usize) -> Result {
+         if self.assigned.load(Ordering::Acquire) != k as u32 {
+             return Err(EINVAL);
+-- 
+2.43.0
+

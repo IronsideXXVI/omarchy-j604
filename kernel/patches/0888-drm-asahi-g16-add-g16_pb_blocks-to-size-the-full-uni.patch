@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 07:26:57 +0000
+Subject: [PATCH] drm/asahi: g16: add g16_pb_blocks to size the full
+ units' parameter buffer
+
+The two full render units of each VM back a parameter buffer heap of
+2048 blocks of 128 KiB, 256 MiB each, so two VMs pin 1 GiB of heap. The
+macOS driver keeps its whole parameter buffer at tens of blocks: 12 to
+25 MiB across the benchmarks, sized from use and grown before a
+submission.
+
+With g16_pb_blocks=N the full units back N blocks of their heap window,
+from its start, rounded up to 16 blocks and kept within the manager's
+64..2048. The PB managers and their block and page lists are seeded with
+that count, as they already are for the 128-block compact units. The
+window and its addresses do not change.
+
+The firmware is given the whole heap up front and has no growth
+protocol, so N must cover the largest render the session runs. The
+switch is read once, at the first render unit built, and takes
+precedence over g16_pb_heap16. The default of 0 keeps 2048 blocks.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 44 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/pools.rs  |  5 +++-
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index aa8e3b418a..3d66e00539 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1307,6 +1307,50 @@ pub(crate) fn fs_tile_bit16() -> bool {
+     "G16: set bit 16 of the FS tile mode word (register 0x10039, +0x9d8) as macOS does on application renders (default 0: off; 1: set; runtime 0644, read per render)"
+ );
+ 
++/// Storage of `g16_pb_blocks` (0644, default 0; latched at its first read).
++static PB_BLOCKS: AtomicU32 = AtomicU32::new(0);
++/// 0 until latched, then the latched value plus one.
++static PB_BLOCKS_LATCH: AtomicU32 = AtomicU32::new(0);
++
++/// The block count of the PB heap of the full render units 0 and 1, if set: the macOS driver
++/// keeps its whole parameter buffer at tens of blocks (12-25 MiB) where these units back 2048
++/// blocks (256 MiB) each. Rounded up to 16 blocks (2 MiB) and kept within the manager's limits.
++/// As with `g16_pb_heap16` the firmware is given the whole heap up front and has no growth
++/// protocol, so a render that needs more blocks than this faults. Read once, at the first
++/// render unit a VM builds, so every VM of the boot is built the same way; it takes precedence
++/// over `g16_pb_heap16`.
++pub(crate) fn pb_blocks() -> Option<u32> {
++    let mut l = PB_BLOCKS_LATCH.load(Ordering::Acquire);
++    if l == 0 {
++        let v = PB_BLOCKS.load(Ordering::Relaxed);
++        let _ = PB_BLOCKS_LATCH.compare_exchange(
++            0,
++            v.saturating_add(1),
++            Ordering::AcqRel,
++            Ordering::Acquire,
++        );
++        l = PB_BLOCKS_LATCH.load(Ordering::Acquire);
++    }
++    let v = l.wrapping_sub(1);
++    if v == 0 {
++        return None;
++    }
++    let v = v
++        .clamp(super::fw::buffer::MIN_BLOCKS, super::fw::buffer::MAX_BLOCKS)
++        .div_ceil(16)
++        * 16;
++    Some(v.min(super::fw::buffer::MAX_BLOCKS))
++}
++
++live_u32_param!(
++    PB_BLOCKS_PARAM,
++    PB_BLOCKS_PARMTYPE,
++    PB_BLOCKS_PARM,
++    PB_BLOCKS,
++    "g16_pb_blocks",
++    "G16: PB heap blocks (128 KiB each) of the full render units 0 and 1, rounded up to 16 and within 64..2048 (default 0: 2048 = 256 MiB each; latched at the first render unit built, set it as a module option)"
++);
++
+ /// Storage of `g16_pb_heap16` (0644, default 0; latched at its first read).
+ static PB_HEAP16: AtomicU32 = AtomicU32::new(0);
+ /// 0 until latched, then 1 (off) or 2 (on).
+diff --git a/drivers/gpu/drm/asahi/g16/pools.rs b/drivers/gpu/drm/asahi/g16/pools.rs
+index 2bd4dfa39d..52d88cd040 100644
+--- a/drivers/gpu/drm/asahi/g16/pools.rs
++++ b/drivers/gpu/drm/asahi/g16/pools.rs
+@@ -59,7 +59,7 @@ pub(crate) struct Allocator {
+     id: u32,
+     /// The firmware UMA slot this allocator's descriptor binds (lifetime::uma_slot).
+     uma_slot: u32,
+-    /// PB heap blocks: buffer::MAX_BLOCKS, or 128 for a compact resident unit.
++    /// PB heap blocks: buffer::MAX_BLOCKS, 128 for a compact resident unit, or `g16_pb_blocks`.
+     blocks: u32,
+ }
+ 
+@@ -161,6 +161,9 @@ fn new(o: &mut Objects, k: u64, compact: bool) -> Result<Self> {
+                 client::compact_window(k) + client::COMPACT_PB_HEAP_OFF,
+                 client::COMPACT_PB_HEAP_SIZE,
+             )
++        } else if let Some(n) = super::params::pb_blocks() {
++            // g16_pb_blocks: the full units back n blocks of their heap window, from its start.
++            (client::pb_heap(k), u64::from(n) * buffer::BLOCK_BYTES)
+         } else if super::params::pb_heap16() {
+             // g16_pb_heap16: the full units back only the first 16 MiB of their heap window,
+             // as the compact units do; the window and its address stay.
+-- 
+2.43.0
+

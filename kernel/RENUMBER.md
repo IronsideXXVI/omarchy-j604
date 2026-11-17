@@ -1304,3 +1304,8 @@ New in 1.1009 (0866 turns on the shared compute pool by default, revert with aur
 Kernel 1.1010 keeps the base (`da8e1acf3656`) and all 866 patches of 1.1009 under the same numbers.
 
 New in 1.1010 (0871 enables the GPU-to-fabric bridge before the GPU firmware runs, on by default, revert with aurora.g16_bridge=0; 0867-0869 are experiment switches that are off by default, not user options; 0870 corrects the table of the g16_main_macos switch, also off by default): 0867 (`drm/asahi: g16: add g16_replay to write template values into compute records`), 0868 (`drm/asahi: g16: Add a switch to show the init objects in debugfs`), 0869 (`drm/asahi: g16: Optionally build the firmware loader map as macOS does`), 0870 (`drm/asahi: g16: Map the macOS Main words through both firmware layouts`), 0871 (`drm/asahi: g16: Enable the GPU-to-fabric bridge before the firmware runs`).
+
+
+# Kernel patch numbers: 1.1010 to 1.1017
+
+The base remains da8e1acf3656. Published 0001–0871 are unchanged; 0872–0907 carry the subsequent initialization, mapping, command-cache and diagnostic changes. Applied source differs from the installed build only in nine comment lines. Diagnostic switches remain off; the current train performance gain comes from Mesa 1.8145.

@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 05:21:44 +0000
+Subject: [PATCH] drm/asahi: g16: let g16_replay write vertex sequence
+ records too
+
+g16_replay writes template values into compute sequence records only.
+The vertex (TA) sequence record of the other driver differs from ours in
+the same way: per-command counters at +0x4c and +0x58, flag words at
++0x5c, +0x78 and +0x84, and its own per-command id where we write the
+draw ordinal.
+
+Accept template entries of a second record kind, 4, for the vertex
+sequence record, and apply them once its attachments are written, so
+nothing later overwrites them. The vertex kind refuses every field this
+driver fills with an address or an identity: the 64-bit addresses, the
+context, the parameter id, the attachment table and its count, the
+inline UMA block, both timestamp records, and the finalize record's
+addresses, context, stamp target and flags.
+
+The compute kind now refuses its context, ordinal and stamp target as
+well, which no template is meant to change.
+
+The stats line gains the vertex commands written.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/encode.rs | 101 ++++++++++++++++++++++++----
+ drivers/gpu/drm/asahi/g16/engine.rs |   1 +
+ 2 files changed, 88 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/encode.rs b/drivers/gpu/drm/asahi/g16/encode.rs
+index 01bf02f4c4..d8842e46bc 100644
+--- a/drivers/gpu/drm/asahi/g16/encode.rs
++++ b/drivers/gpu/drm/asahi/g16/encode.rs
+@@ -305,12 +305,14 @@ pub(crate) fn barrier(
+ /// A template of field values is written to the `aurora-g16/replay` debugfs file as a
+ /// "GRP1" blob: a 4-byte magic, a u16 version (1), a u16 entry count, then entries of 24
+ /// bytes: kind u8, piece u8, width u8, mode u8, offset u16, reserved u16, value u64,
+-/// step u64. Kind 1 is the compute sequence record. Mode 0 writes `value`; mode 1 writes
+-/// `value + step * n`, n being the commands replayed since the blob was written.
++/// step u64. Kind 1 is the compute sequence record, kind 4 the vertex (TA) sequence record.
++/// Mode 0 writes `value`; mode 1 writes `value + step * n`, n being the commands of that
++/// kind replayed since the blob was written.
+ ///
+ /// `g16_replay` is a mask of pieces: an entry is applied only while its piece bit is set,
+ /// so one piece is removed by clearing its bit. Entries that overlap a field this driver
+-/// fills with an address are refused at write time: addresses always stay this driver's.
++/// fills with an address or an identity (context, ordinal, stamp target) are refused at
++/// write time: those always stay this driver's.
+ /// Nothing is applied with the mask at 0 (the default) or without a blob.
+ pub(crate) mod replay {
+     use core::fmt;
+@@ -319,7 +321,7 @@ pub(crate) mod replay {
+     use kernel::prelude::*;
+     use kernel::uaccess::UserSliceReader;
+ 
+-    use super::compute;
++    use super::{compute, ta};
+ 
+     /// Most entries a blob may carry.
+     const MAX_ENTRIES: usize = 256;
+@@ -329,14 +331,18 @@ pub(crate) mod replay {
+     const HEADER_SIZE: usize = 8;
+     /// Record kind: the compute sequence record.
+     pub(crate) const KIND_COMPUTE_SEQ: u8 = 1;
++    /// Record kind: the vertex (TA) sequence record.
++    pub(crate) const KIND_TA_SEQ: u8 = 4;
+ 
+     /// The fields of the compute sequence record this driver fills with an address, as
+     /// (offset, bytes): the 64-bit firmware and GPU addresses, the attachment table and the
+     /// unaligned pair of the finalize record.
+-    const COMPUTE_SEQ_ADDRESSES: [(usize, usize); 33] = [
++    const COMPUTE_SEQ_ADDRESSES: [(usize, usize); 37] = [
+         (0x14, 8),
+         (0x1c, 8),
+         (0x24, 8),
++        (0x2c, 4),
++        (0x38, 4),
+         (0x44, 8),
+         (
+             compute::ATTACHMENTS,
+@@ -365,21 +371,73 @@ pub(crate) mod replay {
+         (compute::TS_END + 0x34, 8),
+         (compute::FINALIZE + 4, 8),
+         (compute::FINALIZE + 0xc, 8),
++        (compute::FINALIZE + 0x14, 4),
+         (compute::FINALIZE + 0x18, 8),
+         (compute::FINALIZE + 0x2c, 8),
++        (compute::FINALIZE + 0x34, 4),
+         (compute::FINALIZE + 0x5c, 8),
+         (compute::FINALIZE + 0x69, 8),
+         (compute::FINALIZE + 0x71, 8),
+     ];
+ 
++    /// The fields of the vertex (TA) sequence record this driver fills with an address or an
++    /// identity: the 64-bit addresses, ctx, the parameter id, the attachment table and its
++    /// count, the inline UMA block's manager, GPU address, counter, event and engine, the two
++    /// timestamp records and the finalize record's addresses, ctx, stamp target and flags.
++    const TA_SEQ_FIELDS: [(usize, usize); 41] = [
++        (0x14, 8),
++        (0x1c, 8),
++        (0x24, 8),
++        (0x2c, 8),
++        (0x34, 8),
++        (0x3c, 8),
++        (0x44, 4),
++        (0x50, 4),
++        (0x64, 8),
++        (0x6c, 8),
++        (0x88, 0x104),
++        (0x190, 8),
++        (0x1a8, 8),
++        (0x1b8, 8),
++        (0x1c0, 8),
++        (ta::TS_START + 4, 8),
++        (ta::TS_START + 0xc, 8),
++        (ta::TS_START + 0x14, 8),
++        (ta::TS_START + 0x1c, 8),
++        (ta::TS_START + 0x24, 8),
++        (ta::TS_START + 0x2c, 8),
++        (ta::TS_START + 0x34, 8),
++        (ta::TS_START + 0x54, 8),
++        (ta::TS_START + 0x5c, 8),
++        (ta::TS_START + 0x64, 8),
++        (ta::TS_START + 0x6c, 8),
++        (ta::TS_START + 0x74, 8),
++        (ta::TS_START + 0x7c, 8),
++        (ta::TS_START + 0x84, 8),
++        (ta::FINALIZE + 4, 8),
++        (ta::FINALIZE + 0xc, 8),
++        (ta::FINALIZE + 0x14, 8),
++        (ta::FINALIZE + 0x1c, 8),
++        (ta::FINALIZE + 0x24, 8),
++        (ta::FINALIZE + 0x2c, 4),
++        (ta::FINALIZE + 0x34, 8),
++        (ta::FINALIZE + 0x48, 8),
++        (ta::FINALIZE + 0x50, 4),
++        (ta::FINALIZE + 0x78, 8),
++        (ta::FINALIZE + 0x84, 1),
++        (ta::FINALIZE + 0x85, 9),
++    ];
++
+     /// Packed entries: meta (kind | piece << 8 | width << 16 | mode << 24 | offset << 32),
+     /// value, step.
+     static ENTRIES: [[AtomicU64; 3]; MAX_ENTRIES] =
+         [const { [const { AtomicU64::new(0) }; 3] }; MAX_ENTRIES];
+     /// Valid entries; 0 while a blob is being written.
+     static COUNT: AtomicU32 = AtomicU32::new(0);
+-    /// Commands replayed since the blob was written (n of the counter mode).
++    /// Compute commands replayed since the blob was written (n of the counter mode).
+     static APPLIED: AtomicU64 = AtomicU64::new(0);
++    /// Vertex (TA) commands replayed since the blob was written.
++    static APPLIED_TA: AtomicU64 = AtomicU64::new(0);
+     /// Blobs refused.
+     static REFUSED: AtomicU32 = AtomicU32::new(0);
+ 
+@@ -406,12 +464,16 @@ fn overlaps(off: usize, width: usize, fields: &[(usize, usize)]) -> bool {
+             let off = u16::from_le_bytes([e[4], e[5]]) as usize;
+             let value = u64::from_le_bytes(e[8..16].try_into().map_err(|_| EINVAL)?);
+             let step = u64::from_le_bytes(e[16..24].try_into().map_err(|_| EINVAL)?);
+-            if kind != KIND_COMPUTE_SEQ
+-                || piece >= 32
++            let (end, fields): (usize, &[(usize, usize)]) = match kind {
++                KIND_COMPUTE_SEQ => (compute::END, &COMPUTE_SEQ_ADDRESSES),
++                KIND_TA_SEQ => (ta::END, &TA_SEQ_FIELDS),
++                _ => return Err(EINVAL),
++            };
++            if piece >= 32
+                 || !matches!(width, 1 | 2 | 4 | 8)
+                 || mode > 1
+-                || off + width > compute::END
+-                || overlaps(off, width, &COMPUTE_SEQ_ADDRESSES)
++                || off + width > end
++                || overlaps(off, width, fields)
+             {
+                 return Err(EINVAL);
+             }
+@@ -448,6 +510,7 @@ pub(crate) fn replay_write(_v: &ReplayView, reader: &mut UserSliceReader) -> Res
+             }
+         }
+         APPLIED.store(0, Ordering::Relaxed);
++        APPLIED_TA.store(0, Ordering::Relaxed);
+         COUNT.store(entries.len() as u32, Ordering::Release);
+         Ok(())
+     }
+@@ -461,28 +524,38 @@ pub(crate) fn replay_show(_v: &ReplayView, f: &mut fmt::Formatter<'_>) -> fmt::R
+     pub(crate) fn stats(f: &mut impl fmt::Write) -> fmt::Result {
+         writeln!(
+             f,
+-            "replay: mask {:#x} entries {} applied {} refused {}",
++            "replay: mask {:#x} entries {} applied {} refused {} ta_applied {}",
+             super::super::params::replay(),
+             COUNT.load(Ordering::Acquire),
+             APPLIED.load(Ordering::Relaxed),
+-            REFUSED.load(Ordering::Relaxed)
++            REFUSED.load(Ordering::Relaxed),
++            APPLIED_TA.load(Ordering::Relaxed)
+         )
+     }
+ 
+     /// Overwrites the enabled pieces of a compute sequence record with the template values.
+     pub(crate) fn apply_compute_seq(q: &mut [u8; compute::SEQ_SIZE]) {
++        apply(KIND_COMPUTE_SEQ, &APPLIED, q);
++    }
++
++    /// Overwrites the enabled pieces of a vertex (TA) sequence record, after its attachments.
++    pub(crate) fn apply_ta_seq(q: &mut [u8]) {
++        apply(KIND_TA_SEQ, &APPLIED_TA, q);
++    }
++
++    fn apply(want: u8, applied: &AtomicU64, q: &mut [u8]) {
+         let mask = super::super::params::replay();
+         let count = (COUNT.load(Ordering::Acquire) as usize).min(MAX_ENTRIES);
+         if mask == 0 || count == 0 {
+             return;
+         }
+-        let n = APPLIED.fetch_add(1, Ordering::Relaxed);
++        let n = applied.fetch_add(1, Ordering::Relaxed);
+         for slot in &ENTRIES[..count] {
+             let meta = slot[0].load(Ordering::Relaxed);
+             let (kind, piece) = (meta as u8, (meta >> 8) as u8);
+             let (width, mode) = ((meta >> 16) as u8 as usize, (meta >> 24) as u8);
+             let off = (meta >> 32) as u16 as usize;
+-            if kind != KIND_COMPUTE_SEQ || mask & (1 << piece) == 0 || off + width > q.len() {
++            if kind != want || mask & (1 << piece) == 0 || off + width > q.len() {
+                 continue;
+             }
+             let mut v = slot[1].load(Ordering::Relaxed);
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index b6259f0c54..fcc99ccca2 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -2189,6 +2189,7 @@ fn prefix_render(
+             }
+         }
+         encode::render_attachments(&mut scratch.tas[..], 0, &cmd.vertex_attachments);
++        encode::replay::apply_ta_seq(&mut scratch.tas[..]);
+         encode::render_attachments(&mut scratch.fss[..], 1, &cmd.fragment_attachments);
+         params::render_patch_apply(&mut scratch.tas[..], &mut scratch.fss[..]);
+         encode::fill_scene(&refs, &pass, &mut scratch.scene[..]);
+-- 
+2.43.0
+

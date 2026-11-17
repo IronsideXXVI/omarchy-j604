@@ -1,0 +1,353 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 05:34:07 +0000
+Subject: [PATCH] drm/asahi: g16: Add g16_init_macos for macOS's INIT
+ words outside Main
+
+macOS 26B123 sets words in the J604's init objects outside Main that
+this encoder leaves at its own value. Add a load-time bit mask, default
+0, that writes them at this firmware's (25G83) offsets, one group per
+bit:
+
+  0x01  Runtime +0x250 = 0: the firmware's log printer writes nothing
+  0x02  Runtime +0x3d8 = 0xff: eight per-index enables
+  0x04  Runtime +0x2c8 = a zeroed table of 256 counters, which the
+        firmware writes without a null check on one work path
+  0x08  Power: 18 controller words at offsets equal in both builds
+  0x10  Power: 5 words at inferred offsets
+  0x20  POWER_PERFORMANCE: 4 words (only with g16_fw_controllers)
+  0x40  POWER_PERFORMANCE: 2 words at inferred offsets (same)
+  0x80  Globals P-state selectors at the top row at INIT, not S1
+
+Each object's offset map comes from paired firmware readers of the two
+builds. Power +0x128 is left out: while it is set the firmware skips
+its power step, and macOS clears it after INIT.
+
+With 0 the encoded objects are unchanged.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs      |   4 +
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs | 153 +++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/initdata.rs    |  57 ++++++++-
+ drivers/gpu/drm/asahi/g16/params.rs      |   6 +
+ 4 files changed, 219 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index e9d7026bad..7192814106 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -299,6 +299,10 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 0,
+             description: "G16: firmware power controllers (default 0; 1: with thermal, 2: without)",
+         },
++        g16_init_macos: u32 {
++            default: 0,
++            description: "G16: macOS INIT words outside Main, bit mask (default 0: none)",
++        },
+         g16_recovery: u32 {
+             default: 1,
+             description: "G16: answer qualified firmware recovery handshakes",
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index 3acb7cf2bc..a097c5a41d 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -354,6 +354,97 @@ pub(crate) mod main_macos {
+     ];
+ }
+ 
++/// macOS 26B123's INIT words outside Main, at this firmware's (25G83) offsets, one
++/// `g16_init_macos` bit per group. Each object's 25G83 -> 26B123 offset map comes from paired
++/// firmware readers of both builds; the values are macOS's at INIT on the J604. Bit 0 (the
++/// default) writes none of them.
++pub(crate) mod init_macos {
++    use super::{id, OBJECT_SIZE};
++
++    /// Runtime +0x250 = 0: the firmware's log printer then writes no log-ring entry, as on
++    /// macOS. This encoder writes 1.
++    pub(crate) const LOG_OFF: u32 = 1 << 0;
++    /// Runtime +0x3d8 = 0xff: the eight per-index enables of a bucketing path, as on macOS.
++    pub(crate) const STATS_MASK: u32 = 1 << 1;
++    /// Runtime +0x2c8 = a zeroed table of 256 {u32, u32} counters. The firmware writes it
++    /// without a null check on a path some work items select; macOS gives it a table.
++    pub(crate) const COUNT_TABLE: u32 = 1 << 2;
++    /// [`POWER`]: Power object words whose offset is the same in both builds.
++    pub(crate) const POWER_WORDS: u32 = 1 << 3;
++    /// [`POWER_TAIL`]: Power object words at inferred offsets.
++    pub(crate) const POWER_TAIL_WORDS: u32 = 1 << 4;
++    /// [`PP`]: POWER_PERFORMANCE words macOS has beyond the controller words; only with
++    /// `g16_fw_controllers`.
++    pub(crate) const PP_WORDS: u32 = 1 << 5;
++    /// [`PP_TAIL`]: POWER_PERFORMANCE words at inferred offsets; only with
++    /// `g16_fw_controllers`.
++    pub(crate) const PP_TAIL_WORDS: u32 = 1 << 6;
++    /// The Globals P-state selectors at the top row at INIT (macOS: 1000 with eleven rows)
++    /// instead of the S1 startup value; written by the owner after [`super::encode`].
++    pub(crate) const SELECTORS: u32 = 1 << 7;
++    pub(crate) const ALL: u32 = 0xff;
++
++    pub(crate) const RUNTIME_LOG: usize = 0x250;
++    pub(crate) const RUNTIME_STATS_MASK: usize = 0x3d8;
++    pub(crate) const RUNTIME_COUNT_TABLE: usize = 0x2c8;
++    pub(crate) const COUNT_TABLE_SIZE: usize = 0x800;
++
++    /// Power (Root +0xb8) at offsets equal in 25G83 and 26B123. +0x128 is left out: macOS
++    /// has 1 there at INIT and 0 later, and while it is set the firmware skips its power
++    /// step (25G83 0x255bc).
++    pub(crate) const POWER: [(usize, u32); 18] = [
++        (0x10, 31),
++        (0x14, 0x3e0a3d71),
++        (0x18, 0x401ae148),
++        (0x1c, 40),
++        (0x20, 1),
++        (0xc8, 11000),
++        (0xcc, 8000),
++        (0xd8, 0x42f00000),
++        (0xdc, 0x3fd55554),
++        (0xf0, 9600),
++        (0xf4, 200),
++        (0x108, 0x43960000),
++        (0x10c, 0x3fa66666),
++        (0x110, 625),
++        (0x124, 300),
++        (0x12c, 0x8dc6),
++        (0x130, 0x3e800000),
++        (0x134, 0x3f99999a),
++    ];
++    /// 26B123 Power +0x624..+0x640 at 25G83 -0x20 (between reader pairs that both move
++    /// by 0x20).
++    pub(crate) const POWER_TAIL: [(usize, u32); 5] = [
++        (0x604, 0x41700000),
++        (0x608, 0x40a00000),
++        (0x60c, 32),
++        (0x610, 1000),
++        (0x620, 900),
++    ];
++    /// 26B123 POWER_PERFORMANCE +0x28e8, +0x2f28, +0x2f30 and +0x2f34.
++    pub(crate) const PP: [(usize, u32); 4] =
++        [(0x28c0, 1), (0x2f08, 0x6958), (0x2f10, 125), (0x2f14, 1)];
++    /// 26B123 POWER_PERFORMANCE +0x2f0c (100.0) and +0x63c0, placed by value anchors.
++    pub(crate) const PP_TAIL: [(usize, u32); 2] = [(0x2eec, 0x42c80000), (0x6398, 0xf)];
++
++    const fn within(words: &[(usize, u32)], size: usize) -> bool {
++        let mut i = 0;
++        while i < words.len() {
++            if words[i].0 % 4 != 0 || words[i].0 + 4 > size {
++                return false;
++            }
++            i += 1;
++        }
++        true
++    }
++    const _: () = assert!(within(&POWER, OBJECT_SIZE[id::POWER]));
++    const _: () = assert!(within(&POWER_TAIL, OBJECT_SIZE[id::POWER]));
++    const _: () = assert!(within(&PP, OBJECT_SIZE[id::POWER_PERFORMANCE]));
++    const _: () = assert!(within(&PP_TAIL, OBJECT_SIZE[id::POWER_PERFORMANCE]));
++    const _: () = assert!(RUNTIME_COUNT_TABLE + 8 <= OBJECT_SIZE[id::RUNTIME]);
++    const _: () = assert!(RUNTIME_STATS_MASK + 4 <= OBJECT_SIZE[id::RUNTIME]);
++}
++
+ /// One logical loader record, including its page offset and exact PTE class.
+ #[derive(Clone, Copy, Debug)]
+ pub(crate) struct Loader {
+@@ -687,6 +778,10 @@ pub(crate) struct Input {
+     /// `g16_main_poke` pairs (offset, value), written last.
+     pub(crate) poke: [(u32, u32); 32],
+     pub(crate) poke_n: usize,
++    /// `g16_init_macos` bits ([`init_macos`]).
++    pub(crate) init_macos: u32,
++    /// With [`init_macos::COUNT_TABLE`]: the zeroed counter table's VA.
++    pub(crate) count_table: u64,
+ }
+ 
+ pub(crate) fn object_va(va: u64, size: usize) -> bool {
+@@ -771,6 +866,8 @@ pub(crate) fn encode(
+         || !bootstrap_alias(input.lower_parameter)
+         || (input.lower_uma < input.lower_parameter + 0x8000
+             && input.lower_parameter < input.lower_uma + 0x8000)
++        || (input.init_macos & init_macos::COUNT_TABLE != 0
++            && !object_va(input.count_table, init_macos::COUNT_TABLE_SIZE))
+     {
+         return Err(());
+     }
+@@ -959,6 +1056,52 @@ pub(crate) fn encode(
+             input.fw_thermal,
+         )?;
+     }
++    encode_init_macos(objects, input)
++}
++
++/// Writes the [`init_macos`] words `input.init_macos` selects; nothing when it is 0.
++fn encode_init_macos(objects: &mut [&mut [u8]; OBJECT_COUNT], input: &Input) -> Result<(), ()> {
++    let bits = input.init_macos;
++    let runtime = &mut objects[id::RUNTIME];
++    if bits & init_macos::LOG_OFF != 0 {
++        put32(runtime, init_macos::RUNTIME_LOG, 0)?;
++    }
++    if bits & init_macos::STATS_MASK != 0 {
++        put32(runtime, init_macos::RUNTIME_STATS_MASK, 0xff)?;
++    }
++    if bits & init_macos::COUNT_TABLE != 0 {
++        put64(runtime, init_macos::RUNTIME_COUNT_TABLE, input.count_table)?;
++    }
++    let mut groups = [
++        (init_macos::POWER_WORDS, id::POWER, &init_macos::POWER[..]),
++        (
++            init_macos::POWER_TAIL_WORDS,
++            id::POWER,
++            &init_macos::POWER_TAIL[..],
++        ),
++        (
++            init_macos::PP_WORDS,
++            id::POWER_PERFORMANCE,
++            &init_macos::PP[..],
++        ),
++        (
++            init_macos::PP_TAIL_WORDS,
++            id::POWER_PERFORMANCE,
++            &init_macos::PP_TAIL[..],
++        ),
++    ];
++    if !input.fw_controllers {
++        groups[2].0 = 0;
++        groups[3].0 = 0;
++    }
++    for (bit, object, words) in groups {
++        if bits & bit == 0 {
++            continue;
++        }
++        for &(at, value) in words {
++            put32(objects[object], at, value)?;
++        }
++    }
+     Ok(())
+ }
+ 
+@@ -1014,6 +1157,16 @@ fn the_word_matches_g17_region_c_and_misses_the_policy_words() {
+         assert!(globals::POLICY.contains(&(0x9cc, 50)));
+     }
+ 
++    #[test]
++    fn the_init_macos_words_miss_the_controller_words() {
++        for (at, _) in init_macos::PP.iter().chain(init_macos::PP_TAIL.iter()) {
++            assert!(!super::super::controllers::WORDS
++                .iter()
++                .any(|(c, _)| c == at));
++        }
++        assert_eq!(init_macos::ALL, (init_macos::SELECTORS << 1) - 1);
++    }
++
+     #[test]
+     fn the_required_words_miss_every_other_globals_word() {
+         for (at, _) in globals::REQUIRED {
+diff --git a/drivers/gpu/drm/asahi/g16/initdata.rs b/drivers/gpu/drm/asahi/g16/initdata.rs
+index 5a84ede985..1df9a011f3 100644
+--- a/drivers/gpu/drm/asahi/g16/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/initdata.rs
+@@ -54,6 +54,9 @@ pub(crate) struct InitData {
+     /// `g16_init_dump`: the encoder's images (the host's bytes before the firmware starts),
+     /// taken once by the `aurora-g16/initdata` file. `None` when the switch is off.
+     encoded: Option<KVec<KVVec<u8>>>,
++    /// `g16_init_macos` COUNT_TABLE: the firmware's counter table (Runtime +0x2c8), kept for
++    /// the life of the firmware. `None` when the bit is off.
++    _count_table: Option<Arc<FwObject>>,
+ }
+ 
+ impl InitData {
+@@ -285,7 +288,52 @@ pub(crate) fn build(
+         poke: [(0, 0); 32],
+         poke_n: 0,
+         fw_thermal: super::params::fw_thermal(),
++        init_macos: super::params::init_macos(),
++        count_table: 0,
+     };
++    if input.init_macos != 0 {
++        let m = input.init_macos;
++        dev_info!(
++            dev,
++            "M4 initdata: g16_init_macos={:#x}: log-off {} stats-mask {} count-table {} power {}+{} pp {}+{} selectors {}\n",
++            m,
++            m & 1,
++            (m >> 1) & 1,
++            (m >> 2) & 1,
++            (m >> 3) & 1,
++            (m >> 4) & 1,
++            (m >> 5) & 1,
++            (m >> 6) & 1,
++            (m >> 7) & 1
++        );
++        if m & (wire::init_macos::PP_WORDS | wire::init_macos::PP_TAIL_WORDS) != 0
++            && !input.fw_controllers
++        {
++            dev_info!(
++                dev,
++                "M4 initdata: g16_init_macos: POWER_PERFORMANCE words need g16_fw_controllers; not written\n"
++            );
++        }
++    }
++    // Not in the inventory: the dump and the 31-object tables index it by object id.
++    let mut count_table = None;
++    if input.init_macos & wire::init_macos::COUNT_TABLE != 0 {
++        let table = objects.alloc(Request {
++            size: wire::init_macos::COUNT_TABLE_SIZE,
++            class: Class::Fw,
++            placement: Placement::Anywhere,
++            offset: 0,
++            client: None,
++            lower: None,
++            cpu: true,
++        })?;
++        table.write(
++            0,
++            &KVVec::from_elem(0u8, wire::init_macos::COUNT_TABLE_SIZE, GFP_KERNEL)?,
++        )?;
++        input.count_table = table.va;
++        count_table = Some(table);
++    }
+     if input.loader_macos != 0 {
+         dev_info!(
+             dev,
+@@ -433,8 +481,14 @@ pub(crate) fn build(
+     loader.copy_from_slice(&images[id::MAIN][0x640..0x640 + wire::LOADER_BYTES]);
+     // Host startup policy: Main and PowerPerformance contain the top row, but the
+     // published selectors remain S1 until the thermal owner admits a raise.
++    // `g16_init_macos` SELECTORS: the top row at INIT, as macOS publishes it.
++    let selector = if input.init_macos & wire::init_macos::SELECTORS != 0 {
++        100 * ceiling
++    } else {
++        100
++    };
+     for at in globals::PSTATE_SELECTORS {
+-        images[id::GLOBALS][at..at + 4].copy_from_slice(&100u32.to_le_bytes());
++        images[id::GLOBALS][at..at + 4].copy_from_slice(&selector.to_le_bytes());
+     }
+     for i in 0..wire::OBJECT_COUNT {
+         graph[i].write(0, &images[i])?;
+@@ -475,6 +529,7 @@ pub(crate) fn build(
+             loader,
+             _graph: graph,
+             encoded,
++            _count_table: count_table,
+         },
+         channels,
+         max_khz,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 1a55a79eab..b903204e41 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2105,6 +2105,12 @@ pub(crate) fn fw_controllers_mode() -> u32 {
+     module_parameters::g16_fw_controllers.value()
+ }
+ 
++/// `g16_init_macos` (load time): the [`super::fw::initdata::init_macos`] bits; unknown bits
++/// are dropped.
++pub(crate) fn init_macos() -> u32 {
++    module_parameters::g16_init_macos.value() & super::fw::initdata::init_macos::ALL
++}
++
+ /// Whether the controllers include the thermal ones and the MTR chain registration.
+ pub(crate) fn fw_thermal() -> bool {
+     fw_controllers_mode() == 1
+-- 
+2.43.0
+

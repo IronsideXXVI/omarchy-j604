@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 09:41:40 +0000
+Subject: [PATCH] drm/asahi: g16: Split compute command cache kinds
+
+The combined compute cache kind passes serial correctness but loses the
+device during the depth-64 test. The fault journal does not identify
+which allocation class causes the failure.
+
+Add independent work-image, sequence and barrier bits to g16_fw_cached
+so each class can be tested separately. Keep bit 2 as an alias selecting
+all three classes and leave the default mask zero. Packed work images
+follow the work-image bit. No cache maintenance or recovery path changes.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs    |  2 +-
+ drivers/gpu/drm/asahi/g16/hw.rs        |  6 ++++++
+ drivers/gpu/drm/asahi/g16/params.rs    | 19 ++++++++++++-------
+ drivers/gpu/drm/asahi/g16/resources.rs |  2 +-
+ drivers/gpu/drm/asahi/g16/slots.rs     |  6 +++---
+ 5 files changed, 23 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index a9876eccec..9e0abf6c98 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -289,7 +289,7 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+         },
+         g16_fw_cached: u32 {
+             default: 1,
+-            description: "G16: cached kinds: 1 queue 2 compute 4 TA 8 FS 16 ring (default 1)",
++            description: "G16: 1 queue 2 compute 4 TA 8 FS 16 ring; 32/64/128 work/seq/barrier",
+         },
+         g16_host_records: u32 {
+             default: 0,
+diff --git a/drivers/gpu/drm/asahi/g16/hw.rs b/drivers/gpu/drm/asahi/g16/hw.rs
+index 27290e5572..da748512d5 100644
+--- a/drivers/gpu/drm/asahi/g16/hw.rs
++++ b/drivers/gpu/drm/asahi/g16/hw.rs
+@@ -512,6 +512,12 @@ pub(crate) mod tuning {
+     pub(crate) const FWC_QUEUE: u32 = 0x1;
+     /// Compute commands: the work image, its sequence object and barrier.
+     pub(crate) const FWC_COMPUTE: u32 = 0x2;
++    /// Compute work image (and packed work blocks), independently cached.
++    pub(crate) const FWC_COMPUTE_WORK: u32 = 0x20;
++    /// Separate compute sequence allocation, independently cached.
++    pub(crate) const FWC_COMPUTE_SEQ: u32 = 0x40;
++    /// Compute dependency/barrier allocation, independently cached.
++    pub(crate) const FWC_COMPUTE_BARRIER: u32 = 0x80;
+     /// Render TA: the TA work image and sequence.
+     pub(crate) const FWC_TA: u32 = 0x4;
+     /// Render FS: the FS work image, sequence and the pass slot's barriers.
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index c96e7b9a41..a5211db453 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -664,14 +664,19 @@ pub(crate) fn cwork_retain() -> bool {
+         && module_parameters::g16_fw_cached.value() & 2 != 0
+ }
+ 
+-/// `g16_fw_cached` (load time): a bitmask of command-object kinds (`hw::tuning::FWC_*`) that use
+-/// the ASC-cached classes instead of AttrIndex 2, as the macOS driver maps its queue objects, job
+-/// blocks and work records. 25G83 cleans and invalidates queue info and scheduler contexts when a
+-/// queue registers, and cleans each work block after its command; it does not invalidate work
+-/// images, sequences or barriers before reading them. Whether every bit in `kind` is set. 0 (the
+-/// uncached selection) keeps today's uncached classes for every kind.
++/// ASC-cached command kinds. Legacy bit 2 selects all compute allocations; bits
++/// 32, 64 and 128 independently select work images, sequences and barriers.
++/// Mask zero keeps command allocations uncached; the default selects queue objects only.
+ pub(crate) fn fw_cached(kind: u32) -> bool {
+-    kind != 0 && module_parameters::g16_fw_cached.value() & kind == kind
++    use super::hw::tuning;
++
++    let mut mask = module_parameters::g16_fw_cached.value();
++    if mask & tuning::FWC_COMPUTE != 0 {
++        mask |= tuning::FWC_COMPUTE_WORK
++            | tuning::FWC_COMPUTE_SEQ
++            | tuning::FWC_COMPUTE_BARRIER;
++    }
++    kind != 0 && mask & kind == kind
+ }
+ 
+ /// The configured load-time command-object cache mask, for the boot receipt.
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index b6de0c8a3f..2981dc204c 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -108,7 +108,7 @@ fn new(
+                 super::hw::client::CWORK_PACK_SIZE as usize,
+                 super::hw::client::CWORK_PACK,
+                 0,
+-                super::hw::tuning::FWC_COMPUTE,
++                super::hw::tuning::FWC_COMPUTE_WORK,
+             )?)
+         } else {
+             None
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index eee7129e69..f0db9bc142 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -90,13 +90,13 @@ pub(crate) fn new(
+                 0x2000,
+                 client::WORK_PAGE + k * client::CWORK_STRIDE,
+                 0,
+-                tuning::FWC_COMPUTE,
++                tuning::FWC_COMPUTE_WORK,
+             )?,
+-            seq: alloc(o, 0x300, cmd_fw(tuning::FWC_COMPUTE), None, 0, false)?,
++            seq: alloc(o, 0x300, cmd_fw(tuning::FWC_COMPUTE_SEQ), None, 0, false)?,
+             barrier: alloc(
+                 o,
+                 barrier::SIZE,
+-                cmd_fw(tuning::FWC_COMPUTE),
++                cmd_fw(tuning::FWC_COMPUTE_BARRIER),
+                 None,
+                 0,
+                 false,
+-- 
+2.43.0
+

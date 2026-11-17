@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <ironsidexxvi@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 09:47:14 +0000
+Subject: [PATCH] drm/asahi: g16: Add bounded opt-in host record
+ snapshots
+
+Capture host preparation bytes and explicit VA/owner/ordinal metadata without touching allocator or UAT paths. No firmware/user payload readback; printk loss must fail decoding.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs       |  4 +++
+ drivers/gpu/drm/asahi/g16/channel.rs      | 13 ++++---
+ drivers/gpu/drm/asahi/g16/engine.rs       | 10 ++++++
+ drivers/gpu/drm/asahi/g16/graph.rs        | 13 ++++---
+ drivers/gpu/drm/asahi/g16/host_records.rs | 43 +++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/mod.rs          |  1 +
+ drivers/gpu/drm/asahi/g16/params.rs       |  6 ++++
+ 7 files changed, 82 insertions(+), 8 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/host_records.rs
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index 0eb5e094ee..a9876eccec 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -291,6 +291,10 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 1,
+             description: "G16: cached kinds: 1 queue 2 compute 4 TA 8 FS 16 ring (default 1)",
+         },
++        g16_host_records: u32 {
++            default: 0,
++            description: "G16: bounded host record bytes before publication (default off)",
++        },
+         g16_init_dump: u32 {
+             default: 0,
+             description: "G16: show the init objects in debugfs aurora-g16/initdata (default 0)",
+diff --git a/drivers/gpu/drm/asahi/g16/channel.rs b/drivers/gpu/drm/asahi/g16/channel.rs
+index dda4deae64..8fc7aac84f 100644
+--- a/drivers/gpu/drm/asahi/g16/channel.rs
++++ b/drivers/gpu/drm/asahi/g16/channel.rs
+@@ -182,10 +182,15 @@ fn post_inner(&mut self, channel: Channel, record: &SubmitRecord, ahead: bool) -
+         if busy || ring.write()? != producer {
+             return Err(EBUSY);
+         }
+-        ring.ring.write(
+-            producer as usize * rings::CHANNEL_RECORD,
+-            &record.to_bytes(),
+-        )?;
++        let bytes = record.to_bytes();
++        super::host_records::capture(
++            "submit-entry",
++            ring.ring.va + producer as u64 * rings::CHANNEL_RECORD as u64,
++            ch as u64,
++            producer as u64,
++            &bytes,
++        );
++        ring.ring.write(producer as usize * rings::CHANNEL_RECORD, &bytes)?;
+         wmb();
+         let producer = (producer + 1) % RING_SLOTS;
+         ring.state.w32(STATE_WRITE, producer)?;
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 0cf0ecc5fa..68d6bdb0d0 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -2048,6 +2048,7 @@ fn prefix_compute(
+             image(&mut scratch.cq)?,
+         )
+         .map_err(|_| EINVAL)?;
++        super::host_records::capture("compute-encoded", s.work.va, g.qinfo.va, n, w);
+         if before != 0 {
+             // Slots::claim_compute proved a different fully retired unit displaced this
+             // descriptor in the same hardware slot. Keep every firmware-mutated byte.
+@@ -2061,6 +2062,15 @@ fn prefix_compute(
+                 return Err(EIO);
+             }
+         }
++        // Immutable encoder scratch under the existing firmware owner; no GEM readback.
++
++        super::host_records::capture(
++            "compute-ring-entry",
++            g.ring.va + 8 * pf.c_head as u64,
++            g.qinfo.va,
++            n,
++            &s.block_va().to_le_bytes(),
++        );
+         s.write_work(w)?;
+         f.uma_submitted = submitted;
+         wmb();
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index 4bfef2f926..739613f506 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -152,10 +152,9 @@ fn init_queue(
+     context: &FwObject,
+     row0: bool,
+ ) -> Result {
+-    q.write(
+-        0,
+-        &graph::queue_image(state.va, ring.va, list.va, q.va, context.va, row0),
+-    )?;
++    let bytes = graph::queue_image(state.va, ring.va, list.va, q.va, context.va, row0);
++    super::host_records::capture("queue-seed", q.va, context.va, 0, &bytes);
++    q.write(0, &bytes)?;
+     state.w32(qstate::CAP, sizes::QUEUE_CAP)
+ }
+ 
+@@ -201,6 +200,12 @@ fn init(&self) -> Result {
+         self.notifier
+             .w64(notifier_page::COMPUTE_RECORD, self.threshold.va)?;
+         self.job_list.w64(job_list::SELF, self.job_list.va)?;
++        if super::params::host_records() {
++            let mut seed = [0u8; job_list::SIZE];
++            seed[job_list::SELF..job_list::SELF + 8]
++                .copy_from_slice(&self.job_list.va.to_le_bytes());
++            super::host_records::capture("job-list-seed", self.job_list.va, self.qinfo.va, 0, &seed);
++        }
+         init_queue(
+             &self.qinfo,
+             &self.qstate,
+diff --git a/drivers/gpu/drm/asahi/g16/host_records.rs b/drivers/gpu/drm/asahi/g16/host_records.rs
+new file mode 100644
+index 0000000000..fc71738da6
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/host_records.rs
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! Bounded host-built bytes, before publication; never reads firmware or user payload.
++//! Log loss is detected by the offline decoder (BEGIN, contiguous chunks, END).
++//! These are preparation images, not proof that a later publication succeeded.
++
++use core::sync::atomic::{AtomicUsize, Ordering};
++use kernel::prelude::*;
++
++static RECORDS: AtomicUsize = AtomicUsize::new(0);
++static BYTES: AtomicUsize = AtomicUsize::new(0);
++
++/// Disabled calls perform only the parameter check. No retained pointers or allocation.
++#[inline(always)]
++pub(crate) fn capture(kind: &str, va: u64, owner: u64, ordinal: u64, data: &[u8]) {
++    if !super::params::host_records() {
++        return;
++    }
++    capture_on(kind, va, owner, ordinal, data);
++}
++
++#[inline(never)]
++fn capture_on(kind: &str, va: u64, owner: u64, ordinal: u64, data: &[u8]) {
++    if data.len() > 0x1000 {
++        return;
++    }
++    let Ok(id) = RECORDS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
++        (n < 64).then_some(n + 1)
++    }) else {
++        return;
++    };
++    if BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
++        n.checked_add(data.len()).filter(|v| *v <= 0x8000)
++    }).is_err() {
++        return;
++    }
++    pr_info!("G16RAW1 BEGIN {} {} {:#x} {:#x} {} {}\n",
++             id, kind, va, owner, ordinal, data.len());
++    for (i, chunk) in data.chunks(32).enumerate() {
++        pr_info!("G16RAW1 DATA {} {} {:02x?}\n", id, i * 32, chunk);
++    }
++    pr_info!("G16RAW1 END {}\n", id);
++}
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index a1c616d26c..762fe0cbc0 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -55,6 +55,7 @@
+ pub(crate) mod fw;
+ mod gate;
+ mod graph;
++mod host_records;
+ pub(crate) mod hw;
+ mod initdata;
+ mod job;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 41495ff4cf..c96e7b9a41 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2918,3 +2918,9 @@ pub(crate) fn shutdown_stop() -> u32 {
+     "g16_shutdown_stop",
+     "G16: at reboot / power-off, stop the firmware as the deep sleep does: idle, run bit off, bridge unlinked (with g16_bridge), domain lowered (default 0: the GPU runs into the reset)"
+ );
++
++/// Boot-only bounded preparation-image recorder, disabled by default.
++#[inline]
++pub(crate) fn host_records() -> bool {
++    module_parameters::g16_host_records.value() != 0
++}
+-- 
+2.43.0
+
