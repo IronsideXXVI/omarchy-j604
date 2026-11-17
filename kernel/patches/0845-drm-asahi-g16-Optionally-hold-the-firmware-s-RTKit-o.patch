@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 23:22:16 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally hold the firmware's RTKit
+ out of its nap
+
+The GPU starts work about 100 us after a doorbell that finds the
+firmware idle. In 25G83 the firmware's GPU power state follows its
+RTKit nap: the RTKit power callback sets the firmware's power-off
+request on a nap transition, and the next doorbell pays the way back.
+RTKit's power task naps only while a count is zero, which the GPU
+firmware itself holds while the GPU is on, and its management handler
+adds one to that count for message 0xa with 0 and takes one off with 1.
+
+Add g16_nap_hold, a runtime switch. With 1 a pass or submission that
+leaves commands in flight sends 0xa with 0, once, and the first one that
+leaves none sends 0xa with 1, so the hold covers busy periods only. A
+send that fails is tried again at the next pass. The default 0 changes
+nothing.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/mod.rs    |  3 +++
+ drivers/gpu/drm/asahi/g16/params.rs | 18 ++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 17 +++++++++++++++++
+ 3 files changed, 38 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index f6c04ae1eb..6cbe2ac028 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -234,6 +234,8 @@ pub(crate) struct Shared {
+     pub(crate) bells_out: AtomicU32,
+     pub(crate) irq_bells: AtomicU64,
+     pub(crate) irq_tally: AtomicU32,
++    /// `g16_nap_hold`: the RTKit nap hold is taken.
++    pub(crate) nap_held: AtomicBool,
+     /// Firmware DATA, where the only RTKit buffer accepted lies.
+     pub(crate) data: Range<u64>,
+     /// Physical address of the accepted RTKit buffer, 0 before.
+@@ -496,6 +498,7 @@ pub(crate) fn new(
+                 bells_out: AtomicU32::new(0),
+                 irq_bells: AtomicU64::new(0),
+                 irq_tally: AtomicU32::new(0),
++                nap_held: AtomicBool::new(false),
+                 data,
+                 rtkit_buffer: AtomicU64::new(0),
+                 orphaned: AtomicBool::new(false),
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 9347986929..6d5588834b 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1034,6 +1034,24 @@ pub(crate) fn gpu_off_delay() -> u32 {
+     "G16: the firmware's GPU power-off delay word (Main hwdata +0xed0, 24 MHz ticks; default 0: 24000 = 1 ms; set before the GPU starts)"
+ );
+ 
++/// Storage of `g16_nap_hold` (runtime 0644, default 0).
++static NAP_HOLD: AtomicU32 = AtomicU32::new(0);
++
++/// While commands are in flight, hold the firmware's RTKit out of its nap with management
++/// message 0xa, taken at the first flight and dropped when none is left.
++pub(crate) fn nap_hold() -> bool {
++    NAP_HOLD.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    NAP_HOLD_PARAM,
++    NAP_HOLD_PARMTYPE,
++    NAP_HOLD_PARM,
++    NAP_HOLD,
++    "g16_nap_hold",
++    "G16: while commands are in flight, keep the firmware's RTKit out of its nap (management message 0xa; default 0: off; runtime 0644)"
++);
++
+ /// Storage of `g16_render_quiet` (runtime 0644, default 0).
+ static RENDER_QUIET: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index d79f5d5c06..a4384a1264 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -362,6 +362,7 @@ pub(crate) fn run_poll(self: Arc<Self>) {
+                 let evented = self.evented.swap(false, Ordering::AcqRel);
+                 let result = firmware.poll(evented, &mut done);
+                 self.note_bells(&firmware.engine.flights);
++                firmware.nap_hold();
+                 let busy = !firmware.engine.flights.is_empty();
+                 match result {
+                     Ok(true) => {
+@@ -431,6 +432,7 @@ pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+                     self.fail_stop(error);
+                 }
+                 self.note_bells(&firmware.engine.flights);
++                firmware.nap_hold();
+                 if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
+                     self.lat_qos(!firmware.engine.flights.is_empty(), false);
+                     self.rearm(firmware.engine.chan_wait, firmware.engine.window_wait);
+@@ -752,6 +754,21 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+             || self.engine.frozen)
+     }
+ 
++    /// `g16_nap_hold`: takes the RTKit nap hold while flights are outstanding and drops it
++    /// after. Management message 0xa with 0 adds one to the count the firmware's RTKit power
++    /// task naps on only at zero (the GPU firmware holds it while the GPU is on), with 1 it
++    /// takes one off, never below zero (25G83, RTKit 3255.160.4: 0x4a280, 0x4cda8). A send
++    /// that fails is left to the next pass.
++    pub(crate) fn nap_hold(&mut self) {
++        let want = params::nap_hold() && !self.engine.flights.is_empty();
++        let shared = self.session.shared.clone();
++        if want != shared.nap_held.load(Ordering::Relaxed)
++            && self.session.send(0, (0xa << 52) | u64::from(!want)).is_ok()
++        {
++            shared.nap_held.store(want, Ordering::Relaxed);
++        }
++    }
++
+     /// Drains the rings and retires finished flights, with up to four trailing 5 us polls
+     /// after an event. A receipt fault is left in `Recovery::receipt_fault` for the hang
+     /// checks.
+-- 
+2.43.0
+

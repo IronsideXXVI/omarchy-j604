@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 23:37:28 +0000
+Subject: [PATCH] drm/asahi: g16: Accept the eleventh DVFS row as a
+ running state
+
+With g16_j604_rows11=1 the J604 booted, the cooling ramp raised the
+limit to S10, and the next poll pass fail-stopped the GPU with
+EPROTO. The session health check reads the firmware's running
+performance state and rejects anything above S9, a bound written for
+the ten-row tables: on the eleven-row table S10 is the top row the
+host itself asked for.
+
+Bound the state by the selected table's top instead of a fixed 9, in
+the register read and in both checks that use it, and give the
+per-state profiling counters an eleventh slot, which an accepted S10
+read would otherwise index past. Ten-row boards keep the bound of 9.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/boot.rs |  4 ++--
+ drivers/gpu/drm/asahi/g16/poll.rs | 24 ++++++++++++++++--------
+ drivers/gpu/drm/asahi/g16/regs.rs |  5 +++--
+ 3 files changed, 21 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 87edc3cc30..59449d0a6f 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -523,7 +523,7 @@ pub(crate) fn check(&self) -> Result {
+         self.shared.check()?;
+         if !self.rtkit.running()
+             || self.regs.asc_control()? & regs::ASC_RUN == 0
+-            || self.regs.pstate()? > 9
++            || self.regs.pstate()? > super::power::policy::pstate_max()
+         {
+             return Err(EIO);
+         }
+@@ -943,7 +943,7 @@ pub(crate) fn start(
+         "M4 G16G: {} cores enabled\n",
+         id.core_masks[0].count_ones()
+     );
+-    if regs.pstate()? > 9 {
++    if regs.pstate()? > super::power::policy::pstate_max() {
+         return Err(eproto());
+     }
+     // Cold only: ASC RUN clear and an all-zero TTBAT before ownership.
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index a4384a1264..2a46751b7c 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -97,10 +97,11 @@
+     [const { core::sync::atomic::AtomicU64::new(0) }; 20];
+ /// Counter time the host received the previous render's completion event (`g16_prof`).
+ static RENDER_PREV_EV: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+-/// Poll passes with work in flight, by the firmware's running performance state (rows S0-S9),
+-/// counted only while profiling is on (`g16_prof`); the row frequencies are in the boot log.
+-static PSTATE_BUSY: [core::sync::atomic::AtomicU64; 10] =
+-    [const { core::sync::atomic::AtomicU64::new(0) }; 10];
++/// Poll passes with work in flight, by the firmware's running performance state (rows S0-S9,
++/// and S10 with eleven rows), counted only while profiling is on (`g16_prof`); the row
++/// frequencies are in the boot log.
++static PSTATE_BUSY: [core::sync::atomic::AtomicU64; 11] =
++    [const { core::sync::atomic::AtomicU64::new(0) }; 11];
+ use crate::module_parameters;
+ 
+ impl_has_hr_timer! {
+@@ -677,8 +678,14 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+         self.session.check()?;
+         pre.lap(&mut self.engine.prof.check_ns);
+         if pre.on() && !self.engine.flights.is_empty() {
+-            if let Ok(state) = self.session.regs.pstate() {
+-                PSTATE_BUSY[state as usize].fetch_add(1, Ordering::Relaxed);
++            if let Some(busy) = self
++                .session
++                .regs
++                .pstate()
++                .ok()
++                .and_then(|state| PSTATE_BUSY.get(state as usize))
++            {
++                busy.fetch_add(1, Ordering::Relaxed);
+             }
+         }
+         // g16_pass_check_once: session.check() just verified the adopted UAT bindings.
+@@ -1760,7 +1767,7 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         let busy = |i: usize| PSTATE_BUSY[i].load(Ordering::Relaxed);
+         writeln!(
+             f,
+-            "pstate_busy: S0 {} S1 {} S2 {} S3 {} S4 {} S5 {} S6 {} S7 {} S8 {} S9 {}",
++            "pstate_busy: S0 {} S1 {} S2 {} S3 {} S4 {} S5 {} S6 {} S7 {} S8 {} S9 {} S10 {}",
+             busy(0),
+             busy(1),
+             busy(2),
+@@ -1770,7 +1777,8 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             busy(6),
+             busy(7),
+             busy(8),
+-            busy(9)
++            busy(9),
++            busy(10)
+         )?;
+         writeln!(
+             f,
+diff --git a/drivers/gpu/drm/asahi/g16/regs.rs b/drivers/gpu/drm/asahi/g16/regs.rs
+index ec09e0c26b..a0b3c3009b 100644
+--- a/drivers/gpu/drm/asahi/g16/regs.rs
++++ b/drivers/gpu/drm/asahi/g16/regs.rs
+@@ -227,10 +227,11 @@ pub(crate) fn identity(&self) -> Result<Identity> {
+         })
+     }
+ 
+-    /// Actual cold or running firmware pstate (zero is valid while stopped).
++    /// Actual cold or running firmware pstate (zero is valid while stopped), up to the top
++    /// row of the selected table: S9 with ten firmware rows, S10 with the J604's eleven.
+     pub(crate) fn pstate(&self) -> Result<u32> {
+         let state = self.res.sgx_read32_at(SGX_CORE + 0x1000)? & 0xf;
+-        if state > 9 {
++        if state > super::power::policy::pstate_max() {
+             Err(super::boot::eproto())
+         } else {
+             Ok(state)
+-- 
+2.43.0
+

@@ -1276,3 +1276,10 @@ New in 1.1003 (none changes what the machine does by default: 0831 and 0833 are 
 Kernel 1.1005 (1.1004 was a trial build that did not pass its install check and is not published) keeps the base (`da8e1acf3656`) and all 833 patches of 1.1003 under the same numbers.
 
 New in 1.1005 (none changes what the machine does by default: all nine are GPU driver switches that are off by default and are experiment switches, not user options): 0834 (`drm/asahi: g16: Optionally let a render ask the firmware for less`), 0835 (`drm/asahi: g16: Optionally ring the render doorbells again at a poll pass`), 0836 (`drm/asahi: g16: Optionally give the J604 eleven DVFS rows`), 0837 (`drm/asahi: g16: Add a runtime ceiling on the governed GPU state`), 0838 (`drm/asahi: g16: Optionally give the second render queue set an app's form`), 0839 (`drm/asahi: g16: Optionally register the second set's FS queue on the app channel`), 0840 (`drm/asahi: g16: Optionally ring the pipes in flight again on a short timer`), 0841 (`drm/asahi: g16: Register the MTR chains with the firmware controllers`), 0842 (`drm/asahi: g16: Optionally share one parameter buffer between renders`).
+
+
+# Kernel patch numbers: 1.1005 to 1.1006
+
+Kernel 1.1006 keeps the base (`da8e1acf3656`) and all 842 patches of 1.1005 under the same numbers.
+
+New in 1.1006 (none changes what the machine does by default: 0843-0845 are experiment switches that are off by default, 0846 matters only with `g16_j604_rows11=1`): 0843 (`drm/asahi: g16: Optionally ring the pipes in flight from the mailbox callback`), 0844 (`drm/asahi: g16: Add a switch for the firmware's GPU power-off delay word`), 0845 (`drm/asahi: g16: Optionally hold the firmware's RTKit out of its nap`), 0846 (`drm/asahi: g16: Accept the eleventh DVFS row as a running state`).
