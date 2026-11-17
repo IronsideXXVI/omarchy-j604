@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 22:21:03 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally ring the render doorbells
+ again at a poll pass
+
+At render.light depth 64 with eight resident renders, the firmware runs
+four renders back to back, sends one completion event and then sits
+idle for about 300 us. Four more renders were already published, with
+their ring records, write pointers, submit records and doorbells, while
+it ran the first four. They start only about 35 us into the host's next
+pass, when that pass's publications ring the doorbells again.
+
+Add g16_rekick, a runtime switch. With 1 a poll pass that follows a
+firmware event rings the TA and FS doorbells once more, with no new
+record, before it does anything else while renders are in flight. With
+2 every poll pass does. The default 0 changes nothing.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 19 +++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  9 +++++++++
+ 2 files changed, 28 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 0fe7a6fe11..021a0b18f1 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -947,6 +947,25 @@ pub(crate) fn fs_sample_size() -> bool {
+     "G16: write the tile-buffer sample size into the FS record (+0xa30) as the G15 backend does (default 0: left 0; 1: written; runtime 0644)"
+ );
+ 
++/// Storage of `g16_rekick` (runtime 0644, default 0).
++static REKICK: AtomicU32 = AtomicU32::new(0);
++
++/// When a poll pass rings the TA and FS doorbells again while renders are in flight, with no
++/// new record: 0 never; 1 at a pass that follows a firmware event; 2 at every pass. A render
++/// published while the firmware runs older ones then gets a doorbell after they end.
++pub(crate) fn rekick() -> u32 {
++    REKICK.load(Ordering::Relaxed).min(2)
++}
++
++live_u32_param!(
++    REKICK_PARAM,
++    REKICK_PARMTYPE,
++    REKICK_PARM,
++    REKICK,
++    "g16_rekick",
++    "G16: ring the render doorbells again at a poll pass while renders are in flight (default 0: never; 1: after a firmware event; 2: every pass; runtime 0644)"
++);
++
+ /// Storage of `g16_render_quiet` (runtime 0644, default 0).
+ static RENDER_QUIET: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 4552b11608..3d1a18cd78 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -755,6 +755,15 @@ pub(crate) fn retire(&mut self, evented: bool, done: &mut Completions) -> Result
+             TAIL_UNTIL_NS.store(now_ns().saturating_add(TAIL_WINDOW_NS), Ordering::Relaxed);
+         }
+         let mut tail = if evented && !params::irq_only() && tail_us == 0 { 4 } else { 0 };
++        // g16_rekick: a render published while the firmware ran older ones may not start until
++        // a later doorbell; ring the render pipes again, before this pass does anything else.
++        let rekick = params::rekick();
++        if (rekick == 2 || (rekick == 1 && evented))
++            && self.engine.flights.iter().any(|f| f.renders != 0)
++        {
++            self.session.ring(Channel::Ta)?;
++            self.session.ring(Channel::Fs)?;
++        }
+         self.engine.stats.retire_src = if evented { 0 } else { 2 };
+         let mut ret;
+ 
+-- 
+2.43.0
+

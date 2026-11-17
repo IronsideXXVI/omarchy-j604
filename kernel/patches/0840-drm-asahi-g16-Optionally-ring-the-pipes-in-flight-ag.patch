@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 22:35:14 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally ring the pipes in flight
+ again on a short timer
+
+At depth 64 the firmware idles with renders published and their
+doorbells rung: each group of four starts about 95 us after the last
+doorbell of the group published after it, in one flight trace. macOS's
+host kicks its pipe every 18 us or so at the same depth, so its firmware
+always gets a doorbell soon after it goes idle. g16_rekick rings again
+only at a poll pass.
+
+Add g16_rekick_us (runtime, default 0; 10 to 1000). While commands are
+in flight, the completion re-poll then runs at least every that many us,
+and each such pass that no firmware event started rings the render pipes
+if renders are in flight and the compute pipe if compute commands are,
+with no new record. The re-poll is armed only while something is
+published, and no pass runs while the GPU domain sleeps or after a
+fail-stop. The stats file counts the doorbells rung again by g16_rekick
+and by this switch.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |  3 +++
+ drivers/gpu/drm/asahi/g16/params.rs | 23 +++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 27 +++++++++++++++++++++++++++
+ 3 files changed, 53 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 2e5c00d71b..77ae03ef93 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -354,6 +354,9 @@ pub(crate) struct Stats {
+     /// empty at that end; from the publication). Diagnostic only.
+     pub(crate) qempty_prev_end: [u64; 3],
+     pub(crate) qempty_hist: [[[u64; 32]; 2]; 3],
++    /// `rekick:` doorbells rung again with no new record: by `g16_rekick` (0), and by
++    /// `g16_rekick_us` on the render (1) and compute (2) pipes.
++    pub(crate) rekick: [u64; 3],
+     /// `receipt_wait:` the oldest compute flight alone: checks that left it pending with its
+     /// stage stamp not reached (0), with the stamp reached but the queue or submit pipe
+     /// cursors not passed (1), or with both and the notifier or timestamp words missing (2);
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index dcf349873d..913bf364c2 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -987,6 +987,29 @@ pub(crate) fn rekick() -> u32 {
+     "G16: ring the render doorbells again at a poll pass while renders are in flight (default 0: never; 1: after a firmware event; 2: every pass; runtime 0644)"
+ );
+ 
++/// Storage of `g16_rekick_us` (runtime 0644, default 0).
++static REKICK_US: AtomicU32 = AtomicU32::new(0);
++
++/// While commands are in flight, the completion re-poll runs at least every this many us and
++/// each such pass that no firmware event started rings the pipes of the commands in flight
++/// again, with no new record, as macOS's host kicks its pipe every few tens of us: 0 off,
++/// else 10..=1000.
++pub(crate) fn rekick_us() -> u32 {
++    match REKICK_US.load(Ordering::Relaxed) {
++        0 => 0,
++        v => v.clamp(10, 1000),
++    }
++}
++
++live_u32_param!(
++    REKICK_US_PARAM,
++    REKICK_US_PARMTYPE,
++    REKICK_US_PARM,
++    REKICK_US,
++    "g16_rekick_us",
++    "G16: while commands are in flight, re-poll at least every this many us and ring their pipes again on each such pass (default 0: off; 10..1000; runtime 0644)"
++);
++
+ /// Storage of `g16_render_quiet` (runtime 0644, default 0).
+ static RENDER_QUIET: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 3d1a18cd78..b377ee9890 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -572,6 +572,11 @@ pub(crate) fn rearm(self: &Arc<Self>, chan_wait: bool, window_wait: bool) {
+             // short interval rather than busy-polling or waiting the full resnap interval.
+             us = params::tail_us();
+         }
++        // g16_rekick_us: at least that often while anything is published (rearm runs only then).
++        let rekick = params::rekick_us();
++        if rekick != 0 {
++            us = us.min(rekick);
++        }
+         {
+             let mut handle = self.resnap_handle.lock();
+             // Dropping the previous handle cancels a still pending expiry before the timer
+@@ -763,6 +768,19 @@ pub(crate) fn retire(&mut self, evented: bool, done: &mut Completions) -> Result
+         {
+             self.session.ring(Channel::Ta)?;
+             self.session.ring(Channel::Fs)?;
++            self.engine.stats.rekick[0] += 1;
++        }
++        // g16_rekick_us: a pass of the short re-poll (no event) rings the pipes in flight again.
++        if params::rekick_us() != 0 && !evented {
++            if self.engine.flights.iter().any(|f| f.renders != 0) {
++                self.session.ring(Channel::Ta)?;
++                self.session.ring(Channel::Fs)?;
++                self.engine.stats.rekick[1] += 1;
++            }
++            if self.engine.flights.iter().any(|f| f.computes != 0) {
++                self.session.ring(Channel::Compute)?;
++                self.engine.stats.rekick[2] += 1;
++            }
+         }
+         self.engine.stats.retire_src = if evented { 0 } else { 2 };
+         let mut ret;
+@@ -1741,6 +1759,15 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             RENDER_CHAINED.load(Ordering::Relaxed),
+             RENDER_NOWAIT.load(Ordering::Relaxed)
+         )?;
++        writeln!(
++            f,
++            "rekick: pass {} timer_render {} timer_compute {} rekick {} rekick_us {}",
++            s.rekick[0],
++            s.rekick[1],
++            s.rekick[2],
++            params::rekick(),
++            params::rekick_us()
++        )?;
+         let w: [u64; 8] = core::array::from_fn(|i| FS_WORDS[i].load(Ordering::Relaxed));
+         writeln!(
+             f,
+-- 
+2.43.0
+

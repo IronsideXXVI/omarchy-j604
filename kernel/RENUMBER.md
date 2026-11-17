@@ -1269,3 +1269,10 @@ New in 1.1002 (none changes what the machine does by default: 0826, 0827, 0828 a
 Kernel 1.1003 keeps the base (`da8e1acf3656`) and all 830 patches of 1.1002 under the same numbers.
 
 New in 1.1003 (none changes what the machine does by default: 0831 and 0833 are switches that are off by default, 0832 is a read-only trace): 0831 (`drm/asahi: g16: Optionally configure the firmware's power controllers`), 0832 (`drm/asahi: g16: Trace the last compute flights in the stats file too`), 0833 (`drm/asahi: g16: Optionally set two FS words as macOS does`).
+
+
+# Kernel patch numbers: 1.1003 to 1.1005
+
+Kernel 1.1005 (1.1004 was a trial build that did not pass its install check and is not published) keeps the base (`da8e1acf3656`) and all 833 patches of 1.1003 under the same numbers.
+
+New in 1.1005 (none changes what the machine does by default: all nine are GPU driver switches that are off by default and are experiment switches, not user options): 0834 (`drm/asahi: g16: Optionally let a render ask the firmware for less`), 0835 (`drm/asahi: g16: Optionally ring the render doorbells again at a poll pass`), 0836 (`drm/asahi: g16: Optionally give the J604 eleven DVFS rows`), 0837 (`drm/asahi: g16: Add a runtime ceiling on the governed GPU state`), 0838 (`drm/asahi: g16: Optionally give the second render queue set an app's form`), 0839 (`drm/asahi: g16: Optionally register the second set's FS queue on the app channel`), 0840 (`drm/asahi: g16: Optionally ring the pipes in flight again on a short timer`), 0841 (`drm/asahi: g16: Register the MTR chains with the firmware controllers`), 0842 (`drm/asahi: g16: Optionally share one parameter buffer between renders`).

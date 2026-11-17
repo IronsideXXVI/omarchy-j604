@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 20:13:49 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally give the second render
+ queue set an app's form
+
+macOS 26B123 gives each app its own queue info objects: scheduling row 2
+(class 2 at +0x30 / +0x34) and an id at +0x4c that differs from one app
+to the next (0x293, 0x299, 0x59d in two captures), while WindowServer's
+queues carry row 0 and its own id. Our queue info always holds
+0xffffffff at +0x4c.
+
+Add g16_render2_id (default 0, read once at the engine start). With
+g16_render_queues 2 and a non-zero value, the second render queue set's
+TA and FS queue info take row 2 whatever g16_render_row0 says, and the
+value at +0x4c. The first set is unchanged, and the second set still
+carries no work.
+
+This shows whether the firmware registers a queue set that carries a
+client id before any work is routed to one.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/graph.rs  | 13 +++++++++----
+ drivers/gpu/drm/asahi/g16/params.rs | 20 ++++++++++++++++++++
+ 2 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index 8f86c59e0f..a994532c89 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -243,7 +243,8 @@ fn new(o: &mut Objects, context: Arc<FwObject>) -> Result<Self> {
+             )?,
+         })
+     }
+-    fn init(&self) -> Result {
++    /// `row0`: scheduling row 0 for both queues; `id`: if not 0, the client id at +0x4c.
++    fn init(&self, row0: bool, id: u32) -> Result {
+         init_notifier(&self.notifier, &self.threshold)?;
+         for e in 0..2 {
+             self.job_list[e].w64(job_list::SELF, self.job_list[e].va)?;
+@@ -253,8 +254,11 @@ fn init(&self) -> Result {
+                 &self.ring[e],
+                 &self.job_list[e],
+                 &self.sched_ctx,
+-                super::params::render_row0(),
++                row0,
+             )?;
++            if id != 0 {
++                self.qinfo[e].w32(qinfo::UNK_4C, id)?;
++            }
+             self.threshold.w64(e * 8, 2)?;
+         }
+         Ok(())
+@@ -295,7 +299,8 @@ fn init_render2(&mut self) -> Result {
+             .as_ref()
+             .ok_or(Error::from_errno(-(kernel::bindings::EINVAL as i32)))?;
+         r2.sched_ctx.write(0, &graph::context_image())?;
+-        r2.init()?;
++        let id = super::params::render2_id();
++        r2.init(super::params::render_row0() && id == 0, id)?;
+         if self.channels.read(Channel::Ta2)? != 0 || self.channels.write_cell(Channel::Ta2)? != 0 {
+             return Err(Error::from_errno(-(kernel::bindings::EPROTO as i32)));
+         }
+@@ -309,7 +314,7 @@ pub(crate) fn init_graphs(&mut self) -> Result {
+             }
+         }
+         self.graph.compute.init()?;
+-        self.graph.render.init()?;
++        self.graph.render.init(super::params::render_row0(), 0)?;
+         self.slots.init()?;
+         self.init_render_pools(false)?;
+         super::engine::wmb();
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index b2fb266414..bb920e3095 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2100,6 +2100,26 @@ pub(crate) fn same_queue_nowait() -> bool {
+     "G16: publish a command waiting only on commands already published ahead of it in its own queue at once, with no wait record (default 0: host waits; 1: queue order only; runtime 0644)"
+ );
+ 
++/// Storage of `g16_render2_id` (0644, default 0; read once, at the engine start).
++static RENDER2_ID: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_render_queues` 2: 0 (default) initialises the second render queue set as the first.
++/// Any other value gives its TA and FS queue info the form macOS 26B123 gives the queues of
++/// each app: scheduling row 2 (class 2) whatever `g16_render_row0` says, and this value as the
++/// client id at +0x4c, where the first set keeps 0xffffffff.
++pub(crate) fn render2_id() -> u32 {
++    RENDER2_ID.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    RENDER2_ID_PARAM,
++    RENDER2_ID_PARMTYPE,
++    RENDER2_ID_PARM,
++    RENDER2_ID,
++    "g16_render2_id",
++    "G16: with g16_render_queues 2, the second render queue set in macOS's per-app form: class 2 and this client id at queue info +0x4c (default 0: as the first set; set before the GPU starts)"
++);
++
+ /// Storage of `g16_compute_same_vm` (runtime 0644, default 0).
+ static COMPUTE_SAME_VM: AtomicU32 = AtomicU32::new(0);
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 21:47:09 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally register the second set's
+ FS queue on the app channel
+
+macOS 26B123 registers an app's TA and FS queues once on pipes of their
+type, and from then on kicks both queues of every app, of every client,
+on one shared pipe; each record names the queue it advances and carries
+kind 2. g16_render_queues 2 registers only the second set's TA queue,
+on submit channel 3.
+
+Add g16_render2_fs (default 0, read once at the engine start). With 1,
+the second set's FS queue is registered on channel 3 too, after its TA
+queue, with the same zero-stamp barrier as its first entry, and every
+record on that channel carries kind 2. With 2 the records carry the
+queue type instead (TA 0, FS 1). Registration waits for the queue and
+channel cursors to pass the record, as for the TA queue. The first set
+is unchanged, and the second set still carries no work.
+
+This shows whether the firmware takes both queues of a set on one
+channel before any work is routed to one.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 47 +++++++++++++++++++++++++++--
+ drivers/gpu/drm/asahi/g16/params.rs | 20 ++++++++++++
+ 2 files changed, 65 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index aa0e1a53f5..2e5c00d71b 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -888,6 +888,7 @@ pub(crate) fn register_context(&mut self) -> Result {
+     /// first set's. Nothing is published to it: this only shows whether the firmware accepts a
+     /// second context with its own queues (the first step toward a firmware queue per VM).
+     pub(crate) fn register_render2(&mut self) -> Result {
++        let fs = params::render2_fs();
+         let r = self.graph.render2.as_ref().ok_or(EINVAL)?;
+         let (barrier, zero, state, info, ring, context) = (
+             r.registration_barrier.clone(),
+@@ -920,8 +921,9 @@ pub(crate) fn register_render2(&mut self) -> Result {
+             &SubmitRecord {
+                 unk_0: submit_time(),
+                 qinfo: info.va,
+-                // The record's kind is the queue type (0 TA), not the channel (macOS 26B123).
+-                kind: 0,
++                // The record's kind is the queue type (0 TA), not the channel (macOS 26B123);
++                // g16_render2_fs 1: 2, as macOS's kicks on its shared app pipe.
++                kind: if fs == 1 { 2 } else { 0 },
+                 head: 1,
+                 event: 0,
+                 new_queue: 1,
+@@ -956,6 +958,47 @@ pub(crate) fn register_render2(&mut self) -> Result {
+                 )
+             };
+         }
++        if fs == 0 {
++            return Ok(());
++        }
++        // g16_render2_fs: the FS queue on the same channel, its first entry the same
++        // zero-stamp barrier; registered once its record is consumed and completed.
++        let r = self.graph.render2.as_ref().ok_or(EINVAL)?;
++        let (state, info, ring) = (r.qstate[1].clone(), r.qinfo[1].clone(), r.ring[1].clone());
++        if state.r32(qstate::READ)? != 0 || state.r32(qstate::WRITE)? != 0 {
++            return Err(super::boot::eproto());
++        }
++        ring.w64(0, barrier.va)?;
++        wmb();
++        state.w32(qstate::WRITE, 1)?;
++        wmb();
++        self.channels.post(
++            Channel::Ta2,
++            &SubmitRecord {
++                unk_0: submit_time(),
++                qinfo: info.va,
++                kind: if fs == 1 { 2 } else { 1 },
++                head: 1,
++                event: 0,
++                new_queue: 1,
++            },
++        )?;
++        self.session.ring(Channel::Ta2)?;
++        let deadline = now_ns().saturating_add(2_000_000_000);
++        while !self.queue_receipt(Channel::Ta2, &state, &info, 1, 2)? {
++            self.drain_rings()?;
++            if now_ns() >= deadline {
++                return Err(ETIMEDOUT);
++            }
++            // SAFETY: probe/backend start holds only the sleepable device mutex.
++            unsafe {
++                kernel::bindings::usleep_range_state(
++                    1000,
++                    2000,
++                    kernel::bindings::TASK_UNINTERRUPTIBLE,
++                )
++            };
++        }
+         Ok(())
+     }
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index bb920e3095..dcf349873d 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2120,6 +2120,26 @@ pub(crate) fn render2_id() -> u32 {
+     "G16: with g16_render_queues 2, the second render queue set in macOS's per-app form: class 2 and this client id at queue info +0x4c (default 0: as the first set; set before the GPU starts)"
+ );
+ 
++/// Storage of `g16_render2_fs` (0644, default 0; read once, at the engine start).
++static RENDER2_FS: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_render_queues` 2: 0 (default) registers only the second set's TA queue. 1 also
++/// registers its FS queue on the same submit channel, every record of that channel with
++/// kind 2, as macOS 26B123 kicks both queues of an app on one pipe; 2 does the same with
++/// the record kind equal to the queue type (TA 0, FS 1).
++pub(crate) fn render2_fs() -> u32 {
++    RENDER2_FS.load(Ordering::Relaxed).min(2)
++}
++
++live_u32_param!(
++    RENDER2_FS_PARAM,
++    RENDER2_FS_PARMTYPE,
++    RENDER2_FS_PARM,
++    RENDER2_FS,
++    "g16_render2_fs",
++    "G16: with g16_render_queues 2, also register the second set's FS queue on its TA queue's submit channel: 1 = record kind 2 for both, 2 = kind = queue type (default 0: TA only; set before the GPU starts)"
++);
++
+ /// Storage of `g16_compute_same_vm` (runtime 0644, default 0).
+ static COMPUTE_SAME_VM: AtomicU32 = AtomicU32::new(0);
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,329 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 22:07:45 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally give the J604 eleven DVFS
+ rows
+
+The J604's own ADT lists sixteen GPU performance states, and they form
+eleven distinct voltage rows: states 0 to 4 on their own (state 4 is
+928 MHz at 725 mV), the equal-voltage pairs 5/6 to 13/14, and the top
+state 15. The firmware takes ten or eleven rows. The J604 got the
+J713's ten, so its layout leaves state 4 out, while macOS 26B123 runs
+the J604 with eleven rows (its POWER_PERFORMANCE at INIT has a top of
+1000).
+
+Add g16_j604_rows11 (load time, default 0). When set on a J604, the
+board takes eleven rows with the existing eleven-row map, whose
+pairing check holds on the J604's values, so state 4 is kept and the
+top state becomes S10. The host governor's top, the idle and board
+floors, the cooling ceiling and the selector at the top follow the
+table instead of a fixed S9, and with g16_fw_controllers=1 the
+controller words that depend on the top take macOS's eleven-row
+values. With the switch off nothing changes.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs         |  4 +++
+ drivers/gpu/drm/asahi/g16/board.rs          | 14 +++++++-
+ drivers/gpu/drm/asahi/g16/fw/controllers.rs | 40 +++++++++++++++++++--
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs    |  2 +-
+ drivers/gpu/drm/asahi/g16/params.rs         | 20 +++++++----
+ drivers/gpu/drm/asahi/g16/power.rs          | 11 +++---
+ drivers/gpu/drm/asahi/g16/power/policy.rs   | 25 ++++++++++---
+ 7 files changed, 96 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index 49e826e408..e5278273a5 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -263,6 +263,10 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 100,
+             description: "G16: completion repoll interval, us",
+         },
++        g16_j604_rows11: u32 {
++            default: 0,
++            description: "G16: J604 with eleven DVFS rows, ADT state 4 kept (default 0)",
++        },
+         g16_fw_controllers: u32 {
+             default: 0,
+             description: "G16: configure the firmware power controllers (default 0)",
+diff --git a/drivers/gpu/drm/asahi/g16/board.rs b/drivers/gpu/drm/asahi/g16/board.rs
+index 7b0726b586..b965ca2ce8 100644
+--- a/drivers/gpu/drm/asahi/g16/board.rs
++++ b/drivers/gpu/drm/asahi/g16/board.rs
+@@ -16,7 +16,11 @@
+ /// Differently shaped tables, inconsistent voltage pairs and layouts with a row count other
+ /// than the one qualified for this board fail before publication.
+ pub(crate) fn qualify(dev: &device::Device, adt: &GpuAdt) -> Result<Performance> {
+-    let rows = super::boot::glue::perf_rows();
++    // g16_j604_rows11: the J604's ADT has eleven distinct voltage rows (states 0-4, the five
++    // equal-voltage pairs 5/6..13/14, 15); macOS uses eleven. The eleven-row map is the
++    // J773g's, whose pairing check holds on the J604's own values.
++    let eleven = super::params::j604_rows11() && super::boot::glue::j604_board();
++    let rows = if eleven { 11 } else { super::boot::glue::perf_rows() };
+     let (performance, layout) = data::select_named(&adt.performance, Some(rows)).map_err(|error| {
+         dev_err!(
+             dev,
+@@ -34,6 +38,14 @@ pub(crate) fn qualify(dev: &device::Device, adt: &GpuAdt) -> Result<Performance>
+         layout,
+         performance.frequency[performance.count - 1]
+     );
++    if eleven {
++        super::power::policy::set_pstate_max(performance.count as u32 - 1);
++        dev_info!(
++            dev,
++            "M4 ADT DVFS: g16_j604_rows11=1, eleven rows with ADT state 4 kept, top state S{}\n",
++            super::power::policy::pstate_max()
++        );
++    }
+     for i in 0..performance.count {
+         dev_info!(
+             dev,
+diff --git a/drivers/gpu/drm/asahi/g16/fw/controllers.rs b/drivers/gpu/drm/asahi/g16/fw/controllers.rs
+index e1ddfebc20..1023e55b2f 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/controllers.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/controllers.rs
+@@ -234,6 +234,37 @@
+     (0x6394, 0x6730454c), // SMC key g0EL
+ ];
+ 
++/// The words that depend on the top state's scaled value, for an eleven-row table (top 1000,
++/// as macOS 26B123 has them at INIT): max_scaled 1000, max_scaled - 100 = 900, 1000.0,
++/// -1000 / 36294 and (1000 - 100) / 95.
++pub(crate) const ELEVEN_ROWS: [(usize, u32); 25] = [
++    (0x48, 0x000003e8),
++    (0x88, 0x000003e8),
++    (0x9f4, 0x000003e8),
++    (0x9f8, 0x000003e8),
++    (0xa38, 0x000003e8),
++    (0xaac, 0x000003e8),
++    (0xb7c, 0x000003e8),
++    (0x221c, 0x000003e8),
++    (0x22b4, 0x000003e8),
++    (0x22b8, 0x000003e8),
++    (0x22f8, 0x000003e8),
++    (0x2870, 0x000003e8),
++    (0x29f8, 0x000003e8),
++    (0x29fc, 0x000003e8),
++    (0x2a3c, 0x000003e8),
++    (0x2b88, 0x000003e8),
++    (0x2c44, 0x000003e8),
++    (0x2e68, 0x000003e8),
++    (0x2e6c, 0x000003e8),
++    (0x2e78, 0x000003e8),
++    (0x2eac, 0x000003e8),
++    (0x9ec, 0xbce1b655), // -1000 / 36294
++    (0xb74, 0x41179436), // (1000 - 100) / 95
++    (0x21f8, 0x447a0000), // 1000.0
++    (0x2e64, 0x00000384), // max_scaled - 100 = 900
++];
++
+ /// Byte words: the turbo controller's input is present (1), and it is not mode 1 (0).
+ pub(crate) const BYTES: [(usize, u8); 2] = [(0x2518, 1), (0x2519, 0)];
+ 
+@@ -245,11 +276,16 @@ fn put(out: &mut [u8], at: usize, bytes: &[u8]) -> Result<(), ()> {
+ }
+ 
+ /// Writes the controller words into a POWER_PERFORMANCE image; `top_frequency` is the
+-/// ceiling row's main frequency, MHz.
+-pub(crate) fn encode(pp: &mut [u8], top_frequency: u32) -> Result<(), ()> {
++/// ceiling row's main frequency, MHz, and `ceiling` its row (9, or 10 for eleven rows).
++pub(crate) fn encode(pp: &mut [u8], top_frequency: u32, ceiling: u32) -> Result<(), ()> {
+     for (at, value) in WORDS {
+         put(pp, at, &value.to_le_bytes())?;
+     }
++    if ceiling == 10 {
++        for (at, value) in ELEVEN_ROWS {
++            put(pp, at, &value.to_le_bytes())?;
++        }
++    }
+     for (at, value) in BYTES {
+         put(pp, at, &[value])?;
+     }
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index 57ef7c8385..d27675c220 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -724,7 +724,7 @@ pub(crate) fn encode(
+         put32(p, at, 100 * ceiling)?;
+     }
+     if input.fw_controllers {
+-        super::controllers::encode(p, input.performance.frequency[ceiling as usize])?;
++        super::controllers::encode(p, input.performance.frequency[ceiling as usize], ceiling)?;
+     }
+     Ok(())
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 021a0b18f1..8365ddb13a 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -13,7 +13,7 @@
+ 
+ use kernel::{prelude::*, uapi};
+ 
+-use super::power::policy::{FLOOR, PSTATE_MAX};
++use super::power::policy::{pstate_max, FLOOR};
+ use super::{hw, Gpu, GPU_GENERATION};
+ use crate::module_parameters;
+ 
+@@ -203,7 +203,7 @@ pub(crate) fn idle_power_off() -> u32 {
+ static IDLE_POWER_OFF_PARM: [u8; BUILTIN_PARM.len()] = modinfo(BUILTIN_PARM);
+ 
+ /// Storage of `asahi.g16_idle_floor`: 0 (the board's default, see [`set_board_floor`]) or a
+-/// state in 1..=[`PSTATE_MAX`].
++/// state in 1..=[`pstate_max`].
+ static IDLE_FLOOR: AtomicU32 = AtomicU32::new(0);
+ 
+ /// The board's default floor: [`FLOOR`] (S3, from J713 measurements) unless the probe set
+@@ -219,7 +219,7 @@ pub(crate) fn idle_power_off() -> u32 {
+ 
+ /// Sets the board's default floor (at probe, before the governor runs).
+ pub(crate) fn set_board_floor(floor: u32) {
+-    BOARD_FLOOR.store(floor.clamp(1, PSTATE_MAX), Ordering::Relaxed);
++    BOARD_FLOOR.store(floor.clamp(1, pstate_max()), Ordering::Relaxed);
+ }
+ 
+ /// Lowest performance state the utilization governor publishes, idle or lightly loaded.
+@@ -230,13 +230,13 @@ pub(crate) fn set_board_floor(floor: u32) {
+ /// down to it. Writing 0 goes back to the board's default.
+ pub(crate) fn idle_floor() -> u32 {
+     match IDLE_FLOOR.load(Ordering::Relaxed) {
+-        0 => BOARD_FLOOR.load(Ordering::Relaxed).clamp(1, PSTATE_MAX),
+-        floor => floor.clamp(1, PSTATE_MAX),
++        0 => BOARD_FLOOR.load(Ordering::Relaxed).clamp(1, pstate_max()),
++        floor => floor.clamp(1, pstate_max()),
+     }
+ }
+ 
+ /// `set` of `asahi.g16_idle_floor`: 0 for the board's default, else a decimal state clamped to
+-/// 1..=[`PSTATE_MAX`].
++/// 1..=[`pstate_max`].
+ ///
+ /// # Safety
+ ///
+@@ -255,7 +255,7 @@ pub(crate) fn idle_floor() -> u32 {
+     let Ok(state) = text.trim().parse::<u32>() else {
+         return EINVAL.to_errno();
+     };
+-    IDLE_FLOOR.store(state.min(PSTATE_MAX), Ordering::Relaxed);
++    IDLE_FLOOR.store(state.min(pstate_max()), Ordering::Relaxed);
+     0
+ }
+ 
+@@ -1730,6 +1730,12 @@ pub(crate) fn fw_controllers() -> bool {
+     module_parameters::g16_fw_controllers.value() != 0
+ }
+ 
++/// Whether the J604 takes eleven firmware rows from its sixteen ADT states, keeping state 4
++/// (`g16_j604_rows11`, load time). Its ADT has eleven distinct voltage rows, which macOS uses.
++pub(crate) fn j604_rows11() -> bool {
++    module_parameters::g16_j604_rows11.value() != 0
++}
++
+ live_u32_param!(
+     SELECTORS_PARAM,
+     SELECTORS_PARMTYPE,
+diff --git a/drivers/gpu/drm/asahi/g16/power.rs b/drivers/gpu/drm/asahi/g16/power.rs
+index ebdc6ef48e..ec8d710ade 100644
+--- a/drivers/gpu/drm/asahi/g16/power.rs
++++ b/drivers/gpu/drm/asahi/g16/power.rs
+@@ -205,8 +205,9 @@ pub(crate) fn new(dev: &device::Device) -> Result<Self> {
+                 backstop: COOLING_MAX,
+             },
+             last_sample_ns: None,
+-            configured: PSTATE_MAX,
+-            user: PSTATE_MAX,
++            // Bounded by the table's top in policy::limit (the J604 eleven-row table has one more).
++            configured: PSTATE_MAX + 1,
++            user: PSTATE_MAX + 1,
+             effective: 1,
+             temperature_mc: 0,
+             governor: COOLING_MAX,
+@@ -254,7 +255,9 @@ fn ceiling(&mut self, now: u64, idle: bool) -> (u32, bool) {
+             self.budget = self.sample.budget;
+         }
+         let level = self.governor.max(self.budget).max(self.sample.backstop);
+-        let ceiling = PSTATE_MAX - level.min(COOLING_MAX);
++        // The full cooling level still reaches S1 with an eleven-row table.
++        let top = policy::pstate_max();
++        let ceiling = if level >= COOLING_MAX { 1 } else { top - level };
+         let limit = policy::limit(self.configured, ceiling, self.user);
+         let decision = (
+             limit,
+@@ -321,7 +324,7 @@ pub(crate) fn service_power(&mut self) -> Result {
+         if target == self.power.effective {
+             return Ok(());
+         }
+-        let value = if macos && target >= PSTATE_MAX {
++        let value = if macos && target >= policy::pstate_max() {
+             globals::MACOS_SELECTOR
+         } else {
+             target * 100
+diff --git a/drivers/gpu/drm/asahi/g16/power/policy.rs b/drivers/gpu/drm/asahi/g16/power/policy.rs
+index 95be1be6e5..d687e8a267 100644
+--- a/drivers/gpu/drm/asahi/g16/power/policy.rs
++++ b/drivers/gpu/drm/asahi/g16/power/policy.rs
+@@ -7,6 +7,20 @@
+ //! shared C cooling policy. This module defines no temperature thresholds.
+ 
+ pub(crate) const PSTATE_MAX: u32 = 9;
++
++/// The top governed state of the selected table: [`PSTATE_MAX`] for ten firmware rows, one
++/// more for the J604's eleven rows (`g16_j604_rows11`), set once before the firmware starts.
++static TOP: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(PSTATE_MAX);
++
++/// The top governed state, [`PSTATE_MAX`] unless the table has an eleventh row.
++pub(crate) fn pstate_max() -> u32 {
++    TOP.load(core::sync::atomic::Ordering::Relaxed)
++}
++
++/// Sets the top governed state from the selected table's last row, [`PSTATE_MAX`] or one more.
++pub(crate) fn set_pstate_max(top: u32) {
++    TOP.store(top.clamp(PSTATE_MAX, PSTATE_MAX + 1), core::sync::atomic::Ordering::Relaxed);
++}
+ pub(crate) const COOLING_MAX: u32 = 8;
+ pub(crate) const SAMPLE_NS: u64 = 5_000_000;
+ /// Utilization window of the governor.
+@@ -25,7 +39,7 @@ pub(crate) fn read_due(last: Option<u64>, now: u64) -> bool {
+ /// Zero is not an unlimited selector in the firmware. Every published state
+ /// is 1..=9, bounded by the initialized Main table and the user ceiling.
+ pub(crate) fn limit(configured: u32, ceiling: u32, user: u32) -> u32 {
+-    ceiling.min(PSTATE_MAX).min(configured).min(user).max(1)
++    ceiling.min(pstate_max()).min(configured).min(user).max(1)
+ }
+ 
+ /// Percentage of `window` ns the GPU was busy for.
+@@ -62,9 +76,10 @@ pub(crate) fn demand(current: u32, util: u32, average: u32) -> u32 {
+ 
+ /// [`demand`] with the lowest state `floor` (1..=[`PSTATE_MAX`]) in place of [`FLOOR`].
+ pub(crate) fn demand_floor(current: u32, util: u32, average: u32, floor: u32) -> u32 {
+-    let floor = floor.clamp(1, PSTATE_MAX);
++    let top = pstate_max();
++    let floor = floor.clamp(1, top);
+     let next = if util >= 70 {
+-        PSTATE_MAX
++        top
+     } else if util >= 40 {
+         current.saturating_add(1)
+     } else if average < 10 {
+@@ -74,7 +89,7 @@ pub(crate) fn demand_floor(current: u32, util: u32, average: u32, floor: u32) ->
+     } else {
+         current
+     };
+-    next.clamp(floor, PSTATE_MAX)
++    next.clamp(floor, top)
+ }
+ 
+ /// Busy-time accounting over the governor's windows. The engine reports each
+@@ -113,7 +128,7 @@ fn active_floor(&self) -> u32 {
+ 
+     /// Sets the lowest state to request once idle, clamped to 1..=[`PSTATE_MAX`].
+     pub(crate) fn set_floor(&mut self, floor: u32) {
+-        self.floor = floor.clamp(1, PSTATE_MAX);
++        self.floor = floor.clamp(1, pstate_max());
+     }
+ 
+     /// The engine published work; it stays busy until [`Governor::idle`].
+-- 
+2.43.0
+

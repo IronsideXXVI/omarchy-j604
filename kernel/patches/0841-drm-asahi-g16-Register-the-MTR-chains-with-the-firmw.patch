@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 22:54:49 +0000
+Subject: [PATCH] drm/asahi: g16: Register the MTR chains with the
+ firmware controllers
+
+With g16_fw_controllers=1 the firmware crashed one second after the
+initdata was published: "agfMTRAlarmHandler: Received MTR Alarm
+interrupt from GPU but no match found in MTR hardware! chainID=0".
+The controller words set the thermal controllers' enable mask, which
+arms the MTR temperature alarms, but no alarm chain was registered:
+25G83 matches an alarm against the chain bitmap after the temperature
+object pointer in POWER_PERFORMANCE, and finding none is fatal.
+
+macOS 26B123 has 0x6b79 in that bitmap at INIT, and 1 in the word
+after it. Write both with the controllers, and add a second form,
+g16_fw_controllers=2, that leaves the thermal mask and the chains
+unset, so that the other controllers can be tried with the MTR alarms
+unarmed. The default stays 0.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs         |  2 +-
+ drivers/gpu/drm/asahi/g16/fw/controllers.rs | 29 +++++++++++++++++++--
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs    | 10 ++++++-
+ drivers/gpu/drm/asahi/g16/initdata.rs       |  7 +++--
+ drivers/gpu/drm/asahi/g16/params.rs         | 11 ++++++++
+ 5 files changed, 53 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index e5278273a5..d5c5b56abf 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -269,7 +269,7 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+         },
+         g16_fw_controllers: u32 {
+             default: 0,
+-            description: "G16: configure the firmware power controllers (default 0)",
++            description: "G16: firmware power controllers (default 0; 1: with thermal, 2: without)",
+         },
+         g16_recovery: u32 {
+             default: 1,
+diff --git a/drivers/gpu/drm/asahi/g16/fw/controllers.rs b/drivers/gpu/drm/asahi/g16/fw/controllers.rs
+index 1023e55b2f..a7c01f2214 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/controllers.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/controllers.rs
+@@ -265,6 +265,17 @@
+     (0x2e64, 0x00000384), // max_scaled - 100 = 900
+ ];
+ 
++/// The thermal (fast-die / MTR) controllers' enable mask, u64 at +0x2268, part of [`WORDS`].
++pub(crate) const THERMAL_MASK: usize = 0x2268;
++
++/// The MTR alarm chains the firmware may match an alarm against: u64 bitmap at +0x3b58
++/// (after the temperature object pointer at +0x3b50) and the word after it, as macOS 26B123
++/// has them at INIT (0x6b79, 1). With the thermal mask set and no chain registered, the first
++/// MTR alarm (chain 0) is fatal in 25G83 (agfMTRAlarmHandler, 0x349fc).
++pub(crate) const MTR_CHAINS: usize = 0x3b58;
++pub(crate) const MTR_CHAIN_BITS: u64 = 0x6b79;
++pub(crate) const MTR_CHAINS_NEXT: usize = 0x3b60;
++
+ /// Byte words: the turbo controller's input is present (1), and it is not mode 1 (0).
+ pub(crate) const BYTES: [(usize, u8); 2] = [(0x2518, 1), (0x2519, 0)];
+ 
+@@ -276,11 +287,25 @@ fn put(out: &mut [u8], at: usize, bytes: &[u8]) -> Result<(), ()> {
+ }
+ 
+ /// Writes the controller words into a POWER_PERFORMANCE image; `top_frequency` is the
+-/// ceiling row's main frequency, MHz, and `ceiling` its row (9, or 10 for eleven rows).
+-pub(crate) fn encode(pp: &mut [u8], top_frequency: u32, ceiling: u32) -> Result<(), ()> {
++/// ceiling row's main frequency, MHz, and `ceiling` its row (9, or 10 for eleven rows); `thermal`
++/// also enables the thermal controllers and registers the MTR chains.
++pub(crate) fn encode(
++    pp: &mut [u8],
++    top_frequency: u32,
++    ceiling: u32,
++    thermal: bool,
++) -> Result<(), ()> {
+     for (at, value) in WORDS {
++        // Without the thermal controllers the MTR alarms stay unarmed.
++        if !thermal && (at == THERMAL_MASK || at == THERMAL_MASK + 4) {
++            continue;
++        }
+         put(pp, at, &value.to_le_bytes())?;
+     }
++    if thermal {
++        put(pp, MTR_CHAINS, &MTR_CHAIN_BITS.to_le_bytes())?;
++        put(pp, MTR_CHAINS_NEXT, &1u64.to_le_bytes())?;
++    }
+     if ceiling == 10 {
+         for (at, value) in ELEVEN_ROWS {
+             put(pp, at, &value.to_le_bytes())?;
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index d27675c220..f6e9fbfd30 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -504,6 +504,9 @@ pub(crate) struct Input {
+     /// Also write the firmware's own controller words into POWER_PERFORMANCE
+     /// (`g16_fw_controllers`).
+     pub(crate) fw_controllers: bool,
++    /// With [`Self::fw_controllers`]: also the thermal controllers and the MTR chains
++    /// (`g16_fw_controllers=1`; 2 leaves them off).
++    pub(crate) fw_thermal: bool,
+ }
+ 
+ pub(crate) fn object_va(va: u64, size: usize) -> bool {
+@@ -724,7 +727,12 @@ pub(crate) fn encode(
+         put32(p, at, 100 * ceiling)?;
+     }
+     if input.fw_controllers {
+-        super::controllers::encode(p, input.performance.frequency[ceiling as usize], ceiling)?;
++        super::controllers::encode(
++            p,
++            input.performance.frequency[ceiling as usize],
++            ceiling,
++            input.fw_thermal,
++        )?;
+     }
+     Ok(())
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/initdata.rs b/drivers/gpu/drm/asahi/g16/initdata.rs
+index c51e7e4697..f4629059fd 100644
+--- a/drivers/gpu/drm/asahi/g16/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/initdata.rs
+@@ -171,12 +171,15 @@ pub(crate) fn build(
+         idle_power_off: idle_power_off_level != 0,
+         globals_required: super::params::globals_required(),
+         fw_controllers: super::params::fw_controllers(),
++        fw_thermal: super::params::fw_thermal(),
+     };
+     if input.fw_controllers {
+         dev_info!(
+             dev,
+-            "M4 initdata: {} firmware controller words written (g16_fw_controllers=1)\n",
+-            super::fw::controllers::WORDS.len()
++            "M4 initdata: {} firmware controller words written (mode {}, thermal+MTR {})\n",
++            super::fw::controllers::WORDS.len(),
++            super::params::fw_controllers_mode(),
++            if input.fw_thermal { "on" } else { "off" }
+         );
+     }
+     if input.globals_required {
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 913bf364c2..b92117d31a 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1774,6 +1774,17 @@ pub(crate) fn fw_controllers() -> bool {
+     module_parameters::g16_fw_controllers.value() != 0
+ }
+ 
++/// The `g16_fw_controllers` value: 0 off, 1 with the thermal controllers and the MTR chains,
++/// 2 without them.
++pub(crate) fn fw_controllers_mode() -> u32 {
++    module_parameters::g16_fw_controllers.value()
++}
++
++/// Whether the controllers include the thermal ones and the MTR chain registration.
++pub(crate) fn fw_thermal() -> bool {
++    fw_controllers_mode() == 1
++}
++
+ /// Whether the J604 takes eleven firmware rows from its sixteen ADT states, keeping state 4
+ /// (`g16_j604_rows11`, load time). Its ADT has eleven distinct voltage rows, which macOS uses.
+ pub(crate) fn j604_rows11() -> bool {
+-- 
+2.43.0
+

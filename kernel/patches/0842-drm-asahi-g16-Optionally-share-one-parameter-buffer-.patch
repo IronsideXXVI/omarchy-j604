@@ -1,0 +1,277 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 23:16:12 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally share one parameter buffer
+ between renders
+
+Each render binds the PB manager and hardware-buffer id of its own pass
+unit, and the pass cursor moves to the next unit at every render, so the
+id changes between any two consecutive renders. The firmware's TA
+dispatch skips its parameter-buffer bind only when the buffer it last
+loaded is the one named again; with a new id every time it evicts, saves
+the free list and loads the next buffer before each render. macOS names
+the same id for every render of a context.
+
+Add g16_pb_shared (default 0, latched at the first render command). With
+it every render of a VM binds one manager on PB slot 0 and unit 0's heap,
+shared by all of its renders in flight. Each render keeps its own unit:
+UMA slot, scene list, TPC, tilemap and work images. A new manager, with
+its InitBM, is installed only when the VM has none exposed, or with no
+render in flight and the free-block ring not fully returned; it never
+goes behind running renders. The PB statistics line reports the latch.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 38 ++++++++++++++++++-----
+ drivers/gpu/drm/asahi/g16/params.rs | 48 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  4 +--
+ drivers/gpu/drm/asahi/g16/pools.rs  | 47 ++++++++++++++++++++++++++--
+ 4 files changed, 125 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 77ae03ef93..c95b9a3b9d 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1156,10 +1156,14 @@ fn batch_open(&self) -> bool {
+     /// `g16_behind_initbm`: whether render `job` on unit `k` may go behind the running
+     /// flights: all of them are of its VM and unit `k` still leases a PB manager of that VM,
+     /// so no InitBM enters the TA ring behind running TA work.
++    /// With `g16_pb_shared`: all of them are of its VM and the VM's shared manager is the one
++    /// exposed on PB slot 0.
+     fn behind_safe(&self, job: &Job, k: usize) -> bool {
+-        params::pb_reuse()
+-            && self.engine.flights.iter().all(|f| f.job.vm.id == job.vm.id)
+-            && self.pools.would_reuse(k, &job.vm)
++        let same_vm = self.engine.flights.iter().all(|f| f.job.vm.id == job.vm.id);
++        if params::pb_shared() {
++            return same_vm && self.pools.would_share(&job.vm);
++        }
++        params::pb_reuse() && same_vm && self.pools.would_reuse(k, &job.vm)
+     }
+ 
+     /// Whether `job`'s next command may be published behind the flights now running
+@@ -1533,7 +1537,14 @@ fn render_refs(
+         let mut a = arena.pools.prepare(k, draw)?;
+         // g16_pb_reuse: the manager slot k still leases from a fully retired command of
+         // this VM, without a new InitBM; otherwise the command's own fresh manager.
+-        let reused = if params::pb_reuse() {
++        // g16_pb_shared: every render of the VM binds the one manager of PB slot 0 on unit
++        // 0's heap, so the firmware finds the parameter buffer it last loaded.
++        let shared = params::pb_shared();
++        let slot = params::pb_slot(k);
++        let reused = if shared {
++            let idle = self.engine.flights.iter().all(|f| f.renders == 0);
++            self.pools.shared(&job.vm, idle)
++        } else if params::pb_reuse() {
+             self.pools.reusable(k, &job.vm)
+         } else {
+             None
+@@ -1545,11 +1556,16 @@ fn render_refs(
+             }
+             None => {
+                 let epoch = job.resources.pb(job.progress.sent() as usize)?;
+-                epoch.prepare(k, arena.pools.heap_gva(k)?, arena.pools.heap_blocks(k)?)?;
++                let blocks = arena.pools.heap_blocks(slot)?;
++                epoch.prepare(slot, arena.pools.heap_gva(slot)?, blocks)?;
+                 epoch.clone()
+             }
+         };
+         a.pb_mgr = epoch.manager.va;
++        if shared {
++            a.parameter_id = slot as u32;
++            a.init_blocks = arena.pools.heap_blocks(slot)?;
++        }
+         a.mgr_misc = epoch.misc.va;
+         *pb_used = Some(epoch);
+         let r = &self.graph.render;
+@@ -1700,7 +1716,9 @@ fn publish_prefix_into(
+                     .ok_or(EAGAIN)?;
+                 // g16_behind_initbm: behind running flights, a render of another VM, or one
+                 // whose unit needs a new InitBM on the TA ring, waits for them to retire.
+-                if ahead && params::behind_initbm() && !self.behind_safe(job, k) {
++                // With g16_pb_shared a new manager never goes behind running renders.
++                let initbm_rule = params::behind_initbm() || params::pb_shared();
++                if ahead && initbm_rule && !self.behind_safe(job, k) {
+                     return Err(EAGAIN);
+                 }
+                 f.claims.pass[0] = k as u32;
+@@ -1730,7 +1748,7 @@ fn publish_prefix_into(
+             f.pb_used
+                 .as_ref()
+                 .ok_or(EINVAL)?
+-                .check_assignment(f.claims.pass[0] as usize)?;
++                .check_assignment(params::pb_slot(f.claims.pass[0] as usize))?;
+         }
+         // Reserve lifetime ownership before any counter or producer becomes reachable.
+         job.vm.vm.mark_binding_published()?;
+@@ -1746,7 +1764,11 @@ fn publish_prefix_into(
+             }
+             if render {
+                 let k = f.claims.pass[0] as usize;
+-                f.pb_used.as_ref().ok_or(EINVAL)?.expose();
++                let epoch = f.pb_used.as_ref().ok_or(EINVAL)?;
++                epoch.expose();
++                if params::pb_shared() {
++                    self.pools.set_shared(epoch);
++                }
+                 job.resources.render()?.pools.publish(k, f.uma_submitted)?;
+                 // Notifier service dereferences u32 counters; the host ordering ledger
+                 // remains u64. Eight-byte spacing is retained allocation padding.
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index b92117d31a..613c829384 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2037,6 +2037,54 @@ pub(crate) fn pb_reuse() -> bool {
+     "G16: let a render command reuse the PB manager its pass slot still leases from a fully retired command of the same VM, without a new InitBM (default 1; 0 = a fresh manager and InitBM for every command; runtime 0644)"
+ );
+ 
++/// Storage of `g16_pb_shared` (0644, default 0; latched at its first read).
++static PB_SHARED: AtomicU32 = AtomicU32::new(0);
++/// 0 until latched, then 1 (off) or 2 (on).
++static PB_SHARED_LATCH: AtomicU32 = AtomicU32::new(0);
++
++/// One PB manager and hardware-buffer id (PB slot 0, on unit 0's heap) for every render of
++/// a VM, shared by all of its renders in flight, so the TA dispatch of the next render finds
++/// the parameter buffer it last loaded. Each render keeps its own unit: UMA slot, scene
++/// list, TPC, tilemap and work images. A new manager, with its InitBM, is installed only
++/// with no render of another VM in flight and never behind running renders. Read once, at
++/// the first render command, so every render of the boot binds the same way.
++pub(crate) fn pb_shared() -> bool {
++    let l = PB_SHARED_LATCH.load(Ordering::Acquire);
++    if l != 0 {
++        return l == 2;
++    }
++    let v = if PB_SHARED.load(Ordering::Relaxed) != 0 {
++        2
++    } else {
++        1
++    };
++    let _ = PB_SHARED_LATCH.compare_exchange(0, v, Ordering::AcqRel, Ordering::Acquire);
++    PB_SHARED_LATCH.load(Ordering::Acquire) == 2
++}
++
++/// The latch as the statistics print it: 0 not yet read, 1 off, 2 on (reading it latches nothing).
++pub(crate) fn pb_shared_state() -> u32 {
++    PB_SHARED_LATCH.load(Ordering::Relaxed)
++}
++
++/// The PB slot a render on unit `k` binds: 0 with `g16_pb_shared`, else `k`.
++pub(crate) fn pb_slot(k: usize) -> usize {
++    if pb_shared() {
++        0
++    } else {
++        k
++    }
++}
++
++live_u32_param!(
++    PB_SHARED_PARAM,
++    PB_SHARED_PARMTYPE,
++    PB_SHARED_PARM,
++    PB_SHARED,
++    "g16_pb_shared",
++    "G16: 1 = every render of a VM binds one PB manager and hardware-buffer id (slot 0, unit 0's heap), shared by its renders in flight; each keeps its own unit (default 0: one PB per unit; latched at the first render command, set it as a module option)"
++);
++
+ /// Storage of `g16_behind_initbm` (runtime 0644, default 1).
+ static BEHIND_INITBM: AtomicU32 = AtomicU32::new(1);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index b377ee9890..9b2d82cbba 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1163,8 +1163,8 @@ pub(crate) fn retire_oldest(
+                 self.recovery.last_retired[1] = Some(f.ta_target);
+                 self.recovery.last_retired[2] = Some(f.fs_target);
+                 let committed = f.pb_used.as_ref().ok_or(EINVAL).and_then(|epoch| {
+-                    self.pools
+-                        .retire_binding(timestamp_claims.pass[0] as usize, epoch)
++                    let slot = super::params::pb_slot(timestamp_claims.pass[0] as usize);
++                    self.pools.retire_binding(slot, epoch)
+                 });
+                 if let Err(error) = committed {
+                     self.retain(&f.job);
+diff --git a/drivers/gpu/drm/asahi/g16/pools.rs b/drivers/gpu/drm/asahi/g16/pools.rs
+index da4e4f55a3..afd5a30b85 100644
+--- a/drivers/gpu/drm/asahi/g16/pools.rs
++++ b/drivers/gpu/drm/asahi/g16/pools.rs
+@@ -299,6 +299,9 @@ pub(crate) struct Pools {
+     pub(crate) dev: ARef<device::Device>,
+     pub(crate) stats: PbStats,
+     owners: [Option<Arc<PbEpoch>>; super::hw::sizes::RENDER_UNITS],
++    /// g16_pb_shared: the manager every render of its VM binds on PB slot 0, from its
++    /// publication until a new one replaces it.
++    shared: Option<Arc<PbEpoch>>,
+ }
+ impl Pools {
+     pub(crate) fn new(dev: &AsahiDrmDevice) -> Self {
+@@ -306,8 +309,47 @@ pub(crate) fn new(dev: &AsahiDrmDevice) -> Self {
+             dev: dev.as_ref().as_ref().into(),
+             stats: PbStats::default(),
+             owners: [const { None }; super::hw::sizes::RENDER_UNITS],
++            shared: None,
+         }
+     }
++    /// g16_pb_shared: the VM's shared manager while it is exposed on PB slot 0. With no
++    /// render in flight (`idle`) its free-block ring words must also agree, every block
++    /// returned; otherwise the command installs a new manager with InitBM.
++    pub(crate) fn shared(
++        &mut self,
++        vm: &Arc<super::vm::VmState>,
++        idle: bool,
++    ) -> Option<Arc<PbEpoch>> {
++        let Some(epoch) = self.shared.as_ref() else {
++            self.stats.fresh += 1;
++            return None;
++        };
++        if !epoch.same_vm(vm) || epoch.check_assignment(0).is_err() || !epoch.is_exposed() {
++            self.stats.fresh += 1;
++            return None;
++        }
++        let Ok(words) = epoch.ring_words() else {
++            self.stats.fresh += 1;
++            return None;
++        };
++        self.stats.ring_last = words;
++        if idle && words[0] != words[1] {
++            self.stats.ring_busy += 1;
++            return None;
++        }
++        self.stats.reused += 1;
++        Some(epoch.clone())
++    }
++    /// Whether `vm`'s shared manager is exposed on PB slot 0, so a render may bind it behind
++    /// running renders of that VM without an InitBM.
++    pub(crate) fn would_share(&self, vm: &Arc<super::vm::VmState>) -> bool {
++        self.shared
++            .as_ref()
++            .is_some_and(|e| e.same_vm(vm) && e.check_assignment(0).is_ok() && e.is_exposed())
++    }
++    pub(crate) fn set_shared(&mut self, epoch: &Arc<PbEpoch>) {
++        self.shared = Some(epoch.clone());
++    }
+     /// The PB manager slot `k` still leases, if it belongs to `vm`, has been exposed on
+     /// slot `k` and its free-block ring words agree (g16_pb_reuse).
+     pub(crate) fn reusable(
+@@ -353,7 +395,7 @@ pub(crate) fn retire_binding(&mut self, k: usize, epoch: &Arc<PbEpoch>) -> Resul
+     pub(crate) fn write_stats(&self, f: &mut impl fmt::Write) -> fmt::Result {
+         writeln!(
+             f,
+-            "pb: M4 private allocators blocks {} requests {} bad {} reuse {} fresh {} ring_busy {} ring {} {}",
++            "pb: M4 private allocators blocks {} requests {} bad {} reuse {} fresh {} ring_busy {} ring {} {} shared {}",
+             buffer::MAX_BLOCKS,
+             self.stats.requests,
+             self.stats.bad,
+@@ -361,7 +403,8 @@ pub(crate) fn write_stats(&self, f: &mut impl fmt::Write) -> fmt::Result {
+             self.stats.fresh,
+             self.stats.ring_busy,
+             self.stats.ring_last[0],
+-            self.stats.ring_last[1]
++            self.stats.ring_last[1],
++            super::params::pb_shared_state()
+         )
+     }
+ }
+-- 
+2.43.0
+

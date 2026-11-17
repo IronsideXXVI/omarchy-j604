@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 22:05:01 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally let a render ask the
+ firmware for less
+
+At render.light depth 64 the firmware sends about 1.3 messages per
+render to the host, against one per 15.7 commands on macOS. Every
+render's TA and FS completion blocks ask for the per-pass host
+notification, and each FS is preceded by a barrier record for its wait
+on its own TA, a record macOS does not write for this work.
+
+Retirement does not need the notification: a receipt is proven from
+the firmware's stamps and queue cursors, which the host's own polls
+read as well.
+
+Add g16_render_quiet, a runtime switch read per render. With 1 no
+render asks for the per-pass notification. With 2 the FS-ring barrier
+record is also left out. Event ids and stamps never change. The
+default 0 leaves every record as before.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 12 +++++++++---
+ drivers/gpu/drm/asahi/g16/params.rs | 20 ++++++++++++++++++++
+ 2 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index a24df89ba8..aa0e1a53f5 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -2016,7 +2016,9 @@ fn prefix_render(
+         // g16_first_kick_idle: a render queued behind running work needs no per-pass
+         // notification; its receipts are proven from the stamps (TA block at +0x878, FS block
+         // at +0xbc0, the word at +0x1c of each, see encode::render metadata()).
+-        if behind && params::first_kick_idle() {
++        // g16_render_quiet >= 1: no render asks for the per-pass notification at all.
++        let quiet = params::render_quiet();
++        if (behind && params::first_kick_idle()) || quiet >= 1 {
+             for (v, at) in [(&mut scratch.ta, 0x878 + 0x1c), (&mut scratch.fs, 0xbc0 + 0x1c)] {
+                 v.get_mut(at..at + 4).ok_or(EINVAL)?.fill(0);
+             }
+@@ -2118,8 +2120,12 @@ fn prefix_render(
+         }
+         r.ring[0].w64(8 * pf.ta_head as usize, p.ta_work.va)?;
+         pf.ta_head = (pf.ta_head + 1) % cap;
+-        r.ring[1].w64(8 * pf.fs_head as usize, p.own_barrier.va)?;
+-        pf.fs_head = (pf.fs_head + 1) % cap;
++        // g16_render_quiet 2: no FS-ring barrier record; the FS follows its TA by the
++        // firmware's own pairing, as macOS's records have no such record.
++        if quiet < 2 {
++            r.ring[1].w64(8 * pf.fs_head as usize, p.own_barrier.va)?;
++            pf.fs_head = (pf.fs_head + 1) % cap;
++        }
+         r.ring[1].w64(8 * pf.fs_head as usize, p.fs_work.va)?;
+         pf.fs_head = (pf.fs_head + 1) % cap;
+         pf.renders = 1;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index dead195160..0fe7a6fe11 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -947,6 +947,26 @@ pub(crate) fn fs_sample_size() -> bool {
+     "G16: write the tile-buffer sample size into the FS record (+0xa30) as the G15 backend does (default 0: left 0; 1: written; runtime 0644)"
+ );
+ 
++/// Storage of `g16_render_quiet` (runtime 0644, default 0).
++static RENDER_QUIET: AtomicU32 = AtomicU32::new(0);
++
++/// How little a render asks the firmware for: 0 as before; 1 no per-pass host notification
++/// (+0x1c of the TA and FS completion blocks) on any render, so the host retires on its own
++/// polls; 2 also no FS-ring barrier record before the FS (the FS's wait for its own TA), as
++/// macOS 26B123 writes none for this work. Event ids and stamps are never changed.
++pub(crate) fn render_quiet() -> u32 {
++    RENDER_QUIET.load(Ordering::Relaxed).min(2)
++}
++
++live_u32_param!(
++    RENDER_QUIET_PARAM,
++    RENDER_QUIET_PARMTYPE,
++    RENDER_QUIET_PARM,
++    RENDER_QUIET,
++    "g16_render_quiet",
++    "G16: 1: no per-pass host notification on any render (the host retires on its polls); 2: also no FS-ring barrier record for the FS's wait on its own TA, as macOS (default 0: as before; runtime 0644, read per render)"
++);
++
+ /// Storage of `g16_fs_tile_bit16` (runtime 0644, default 0).
+ static FS_TILE_BIT16: AtomicU32 = AtomicU32::new(0);
+ 
+-- 
+2.43.0
+
