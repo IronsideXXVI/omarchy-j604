@@ -1317,3 +1317,7 @@ The base remains da8e1acf3656. Published 0001–0907 are unchanged. 0908 keeps o
 # Kernel patch numbers: 1.1022 to 1.1024
 
 The base remains da8e1acf3656. Published 0001–0909 are unchanged. 0910 adds `g16_pb_lazy` (off by default): the full render units keep their parameter-buffer address window but back it on demand. Applied source differs from the installed build only in the same nine comment lines as before. Version 1.1023 was a test kernel and is not published.
+
+# Kernel patch numbers: 1.1024 to 1.1030
+
+The base remains da8e1acf3656. Published 0001–0910 are unchanged. 0911 adds `g16_tail_cut` (a completion pass that retired work submits the next work before any further firmware polling), and 0912 turns it on by default. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1025 to 1.1029 were test kernels and are not published.
