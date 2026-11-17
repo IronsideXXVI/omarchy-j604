@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 21:47:06 +0000
+Subject: [PATCH] drm/asahi: g16: Keep the fixed big-core poll CPU
+ online and housekeeping
+
+g16_worker_big=2 queues the poll work on one big CPU chosen at probe.
+Make that safe as a default:
+
+- choose it among the big CPUs that are workqueue and scheduler-domain
+  housekeeping CPUs (not isolcpus or nohz_full), all big CPUs if none;
+- if it is offline (CPU hotplug, or suspend taking the non-boot CPUs
+  down), use another online candidate for that queueing, counted as
+  rechosen in the wbig: line, and the default placement when no big
+  CPU is online, counted as fallback;
+- pin only immediate queueings: a delayed one (the re-poll backup)
+  would arm its timer on that CPU with add_timer_on() and be stranded
+  while the CPU is offline, so it uses the unbound big-CPU queue, whose
+  timer is armed on the local CPU.
+
+No change while g16_worker_big is 0 or 1.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/boot.rs |  6 ++++++
+ drivers/gpu/drm/asahi/g16/glue.c  | 35 +++++++++++++++++++++++++++----
+ drivers/gpu/drm/asahi/g16/poll.rs | 16 +++++++++++---
+ 3 files changed, 50 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 4d52aca230..0791cccc8c 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -63,6 +63,7 @@ fn asahi_g16_rt_start(
+         fn asahi_g16_big_init() -> core::ffi::c_int;
+         fn asahi_g16_big_wq() -> *mut kernel::bindings::workqueue_struct;
+         fn asahi_g16_big_cpu() -> core::ffi::c_int;
++        fn asahi_g16_big_rechosen() -> core::ffi::c_uint;
+         fn asahi_g16_cpu_is_big(cpu: core::ffi::c_int) -> bool;
+         fn asahi_g16_this_cpu() -> core::ffi::c_int;
+         fn asahi_g16_big_mask() -> *const kernel::bindings::cpumask;
+@@ -159,6 +160,11 @@ pub(crate) fn big_cpu() -> i32 {
+         // SAFETY: Reads the init-time choice and the online mask.
+         unsafe { asahi_g16_big_cpu() }
+     }
++    /// Immediate queueings that found the chosen big CPU offline and used another one.
++    pub(crate) fn big_rechosen() -> u32 {
++        // SAFETY: Reads an atomic counter.
++        unsafe { asahi_g16_big_rechosen() }
++    }
+     /// Whether `cpu` is one of the max-capacity CPUs. Any context.
+     pub(crate) fn cpu_is_big(cpu: i32) -> bool {
+         // SAFETY: Bounds-checked mask test.
+diff --git a/drivers/gpu/drm/asahi/g16/glue.c b/drivers/gpu/drm/asahi/g16/glue.c
+index 698c1668a3..357c415367 100644
+--- a/drivers/gpu/drm/asahi/g16/glue.c
++++ b/drivers/gpu/drm/asahi/g16/glue.c
+@@ -33,6 +33,7 @@
+ #include <linux/cpumask.h>
+ #include <linux/smp.h>
+ #include <linux/workqueue.h>
++#include <linux/sched/isolation.h>
+ 
+ #include "glue.h"
+ 
+@@ -48,6 +49,7 @@ bool asahi_g16_rt_kick(void);
+ int asahi_g16_big_init(void);
+ struct workqueue_struct *asahi_g16_big_wq(void);
+ int asahi_g16_big_cpu(void);
++unsigned int asahi_g16_big_rechosen(void);
+ bool asahi_g16_cpu_is_big(int cpu);
+ int asahi_g16_this_cpu(void);
+ const struct cpumask *asahi_g16_big_mask(void);
+@@ -596,6 +598,10 @@ int asahi_g16_lat_qos(int us)
+ static struct cpumask g16_big_mask;
+ static struct workqueue_struct *g16_big_wq;
+ static int g16_big_cpu = -1;
++/* The big CPUs the fixed CPU may be (re)chosen from: housekeeping ones if any. */
++static struct cpumask g16_big_pick;
++/* Queueings that found the chosen CPU offline and used another online big CPU. */
++static atomic_t g16_big_rechosen = ATOMIC_INIT(0);
+ 
+ int asahi_g16_big_init(void)
+ {
+@@ -610,8 +616,17 @@ int asahi_g16_big_init(void)
+ 	for_each_possible_cpu(cpu)
+ 		if (arch_scale_cpu_capacity(cpu) == max)
+ 			cpumask_set_cpu(cpu, &g16_big_mask);
+-	/* The last big CPU: away from CPU 0's boot-time housekeeping. */
+-	g16_big_cpu = cpumask_last(&g16_big_mask);
++	/* Fixed-CPU candidates: big CPUs that are workqueue and scheduler-domain
++	 * housekeeping CPUs (not isolcpus / nohz_full); all big CPUs if none are.
++	 */
++	cpumask_clear(&g16_big_pick);
++	for_each_cpu(cpu, &g16_big_mask)
++		if (housekeeping_cpu(cpu, HK_TYPE_WQ) && housekeeping_cpu(cpu, HK_TYPE_DOMAIN))
++			cpumask_set_cpu(cpu, &g16_big_pick);
++	if (cpumask_empty(&g16_big_pick))
++		cpumask_copy(&g16_big_pick, &g16_big_mask);
++	/* The last candidate: away from CPU 0's boot-time housekeeping. */
++	g16_big_cpu = cpumask_last(&g16_big_pick);
+ 	/* Restricted to g16_big_mask by the caller (workqueue_restrict, the exported helper). */
+ 	g16_big_wq = alloc_workqueue("aurora_g16_big", WQ_UNBOUND | WQ_HIGHPRI, 0);
+ 	return g16_big_wq ? 0 : -ENOMEM;
+@@ -634,8 +649,20 @@ int asahi_g16_big_cpu(void)
+ 
+ 	if (cpu >= 0 && cpu < nr_cpu_ids && cpu_online(cpu))
+ 		return cpu;
+-	cpu = cpumask_any_and(&g16_big_mask, cpu_online_mask);
+-	return cpu < nr_cpu_ids ? cpu : -1;
++	/* The chosen CPU is offline (hotplug, or suspend took the non-boot CPUs down):
++	 * another online candidate for this queueing only; -1 (the caller falls back to
++	 * the default placement) when none is online. Never an offline CPU.
++	 */
++	cpu = cpumask_any_and(&g16_big_pick, cpu_online_mask);
++	if (cpu >= nr_cpu_ids)
++		return -1;
++	atomic_inc(&g16_big_rechosen);
++	return cpu;
++}
++
++unsigned int asahi_g16_big_rechosen(void)
++{
++	return atomic_read(&g16_big_rechosen);
+ }
+ 
+ bool asahi_g16_cpu_is_big(int cpu)
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 6ced625f47..0070dc8c0a 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -79,9 +79,10 @@ fn wbig_stats(f: &mut fmt::Formatter<'_>) -> fmt::Result {
+     let v = |i: usize| WBIG_N[i].load(Ordering::Relaxed);
+     write!(
+         f,
+-        "wbig: on {} big_cpu {} passes_big {} passes_little {} lat_us {} lat_max_us {} queued {} fallback {} cpu",
++        "wbig: on {} big_cpu {} rechosen {} passes_big {} passes_little {} lat_us {} lat_max_us {} queued {} fallback {} cpu",
+         params::worker_big(),
+         super::boot::glue::big_cpu(),
++        super::boot::glue::big_rechosen(),
+         v(0),
+         v(1),
+         v(2) / 1000,
+@@ -610,10 +611,19 @@ fn mod_poll(self: &Arc<Self>, delay: Jiffies) {
+         // else (or without them) the queueing CPU's system_highpri_wq worker, as before.
+         let unbound = bindings::wq_misc_consts_WORK_CPU_UNBOUND as kernel::ffi::c_int;
+         let mode = params::worker_big();
+-        let (big_wq, big_cpu) = (super::boot::glue::big_wq(), super::boot::glue::big_cpu());
++        let big_wq = super::boot::glue::big_wq();
++        // 2 pins only an IMMEDIATE queueing, to an online big CPU (glue.c re-chooses one if
++        // the chosen CPU is offline, -1 if none is). A delayed queueing (the re-poll backup)
++        // would arm its timer on that CPU (add_timer_on), stranded while the CPU is offline
++        // (suspend takes the non-boot CPUs down), so it takes the unbound big queue, whose
++        // timer is armed on the local CPU.
+         let target = match mode {
+             1 if !big_wq.is_null() => Some((unbound, big_wq)),
+-            2 if big_cpu >= 0 => Some((big_cpu, core::ptr::null_mut())),
++            2 if delay != 0 && !big_wq.is_null() => Some((unbound, big_wq)),
++            2 if delay == 0 => match super::boot::glue::big_cpu() {
++                cpu if cpu >= 0 => Some((cpu, core::ptr::null_mut())),
++                _ => None,
++            },
+             _ => None,
+         };
+         if mode != 0 && target.is_none() {
+-- 
+2.43.0
+

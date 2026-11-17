@@ -1,0 +1,381 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 21:09:20 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally run the completion work on
+ the big cores
+
+The poll work that retires completions, handles reports and publishes
+the next commands is queued with WORK_CPU_UNBOUND on the per-CPU
+system_highpri_wq, so it runs on the CPU that queued it: the one that
+took the mailbox interrupt or fired the re-poll hrtimer, which the
+work itself re-arms where it runs. On the J604 that is an efficiency
+core at half the capacity of the performance cores, busy 46 % during
+compute.light at depth 64 while the client runs on a performance core.
+
+Add the runtime switch g16_worker_big (default 0, same as before). At
+probe the driver takes the CPUs of maximum arch_scale_cpu_capacity()
+and builds an unbound high-priority queue, aurora_g16_big, limited to
+them. With 1 the poll work is queued there; with 2 it is queued on
+system_highpri_wq on one such CPU chosen at probe (the last), with no
+migration between passes. Either way the hrtimer callback and the
+mailbox kick only queue the work, so a timer firing elsewhere does not
+bring the pass back to the little core, and the timer re-armed by the
+pass is started on the big CPU that runs it. Scheduler submit queues
+(aurora_g16_hi, run-job and free-job) created while the switch is on
+are limited to the same CPUs.
+
+Nothing is queued while no GPU work is outstanding, so the switch costs
+nothing at an idle desktop. The stats file gains a wbig: line: passes
+on big and on other CPUs, passes per CPU, and the time from an
+immediate queueing to the pass that serves it.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/boot.rs   | 59 +++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/glue.c    | 69 +++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/job.rs    |  5 ++
+ drivers/gpu/drm/asahi/g16/params.rs | 25 ++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 72 ++++++++++++++++++++++++++++-
+ 5 files changed, 228 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 83399114b9..4d52aca230 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -60,6 +60,12 @@ fn asahi_g16_rt_start(
+             cookie: *mut core::ffi::c_void,
+         ) -> core::ffi::c_int;
+         fn asahi_g16_rt_kick() -> bool;
++        fn asahi_g16_big_init() -> core::ffi::c_int;
++        fn asahi_g16_big_wq() -> *mut kernel::bindings::workqueue_struct;
++        fn asahi_g16_big_cpu() -> core::ffi::c_int;
++        fn asahi_g16_cpu_is_big(cpu: core::ffi::c_int) -> bool;
++        fn asahi_g16_this_cpu() -> core::ffi::c_int;
++        fn asahi_g16_big_mask() -> *const kernel::bindings::cpumask;
+         fn asahi_g16_ram_disjoint(start: u64, size: u64) -> bool;
+         fn asahi_g16_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
+         fn asahi_g16_dma_unsupported(dev: *mut core::ffi::c_void) -> bool;
+@@ -125,6 +131,50 @@ pub(crate) fn rt_kick() -> bool {
+         unsafe { asahi_g16_rt_kick() }
+     }
+ 
++    /// `g16_worker_big`: builds the max-capacity CPU mask and the `aurora_g16_big` queue.
++    /// Process context, at probe.
++    pub(crate) fn big_init() -> Result {
++        // SAFETY: Reads CPU capacities and allocates a workqueue; no driver state.
++        kernel::error::to_result(unsafe { asahi_g16_big_init() })?;
++        restrict(big_wq(), false)
++    }
++    /// Limits the unbound queue `wq` to the big CPUs, keeping high priority (and order if
++    /// `ordered`), through the kernel's exported workqueue_restrict helper. May sleep.
++    fn restrict(wq: *mut kernel::bindings::workqueue_struct, ordered: bool) -> Result {
++        if wq.is_null() {
++            return Err(EINVAL);
++        }
++        // SAFETY: `wq` is a live unbound workqueue; the mask is static and the helper copies it.
++        kernel::error::to_result(unsafe {
++            kernel::bindings::workqueue_restrict(wq, asahi_g16_big_mask(), ordered, true)
++        })
++    }
++    /// The `aurora_g16_big` queue (unbound, high priority, big CPUs only), or null.
++    pub(crate) fn big_wq() -> *mut kernel::bindings::workqueue_struct {
++        // SAFETY: Returns a pointer set once at probe and never freed.
++        unsafe { asahi_g16_big_wq() }
++    }
++    /// The big CPU chosen at init (re-chosen only if offline), or -1. Any context.
++    pub(crate) fn big_cpu() -> i32 {
++        // SAFETY: Reads the init-time choice and the online mask.
++        unsafe { asahi_g16_big_cpu() }
++    }
++    /// Whether `cpu` is one of the max-capacity CPUs. Any context.
++    pub(crate) fn cpu_is_big(cpu: i32) -> bool {
++        // SAFETY: Bounds-checked mask test.
++        unsafe { asahi_g16_cpu_is_big(cpu) }
++    }
++    /// The CPU running the caller (raw_smp_processor_id). Any context.
++    pub(crate) fn this_cpu() -> i32 {
++        // SAFETY: No preconditions.
++        unsafe { asahi_g16_this_cpu() }
++    }
++    /// Restricts the caller's unbound ORDERED high-priority queue (`aurora_g16_hi`) to the big
++    /// CPUs. Process context; `wq` must stay live for the call.
++    pub(crate) fn big_apply(wq: *mut kernel::bindings::workqueue_struct) -> Result {
++        restrict(wq, true)
++    }
++
+     /// A qualified T8132 board (J713, J773g).
+     pub(crate) fn board() -> bool {
+         // SAFETY: Reads the machine compatible strings only.
+@@ -426,6 +476,15 @@ fn new(dev: &device::Device, shared: &Arc<Shared>) -> Result<Self> {
+                         e
+                     );
+                 }
++                // g16_worker_big: the big-core queue is built here (process context) whatever
++                // the switch, so it can be turned on at runtime.
++                if let Err(e) = glue::big_init() {
++                    dev_warn!(
++                        dev,
++                        "G16: big-core poll queue not built ({:?}); g16_worker_big has no effect\n",
++                        e
++                    );
++                }
+                 shared.rtk.store(rtk, Ordering::Release);
+                 Ok(Self { rtk })
+             }
+diff --git a/drivers/gpu/drm/asahi/g16/glue.c b/drivers/gpu/drm/asahi/g16/glue.c
+index 1e169b0523..698c1668a3 100644
+--- a/drivers/gpu/drm/asahi/g16/glue.c
++++ b/drivers/gpu/drm/asahi/g16/glue.c
+@@ -29,6 +29,10 @@
+ #include <linux/soc/apple/pmp-cooling.h>
+ #include <linux/soc/apple/pmp-telemetry.h>
+ #include <linux/thermal.h>
++#include <linux/arch_topology.h>
++#include <linux/cpumask.h>
++#include <linux/smp.h>
++#include <linux/workqueue.h>
+ 
+ #include "glue.h"
+ 
+@@ -41,6 +45,12 @@ int asahi_g16_lat_qos(int us);
+ int asahi_g16_cpu_floor(bool on);
+ int asahi_g16_rt_start(void (*fn)(void *cookie), void *cookie);
+ bool asahi_g16_rt_kick(void);
++int asahi_g16_big_init(void);
++struct workqueue_struct *asahi_g16_big_wq(void);
++int asahi_g16_big_cpu(void);
++bool asahi_g16_cpu_is_big(int cpu);
++int asahi_g16_this_cpu(void);
++const struct cpumask *asahi_g16_big_mask(void);
+ bool asahi_g16_ram_disjoint(u64 start, u64 size);
+ void __iomem *asahi_g16_ioremap_wc(u64 start, size_t size);
+ bool asahi_g16_dma_unsupported(struct device *dev);
+@@ -578,3 +588,62 @@ int asahi_g16_lat_qos(int us)
+ 	cpu_latency_qos_update_request(req, us < 0 ? PM_QOS_DEFAULT_VALUE : us);
+ 	return 0;
+ }
++
++/* g16_worker_big: run the completion/poll work on the CPUs of maximum capacity.
++ * The mask is taken from arch_scale_cpu_capacity() once, at probe (no CPU numbers are
++ * hardcoded); nothing here runs while no GPU work is queued.
++ */
++static struct cpumask g16_big_mask;
++static struct workqueue_struct *g16_big_wq;
++static int g16_big_cpu = -1;
++
++int asahi_g16_big_init(void)
++{
++	unsigned long max = 0;
++	int cpu;
++
++	if (g16_big_wq)
++		return 0;
++	for_each_possible_cpu(cpu)
++		max = max_t(unsigned long, max, arch_scale_cpu_capacity(cpu));
++	cpumask_clear(&g16_big_mask);
++	for_each_possible_cpu(cpu)
++		if (arch_scale_cpu_capacity(cpu) == max)
++			cpumask_set_cpu(cpu, &g16_big_mask);
++	/* The last big CPU: away from CPU 0's boot-time housekeeping. */
++	g16_big_cpu = cpumask_last(&g16_big_mask);
++	/* Restricted to g16_big_mask by the caller (workqueue_restrict, the exported helper). */
++	g16_big_wq = alloc_workqueue("aurora_g16_big", WQ_UNBOUND | WQ_HIGHPRI, 0);
++	return g16_big_wq ? 0 : -ENOMEM;
++}
++
++const struct cpumask *asahi_g16_big_mask(void)
++{
++	return &g16_big_mask;
++}
++
++struct workqueue_struct *asahi_g16_big_wq(void)
++{
++	return g16_big_wq;
++}
++
++/* The big CPU for queue_work_on(), or -1: chosen at init, re-chosen only if it went offline. */
++int asahi_g16_big_cpu(void)
++{
++	int cpu = READ_ONCE(g16_big_cpu);
++
++	if (cpu >= 0 && cpu < nr_cpu_ids && cpu_online(cpu))
++		return cpu;
++	cpu = cpumask_any_and(&g16_big_mask, cpu_online_mask);
++	return cpu < nr_cpu_ids ? cpu : -1;
++}
++
++bool asahi_g16_cpu_is_big(int cpu)
++{
++	return cpu >= 0 && cpu < nr_cpu_ids && cpumask_test_cpu(cpu, &g16_big_mask);
++}
++
++int asahi_g16_this_cpu(void)
++{
++	return raw_smp_processor_id();
++}
+diff --git a/drivers/gpu/drm/asahi/g16/job.rs b/drivers/gpu/drm/asahi/g16/job.rs
+index c18e647c6a..94237dd490 100644
+--- a/drivers/gpu/drm/asahi/g16/job.rs
++++ b/drivers/gpu/drm/asahi/g16/job.rs
+@@ -598,6 +598,11 @@ pub(crate) fn new(dev: &device::Device) -> Result<Self> {
+         } else {
+             None
+         };
++        // g16_worker_big: a submit queue (unbound, ordered) created while the switch is on
++        // runs its run-job/free-job work on the max-capacity CPUs too. Failure keeps it as is.
++        if let (Some(q), true) = (submit_wq.as_ref(), super::params::worker_big() != 0) {
++            let _ = super::boot::glue::big_apply(q.as_raw());
++        }
+         let scheduler = sched::Scheduler::new_with_queues(
+             dev,
+             1,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index eeaf836b92..d0e6ae4c1c 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -940,6 +940,31 @@ pub(crate) fn rt_poll() -> bool {
+     "G16: retire after a firmware event on the SCHED_FIFO poller thread instead of the CFS worker (default 0; 1: on; runtime 0644)"
+ );
+ 
++/// Storage of `g16_worker_big` (runtime 0644, default 0).
++static WORKER_BIG: AtomicU32 = AtomicU32::new(0);
++
++/// Where the poll/completion work runs: 0 (default) `system_highpri_wq` on the CPU that
++/// queued it (the mailbox interrupt's or the hrtimer's CPU, often an efficiency core); 1 the
++/// unbound high-priority `aurora_g16_big` queue limited to the CPUs of maximum capacity;
++/// 2 `system_highpri_wq` on one such CPU chosen at probe (no migration between passes).
++/// With 1 or 2, scheduler submit queues (`aurora_g16_hi`) created afterwards are limited to
++/// the same CPUs. Read per queueing.
++pub(crate) fn worker_big() -> u32 {
++    match WORKER_BIG.load(Ordering::Relaxed) {
++        v @ 1..=2 => v,
++        _ => 0,
++    }
++}
++
++live_u32_param!(
++    WORKER_BIG_PARAM,
++    WORKER_BIG_PARMTYPE,
++    WORKER_BIG_PARM,
++    WORKER_BIG,
++    "g16_worker_big",
++    "G16: run the completion/poll work on the max-capacity CPUs (default 0: where queued; 1: unbound high-priority queue on those CPUs; 2: one such CPU chosen at probe; runtime 0644)"
++);
++
+ /// Storage of `g16_pmp_agx` (runtime 0644, default 1).
+ static PMP_AGX: AtomicU32 = AtomicU32::new(1);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 2e1350bd3b..6ced625f47 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -61,6 +61,39 @@ fn tailcut_stats(f: &mut fmt::Formatter<'_>) -> fmt::Result {
+     )
+ }
+ 
++
++/// `g16_worker_big` counters: [0] poll passes on a max-capacity CPU, [1] on another CPU,
++/// [2] summed and [3] longest ns from an immediate queueing to the pass that ran it,
++/// [4] immediate queueings, [5] queueings that fell back to the default (switch on, but no
++/// big queue or online big CPU). Kept whatever the switch, so 0 shows where passes run today.
++static WBIG_N: [core::sync::atomic::AtomicU64; 6] =
++    [const { core::sync::atomic::AtomicU64::new(0) }; 6];
++/// Poll passes per CPU (CPUs above 15 counted as 15).
++static WBIG_CPU: [core::sync::atomic::AtomicU64; 16] =
++    [const { core::sync::atomic::AtomicU64::new(0) }; 16];
++/// Time of the oldest immediate queueing not yet run (0: none).
++static WBIG_QUEUED_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
++
++/// The `wbig:` line of the stats file.
++fn wbig_stats(f: &mut fmt::Formatter<'_>) -> fmt::Result {
++    let v = |i: usize| WBIG_N[i].load(Ordering::Relaxed);
++    write!(
++        f,
++        "wbig: on {} big_cpu {} passes_big {} passes_little {} lat_us {} lat_max_us {} queued {} fallback {} cpu",
++        params::worker_big(),
++        super::boot::glue::big_cpu(),
++        v(0),
++        v(1),
++        v(2) / 1000,
++        v(3) / 1000,
++        v(4),
++        v(5)
++    )?;
++    for c in &WBIG_CPU {
++        write!(f, " {}", c.load(Ordering::Relaxed))?;
++    }
++    writeln!(f)
++}
+ /// The tile-buffer words of the last render published, for the stats line `fswords:`: the
+ /// FS record's tilebuffer control, tile mode and ISP control, the utile config, sample size
+ /// and samples, ZLS control, PPP multisample control and the framebuffer size.
+@@ -367,6 +400,20 @@ pub(crate) fn run_poll(self: Arc<Self>) {
+         if self.sleeping.load(Ordering::Acquire) {
+             return;
+         }
++        // g16_worker_big accounting: the CPU running this pass, and the time since the
++        // immediate queueing it serves (reads and counters only).
++        {
++            let cpu = super::boot::glue::this_cpu();
++            let big = super::boot::glue::cpu_is_big(cpu);
++            WBIG_N[if big { 0 } else { 1 }].fetch_add(1, Ordering::Relaxed);
++            WBIG_CPU[(cpu.max(0) as usize).min(15)].fetch_add(1, Ordering::Relaxed);
++            let queued = WBIG_QUEUED_NS.swap(0, Ordering::Relaxed);
++            if queued != 0 {
++                let ns = now_ns().saturating_sub(queued);
++                WBIG_N[2].fetch_add(ns, Ordering::Relaxed);
++                WBIG_N[3].fetch_max(ns, Ordering::Relaxed);
++            }
++        }
+         self.work_ticks.store(counter_ticks(), Ordering::Relaxed);
+         let signalling = kernel::dma_fence::SignallingGuard::new();
+         let mut done = Completions::new();
+@@ -559,15 +606,35 @@ pub(crate) fn poll_now(self: &Arc<Self>) {
+     /// Queues the poll on `system_highpri_wq` after `delay` jiffies, or moves an already
+     /// pending one to that expiry.
+     fn mod_poll(self: &Arc<Self>, delay: Jiffies) {
++        // g16_worker_big: 1 the unbound big-CPU queue, 2 one big CPU on system_highpri_wq,
++        // else (or without them) the queueing CPU's system_highpri_wq worker, as before.
++        let unbound = bindings::wq_misc_consts_WORK_CPU_UNBOUND as kernel::ffi::c_int;
++        let mode = params::worker_big();
++        let (big_wq, big_cpu) = (super::boot::glue::big_wq(), super::boot::glue::big_cpu());
++        let target = match mode {
++            1 if !big_wq.is_null() => Some((unbound, big_wq)),
++            2 if big_cpu >= 0 => Some((big_cpu, core::ptr::null_mut())),
++            _ => None,
++        };
++        if mode != 0 && target.is_none() {
++            WBIG_N[5].fetch_add(1, Ordering::Relaxed);
++        }
++        if delay == 0 {
++            WBIG_N[4].fetch_add(1, Ordering::Relaxed);
++            let _ =
++                WBIG_QUEUED_NS.compare_exchange(0, now_ns(), Ordering::Relaxed, Ordering::Relaxed);
++        }
++        let (cpu, wq) = target.unwrap_or((unbound, core::ptr::null_mut()));
+         // SAFETY: The closure returns false only when `mod_delayed_work_on` found the work
+         // already pending (it then only modified its timer), so the queue keeps the reference
+         // it took when it was queued; otherwise the work is queued and owns this reference.
++        // `aurora_g16_big` is created at probe and never destroyed.
+         let _ = unsafe {
+             <Arc<Shared> as RawWorkItem<POLL_WORK>>::__enqueue(self.clone(), |work| {
+                 let dwork = kernel::container_of!(work, bindings::delayed_work, work);
+                 !bindings::mod_delayed_work_on(
+-                    bindings::wq_misc_consts_WORK_CPU_UNBOUND as kernel::ffi::c_int,
+-                    bindings::system_highpri_wq,
++                    cpu,
++                    if wq.is_null() { bindings::system_highpri_wq } else { wq },
+                     dwork,
+                     delay,
+                 )
+@@ -1861,6 +1928,7 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             self.session.shared.irq_bells.load(Ordering::Relaxed)
+         )?;
+         super::encode::replay::stats(f)?;
++        wbig_stats(f)?;
+         let probe = &super::pools::PROBE;
+         writeln!(
+             f,
+-- 
+2.43.0
+

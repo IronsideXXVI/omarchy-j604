@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 22:53:54 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally end the trailing polls
+ only after compute
+
+g16_tail_cut=1, the default, ends an evented pass's trailing 5 us
+polls once it has retired a flight. That moved compute.light at depth
+64 from 56-58 to 37.8 us, but render.light at depth 64 lost 1.0 us: a
+group of four renders reports in two emissions some 35 us apart, and
+the trailing polls used to retire the second half in the same pass;
+now it waits for its own event and a new pass.
+
+The early publication cannot help a render. Its next jobs reach the
+engine only as the retired jobs' fences signal, and those signal after
+the pass, so a cut render pass has nothing new to publish.
+
+Add the value 2: only a pass that retired a compute flight ends its
+trailing polls; one that retired only renders polls as before. The
+default stays 1.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 10 +++++++++-
+ drivers/gpu/drm/asahi/g16/poll.rs   |  4 +++-
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 74ed4838d2..5f9bfa5e4d 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2049,13 +2049,21 @@ pub(crate) fn tail_cut() -> bool {
+     TAIL_CUT.load(Ordering::Relaxed) != 0
+ }
+ 
++/// `g16_tail_cut` value: 1 every evented pass that retired a flight ends its trailing polls;
++/// 2 only a pass that retired a compute flight does. Render jobs reach the engine only as
++/// earlier fences signal, at the end of the pass, so for render the early publish has
++/// nothing new to publish while the trailing polls catch the group's second report.
++pub(crate) fn tail_cut_value() -> u32 {
++    TAIL_CUT.load(Ordering::Relaxed).min(2)
++}
++
+ live_u32_param!(
+     TAIL_CUT_PARAM,
+     TAIL_CUT_PARMTYPE,
+     TAIL_CUT_PARM,
+     TAIL_CUT,
+     "g16_tail_cut",
+-    "G16: 1: an evented pass that retired a flight skips its remaining trailing 5 us polls and publishes at once (default 1; 0: as before; runtime 0644)"
++    "G16: 1: an evented pass that retired a flight skips its remaining trailing 5 us polls and publishes at once; 2: only a pass that retired a compute flight does (default 1; 0: as before; runtime 0644)"
+ );
+ 
+ /// Storage of `g16_idle_decay` (runtime 0644, default 0).
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 1dd09ba8d8..90e3fc275b 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -992,6 +992,7 @@ pub(crate) fn retire(&mut self, evented: bool, done: &mut Completions) -> Result
+         self.engine.stats.retire_src = if evented { 0 } else { 2 };
+         let mut ret;
+         let mut freed = false;
++        let mut freed_compute = false;
+ 
+         loop {
+             let mut lap = Lap::start();
+@@ -1007,6 +1008,7 @@ pub(crate) fn retire(&mut self, evented: bool, done: &mut Completions) -> Result
+                     break;
+                 }
+                 let outcome = self.retire_outcome(receipt);
++                freed_compute |= self.engine.oldest().is_some_and(|f| f.computes != 0);
+                 self.retire_oldest(receipt, outcome, done);
+                 freed = true;
+                 ret = self.retired();
+@@ -1016,7 +1018,7 @@ pub(crate) fn retire(&mut self, evented: bool, done: &mut Completions) -> Result
+             }
+             // g16_tail_cut: this pass freed a unit; publish into it now instead of after the
+             // remaining trailing polls (the next event or the re-poll catches later receipts).
+-            if freed && params::tail_cut() {
++            if freed && params::tail_cut() && (params::tail_cut_value() != 2 || freed_compute) {
+                 TAILCUT_N[0].fetch_add(1, Ordering::Relaxed);
+                 TAILCUT_N[1].fetch_add(tail.max(0) as u64, Ordering::Relaxed);
+                 break;
+-- 
+2.43.0
+

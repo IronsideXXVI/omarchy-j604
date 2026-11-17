@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 22:22:15 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally give the idle state back
+ at once
+
+When the engine drains, the host governor keeps the state it reached and
+gives it back one step per 20 ms window: every idle pass that still sees
+a state above the floor queues another pass one window later and keeps
+the CPU latency bound until then. At an idle desktop each compositor
+frame is followed by several such passes, about 3.5 passes a second in
+all, and moving the completion work to the performance cores made that
+cost 46 mW.
+
+Add the runtime switch g16_idle_decay (default 0). At 1, an idle pass
+with nothing published or pending returns the state to the idle floor in
+one step, drops the latency bound and queues nothing. The next work
+lifts the state to the active floor at once, as after any idle stretch,
+and the window governor rises from there. Running workloads never reach
+this path; work paced with idle gaps between submissions (frame-paced
+rendering, single submissions) starts each burst from the active floor
+instead of the state the last burst left.
+
+Count the poll passes by cause in the new idlepass: stats line (any
+setting): passes run, woken by a firmware ring-service message, queued
+by the decay window, the rest, and idle passes settled at once.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/params.rs       | 21 ++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs         | 47 ++++++++++++++++++++---
+ drivers/gpu/drm/asahi/g16/power/policy.rs | 26 +++++++++++++
+ 3 files changed, 89 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 922741ea98..74ed4838d2 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2058,6 +2058,27 @@ pub(crate) fn tail_cut() -> bool {
+     "G16: 1: an evented pass that retired a flight skips its remaining trailing 5 us polls and publishes at once (default 1; 0: as before; runtime 0644)"
+ );
+ 
++/// Storage of `g16_idle_decay` (runtime 0644, default 0).
++static IDLE_DECAY: AtomicU32 = AtomicU32::new(0);
++
++/// What an idle pass does while the governor still holds a state above the idle floor: 0
++/// (default) comes back once per governor window until the state has decayed to the floor,
++/// keeping the CPU latency bound meanwhile; 1, when nothing is published or pending, gives
++/// the state back to the idle floor in one step, drops the latency bound and does not come
++/// back. The next work lifts the state to the active floor at once, as after any idle stretch.
++pub(crate) fn idle_decay() -> u32 {
++    IDLE_DECAY.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    IDLE_DECAY_PARAM,
++    IDLE_DECAY_PARMTYPE,
++    IDLE_DECAY_PARM,
++    IDLE_DECAY,
++    "g16_idle_decay",
++    "G16: 1: an idle pass with nothing published returns the governed state to the idle floor at once and does not re-queue (default 0: decay once per 20 ms window; runtime 0644)"
++);
++
+ /// Storage of `g16_tail_us` (runtime 0644, default 0).
+ static TAIL_US: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 31536a1471..1dd09ba8d8 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -44,6 +44,14 @@
+ pub(crate) const TAIL_WINDOW_NS: u64 = 300_000;
+ /// End of the current `g16_tail_us` window (`now_ns()`), 0 for none.
+ static TAIL_UNTIL_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
++/// Poll passes by what queued them, for the stats line `idlepass:` (any `g16_idle_decay`):
++/// [0] passes run, [1] woken by a firmware ring-service message, [2] queued by the governor's
++/// idle decay window, [3] the rest (completion re-poll, its backup, sleep and publication
++/// paths), [4] idle passes that gave the state back at once (`g16_idle_decay` 1).
++static IDLEPASS: [core::sync::atomic::AtomicU64; 5] =
++    [const { core::sync::atomic::AtomicU64::new(0) }; 5];
++/// Set when the governor's idle decay queues the next pass; taken by that pass.
++static DECAY_QUEUED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+ /// `g16_tail_cut` counters: evented passes whose trailing polls ended at a retirement; the
+ /// trailing 5 us polls so skipped.
+ static TAILCUT_N: [core::sync::atomic::AtomicU64; 2] =
+@@ -436,6 +444,10 @@ pub(crate) fn run_poll(self: Arc<Self>) {
+                     firmware.engine.shared = Some(self.clone());
+                 }
+                 let evented = self.evented.swap(false, Ordering::AcqRel);
++                let decay_pass = DECAY_QUEUED.swap(false, Ordering::Relaxed);
++                IDLEPASS[0].fetch_add(1, Ordering::Relaxed);
++                IDLEPASS[if evented { 1 } else if decay_pass { 2 } else { 3 }]
++                    .fetch_add(1, Ordering::Relaxed);
+                 let result = firmware.poll(evented, &mut done);
+                 self.note_bells(&firmware.engine.flights);
+                 firmware.nap_hold();
+@@ -451,11 +463,26 @@ pub(crate) fn run_poll(self: Arc<Self>) {
+                         if firmware.recovery.failed().is_none()
+                             && firmware.power.utilization.decaying() =>
+                     {
+-                        // A pass follows after the window: the bound may stay until then.
+-                        self.lat_qos(busy, false);
+-                        self.mod_poll(kernel::time::msecs_to_jiffies(
+-                            (super::power::policy::WINDOW_NS / 1_000_000) as u32,
+-                        ))
++                        // g16_idle_decay 1: with nothing published or pending, give the state
++                        // back to the idle floor now and let the bound go; no pass follows.
++                        if params::idle_decay() == 1
++                            && firmware.engine.flights.is_empty()
++                            && firmware.engine.pending.is_empty()
++                            && {
++                                firmware.power.utilization.settle_idle(now_ns());
++                                firmware.service_power().is_ok()
++                            }
++                        {
++                            IDLEPASS[4].fetch_add(1, Ordering::Relaxed);
++                            self.lat_qos(false, true)
++                        } else {
++                            // A pass follows after the window: the bound may stay until then.
++                            self.lat_qos(busy, false);
++                            DECAY_QUEUED.store(true, Ordering::Relaxed);
++                            self.mod_poll(kernel::time::msecs_to_jiffies(
++                                (super::power::policy::WINDOW_NS / 1_000_000) as u32,
++                            ))
++                        }
+                     }
+                     // The last pass of this busy period: nothing comes back to drop it later.
+                     Ok(false) => self.lat_qos(false, true),
+@@ -2293,6 +2320,16 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.tsplit_other_ns / 1000,
+             s.submit_retires
+         )?;
++        let ip = |i: usize| IDLEPASS[i].load(Ordering::Relaxed);
++        writeln!(
++            f,
++            "idlepass: runs {} kick {} decay {} rearm {} settled {}",
++            ip(0),
++            ip(1),
++            ip(2),
++            ip(3),
++            ip(4)
++        )?;
+         for (c, name) in ["compute", "render"].iter().enumerate() {
+             write!(
+                 f,
+diff --git a/drivers/gpu/drm/asahi/g16/power/policy.rs b/drivers/gpu/drm/asahi/g16/power/policy.rs
+index d687e8a267..970c312d67 100644
+--- a/drivers/gpu/drm/asahi/g16/power/policy.rs
++++ b/drivers/gpu/drm/asahi/g16/power/policy.rs
+@@ -149,6 +149,17 @@ pub(crate) fn decaying(&self) -> bool {
+         self.busy_since.is_none() && self.demand > self.floor
+     }
+ 
++    /// `g16_idle_decay` 1: an idle engine with nothing published gives its state back to the
++    /// idle floor at once, as if its idle stretch had already run [`IDLE_WINDOWS`] windows.
++    /// Afterwards [`Governor::decaying`] is false; work lifts it to the active floor at once.
++    pub(crate) fn settle_idle(&mut self, now: u64) {
++        self.idle(now);
++        self.demand = self.floor;
++        self.idle_windows = IDLE_WINDOWS;
++        self.window_ns = now;
++        self.busy_ns = 0;
++    }
++
+     /// Closes the window once it is due and returns the state to publish
+     /// under the ceiling `limit`; `busy` is whether flights are outstanding.
+     pub(crate) fn govern(&mut self, now: u64, limit: u32, busy: bool) -> u32 {
+@@ -227,6 +238,21 @@ fn the_idle_floor_waits_for_an_idle_stretch_and_work_lifts_it_at_once() {
+         assert!(g.govern(now, PSTATE_MAX, false) >= 4);
+     }
+ 
++    #[test]
++    fn settle_idle_gives_the_state_back_at_once_and_work_lifts_it() {
++        let mut g = Governor::new();
++        g.set_floor(1);
++        let now = 1_000_000_000;
++        // A burst left the demand high; the engine is idle now.
++        g.demand = PSTATE_MAX;
++        assert!(g.decaying());
++        g.settle_idle(now);
++        assert!(!g.decaying());
++        assert_eq!(g.govern(now + 1, PSTATE_MAX, false), 1);
++        // Work arrives: the active floor at once, as after any idle stretch.
++        g.busy(now + 2);
++        assert_eq!(g.govern(now + 3, PSTATE_MAX, true), FLOOR);
++    }
+     #[test]
+     fn provider_sampling_is_independent_of_completion_polling() {
+         assert!(read_due(None, 0));
+-- 
+2.43.0
+

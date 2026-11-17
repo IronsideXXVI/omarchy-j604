@@ -1,8 +1,8 @@
 diff --git a/src/asahi/compiler/agx_compile.c b/src/asahi/compiler/agx_compile.c
-index c6606c18c1c..0eddc976651 100644
+index c6606c18c1c..edd22d9c5ed 100644
 --- a/src/asahi/compiler/agx_compile.c
 +++ b/src/asahi/compiler/agx_compile.c
-@@ -87,6 +87,24 @@ agx_g16_shared_nz_enabled(void)
+@@ -87,6 +87,30 @@ agx_g16_shared_nz_enabled(void)
     return debug_get_bool_option("ASAHI_G16_SHARED_NZ", true);
  }
  
@@ -24,10 +24,16 @@ index c6606c18c1c..0eddc976651 100644
 +   return debug_get_bool_option("ASAHI_G16_HOST_BLEND_SRC", true);
 +}
 +
++bool
++agx_g16_border_twin_enabled(void)
++{
++   return debug_get_bool_option("ASAHI_G16_BORDER_TWIN", true);
++}
++
  uint64_t
  agx_get_compiler_debug(void)
  {
-@@ -10905,6 +10923,71 @@ agx3_coalesce_uniform_half_stores(agx_context *ctx)
+@@ -10905,6 +10929,71 @@ agx3_coalesce_uniform_half_stores(agx_context *ctx)
   * adjacent run of non-coherent loads with identical operation and base; SSA
   * keeps their consumers attached to the correct result and no serialization
   * is introduced. */
@@ -99,7 +105,7 @@ index c6606c18c1c..0eddc976651 100644
  static bool
  agx3_order_fragment_device_loads(agx_context *ctx)
  {
-@@ -12936,6 +13019,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
+@@ -12936,6 +13025,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
     }
  
     AGX_PASS(ctx, agx3_order_fragment_device_loads);
@@ -108,10 +114,10 @@ index c6606c18c1c..0eddc976651 100644
     if (agx_should_dump(nir, AGX_DBG_SHADERS))
        agx_print_shader(ctx, stdout);
 diff --git a/src/asahi/compiler/agx_debug.h b/src/asahi/compiler/agx_debug.h
-index 35509837330..b687b2126a4 100644
+index 35509837330..e7a136aa01f 100644
 --- a/src/asahi/compiler/agx_debug.h
 +++ b/src/asahi/compiler/agx_debug.h
-@@ -41,6 +41,13 @@ uint64_t agx_get_compiler_debug(void);
+@@ -41,6 +41,16 @@ uint64_t agx_get_compiler_debug(void);
  
  /* Qualified on G16G; ASAHI_G16_SHARED_NZ=0 restores legacy materialization. */
  bool agx_g16_shared_nz_enabled(void);
@@ -122,6 +128,9 @@ index 35509837330..b687b2126a4 100644
 +/* Qualified on G16G; ASAHI_G16_HOST_BLEND_SRC=0 restores per-pixel evaluation
 + * of uniform-only inline-blend fragment arithmetic. */
 +bool agx_g16_host_blend_src_enabled(void);
++/* Qualified on G16G; ASAHI_G16_BORDER_TWIN=0 keeps the custom-border emulation in
++ * every G16G texture sample instead of compiling border-free twins. */
++bool agx_g16_border_twin_enabled(void);
  
  /* Why the last agx_compile_shader_nir() on this thread returned false
   * ("" when it succeeded), for the driver's "cannot encode" error. */
@@ -537,20 +546,101 @@ index 9b381878429..c46af155210 100644
     if (gfx->descriptors.root_dirty) {
        gfx->root =
 diff --git a/src/asahi/vulkan/hk_shader.c b/src/asahi/vulkan/hk_shader.c
-index 1901f0a3303..2e12dabf999 100644
+index 1901f0a3303..8fa53f0bfb4 100644
 --- a/src/asahi/vulkan/hk_shader.c
 +++ b/src/asahi/vulkan/hk_shader.c
-@@ -196,7 +196,9 @@ hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
+@@ -196,7 +196,10 @@ hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
     /* This could be optimized but it doesn't matter. */
     return pdev->dev.debug |
            hk_fs_structure_key_bits() |
 -          ((uint64_t)!!agx_g16_shared_nz_enabled() << 31);
 +          ((uint64_t)!!agx_g16_shared_nz_enabled() << 31) |
 +          ((uint64_t)!!agx_g16_pix_hoist_enabled() << 33) |
-+          ((uint64_t)!!agx_g16_host_blend_src_enabled() << 34);
++          ((uint64_t)!!agx_g16_host_blend_src_enabled() << 34) |
++          ((uint64_t)!!agx_g16_border_twin_enabled() << 35);
  }
  
  const nir_shader_compiler_options *
+@@ -2518,8 +2521,29 @@ agx_nir_lower_custom_border(nir_shader *nir)
+  * clamp-to-0 sample tex_0, after descriptor lowering: taken iff the sampler's
+  * clamp-to-0 index c is not negative, i.e. `if (c >= 0)`, with tex_0 sampling
+  * c without its integer-border bit (hk_nir_lower_descriptors()). */
++/* G16G: whether the border test reads clamp_0_sampler_index_or_negative and
++ * the clamp-to-0 sample reads the unbiased clamp-to-0 index of the same
++ * sampled-image descriptor, as hk_nir_lower_descriptors() emits them (two
++ * loads from one descriptor set address). */
+ static bool
+-hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
++hk_g16_border_test_and_index(nir_scalar tested, nir_scalar c)
++{
++   const uint64_t delta =
++      offsetof(struct hk_sampled_image_descriptor_sw,
++               clamp_0_sampler_index_or_negative) -
++      offsetof(struct hk_sampled_image_descriptor_sw,
++               g17p.unbiased_clamp_0_sampler_index);
++   nir_scalar tb, cb;
++   uint64_t to, co;
++   if (!hk_nir_border_address(tested, &tb, &to) ||
++       !hk_nir_border_address(c, &cb, &co) || to - co != delta)
++      return false;
++   return nir_scalar_equal(tb, cb);
++}
++
++static bool
++hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p,
++                          bool g16_twin)
+ {
+    const int s = nir_tex_instr_src_index(tex_0, nir_tex_src_sampler_handle);
+    if (s < 0)
+@@ -2547,6 +2571,10 @@ hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
+       return false;
+    if (nir_scalar_equal(tested, c))
+       return true;
++   /* G16G: the branch and the clamp-to-0 sample read the same descriptor
++    * field (clamp_0_sampler_index_or_negative) through two loads. */
++   if (g16_twin)
++      return hk_g16_border_test_and_index(tested, c);
+    if (!g17p)
+       return false;
+    const struct hk_sampled_image_descriptor_layout native =
+@@ -2563,7 +2591,8 @@ hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
+  * emulation, unless every clamp-to-0 sample sits directly in the then-list
+  * of its branch (hk_is_border_emulation_if()). */
+ static bool
+-hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs, bool g17p)
++hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs, bool g17p,
++                         bool g16_twin)
+ {
+    nir_foreach_function_impl(impl, nir) {
+       nir_foreach_block(block, impl) {
+@@ -2582,7 +2611,8 @@ hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs, bool g17p)
+             foreach_list_typed(nir_cf_node, node, node, &nif->then_list)
+                in_then |= node == &block->cf_node;
+             if (!in_then ||
+-                !hk_is_border_emulation_if(nif, nir_instr_as_tex(instr), g17p)) {
++                !hk_is_border_emulation_if(nif, nir_instr_as_tex(instr), g17p,
++                                          g16_twin)) {
+                return false;
+             }
+ 
+@@ -6275,7 +6305,16 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
+       struct hk_physical_device *pdev = hk_device_physical(dev);
+       struct util_dynarray ifs;
+       util_dynarray_init(&ifs, NULL);
+-      if (hk_find_border_emulation(nir, &ifs, dev->dev.chip == AGX_CHIP_G17P) &&
++      /* G16G: a twin is chosen when the shader is compiled and replaced when
++       * a command buffer binds it or draws after a border sampler exists.
++       * Update-after-bind sampled images could put such a sampler under an
++       * already recorded border-free draw, so those devices keep the
++       * emulation (the feature is part of the shader key). */
++      const bool g16_twin =
++         dev->dev.chip == AGX_CHIP_G16G && agx_g16_border_twin_enabled() &&
++         !(features & HK_FEAT_SAMPLED_IMAGE_UPDATE_AFTER_BIND);
++      if (hk_find_border_emulation(nir, &ifs, dev->dev.chip == AGX_CHIP_G17P,
++                                   g16_twin) &&
+           ifs.size) {
+          if (twin_of || p_atomic_read(&pdev->border_emulation)) {
+             border_emulating = true;
 diff --git a/src/asahi/vulkan/hk_shader.h b/src/asahi/vulkan/hk_shader.h
 index 7b7995c04ed..65d1bd22db6 100644
 --- a/src/asahi/vulkan/hk_shader.h
