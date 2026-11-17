@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 00:02:00 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally register the second set's
+ FS queue on its own channel
+
+With g16_render_queues 2 the second render queue set's TA queue registers
+on submit channel 3, but its FS queue on the same channel does not: the
+wait for its receipt times out with the record kind 2 (g16_render2_fs 1)
+and with kind 1 (2), and the log line does not say which wait ran out.
+macOS's depth-1 client has its TA and FS queues on two pipes.
+
+Add value 3 to g16_render2_fs: the FS queue is registered on submit
+channel 4, one of the twelve the firmware already has, with kind 1.
+When a registration wait times out, log which queue it was and what it
+saw: the queue's read and write cursors, its info words, the channel's
+cursors and the scheduling context word. The default 0 changes nothing.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/channel.rs |  8 ++--
+ drivers/gpu/drm/asahi/g16/engine.rs  | 55 ++++++++++++++++++++++++----
+ drivers/gpu/drm/asahi/g16/params.rs  |  8 ++--
+ 3 files changed, 58 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/channel.rs b/drivers/gpu/drm/asahi/g16/channel.rs
+index 138b436ec2..c005624650 100644
+--- a/drivers/gpu/drm/asahi/g16/channel.rs
++++ b/drivers/gpu/drm/asahi/g16/channel.rs
+@@ -39,6 +39,8 @@ pub(crate) enum Channel {
+     Compute = 2,
+     /// The TA queue of the second render queue set (`g16_render_queues` 2): registration only.
+     Ta2 = 3,
++    /// Its FS queue on a channel of its own (`g16_render2_fs` 3): registration only.
++    Fs2 = 4,
+ }
+ 
+ /// A ring and its state block.
+@@ -76,8 +78,8 @@ pub(crate) struct Channels {
+     pub(crate) stats: Ring,
+     /// Allocated for the firmware; the host never uses it.
+     _fwctl: Ring,
+-    /// Host producers of channels 0 TA, 1 FS, 2 compute, 3 the second set's TA.
+-    producer: [u32; 4],
++    /// Host producers of channels 0 TA, 1 FS, 2 compute, 3 and 4 the second set's TA and FS.
++    producer: [u32; 5],
+     /// Host producer of the device-control ring.
+     devctl_producer: u32,
+ }
+@@ -124,7 +126,7 @@ pub(crate) fn alloc_submit_and_attach(
+             trace,
+             stats,
+             _fwctl: fwctl,
+-            producer: [0; 4],
++            producer: [0; 5],
+             devctl_producer: 0,
+         })
+     }
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index c95b9a3b9d..3c12a00fd1 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -890,6 +890,40 @@ pub(crate) fn register_context(&mut self) -> Result {
+     /// scheduling context, on submit channel 3, as [`Self::register_context`] registers the
+     /// first set's. Nothing is published to it: this only shows whether the firmware accepts a
+     /// second context with its own queues (the first step toward a firmware queue per VM).
++    /// `g16_render_queues` 2: logs what a registration wait saw when it timed out.
++    fn render2_timeout(
++        &self,
++        queue: &str,
++        channel: Channel,
++        state: &super::object::FwObject,
++        info: &super::object::FwObject,
++    ) -> Error {
++        let r = |o: &super::object::FwObject, at: usize| o.r32(at).unwrap_or(u32::MAX);
++        let ring = self.channels.channel(channel);
++        let context = self
++            .graph
++            .render2
++            .as_ref()
++            .map_or(u32::MAX, |g| r(&g.sched_ctx, 0));
++        dev_warn!(
++            self.graph.dev.as_ref(),
++            "G16: second set {} queue timed out: qstate read {} write {}, info {} {} {}, channel {} read {} write {} completion {} producer {}, context {:#x}\n",
++            queue,
++            r(state, qstate::READ),
++            r(state, qstate::WRITE),
++            r(info, 0x20),
++            r(info, 0x24),
++            r(info, 0x28),
++            channel as u32,
++            ring.read().unwrap_or(u32::MAX),
++            ring.write().unwrap_or(u32::MAX),
++            ring.completion().unwrap_or(u32::MAX),
++            self.channels.producer(channel),
++            context
++        );
++        ETIMEDOUT
++    }
++
+     pub(crate) fn register_render2(&mut self) -> Result {
+         let fs = params::render2_fs();
+         let r = self.graph.render2.as_ref().ok_or(EINVAL)?;
+@@ -939,7 +973,7 @@ pub(crate) fn register_render2(&mut self) -> Result {
+             self.drain_rings()?;
+             let now = now_ns();
+             if now >= deadline {
+-                return Err(ETIMEDOUT);
++                return Err(self.render2_timeout("TA", Channel::Ta2, &state, &info));
+             }
+             let word = context.r32(0)?;
+             let registered =
+@@ -968,7 +1002,13 @@ pub(crate) fn register_render2(&mut self) -> Result {
+         // zero-stamp barrier; registered once its record is consumed and completed.
+         let r = self.graph.render2.as_ref().ok_or(EINVAL)?;
+         let (state, info, ring) = (r.qstate[1].clone(), r.qinfo[1].clone(), r.ring[1].clone());
+-        if state.r32(qstate::READ)? != 0 || state.r32(qstate::WRITE)? != 0 {
++        // 3: the FS queue's records go on a channel of their own.
++        let channel = if fs == 3 { Channel::Fs2 } else { Channel::Ta2 };
++        if state.r32(qstate::READ)? != 0
++            || state.r32(qstate::WRITE)? != 0
++            || (fs == 3
++                && (self.channels.read(channel)? != 0 || self.channels.producer(channel) != 0))
++        {
+             return Err(super::boot::eproto());
+         }
+         ring.w64(0, barrier.va)?;
+@@ -976,7 +1016,7 @@ pub(crate) fn register_render2(&mut self) -> Result {
+         state.w32(qstate::WRITE, 1)?;
+         wmb();
+         self.channels.post(
+-            Channel::Ta2,
++            channel,
+             &SubmitRecord {
+                 unk_0: submit_time(),
+                 qinfo: info.va,
+@@ -986,12 +1026,13 @@ pub(crate) fn register_render2(&mut self) -> Result {
+                 new_queue: 1,
+             },
+         )?;
+-        self.session.ring(Channel::Ta2)?;
++        self.session.ring(channel)?;
+         let deadline = now_ns().saturating_add(2_000_000_000);
+-        while !self.queue_receipt(Channel::Ta2, &state, &info, 1, 2)? {
++        let record = if fs == 3 { 1 } else { 2 };
++        while !self.queue_receipt(channel, &state, &info, 1, record)? {
+             self.drain_rings()?;
+             if now_ns() >= deadline {
+-                return Err(ETIMEDOUT);
++                return Err(self.render2_timeout("FS", channel, &state, &info));
+             }
+             // SAFETY: probe/backend start holds only the sleepable device mutex.
+             unsafe {
+@@ -1827,7 +1868,7 @@ fn publish_prefix_into(
+                         !self.engine.render_registered,
+                     ),
+                     // The second render queue set carries no work yet.
+-                    Channel::Ta2 => return Err(EINVAL),
++                    Channel::Ta2 | Channel::Fs2 => return Err(EINVAL),
+                 };
+                 let record = SubmitRecord {
+                     unk_0: submit_time(),
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 6d5588834b..5aa6869180 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2250,9 +2250,11 @@ pub(crate) fn render2_id() -> u32 {
+ /// `g16_render_queues` 2: 0 (default) registers only the second set's TA queue. 1 also
+ /// registers its FS queue on the same submit channel, every record of that channel with
+ /// kind 2, as macOS 26B123 kicks both queues of an app on one pipe; 2 does the same with
+-/// the record kind equal to the queue type (TA 0, FS 1).
++/// the record kind equal to the queue type (TA 0, FS 1). 3 registers the FS queue on a
++/// submit channel of its own (4), kind 1, as macOS's depth-1 client has its TA and FS queues
++/// on two pipes.
+ pub(crate) fn render2_fs() -> u32 {
+-    RENDER2_FS.load(Ordering::Relaxed).min(2)
++    RENDER2_FS.load(Ordering::Relaxed).min(3)
+ }
+ 
+ live_u32_param!(
+@@ -2261,7 +2263,7 @@ pub(crate) fn render2_fs() -> u32 {
+     RENDER2_FS_PARM,
+     RENDER2_FS,
+     "g16_render2_fs",
+-    "G16: with g16_render_queues 2, also register the second set's FS queue on its TA queue's submit channel: 1 = record kind 2 for both, 2 = kind = queue type (default 0: TA only; set before the GPU starts)"
++    "G16: with g16_render_queues 2, also register the second set's FS queue: on its TA queue's submit channel with 1 = record kind 2 for both, 2 = kind = queue type; 3 = on a channel of its own (default 0: TA only; set before the GPU starts)"
+ );
+ 
+ /// Storage of `g16_compute_same_vm` (runtime 0644, default 0).
+-- 
+2.43.0
+

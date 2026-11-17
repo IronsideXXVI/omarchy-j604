@@ -1283,3 +1283,10 @@ New in 1.1005 (none changes what the machine does by default: all nine are GPU d
 Kernel 1.1006 keeps the base (`da8e1acf3656`) and all 842 patches of 1.1005 under the same numbers.
 
 New in 1.1006 (none changes what the machine does by default: 0843-0845 are experiment switches that are off by default, 0846 matters only with `g16_j604_rows11=1`): 0843 (`drm/asahi: g16: Optionally ring the pipes in flight from the mailbox callback`), 0844 (`drm/asahi: g16: Add a switch for the firmware's GPU power-off delay word`), 0845 (`drm/asahi: g16: Optionally hold the firmware's RTKit out of its nap`), 0846 (`drm/asahi: g16: Accept the eleventh DVFS row as a running state`).
+
+
+# Kernel patch numbers: 1.1006 to 1.1007
+
+Kernel 1.1007 keeps the base (`da8e1acf3656`) and all 846 patches of 1.1006 under the same numbers.
+
+New in 1.1007 (0856 turns on the eleven-row GPU power table by default, revert with aurora.g16_j604_rows11=0; the other nine are experiment switches that are off by default, not user options): 0847 (`drm/asahi: g16: Optionally register the second set's FS queue on its own channel`), 0848 (`drm/asahi: g16: Optionally write macOS's USC pool fields in the render tables`), 0849 (`drm/asahi: g16: Optionally write the J604's Main tables as macOS does`), 0850 (`drm/asahi: g16: Optionally let the firmware make its power-off request`), 0851 (`drm/asahi: g16: Take g16_main_nap at initdata time only`), 0852 (`drm/asahi: g16: Optionally keep the firmware's ktrace records for debugfs`), 0853 (`drm/asahi: g16: Optionally write the J604's Main words as macOS does`), 0854 (`drm/asahi: g16: Optionally write dependency records as Gravity does`), 0855 (`drm/asahi: g16: Optionally set the per-queue look-again word before a doorbell`), 0856 (`drm/asahi: g16: Give the J604 its eleven DVFS rows by default`).

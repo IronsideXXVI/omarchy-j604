@@ -1,0 +1,330 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 01:25:00 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally write the J604's Main
+ words as macOS does
+
+macOS 26B123 on the J604 starts the same firmware with a Main object
+that differs from ours in 131 words besides its own pointers and
+allocation records: a block of enable words around +0xe98 (where we
+also set two that macOS leaves clear), the per-row scale and relative
+tables, the state and core counts, and a run of later words. Which of
+them matter is not known yet.
+
+Add g16_main_macos (load time, default 0) with a built-in table of all
+131 words as macOS has them, written into Main after the encoder, and
+g16_main_macos_from / g16_main_macos_to to write only an index range of
+it, so the set can be halved one boot at a time. The table assumes the
+eleven-row table and is refused without it. Add g16_main_poke for
+single words: "offset:value" pairs, at most 32, aligned and inside
+Main, written last; a list that does not parse is ignored as a whole
+and reported, and never fails the module load. With all of them unset
+nothing changes.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs      |  12 +++
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs |  52 +++++++++
+ drivers/gpu/drm/asahi/g16/initdata.rs    |  32 ++++++
+ drivers/gpu/drm/asahi/g16/params.rs      | 128 +++++++++++++++++++++++
+ 4 files changed, 224 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index 4e1cfd363c..8a074977e2 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -267,6 +267,18 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 0,
+             description: "G16: J604 with eleven DVFS rows, ADT state 4 kept (default 0)",
+         },
++        g16_main_macos: u32 {
++            default: 0,
++            description: "G16: J604 Main words as macOS 26B123 has them (default 0; 1: the table)",
++        },
++        g16_main_macos_from: u32 {
++            default: 0,
++            description: "G16: first g16_main_macos table index written (default 0)",
++        },
++        g16_main_macos_to: u32 {
++            default: 0xffff,
++            description: "G16: last g16_main_macos table index written (default: the whole table)",
++        },
+         g16_main_nap: u32 {
+             default: 0,
+             description: "G16: Main +0xf38 = 1 and +0x2568 = core count, as macOS (default 0)",
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index 263d385f1f..df0d564e1e 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -231,6 +231,43 @@ pub(crate) mod j604 {
+     }
+ }
+ 
++/// Every Main word where macOS 26B123 on the J604 differs from this encoder (with the eleven-row
++/// table), as (offset, macOS value), in offset order; the J604 lab notes give each
++/// index, our value, its 25G83 readers and the words left out (pointers, macOS allocation
++/// descriptors and loader records, firmware-written words). `g16_main_macos`.
++pub(crate) mod main_macos {
++    pub(crate) const WORDS: [(u16, u32); 131] = [
++        (0x0d64, 0x2), (0x0d8c, 0x2), (0x0db4, 0x2), (0x0ddc, 0x2), (0x0e54, 0x2),
++        (0x0e94, 0x8132), (0x0e98, 0x1), (0x0e9c, 0x1), (0x0ea0, 0x0), (0x0ea8, 0x1),
++        (0x0eb8, 0x0), (0x0ebc, 0x1), (0x0ec0, 0x1), (0x0ec8, 0x1), (0x0ee4, 0x1), (0x0ee8, 0x1),
++        (0x0f04, 0x1f), (0x0f28, 0xc), (0x0f34, 0x1), (0x0f38, 0x1), (0x0f4c, 0x31), (0x0f6c, 0x1),
++        (0x0f88, 0xa), (0x0f8c, 0x3), (0x0fb8, 0x12), (0x0fbc, 0x4), (0x0fc0, 0xa),
++        (0x1848, 0x3f828f5c), (0x184c, 0x3f828f5c), (0x1850, 0x3f828f5c), (0x1854, 0x3f828f5c),
++        (0x1858, 0x3f828f5c), (0x185c, 0x3f828f5c), (0x1860, 0x3f828f5c), (0x1864, 0x3f828f5c),
++        (0x1868, 0x3f828f5c), (0x186c, 0x3f828f5c), (0x1870, 0x3f828f5c), (0x18cc, 0x410a8eae),
++        (0x18d0, 0x416e7f29), (0x18d4, 0x41a73bf8), (0x18d8, 0x41db5790), (0x18dc, 0x42105246),
++        (0x18e0, 0x4232fb96), (0x18e4, 0x425732b7), (0x18e8, 0x42721f67), (0x18ec, 0x429e25b9),
++        (0x18f0, 0x42c80000), (0x1910, 0x41b4a529), (0x1914, 0x4213bdf0), (0x1918, 0x423e5295),
++        (0x191c, 0x42679ce6), (0x1920, 0x4286318c), (0x1924, 0x42979ce7), (0x1928, 0x42a14a52),
++        (0x192c, 0x42b694a5), (0x1930, 0x42c80000), (0x19cc, 0x1), (0x19d0, 0x2), (0x19d4, 0x3),
++        (0x19d8, 0x4), (0x19dc, 0x6), (0x19e0, 0x8), (0x19e4, 0xa), (0x19e8, 0xc), (0x19ec, 0xe),
++        (0x19f0, 0xf), (0x1a0c, 0x1), (0x1a10, 0x2), (0x1a14, 0x3), (0x1a18, 0x4), (0x1a1c, 0x5),
++        (0x1a20, 0x7), (0x1a24, 0x9), (0x1a28, 0xb), (0x1a2c, 0xd), (0x1a30, 0xf), (0x1cd8, 0xa),
++        (0x1ce0, 0x152), (0x1ce4, 0x26a), (0x1ce8, 0x31c), (0x1cec, 0x3a0), (0x1cf0, 0x3b8),
++        (0x1cf4, 0x41d), (0x1cf8, 0x480), (0x1cfc, 0x4b4), (0x1d00, 0x52e), (0x1d04, 0x62a),
++        (0x1d1c, 0x7d), (0x1d5c, 0x262), (0x1d9c, 0x280), (0x1ddc, 0x2a8), (0x1e1c, 0x2d5),
++        (0x1e5c, 0x30c), (0x1e9c, 0x339), (0x1edc, 0x361), (0x1f1c, 0x37f), (0x1f5c, 0x3ca),
++        (0x1f9c, 0x415), (0x211c, 0x30c), (0x215c, 0x30c), (0x219c, 0x30c), (0x21dc, 0x30c),
++        (0x221c, 0x30c), (0x225c, 0x30c), (0x229c, 0x339), (0x22dc, 0x361), (0x231c, 0x37f),
++        (0x235c, 0x3ca), (0x239c, 0x415), (0x2568, 0xa), (0x258c, 0x160000), (0x2594, 0x1),
++        (0x2598, 0x1), (0x25a4, 0x1), (0x25a8, 0x1), (0x25ac, 0x1), (0x25b4, 0xffffffff),
++        (0x25b8, 0xffffffff), (0x25bc, 0xffffffff), (0x25c0, 0xffffffff), (0x25c4, 0xffffffff),
++        (0x25c8, 0xffffffff), (0x25cc, 0xffffffff), (0x25d0, 0xffffffff), (0x25d4, 0xffffffff),
++        (0x25d8, 0xffffffff), (0x25dc, 0xffffffff), (0x25e0, 0xffffffff), (0x2608, 0x1),
++        (0x2638, 0x1),
++    ];
++}
++
+ /// One logical loader record, including its page offset and exact PTE class.
+ #[derive(Clone, Copy, Debug)]
+ pub(crate) struct Loader {
+@@ -546,6 +583,11 @@ pub(crate) struct Input {
+     /// Main +0xf38 = 1 and +0x2568 = [`Self::cores`] (`g16_main_nap`).
+     pub(crate) main_nap: bool,
+     pub(crate) cores: u32,
++    /// [`main_macos::WORDS`] index range to write (`g16_main_macos`); eleven-row table only.
++    pub(crate) main_macos: Option<(usize, usize)>,
++    /// `g16_main_poke` pairs (offset, value), written last.
++    pub(crate) poke: [(u32, u32); 32],
++    pub(crate) poke_n: usize,
+ }
+ 
+ pub(crate) fn object_va(va: u64, size: usize) -> bool {
+@@ -623,6 +665,8 @@ pub(crate) fn encode(
+     if !input.performance.valid()
+         || !(1..input.performance.count as u32).contains(&ceiling)
+         || (input.j604_main && input.performance.count != 11)
++        || (input.main_macos.is_some() && input.performance.count != 11)
++        || input.poke_n > input.poke.len()
+         || !object_va(input.scratch, 0x8000)
+         || !bootstrap_alias(input.lower_uma)
+         || !bootstrap_alias(input.lower_parameter)
+@@ -762,6 +806,14 @@ pub(crate) fn encode(
+             &mut main[0x640 + slot * LOADER_STRIDE..],
+         )?;
+     }
++    if let Some((from, to)) = input.main_macos {
++        for &(at, value) in main_macos::WORDS.iter().take(to.saturating_add(1)).skip(from) {
++            put32(main, usize::from(at), value)?;
++        }
++    }
++    for &(at, value) in &input.poke[..input.poke_n] {
++        put32(main, at as usize, value)?;
++    }
+     let p = &mut objects[id::POWER_PERFORMANCE];
+     put64(p, 0x3b50, input.va[id::TEMPERATURE])?;
+     for (at, value) in [
+diff --git a/drivers/gpu/drm/asahi/g16/initdata.rs b/drivers/gpu/drm/asahi/g16/initdata.rs
+index f31c0cd232..b072f26566 100644
+--- a/drivers/gpu/drm/asahi/g16/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/initdata.rs
+@@ -174,6 +174,9 @@ pub(crate) fn build(
+         j604_main: false,
+         main_nap: super::params::main_nap(),
+         cores: super::params::main_cores(),
++        main_macos: None,
++        poke: [(0, 0); 32],
++        poke_n: 0,
+         fw_thermal: super::params::fw_thermal(),
+     };
+     if input.fw_controllers {
+@@ -185,6 +188,35 @@ pub(crate) fn build(
+             if input.fw_thermal { "on" } else { "off" }
+         );
+     }
++    if let Some((from, to)) = super::params::main_macos() {
++        let words = wire::main_macos::WORDS.len();
++        let last = to.min(words.saturating_sub(1));
++        let written = if from <= last { last - from + 1 } else { 0 };
++        if input.performance.count != 11 {
++            dev_info!(dev, "M4 initdata: g16_main_macos=1 needs eleven rows; none written\n");
++        } else {
++            input.main_macos = Some((from, to));
++            dev_info!(
++                dev,
++                "M4 initdata: g16_main_macos=1: {} of {} macOS Main words (index {}..={})\n",
++                written,
++                words,
++                from,
++                last
++            );
++        }
++    }
++    let (poke, poke_n, poke_bad) = super::params::main_poke();
++    input.poke = poke;
++    input.poke_n = poke_n;
++    if poke_bad {
++        dev_info!(dev, "M4 initdata: g16_main_poke rejected (bad list or outside Main)\n");
++    } else if poke_n > 0 {
++        dev_info!(dev, "M4 initdata: g16_main_poke: {} Main words written\n", poke_n);
++        for &(at, value) in &poke[..poke_n] {
++            dev_info!(dev, "M4 initdata: g16_main_poke Main +{:#x} = {:#x}\n", at, value);
++        }
++    }
+     if input.main_nap {
+         dev_info!(
+             dev,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index de34c73c5f..fb95e42dd8 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -520,6 +520,134 @@ pub(crate) fn max_pstate() -> u32 {
+     "G16: highest governed performance state (default 0: the table's top; 1..top; runtime 0644)"
+ );
+ 
++/// `g16_main_macos` (load time): the index range of [`super::fw::initdata::main_macos::WORDS`]
++/// to write into Main after the encoder, `g16_main_macos_from..=g16_main_macos_to`, or `None`.
++pub(crate) fn main_macos() -> Option<(usize, usize)> {
++    if module_parameters::g16_main_macos.value() == 0 {
++        return None;
++    }
++    Some((
++        module_parameters::g16_main_macos_from.value() as usize,
++        module_parameters::g16_main_macos_to.value() as usize,
++    ))
++}
++
++/// Most `g16_main_poke` pairs.
++pub(crate) const MAIN_POKE_MAX: usize = 32;
++/// `g16_main_poke` pairs: offset in even cells, value in odd cells.
++static MAIN_POKE: [AtomicU32; 2 * MAIN_POKE_MAX] = [const { AtomicU32::new(0) }; 2 * MAIN_POKE_MAX];
++/// How many `g16_main_poke` pairs were accepted (all or none).
++static MAIN_POKE_N: AtomicU32 = AtomicU32::new(0);
++/// Set when `g16_main_poke` was given but rejected (malformed, misaligned or outside Main).
++static MAIN_POKE_BAD: AtomicU32 = AtomicU32::new(0);
++
++fn parse_u32(text: &str) -> Option<u32> {
++    let t = text.trim();
++    match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
++        Some(hex) => u32::from_str_radix(hex, 16).ok(),
++        None => t.parse::<u32>().ok(),
++    }
++}
++
++/// `set` of `g16_main_poke`: "off:val,off:val,..." (hex with 0x or decimal), 32-bit words in
++/// Main, 4-byte aligned, at most [`MAIN_POKE_MAX`]. A bad list is ignored as a whole and reported
++/// at INIT; it never fails the module load.
++///
++/// # Safety
++///
++/// Called by the module-parameter core with `val` NULL or a NUL-terminated string.
++unsafe extern "C" fn main_poke_set(
++    val: *const c_char,
++    _kp: *const kernel::bindings::kernel_param,
++) -> c_int {
++    MAIN_POKE_N.store(0, Ordering::Relaxed);
++    MAIN_POKE_BAD.store(1, Ordering::Relaxed);
++    if val.is_null() {
++        return 0;
++    }
++    // SAFETY: `val` is a NUL-terminated string per the function contract.
++    let Ok(text) = unsafe { core::ffi::CStr::from_ptr(val) }.to_str() else {
++        return 0;
++    };
++    let size = super::fw::initdata::hwdata::SIZE as u32;
++    let mut n = 0;
++    for pair in text.split(',').filter(|p| !p.trim().is_empty()) {
++        let Some((a, v)) = pair.split_once(':') else {
++            return 0;
++        };
++        let (Some(at), Some(value)) = (parse_u32(a), parse_u32(v)) else {
++            return 0;
++        };
++        if n == MAIN_POKE_MAX || at % 4 != 0 || at.checked_add(4).is_none_or(|end| end > size) {
++            return 0;
++        }
++        MAIN_POKE[2 * n].store(at, Ordering::Relaxed);
++        MAIN_POKE[2 * n + 1].store(value, Ordering::Relaxed);
++        n += 1;
++    }
++    MAIN_POKE_N.store(n as u32, Ordering::Relaxed);
++    MAIN_POKE_BAD.store(0, Ordering::Relaxed);
++    0
++}
++
++static MAIN_POKE_OPS: kernel::bindings::kernel_param_ops = kernel::bindings::kernel_param_ops {
++    flags: 0,
++    set: Some(main_poke_set),
++    // Reads back the number of accepted pairs.
++    get: Some(live_u32_get),
++    free: None,
++};
++
++#[link_section = "__param"]
++#[used(compiler)]
++static MAIN_POKE_PARAM: kernel::module_param::KernelParam =
++    kernel::module_param::KernelParam::new(kernel::bindings::kernel_param {
++        name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
++            kernel::c_str!("g16_main_poke")
++        } else {
++            kernel::c_str!("asahi.g16_main_poke")
++        }),
++        // See IDLE_POWER_OFF_PARAM.
++        #[cfg(MODULE)]
++        mod_: (&raw const kernel::bindings::__this_module).cast_mut(),
++        #[cfg(not(MODULE))]
++        mod_: core::ptr::null_mut(),
++        ops: core::ptr::from_ref(&MAIN_POKE_OPS),
++        perm: 0o444,
++        level: -1,
++        flags: 0,
++        __bindgen_anon_1: kernel::bindings::kernel_param__bindgen_ty_1 {
++            arg: core::ptr::from_ref(&MAIN_POKE_N).cast_mut().cast(),
++        },
++    });
++
++#[cfg(MODULE)]
++const MAIN_POKE_TYPE: &[u8] = b"parmtype=g16_main_poke:charp\0";
++#[cfg(MODULE)]
++const MAIN_POKE_DESC: &[u8] =
++    b"parm=g16_main_poke:G16: off:val,... Main words written after the encoder (load time)\0";
++#[cfg(MODULE)]
++#[link_section = ".modinfo"]
++#[used(compiler)]
++static MAIN_POKE_PARMTYPE: [u8; MAIN_POKE_TYPE.len()] = modinfo(MAIN_POKE_TYPE);
++#[cfg(MODULE)]
++#[link_section = ".modinfo"]
++#[used(compiler)]
++static MAIN_POKE_PARM: [u8; MAIN_POKE_DESC.len()] = modinfo(MAIN_POKE_DESC);
++
++/// The accepted `g16_main_poke` pairs, and whether a given list was rejected.
++pub(crate) fn main_poke() -> ([(u32, u32); MAIN_POKE_MAX], usize, bool) {
++    let mut out = [(0, 0); MAIN_POKE_MAX];
++    let n = (MAIN_POKE_N.load(Ordering::Relaxed) as usize).min(MAIN_POKE_MAX);
++    for (i, pair) in out.iter_mut().enumerate().take(n) {
++        *pair = (
++            MAIN_POKE[2 * i].load(Ordering::Relaxed),
++            MAIN_POKE[2 * i + 1].load(Ordering::Relaxed),
++        );
++    }
++    (out, n, MAIN_POKE_BAD.load(Ordering::Relaxed) != 0)
++}
++
+ /// `g16_main_nap` (load time): write the two Main words macOS 26B123 has on the J604 where ours
+ /// keeps the J713's: +0xf38 = 1 and +0x2568 = the enabled core count. 25G83 reads +0xf38 at its
+ /// init to register the perf-state completion interrupts (0x34420) and later both waits on them
+-- 
+2.43.0
+

@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 01:15:26 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally keep the firmware's ktrace
+ records for debugfs
+
+The firmware writes a 0x48-byte record into the ktrace ring at each of
+its trace points whose bit is set in its trace mask (copied at INIT from
+Main +0xec0). Each record carries the firmware timestamp (+0x4), the
+trace id and task (+0x2c), an argument word (+0x30) and four argument
+doublewords (+0xc .. +0x24). The drain only counts them.
+
+Add g16_ktrace_keep (runtime, default 0). With it set the drain copies
+the newest 2048 records into a static ring as it consumes them, and the
+new aurora-g16/ktrace debugfs file prints them, oldest first, with their
+sequence numbers. Nothing is printed to the kernel log per record, and
+the drain itself is unchanged.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/channel.rs | 64 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/mod.rs     |  4 ++
+ drivers/gpu/drm/asahi/g16/params.rs  | 19 +++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs    |  9 ++++
+ 4 files changed, 96 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/channel.rs b/drivers/gpu/drm/asahi/g16/channel.rs
+index c005624650..dda4deae64 100644
+--- a/drivers/gpu/drm/asahi/g16/channel.rs
++++ b/drivers/gpu/drm/asahi/g16/channel.rs
+@@ -266,6 +266,9 @@ pub(crate) fn drain_reports(&self, dev: &kernel::device::Device, events: &mut Ev
+                 return Err(super::boot::eproto());
+             }
+             TRACE_RECORDS.fetch_add(1, Ordering::Relaxed);
++            if super::params::ktrace_keep() {
++                keep_trace(&self.trace.ring, consumer as usize * 0x48);
++            }
+             consumer = (consumer + 1) % 512;
+             self.trace.state.w32(STATE_READ, consumer)?;
+             wmb();
+@@ -284,6 +287,67 @@ pub(crate) fn drain_reports(&self, dev: &kernel::device::Device, events: &mut Ev
+ /// Ktrace records drained since load.
+ static TRACE_RECORDS: AtomicU64 = AtomicU64::new(0);
+ 
++/// Ktrace records `g16_ktrace_keep` holds: the newest ones, oldest overwritten.
++const KT_CAP: usize = 2048;
++/// Per kept record: the timestamp (+0x4), the id word (+0x2c, the task in bits 31:24) with the
++/// argument word (+0x30) above it, and the four argument doublewords (+0xc .. +0x24).
++static KT: [[AtomicU64; 6]; KT_CAP] = [const { [const { AtomicU64::new(0) }; 6] }; KT_CAP];
++/// Records kept since load; the newest is `KT_SEQ - 1`.
++static KT_SEQ: AtomicU64 = AtomicU64::new(0);
++
++/// Copies the ktrace record at byte `at` of the ring before the drain hands it back. The
++/// record is 0x48 bytes and only 4-byte aligned, so it is read in words.
++fn keep_trace(ring: &FwObject, at: usize) {
++    let w = |o: usize| u64::from(ring.r32(at + o).unwrap_or(0));
++    let seq = KT_SEQ.fetch_add(1, Ordering::Relaxed);
++    let kept = [
++        w(0x4) | w(0x8) << 32,
++        w(0x2c) | w(0x30) << 32,
++        w(0xc) | w(0x10) << 32,
++        w(0x14) | w(0x18) << 32,
++        w(0x1c) | w(0x20) << 32,
++        w(0x24) | w(0x28) << 32,
++    ];
++    for (slot, v) in KT[seq as usize % KT_CAP].iter().zip(kept) {
++        slot.store(v, Ordering::Relaxed);
++    }
++}
++
++/// The `aurora-g16/ktrace` file.
++pub(crate) struct KtraceView;
++
++/// One header line, then one line per kept record, oldest first: `kt` seq, the firmware
++/// timestamp (decimal counter ticks), the id word, the argument word and the four arguments
++/// (hex). A record kept while the file is read may print torn; seq tells the reader.
++pub(crate) fn ktrace_show(_v: &KtraceView, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++    let end = KT_SEQ.load(Ordering::Relaxed);
++    let start = end.saturating_sub(KT_CAP as u64);
++    writeln!(
++        f,
++        "ktrace: kept {} shown {} keep {}",
++        end,
++        end - start,
++        u32::from(super::params::ktrace_keep())
++    )?;
++    for seq in start..end {
++        let e = &KT[seq as usize % KT_CAP];
++        let v: [u64; 6] = core::array::from_fn(|i| e[i].load(Ordering::Relaxed));
++        writeln!(
++            f,
++            "kt {} {} {:x} {:x} {:x} {:x} {:x} {:x}",
++            seq,
++            v[0],
++            v[1] & 0xffff_ffff,
++            v[1] >> 32,
++            v[2],
++            v[3],
++            v[4],
++            v[5]
++        )?;
++    }
++    Ok(())
++}
++
+ /// Counts the records log sub-ring `i` holds and keeps the head of its newest one. Read only:
+ /// the drain itself is unchanged. A sub-ring that wraps between two drains is undercounted.
+ fn count_log(log: &Ring, i: usize) {
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 6cbe2ac028..fa2238a8f9 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -265,6 +265,9 @@ pub(crate) struct Shared {
+     /// The `aurora-g16/fwpower` file (read-only view of firmware power words), once created.
+     #[pin]
+     pub(crate) fwpower: Mutex<Option<Pin<KBox<kernel::debugfs::File<poll::FwPower>>>>>,
++    /// The `aurora-g16/ktrace` file (the kept firmware ktrace records), once created.
++    #[pin]
++    pub(crate) ktrace: Mutex<Option<Pin<KBox<kernel::debugfs::File<channel::KtraceView>>>>>,
+ }
+ 
+ impl_has_delayed_work! {
+@@ -511,6 +514,7 @@ pub(crate) fn new(
+                 resnap_handle <- new_mutex!(None, "g16::Shared::resnap_handle"),
+                 state <- new_mutex!(None, "g16::Shared::state"),
+                 fwpower <- new_mutex!(None, "g16::Shared::fwpower"),
++                ktrace <- new_mutex!(None, "g16::Shared::ktrace"),
+             }),
+             GFP_KERNEL,
+         )?;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 766d65af96..de34c73c5f 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1115,6 +1115,25 @@ pub(crate) fn fs_tile_bit16() -> bool {
+     "G16: set bit 16 of the FS tile mode word (register 0x10039, +0x9d8) as macOS does on application renders (default 0: off; 1: set; runtime 0644, read per render)"
+ );
+ 
++/// Storage of `g16_ktrace_keep` (runtime 0644, default 0).
++static KTRACE_KEEP: AtomicU32 = AtomicU32::new(0);
++
++/// Whether the drain keeps a copy of each firmware ktrace record for `aurora-g16/ktrace`. The
++/// firmware writes them only for the trace points its enable mask selects (Main +0xec0, copied at
++/// INIT); without the mask the ring stays empty and this keeps nothing.
++pub(crate) fn ktrace_keep() -> bool {
++    KTRACE_KEEP.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    KTRACE_KEEP_PARAM,
++    KTRACE_KEEP_PARMTYPE,
++    KTRACE_KEEP_PARM,
++    KTRACE_KEEP,
++    "g16_ktrace_keep",
++    "G16: keep the newest 2048 firmware ktrace records, with their firmware timestamps, for aurora-g16/ktrace (default 0: count them only; runtime 0644)"
++);
++
+ /// Storage of `g16_usc_pool` (runtime 0644, default 0).
+ static USC_POOL: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 2a46751b7c..ade944bd1a 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -599,6 +599,15 @@ pub(crate) fn start_engine(self: &Arc<Self>) -> Result {
+             dir.read_callback_file(c_str!("stats"), self.clone(), &stats_show),
+             GFP_KERNEL,
+         )?;
++        let ktrace = KBox::pin_init(
++            dir.read_callback_file(
++                c_str!("ktrace"),
++                super::channel::KtraceView,
++                &super::channel::ktrace_show,
++            ),
++            GFP_KERNEL,
++        )?;
++        *self.ktrace.lock() = Some(ktrace);
+         let mut state = self.state.lock();
+         let firmware = state.as_deref_mut().ok_or(ENODEV)?;
+         firmware.engine.shared = Some(self.clone());
+-- 
+2.43.0
+

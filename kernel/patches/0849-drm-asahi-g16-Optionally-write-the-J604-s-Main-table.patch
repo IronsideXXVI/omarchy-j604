@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 00:04:25 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally write the J604's Main
+ tables as macOS does
+
+With the eleven-row table the J604's Main object carries the right
+frequencies and voltages, but its per-row tables are zero: the scale,
+the two relative tables, and the two ladders of the ADT states the rows
+came from. macOS 26B123 writes all five on this machine at INIT, and
+counts ten states where we count eleven rows. 25G83 copies the scale
+and both relative tables into its own per-row state when it starts, and
+interpolates its controllers over them; it does not read the ladders.
+
+Add g16_j604_main (load time, default 0). With the eleven-row table it
+writes macOS's values for the J604: scale 1.02 on every row, relative
+tables in percent of the top row, the two ADT state ladders, and a
+state count of ten. Without the eleven-row table it writes nothing and
+says so. With the switch off nothing changes.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs      |  4 +++
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs | 41 ++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/initdata.rs    | 16 +++++++++
+ drivers/gpu/drm/asahi/g16/params.rs      |  7 ++++
+ 4 files changed, 68 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index d5c5b56abf..82b1cabb3f 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -267,6 +267,10 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 0,
+             description: "G16: J604 with eleven DVFS rows, ADT state 4 kept (default 0)",
+         },
++        g16_j604_main: u32 {
++            default: 0,
++            description: "G16: J604 Main tables as macOS has them (default 0; needs eleven rows)",
++        },
+         g16_fw_controllers: u32 {
+             default: 0,
+             description: "G16: firmware power controllers (default 0; 1: with thermal, 2: without)",
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index 254e84f5d7..de7360cdc5 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -195,6 +195,33 @@ pub(crate) fn encode_globals_policy(g: &mut [u8], idle_power_off: bool) -> Resul
+ }
+ pub(crate) mod hwdata {
+     pub(crate) const SIZE: usize = super::OBJECT_SIZE[super::id::MAIN];
++
++    /// The J604's eleven-row Main tables as macOS 26B123 has them at INIT on this machine
++    /// (its Main = these offsets + 0x11c). 25G83 copies the scale and both relative tables
++    /// into its own per-row state at 0x316fc; no 25G83 instruction reads the index ladders.
++    pub(crate) mod j604 {
++        /// The state count: 10 on macOS with eleven rows (the row count less the off row).
++        pub(crate) const STATES: u32 = 10;
++        /// f32 per row, 1.02 on every row.
++        pub(crate) const SCALE: usize = 0x1848;
++        pub(crate) const SCALE_VALUE: u32 = 0x3f82_8f5c;
++        /// f32 per row, percent of the top row.
++        pub(crate) const RELATIVE_A: usize = 0x18c8;
++        pub(crate) const RELATIVE_A_ROWS: [u32; 11] = [
++            0x0000_0000, 0x410a_8eae, 0x416e_7f29, 0x41a7_3bf8, 0x41db_5790, 0x4210_5246,
++            0x4232_fb96, 0x4257_32b7, 0x4272_1f67, 0x429e_25b9, 0x42c8_0000,
++        ];
++        pub(crate) const RELATIVE_B: usize = 0x1908;
++        pub(crate) const RELATIVE_B_ROWS: [u32; 11] = [
++            0x0000_0000, 0x0000_0000, 0x41b4_a529, 0x4213_bdf0, 0x423e_5295, 0x4267_9ce6,
++            0x4286_318c, 0x4297_9ce7, 0x42a1_4a52, 0x42b6_94a5, 0x42c8_0000,
++        ];
++        /// u32 per row, the ADT state each row came from.
++        pub(crate) const INDEX_A: usize = 0x19c8;
++        pub(crate) const INDEX_A_ROWS: [u32; 11] = [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 15];
++        pub(crate) const INDEX_B: usize = 0x1a08;
++        pub(crate) const INDEX_B_ROWS: [u32; 11] = [0, 1, 2, 3, 4, 5, 7, 9, 11, 13, 15];
++    }
+ }
+ 
+ /// One logical loader record, including its page offset and exact PTE class.
+@@ -507,6 +534,8 @@ pub(crate) struct Input {
+     /// With [`Self::fw_controllers`]: also the thermal controllers and the MTR chains
+     /// (`g16_fw_controllers=1`; 2 leaves them off).
+     pub(crate) fw_thermal: bool,
++    /// Write [`hwdata::j604`] (`g16_j604_main`); only with an eleven-row table.
++    pub(crate) j604_main: bool,
+ }
+ 
+ pub(crate) fn object_va(va: u64, size: usize) -> bool {
+@@ -583,6 +612,7 @@ pub(crate) fn encode(
+ ) -> Result<(), ()> {
+     if !input.performance.valid()
+         || !(1..input.performance.count as u32).contains(&ceiling)
++        || (input.j604_main && input.performance.count != 11)
+         || !object_va(input.scratch, 0x8000)
+         || !bootstrap_alias(input.lower_uma)
+         || !bootstrap_alias(input.lower_parameter)
+@@ -684,6 +714,17 @@ pub(crate) fn encode(
+     put32(main, 0xea4, input.progress_recovery)?;
+     put64(main, 0xf24, 0x0000000607002004)?;
+     put32(main, 0xfc4, ceiling)?;
++    if input.j604_main {
++        use hwdata::j604;
++        put32(main, 0xfc0, j604::STATES)?;
++        for i in 0..11 {
++            put32(main, j604::SCALE + i * 4, j604::SCALE_VALUE)?;
++            put32(main, j604::RELATIVE_A + i * 4, j604::RELATIVE_A_ROWS[i])?;
++            put32(main, j604::RELATIVE_B + i * 4, j604::RELATIVE_B_ROWS[i])?;
++            put32(main, j604::INDEX_A + i * 4, j604::INDEX_A_ROWS[i])?;
++            put32(main, j604::INDEX_B + i * 4, j604::INDEX_B_ROWS[i])?;
++        }
++    }
+     for i in 0..=ceiling as usize {
+         put32(main, 0xfc8 + i * 4, input.performance.frequency[i])?;
+         put32(main, 0x1808 + i * 4, input.performance.auxiliary[i])?;
+diff --git a/drivers/gpu/drm/asahi/g16/initdata.rs b/drivers/gpu/drm/asahi/g16/initdata.rs
+index f4629059fd..6315a3c8c2 100644
+--- a/drivers/gpu/drm/asahi/g16/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/initdata.rs
+@@ -171,6 +171,7 @@ pub(crate) fn build(
+         idle_power_off: idle_power_off_level != 0,
+         globals_required: super::params::globals_required(),
+         fw_controllers: super::params::fw_controllers(),
++        j604_main: false,
+         fw_thermal: super::params::fw_thermal(),
+     };
+     if input.fw_controllers {
+@@ -182,6 +183,21 @@ pub(crate) fn build(
+             if input.fw_thermal { "on" } else { "off" }
+         );
+     }
++    if super::params::j604_main() {
++        if input.performance.count == 11 {
++            input.j604_main = true;
++            dev_info!(
++                dev,
++                "M4 initdata: g16_j604_main=1: J604 Main rows as macOS, states {}\n",
++                wire::hwdata::j604::STATES
++            );
++        } else {
++            dev_info!(
++                dev,
++                "M4 initdata: g16_j604_main=1 needs the eleven-row table; not written\n"
++            );
++        }
++    }
+     if input.globals_required {
+         dev_info!(
+             dev,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 931d494901..2f7a2956db 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1851,6 +1851,13 @@ pub(crate) fn fw_thermal() -> bool {
+     fw_controllers_mode() == 1
+ }
+ 
++/// Whether the J604's eleven-row Main tables are written as macOS 26B123 writes them at INIT
++/// on this machine (`g16_j604_main`, load time): the per-row scale, relative_a / relative_b and
++/// index ladders, and the state count. Only with the eleven-row table (`g16_j604_rows11`).
++pub(crate) fn j604_main() -> bool {
++    module_parameters::g16_j604_main.value() != 0
++}
++
+ /// Whether the J604 takes eleven firmware rows from its sixteen ADT states, keeping state 4
+ /// (`g16_j604_rows11`, load time). Its ADT has eleven distinct voltage rows, which macOS uses.
+ pub(crate) fn j604_rows11() -> bool {
+-- 
+2.43.0
+

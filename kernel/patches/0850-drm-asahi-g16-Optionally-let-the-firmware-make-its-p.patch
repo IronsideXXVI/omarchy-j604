@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 00:05:59 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally let the firmware make its
+ power-off request
+
+When 25G83 powers the GPU off, and when it enters NAP, it makes a
+guarded power request (call 1) only if Main +0xf38 is non-zero. macOS
+26B123 has 1 there on the J604; we leave it zero, so our firmware powers
+the cores off without ever making that request. macOS's PMGR GFX domain
+gates at idle and ours stays on, and this is the one difference found on
+that path. macOS also has the J604's enabled core count, 10, in Main
++0x2568, where we carry the J713's 8.
+
+Add g16_main_nap (runtime, default 0). Set, it writes Main +0xf38 = 1
+and +0x2568 = the core count read at power-up, at INIT and into the
+live Main object, which the firmware reads at its next power-off or
+NAP; 0 writes back zero and 8. Main +0x2560, the other word the same
+code tests, stays zero as on macOS. With the switch off nothing changes.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/boot.rs        |  1 +
+ drivers/gpu/drm/asahi/g16/fw/initdata.rs | 16 ++++++++++-
+ drivers/gpu/drm/asahi/g16/initdata.rs    | 12 +++++++-
+ drivers/gpu/drm/asahi/g16/params.rs      | 35 ++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/power.rs       | 32 ++++++++++++++++++++++
+ 5 files changed, 94 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index 59449d0a6f..abb238ef58 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -943,6 +943,7 @@ pub(crate) fn start(
+         "M4 G16G: {} cores enabled\n",
+         id.core_masks[0].count_ones()
+     );
++    super::params::set_cores(id.core_masks[0].count_ones());
+     if regs.pstate()? > super::power::policy::pstate_max() {
+         return Err(eproto());
+     }
+diff --git a/drivers/gpu/drm/asahi/g16/fw/initdata.rs b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+index de7360cdc5..263d385f1f 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/initdata.rs
+@@ -195,6 +195,13 @@ pub(crate) fn encode_globals_policy(g: &mut [u8], idle_power_off: bool) -> Resul
+ }
+ pub(crate) mod hwdata {
+     pub(crate) const SIZE: usize = super::OBJECT_SIZE[super::id::MAIN];
++    /// u32: non-zero makes 25G83 issue its guarded power call 1 at power-off and NAP entry
++    /// (1 on macOS 26B123 on the J604).
++    pub(crate) const NAP_REQUEST: usize = 0xf38;
++    /// u32: the enabled core count (10 on macOS on the J604).
++    pub(crate) const CORES: usize = 0x2568;
++    /// The J713's count, which the qualified encoding carries.
++    pub(crate) const CORES_J713: u32 = 8;
+ 
+     /// The J604's eleven-row Main tables as macOS 26B123 has them at INIT on this machine
+     /// (its Main = these offsets + 0x11c). 25G83 copies the scale and both relative tables
+@@ -536,6 +543,9 @@ pub(crate) struct Input {
+     pub(crate) fw_thermal: bool,
+     /// Write [`hwdata::j604`] (`g16_j604_main`); only with an eleven-row table.
+     pub(crate) j604_main: bool,
++    /// Main +0xf38 = 1 and +0x2568 = [`Self::cores`] (`g16_main_nap`).
++    pub(crate) main_nap: bool,
++    pub(crate) cores: u32,
+ }
+ 
+ pub(crate) fn object_va(va: u64, size: usize) -> bool {
+@@ -706,7 +716,7 @@ pub(crate) fn encode(
+         (0x254c, 3),
+         (0x2550, 7),
+         (0x2554, 7),
+-        (0x2568, 8),
++        (hwdata::CORES, hwdata::CORES_J713),
+         (0x2570, 1),
+     ] {
+         put32(main, at, value)?;
+@@ -725,6 +735,10 @@ pub(crate) fn encode(
+             put32(main, j604::INDEX_B + i * 4, j604::INDEX_B_ROWS[i])?;
+         }
+     }
++    if input.main_nap {
++        put32(main, hwdata::NAP_REQUEST, 1)?;
++        put32(main, hwdata::CORES, input.cores)?;
++    }
+     for i in 0..=ceiling as usize {
+         put32(main, 0xfc8 + i * 4, input.performance.frequency[i])?;
+         put32(main, 0x1808 + i * 4, input.performance.auxiliary[i])?;
+diff --git a/drivers/gpu/drm/asahi/g16/initdata.rs b/drivers/gpu/drm/asahi/g16/initdata.rs
+index 6315a3c8c2..ff708888fa 100644
+--- a/drivers/gpu/drm/asahi/g16/initdata.rs
++++ b/drivers/gpu/drm/asahi/g16/initdata.rs
+@@ -21,7 +21,6 @@ pub(crate) struct InitData {
+     /// Recovery/scheduler owner: root.FirmwareData, not the small Control.
+     pub(crate) control: Option<Arc<FwObject>>,
+     pub(crate) ready_control: Option<Arc<FwObject>>,
+-    #[allow(dead_code)]
+     pub(crate) main: Option<Arc<FwObject>>,
+     /// Fault/recovery activity; retained under the historical field name.
+     #[allow(dead_code)]
+@@ -172,6 +171,8 @@ pub(crate) fn build(
+         globals_required: super::params::globals_required(),
+         fw_controllers: super::params::fw_controllers(),
+         j604_main: false,
++        main_nap: super::params::main_nap(),
++        cores: super::params::main_cores(),
+         fw_thermal: super::params::fw_thermal(),
+     };
+     if input.fw_controllers {
+@@ -183,6 +184,15 @@ pub(crate) fn build(
+             if input.fw_thermal { "on" } else { "off" }
+         );
+     }
++    if input.main_nap {
++        dev_info!(
++            dev,
++            "M4 initdata: g16_main_nap=1: Main +{:#x} = 1, +{:#x} = {}\n",
++            wire::hwdata::NAP_REQUEST,
++            wire::hwdata::CORES,
++            input.cores
++        );
++    }
+     if super::params::j604_main() {
+         if input.performance.count == 11 {
+             input.j604_main = true;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 2f7a2956db..a9e4ff2312 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -520,6 +520,41 @@ pub(crate) fn max_pstate() -> u32 {
+     "G16: highest governed performance state (default 0: the table's top; 1..top; runtime 0644)"
+ );
+ 
++/// Storage of `g16_main_nap` (runtime 0644, default 0).
++static MAIN_NAP: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_main_nap`: write the two Main words macOS 26B123 has on the J604 where ours keeps the
++/// J713's: +0xf38 = 1, on which 25G83 makes its guarded power call 1 whenever it powers the
++/// GPU off (0x3b600) and on entering NAP (0x358e8), and +0x2568 = the enabled core count.
++/// The firmware reads +0xf38 at each of those, so a change applies at the next one.
++pub(crate) fn main_nap() -> bool {
++    MAIN_NAP.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    MAIN_NAP_PARAM,
++    MAIN_NAP_PARMTYPE,
++    MAIN_NAP_PARM,
++    MAIN_NAP,
++    "g16_main_nap",
++    "G16: Main +0xf38 = 1 and +0x2568 = core count, as macOS (default 0; runtime 0644)"
++);
++
++/// Enabled GPU cores, from the identity read at power-up (0 before it).
++static CORES: AtomicU32 = AtomicU32::new(0);
++
++pub(crate) fn set_cores(cores: u32) {
++    CORES.store(cores, Ordering::Relaxed);
++}
++
++/// The enabled core count for Main +0x2568, or the J713's 8 if it was never read.
++pub(crate) fn main_cores() -> u32 {
++    match CORES.load(Ordering::Relaxed) {
++        cores @ 1..=16 => cores,
++        _ => super::fw::initdata::hwdata::CORES_J713,
++    }
++}
++
+ /// Storage of `g16_irq_only` (runtime 0644, default 0).
+ static IRQ_ONLY: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/power.rs b/drivers/gpu/drm/asahi/g16/power.rs
+index bb3acb37da..a8e7a66446 100644
+--- a/drivers/gpu/drm/asahi/g16/power.rs
++++ b/drivers/gpu/drm/asahi/g16/power.rs
+@@ -174,6 +174,8 @@ pub(crate) struct Power {
+     pub(crate) decisions: u64,
+     last_decision: Option<(u32, u32, u32, u32, Option<Error>)>,
+     pub(crate) utilization: policy::Governor,
++    /// The `g16_main_nap` value last written into the live Main object.
++    main_nap: Option<bool>,
+ }
+ 
+ impl Drop for Power {
+@@ -220,6 +222,7 @@ pub(crate) fn new(dev: &device::Device) -> Result<Self> {
+             decisions: 0,
+             last_decision: None,
+             utilization: policy::Governor::new(),
++            main_nap: None,
+         })
+     }
+ 
+@@ -276,6 +279,34 @@ fn ceiling(&mut self, now: u64, idle: bool) -> (u32, bool) {
+ }
+ 
+ impl Firmware {
++    /// `g16_main_nap` at runtime: written into the live Main object, read by the firmware at
++    /// its next power-off or NAP entry. The first pass rewrites what INIT wrote.
++    fn service_main_nap(&mut self) -> Result {
++        use super::fw::initdata::hwdata;
++        let want = params::main_nap();
++        if self.power.main_nap == Some(want) {
++            return Ok(());
++        }
++        let cores = if want { params::main_cores() } else { hwdata::CORES_J713 };
++        let main = self.init.main.as_ref().ok_or(ENODEV)?;
++        main.w32(hwdata::NAP_REQUEST, u32::from(want))?;
++        main.w32(hwdata::CORES, cores)?;
++        wmb();
++        if self.power.main_nap.is_some() || want {
++            dev_info!(
++                self.dev(),
++                "M4 power: g16_main_nap={}: Main +{:#x} = {}, +{:#x} = {}\n",
++                u32::from(want),
++                hwdata::NAP_REQUEST,
++                u32::from(want),
++                hwdata::CORES,
++                cores
++            );
++        }
++        self.power.main_nap = Some(want);
++        Ok(())
++    }
++
+     /// Runs after firmware acceptance, before publication and while polling
+     /// active work. Provider, governor and budget reads occur at most every
+     /// 5 ms, independently of completion polling. Only the three
+@@ -286,6 +317,7 @@ pub(crate) fn service_power(&mut self) -> Result {
+             return Err(error);
+         }
+         self.service_idle_power_off()?;
++        self.service_main_nap()?;
+         // g16_idle_selector: keep the idle value while idle; once work is in flight or
+         // pending, force the busy value out below, before any publication.
+         if self.power.idle_selected {
+-- 
+2.43.0
+

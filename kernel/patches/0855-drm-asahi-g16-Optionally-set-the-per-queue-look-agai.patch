@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 01:27:27 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally set the per-queue
+ look-again word before a doorbell
+
+At every completion event the 25G83 firmware pauses for about 300 us
+while published work waits in its queues. Its dispatcher reads a word per
+queue in the Activity-Tiler object (+0x614, 0x18 per queue), tests it for
+1, clears it and raises a scheduler event when it was set, and no
+firmware code sets it: a flag only the host can raise. We never write it.
+
+Add g16_look_again, a runtime switch: before each doorbell, 1 writes 1 to
+the word of the channel being rung, 2 to the words of the TA, FS and
+compute channels. The object is our Activity-Tiler object, which Runtime
++0x254 names. The default 0 changes nothing.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/boot.rs   | 25 +++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/params.rs | 19 +++++++++++++++++++
+ 2 files changed, 44 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/boot.rs b/drivers/gpu/drm/asahi/g16/boot.rs
+index abb238ef58..5fc2e327e7 100644
+--- a/drivers/gpu/drm/asahi/g16/boot.rs
++++ b/drivers/gpu/drm/asahi/g16/boot.rs
+@@ -510,6 +510,8 @@ pub(crate) struct Session {
+     /// The Globals object once initdata is built: every doorbell adds one to its
+     /// [`super::fw::initdata::globals::DOORBELL_TALLY`] (`g16_doorbell_tally`).
+     pub(crate) globals: Option<Arc<super::object::FwObject>>,
++    /// The Activity-Tiler object (Runtime +0x254) once initdata is built (`g16_look_again`).
++    pub(crate) activity: Option<Arc<super::object::FwObject>>,
+ }
+ 
+ impl Session {
+@@ -547,10 +549,31 @@ pub(crate) fn send(&mut self, endpoint: u8, message: u64) -> Result {
+ 
+     /// Rings a submit channel's doorbell: EP 0x21 `0x0083 << 48 | channel`.
+     pub(crate) fn ring(&mut self, channel: Channel) -> Result {
++        // g16_look_again: the per-queue word of the Activity-Tiler object (+0x614, 0x18 per
++        // queue) that the 25G83 dispatcher reads, tests for 1 and clears, and that no firmware
++        // code sets: 1 for the channel rung, or for TA, FS and compute, before the doorbell.
++        let look = super::params::look_again();
++        if look != 0 {
++            if let Some(a) = self.activity.as_ref() {
++                let all = [Channel::Ta, Channel::Fs, Channel::Compute];
++                let chans: &[Channel] = if look == 1 {
++                    core::slice::from_ref(&channel)
++                } else {
++                    &all
++                };
++                for c in chans {
++                    a.w32(LOOK_AGAIN + 0x18 * *c as usize, 1)?;
++                }
++                regs::wmb();
++            }
++        }
+         self.send(hw::ep::DOORBELL, hw::engine::DOORBELL | channel as u64)
+     }
+ }
+ 
++/// `g16_look_again`: the first per-queue word in the Activity-Tiler object.
++const LOOK_AGAIN: usize = 0x614;
++
+ /// The firmware at READY.
+ pub(crate) struct Booted {
+     pub(crate) session: Session,
+@@ -987,6 +1010,7 @@ pub(crate) fn start(
+         adt,
+         uat,
+         globals: None,
++        activity: None,
+     };
+     let mut events = Events::new();
+     let mut built = None;
+@@ -995,6 +1019,7 @@ pub(crate) fn start(
+         // Every host object and every context-0 alias is prepared before RUN is set.
+         built = Some(initdata::build(&d, &session.adt, &mut objects)?);
+         session.globals = built.as_ref().and_then(|(init, _, _)| init.globals.clone());
++        session.activity = built.as_ref().map(|(init, _, _)| init.ta_activity.clone());
+         objects.window.lock().bootstrap(&d, &session.uat)?;
+         uat::tlbi_all();
+         if session.regs.asc_control()? & regs::ASC_RUN != 0 {
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 692fa3f78c..da5ab02c95 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1187,6 +1187,25 @@ pub(crate) fn gpu_off_delay() -> u32 {
+     "G16: the firmware's GPU power-off delay word (Main hwdata +0xed0, 24 MHz ticks; default 0: 24000 = 1 ms; set before the GPU starts)"
+ );
+ 
++/// Storage of `g16_look_again` (runtime 0644, default 0).
++static LOOK_AGAIN: AtomicU32 = AtomicU32::new(0);
++
++/// Before each doorbell, set the Activity-Tiler per-queue word (+0x614 + 0x18 per queue)
++/// that the dispatcher tests for 1 and clears: 0 never; 1 for the channel rung; 2 for the
++/// TA, FS and compute channels.
++pub(crate) fn look_again() -> u32 {
++    LOOK_AGAIN.load(Ordering::Relaxed).min(2)
++}
++
++live_u32_param!(
++    LOOK_AGAIN_PARAM,
++    LOOK_AGAIN_PARMTYPE,
++    LOOK_AGAIN_PARM,
++    LOOK_AGAIN,
++    "g16_look_again",
++    "G16: before each doorbell write 1 to the Activity-Tiler per-queue word the dispatcher reads and clears (default 0: never; 1: the channel rung; 2: TA, FS and compute; runtime 0644)"
++);
++
+ /// Storage of `g16_dep_record` (runtime 0644, default 0).
+ static DEP_RECORD: AtomicU32 = AtomicU32::new(0);
+ 
+-- 
+2.43.0
+

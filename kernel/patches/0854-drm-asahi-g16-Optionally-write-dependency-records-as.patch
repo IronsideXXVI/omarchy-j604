@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 01:18:31 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally write dependency records
+ as Gravity does
+
+Gravity's G16 dependency record carries the waiter's uuid at +0x28 and a
+1 at +0x30, "type 1 participates in firmware's dynamic dependency graph",
+and nothing at +0x3c. Ours drops the uuid and writes neither word; it
+writes its own type at +0x3c instead. The FS of every render waits on its
+TA through such a record, and that hand-off takes 33-36 us against
+macOS's 7.
+
+Add g16_dep_record, a runtime switch read at each record written: 1 also
+writes the uuid and dependency type 1, 2 writes Gravity's record exactly,
+without the +0x3c word. The render records get it (the FS wait on its TA,
+and the predecessor wait with g16_render_chain); compute writes no
+dependency record. The default 0 changes nothing.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/encode.rs  | 13 +++++++++++--
+ drivers/gpu/drm/asahi/g16/fw/work.rs |  4 ++++
+ drivers/gpu/drm/asahi/g16/params.rs  | 19 +++++++++++++++++++
+ 3 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/encode.rs b/drivers/gpu/drm/asahi/g16/encode.rs
+index 50e4f5d00d..420a647767 100644
+--- a/drivers/gpu/drm/asahi/g16/encode.rs
++++ b/drivers/gpu/drm/asahi/g16/encode.rs
+@@ -268,7 +268,7 @@ pub(crate) fn barrier(
+     wait: u32,
+     event: u32,
+     own: u32,
+-    _uuid: u32,
++    uuid: u32,
+     ty: work::BarrierType,
+ ) -> [u8; barrier::SIZE] {
+     let mut x = [0u8; barrier::SIZE];
+@@ -279,7 +279,16 @@ pub(crate) fn barrier(
+     put32(&mut x, barrier::WAIT, wait);
+     put32(&mut x, barrier::EVENT, event);
+     put32(&mut x, barrier::OWN, own);
+-    put32(&mut x, barrier::TYPE, ty as u32);
++    // g16_dep_record: 1 adds Gravity's uuid and dependency type 1; 2 is Gravity's record
++    // exactly, without our type word at +0x3c.
++    let dep = super::params::dep_record();
++    if dep != 2 {
++        put32(&mut x, barrier::TYPE, ty as u32);
++    }
++    if dep != 0 {
++        put32(&mut x, barrier::UUID, uuid);
++        put32(&mut x, barrier::DEPENDENCY, 1);
++    }
+     x
+ }
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/fw/work.rs b/drivers/gpu/drm/asahi/g16/fw/work.rs
+index f903c7024c..fcb3bbd7fb 100644
+--- a/drivers/gpu/drm/asahi/g16/fw/work.rs
++++ b/drivers/gpu/drm/asahi/g16/fw/work.rs
+@@ -128,6 +128,10 @@ pub(crate) mod barrier {
+     pub(crate) const EVENT: usize = 0x20;
+     pub(crate) const OWN: usize = 0x24;
+     pub(crate) const TYPE: usize = 0x3c;
++    /// The waiter's uuid and the dependency type of Gravity's 0x40-byte dependency record
++    /// (type 1: the edge takes part in the firmware's dynamic dependency graph).
++    pub(crate) const UUID: usize = 0x28;
++    pub(crate) const DEPENDENCY: usize = 0x30;
+     /// UUID of render predecessor waits.
+     pub(crate) const RENDER_WAIT_UUID: u32 = 0x3d420;
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index fb95e42dd8..692fa3f78c 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1187,6 +1187,25 @@ pub(crate) fn gpu_off_delay() -> u32 {
+     "G16: the firmware's GPU power-off delay word (Main hwdata +0xed0, 24 MHz ticks; default 0: 24000 = 1 ms; set before the GPU starts)"
+ );
+ 
++/// Storage of `g16_dep_record` (runtime 0644, default 0).
++static DEP_RECORD: AtomicU32 = AtomicU32::new(0);
++
++/// The dependency (barrier) records the host writes, as Gravity's `dependency` record: 0 as
++/// before; 1 also the waiter's uuid at +0x28 and dependency type 1 at +0x30; 2 the same
++/// without our type word at +0x3c. Read at each record written.
++pub(crate) fn dep_record() -> u32 {
++    DEP_RECORD.load(Ordering::Relaxed).min(2)
++}
++
++live_u32_param!(
++    DEP_RECORD_PARAM,
++    DEP_RECORD_PARMTYPE,
++    DEP_RECORD_PARM,
++    DEP_RECORD,
++    "g16_dep_record",
++    "G16: dependency records in Gravity's form (default 0: as before; 1: also uuid at +0x28 and type 1 at +0x30; 2: the same without the +0x3c type word; runtime 0644)"
++);
++
+ /// Storage of `g16_nap_hold` (runtime 0644, default 0).
+ static NAP_HOLD: AtomicU32 = AtomicU32::new(0);
+ 
+-- 
+2.43.0
+
