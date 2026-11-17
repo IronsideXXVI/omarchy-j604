@@ -1,0 +1,228 @@
+diff --git a/src/asahi/compiler/agx_compile.c b/src/asahi/compiler/agx_compile.c
+index c6606c18c1c..9cefed0c718 100644
+--- a/src/asahi/compiler/agx_compile.c
++++ b/src/asahi/compiler/agx_compile.c
+@@ -87,6 +87,18 @@ agx_g16_shared_nz_enabled(void)
+    return debug_get_bool_option("ASAHI_G16_SHARED_NZ", true);
+ }
+ 
++bool
++agx_g16_pix_hoist_enabled(void)
++{
++   return debug_get_bool_option("ASAHI_G16_PIX_HOIST", true);
++}
++
++bool
++agx_g16_blend_dst_first_enabled(void)
++{
++   return debug_get_bool_option("ASAHI_G16_BLEND_DST_FIRST", true);
++}
++
+ uint64_t
+ agx_get_compiler_debug(void)
+ {
+@@ -10905,6 +10917,71 @@ agx3_coalesce_uniform_half_stores(agx_context *ctx)
+  * adjacent run of non-coherent loads with identical operation and base; SSA
+  * keeps their consumers attached to the correct result and no serialization
+  * is introduced. */
++/* G16G (ASAHI_G16_PIX_HOIST=0 opts out): after scheduling, move
++ * float arithmetic computed only from uniforms ahead of the first
++ * pixel-ordering wait of its block, so it executes outside the ordered colour
++ * transaction instead of between WAIT_PIX and the tile store. Only fadd, fmul,
++ * ffma and mov_imm move, and only when every source is a uniform, an
++ * immediate, or the result of another such instruction. Moved instructions
++ * keep their relative order and their exact operations, modifiers and
++ * operands, so results are bit-identical. */
++static bool
++agx3_g16_hoist_pixel_independent(agx_context *ctx)
++{
++   if (ctx->key->dev.chip != AGX_CHIP_G16G ||
++       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble ||
++       !agx_g16_pix_hoist_enabled())
++      return false;
++
++   /* Values computed only from uniforms and immediates by the movable ops,
++    * wherever they are in the block. Texture, varying and tile results never
++    * qualify, so per-pixel work keeps its scheduled place. */
++   BITSET_WORD *uniform = BITSET_CALLOC(ctx->alloc);
++   if (!uniform)
++      return false;
++
++   bool progress = false;
++   agx_foreach_block(ctx, block) {
++      agx_instr *wait = NULL;
++      agx_foreach_instr_in_block_safe(block, I) {
++         if (!wait && I->op == AGX_OPCODE_WAIT_PIX) {
++            wait = I;
++            continue;
++         }
++
++         bool uniform_only = (I->op == AGX_OPCODE_FADD ||
++                              I->op == AGX_OPCODE_FMUL ||
++                              I->op == AGX_OPCODE_FFMA ||
++                              I->op == AGX_OPCODE_MOV_IMM) &&
++                             I->nr_dests == 1 &&
++                             I->dest[0].type == AGX_INDEX_NORMAL;
++         agx_foreach_src(I, s) {
++            const agx_index src = I->src[s];
++            if (src.type == AGX_INDEX_NORMAL) {
++               if (!BITSET_TEST(uniform, src.value))
++                  uniform_only = false;
++            } else if (src.type != AGX_INDEX_UNIFORM &&
++                       src.type != AGX_INDEX_IMMEDIATE &&
++                       src.type != AGX_INDEX_NULL) {
++               uniform_only = false;
++            }
++         }
++
++         if (!uniform_only)
++            continue;
++         BITSET_SET(uniform, I->dest[0].value);
++         if (wait) {
++            list_del(&I->link);
++            list_addtail(&I->link, &wait->link);
++            progress = true;
++         }
++      }
++   }
++
++   free(uniform);
++   return progress;
++}
++
+ static bool
+ agx3_order_fragment_device_loads(agx_context *ctx)
+ {
+@@ -12936,6 +13013,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
+    }
+ 
+    AGX_PASS(ctx, agx3_order_fragment_device_loads);
++   AGX_PASS(ctx, agx3_g16_hoist_pixel_independent);
+ 
+    if (agx_should_dump(nir, AGX_DBG_SHADERS))
+       agx_print_shader(ctx, stdout);
+diff --git a/src/asahi/compiler/agx_debug.h b/src/asahi/compiler/agx_debug.h
+index 35509837330..92ec71733e1 100644
+--- a/src/asahi/compiler/agx_debug.h
++++ b/src/asahi/compiler/agx_debug.h
+@@ -41,6 +41,10 @@ uint64_t agx_get_compiler_debug(void);
+ 
+ /* Qualified on G16G; ASAHI_G16_SHARED_NZ=0 restores legacy materialization. */
+ bool agx_g16_shared_nz_enabled(void);
++/* Qualified on G16G; ASAHI_G16_PIX_HOIST=0 restores the scheduler placement. */
++bool agx_g16_pix_hoist_enabled(void);
++/* Qualified on G16G; ASAHI_G16_BLEND_DST_FIRST=0 restores the source-first blend add. */
++bool agx_g16_blend_dst_first_enabled(void);
+ 
+ /* Why the last agx_compile_shader_nir() on this thread returned false
+  * ("" when it succeeded), for the driver's "cannot encode" error. */
+diff --git a/src/asahi/lib/agx_linker.h b/src/asahi/lib/agx_linker.h
+index c12b20efc2d..1753c5ad918 100644
+--- a/src/asahi/lib/agx_linker.h
++++ b/src/asahi/lib/agx_linker.h
+@@ -361,6 +361,8 @@ struct agx_fs_epilog_key {
+    /* The layout keeps attachment 0 alone in the tilebuffer and spills the
+     * others (agx_build_tilebuffer_layout_rt0_resident). */
+    bool rt0_resident;
++   /* Emit the blend destination term first (nir_lower_blend_rt::dst_term_first). */
++   bool blend_dst_first;
+    /* Pixel classes the main part already holds (agx_shader_info::
+     * agx3_pixel_held); the epilog does not wait for them again. */
+    uint8_t main_pixel_held;
+diff --git a/src/asahi/lib/agx_nir_prolog_epilog.c b/src/asahi/lib/agx_nir_prolog_epilog.c
+index a9883cf5c6b..0fa1fd95cd8 100644
+--- a/src/asahi/lib/agx_nir_prolog_epilog.c
++++ b/src/asahi/lib/agx_nir_prolog_epilog.c
+@@ -843,6 +843,7 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
+ 
+             .alpha.src_factor = blend.alpha_src_factor,
+             .alpha.dst_factor = blend.alpha_dst_factor,
++            .dst_term_first = key->blend_dst_first,
+             .alpha.func = blend.alpha_func,
+ 
+             .colormask = key->blend.rt[i].colormask,
+diff --git a/src/asahi/vulkan/hk_cmd_draw.c b/src/asahi/vulkan/hk_cmd_draw.c
+index 9b381878429..01bf7a427bc 100644
+--- a/src/asahi/vulkan/hk_cmd_draw.c
++++ b/src/asahi/vulkan/hk_cmd_draw.c
+@@ -10538,6 +10538,8 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
+    key->epilog.link.already_ran_zs |= nontrivial_force_early;
+    key->epilog.native_imageblock = in->tib->native_imageblock;
+    key->epilog.max_sample_size_B = in->tib->max_sample_size_B;
++   key->epilog.blend_dst_first =
++      dev->dev.chip == AGX_CHIP_G16G && agx_g16_blend_dst_first_enabled();
+    key->epilog.resident_mask = in->tib->resident_mask;
+    key->epilog.max_bytes_per_tile = in->tib->max_bytes_per_tile;
+    key->epilog.max_samples_per_tile = in->tib->max_samples_per_tile;
+diff --git a/src/asahi/vulkan/hk_shader.c b/src/asahi/vulkan/hk_shader.c
+index 1901f0a3303..d0d85720098 100644
+--- a/src/asahi/vulkan/hk_shader.c
++++ b/src/asahi/vulkan/hk_shader.c
+@@ -196,7 +196,8 @@ hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
+    /* This could be optimized but it doesn't matter. */
+    return pdev->dev.debug |
+           hk_fs_structure_key_bits() |
+-          ((uint64_t)!!agx_g16_shared_nz_enabled() << 31);
++          ((uint64_t)!!agx_g16_shared_nz_enabled() << 31) |
++          ((uint64_t)!!agx_g16_pix_hoist_enabled() << 33);
+ }
+ 
+ const nir_shader_compiler_options *
+diff --git a/src/compiler/nir/nir_lower_blend.c b/src/compiler/nir/nir_lower_blend.c
+index a5099116af4..7f6e5a001f2 100644
+--- a/src/compiler/nir/nir_lower_blend.c
++++ b/src/compiler/nir/nir_lower_blend.c
+@@ -51,11 +51,11 @@ static nir_def *
+ nir_blend_func(
+    nir_builder *b,
+    enum pipe_blend_func func,
+-   nir_def *src, nir_def *dst)
++   nir_def *src, nir_def *dst, bool dst_first)
+ {
+    switch (func) {
+    case PIPE_BLEND_ADD:
+-      return nir_fadd(b, src, dst);
++      return dst_first ? nir_fadd(b, dst, src) : nir_fadd(b, src, dst);
+    case PIPE_BLEND_SUBTRACT:
+       return nir_fsub(b, src, dst);
+    case PIPE_BLEND_REVERSE_SUBTRACT:
+@@ -1006,7 +1006,8 @@ nir_color_blend(nir_builder *b, nir_def *src, nir_def *src1, nir_def *dst,
+             chan.dst_factor, rt->format);
+       }
+ 
+-      channels[c] = nir_blend_func(b, chan.func, psrc, pdst);
++      channels[c] = nir_blend_func(b, chan.func, psrc, pdst,
++                                   rt->dst_term_first);
+    }
+ 
+    return nir_vec(b, channels, 4);
+diff --git a/src/compiler/nir/nir_lower_blend.h b/src/compiler/nir/nir_lower_blend.h
+index bc979a79efc..f5b865337a5 100644
+--- a/src/compiler/nir/nir_lower_blend.h
++++ b/src/compiler/nir/nir_lower_blend.h
+@@ -53,6 +53,12 @@ typedef struct {
+    bool src_premultiplied;
+    bool dst_premultiplied;
+    enum pipe_blend_overlap_mode overlap;
++
++   /* Emit the destination term first in additive blending, so contraction
++    * fuses dst * dst_factor into the final multiply-add and the source
++    * product stays a separate multiply that does not depend on the
++    * destination. */
++   bool dst_term_first;
+ } nir_lower_blend_rt;
+ 
+ typedef struct {
+diff --git a/src/gallium/drivers/asahi/agx_disk_cache.c b/src/gallium/drivers/asahi/agx_disk_cache.c
+index 5c3718c4c36..207424e1d32 100644
+--- a/src/gallium/drivers/asahi/agx_disk_cache.c
++++ b/src/gallium/drivers/asahi/agx_disk_cache.c
+@@ -252,6 +252,8 @@ agx_disk_cache_init(struct agx_screen *screen)
+    uint64_t driver_flags = screen->dev.debug;
+    if (screen->dev.chip == AGX_CHIP_G16G && agx_g16_shared_nz_enabled())
+       driver_flags |= UINT64_C(1) << 63;
++   if (screen->dev.chip == AGX_CHIP_G16G && agx_g16_pix_hoist_enabled())
++      driver_flags |= UINT64_C(1) << 61;
+    screen->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
+ #endif
+ }

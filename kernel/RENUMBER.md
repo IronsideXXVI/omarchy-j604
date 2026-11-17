@@ -1309,3 +1309,7 @@ New in 1.1010 (0871 enables the GPU-to-fabric bridge before the GPU firmware run
 # Kernel patch numbers: 1.1010 to 1.1017
 
 The base remains da8e1acf3656. Published 0001–0871 are unchanged; 0872–0907 carry the subsequent initialization, mapping, command-cache and diagnostic changes. Applied source differs from the installed build only in nine comment lines. Diagnostic switches remain off; the current train performance gain comes from Mesa 1.8145.
+
+# Kernel patch numbers: 1.1017 to 1.1022
+
+The base remains da8e1acf3656. Published 0001–0907 are unchanged. 0908 keeps only the compute arena in a compute lease, and 0909 releases a closed VM's compute leases once the VM has retired, so GPU memory of a finished compute-using program is returned. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1018 to 1.1021 were test kernels and are not published.

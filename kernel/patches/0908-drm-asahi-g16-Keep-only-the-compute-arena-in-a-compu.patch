@@ -1,0 +1,296 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 18:20:57 +0000
+Subject: [PATCH] drm/asahi: g16: Keep only the compute arena in a
+ compute unit's lease
+
+A compute unit keeps a lease on the VM of the last command that retired
+on it until another VM's compute command retires on the same unit. The
+lease held the whole VmState, and with it the VM's resource cache: its
+compute arena and also its render arena, about 0.9 GB with eight
+resident units.
+
+Render leases are displaced by any later render, and the desktop
+renders, so they end within a minute. Nothing on a desktop issues
+compute, so a client that issued a single compute command, such as a
+texture upload that Mesa performs with a compute copy, kept its whole
+render arena until reboot. Each such client added about 0.9 GB.
+
+The lease now holds the compute arena itself, which owns everything the
+unit's last command named: the compute objects, the VM's binding (page
+tables and ASID) and its live token. The VM identity needed for the
+retarget record is copied into the lease. The VM state, its render
+arena and its context mapping are released with the VM's other
+references. Compute commands name neither the render arena nor the
+context mapping.
+
+The stats file now lists each held lease by VM id (compute with the
+arena size), the PB-slot leases and the open VMs.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs    |  6 +--
+ drivers/gpu/drm/asahi/g16/poll.rs      |  3 ++
+ drivers/gpu/drm/asahi/g16/pools.rs     | 14 ++++++
+ drivers/gpu/drm/asahi/g16/resources.rs |  7 +++
+ drivers/gpu/drm/asahi/g16/slots.rs     | 67 +++++++++++++++++++++-----
+ drivers/gpu/drm/asahi/g16/vm.rs        |  9 ++++
+ 6 files changed, 91 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index f4b792a473..bc5d3d6223 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1805,7 +1805,7 @@ fn publish_prefix_into(
+         }
+         // Reserve lifetime ownership before any counter or producer becomes reachable.
+         job.vm.vm.mark_binding_published()?;
+-        self.slots.hold_vm(&f.claims, &job.vm)?;
++        self.slots.hold_vm(&f.claims, &job.vm, job.resources.compute_arc())?;
+         self.slots.publish(&f.claims)?;
+         // Even a failed first store may have become visible. From this boundary preserve
+         // every owner and return explicit uncertainty rather than guessing from errno.
+@@ -1989,7 +1989,7 @@ fn prefix_compute(
+             .claim_compute(job.resources.compute()?, &mut f.claims, 0)?
+             .ok_or(EAGAIN)?;
+         let generation = job.vm.generation;
+-        self.slots.hold_vm(&f.claims, &job.vm)?;
++        self.slots.hold_vm(&f.claims, &job.vm, job.resources.compute_arc())?;
+         let s = &job.resources.compute()?.compute[index];
+         // `g16_compute_shared_pool`: the freelist and pool table of unit 0 serve every unit.
+         let pool = if super::params::compute_shared_pool() {
+@@ -2102,7 +2102,7 @@ fn prefix_render(
+         let target = encode::stamp(draw);
+         // Claim performs only a qualified per-use scrub, never allocator/list reset.
+         self.slots.claim_pass(job.resources.render()?, k)?;
+-        self.slots.hold_vm(&f.claims, &job.vm)?;
++        self.slots.hold_vm(&f.claims, &job.vm, job.resources.compute_arc())?;
+         let (refs, init_buffer) = self.render_refs(k, job, draw, &mut f.pb_used)?;
+         let p = job.resources.render()?.pass(k).ok_or(EINVAL)?;
+         let pass = p.refs();
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 007429d3ef..fa0f55bb79 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1988,6 +1988,9 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                 owners.quarantined, owners.reusable
+             )?;
+         }
++        self.slots.write_leases(f)?;
++        self.pools.write_leases(f)?;
++        self.vms.write_open(f)?;
+         for (kind, name) in ["compute", "render"].iter().enumerate() {
+             let proof = &slots.last_retarget[kind];
+             writeln!(f,
+diff --git a/drivers/gpu/drm/asahi/g16/pools.rs b/drivers/gpu/drm/asahi/g16/pools.rs
+index 6a86d3f4cd..ffb6e58015 100644
+--- a/drivers/gpu/drm/asahi/g16/pools.rs
++++ b/drivers/gpu/drm/asahi/g16/pools.rs
+@@ -443,6 +443,16 @@ pub(crate) struct Pools {
+     shared: Option<Arc<PbEpoch>>,
+ }
+ impl Pools {
++    /// Read-only: the VM id each PB-slot lease belongs to.
++    pub(crate) fn write_leases(&self, f: &mut impl core::fmt::Write) -> core::fmt::Result {
++        write!(f, "pb_leases:")?;
++        for (k, o) in self.owners.iter().enumerate() {
++            if let Some(o) = o {
++                write!(f, " {}:{}", k, o.vm_id())?;
++            }
++        }
++        writeln!(f)
++    }
+     pub(crate) fn new(dev: &AsahiDrmDevice) -> Self {
+         Self {
+             dev: dev.as_ref().as_ref().into(),
+@@ -686,6 +696,10 @@ pub(crate) fn expose(&self) {
+     pub(crate) fn is_exposed(&self) -> bool {
+         self.exposed.load(Ordering::Acquire)
+     }
++    /// The id of the VM this manager belongs to (stats only).
++    pub(crate) fn vm_id(&self) -> u64 {
++        self._vm.id
++    }
+     pub(crate) fn same_vm(&self, vm: &Arc<super::vm::VmState>) -> bool {
+         Arc::ptr_eq(&self._vm, vm)
+     }
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 2981dc204c..63575adee2 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -77,6 +77,8 @@ fn deref(&self) -> &Self::Target {
+ }
+ pub(crate) struct ComputeInner {
+     pub(crate) compute: KVec<ComputeSlot>,
++    /// Pages of this arena's private objects at construction, in bytes (stats only).
++    pub(crate) bytes: u64,
+     _objects: Objects,
+     // Mappings must disappear while their root still owns its ASID.
+     _bind: mmu::VmBind,
+@@ -122,6 +124,7 @@ fn new(
+         let arena = Arc::new(
+             Self(crate::cleanup::Deferred::new(ComputeInner {
+                 compute,
++                bytes,
+                 _objects: objects,
+                 _bind: bind.clone(),
+                 _live: live.clone(),
+@@ -516,6 +519,10 @@ impl Prepared {
+     pub(crate) fn compute(&self) -> Result<&ComputeArena> {
+         self.compute.as_deref().ok_or(EINVAL)
+     }
++    /// The job's compute arena, for a compute unit's last-owner lease.
++    pub(crate) fn compute_arc(&self) -> Option<&Arc<ComputeArena>> {
++        self.compute.as_ref()
++    }
+     pub(crate) fn render(&self) -> Result<&RenderArena> {
+         self.render.as_deref().ok_or(EINVAL)
+     }
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index f0db9bc142..b1c52c2b55 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -531,6 +531,18 @@ pub(crate) struct SlotStats {
+     pub(crate) pass_scrubs: u64,
+ }
+ 
++/// A compute unit's last-owner lease. It keeps what the unit's last command can name: the
++/// VM's compute arena, which owns that VM's binding (page tables and ASID), its live token
++/// and every compute object. It does not keep the whole VM: a closed VM's render arena and
++/// context mapping go with the VM's other references, so a compute lease, which only another
++/// VM's compute command displaces, no longer pins the render memory of a client that exited.
++pub(crate) struct ComputeOwner {
++    id: u64,
++    slot: u32,
++    generation: u8,
++    arena: Arc<super::resources::ComputeArena>,
++}
++
+ pub(crate) struct Slots {
+     pub(crate) cursor: u32,
+     pub(crate) pass_busy: u32,
+@@ -540,11 +552,11 @@ pub(crate) struct Slots {
+     pass_lifetime: Lifetime,
+     // Last-owner leases remain bound through retirement and displacement. Replaced only
+     // when the displaced unit is safely rebound to a new publication.
+-    compute_owner: [Option<Arc<super::vm::VmState>>; sizes::COMPUTE_UNITS_MAX],
++    compute_owner: [Option<ComputeOwner>; sizes::COMPUTE_UNITS_MAX],
+     pass_owner: [Option<Arc<super::vm::VmState>>; sizes::RENDER_UNITS],
+     pending_compute_retarget: [Option<VmRetarget>; sizes::COMPUTE_UNITS_MAX],
+     pending_pass_retarget: [Option<VmRetarget>; sizes::RENDER_UNITS],
+-    pending_compute_owner: [Option<Arc<super::vm::VmState>>; sizes::COMPUTE_UNITS_MAX],
++    pending_compute_owner: [Option<ComputeOwner>; sizes::COMPUTE_UNITS_MAX],
+     pending_pass_owner: [Option<Arc<super::vm::VmState>>; sizes::RENDER_UNITS],
+ }
+ impl Slots {
+@@ -686,20 +698,39 @@ pub(crate) fn claim_ct(&mut self, _f: &mut Claims, _bytes: u64) -> Result<Option
+     }
+     fn vm_retarget(
+         unit: usize,
+-        old: &super::vm::VmState,
++        old: (u64, u32, u8),
+         new: &super::vm::VmState,
+     ) -> Option<VmRetarget> {
+-        (old.id != new.id).then_some(VmRetarget {
++        (old.0 != new.id).then_some(VmRetarget {
+             unit: unit as u32,
+-            old_vm: old.id,
++            old_vm: old.0,
+             new_vm: new.id,
+-            old_asid: old.slot,
++            old_asid: old.1,
+             new_asid: new.slot,
+-            old_generation: old.generation,
++            old_generation: old.2,
+             new_generation: new.generation,
+         })
+     }
+ 
++    /// Read-only: every unit that still holds a last-owner lease, by VM id (and, for compute,
++    /// the leased compute arena's bytes in MiB). Under the device lock, like all stats.
++    pub(crate) fn write_leases(&self, f: &mut impl core::fmt::Write) -> core::fmt::Result {
++        write!(f, "compute_leases:")?;
++        for (k, o) in self.compute_owner.iter().enumerate() {
++            if let Some(o) = o {
++                write!(f, " {}:{}:{}", k, o.id, o.arena.bytes >> 20)?;
++            }
++        }
++        writeln!(f)?;
++        write!(f, "render_leases:")?;
++        for (k, o) in self.pass_owner.iter().enumerate() {
++            if let Some(o) = o {
++                write!(f, " {}:{}", k, o.id)?;
++            }
++        }
++        writeln!(f)
++    }
++
+     /// Records a host transfer only after every queue producer and doorbell succeeded.
+     /// Full wire retirement is a separate condition for hardware qualification.
+     pub(crate) fn note_published(&mut self, f: &Claims) {
+@@ -722,8 +753,14 @@ pub(crate) fn note_published(&mut self, f: &Claims) {
+     }
+ 
+     /// Retains each actual owner's VM/ASID binding through the firmware's last-owner era.
+-    /// A previous lease is replaced only after the new publication fully retires.
+-    pub(crate) fn hold_vm(&mut self, f: &Claims, vm: &Arc<super::vm::VmState>) -> Result {
++    /// A previous lease is replaced only after the new publication fully retires. A compute
++    /// lease holds the job's compute arena (which owns the VM binding), not the VM.
++    pub(crate) fn hold_vm(
++        &mut self,
++        f: &Claims,
++        vm: &Arc<super::vm::VmState>,
++        compute: Option<&Arc<super::resources::ComputeArena>>,
++    ) -> Result {
+         if f.slot_count as usize > sizes::COMPUTE_UNITS_MAX
+             || f.slot[..f.slot_count as usize]
+                 .iter()
+@@ -734,16 +771,22 @@ pub(crate) fn hold_vm(&mut self, f: &Claims, vm: &Arc<super::vm::VmState>) -> Re
+         }
+         for &k in &f.slot[..f.slot_count as usize] {
+             let k = k as usize;
++            let arena = compute.ok_or(EINVAL)?;
+             self.pending_compute_retarget[k] = self.compute_owner[k]
+                 .as_ref()
+-                .and_then(|old| Self::vm_retarget(k, old, vm));
+-            self.pending_compute_owner[k] = Some(vm.clone());
++                .and_then(|old| Self::vm_retarget(k, (old.id, old.slot, old.generation), vm));
++            self.pending_compute_owner[k] = Some(ComputeOwner {
++                id: vm.id,
++                slot: vm.slot,
++                generation: vm.generation,
++                arena: arena.clone(),
++            });
+         }
+         for k in 0..sizes::RENDER_UNITS {
+             if f.pass_mask & (1 << k) != 0 {
+                 self.pending_pass_retarget[k] = self.pass_owner[k]
+                     .as_ref()
+-                    .and_then(|old| Self::vm_retarget(k, old, vm));
++                    .and_then(|old| Self::vm_retarget(k, (old.id, old.slot, old.generation), vm));
+                 self.pending_pass_owner[k] = Some(vm.clone());
+             }
+         }
+diff --git a/drivers/gpu/drm/asahi/g16/vm.rs b/drivers/gpu/drm/asahi/g16/vm.rs
+index 343986a9f3..bd4f73dbdd 100644
+--- a/drivers/gpu/drm/asahi/g16/vm.rs
++++ b/drivers/gpu/drm/asahi/g16/vm.rs
+@@ -282,6 +282,15 @@ fn prune(&self) {
+         }
+     }
+ 
++    /// Read-only: the ids of VMs whose handle is still registered (open).
++    pub(crate) fn write_open(&self, f: &mut impl core::fmt::Write) -> core::fmt::Result {
++        write!(f, "vm_open:")?;
++        for state in self.vms.lock().iter() {
++            write!(f, " {}", state.id)?;
++        }
++        writeln!(f)
++    }
++
+     pub(crate) fn counts(&self) -> (u32, usize) {
+         (self.live.load(Ordering::Acquire), self.vms.lock().len())
+     }
+-- 
+2.43.0
+

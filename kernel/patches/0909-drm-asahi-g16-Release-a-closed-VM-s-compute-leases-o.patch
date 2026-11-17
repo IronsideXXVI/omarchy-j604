@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 17 Nov 2026 18:31:02 +0000
+Subject: [PATCH] drm/asahi: g16: Release a closed VM's compute leases
+ once retired
+
+A compute unit's last-owner lease now holds only the owner's compute
+arena, but it is still released only when another VM's compute command
+retires on the same unit. Up to sixteen closed VMs' arenas, about 40 MiB
+each, can therefore stay mapped until reboot on a desktop that runs no
+compute.
+
+When a VM's handle is closed (after its last job guard, so none of its
+commands is in flight), drop its compute leases on units that are fully
+retired. A unit whose owner closes while its command is still in flight
+drops the lease when that command passes the full receipt. Quarantined
+units keep their lease.
+
+The firmware's descriptor retire runs at each compute completion before
+the notifier store that the full receipt waits for. It saves the
+descriptor row and clears the binding, so a fully retired unit leaves
+the firmware no reference into the owner's arena or address space.
+
+The runtime parameter g16_lease_release (default 1) restores the old
+behaviour when set to 0. The stats line counts the released leases.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/mod.rs            | 10 +++---
+ drivers/gpu/drm/asahi/g16/params.rs         | 18 ++++++++++
+ drivers/gpu/drm/asahi/g16/pools/lifetime.rs |  5 +++
+ drivers/gpu/drm/asahi/g16/resources.rs      |  7 ++++
+ drivers/gpu/drm/asahi/g16/slots.rs          | 40 +++++++++++++++++++--
+ 5 files changed, 72 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 762fe0cbc0..aa2f4522bd 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -769,12 +769,10 @@ fn new_vm_for_file(&self, kernel_range: Range<u64>, file_id: u64) -> Result<mmu:
+         vm::new_vm(self, kernel_range, file_id)
+     }
+     fn vm_closed(&self, vm: &mmu::Vm) {
+-        let registry = self
+-            .shared
+-            .state
+-            .lock()
+-            .as_ref()
+-            .map(|state| state.vms.clone());
++        let registry = self.shared.state.lock().as_deref_mut().map(|state| {
++            state.slots.release_closed(vm.id());
++            state.vms.clone()
++        });
+         if let Some(registry) = registry {
+             registry.close(vm.id());
+         }
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index a5211db453..0fcb5482f6 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1099,6 +1099,24 @@ pub(crate) fn pass_check_once() -> bool {
+     "G16: verify the firmware session and the adopted UAT bindings once per poll pass instead of four times under the same lock (0: four; default 1: once; runtime 0644)"
+ );
+ 
++/// Storage of `g16_lease_release` (runtime 0644, default 1).
++static LEASE_RELEASE: AtomicU32 = AtomicU32::new(1);
++
++/// Whether a closed VM's compute last-owner leases are dropped as soon as their units are
++/// fully retired, instead of waiting for another VM's compute command on each unit.
++pub(crate) fn lease_release() -> bool {
++    LEASE_RELEASE.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    LEASE_RELEASE_PARAM,
++    LEASE_RELEASE_PARMTYPE,
++    LEASE_RELEASE_PARM,
++    LEASE_RELEASE,
++    "g16_lease_release",
++    "G16: drop a closed VM's compute unit leases once those units fully retired (default 1; 0: keep until another VM's compute; runtime 0644)"
++);
++
+ /// Storage of `g16_drain_first` (runtime 0644, default 0).
+ static DRAIN_FIRST: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/pools/lifetime.rs b/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
+index a06bb8a632..15673b319d 100644
+--- a/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
++++ b/drivers/gpu/drm/asahi/g16/pools/lifetime.rs
+@@ -130,6 +130,11 @@ pub(crate) const fn with_units(count: usize) -> Self {
+             last_owner: None,
+         }
+     }
++    /// Whether unit `k` is fully retired: its last command passed the complete normal receipt
++    /// and nothing is preparing or published on it (not quarantined).
++    pub(crate) fn is_retired(&self, k: usize) -> bool {
++        k < self.count && self.units[k].state == State::Retired
++    }
+     pub(crate) fn units(&self) -> usize {
+         self.count
+     }
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 63575adee2..83352d621d 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -69,6 +69,12 @@ fn reserve_retained_arena() -> Result<u32> {
+ }
+ 
+ pub(crate) struct ComputeArena(crate::cleanup::Deferred<ComputeInner>);
++impl ComputeArena {
++    /// Whether the client closed the VM this arena belongs to.
++    pub(crate) fn vm_closed(&self) -> bool {
++        self._bind.vm().is_closed()
++    }
++}
+ impl core::ops::Deref for ComputeArena {
+     type Target = ComputeInner;
+     fn deref(&self) -> &Self::Target {
+@@ -520,6 +526,7 @@ pub(crate) fn compute(&self) -> Result<&ComputeArena> {
+         self.compute.as_deref().ok_or(EINVAL)
+     }
+     /// The job's compute arena, for a compute unit's last-owner lease.
++    /// (See also [`ComputeArena::vm_closed`].)
+     pub(crate) fn compute_arc(&self) -> Option<&Arc<ComputeArena>> {
+         self.compute.as_ref()
+     }
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index b1c52c2b55..5b7a6c18a6 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -520,6 +520,8 @@ pub(crate) struct SlotStats {
+     /// observed separately to qualify a successful cross-VM hardware execution.
+     pub(crate) cross_vm_retargets: [u64; 2],
+     pub(crate) last_retarget: [VmRetarget; 2],
++    /// Compute leases dropped because their VM closed (`g16_lease_release`).
++    pub(crate) lease_releases: u64,
+     pub(crate) ct_sync: u64,
+     pub(crate) pass_sync: u64,
+     pub(crate) slot_sync: u64,
+@@ -542,6 +544,11 @@ pub(crate) struct ComputeOwner {
+     generation: u8,
+     arena: Arc<super::resources::ComputeArena>,
+ }
++impl ComputeOwner {
++    fn closed(&self) -> bool {
++        self.arena.vm_closed()
++    }
++}
+ 
+ pub(crate) struct Slots {
+     pub(crate) cursor: u32,
+@@ -712,10 +719,30 @@ fn vm_retarget(
+         })
+     }
+ 
++    /// VM `id` closed (no command of it in flight: called after its last job guard). Drop its
++    /// compute leases on fully retired units; quarantined or in-flight units keep theirs.
++    /// The arenas are destroyed through their deferred cleanup, never under this lock.
++    pub(crate) fn release_closed(&mut self, id: u64) {
++        if !super::params::lease_release() {
++            return;
++        }
++        for k in 0..sizes::COMPUTE_UNITS_MAX {
++            let release = self.compute_owner[k]
++                .as_ref()
++                .is_some_and(|o| o.id == id || o.closed())
++                && self.pending_compute_owner[k].is_none()
++                && self.compute_lifetime.is_retired(k);
++            if release {
++                self.compute_owner[k] = None;
++                self.stats.lease_releases = self.stats.lease_releases.saturating_add(1);
++            }
++        }
++    }
++
+     /// Read-only: every unit that still holds a last-owner lease, by VM id (and, for compute,
+     /// the leased compute arena's bytes in MiB). Under the device lock, like all stats.
+     pub(crate) fn write_leases(&self, f: &mut impl core::fmt::Write) -> core::fmt::Result {
+-        write!(f, "compute_leases:")?;
++        write!(f, "compute_leases: released {}", self.stats.lease_releases)?;
+         for (k, o) in self.compute_owner.iter().enumerate() {
+             if let Some(o) = o {
+                 write!(f, " {}:{}:{}", k, o.id, o.arena.bytes >> 20)?;
+@@ -829,7 +856,16 @@ pub(crate) fn retire(&mut self, f: &mut Claims) -> Result {
+         self.compute_lifetime = c;
+         self.pass_lifetime = p;
+         for &k in &f.slot[..f.slot_count as usize] {
+-            self.compute_owner[k as usize] = self.pending_compute_owner[k as usize].take();
++            let owner = self.pending_compute_owner[k as usize].take();
++            // The unit just passed its full receipt: the firmware's equal-path retire saved the
++            // descriptor row and cleared the binding before the notifier store that receipt
++            // waits for (GPU-FW 1824Z, CODE 25G83). A closed owner has no next command.
++            if super::params::lease_release() && owner.as_ref().is_some_and(|o| o.closed()) {
++                self.stats.lease_releases = self.stats.lease_releases.saturating_add(1);
++                self.compute_owner[k as usize] = None;
++            } else {
++                self.compute_owner[k as usize] = owner;
++            }
+         }
+         for k in 0..sizes::RENDER_UNITS {
+             if f.pass_mask & (1 << k) != 0 {
+-- 
+2.43.0
+
