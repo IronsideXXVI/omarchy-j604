@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 21:39:12 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally leave busy compute
+ submissions to the poll pass
+
+Every submission takes the device lock and runs a publish pass of its
+own: the session and binding checks, the window check, the hang scan,
+and the publication of its record behind its own doorbell. While every
+compute unit is held that pass publishes nothing, and the poll pass
+that follows the next retirement publishes the waiting commands behind
+one doorbell. When the firmware runs a light compute command in less
+time than that pass takes, the queue stops filling and each submission
+publishes alone, which costs more per command than the firmware saved.
+
+With g16_submit_defer=N (runtime, default 0), a compute submission
+that finds at least N compute flights outstanding is only queued.
+Their retirement brings a poll pass, which publishes it with the
+others, and the backup re-poll stays armed. Submissions with fewer
+flights in front of them, render submissions and those waiting for
+ring space publish as before. The stats file gains a submit_defer
+line with the queued and the self-published submissions.
+
+g16_submit_defer=0 behaves as before.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 21 +++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 58 ++++++++++++++++++++++-------
+ 2 files changed, 66 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index f5debd8342..16836b92e3 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2364,6 +2364,27 @@ pub(crate) fn submit_retire() -> bool {
+     "G16: 1 = a submission first retires the commands that completed since the last poll pass, without waiting for the firmware's event, then publishes (default 0: off; runtime 0644)"
+ );
+ 
++/// Storage of `g16_submit_defer` (runtime 0644, default 0).
++static SUBMIT_DEFER: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_submit_defer` = N: a compute submission that finds at least N compute flights
++/// outstanding is only queued. The poll pass that follows their next retirement publishes it
++/// with the others behind one doorbell, as it already does for submissions that arrive while
++/// every unit is held. 0 (the default): every submission runs its own publish pass, as before.
++/// Read at each submission.
++pub(crate) fn submit_defer() -> u32 {
++    SUBMIT_DEFER.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    SUBMIT_DEFER_PARAM,
++    SUBMIT_DEFER_PARMTYPE,
++    SUBMIT_DEFER_PARM,
++    SUBMIT_DEFER,
++    "g16_submit_defer",
++    "G16: N = a compute submission that finds at least N compute flights outstanding is only queued for the next poll pass (default 0: off; runtime 0644)"
++);
++
+ /// Storage of `g16_lat_qos_us` (runtime 0644, default 0).
+ static LAT_QOS_US: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index a4eed32ed3..140ef63f05 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -40,6 +40,11 @@
+ use super::regs::EngineState;
+ use super::{params, Firmware, Shared, POLL_WORK};
+ 
++/// `g16_submit_defer`: compute submissions only queued [0], and published by their own pass
++/// while the switch was on [1].
++pub(crate) static SUBMIT_DEFER_N: [core::sync::atomic::AtomicU64; 2] =
++    [const { core::sync::atomic::AtomicU64::new(0) }; 2];
++
+ /// How long after an EP 0x20 event `g16_tail_us` re-polls apply.
+ pub(crate) const TAIL_WINDOW_NS: u64 = 300_000;
+ /// End of the current `g16_tail_us` window (`now_ns()`), 0 for none.
+@@ -539,23 +544,43 @@ pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+                 firmware.fail_stop(ETIMEDOUT, &mut done);
+                 self.fail_stop(ETIMEDOUT);
+             }
++            let compute_only = job
++                .commands
++                .iter()
++                .all(|c| matches!(c, super::command::Command::Compute(_)));
+             let accepted = firmware.enqueue(job);
+             if accepted.is_ok() {
+-                // g16_submit_retire: take the receipts that completed since the last pass
+-                // first, without waiting for the firmware's event, so that the units they
+-                // free serve this submission.
+-                let take = super::params::submit_retire() && !firmware.engine.flights.is_empty();
+-                let retired = if take {
+-                    firmware.engine.stats.submit_retires += 1;
+-                    firmware.retire(false, &mut done)
++                // g16_submit_defer: with enough compute flights outstanding their retirement
++                // brings a poll pass soon; leave this one queued for it instead of running a
++                // pass (checks, then one record and one doorbell) on the submitting thread.
++                let defer = super::params::submit_defer() as usize;
++                let deferred = defer != 0
++                    && compute_only
++                    && !firmware.engine.chan_wait
++                    && firmware.engine.flights.iter().filter(|f| f.computes != 0).count() >= defer;
++                if deferred {
++                    SUBMIT_DEFER_N[0].fetch_add(1, Ordering::Relaxed);
+                 } else {
+-                    Ok(())
+-                };
+-                if let Err(error) = retired.and_then(|()| firmware.publish(&mut done)) {
+-                    firmware.fail_stop(error, &mut done);
+-                    self.fail_stop(error);
++                    if defer != 0 {
++                        SUBMIT_DEFER_N[1].fetch_add(1, Ordering::Relaxed);
++                    }
++                    // g16_submit_retire: take the receipts that completed since the last pass
++                    // first, without waiting for the firmware's event, so that the units they
++                    // free serve this submission.
++                    let take =
++                        super::params::submit_retire() && !firmware.engine.flights.is_empty();
++                    let retired = if take {
++                        firmware.engine.stats.submit_retires += 1;
++                        firmware.retire(false, &mut done)
++                    } else {
++                        Ok(())
++                    };
++                    if let Err(error) = retired.and_then(|()| firmware.publish(&mut done)) {
++                        firmware.fail_stop(error, &mut done);
++                        self.fail_stop(error);
++                    }
++                    self.note_bells(&firmware.engine.flights);
+                 }
+-                self.note_bells(&firmware.engine.flights);
+                 firmware.nap_hold();
+                 if !firmware.engine.flights.is_empty() || firmware.engine.chan_wait {
+                     self.lat_qos(!firmware.engine.flights.is_empty(), false);
+@@ -2426,6 +2451,13 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.tsplit_other_ns / 1000,
+             s.submit_retires
+         )?;
++        writeln!(
++            f,
++            "submit_defer: n {} deferred {} published {}",
++            super::params::submit_defer(),
++            SUBMIT_DEFER_N[0].load(Ordering::Relaxed),
++            SUBMIT_DEFER_N[1].load(Ordering::Relaxed)
++        )?;
+         let ip = |i: usize| IDLEPASS[i].load(Ordering::Relaxed);
+         writeln!(
+             f,
+-- 
+2.43.0
+

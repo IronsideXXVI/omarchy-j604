@@ -1,0 +1,413 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 21:50:49 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally keep compute work blocks
+ in session slots
+
+Each compute command's work block (the first 0x900 bytes of its work
+image: register list, start and finalize pointers, stamp and notifier
+pointers, the descriptor pointer) is written at every publication and
+read by the firmware at ingest, by the start op and by the timestamp ops;
+finalize writes into it, and the ingest and the post clean and invalidate
+it. It lives in the per-VM work objects, mapped uncached. macOS maps its
+command records ASC-cached. The existing switch that caches ours
+(g16_fw_cached bit 32) puts the cached class on per-VM objects, which the
+1.1019 measurement found slower and whose first unmap at client exit
+fails.
+
+Add the load-time parameter g16_compute_work_pool. At 1 two session
+objects, one uncached and one ASC-cached, each hold one work block slot
+per compute unit index; the hardware reads them at a context-0 lower
+address reserved at boot above the render work ranges, so no VM is given
+it. Every compute command then writes its block into its unit's slot,
+the rest of its image stays in the unit's work page, and the block's
+firmware and lower addresses and its ring entry name the slot. Compute
+units are claimed device-wide and held until their command retires, so
+no two commands in flight share a slot, and the session objects are
+never dropped. The runtime switch g16_compute_work_cached chooses the
+copy for commands published from then on.
+
+The compute_work: stats line counts the commands written to each copy.
+At 0, the default, nothing is allocated and no record changes. The slot
+layout is in g16/cwslot.rs with host tests.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs |  4 ++
+ drivers/gpu/drm/asahi/g16/cwslot.rs | 94 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/engine.rs | 39 ++++++++++--
+ drivers/gpu/drm/asahi/g16/graph.rs  | 44 ++++++++++++++
+ drivers/gpu/drm/asahi/g16/mod.rs    |  1 +
+ drivers/gpu/drm/asahi/g16/params.rs | 33 ++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  8 +++
+ 7 files changed, 218 insertions(+), 5 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/cwslot.rs
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index d305ca8a1a..052cc92b35 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -303,6 +303,10 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 1,
+             description: "G16: 1 (default) = compute sequences in session slots; 0 = work pages",
+         },
++        g16_compute_work_pool: u32 {
++            default: 0,
++            description: "G16: 1 = compute work blocks in per-unit session slots, both copies",
++        },
+         g16_host_records: u32 {
+             default: 0,
+             description: "G16: bounded host record bytes before publication (default off)",
+diff --git a/drivers/gpu/drm/asahi/g16/cwslot.rs b/drivers/gpu/drm/asahi/g16/cwslot.rs
+new file mode 100644
+index 0000000000..6dcb1a43ae
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/cwslot.rs
+@@ -0,0 +1,94 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! `g16_compute_work_pool`: where a compute unit's work block goes in the session pool. Core only.
++//!
++//! Two session objects (one uncached, one ASC-cached) each hold one work block slot per compute
++//! unit index, at `k * STRIDE`. The hardware reads a block through a context-0 lower address, so
++//! each object gets a lower range reserved when the firmware session starts, before any VM exists,
++//! at the top of the per-VM work aperture, above the two render work ranges and below the
++//! self-check page. Compute units are claimed device-wide and held until their command retires, so
++//! no two commands in flight share a slot.
++
++/// Bytes per unit slot: the 0x900-byte block, padded so every block starts on its own page and no
++/// cache line is shared between two units' blocks.
++pub(crate) const STRIDE: usize = 0x1000;
++/// The block written into a slot (the work image's first 0x900 bytes).
++#[allow(dead_code)] // read only by const asserts and host tests
++pub(crate) const BLOCK: usize = 0x900;
++/// Most unit indices with a slot (the latched unit count never exceeds it).
++pub(crate) const UNITS: usize = 64;
++/// Context-0 lower addresses of the uncached [0] and ASC-cached [1] copy.
++pub(crate) const LOWER: [u64; 2] = [0x70fe100000, 0x70fe180000];
++/// The render work ranges below them (graph::RENDER_WORK_LOWER, RENDER_UNITS x 0x2000 each) and
++/// the self-check page above them; graph.rs asserts these equal its own constants.
++#[allow(dead_code)] // read only by const asserts and host tests
++pub(crate) const RENDER_LOWER: [u64; 2] = [0x70fe000000, 0x70fe080000];
++#[allow(dead_code)] // read only by const asserts and host tests
++pub(crate) const RENDER_BYTES: u64 = 18 * 0x2000;
++#[allow(dead_code)] // read only by const asserts and host tests
++pub(crate) const SELF_CHECK: u64 = 0x70ff000000;
++/// Bytes of each session object.
++pub(crate) const SIZE: usize = UNITS * STRIDE;
++
++const _: () = assert!(BLOCK <= STRIDE && STRIDE % 0x1000 == 0);
++const _: () = assert!(RENDER_LOWER[1] + RENDER_BYTES <= LOWER[0]);
++const _: () = assert!(LOWER[0] + SIZE as u64 <= LOWER[1]);
++const _: () = assert!(LOWER[1] + SIZE as u64 <= SELF_CHECK);
++
++/// Offset of unit `k`'s slot, or None above the slots (the unit then keeps its own block).
++pub(crate) fn offset(k: usize) -> Option<usize> {
++    (k < UNITS).then(|| k * STRIDE)
++}
++
++/// What a flight records about its block: 0 its unit's own block, 1 / 2 copy 0 / 1 of the pool.
++pub(crate) fn code(copy: Option<usize>) -> u8 {
++    match copy {
++        None => 0,
++        Some(c) => 1 + (c & 1) as u8,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn slots_are_distinct_page_aligned_and_inside() {
++        let mut seen = std::collections::BTreeSet::new();
++        for k in 0..UNITS {
++            let at = offset(k).unwrap();
++            assert_eq!(at % 0x1000, 0);
++            assert!(at + BLOCK <= SIZE);
++            assert!(seen.insert(at));
++            for lower in LOWER {
++                // The hardware reads the block at lower + at; the encoder needs 0x100 alignment.
++                assert_eq!((lower + at as u64) % 0x100, 0);
++            }
++        }
++        assert_eq!(offset(UNITS), None);
++        assert_eq!(offset(usize::MAX), None);
++    }
++
++    #[test]
++    fn lower_ranges_do_not_overlap() {
++        let ranges = [
++            (RENDER_LOWER[0], RENDER_LOWER[0] + RENDER_BYTES),
++            (RENDER_LOWER[1], RENDER_LOWER[1] + RENDER_BYTES),
++            (LOWER[0], LOWER[0] + SIZE as u64),
++            (LOWER[1], LOWER[1] + SIZE as u64),
++        ];
++        for (i, a) in ranges.iter().enumerate() {
++            assert!(a.1 <= SELF_CHECK);
++            for b in &ranges[i + 1..] {
++                assert!(a.1 <= b.0 || b.1 <= a.0, "{a:x?} {b:x?}");
++            }
++        }
++    }
++
++    #[test]
++    fn codes() {
++        assert_eq!(code(None), 0);
++        assert_eq!(code(Some(0)), 1);
++        assert_eq!(code(Some(1)), 2);
++    }
++}
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 4e685fead1..bd45ae716c 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -33,6 +33,11 @@
+ pub(crate) static COMPUTE_SEQ_N: [core::sync::atomic::AtomicU64; 2] =
+     [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+ 
++/// `g16_compute_work_pool`: compute commands whose work block went to the uncached [0] and the
++/// ASC-cached [1] copy of their unit's session slot.
++pub(crate) static COMPUTE_WORK_N: [core::sync::atomic::AtomicU64; 2] =
++    [const { core::sync::atomic::AtomicU64::new(0) }; 2];
++
+ /// `wmb()`: `dsb st` (a full fence on other architectures).
+ #[inline(always)]
+ pub(crate) fn wmb() {
+@@ -215,6 +220,9 @@ pub(crate) struct Flight {
+     /// `g16_render_work_pool`: where the render's work records went (0: its unit's own work
+     /// objects; 1 / 2: the uncached / ASC-cached pool copy).
+     pub(crate) work_copy: u8,
++    /// `g16_compute_work_pool`: where the compute command's work block went (0: its unit's own
++    /// block; 1 / 2: the uncached / ASC-cached slot).
++    pub(crate) cwork_copy: u8,
+     /// Render: final TA/FS stamps, ring ends and ring positions before the prefix.
+     pub(crate) ta_target: u32,
+     pub(crate) fs_target: u32,
+@@ -259,6 +267,7 @@ fn new(job: Arc<Job>) -> Self {
+             c_start: 0,
+             fs_short: false,
+             work_copy: 0,
++            cwork_copy: 0,
+             ta_target: 0,
+             fs_target: 0,
+             ta_head: 0,
+@@ -2133,13 +2142,21 @@ fn prefix_compute(
+         };
+         let before = counter.r64(0)?;
+         let submitted = before.checked_add(1).ok_or(EOVERFLOW)?;
++        // g16_compute_work_pool: the work block goes to the unit's session slot (the rest of the
++        // image stays in the unit's work page); its firmware and lower addresses, the ring entry
++        // and every self-reference then name the slot.
++        let work_slot = self.graph.compute_work_slot(index);
++        let (work_va, work_gva) = match &work_slot {
++            Some((obj, at, _)) => (obj.va + *at as u64, obj.lower_gva.ok_or(EINVAL)? + *at as u64),
++            None => (s.block_va(), s.block_gva()?),
++        };
+         let refs = ComputeRefs {
+             notifier: g.notifier.va + notifier_page::COMPUTE_RECORD as u64,
+             qinfo: g.qinfo.va,
+             user_stamp: g.notifier.va + notifier_page::COMPUTE_STAMP as u64,
+             fw_stamp: g.fw_stamp.va,
+-            work: s.block_va(),
+-            work_gva: s.block_gva()?,
++            work: work_va,
++            work_gva,
+             tail: s.work.va,
+             // Exact embedded sequence: every self-reference then matches the 25G83 layout.
+             // `g16_compute_seq_pool`: the live sequence is the session slot instead; the
+@@ -2215,7 +2232,7 @@ fn prefix_compute(
+             g.ring.va + 8 * pf.c_head as u64,
+             g.qinfo.va,
+             n,
+-            &s.block_va().to_le_bytes(),
++            &work_va.to_le_bytes(),
+             job.host_identity,
+         );
+         if let Some(st) = stream {
+@@ -2233,10 +2250,22 @@ fn prefix_compute(
+             pool.write(*at, &scratch.cq[..work::compute::SEQ_SIZE])?;
+             COMPUTE_SEQ_N[*copy].fetch_add(1, Ordering::Relaxed);
+         }
+-        s.write_work(w)?;
++        match &work_slot {
++            Some((obj, at, copy)) => {
++                let block = w.get(..work::compute::BLOCK).ok_or(EINVAL)?;
++                let rest = w.get(work::compute::BLOCK..).ok_or(EINVAL)?;
++                obj.write(*at, block)?;
++                s.work.write(work::compute::BLOCK, rest)?;
++                if let Some(c) = COMPUTE_WORK_N.get(*copy) {
++                    c.fetch_add(1, Ordering::Relaxed);
++                }
++            }
++            None => s.write_work(w)?,
++        }
++        f.cwork_copy = super::cwslot::code(work_slot.as_ref().map(|x| x.2));
+         f.uma_submitted = submitted;
+         wmb();
+-        g.ring.w64(8 * pf.c_head as usize, s.block_va())?;
++        g.ring.w64(8 * pf.c_head as usize, work_va)?;
+         pf.c_head = (pf.c_head + 1) % sizes::QUEUE_CAP;
+         f.cstamp[0] = target;
+         f.cwait[0] = 0;
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index 55fb1ea89a..ff4ced561e 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -304,6 +304,9 @@ pub(crate) struct Graphs {
+     /// their sequence in their own unit's work page, so the aborted ordinal's slot is never
+     /// written again in this boot. The objects stay allocated for what is in flight.
+     pub(crate) compute_seq_off: bool,
++    /// `g16_compute_work_pool`: one compute work block slot per compute unit index, in an
++    /// uncached [0] and an ASC-cached [1] session object with a context-0 lower mapping each.
++    pub(crate) compute_work: Option<[Arc<FwObject>; 2]>,
+ }
+ 
+ /// Bytes per render unit in each `g16_render_seq_pool` object: the TA slot, then the FS slot,
+@@ -333,6 +336,15 @@ pub(crate) struct Graphs {
+ pub(crate) const COMPUTE_SEQ_SLOTS: usize = 2 * sizes::FLIGHTS;
+ /// Bytes per compute slot: one compute microsequence, in whole 64-byte cache lines.
+ pub(crate) const COMPUTE_SEQ_STRIDE: usize = (super::fw::work::compute::SEQ_SIZE + 63) & !63;
++
++// The compute work pool's lower ranges sit above the render work ranges (cwslot.rs).
++const _: () = assert!(
++    super::cwslot::RENDER_LOWER[0] == RENDER_WORK_LOWER[0]
++        && super::cwslot::RENDER_LOWER[1] == RENDER_WORK_LOWER[1]
++        && super::cwslot::RENDER_BYTES >= (sizes::RENDER_UNITS * RENDER_WORK_STRIDE) as u64
++        && super::cwslot::UNITS >= sizes::COMPUTE_UNITS_MAX
++        && super::cwslot::BLOCK == super::fw::work::compute::BLOCK
++);
+ impl Graphs {
+     pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+         let compute = ComputeGraph::new(o)?;
+@@ -388,6 +400,27 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+         } else {
+             None
+         };
++        // `g16_compute_work_pool`: allocated after everything else, so without it every object
++        // keeps its address.
++        let compute_work = if super::params::compute_work_pool() {
++            let mut copy = |class: Class, lower: u64| {
++                o.alloc(Request {
++                    size: super::cwslot::SIZE,
++                    class,
++                    placement: Placement::Anywhere,
++                    offset: 0,
++                    client: None,
++                    lower: Some(lower),
++                    cpu: true,
++                })
++            };
++            Some([
++                copy(Class::Shared, super::cwslot::LOWER[0])?,
++                copy(Class::SharedCached, super::cwslot::LOWER[1])?,
++            ])
++        } else {
++            None
++        };
+         Ok(Self {
+             dev: dev.as_ref().as_ref().into(),
+             compute,
+@@ -397,6 +430,7 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+             render_work,
+             compute_seq,
+             compute_seq_off: false,
++            compute_work,
+         })
+     }
+ 
+@@ -413,6 +447,16 @@ pub(crate) fn compute_seq_slot(&self, n: u64) -> Option<(Arc<FwObject>, usize, u
+         Some((pool[copy].clone(), at, copy))
+     }
+ 
++    /// Unit `k`'s `g16_compute_work_pool` slot: the object, the block's offset in it, and the copy
++    /// (0 uncached, 1 ASC-cached, as `g16_compute_work_cached` reads now). None without the pool
++    /// or above the slots, so the unit's own block is used.
++    pub(crate) fn compute_work_slot(&self, k: usize) -> Option<(Arc<FwObject>, usize, usize)> {
++        let pool = self.compute_work.as_ref()?;
++        let at = super::cwslot::offset(k)?;
++        let copy = usize::from(super::params::compute_work_cached());
++        Some((pool[copy].clone(), at, copy))
++    }
++
+     /// Unit `k`'s `g16_render_seq_pool` slot: the object, the TA and FS offsets in it, and the
+     /// copy (0 uncached, 1 ASC-cached, as `g16_render_seq_cached` reads now). None without the
+     /// pool, so the unit's own sequence objects are used.
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index d3f96c1168..238dfb78c4 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -57,6 +57,7 @@
+ mod graph;
+ mod host_records;
+ pub(crate) mod hw;
++pub(crate) mod cwslot;
+ mod initdata;
+ mod job;
+ mod object;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index bee101687b..f5debd8342 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -793,6 +793,39 @@ pub(crate) fn compute_seq_cached() -> bool {
+     "G16: with g16_compute_seq_pool=1, publish compute commands with the ASC-cached copy of their microsequence slot (default 1; 0: the uncached copy; runtime 0644)"
+ );
+ 
++/// `g16_compute_work_pool` (load time, default 0). 1: at boot two session objects, one uncached and
++/// one ASC-cached, each hold one compute work block slot per compute unit index (g16/cwslot.rs).
++/// The hardware reads them at a context-0 lower address reserved at boot above the render work
++/// ranges. Every compute command then writes its work block (the image's first 0x900 bytes) into
++/// its unit's slot; the rest of the image stays in the unit's work page, and the block's firmware
++/// and lower addresses and the ring entry name the slot. Compute units are claimed device-wide and
++/// held until their command retires, so no two commands in flight share a slot, and the session
++/// objects are never dropped, so the cached class never reaches a per-VM mapping (the fault
++/// `g16_fw_cached` bit 32 on per-VM work hits). Not with the private notifier.
++pub(crate) fn compute_work_pool() -> bool {
++    module_parameters::g16_compute_work_pool.value() == 1
++}
++
++/// Storage of `g16_compute_work_cached` (runtime 0644, default 0).
++static COMPUTE_WORK_CACHED: AtomicU32 = AtomicU32::new(0);
++
++/// With `g16_compute_work_pool`, whether compute commands published from now on use the
++/// ASC-cached copy of their unit's work block slot (the class macOS gives its command records,
++/// GPU-MAP trip E) instead of the uncached one. The firmware cleans and invalidates the block at
++/// ingest and at the post.
++pub(crate) fn compute_work_cached() -> bool {
++    COMPUTE_WORK_CACHED.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    COMPUTE_WORK_CACHED_PARAM,
++    COMPUTE_WORK_CACHED_PARMTYPE,
++    COMPUTE_WORK_CACHED_PARM,
++    COMPUTE_WORK_CACHED,
++    "g16_compute_work_cached",
++    "G16: with g16_compute_work_pool=1, publish compute commands with the ASC-cached copy of their unit's work block slot (default 0: the uncached copy; runtime 0644)"
++);
++
+ /// `g16_ktrace_mask` (load time): the word written to CONTROL+0 at init. 25G83 copies it into
+ /// its trace gate (0x192db4) from fn 0x3350, which INIT points at CONTROL through init-block
+ /// +0xa8. Bit 0 enables the event-handler trace points, bit 1 the scheduler ones, bit 2 the power
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 38127f11bc..a4eed32ed3 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -2071,6 +2071,14 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             u32::from(super::params::compute_seq_cached()),
+             u32::from(self.graph.compute_seq_off)
+         )?;
++        writeln!(
++            f,
++            "compute_work: pool {} uncached {} cached {} select {}",
++            u32::from(super::params::compute_work_pool()),
++            super::engine::COMPUTE_WORK_N[0].load(Ordering::Relaxed),
++            super::engine::COMPUTE_WORK_N[1].load(Ordering::Relaxed),
++            u32::from(super::params::compute_work_cached())
++        )?;
+         writeln!(
+             f,
+             "rekick: pass {} timer_render {} timer_compute {} rekick {} rekick_us {} irq {}",
+-- 
+2.43.0
+

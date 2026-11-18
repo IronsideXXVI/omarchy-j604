@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 21:55:01 +0000
+Subject: [PATCH] drm/asahi: g16: Cache compute work blocks and defer
+ busy submits
+
+With the compute microsequences cached, the firmware takes less time
+per light compute command than a submission's own publish pass. Caching
+the work blocks too then made light compute slower, not faster: the
+queue stopped filling and every submission published its own record
+behind its own doorbell.
+
+Make g16_compute_work_pool and g16_compute_work_cached default to 1,
+so every compute command's work block lives in its unit's slot of the
+ASC-cached session object, and make g16_submit_defer default to 16, so
+a compute submission that finds 16 or more compute flights outstanding
+is left to the poll pass that their retirement brings. Submissions with
+fewer flights in front of them publish at once, as before.
+
+RESULT: on a J604 with both pools cached, five alternating blocks on
+one boot: light compute at depth 64 took 19.0 and 18.8 us per command
+with g16_submit_defer=16 against 29.7, 29.5 and 31.9 us with 0. Depth
+1 (179.9 to 180.8 us) and depth 8 (39.3 to 39.7 us) did not move, heavy
+compute stayed at 555.2 to 555.6 us, and the two stress tests passed in
+every block with no fault line.
+
+g16_compute_work_cached=0 and g16_submit_defer=0 at run time return to
+the uncached block and to a pass per submission, and
+aurora.g16_compute_work_pool=0 on the command line to each unit's own
+work page.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs |  4 ++--
+ drivers/gpu/drm/asahi/g16/params.rs | 16 ++++++++--------
+ 2 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index 052cc92b35..c0abe8905e 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -304,8 +304,8 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             description: "G16: 1 (default) = compute sequences in session slots; 0 = work pages",
+         },
+         g16_compute_work_pool: u32 {
+-            default: 0,
+-            description: "G16: 1 = compute work blocks in per-unit session slots, both copies",
++            default: 1,
++            description: "G16: 1 (default) = compute work blocks in session slots; 0 = work pages",
+         },
+         g16_host_records: u32 {
+             default: 0,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 16836b92e3..4669e904d6 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -793,7 +793,7 @@ pub(crate) fn compute_seq_cached() -> bool {
+     "G16: with g16_compute_seq_pool=1, publish compute commands with the ASC-cached copy of their microsequence slot (default 1; 0: the uncached copy; runtime 0644)"
+ );
+ 
+-/// `g16_compute_work_pool` (load time, default 0). 1: at boot two session objects, one uncached and
++/// `g16_compute_work_pool` (load time, default 1). 1: at boot two session objects, one uncached and
+ /// one ASC-cached, each hold one compute work block slot per compute unit index (g16/cwslot.rs).
+ /// The hardware reads them at a context-0 lower address reserved at boot above the render work
+ /// ranges. Every compute command then writes its work block (the image's first 0x900 bytes) into
+@@ -806,8 +806,8 @@ pub(crate) fn compute_work_pool() -> bool {
+     module_parameters::g16_compute_work_pool.value() == 1
+ }
+ 
+-/// Storage of `g16_compute_work_cached` (runtime 0644, default 0).
+-static COMPUTE_WORK_CACHED: AtomicU32 = AtomicU32::new(0);
++/// Storage of `g16_compute_work_cached` (runtime 0644, default 1).
++static COMPUTE_WORK_CACHED: AtomicU32 = AtomicU32::new(1);
+ 
+ /// With `g16_compute_work_pool`, whether compute commands published from now on use the
+ /// ASC-cached copy of their unit's work block slot (the class macOS gives its command records,
+@@ -823,7 +823,7 @@ pub(crate) fn compute_work_cached() -> bool {
+     COMPUTE_WORK_CACHED_PARM,
+     COMPUTE_WORK_CACHED,
+     "g16_compute_work_cached",
+-    "G16: with g16_compute_work_pool=1, publish compute commands with the ASC-cached copy of their unit's work block slot (default 0: the uncached copy; runtime 0644)"
++    "G16: with g16_compute_work_pool=1, publish compute commands with the ASC-cached copy of their unit's work block slot (default 1; 0: the uncached copy; runtime 0644)"
+ );
+ 
+ /// `g16_ktrace_mask` (load time): the word written to CONTROL+0 at init. 25G83 copies it into
+@@ -2364,13 +2364,13 @@ pub(crate) fn submit_retire() -> bool {
+     "G16: 1 = a submission first retires the commands that completed since the last poll pass, without waiting for the firmware's event, then publishes (default 0: off; runtime 0644)"
+ );
+ 
+-/// Storage of `g16_submit_defer` (runtime 0644, default 0).
+-static SUBMIT_DEFER: AtomicU32 = AtomicU32::new(0);
++/// Storage of `g16_submit_defer` (runtime 0644, default 16).
++static SUBMIT_DEFER: AtomicU32 = AtomicU32::new(16);
+ 
+ /// `g16_submit_defer` = N: a compute submission that finds at least N compute flights
+ /// outstanding is only queued. The poll pass that follows their next retirement publishes it
+ /// with the others behind one doorbell, as it already does for submissions that arrive while
+-/// every unit is held. 0 (the default): every submission runs its own publish pass, as before.
++/// every unit is held. Default 16; 0: every submission runs its own publish pass, as before.
+ /// Read at each submission.
+ pub(crate) fn submit_defer() -> u32 {
+     SUBMIT_DEFER.load(Ordering::Relaxed)
+@@ -2382,7 +2382,7 @@ pub(crate) fn submit_defer() -> u32 {
+     SUBMIT_DEFER_PARM,
+     SUBMIT_DEFER,
+     "g16_submit_defer",
+-    "G16: N = a compute submission that finds at least N compute flights outstanding is only queued for the next poll pass (default 0: off; runtime 0644)"
++    "G16: N = a compute submission that finds at least N compute flights outstanding is only queued for the next poll pass (default 16; 0: off; runtime 0644)"
+ );
+ 
+ /// Storage of `g16_lat_qos_us` (runtime 0644, default 0).
+-- 
+2.43.0
+
