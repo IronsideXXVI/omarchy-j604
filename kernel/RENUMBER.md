@@ -1325,3 +1325,7 @@ The base remains da8e1acf3656. Published 0001–0910 are unchanged. 0911 adds `g
 # Kernel patch numbers: 1.1030 to 1.1032
 
 The base remains da8e1acf3656. Published 0001–0912 are unchanged. 0913–0915 add `g16_worker_big` (where the completion work runs: 0 as before, 1 and 2 on the performance cores, 3 on a performance core only while GPU work is out), 0916 adds `g16_idle_decay` (give the idle power state back in one step), and 0917 lets `g16_tail_cut` take the value 2 (end the trailing polls only after compute work). All three are off or unchanged by default. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1031, 1.1033 and 1.1034 are test kernels and are not published.
+
+# Kernel patch numbers: 1.1032 to 1.1036
+
+The base remains da8e1acf3656. Published 0001–0917 are unchanged. 0918 sets `g16_worker_big` to 3 by default (the completion work runs on a performance core while GPU work is out, and anywhere when the GPU is idle), and 0919 sets `g16_tail_cut` to 2 by default (the trailing firmware polls end early only after a pass that retired compute work). Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1033 to 1.1035 were test kernels and are not published.
