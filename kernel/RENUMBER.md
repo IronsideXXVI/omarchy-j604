@@ -1337,3 +1337,7 @@ The base remains da8e1acf3656. Published 0001–0919 are unchanged. 0920 adds `g
 # Kernel patch numbers: 1.1038 to 1.1052
 
 The base remains da8e1acf3656. Published 0001–0922 are unchanged. 0923 sets `g16_compute_shared_pool` to 0 by default (each compute unit has its own 32 MiB memory pool again; `aurora.g16_compute_shared_pool=1` restores the shared pool). Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1039 to 1.1051 were test kernels and are not published.
+
+# Kernel patch numbers: 1.1052 to 1.1056
+
+The base remains da8e1acf3656. Published 0001–0923 are unchanged. 0924 adds mode 2 of `g16_compute_shared_pool` (one memory pool, one allocator record, one submitted counter and one firmware allocator index per client, shared by all its compute units), and 0925 makes mode 2 the default (`aurora.g16_compute_shared_pool=0` restores one pool per unit, `=1` the earlier shared pool). Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1053 to 1.1055 were test kernels and are not published.

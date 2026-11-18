@@ -1,0 +1,408 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 14:56:45 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally give each VM one compute
+ allocator descriptor
+
+The shared compute pool (g16_compute_shared_pool=1) lets every compute
+unit of a VM allocate from unit 0's UMA page ring, but each unit keeps
+its own allocator descriptor and UMA index. The firmware saves the
+ring's read and write cursors into the descriptor it retires and
+programs the allocator row from the descriptor it binds, so up to 16
+saved copies of one ring's cursors disagree, and a stale copy can hand
+out a page that is still in use.
+
+macOS gives all compute commands of a context one descriptor, one
+submitted counter and one UMA index. While commands are counted ahead
+the firmware keeps the row bound; it saves the row into that descriptor
+once the context drains.
+
+Add mode 2 to g16_compute_shared_pool: one pool and one allocator
+descriptor, counter and UMA index (1) per VM, shared by all its compute
+units. The host writes the descriptor once, before the VM's first
+compute command is counted, and never restores a per-unit copy. A
+command is complete once the descriptor's completed count reaches the
+count written at its publication. Because every VM binds index 1, a
+compute command goes behind running flights only when all of them
+belong to its VM. After an aborted counted command, the VM's later
+compute commands fail.
+
+Modes 0 (the default) and 1 are unchanged. The statistics report mode 2
+as shared_pool 3.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/encode/compute.rs | 17 ++++++-
+ drivers/gpu/drm/asahi/g16/engine.rs         | 54 ++++++++++++++++++---
+ drivers/gpu/drm/asahi/g16/params.rs         | 44 +++++++++++------
+ drivers/gpu/drm/asahi/g16/poll.rs           | 34 +++++++++++--
+ drivers/gpu/drm/asahi/g16/resources.rs      | 34 +++++++++++++
+ 5 files changed, 154 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/encode/compute.rs b/drivers/gpu/drm/asahi/g16/encode/compute.rs
+index c464e7914c..bdadff4a57 100644
+--- a/drivers/gpu/drm/asahi/g16/encode/compute.rs
++++ b/drivers/gpu/drm/asahi/g16/encode/compute.rs
+@@ -38,6 +38,9 @@ pub(crate) struct ComputeRefs {
+     pub(crate) auxiliary_gva: u64,
+     pub(crate) context_store_gva: u64,
+     pub(crate) counter_fw: u64,
++    /// Firmware VA of the VM's one allocator descriptor (`g16_compute_shared_pool` = 2);
++    /// zero names the unit's own at tail + DESCRIPTOR.
++    pub(crate) desc: u64,
+     pub(crate) pool_state_gva: u64,
+     pub(crate) page_list_gva: u64,
+     pub(crate) usc_base: u64,
+@@ -107,6 +110,15 @@ pub(crate) fn init_compute_pool(
+ /// Numeric checks here do not establish that ownership proof. The old descriptor's completion
+ /// counter must equal A's cumulative submission count. Pool/list/counter backing stays pinned;
+ /// only the work pointer and destination slot are rewritten. Returns the next private counter.
++/// The allocator descriptor the command names (launch W+0x86a and StartCompute +0x160).
++fn descriptor(r: &ComputeRefs) -> u64 {
++    if r.desc != 0 {
++        r.desc
++    } else {
++        r.tail + compute::DESCRIPTOR as u64
++    }
++}
++
+ pub(crate) fn preserve_compute_descriptor(
+     r: &ComputeRefs,
+     old: &[u8; compute::DESCRIPTOR_SIZE],
+@@ -183,6 +195,7 @@ pub(crate) fn encode_compute(
+         || !fw(r.stats_fw, 0xe10)
+         || !fw(r.auxiliary_fw, compute::AUX_SIZE as u64)
+         || !fw(r.counter_fw, 8)
++        || (r.desc != 0 && !fw(r.desc, compute::DESCRIPTOR_SIZE as u64))
+         || !fw(r.notifier, 0x118)
+         || !fw(r.user_stamp, 8)
+         || !fw(r.fw_stamp, 8)
+@@ -326,7 +339,7 @@ pub(crate) fn encode_compute(
+     put64(w, 0x83c, r.its + 8);
+     put64(w, 0x844, ts_va[0]);
+     put64(w, 0x84c, ts_va[1]);
+-    put64(w, 0x86a, r.tail + compute::DESCRIPTOR as u64);
++    put64(w, 0x86a, descriptor(r));
+     put8(w, 0x872, 1);
+     put64(w, 0x873, 0x1588000);
+     put64(w, 0x87b, 0xef8000);
+@@ -353,7 +366,7 @@ pub(crate) fn encode_compute(
+         put16(q, off + 0xe, 1);
+     }
+     put32(q, 0x158, att.len() as u32);
+-    put64(q, 0x160, r.tail + compute::DESCRIPTOR as u64);
++    put64(q, 0x160, descriptor(r));
+     put64(q, 0x178, r.auxiliary_gva);
+     put64(q, 0x188, r.context_store_gva);
+     put64(q, 0x190, r.context_store_gva + 0xf400);
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index e01733f99c..5681bd81c5 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1192,6 +1192,15 @@ fn other_vm_running(&self, job: &Job) -> bool {
+         on && self.engine.flights.iter().any(|f| f.job.vm.id != job.vm.id)
+     }
+ 
++    /// `g16_compute_shared_pool` = 2: every VM's compute commands bind firmware UMA index 1
++    /// with that VM's one descriptor, and the binder reprograms the row from a different
++    /// descriptor without saving the previous one. So a compute command goes behind running
++    /// flights only when all of them are of its VM; another VM binds only after the pipe
++    /// drained, when the firmware's retire has saved the row into the previous descriptor.
++    fn one_descriptor_ok(&self, job: &Job) -> bool {
++        !params::compute_one_descriptor()
++            || self.engine.flights.iter().all(|f| f.job.vm.id == job.vm.id)
++    }
+     /// Whether the VM holding the engine may still publish while another VM waits: its
+     /// batch since its turn began is below `g16_vm_batch` commands and `g16_vm_batch_us`.
+     fn batch_open(&self) -> bool {
+@@ -1232,7 +1241,8 @@ fn ahead_ok(&self, job: &Job) -> bool {
+                 && !self.engine.frozen
+                 && self.engine.flights.iter().all(|f| {
+                     f.renders == 0 && f.computes != 0 && !f.doomed && !f.recovery_suspect
+-                });
++                })
++                && self.one_descriptor_ok(job);
+         }
+         // g16_resident: up to the resident depth, one render unit each; otherwise
+         // g16_flights / g16_depth (at most two).
+@@ -1857,9 +1867,11 @@ fn publish_prefix_into(
+                 self.graph.render.threshold.w32(8, prefix.draw as u32)?;
+             } else {
+                 let k = f.claims.slot[0] as usize;
+-                job.resources.compute()?.compute[k]
+-                    .counter
+-                    .w64(0, f.uma_submitted)?;
++                let arena = job.resources.compute()?;
++                match arena.stream.as_ref() {
++                    Some(st) => st.counter.w64(0, f.uma_submitted)?,
++                    None => arena.compute[k].counter.w64(0, f.uma_submitted)?,
++                }
+                 self.graph.compute.threshold.w32(0, prefix.n as u32)?;
+             }
+             wmb();
+@@ -2012,6 +2024,13 @@ fn prefix_compute(
+     ) -> Result {
+         let n = super::recovery::logic::next_ordinal(pf.n).ok_or(EOVERFLOW)?;
+         let target = encode::stamp(n);
++        // `g16_compute_shared_pool` = 2: the VM's one descriptor and counter, on UMA index 1.
++        // After an aborted counted command the descriptor no longer holds its ring's cursors;
++        // never bind it again.
++        let stream = job.resources.compute()?.stream.as_ref();
++        if stream.is_some_and(|st| st.poisoned()) {
++            return Err(EIO);
++        }
+         let index = self
+             .slots
+             .claim_compute(job.resources.compute()?, &mut f.claims, 0)?
+@@ -2026,7 +2045,11 @@ fn prefix_compute(
+             s
+         };
+         let g = &self.graph.compute;
+-        let before = s.counter.r64(0)?;
++        let counter = match stream {
++            Some(st) => &st.counter,
++            None => &s.counter,
++        };
++        let before = counter.r64(0)?;
+         let submitted = before.checked_add(1).ok_or(EOVERFLOW)?;
+         let refs = ComputeRefs {
+             notifier: g.notifier.va + notifier_page::COMPUTE_RECORD as u64,
+@@ -2044,13 +2067,18 @@ fn prefix_compute(
+             auxiliary_fw: s.aux.va,
+             auxiliary_gva: s.aux.gva.ok_or(EINVAL)?,
+             context_store_gva: s.context_store.gva.ok_or(EINVAL)?,
+-            counter_fw: s.counter.va,
++            counter_fw: counter.va,
++            desc: stream.map_or(0, |st| st.desc.va),
+             pool_state_gva: pool.pool_state.gva.ok_or(EINVAL)?,
+             page_list_gva: pool.page_list.gva.ok_or(EINVAL)?,
+             usc_base: job.queue.usc_base,
+             record_fw: g.notifier.va + notifier_page::COMPUTE_RECORD as u64,
+             binding_generation: generation,
+-            uma_slot: super::pools::lifetime::uma_slot(super::hw::engine::COMPUTE_UMA_SLOT, index),
++            uma_slot: if stream.is_some() {
++                super::hw::engine::COMPUTE_UMA_SLOT
++            } else {
++                super::pools::lifetime::uma_slot(super::hw::engine::COMPUTE_UMA_SLOT, index)
++            },
+             // Preserve the already qualified packet bytes while expressing the native
+             // fields separately. This compatibility identifier is not proof of native
+             // global command-ID allocation or uniqueness after compute-index wrap.
+@@ -2079,7 +2107,8 @@ fn prefix_compute(
+         super::host_records::capture_submit(
+             "compute-encoded-prefix", s.work.va, g.qinfo.va, n, &w[..0x1000], job.host_identity,
+         );
+-        if before != 0 {
++        // Mode 2 has no per-unit descriptor to restore: the work names the VM's descriptor.
++        if before != 0 && stream.is_none() {
+             // Slots::claim_compute proved a different fully retired unit displaced this
+             // descriptor in the same hardware slot. Keep every firmware-mutated byte.
+             let mut descriptor = [0u8; work::compute::DESCRIPTOR_SIZE];
+@@ -2102,6 +2131,15 @@ fn prefix_compute(
+             &s.block_va().to_le_bytes(),
+             job.host_identity,
+         );
++        if let Some(st) = stream {
++            // Written once, while no command of this VM has been counted on it (its counter
++            // is still 0), so the firmware has never bound it; afterwards only the firmware
++            // writes it (bind programs the row from it, the retire at drain saves the row).
++            if before == 0 {
++                let d = &w[work::compute::DESCRIPTOR..][..work::compute::DESCRIPTOR_SIZE];
++                st.desc.write(0, d)?;
++            }
++        }
+         s.write_work(w)?;
+         f.uma_submitted = submitted;
+         wmb();
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index e584786c5c..aa4d9f80a0 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -856,29 +856,43 @@ pub(crate) fn compute_units() -> usize {
+ 
+ /// Storage of `g16_compute_shared_pool` (0644, default 0; latched at its first read).
+ static COMPUTE_SHARED_POOL: AtomicU32 = AtomicU32::new(0);
+-/// 0 until latched, then 1 (off) or 2 (on).
++/// 0 until latched, then 1 (mode 0), 2 (mode 1) or 3 (mode 2).
+ static COMPUTE_SHARED_POOL_LATCH: AtomicU32 = AtomicU32::new(0);
+ 
+-/// Every compute unit of a VM allocates from unit 0's UMA freelist and pool table instead of
+-/// its own. Each command keeps its own work, allocator descriptor, UMA slot, completion
+-/// counter and context store. The firmware runs the one compute ring in order, so only one
+-/// command at a time allocates from the shared pool. Read once, at the first compute command,
+-/// so every descriptor of a run names the same pool.
+-pub(crate) fn compute_shared_pool() -> bool {
++/// The latched `g16_compute_shared_pool` mode plus one. Any value other than 0 and 2 keeps
++/// the meaning every non-zero value had before mode 2 existed (mode 1). Read once, at the
++/// engine start, so every descriptor of a run names the same pool.
++fn compute_pool_latch() -> u32 {
+     let l = COMPUTE_SHARED_POOL_LATCH.load(Ordering::Acquire);
+     if l != 0 {
+-        return l == 2;
++        return l;
+     }
+-    let v = if COMPUTE_SHARED_POOL.load(Ordering::Relaxed) != 0 {
+-        2
+-    } else {
+-        1
++    let v = match COMPUTE_SHARED_POOL.load(Ordering::Relaxed) {
++        0 => 1,
++        2 => 3,
++        _ => 2,
+     };
+     let _ = COMPUTE_SHARED_POOL_LATCH.compare_exchange(0, v, Ordering::AcqRel, Ordering::Acquire);
+-    COMPUTE_SHARED_POOL_LATCH.load(Ordering::Acquire) == 2
++    COMPUTE_SHARED_POOL_LATCH.load(Ordering::Acquire)
+ }
+ 
+-/// The latch as the statistics print it: 0 not yet read, 1 off, 2 on (reading it latches nothing).
++/// Modes 1 and 2: every compute unit of a VM allocates from unit 0's UMA freelist and pool
++/// table instead of its own.
++pub(crate) fn compute_shared_pool() -> bool {
++    compute_pool_latch() >= 2
++}
++
++/// Mode 2: the VM's one pool also has ONE allocator descriptor, one submitted counter and
++/// one firmware UMA index (1), shared by all its compute units, as macOS gives one
++/// descriptor to all compute commands of a context. Mode 1 gives each unit its own
++/// descriptor and index over the one pool, so up to 16 saved copies of the pool's ring
++/// cursors disagree.
++pub(crate) fn compute_one_descriptor() -> bool {
++    compute_pool_latch() == 3
++}
++
++/// The latch as the statistics print it: 0 not yet read, 1 mode 0, 2 mode 1, 3 mode 2
++/// (reading it latches nothing).
+ pub(crate) fn compute_shared_pool_state() -> u32 {
+     COMPUTE_SHARED_POOL_LATCH.load(Ordering::Relaxed)
+ }
+@@ -889,7 +903,7 @@ pub(crate) fn compute_shared_pool_state() -> u32 {
+     COMPUTE_SHARED_POOL_PARM,
+     COMPUTE_SHARED_POOL,
+     "g16_compute_shared_pool",
+-    "G16: 1 = all compute units of a VM allocate from unit 0's UMA pool, each command keeping its own descriptor, UMA slot and context store; 0 (default) = one 32 MiB pool per unit; latched at the first compute command, set it as a module option"
++    "G16: 0 (default) = one 32 MiB UMA pool per compute unit; 1 = all compute units of a VM allocate from unit 0's pool, each keeping its own allocator descriptor and UMA index; 2 = one pool AND one allocator descriptor, counter and UMA index per VM, shared by all its compute units, as macOS has; latched at the engine start, set it as a module option"
+ );
+ 
+ live_u32_param!(
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index f647417d50..3879c41758 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1217,7 +1217,24 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+             }
+             let k = f.claims.slot[0] as usize;
+             let unit = f.job.resources.compute()?.compute.get(k).ok_or(EINVAL)?;
+-            let submitted = unit.counter.r64(0)?;
++            // `g16_compute_shared_pool` = 2: the VM's one descriptor counts its commands in
++            // ring order, so this flight is done once COMPLETED reaches the count written at
++            // its publication; the descriptor must still name the VM's counter.
++            let (counted, completed, linked) = match f.job.resources.compute()?.stream.as_ref() {
++                Some(st) => (
++                    f.uma_submitted != 0,
++                    st.desc.r64(super::fw::graph::manager::COMPLETED)? >= f.uma_submitted,
++                    st.desc.r64(super::fw::graph::manager::COUNTER)? == st.counter.va,
++                ),
++                None => {
++                    let submitted = unit.counter.r64(0)?;
++                    (
++                        submitted != 0,
++                        unit.work.r64(compute::DESCRIPTOR_COMPLETED)? == submitted,
++                        unit.work.r64(compute::DESCRIPTOR_COUNTER)? == unit.counter.va,
++                    )
++                }
++            };
+             let start = unit.its.r64(0)?;
+             let end = unit.its.r64(8)?;
+             let note = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
+@@ -1229,9 +1246,9 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+                     && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot
+             };
+             full &= noted
+-                && submitted != 0
+-                && unit.work.r64(compute::DESCRIPTOR_COMPLETED)? == submitted
+-                && unit.work.r64(compute::DESCRIPTOR_COUNTER)? == unit.counter.va
++                && counted
++                && completed
++                && linked
+                 && start != 0
+                 && end > start;
+         }
+@@ -1436,6 +1453,15 @@ pub(crate) fn retire_oldest(
+             self.slots.quarantine(&mut f.claims);
+             self.retain(&f.job);
+             f.job.mark_aborted();
++            // `g16_compute_shared_pool` = 2: an aborted counted command may leave the VM's
++            // descriptor bound and unsaved on UMA index 1. Its later compute commands fail;
++            // the retained job keeps the descriptor mapped.
++            if f.computes != 0 && f.uma_submitted != 0 {
++                let arena = f.job.resources.compute().ok();
++                if let Some(st) = arena.and_then(|a| a.stream.as_ref()) {
++                    st.poison();
++                }
++            }
+             self.recovery.aborted_receipts = self.recovery.aborted_receipts.saturating_add(1);
+         }
+         if self.slots.compute_exhausted() {
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 699c8943c9..fc9feb7f9c 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -81,8 +81,31 @@ fn deref(&self) -> &Self::Target {
+         &self.0
+     }
+ }
++/// `g16_compute_shared_pool` = 2: the VM's one allocator descriptor and its submitted
++/// counter. The host writes the descriptor once, before the VM's first compute command is
++/// counted; afterwards only the firmware writes it. Both live as long as the arena, which a
++/// retained (aborted) job keeps forever.
++pub(crate) struct ComputeStream {
++    pub(crate) desc: Arc<super::object::FwObject>,
++    pub(crate) counter: Arc<super::object::FwObject>,
++    poisoned: AtomicBool,
++}
++
++impl ComputeStream {
++    /// A counted command of this VM was aborted: its descriptor may stay bound and unsaved
++    /// on UMA index 1, so its saved ring cursors are no longer the ring's.
++    pub(crate) fn poison(&self) {
++        self.poisoned.store(true, Ordering::Release);
++    }
++    pub(crate) fn poisoned(&self) -> bool {
++        self.poisoned.load(Ordering::Acquire)
++    }
++}
++
+ pub(crate) struct ComputeInner {
+     pub(crate) compute: KVec<ComputeSlot>,
++    /// `g16_compute_shared_pool` = 2 only.
++    pub(crate) stream: Option<ComputeStream>,
+     /// Pages of this arena's private objects at construction, in bytes (stats only).
+     pub(crate) bytes: u64,
+     _objects: Objects,
+@@ -125,11 +148,22 @@ fn new(
+             let unit = ComputeSlot::new(&mut objects, k, compute.first(), pack.as_ref())?;
+             compute.push(unit, GFP_KERNEL)?;
+         }
++        let stream = if super::params::compute_one_descriptor() {
++            let sh = super::object::Class::Shared;
++            Some(ComputeStream {
++                desc: super::graph::alloc(&mut objects, 0x100, sh, None, 0, false)?,
++                counter: super::graph::alloc(&mut objects, 0x80, sh, None, 0, false)?,
++                poisoned: AtomicBool::new(false),
++            })
++        } else {
++            None
++        };
+         objects.finish_private()?;
+         let bytes = objects.pages() as u64 * super::hw::PAGE;
+         let arena = Arc::new(
+             Self(crate::cleanup::Deferred::new(ComputeInner {
+                 compute,
++                stream,
+                 bytes,
+                 _objects: objects,
+                 _bind: bind.clone(),
+-- 
+2.43.0
+
