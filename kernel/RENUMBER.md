@@ -1329,3 +1329,7 @@ The base remains da8e1acf3656. Published 0001–0912 are unchanged. 0913–0915 
 # Kernel patch numbers: 1.1032 to 1.1036
 
 The base remains da8e1acf3656. Published 0001–0917 are unchanged. 0918 sets `g16_worker_big` to 3 by default (the completion work runs on a performance core while GPU work is out, and anywhere when the GPU is idle), and 0919 sets `g16_tail_cut` to 2 by default (the trailing firmware polls end early only after a pass that retired compute work). Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1033 to 1.1035 were test kernels and are not published.
+
+# Kernel patch numbers: 1.1036 to 1.1038
+
+The base remains da8e1acf3656. Published 0001–0919 are unchanged. 0920 adds `g16_large_window` and `g16_large_px` (publish fewer renders ahead when the target is large), 0921 adds value 4 to `g16_worker_big` (a performance core only while compute work is outstanding; the default stays 3), and 0922 sets `g16_large_window` to 4 by default. Applied source differs from the installed build only in the same nine comment lines as before. Version 1.1037 was a test kernel and is not published.

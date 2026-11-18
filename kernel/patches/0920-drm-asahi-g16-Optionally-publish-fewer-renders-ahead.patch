@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 00:52:04 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally publish fewer renders
+ ahead for large targets
+
+A client that keeps many renders queued has up to the resident depth of
+them in the firmware at once. For small targets that depth is what keeps
+the GPU fed between renders. For large ones it costs overlap: with eight
+renders out, a depth-64 client's 2560x1440 geometry runs at 275.7 us per
+submit and its 3840x2160 geometry at 470.5; with four, 261.4 and 452.0.
+The smaller window gives the same 1080p-sized light renders 27 % less.
+
+Add g16_large_window (runtime, default 0: off) and g16_large_px
+(runtime, default 3500000). When the window is set and the next render's
+target has at least that many pixels, at most that many renders are
+published ahead of it. Every smaller render keeps the resident depth.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 14 +++++++++++-
+ drivers/gpu/drm/asahi/g16/params.rs | 35 +++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 31bf6bf14e..f296f9d223 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1236,10 +1236,22 @@ fn ahead_ok(&self, job: &Job) -> bool {
+         }
+         // g16_resident: up to the resident depth, one render unit each; otherwise
+         // g16_flights / g16_depth (at most two).
+-        let limit = match params::resident() {
++        let mut limit = match params::resident() {
+             0 => params::flights().max(1 + params::depth() as usize),
+             r => r,
+         };
++        // g16_large_window: a large target publishes fewer renders ahead. At 2560x1440 and
++        // 3840x2160 a depth-64 client's renders then overlap better (window 4 against 8:
++        // geometry -5 % / -4 %), while small targets keep the whole resident depth.
++        let large = params::large_window() as usize;
++        if large != 0 {
++            if let Some(Command::Render(r)) = command(job, job.progress.sent()) {
++                let px = u32::from(r.cmd.width_px) * u32::from(r.cmd.height_px);
++                if px >= params::large_px() {
++                    limit = limit.min(large);
++                }
++            }
++        }
+         n < limit.min(sizes::RENDER_UNITS)
+             && self.engine.draw != 0
+             && !self.engine.frozen
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 4644f9055b..1d2a6915ed 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2558,6 +2558,41 @@ fn resident_latch() -> u32 {
+     RESIDENT_LATCH.load(Ordering::Acquire)
+ }
+ 
++/// Storage of `g16_large_window` (0644, default 0 = off; read at every publication).
++static LARGE_WINDOW: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_large_window`: the most renders in firmware when the next render's target is at least
++/// `g16_large_px` pixels (0: off, the resident depth applies to every render).
++pub(crate) fn large_window() -> u32 {
++    LARGE_WINDOW.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    LARGE_WINDOW_PARAM,
++    LARGE_WINDOW_PARMTYPE,
++    LARGE_WINDOW_PARM,
++    LARGE_WINDOW,
++    "g16_large_window",
++    "G16: publish at most this many renders ahead when the next render's target has at least g16_large_px pixels (default 0: off; runtime 0644)"
++);
++
++/// Storage of `g16_large_px` (0644, default 3500000; read at every publication).
++static LARGE_PX: AtomicU32 = AtomicU32::new(3_500_000);
++
++/// `g16_large_px`: the target size, in pixels, from which `g16_large_window` applies.
++pub(crate) fn large_px() -> u32 {
++    LARGE_PX.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    LARGE_PX_PARAM,
++    LARGE_PX_PARMTYPE,
++    LARGE_PX_PARM,
++    LARGE_PX,
++    "g16_large_px",
++    "G16: target size in pixels (width x height) from which g16_large_window applies (default 3500000, between 1920x1080 and 2560x1440; runtime 0644)"
++);
++
+ /// Storage of `g16_bridge` (0644, default 1; read at start and at every wake).
+ static BRIDGE: AtomicU32 = AtomicU32::new(1);
+ 
+-- 
+2.43.0
+
