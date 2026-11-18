@@ -1357,3 +1357,7 @@ The base remains da8e1acf3656. Published 0001–0931 are unchanged. 0932 adds pe
 # Kernel patch numbers: 1.1065 to 1.1067
 
 The base remains da8e1acf3656. Published 0001–0933 are unchanged. 0934 adds `g16_window_check_n`, which bounds how many linked host-window entries each check reads, and 0935 makes 8 the default. The message of 0935 was corrected after the build so that each light-compute figure names the stress sets it was measured after; its diff and the built tree (2f5b2742f71e) are unchanged. Applied source differs from the installed build only in the same nine comment lines as before. Version 1.1066 was not released or published.
+
+# Kernel patch numbers: 1.1067 to 1.1070
+
+The base remains da8e1acf3656. Published 0001–0935 are unchanged. 0936 adds compute microsequence slots in two session objects, an uncached and an ASC-cached copy (`g16_compute_seq_pool`, with the copy selected by `g16_compute_seq_cached`); 0937 stops using the pool for the rest of a boot once a firmware recovery has aborted a compute command; and 0938 makes the pool and the cached copy the default. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1068 and 1.1069 were not released or published.

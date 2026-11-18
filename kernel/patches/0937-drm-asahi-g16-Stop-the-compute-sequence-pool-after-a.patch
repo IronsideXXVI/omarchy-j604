@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 21:32:10 +0000
+Subject: [PATCH] drm/asahi: g16: Stop the compute sequence pool after
+ a passed abort
+
+A compute sequence slot belongs to the compute ordinal, not to the
+compute unit. When a firmware recovery ends in a passed abort of a
+compute command, its units stay quarantined for the rest of the boot
+because the firmware may still hold the command, but its sequence slot
+would be written again by the command 64 ordinals later once other VMs
+keep computing.
+
+After the first passed abort of a compute command, publish every later
+compute command with its sequence in its own unit's work page, as
+without g16_compute_seq_pool. The session objects stay allocated, so
+commands already in flight keep their slots, and no slot is written
+again in this boot. The kernel log says so once, and the stats file's
+compute_seq line gains "off 1".
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/graph.rs |  8 ++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs  | 14 ++++++++++++--
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index 9affcc4a9d..55fb1ea89a 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -300,6 +300,10 @@ pub(crate) struct Graphs {
+     /// `g16_compute_seq_pool`: `COMPUTE_SEQ_SLOTS` compute microsequence slots, in an uncached
+     /// [0] and an ASC-cached [1] session object, never dropped while the session lives.
+     pub(crate) compute_seq: Option<[Arc<FwObject>; 2]>,
++    /// Set by the first passed abort of a compute command: from then on compute commands keep
++    /// their sequence in their own unit's work page, so the aborted ordinal's slot is never
++    /// written again in this boot. The objects stay allocated for what is in flight.
++    pub(crate) compute_seq_off: bool,
+ }
+ 
+ /// Bytes per render unit in each `g16_render_seq_pool` object: the TA slot, then the FS slot,
+@@ -392,6 +396,7 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+             render_seq,
+             render_work,
+             compute_seq,
++            compute_seq_off: false,
+         })
+     }
+ 
+@@ -399,6 +404,9 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+     /// the copy (0 uncached, 1 ASC-cached, as `g16_compute_seq_cached` reads now). None without
+     /// the pool, so the sequence stays embedded in the unit's work page.
+     pub(crate) fn compute_seq_slot(&self, n: u64) -> Option<(Arc<FwObject>, usize, usize)> {
++        if self.compute_seq_off {
++            return None;
++        }
+         let pool = self.compute_seq.as_ref()?;
+         let copy = usize::from(super::params::compute_seq_cached());
+         let at = (n % COMPUTE_SEQ_SLOTS as u64) as usize * COMPUTE_SEQ_STRIDE;
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 4aeb68c8fb..38127f11bc 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1460,6 +1460,15 @@ pub(crate) fn retire_oldest(
+             self.slots.quarantine(&mut f.claims);
+             self.retain(&f.job);
+             f.job.mark_aborted();
++            // `g16_compute_seq_pool`: a sequence slot belongs to the compute ordinal, not to the
++            // quarantined unit, so stop using the pool before the slot could come round again.
++            if f.computes != 0 && self.graph.compute_seq.is_some() && !self.graph.compute_seq_off {
++                self.graph.compute_seq_off = true;
++                dev_warn!(
++                    self.dev(),
++                    "G16: compute sequence pool off after a passed compute abort\n"
++                );
++            }
+             // `g16_compute_shared_pool` = 2: an aborted counted command may leave the VM's
+             // descriptor bound and unsaved on UMA index 1. Its later compute commands fail;
+             // the retained job keeps the descriptor mapped.
+@@ -2055,11 +2064,12 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         )?;
+         writeln!(
+             f,
+-            "compute_seq: pool {} uncached {} cached {} select {}",
++            "compute_seq: pool {} uncached {} cached {} select {} off {}",
+             u32::from(super::params::compute_seq_pool()),
+             super::engine::COMPUTE_SEQ_N[0].load(Ordering::Relaxed),
+             super::engine::COMPUTE_SEQ_N[1].load(Ordering::Relaxed),
+-            u32::from(super::params::compute_seq_cached())
++            u32::from(super::params::compute_seq_cached()),
++            u32::from(self.graph.compute_seq_off)
+         )?;
+         writeln!(
+             f,
+-- 
+2.43.0
+

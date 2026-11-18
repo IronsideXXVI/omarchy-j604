@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 15:48:11 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally keep compute
+ microsequences in session slots
+
+macOS maps the compute microsequence (W+0x760) in the firmware's cached
+heap (attribute index 0), and so do its notifier, allocator descriptor
+and firmware stamp; the cells the host reads stay uncached. Ours embeds
+the live compute microsequence at work+0x900 in each unit's per-VM work
+page, uncached. A per-VM ASC-cached mapping cannot be dropped safely at
+client exit, so it cannot simply become cached there.
+
+g16_compute_seq_pool=1 (load time, default 0) allocates at boot two
+session objects, one uncached and one ASC-cached, each with 64 compute
+microsequence slots (twice the most flights in flight). A compute
+command writes its live microsequence into slot (compute ordinal mod
+64), and its work record (W+0x760) and every self-reference of the
+sequence name that slot; the mirror at work+0x900 is kept. Compute units
+are per VM, so the slot follows the device-wide ordinal: at most 32
+flights are outstanding and they retire in order, so a slot is written
+again only long after its command retired. Publication waits if the
+flight count ever reached the slot count. The session objects are never
+dropped.
+
+g16_compute_seq_cached (runtime 0644, default 0) picks the copy for the
+compute commands published from then on: 0 the uncached one, 1 the
+ASC-cached one. The firmware cleans and invalidates the compute sequence
+at the command's start, before it reads it (25G83 0x23184..0x2318c), and
+again at its post (0x239ec..0x239f4). The stats file gains a
+compute_seq line with the publication count per copy.
+
+Values 0 of both parameters behave as before.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs |  4 ++++
+ drivers/gpu/drm/asahi/g16/engine.rs | 26 ++++++++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/graph.rs  | 28 +++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/params.rs | 32 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  8 ++++++++
+ 5 files changed, 97 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index b93c69f634..562e2af23b 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -299,6 +299,10 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 1,
+             description: "G16: 1 (default) = render TA and FS work records in session slots per unit, uncached and ASC-cached copies; 0 = each unit's own work objects",
+         },
++        g16_compute_seq_pool: u32 {
++            default: 0,
++            description: "G16: 1 = compute microsequences in device-wide session slots, uncached and ASC-cached copies",
++        },
+         g16_host_records: u32 {
+             default: 0,
+             description: "G16: bounded host record bytes before publication (default off)",
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 58f0c84afd..4e685fead1 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -28,6 +28,11 @@
+ /// Renders encoded with the long fragment sequence ([0]) and the short one ([1], `g16_fs_short`).
+ pub(crate) static FS_FORMS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+ 
++/// `g16_compute_seq_pool`: compute commands published with their microsequence in the uncached
++/// [0] and in the ASC-cached [1] slot copy.
++pub(crate) static COMPUTE_SEQ_N: [core::sync::atomic::AtomicU64; 2] =
++    [const { core::sync::atomic::AtomicU64::new(0) }; 2];
++
+ /// `wmb()`: `dsb st` (a full fence on other architectures).
+ #[inline(always)]
+ pub(crate) fn wmb() {
+@@ -2100,6 +2105,14 @@ fn prefix_compute(
+         if stream.is_some_and(|st| st.poisoned()) {
+             return Err(EIO);
+         }
++        // `g16_compute_seq_pool`: ordinal n's slot is written again only for n + SLOTS, which can
++        // be published only after n retired while fewer than SLOTS flights are outstanding.
++        if self.graph.compute_seq.is_some()
++            && self.engine.flights.len() >= super::graph::COMPUTE_SEQ_SLOTS
++        {
++            return Err(EAGAIN);
++        }
++        let seq_slot = self.graph.compute_seq_slot(n);
+         let index = self
+             .slots
+             .claim_compute(job.resources.compute()?, &mut f.claims, 0)?
+@@ -2129,7 +2142,12 @@ fn prefix_compute(
+             work_gva: s.block_gva()?,
+             tail: s.work.va,
+             // Exact embedded sequence: every self-reference then matches the 25G83 layout.
+-            seq: s.work.va + 0x900,
++            // `g16_compute_seq_pool`: the live sequence is the session slot instead; the
++            // encoder keeps the mirror at work+0x900 and points every self-reference at `seq`.
++            seq: match &seq_slot {
++                Some((pool, at, _)) => pool.va + *at as u64,
++                None => s.work.va + 0x900,
++            },
+             preempt_gva: s.preempt.gva.ok_or(EINVAL)?,
+             its: s.its.va,
+             stats_fw: self.init.compute_activity.va,
+@@ -2209,6 +2227,12 @@ fn prefix_compute(
+                 st.desc.write(0, d)?;
+             }
+         }
++        // `g16_compute_seq_pool`: the live microsequence goes to its slot before the work and the
++        // ring entry that name it become visible.
++        if let Some((pool, at, copy)) = &seq_slot {
++            pool.write(*at, &scratch.cq[..work::compute::SEQ_SIZE])?;
++            COMPUTE_SEQ_N[*copy].fetch_add(1, Ordering::Relaxed);
++        }
+         s.write_work(w)?;
+         f.uma_submitted = submitted;
+         wmb();
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index bf8a4a9c40..9affcc4a9d 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -297,6 +297,9 @@ pub(crate) struct Graphs {
+     /// `g16_render_work_pool`: one TA and one FS work record slot per render unit, in an
+     /// uncached [0] and an ASC-cached [1] session object with a context-0 lower mapping each.
+     pub(crate) render_work: Option<[Arc<FwObject>; 2]>,
++    /// `g16_compute_seq_pool`: `COMPUTE_SEQ_SLOTS` compute microsequence slots, in an uncached
++    /// [0] and an ASC-cached [1] session object, never dropped while the session lives.
++    pub(crate) compute_seq: Option<[Arc<FwObject>; 2]>,
+ }
+ 
+ /// Bytes per render unit in each `g16_render_seq_pool` object: the TA slot, then the FS slot,
+@@ -321,6 +324,11 @@ pub(crate) struct Graphs {
+ const _: () =
+     assert!(RENDER_WORK_LOWER[1] + (sizes::RENDER_UNITS * RENDER_WORK_STRIDE) as u64 <= 0x70ff000000);
+ 
++/// `g16_compute_seq_pool` slots: twice the most flights in flight, so the slot of compute
++/// ordinal n is written again only for ordinal n + COMPUTE_SEQ_SLOTS, published after n retired.
++pub(crate) const COMPUTE_SEQ_SLOTS: usize = 2 * sizes::FLIGHTS;
++/// Bytes per compute slot: one compute microsequence, in whole 64-byte cache lines.
++pub(crate) const COMPUTE_SEQ_STRIDE: usize = (super::fw::work::compute::SEQ_SIZE + 63) & !63;
+ impl Graphs {
+     pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+         let compute = ComputeGraph::new(o)?;
+@@ -367,6 +375,15 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+         } else {
+             None
+         };
++        let compute_seq = if super::params::compute_seq_pool() {
++            let size = COMPUTE_SEQ_SLOTS * COMPUTE_SEQ_STRIDE;
++            Some([
++                alloc(o, size, Class::Fw, None, 0, false)?,
++                alloc(o, size, Class::FwCached, None, 0, false)?,
++            ])
++        } else {
++            None
++        };
+         Ok(Self {
+             dev: dev.as_ref().as_ref().into(),
+             compute,
+@@ -374,9 +391,20 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+             render2,
+             render_seq,
+             render_work,
++            compute_seq,
+         })
+     }
+ 
++    /// The `g16_compute_seq_pool` slot of compute ordinal `n`: the object, the offset in it and
++    /// the copy (0 uncached, 1 ASC-cached, as `g16_compute_seq_cached` reads now). None without
++    /// the pool, so the sequence stays embedded in the unit's work page.
++    pub(crate) fn compute_seq_slot(&self, n: u64) -> Option<(Arc<FwObject>, usize, usize)> {
++        let pool = self.compute_seq.as_ref()?;
++        let copy = usize::from(super::params::compute_seq_cached());
++        let at = (n % COMPUTE_SEQ_SLOTS as u64) as usize * COMPUTE_SEQ_STRIDE;
++        Some((pool[copy].clone(), at, copy))
++    }
++
+     /// Unit `k`'s `g16_render_seq_pool` slot: the object, the TA and FS offsets in it, and the
+     /// copy (0 uncached, 1 ASC-cached, as `g16_render_seq_cached` reads now). None without the
+     /// pool, so the unit's own sequence objects are used.
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 6c237832da..32553b3e10 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -761,6 +761,38 @@ pub(crate) fn render_seq_cached() -> bool {
+     "G16: with g16_render_seq_pool=1, publish renders with the ASC-cached copy of their unit's microsequence slot (default 1; 0: the uncached copy; runtime 0644)"
+ );
+ 
++/// `g16_compute_seq_pool` (load time, default 0). 1: at boot two session objects, one uncached
++/// and one ASC-cached, each hold `graph::COMPUTE_SEQ_SLOTS` compute microsequence slots, and
++/// every compute command writes its live microsequence into slot (compute ordinal mod
++/// COMPUTE_SEQ_SLOTS) instead of its unit's per-VM work page. Compute units are per VM, so the
++/// slot follows the device-wide ordinal: at most `sizes::FLIGHTS` commands are in flight and
++/// flights retire in order, so a slot is reused only long after its command retired. The session
++/// objects are never dropped, so a cached class never reaches a per-VM mapping.
++pub(crate) fn compute_seq_pool() -> bool {
++    module_parameters::g16_compute_seq_pool.value() == 1
++}
++
++/// Storage of `g16_compute_seq_cached` (runtime 0644, default 0).
++static COMPUTE_SEQ_CACHED: AtomicU32 = AtomicU32::new(0);
++
++/// With `g16_compute_seq_pool`, whether compute commands published from now on name the
++/// ASC-cached copy of their slot (attribute index 0, the class macOS gives the compute
++/// microsequence) instead of the uncached one. The firmware cleans and invalidates the compute
++/// sequence at the command's start, before it reads it (25G83 0x23184..0x2318c), and again at
++/// its post (0x239ec..0x239f4).
++pub(crate) fn compute_seq_cached() -> bool {
++    COMPUTE_SEQ_CACHED.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    COMPUTE_SEQ_CACHED_PARAM,
++    COMPUTE_SEQ_CACHED_PARMTYPE,
++    COMPUTE_SEQ_CACHED_PARM,
++    COMPUTE_SEQ_CACHED,
++    "g16_compute_seq_cached",
++    "G16: with g16_compute_seq_pool=1, publish compute commands with the ASC-cached copy of their microsequence slot (default 0: the uncached copy; runtime 0644)"
++);
++
+ /// `g16_ktrace_mask` (load time): the word written to CONTROL+0 at init. 25G83 copies it into
+ /// its trace gate (0x192db4) from fn 0x3350, which INIT points at CONTROL through init-block
+ /// +0xa8. Bit 0 enables the event-handler trace points, bit 1 the scheduler ones, bit 2 the power
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 5bb313166f..4aeb68c8fb 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -2053,6 +2053,14 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             super::winscan::WINDOW_N[0].load(Ordering::Relaxed),
+             super::winscan::WINDOW_N[1].load(Ordering::Relaxed)
+         )?;
++        writeln!(
++            f,
++            "compute_seq: pool {} uncached {} cached {} select {}",
++            u32::from(super::params::compute_seq_pool()),
++            super::engine::COMPUTE_SEQ_N[0].load(Ordering::Relaxed),
++            super::engine::COMPUTE_SEQ_N[1].load(Ordering::Relaxed),
++            u32::from(super::params::compute_seq_cached())
++        )?;
+         writeln!(
+             f,
+             "rekick: pass {} timer_render {} timer_compute {} rekick {} rekick_us {} irq {}",
+-- 
+2.43.0
+
