@@ -1333,3 +1333,7 @@ The base remains da8e1acf3656. Published 0001–0917 are unchanged. 0918 sets `g
 # Kernel patch numbers: 1.1036 to 1.1038
 
 The base remains da8e1acf3656. Published 0001–0919 are unchanged. 0920 adds `g16_large_window` and `g16_large_px` (publish fewer renders ahead when the target is large), 0921 adds value 4 to `g16_worker_big` (a performance core only while compute work is outstanding; the default stays 3), and 0922 sets `g16_large_window` to 4 by default. Applied source differs from the installed build only in the same nine comment lines as before. Version 1.1037 was a test kernel and is not published.
+
+# Kernel patch numbers: 1.1038 to 1.1052
+
+The base remains da8e1acf3656. Published 0001–0922 are unchanged. 0923 sets `g16_compute_shared_pool` to 0 by default (each compute unit has its own 32 MiB memory pool again; `aurora.g16_compute_shared_pool=1` restores the shared pool). Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1039 to 1.1051 were test kernels and are not published.
