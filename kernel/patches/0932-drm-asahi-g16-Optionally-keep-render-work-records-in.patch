@@ -1,0 +1,328 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 18:22:09 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally keep render work records
+ in session slots
+
+Each render's TA and FS work records (0x940 and 0xca0 bytes) are written
+at every publication and read by the firmware while it prepares, starts
+and posts each stage: the start ops program the hardware from them, the
+prepare callbacks prefetch them and the posts clean and invalidate them.
+They live in per-VM work objects mapped uncached. macOS maps its work
+records ASC-cached, and the existing switch that caches ours
+(g16_fw_cached bits 4 and 8) puts the cached class on per-VM objects,
+whose first unmap at client exit fails.
+
+Add the load-time parameter g16_render_work_pool. At 1 two session
+objects, one uncached and one ASC-cached, each hold a TA and an FS work
+record slot per render unit; the hardware reads them at a context-0
+lower address reserved at boot at the top of the per-VM work aperture,
+below the self-check page, so no VM is given it. Every render then
+writes its work records into its unit's slot, and its records, its TA
+and FS ring entries and its lower addresses name the slot. Render units
+are claimed device-wide and held until their render retires, so no two
+renders in flight share a slot, and the session objects are never
+dropped. The runtime switch g16_render_work_cached chooses the copy for
+renders published from then on. Recovery reads the TPC size of a render
+from wherever its work records went.
+
+The render_work: stats line counts the renders written to each copy. At
+0, the default, nothing is allocated and no record changes.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs |  4 ++
+ drivers/gpu/drm/asahi/g16/engine.rs | 36 ++++++++++++++--
+ drivers/gpu/drm/asahi/g16/graph.rs  | 65 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/params.rs | 32 ++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 11 +++++
+ 5 files changed, 144 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index 342fe00ce1..56e2c57757 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -295,6 +295,10 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 1,
+             description: "G16: 1 (default) = render microsequences in session slots per unit, uncached and ASC-cached copies; 0 = each unit's own sequence objects",
+         },
++        g16_render_work_pool: u32 {
++            default: 0,
++            description: "G16: 1 = render TA and FS work records in session slots per unit, uncached and ASC-cached copies",
++        },
+         g16_host_records: u32 {
+             default: 0,
+             description: "G16: bounded host record bytes before publication (default off)",
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 4208da8d57..58f0c84afd 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -207,6 +207,9 @@ pub(crate) struct Flight {
+     pub(crate) c_start: u32,
+     /// The render's fragment sequence has no timestamp records (`g16_fs_short`).
+     pub(crate) fs_short: bool,
++    /// `g16_render_work_pool`: where the render's work records went (0: its unit's own work
++    /// objects; 1 / 2: the uncached / ASC-cached pool copy).
++    pub(crate) work_copy: u8,
+     /// Render: final TA/FS stamps, ring ends and ring positions before the prefix.
+     pub(crate) ta_target: u32,
+     pub(crate) fs_target: u32,
+@@ -250,6 +253,7 @@ fn new(job: Arc<Job>) -> Self {
+             head: 0,
+             c_start: 0,
+             fs_short: false,
++            work_copy: 0,
+             ta_target: 0,
+             fs_target: 0,
+             ta_head: 0,
+@@ -1136,7 +1140,11 @@ pub(crate) fn recovery_prepare(
+         {
+             let k = f.claims.pass[0] as usize;
+             let pass = f.job.resources.render()?.pass(k).ok_or(EINVAL)?;
+-            let bytes = pass.ta_r64(work::ta::TPC_BYTES)?;
++            // g16_render_work_pool: the render's TA work went to unit k's session slot.
++            let bytes = match self.graph.render_work_at(k, f.work_copy) {
++                Some((obj, ta_at)) => obj.r64(ta_at + work::ta::TPC_BYTES)?,
++                None => pass.ta_r64(work::ta::TPC_BYTES)?,
++            };
+             if bytes == 0 || bytes > pass.tpc.size as u64 {
+                 return Err(ERANGE);
+             }
+@@ -2241,6 +2249,16 @@ fn prefix_render(
+             pass.ta_seq = obj.va + *ta_at as u64;
+             pass.fs_seq = obj.va + *fs_at as u64;
+         }
++        // g16_render_work_pool: the TA and FS work records go to unit k's session slot; the
++        // records, the ring entries and the hardware's lower addresses then name that slot.
++        let work_slot = self.graph.render_work_slot(k);
++        if let Some((obj, ta_at, fs_at, _)) = &work_slot {
++            let lower = obj.lower_gva.ok_or(EINVAL)?;
++            pass.ta_work = obj.va + *ta_at as u64;
++            pass.ta_work_gva = lower + *ta_at as u64;
++            pass.fs_work = obj.va + *fs_at as u64;
++            pass.fs_work_gva = lower + *fs_at as u64;
++        }
+         let geometry = Geometry::new(&cmd.cmd, pass.heap_gva);
+         super::poll::note_fs_words([
+             u64::from(geometry.tilebuffer_control),
+@@ -2261,6 +2279,7 @@ fn prefix_render(
+         // retirement check, which then relies on the stamps and receipts alone.
+         let short = params::fs_short() && cmd.timestamp_outputs.is_empty();
+         f.fs_short = short;
++        f.work_copy = work_slot.as_ref().map_or(0, |s| s.3 as u8 + 1);
+         FS_FORMS[usize::from(short)].fetch_add(1, Ordering::Relaxed);
+         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
+         encode::encode_ta(
+@@ -2356,7 +2375,16 @@ fn prefix_render(
+             init_buffer,
+             &mut scratch.scene[..],
+         );
+-        p.write_work(&scratch.ta[..], &scratch.fs[..])?;
++        match &work_slot {
++            Some((obj, ta_at, fs_at, copy)) => {
++                obj.write(*ta_at, &scratch.ta[..])?;
++                obj.write(*fs_at, &scratch.fs[..])?;
++                if let Some(c) = super::poll::RENDER_WORK.get(*copy) {
++                    c.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
++                }
++            }
++            None => p.write_work(&scratch.ta[..], &scratch.fs[..])?,
++        }
+         match &seq_slot {
+             Some((obj, ta_at, fs_at, copy)) => {
+                 obj.write(*ta_at, &scratch.tas[..])?;
+@@ -2422,7 +2450,7 @@ fn prefix_render(
+             pf.ta_head = (pf.ta_head + 1) % cap;
+             super::poll::RENDER_CHAINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+         }
+-        r.ring[0].w64(8 * pf.ta_head as usize, p.ta_va())?;
++        r.ring[0].w64(8 * pf.ta_head as usize, pass.ta_work)?;
+         pf.ta_head = (pf.ta_head + 1) % cap;
+         // g16_render_quiet 2: no FS-ring barrier record; the FS follows its TA by the
+         // firmware's own pairing, as macOS's records have no such record.
+@@ -2430,7 +2458,7 @@ fn prefix_render(
+             r.ring[1].w64(8 * pf.fs_head as usize, p.own_barrier.va)?;
+             pf.fs_head = (pf.fs_head + 1) % cap;
+         }
+-        r.ring[1].w64(8 * pf.fs_head as usize, p.fs_va())?;
++        r.ring[1].w64(8 * pf.fs_head as usize, pass.fs_work)?;
+         pf.fs_head = (pf.fs_head + 1) % cap;
+         pf.renders = 1;
+         pf.draw = draw;
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index 4cf3a8fb44..bf8a4a9c40 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -294,12 +294,33 @@ pub(crate) struct Graphs {
+     /// `g16_render_seq_pool`: one TA and one FS microsequence slot per render unit, in an
+     /// uncached [0] and an ASC-cached [1] session object, never dropped while the session lives.
+     pub(crate) render_seq: Option<[Arc<FwObject>; 2]>,
++    /// `g16_render_work_pool`: one TA and one FS work record slot per render unit, in an
++    /// uncached [0] and an ASC-cached [1] session object with a context-0 lower mapping each.
++    pub(crate) render_work: Option<[Arc<FwObject>; 2]>,
+ }
+ 
+ /// Bytes per render unit in each `g16_render_seq_pool` object: the TA slot, then the FS slot,
+ /// each as large as a unit's own sequence object and page aligned.
+ pub(crate) const RENDER_SEQ_STRIDE: usize =
+     super::fw::work::ta::SEQ_OBJECT + super::fw::work::fs::SEQ_OBJECT;
++/// Bytes per render unit in each `g16_render_work_pool` object: the TA work record, then the FS
++/// work record at [`RENDER_WORK_FS`]. The units' own work objects start on a page; nothing in the
++/// records needs more than the 64-byte alignment these offsets give.
++pub(crate) const RENDER_WORK_STRIDE: usize = 0x2000;
++pub(crate) const RENDER_WORK_FS: usize = 0x1000;
++/// Context-0 lower addresses of the two `g16_render_work_pool` copies. They are at the top of the
++/// aperture the per-VM work objects take their lower addresses from (0x70f1000000..0x70ff000000,
++/// object.rs, insert_node_in_range), below the self-check page 0x70ff000000. They are reserved
++/// with map_at when the firmware session starts, before any VM exists, so no VM is given them.
++pub(crate) const RENDER_WORK_LOWER: [u64; 2] = [0x70fe000000, 0x70fe080000];
++const _: () = assert!(super::fw::work::ta::WORK_SIZE <= RENDER_WORK_FS);
++const _: () = assert!(super::fw::work::fs::WORK_SIZE <= RENDER_WORK_STRIDE - RENDER_WORK_FS);
++const _: () = assert!(
++    (sizes::RENDER_UNITS * RENDER_WORK_STRIDE) as u64 <= RENDER_WORK_LOWER[1] - RENDER_WORK_LOWER[0]
++);
++const _: () =
++    assert!(RENDER_WORK_LOWER[1] + (sizes::RENDER_UNITS * RENDER_WORK_STRIDE) as u64 <= 0x70ff000000);
++
+ impl Graphs {
+     pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+         let compute = ComputeGraph::new(o)?;
+@@ -326,12 +347,33 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+         } else {
+             None
+         };
++        let render_work = if super::params::render_work_pool() {
++            let size = sizes::RENDER_UNITS * RENDER_WORK_STRIDE;
++            let mut copy = |class: Class, lower: u64| {
++                o.alloc(Request {
++                    size,
++                    class,
++                    placement: Placement::Anywhere,
++                    offset: 0,
++                    client: None,
++                    lower: Some(lower),
++                    cpu: true,
++                })
++            };
++            Some([
++                copy(Class::Shared, RENDER_WORK_LOWER[0])?,
++                copy(Class::SharedCached, RENDER_WORK_LOWER[1])?,
++            ])
++        } else {
++            None
++        };
+         Ok(Self {
+             dev: dev.as_ref().as_ref().into(),
+             compute,
+             render,
+             render2,
+             render_seq,
++            render_work,
+         })
+     }
+ 
+@@ -352,6 +394,29 @@ pub(crate) fn render_seq_slot(&self, k: usize) -> Option<(Arc<FwObject>, usize,
+             copy,
+         ))
+     }
++
++    /// Unit `k`'s `g16_render_work_pool` slot: the object, the TA and FS offsets in it, and the
++    /// copy (0 uncached, 1 ASC-cached, as `g16_render_work_cached` reads now). None without the
++    /// pool or above [`sizes::RENDER_UNITS`], so the unit's own work objects are used.
++    pub(crate) fn render_work_slot(&self, k: usize) -> Option<(Arc<FwObject>, usize, usize, usize)> {
++        let pool = self.render_work.as_ref()?;
++        if k >= sizes::RENDER_UNITS {
++            return None;
++        }
++        let copy = usize::from(super::params::render_work_cached());
++        let at = k * RENDER_WORK_STRIDE;
++        Some((pool[copy].clone(), at, at + RENDER_WORK_FS, copy))
++    }
++
++    /// Where a flight's TA work went: `code` is its `Flight::work_copy` (0: the unit's own work
++    /// object, 1 or 2: copy 0 or 1 of the pool). The object and the TA offset, or None.
++    pub(crate) fn render_work_at(&self, k: usize, code: u8) -> Option<(Arc<FwObject>, usize)> {
++        let pool = self.render_work.as_ref()?;
++        if code == 0 || k >= sizes::RENDER_UNITS {
++            return None;
++        }
++        Some((pool[usize::from(code - 1) & 1].clone(), k * RENDER_WORK_STRIDE))
++    }
+ }
+ impl Firmware {
+     /// `g16_render_queues` 2: initialises the second render queue set and registers it.
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 6fed215f49..cf79f5cd22 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2949,6 +2949,38 @@ pub(crate) fn pb_slot(k: usize) -> usize {
+     "G16: 1 = every render of a VM binds one PB manager and hardware-buffer id (slot 0, unit 0's heap), shared by its renders in flight; each keeps its own unit (default 0: one PB per unit; latched at the first render command, set it as a module option)"
+ );
+ 
++/// `g16_render_work_pool` (load time, default 0). 1: at boot two session objects, one uncached
++/// and one ASC-cached, each hold one TA and one FS work record slot per render unit. The firmware
++/// maps them like the units' own work objects, and the hardware reads them at a context-0 lower
++/// address reserved at boot (graph::RENDER_WORK_LOWER). Every render then writes its work records
++/// into its unit's slot instead of the unit's per-VM work objects, and its records, its TA and FS
++/// ring entries and its lower addresses name the slot. Render units are claimed device-wide, so no
++/// two renders in flight share a slot, and the session objects are never dropped, so a cached class
++/// never reaches a per-VM mapping that is dropped at client exit (the fault g16_fw_cached bits 4
++/// and 8 hit).
++pub(crate) fn render_work_pool() -> bool {
++    module_parameters::g16_render_work_pool.value() == 1
++}
++
++/// Storage of `g16_render_work_cached` (runtime 0644, default 0).
++static RENDER_WORK_CACHED: AtomicU32 = AtomicU32::new(0);
++
++/// With `g16_render_work_pool`, whether renders published from now on use the ASC-cached copy of
++/// their unit's work slot (the class macOS gives its work records, GPU-MAP trip E) instead of the
++/// uncached one. The firmware cleans and invalidates each work record at its stage's post.
++pub(crate) fn render_work_cached() -> bool {
++    RENDER_WORK_CACHED.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    RENDER_WORK_CACHED_PARAM,
++    RENDER_WORK_CACHED_PARMTYPE,
++    RENDER_WORK_CACHED_PARM,
++    RENDER_WORK_CACHED,
++    "g16_render_work_cached",
++    "G16: with g16_render_work_pool=1, publish renders with the ASC-cached copy of their unit's work record slot (default 0: the uncached copy; runtime 0644)"
++);
++
+ /// Storage of `g16_behind_initbm` (runtime 0644, default 1).
+ static BEHIND_INITBM: AtomicU32 = AtomicU32::new(1);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 80fe5b8dad..5412052d52 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -164,6 +164,9 @@ fn wbig_stats(f: &mut fmt::Formatter<'_>) -> fmt::Result {
+     core::sync::atomic::AtomicU64::new(0);
+ /// Renders whose microsequences went to a `g16_render_seq_pool` slot: [0] the uncached copy,
+ /// [1] the ASC-cached copy.
++/// `g16_render_work_pool`: renders whose work records went to the uncached / ASC-cached copy.
++pub(crate) static RENDER_WORK: [core::sync::atomic::AtomicU64; 2] =
++    [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+ pub(crate) static RENDER_SEQ: [core::sync::atomic::AtomicU64; 2] =
+     [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+ /// Render commands queued behind work whose start came 100 us or more after the previous command's
+@@ -2034,6 +2037,14 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             RENDER_SEQ[1].load(Ordering::Relaxed),
+             u32::from(super::params::render_seq_cached())
+         )?;
++        writeln!(
++            f,
++            "render_work: pool {} uncached {} cached {} select {}",
++            u32::from(super::params::render_work_pool()),
++            RENDER_WORK[0].load(Ordering::Relaxed),
++            RENDER_WORK[1].load(Ordering::Relaxed),
++            u32::from(super::params::render_work_cached())
++        )?;
+         writeln!(
+             f,
+             "rekick: pass {} timer_render {} timer_compute {} rekick {} rekick_us {} irq {}",
+-- 
+2.43.0
+

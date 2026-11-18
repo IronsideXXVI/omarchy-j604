@@ -1349,3 +1349,7 @@ The base remains da8e1acf3656. Published 0001–0925 are unchanged. 0926 adds an
 # Kernel patch numbers: 1.1058 to 1.1062
 
 The base remains da8e1acf3656. Published 0001–0929 are unchanged. 0930 adds per-unit render microsequence slots in two session objects, an uncached and an ASC-cached copy (`g16_render_seq_pool`, with the copy selected by `g16_render_seq_cached`), and 0931 makes both the default. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1059 to 1.1061 were test kernels and are not published.
+
+# Kernel patch numbers: 1.1062 to 1.1065
+
+The base remains da8e1acf3656. Published 0001–0931 are unchanged. 0932 adds per-unit render work record slots in two session objects, an uncached and an ASC-cached copy (`g16_render_work_pool`, with the copy selected by `g16_render_work_cached`), and 0933 makes both the default. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1063 and 1.1064 were test kernels and are not published.
