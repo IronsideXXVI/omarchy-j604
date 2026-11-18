@@ -1341,3 +1341,7 @@ The base remains da8e1acf3656. Published 0001–0922 are unchanged. 0923 sets `g
 # Kernel patch numbers: 1.1052 to 1.1056
 
 The base remains da8e1acf3656. Published 0001–0923 are unchanged. 0924 adds mode 2 of `g16_compute_shared_pool` (one memory pool, one allocator record, one submitted counter and one firmware allocator index per client, shared by all its compute units), and 0925 makes mode 2 the default (`aurora.g16_compute_shared_pool=0` restores one pool per unit, `=1` the earlier shared pool). Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1053 to 1.1055 were test kernels and are not published.
+
+# Kernel patch numbers: 1.1056 to 1.1058
+
+The base remains da8e1acf3656. Published 0001–0925 are unchanged. 0926 adds an optional single compute doorbell per publish pass (`g16_compute_onebell`) and 0927 makes mode 2 (a doorbell after the first record and when the pass ends) the default; 0928 gives each client 32 compute units by default (`g16_compute_units`), and 0929 lets 31 compute commands of a queue wait behind a running one by default (`g16_horizon`). Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1057 and 1.1059 were test kernels and are not published.

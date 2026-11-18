@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 14:42:25 +0000
+Subject: [PATCH] drm/asahi: g16: optionally ring one compute doorbell
+ per publish pass
+
+A poll pass that retires compute work publishes the commands waiting
+behind it back to back, and each compute publication rings the compute
+pipe after its submit record. Every doorbell wakes one firmware
+scheduler pass. One such pass consumes every submit record published up
+to the queue head (25G83, 0x36708), so the passes after the first find
+nothing new, but the firmware still runs each of them on the thread that
+also posts completions and launches the next command.
+
+Add g16_compute_onebell (runtime 0644, default 0: unchanged). Once the
+compute queue is registered:
+1 posts every compute record of the publish pass and rings the compute
+  pipe once when the pass ends;
+2 rings after the first compute record of the pass, so an idle firmware
+  starts at once, and once more when the pass ends if more records
+  followed without a doorbell.
+The first record of an unregistered queue always rings at once. The
+owed doorbell is rung before publish() returns, also when it stops on
+its publication deadline; after a fail-stop nothing is rung. A failed
+owed doorbell fails the pass like a failed per-record doorbell.
+
+A "cbell:" stats line counts the records posted without a doorbell, the
+doorbells rung when a pass ended, and the first-of-pass doorbells.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 63 ++++++++++++++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/params.rs | 25 ++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  8 ++++
+ 3 files changed, 95 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 5681bd81c5..0bf5af4593 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -395,6 +395,9 @@ pub(crate) struct Stats {
+     /// `g16_onebell`: render publications rung once (1, 2), and rung on both pipes after
+     /// both records (3).
+     pub(crate) onebell: [u64; 2],
++    /// `g16_compute_onebell`: compute records posted without their own doorbell, doorbells
++    /// rung when a publish pass ended, and first-of-pass doorbells (mode 2).
++    pub(crate) cbell: [u64; 3],
+     /// The last prefix that failed that check: publication, first stage start, last stage end
+     /// and retirement, raw 24 MHz ticks (to find the stamps' time base).
+     pub(crate) lat_last_bad: [u64; 4],
+@@ -621,6 +624,10 @@ pub(crate) struct Engine {
+     pub(crate) chan_wait: bool,
+     /// Ready work waits for a running command to retire (`g16_window_poll_us`).
+     pub(crate) window_wait: bool,
++    /// `g16_compute_onebell`: a compute record of this publish pass was posted without its
++    /// doorbell (rung when the pass ends), and the compute pipe was rung in this pass.
++    pub(crate) cbell_owed: bool,
++    pub(crate) cbell_rung: bool,
+     /// `g16_pass_check_once`: the poll pass calling [`Firmware::publish`] has just made the
+     /// session and health checks under this device lock. Taken by publish().
+     pub(crate) pass_checked: bool,
+@@ -677,6 +684,8 @@ pub(crate) fn new() -> Result<Self> {
+             ta_registered: false,
+             chan_wait: false,
+             window_wait: false,
++            cbell_owed: false,
++            cbell_rung: false,
+             pass_checked: false,
+             progress_flight: 0,
+             progress: [None; 3],
+@@ -798,6 +807,32 @@ fn kick_firmware(&mut self) -> Result {
+         )
+     }
+ 
++    /// `g16_compute_onebell`: whether this compute record waits for the doorbell rung when the
++    /// publish pass ends. 1: always; 2: not the first compute record of the pass.
++    fn defer_compute_bell(&mut self) -> bool {
++        match super::params::compute_onebell() {
++            1 => true,
++            2 if self.engine.cbell_rung => true,
++            2 => {
++                self.engine.stats.cbell[2] += 1;
++                false
++            }
++            _ => false,
++        }
++    }
++
++    /// `g16_compute_onebell`: rings the compute pipe once for the records of this publish pass
++    /// that were posted without a doorbell. One firmware scheduler pass consumes them all.
++    fn ring_owed_compute(&mut self) -> Result {
++        if !core::mem::take(&mut self.engine.cbell_owed) {
++            return Ok(());
++        }
++        self.session.ring(Channel::Compute)?;
++        self.engine.cbell_rung = true;
++        self.engine.stats.cbell[1] += 1;
++        Ok(())
++    }
++
+     /// Publishes the Globals performance-floor word when `g16_effort` changed it: zero to
+     /// +0xe8, then the effort to +0xe4, ordered before the publication's stores.
+     fn publish_effort(&mut self) -> Result {
+@@ -1346,6 +1381,8 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+         let mut result = Ok(());
+ 
+         self.engine.chan_wait = false;
++        // g16_compute_onebell: a new publish pass; its first compute record may ring (mode 2).
++        self.engine.cbell_rung = false;
+         while self.recovery.failed().is_none()
+             && !self.engine.frozen
+             && !self.engine.pending.is_empty()
+@@ -1549,6 +1586,8 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+                                 .0
+                             });
+                     if super::recovery::logic::expired(now_ns(), deadline) {
++                        // Records posted earlier in this pass still get their doorbell.
++                        self.ring_owed_compute()?;
+                         return Err(ETIMEDOUT);
+                     }
+                     break;
+@@ -1575,6 +1614,17 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+                 }
+             }
+         }
++        // g16_compute_onebell: one doorbell for the compute records posted without their own.
++        // After a fail-stop nothing is rung; the records stay with the retained flights.
++        if self.recovery.failed().is_none() {
++            if let Err(e) = self.ring_owed_compute() {
++                if result.is_ok() {
++                    result = Err(e);
++                }
++            }
++        } else {
++            self.engine.cbell_owed = false;
++        }
+         // Work left pending behind running flights waits for one of them to retire.
+         self.engine.window_wait =
+             !self.engine.pending.is_empty() && !self.engine.flights.is_empty();
+@@ -1939,7 +1989,18 @@ fn publish_prefix_into(
+                     self.subgen_bump(channel as usize);
+                 }
+                 if onebell == 0 {
+-                    self.session.ring(channel)?;
++                    // g16_compute_onebell: a registered compute queue's record may wait for the
++                    // one doorbell at the end of this publish pass.
++                    if channel == Channel::Compute && !fresh && self.defer_compute_bell() {
++                        self.engine.cbell_owed = true;
++                        self.engine.stats.cbell[0] += 1;
++                    } else {
++                        self.session.ring(channel)?;
++                        if channel == Channel::Compute {
++                            self.engine.cbell_rung = true;
++                            self.engine.cbell_owed = false;
++                        }
++                    }
+                 }
+             }
+             match onebell {
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index b6c9dfa39d..3976742e05 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -490,6 +490,31 @@ pub(crate) fn onebell() -> u32 {
+     "G16: doorbells of a render publication (default 0: one per pipe after its record; 1: both records, then the TA pipe only; 2: then the FS pipe only; 3: then both; runtime 0644)"
+ );
+ 
++/// Storage of `g16_compute_onebell` (runtime 0644, default 0).
++static COMPUTE_ONEBELL: AtomicU32 = AtomicU32::new(0);
++
++/// Doorbells of the compute publications of one publish pass, once the compute queue is
++/// registered. Each doorbell wakes one firmware scheduler pass, and one pass consumes every
++/// submit record published up to the queue head (25G83 0x36708). A publish pass that follows
++/// a retirement publishes several compute commands back to back, so with one doorbell per
++/// record the firmware runs a burst of scheduler passes while it also has to post and
++/// launch. 0: one doorbell after each record (unchanged). 1: post every record of the pass,
++/// then ring the compute pipe once when the pass ends. 2: ring after the first record of the
++/// pass, then once more when the pass ends if more records followed. The deferred doorbell
++/// is rung before publish() returns, also when it stops early.
++pub(crate) fn compute_onebell() -> u32 {
++    COMPUTE_ONEBELL.load(Ordering::Relaxed).min(2)
++}
++
++live_u32_param!(
++    COMPUTE_ONEBELL_PARAM,
++    COMPUTE_ONEBELL_PARMTYPE,
++    COMPUTE_ONEBELL_PARM,
++    COMPUTE_ONEBELL,
++    "g16_compute_onebell",
++    "G16: doorbells of the compute publications of one publish pass (default 0: one after each record; 1: one when the pass ends; 2: after the first record and when the pass ends; runtime 0644)"
++);
++
+ live_u32_param!(
+     RESNAP_LIVE_PARAM,
+     RESNAP_LIVE_PARMTYPE,
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 3879c41758..2228a0867d 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -2451,6 +2451,14 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.onebell[0],
+             s.onebell[1]
+         )?;
++        writeln!(
++            f,
++            "cbell: mode {} deferred {} pass_end {} first {}",
++            super::params::compute_onebell(),
++            s.cbell[0],
++            s.cbell[1],
++            s.cbell[2]
++        )?;
+         write!(f, "first_hist_100us:")?;
+         for n in s.first_hist.iter() {
+             write!(f, " {}", n)?;
+-- 
+2.43.0
+
