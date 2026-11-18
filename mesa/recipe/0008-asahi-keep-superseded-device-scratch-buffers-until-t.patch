@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 15:56:43 +0000
+Subject: [PATCH] asahi: keep superseded device scratch buffers until teardown
+
+agx_scratch_realloc() frees the old scratch buffer the moment scratch
+grows. But a submission that already reached the kernel embeds the
+scratch buffer's GPU address in its compute or render command
+(helper.data) and takes no reference to the buffer. Freeing it lets the
+BO cache rebind that address to a different allocation while the earlier
+job is still spilling to it, so the running shader reads or writes the
+wrong memory once two submissions with different spill sizes overlap.
+
+What a user can see without this: an application whose shaders spill
+registers (large compute kernels, heavy fragment shaders) can hit a GPU
+fault that fails or loses its submission, or get silently corrupted
+rendering or compute results, or corrupt an unrelated buffer that reused
+the freed memory, whenever a job is still running while a later
+submission makes scratch grow.
+
+Scratch only ever grows, so the number of superseded buffers is bounded.
+Retain them on a list and release them all in agx_scratch_fini() rather
+than freeing the live one at realloc time.
+---
+ src/asahi/lib/agx_scratch.c | 8 +++++++-
+ src/asahi/lib/agx_scratch.h | 8 ++++++++
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/src/asahi/lib/agx_scratch.c b/src/asahi/lib/agx_scratch.c
+index 049ecf6463d..03b4f3ecd00 100644
+--- a/src/asahi/lib/agx_scratch.c
++++ b/src/asahi/lib/agx_scratch.c
+@@ -72,8 +72,10 @@ agx_scratch_get_bucket(uint32_t dwords)
+ static void
+ agx_scratch_realloc(struct agx_scratch *scratch)
+ {
++   /* The old buffer may still be read by an in-flight job that embedded its
++    * VA; retain it until device teardown rather than free it here. */
+    if (scratch->buf)
+-      agx_bo_unreference(scratch->dev, scratch->buf);
++      util_dynarray_append(&scratch->retired, scratch->buf);
+ 
+    struct spill_size size = agx_scratch_get_spill_size(scratch->size_dwords);
+ 
+@@ -270,6 +272,7 @@ agx_scratch_init(struct agx_device *dev, struct agx_scratch *scratch)
+    memset(scratch, 0, sizeof(*scratch));
+ 
+    scratch->dev = dev;
++   util_dynarray_init(&scratch->retired, NULL);
+ #ifdef SCRATCH_DEBUG_CORES
+    scratch->num_cores = SCRATCH_DEBUG_CORES;
+ #else
+@@ -280,6 +283,9 @@ agx_scratch_init(struct agx_device *dev, struct agx_scratch *scratch)
+ void
+ agx_scratch_fini(struct agx_scratch *scratch)
+ {
++   util_dynarray_foreach(&scratch->retired, struct agx_bo *, bo)
++      agx_bo_unreference(scratch->dev, *bo);
++   util_dynarray_fini(&scratch->retired);
+    if (scratch->buf)
+       agx_bo_unreference(scratch->dev, scratch->buf);
+    scratch->buf = NULL;
+diff --git a/src/asahi/lib/agx_scratch.h b/src/asahi/lib/agx_scratch.h
+index eab82f5d579..b7a53b31599 100644
+--- a/src/asahi/lib/agx_scratch.h
++++ b/src/asahi/lib/agx_scratch.h
+@@ -7,6 +7,7 @@
+ 
+ #include "agx_device.h"
+ #include <agx_pack.h>
++#include "util/u_dynarray.h"
+ 
+ // #define SCRATCH_DEBUG
+ 
+@@ -21,6 +22,13 @@ struct agx_scratch {
+ 
+    struct agx_helper_header *header;
+ 
++   /* Superseded scratch buffers. Growing scratch cannot free the old
++    * buffer at once: a submitted job embeds its VA in the compute/render
++    * command (helper.data) with no reference, so freeing it lets the VA be
++    * rebound while that job still reads it. Scratch only grows, so these are
++    * bounded; they are released at agx_scratch_fini. */
++   struct util_dynarray retired;
++
+ #ifdef SCRATCH_DEBUG
+    bool core_present[1024];
+    struct agx_helper_block *blocklist;
+-- 
+2.43.0
+

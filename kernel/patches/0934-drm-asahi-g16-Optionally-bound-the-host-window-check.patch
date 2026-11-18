@@ -1,0 +1,317 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 19:02:06 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally bound the host window
+ check
+
+Every poll pass and every submission checks the host window: it reads
+back, uncached, every linked entry of the shared L2 of the 64 GiB host
+window, one entry per 32 MiB. An entry is linked the first time anything
+is mapped in its 32 MiB and is never unlinked, because its L3 table is
+never freed. The objects in it are freed and their VA reused, but the
+link stays. So the check's length is the most host-window VA the boot
+has ever used, which grows with every client mix (overlapping clients,
+arenas held by unit leases, fragmentation of the best-fit allocator) and
+never shrinks. A light compute command gets slower the more clients the
+boot has run.
+
+Add aurora.g16_window_check_n (runtime, default 0: unchanged). With N > 0
+a check still verifies the firmware root words, then reads N linked
+shared-L2 words round robin from a list of the linked indices, which is
+rebuilt only after a new link. Every linked word is still read at least
+once every ceil(linked / N) checks, and linking a new entry (sync_range)
+still compares all 2048 words. The choice of words is in g16/winscan.rs
+with host tests.
+
+The stats file reports "window: linked L check_n N bounded_checks C
+bounded_words W", so the growth itself can be read off.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/mod.rs     |   1 +
+ drivers/gpu/drm/asahi/g16/params.rs  |  21 +++++
+ drivers/gpu/drm/asahi/g16/poll.rs    |   8 ++
+ drivers/gpu/drm/asahi/g16/uat.rs     |  45 +++++++++-
+ drivers/gpu/drm/asahi/g16/winscan.rs | 125 +++++++++++++++++++++++++++
+ 5 files changed, 197 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/winscan.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index aa2f4522bd..d3f96c1168 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -73,6 +73,7 @@
+ mod slots;
+ mod timestamp;
+ mod uat;
++pub(crate) mod winscan;
+ mod vm;
+ 
+ use core::any::Any;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 50303b5ff8..70022c422b 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -515,6 +515,27 @@ pub(crate) fn compute_onebell() -> u32 {
+     "G16: doorbells of the compute publications of one publish pass (default 2: after the first record and when the pass ends; 0: one after each record; 1: one when the pass ends; runtime 0644)"
+ );
+ 
++/// Storage of `g16_window_check_n` (runtime 0644, default 0).
++static WINDOW_CHECK_N: AtomicU32 = AtomicU32::new(0);
++
++/// Shared-L2 words one host-window check reads back (g16/winscan.rs). 0: every linked word on
++/// every check, as before. N: the root words and N linked words round robin, so every linked
++/// word is still read at least once every ceil(linked / N) checks while a check's cost stops
++/// growing with the host-window VA the boot has ever used. Linking a new entry (sync_range)
++/// still compares all 2048 words. Read at each check.
++pub(crate) fn window_check_n() -> u32 {
++    WINDOW_CHECK_N.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    WINDOW_CHECK_N_PARAM,
++    WINDOW_CHECK_N_PARMTYPE,
++    WINDOW_CHECK_N_PARM,
++    WINDOW_CHECK_N,
++    "g16_window_check_n",
++    "G16: shared-L2 words one host-window check reads (default 0: every linked word; N: N linked words round robin, each still read every ceil(linked/N) checks; runtime 0644)"
++);
++
+ live_u32_param!(
+     RESNAP_LIVE_PARAM,
+     RESNAP_LIVE_PARMTYPE,
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 5412052d52..5bb313166f 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -2045,6 +2045,14 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             RENDER_WORK[1].load(Ordering::Relaxed),
+             u32::from(super::params::render_work_cached())
+         )?;
++        writeln!(
++            f,
++            "window: linked {} check_n {} bounded_checks {} bounded_words {}",
++            self.objects.window.lock().linked(),
++            super::params::window_check_n(),
++            super::winscan::WINDOW_N[0].load(Ordering::Relaxed),
++            super::winscan::WINDOW_N[1].load(Ordering::Relaxed)
++        )?;
+         writeln!(
+             f,
+             "rekick: pass {} timer_render {} timer_compute {} rekick {} rekick_us {} irq {}",
+diff --git a/drivers/gpu/drm/asahi/g16/uat.rs b/drivers/gpu/drm/asahi/g16/uat.rs
+index 72ca9cb94b..0e01bfea27 100644
+--- a/drivers/gpu/drm/asahi/g16/uat.rs
++++ b/drivers/gpu/drm/asahi/g16/uat.rs
+@@ -170,6 +170,12 @@ pub(crate) struct Window {
+     /// The shared L2 entries last written, and a snapshot buffer of the shadow L2.
+     image: KVec<u64>,
+     snapshot: KVec<u64>,
++    /// `g16_window_check_n`: the indices of the linked entries of `image` (rebuilt after a
++    /// new link), how many there are, and the next position a bounded check starts from.
++    linked: KVec<u16>,
++    linked_len: usize,
++    linked_dirty: bool,
++    cursor: usize,
+     /// No firmware-visible link is written until the explicit stopped bootstrap epoch.
+     published: bool,
+     /// Observed firmware-owned root words; only the exact qualified forward transition is
+@@ -189,6 +195,10 @@ pub(crate) fn new(adt: &super::adt::GpuAdt) -> Result<Self> {
+             shared_l2: Mapping::write_combined(adt.shared_l2.start, hw::SHARED_L2_SIZE as usize)?,
+             image: KVec::from_elem(0u64, ENTRIES, GFP_KERNEL)?,
+             snapshot: KVec::from_elem(0u64, ENTRIES, GFP_KERNEL)?,
++            linked: KVec::from_elem(0u16, ENTRIES, GFP_KERNEL)?,
++            linked_len: 0,
++            linked_dirty: true,
++            cursor: 0,
+             published: false,
+             firmware_root: [0; 2],
+             text_pa: adt.text.start,
+@@ -430,14 +440,42 @@ pub(crate) fn check(&mut self) -> Result {
+             return Err(ENODEV);
+         }
+         self.verify_root()?;
+-        for (index, &expected) in self.image.iter().enumerate() {
+-            if expected != 0 && self.shared_l2.io().try_read64(index * 8)? != expected {
+-                return Err(EIO);
++        let budget = super::params::window_check_n() as usize;
++        if budget == 0 {
++            for (index, &expected) in self.image.iter().enumerate() {
++                if expected != 0 && self.shared_l2.io().try_read64(index * 8)? != expected {
++                    return Err(EIO);
++                }
+             }
++            return Ok(());
++        }
++        // g16_window_check_n: N linked words round robin (winscan.rs).
++        if self.linked_dirty {
++            self.linked_len = super::winscan::collect(&self.image, &mut self.linked);
++            self.linked_dirty = false;
+         }
++        let (ranges, next) = super::winscan::batch(self.linked_len, self.cursor, budget);
++        let mut words = 0;
++        for range in ranges {
++            for position in range {
++                let index = *self.linked.get(position).ok_or(EINVAL)? as usize;
++                let expected = *self.image.get(index).ok_or(EINVAL)?;
++                if self.shared_l2.io().try_read64(index * 8)? != expected {
++                    return Err(EIO);
++                }
++                words += 1;
++            }
++        }
++        self.cursor = next;
++        super::winscan::note(words);
+         Ok(())
+     }
+ 
++    /// Linked shared-L2 entries: 32 MiB regions of the host window the boot has ever mapped.
++    pub(crate) fn linked(&self) -> usize {
++        self.image.iter().filter(|&&e| e != 0).count()
++    }
++
+     /// The RAM L2 table of the shadow window, if anything is mapped in the window.
+     fn shadow_l2(uat: &mmu::Uat) -> Result<Option<u64>> {
+         let e = entry(uat.kernel_window_root(), WINDOW_INDEX)?;
+@@ -507,6 +545,7 @@ fn sync_inner(&mut self, shadow_l2: Option<u64>, range: Option<Range<u64>>) -> R
+                 mb();
+                 shared.try_write64(e, i * 8)?;
+                 self.image[i] = e;
++                self.linked_dirty = true;
+                 continue;
+             }
+             match &range {
+diff --git a/drivers/gpu/drm/asahi/g16/winscan.rs b/drivers/gpu/drm/asahi/g16/winscan.rs
+new file mode 100644
+index 0000000000..f756c9952c
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/winscan.rs
+@@ -0,0 +1,125 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! `g16_window_check_n`: which linked shared-L2 words one host-window check reads. Core only.
++//!
++//! The shared L2 of the 64 GiB host window has one entry per 32 MiB. An entry is linked the
++//! first time anything is mapped in its 32 MiB and is never unlinked (its L3 table is never
++//! freed), so the number of linked entries is the most host-window VA a boot has ever used:
++//! it grows with every client mix and never shrinks. Each window check (every poll pass and
++//! every submission) reads every linked entry back. With a budget N, a check reads N of them
++//! round robin, so its cost no longer grows with the boot's history, and every linked entry
++//! is still read at least once every ceil(linked / N) checks.
++
++use core::ops::Range;
++use core::sync::atomic::{AtomicU64, Ordering};
++
++/// Writes the indices of the nonzero entries of `image` into `out`, in index order, and
++/// returns how many were written (at most `out.len()`).
++pub(crate) fn collect(image: &[u64], out: &mut [u16]) -> usize {
++    let mut n = 0;
++    for (i, &e) in image.iter().enumerate() {
++        if e != 0 && n < out.len() {
++            out[n] = i as u16;
++            n += 1;
++        }
++    }
++    n
++}
++
++/// The positions in a list of `len` linked entries that one check reads, as two ranges (the
++/// second one when the batch wraps), and the cursor after it. A budget of 0, or one not
++/// smaller than `len`, reads all of them and leaves the cursor at 0.
++pub(crate) fn batch(len: usize, cursor: usize, budget: usize) -> ([Range<usize>; 2], usize) {
++    if budget == 0 || budget >= len {
++        return ([0..len, 0..0], 0);
++    }
++    let start = cursor % len;
++    let end = start + budget;
++    if end <= len {
++        ([start..end, 0..0], end % len)
++    } else {
++        ([start..len, 0..end - len], end - len)
++    }
++}
++
++/// [0] window checks made with a budget, [1] shared-L2 words they read.
++pub(crate) static WINDOW_N: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
++
++pub(crate) fn note(words: usize) {
++    WINDOW_N[0].fetch_add(1, Ordering::Relaxed);
++    WINDOW_N[1].fetch_add(words as u64, Ordering::Relaxed);
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn positions(r: &[Range<usize>; 2]) -> Vec<usize> {
++        r[0].clone().chain(r[1].clone()).collect()
++    }
++
++    #[test]
++    fn collect_lists_linked_entries_in_order() {
++        let mut image = vec![0u64; 2048];
++        for i in [3usize, 4, 100, 2047] {
++            image[i] = 0x1000 * i as u64 | 3;
++        }
++        let mut out = vec![0u16; 2048];
++        let n = collect(&image, &mut out);
++        assert_eq!(&out[..n], &[3, 4, 100, 2047]);
++        let mut short = [0u16; 2];
++        assert_eq!(collect(&image, &mut short), 2);
++        assert_eq!(short, [3, 4]);
++        assert_eq!(collect(&[0u64; 16], &mut out), 0);
++    }
++
++    #[test]
++    fn budget_zero_or_large_reads_everything() {
++        for (len, budget) in [(0, 0), (7, 0), (7, 7), (7, 100), (0, 5)] {
++            let (r, next) = batch(len, 3, budget);
++            assert_eq!(positions(&r), (0..len).collect::<Vec<_>>(), "len {len} budget {budget}");
++            assert_eq!(next, 0);
++        }
++    }
++
++    #[test]
++    fn every_entry_within_ceil_len_over_budget_checks() {
++        for len in 1..70usize {
++            for budget in 1..len {
++                for start in 0..len {
++                    let mut seen = vec![0u32; len];
++                    let mut cursor = start;
++                    for _ in 0..len.div_ceil(budget) {
++                        let (r, next) = batch(len, cursor, budget);
++                        let p = positions(&r);
++                        assert_eq!(p.len(), budget);
++                        for x in p {
++                            seen[x] += 1;
++                        }
++                        cursor = next;
++                    }
++                    let all = seen.iter().all(|&s| s >= 1);
++                    assert!(all, "len {len} budget {budget} start {start}");
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn a_grown_list_keeps_the_cursor_in_range() {
++        // The list grew from 10 to 12 entries between checks: the old cursor stays valid.
++        let (r, next) = batch(12, 9, 4);
++        assert_eq!(positions(&r), vec![9, 10, 11, 0]);
++        assert_eq!(next, 1);
++        // A cursor past the end (the list was rebuilt shorter) wraps instead of indexing out.
++        let (r, _) = batch(5, 9, 2);
++        assert_eq!(positions(&r), vec![4, 0]);
++    }
++
++    #[test]
++    fn counters() {
++        let before = WINDOW_N[1].load(Ordering::Relaxed);
++        note(8);
++        assert_eq!(WINDOW_N[1].load(Ordering::Relaxed), before + 8);
++    }
++}
+-- 
+2.43.0
+

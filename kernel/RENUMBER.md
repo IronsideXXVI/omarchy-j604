@@ -1353,3 +1353,7 @@ The base remains da8e1acf3656. Published 0001–0929 are unchanged. 0930 adds pe
 # Kernel patch numbers: 1.1062 to 1.1065
 
 The base remains da8e1acf3656. Published 0001–0931 are unchanged. 0932 adds per-unit render work record slots in two session objects, an uncached and an ASC-cached copy (`g16_render_work_pool`, with the copy selected by `g16_render_work_cached`), and 0933 makes both the default. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1063 and 1.1064 were test kernels and are not published.
+
+# Kernel patch numbers: 1.1065 to 1.1067
+
+The base remains da8e1acf3656. Published 0001–0933 are unchanged. 0934 adds `g16_window_check_n`, which bounds how many linked host-window entries each check reads, and 0935 makes 8 the default. The message of 0935 was corrected after the build so that each light-compute figure names the stress sets it was measured after; its diff and the built tree (2f5b2742f71e) are unchanged. Applied source differs from the installed build only in the same nine comment lines as before. Version 1.1066 was not released or published.
