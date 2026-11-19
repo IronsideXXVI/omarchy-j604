@@ -1,0 +1,251 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 21:52:39 +0000
+Subject: [PATCH] drm/asahi: g16: name a compute queue's own id in its
+ work and sequence
+
+With g16_compute_queues=2 the GPU firmware faulted within a second of
+the first deep compute run, reading a null queue record (PC 0x1e128,
+FAR 0x20) in the launch walk of row 16.
+
+25G83 takes the row it walks from the submit record's event byte
+(+0x16, 0x37148), but registers a compute queue's row, the queue
+record pointer the walk reads, from the word at compute work +0x814
+(0x1cef8, then 0x1da24 to 0x1d8f0). The compute encoder wrote 15
+(compute::EVENT) there, and at StartCompute +0x1b8, on every queue.
+Queue 1's records named row 16 while its work registered row 15, so
+row 16 was walked without ever being registered.
+
+Write the command's queue id, cqueue::queue_id(), at work +0x814 and
+StartCompute +0x1b8, and take the submit record's event byte from the
+same function. Queue 0 keeps 15 in all three places, so its encoded
+bytes do not change, and a const assert keeps compute::EVENT equal to
+queue 0's id. Grouped jobs run on queue 0 only. g16_compute_queues
+stays 1 by default.
+
+The host tests in cqueue.rs build the work word, the sequence word and
+a real SubmitRecord for one to four queues and check that all three
+carry the queue's own id. They also check that queue 0's bytes equal
+the old constant's, and that the old constant on queue 1 does not
+match its record.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/cqueue.rs         | 129 ++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/encode/compute.rs |  10 +-
+ drivers/gpu/drm/asahi/g16/engine.rs         |   3 +-
+ 3 files changed, 139 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/cqueue.rs b/drivers/gpu/drm/asahi/g16/cqueue.rs
+index 8191d49aeb..37c7c2d463 100644
+--- a/drivers/gpu/drm/asahi/g16/cqueue.rs
++++ b/drivers/gpu/drm/asahi/g16/cqueue.rs
+@@ -20,6 +20,37 @@
+ /// 7-bit queue table.
+ pub(crate) const QUEUE_IDS: [u8; QUEUES_MAX] = [15, 16, 17, 18];
+ 
++/// Offset of the queue id in a compute work block. 25G83 registers a compute queue's row from
++/// this word (0x1cef8, then 0x1da24 to 0x1d8f0) but walks the row named by the submit record's
++/// event byte (0x37148), so both must name the same queue: a row walked without registration
++/// faults the firmware (a null queue record read at 0x1e128).
++pub(crate) const WORK_QUEUE_ID: usize = 0x814;
++
++/// Offset of the queue id in the compute sequence's StartCompute record.
++pub(crate) const SEQ_QUEUE_ID: usize = 0x1b8;
++
++/// The firmware queue id of compute queue `q`: the event byte of its submit records and the id
++/// its work blocks and StartCompute records carry.
++pub(crate) fn queue_id(q: usize) -> u8 {
++    QUEUE_IDS[q % QUEUES_MAX]
++}
++
++fn put_id(b: &mut [u8], at: usize, q: usize) {
++    if let Some(d) = b.get_mut(at..at + 4) {
++        d.copy_from_slice(&u32::from(queue_id(q)).to_le_bytes());
++    }
++}
++
++/// Writes compute queue `q`'s id into a work block.
++pub(crate) fn put_work_id(work: &mut [u8], q: usize) {
++    put_id(work, WORK_QUEUE_ID, q);
++}
++
++/// Writes compute queue `q`'s id into a compute sequence's StartCompute record.
++pub(crate) fn put_seq_id(seq: &mut [u8], q: usize) {
++    put_id(seq, SEQ_QUEUE_ID, q);
++}
++
+ /// Where the next compute command goes.
+ #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+ pub(crate) enum Place {
+@@ -159,6 +190,104 @@ pub(crate) fn queue_set<T, E>(
+ #[allow(dead_code)]
+ mod fwg;
+ 
++#[cfg(test)]
++#[path = "fw/channels.rs"]
++#[allow(dead_code)]
++mod channels;
++
++#[cfg(test)]
++mod ids {
++    use super::*;
++
++    /// The id a work block and its StartCompute record carry, when the two agree.
++    fn carried(work: &[u8], seq: &[u8]) -> Option<u32> {
++        let get =
++            |b: &[u8], at: usize| Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?));
++        let (w, s) = (get(work, WORK_QUEUE_ID)?, get(seq, SEQ_QUEUE_ID)?);
++        (w == s).then_some(w)
++    }
++
++    /// Work block and sequence as the encoder writes the id into them, and the submit record
++    /// as the engine posts it, for compute queue `q`.
++    fn encoded(q: usize) -> ([u8; 0x2000], [u8; 0x300], [u8; 0x18]) {
++        let mut work = [0xa5u8; 0x2000];
++        let mut seq = [0x5au8; 0x300];
++        put_work_id(&mut work, q);
++        put_seq_id(&mut seq, q);
++        let record = super::channels::SubmitRecord {
++            unk_0: 1,
++            qinfo: 0xfffffc20c0668000 + 0x2480 * q as u64,
++            kind: 2,
++            head: 1,
++            event: queue_id(q),
++            new_queue: 1,
++        }
++        .to_bytes();
++        (work, seq, record)
++    }
++
++    /// The submit record's event byte (fw/channels.rs asserts the offset).
++    const RECORD_ID: usize = core::mem::offset_of!(super::channels::SubmitRecord, event);
++
++    #[test]
++    fn work_sequence_and_record_name_the_same_queue() {
++        for queues in 1..=QUEUES_MAX {
++            let mut seen = [false; 128];
++            for q in 0..queues {
++                let (work, seq, record) = encoded(q);
++                let id = carried(&work, &seq).expect("work block and sequence agree");
++                assert_eq!(
++                    id,
++                    u32::from(record[RECORD_ID]),
++                    "queue {q} of {queues}: work = record"
++                );
++                assert_eq!(
++                    id,
++                    u32::from(QUEUE_IDS[q]),
++                    "queue {q} of {queues}: its own id"
++                );
++                assert!(
++                    !seen[id as usize],
++                    "queue {q} of {queues}: id {id} used twice"
++                );
++                seen[id as usize] = true;
++            }
++        }
++    }
++
++    #[test]
++    fn queue_zero_bytes_are_unchanged() {
++        // Before: put32(w, 0x814, compute::EVENT) and put32(q, 0x1b8, compute::EVENT), EVENT = 15.
++        let (work, seq, record) = encoded(0);
++        let mut old_w = [0xa5u8; 0x2000];
++        old_w[0x814..0x818].copy_from_slice(&15u32.to_le_bytes());
++        let mut old_q = [0x5au8; 0x300];
++        old_q[0x1b8..0x1bc].copy_from_slice(&15u32.to_le_bytes());
++        assert!(work == old_w, "queue 0 work block changed");
++        assert!(seq == old_q, "queue 0 sequence changed");
++        assert_eq!(record[RECORD_ID], 15);
++    }
++
++    #[test]
++    fn the_old_constant_fails_on_queue_one() {
++        let (_, _, record) = encoded(1);
++        let mut work = [0u8; 0x2000];
++        work[0x814..0x818].copy_from_slice(&15u32.to_le_bytes());
++        let mut seq = [0u8; 0x300];
++        seq[0x1b8..0x1bc].copy_from_slice(&15u32.to_le_bytes());
++        assert_eq!(carried(&work, &seq), Some(15));
++        assert_ne!(carried(&work, &seq), Some(u32::from(record[RECORD_ID])));
++    }
++
++    #[test]
++    fn out_of_range_buffers_are_left_alone() {
++        let mut short = [7u8; 0x10];
++        put_work_id(&mut short, 1);
++        put_seq_id(&mut short, 1);
++        assert_eq!(short, [7u8; 0x10]);
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/drivers/gpu/drm/asahi/g16/encode/compute.rs b/drivers/gpu/drm/asahi/g16/encode/compute.rs
+index bdadff4a57..c5c189a714 100644
+--- a/drivers/gpu/drm/asahi/g16/encode/compute.rs
++++ b/drivers/gpu/drm/asahi/g16/encode/compute.rs
+@@ -23,6 +23,9 @@ pub(crate) enum ComputeEncodeError {
+ pub(crate) struct ComputeRefs {
+     pub(crate) notifier: u64,
+     pub(crate) qinfo: u64,
++    /// Compute queue (`g16_compute_queues`) the command runs on; its firmware id goes to work
++    /// +0x814 and StartCompute +0x1b8 (`cqueue::queue_id`).
++    pub(crate) queue: usize,
+     pub(crate) user_stamp: u64,
+     pub(crate) fw_stamp: u64,
+     pub(crate) work: u64,
+@@ -59,6 +62,9 @@ pub(crate) struct ComputeRefs {
+     pub(crate) submitted: u64,
+ }
+ 
++/// Queue 0 keeps the id it always carried.
++const _: () = assert!(super::super::cqueue::QUEUE_IDS[0] as u32 == compute::EVENT);
++
+ const FW_START: u64 = 0xfffffc2000000000;
+ const FW_END: u64 = 0xfffffc2ffc000000;
+ const VM_START: u64 = 0x4000;
+@@ -331,7 +337,7 @@ pub(crate) fn encode_compute(
+     put64(w, 0x800, r.user_stamp);
+     put64(w, 0x808, r.fw_stamp);
+     put32(w, 0x810, r.target_stamp);
+-    put32(w, 0x814, compute::EVENT);
++    super::super::cqueue::put_work_id(w, r.queue);
+     put32(w, 0x81c, 1);
+     put32(w, 0x818, r.work_818);
+     put64(w, 0x820, r.command_id);
+@@ -373,7 +379,7 @@ pub(crate) fn encode_compute(
+     put64(q, 0x198, r.context_store_gva + 0x1e800);
+     put64(q, 0x1a0, r.context_store_gva + 0x1f000);
+     put64(q, 0x1a8, r.work + 0x8ac);
+-    put32(q, 0x1b8, compute::EVENT);
++    super::super::cqueue::put_seq_id(q, r.queue);
+     let requested = ts_va[0] != 0 || ts_va[1] != 0;
+     timestamp(q, compute::TS_START, false, r, requested);
+     put32(q, 0x208, 1);
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 82909ef77e..1e19a3931a 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -2084,7 +2084,7 @@ fn publish_prefix_into(
+                     Channel::Compute => (
+                         self.graph.compute_q(f.cq)?.qinfo.va,
+                         prefix.c_head,
+-                        cqueue::QUEUE_IDS[f.cq % QUEUES_MAX],
++                        cqueue::queue_id(f.cq),
+                         !self.engine.c_registered(f.cq),
+                     ),
+                     Channel::Ta => (
+@@ -2270,6 +2270,7 @@ fn prefix_compute(
+         let refs = ComputeRefs {
+             notifier: g.notifier.va + notifier_page::COMPUTE_RECORD as u64,
+             qinfo: g.qinfo.va,
++            queue: f.cq,
+             user_stamp: g.notifier.va + notifier_page::COMPUTE_STAMP as u64,
+             fw_stamp: g.fw_stamp.va,
+             work: work_va,
+-- 
+2.43.0
+

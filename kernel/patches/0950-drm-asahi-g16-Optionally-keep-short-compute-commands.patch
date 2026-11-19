@@ -1,0 +1,486 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 19 Nov 2026 00:27:19 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally keep short compute
+ commands on one queue
+
+With g16_compute_queues=2 every independent compute command goes to the
+firmware queue after the previous one's. That overlaps long commands,
+but short commands gain nothing from a second queue, and rotating them
+made light compute about 1 us per command slower on experimental 1.1075
+(20.1 against 19.1 us at depth 64) while heavy compute got 8.9 us
+faster.
+
+Add g16_cq_split_us (runtime, default 0). With N above 0 and more than
+one compute queue, the kernel keeps for each client (VM) a moving
+average of the GPU span of its retired compute commands, read from the
+start and end stamps the firmware writes into the command's unit, each
+new command weighing 1/4. While that average is under N us, or before
+any command of the client has retired, a command the placement would
+rotate stays on the queue of the client's previous compute command.
+Longer clients rotate as before. A client that mixes both is judged on
+its average.
+
+Registration of an unregistered queue on an idle engine, the wait for
+running work a command names, and the queue-order modes are unchanged.
+A VM slot taken over by a new VM starts with no span. The statistics
+gain a cq_split line with the word and the placements it changed.
+
+With g16_cq_split_us=0, the default, or one compute queue, placement is
+unchanged.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/cqueue.rs | 240 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/engine.rs |  41 ++++-
+ drivers/gpu/drm/asahi/g16/params.rs |  23 +++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  32 ++++
+ 4 files changed, 335 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/cqueue.rs b/drivers/gpu/drm/asahi/g16/cqueue.rs
+index 67c2ebd393..b3f20e100b 100644
+--- a/drivers/gpu/drm/asahi/g16/cqueue.rs
++++ b/drivers/gpu/drm/asahi/g16/cqueue.rs
+@@ -105,6 +105,93 @@ pub(crate) struct State<'a> {
+     pub(crate) running_off_zero: bool,
+     /// Every barrier, historical prior and in-fence of the command has retired.
+     pub(crate) waits_retired: bool,
++    /// `g16_cq_split_us`: the queue this command's client keeps because its recent compute
++    /// commands ran short ([`keeps_queue`]), instead of the queue after the last one.
++    pub(crate) keep: Option<usize>,
++}
++
++/// VM slots a client can hold (the 64 UAT contexts), the index of the per-client state of
++/// `g16_cq_split_us`.
++pub(crate) const CLIENTS: usize = 64;
++/// No compute command of the client has retired yet.
++pub(crate) const SPAN_UNKNOWN: u32 = 0;
++/// No compute command of the client has been published yet.
++pub(crate) const QUEUE_NONE: u8 = u8::MAX;
++
++/// `g16_cq_split_us`: one client's entry (VM slot), kept on the heap by the engine.
++#[derive(Copy, Clone, Debug, PartialEq, Eq)]
++pub(crate) struct Client {
++    /// The VM id the entry belongs to; a slot taken over by a new VM starts afresh.
++    pub(crate) owner: u64,
++    /// The client's recent compute span in us ([`span_update`]).
++    pub(crate) span: u32,
++    /// The queue of the client's last compute publication.
++    pub(crate) mine: u8,
++}
++
++impl Client {
++    /// An entry no VM owns yet.
++    pub(crate) const NONE: Self = Self {
++        owner: 0,
++        span: SPAN_UNKNOWN,
++        mine: QUEUE_NONE,
++    };
++
++    /// The span and queue that place() reads for VM `id`: unknown for a VM that does not own the
++    /// entry.
++    pub(crate) fn of(&self, id: u64) -> (u32, u8) {
++        if self.owner == id {
++            (self.span, self.mine)
++        } else {
++            (SPAN_UNKNOWN, QUEUE_NONE)
++        }
++    }
++
++    /// Records a compute publication of VM `id` on queue `q`.
++    pub(crate) fn published(&mut self, id: u64, q: usize) {
++        if self.owner != id {
++            *self = Self {
++                owner: id,
++                ..Self::NONE
++            };
++        }
++        self.mine = (q % QUEUES_MAX) as u8;
++    }
++
++    /// Folds a retired compute span of VM `id` into the entry, if the VM still owns it.
++    pub(crate) fn retired(&mut self, id: u64, us: u32) {
++        if self.owner == id {
++            self.span = span_update(self.span, us);
++        }
++    }
++}
++
++/// A command's GPU span in microseconds from its start and end stamps, `hz` ticks per second
++/// (at least 1 us, so a known span is never [`SPAN_UNKNOWN`]); None for stamps that are unset
++/// or out of order.
++pub(crate) fn span_us(start: u64, end: u64, hz: u64) -> Option<u32> {
++    if start == 0 || end <= start || hz < 1_000_000 {
++        return None;
++    }
++    let us = (end - start) / (hz / 1_000_000);
++    Some(us.clamp(1, u64::from(u32::MAX)) as u32)
++}
++
++/// The client's recent compute span after one more retired command of `us`: the first
++/// sample as it is, then a moving average that gives each new command a weight of 1/4.
++pub(crate) fn span_update(recent: u32, us: u32) -> u32 {
++    if recent == SPAN_UNKNOWN {
++        return us.max(1);
++    }
++    let v = (u64::from(recent) * 3 + u64::from(us)) / 4;
++    v.clamp(1, u64::from(u32::MAX)) as u32
++}
++
++/// `g16_cq_split_us` = `split`: whether a client whose recent compute span is `recent` keeps
++/// its queue. 0 is off (strict rotation, as before). A client with no retired compute command
++/// yet keeps its queue until its first span says it is long.
++pub(crate) fn keeps_queue(split: u32, recent: u32) -> bool {
++    split != 0 && (recent == SPAN_UNKNOWN || recent < split)
+ }
+ 
+ /// The queue for the next compute command. With one queue always queue 0, as before.
+@@ -120,11 +207,15 @@ pub(crate) fn place(s: &State<'_>) -> Place {
+             Place::Queue(0)
+         };
+     }
++    let keep = s.keep.filter(|&k| k < n && s.registered[k]);
+     if !s.ahead {
+         // Nothing runs: a queue is registered on an idle engine, as queue 0 always was.
+         if let Some(q) = (0..n).find(|&q| !s.registered[q]) {
+             return Place::Queue(q);
+         }
++        if let Some(k) = keep {
++            return Place::Queue(k);
++        }
+         return Place::Queue((s.last + 1) % n);
+     }
+     if !s.waits_retired {
+@@ -132,6 +223,10 @@ pub(crate) fn place(s: &State<'_>) -> Place {
+         // behind running flights only once everything it names has retired.
+         return Place::Wait;
+     }
++    // `g16_cq_split_us`: a short client stays behind its own previous command, as on one queue.
++    if let Some(k) = keep {
++        return Place::Queue(k);
++    }
+     let next = (s.last + 1) % n;
+     if s.registered[next] {
+         Place::Queue(next)
+@@ -328,7 +423,152 @@ fn st(queues: usize, last: usize, registered: &[bool], ahead: bool) -> State<'_>
+             queue_order: false,
+             running_off_zero: false,
+             waits_retired: true,
++            keep: None,
++        }
++    }
++
++    /// The queues `count` independent commands of one client get behind running work, its
++    /// spans `span(i)` us retiring `lag` commands after publication, with `g16_cq_split_us` =
++    /// `split` (as the engine does: span state per client, its last queue kept).
++    fn split_run(
++        queues: usize,
++        count: usize,
++        split: u32,
++        lag: usize,
++        span: impl Fn(usize) -> u32,
++    ) -> Vec<usize> {
++        let registered = [true; QUEUES_MAX];
++        let (mut recent, mut mine, mut last) = (SPAN_UNKNOWN, QUEUE_NONE, 0usize);
++        let mut out = Vec::new();
++        for i in 0..count {
++            if i >= lag {
++                recent = span_update(recent, span(i - lag));
++            }
++            let mut s = st(queues, last, &registered[..queues], true);
++            s.keep = keeps_queue(split, recent).then(|| match mine {
++                QUEUE_NONE => last,
++                q => q as usize,
++            });
++            let Place::Queue(q) = place(&s) else {
++                panic!("an independent command waited");
++            };
++            out.push(q);
++            mine = q as u8;
++            last = q;
+         }
++        out
++    }
++
++    #[test]
++    fn split_keeps_light_on_one_queue_and_rotates_heavy() {
++        // compute.light: about 2 us of GPU per command, 64 in flight.
++        let light = split_run(2, 200, 100, 64, |_| 2);
++        assert!(
++            light.iter().all(|&q| q == light[0]),
++            "light stays on one queue"
++        );
++        // compute.heavy: about 554 us per command; it rotates once its first span retired.
++        let heavy = split_run(2, 200, 100, 64, |_| 554);
++        assert!(
++            heavy[..64].iter().all(|&q| q == heavy[0]),
++            "unknown span keeps the queue"
++        );
++        for w in heavy[64..].windows(2) {
++            assert_ne!(w[0], w[1], "heavy alternates");
++        }
++        // Off: every command rotates, as before the word existed.
++        let off = split_run(2, 50, 0, 64, |_| 2);
++        for w in off.windows(2) {
++            assert_ne!(w[0], w[1]);
++        }
++    }
++
++    #[test]
++    fn split_on_a_mixed_client_follows_the_average() {
++        // Light and heavy commands alternating: the average settles between about 240 and
++        // 320 us, above 100, so the client rotates every command. Mostly light with one heavy
++        // command in 50: each heavy retirement lifts the average to about 140 us for two
++        // placements, which move the client once or twice; then it stays on its new queue.
++        let turns = |v: &[usize]| v.windows(2).filter(|w| w[0] != w[1]).count();
++        let mixed = split_run(2, 300, 100, 8, |i| if i % 2 == 0 { 554 } else { 2 });
++        assert_eq!(turns(&mixed[100..]), 199);
++        let rare = split_run(2, 300, 100, 8, |i| if i % 50 == 0 { 554 } else { 2 });
++        assert!(turns(&rare[100..]) <= 8, "{} turns", turns(&rare[100..]));
++    }
++
++    #[test]
++    fn split_never_overrides_registration_or_waits() {
++        let mut s = st(2, 0, &[true, false], false);
++        s.keep = Some(0);
++        assert_eq!(
++            place(&s),
++            Place::Queue(1),
++            "an idle engine still registers queue 1"
++        );
++        let r = [true; 2];
++        let mut s = st(2, 0, &r, true);
++        s.keep = Some(0);
++        s.waits_retired = false;
++        assert_eq!(place(&s), Place::Wait);
++        s.queue_order = true;
++        s.running_off_zero = false;
++        assert_eq!(place(&s), Place::Queue(0));
++        // A kept queue that is not registered (or out of range) falls back to rotation.
++        let mut s = st(2, 0, &[true, false], true);
++        s.keep = Some(1);
++        assert_eq!(place(&s), Place::Queue(0));
++        let mut s = st(2, 1, &r, true);
++        s.keep = Some(7);
++        assert_eq!(place(&s), Place::Queue(0));
++    }
++
++    #[test]
++    fn split_off_is_the_old_placement() {
++        // keep None (g16_cq_split_us 0) gives exactly the placement before the word.
++        for queues in 1..=QUEUES_MAX {
++            for last in 0..queues {
++                for bits in 0..(1u32 << queues) {
++                    let reg: Vec<bool> = (0..queues).map(|q| bits & (1 << q) != 0).collect();
++                    for flags in 0..16u32 {
++                        let mut s = st(queues, last, &reg, flags & 1 != 0);
++                        s.queue_order = flags & 2 != 0;
++                        s.running_off_zero = flags & 4 != 0;
++                        s.waits_retired = flags & 8 != 0;
++                        let mut k = s;
++                        k.keep = keeps_queue(0, SPAN_UNKNOWN).then_some(0);
++                        assert_eq!(place(&s), place(&k));
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn a_client_entry_follows_its_vm() {
++        let mut c = Client::NONE;
++        assert_eq!(c.of(7), (SPAN_UNKNOWN, QUEUE_NONE));
++        c.published(7, 1);
++        c.retired(7, 554);
++        assert_eq!(c.of(7), (554, 1));
++        // Another VM in the slot sees nothing of the old one and starts afresh.
++        assert_eq!(c.of(8), (SPAN_UNKNOWN, QUEUE_NONE));
++        c.retired(8, 2);
++        assert_eq!(c.of(7), (554, 1));
++        c.published(8, 0);
++        assert_eq!(c.of(8), (SPAN_UNKNOWN, 0));
++        assert_eq!(c.of(7), (SPAN_UNKNOWN, QUEUE_NONE));
++    }
++
++    #[test]
++    fn spans_from_stamps() {
++        let hz = 24_000_000;
++        assert_eq!(span_us(24_000, 24_000 + 24 * 554, hz), Some(554));
++        assert_eq!(span_us(100, 101, hz), Some(1));
++        assert_eq!(span_us(0, 24, hz), None);
++        assert_eq!(span_us(48, 24, hz), None);
++        assert_eq!(span_update(SPAN_UNKNOWN, 554), 554);
++        assert_eq!(span_update(554, 2), 416);
++        assert!(span_update(2, 2) >= 1);
+     }
+ 
+     #[test]
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index bd7c23cf1a..7bf63e33cd 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -656,6 +656,13 @@ pub(crate) struct Engine {
+     pub(crate) cq_last: usize,
+     pub(crate) cq_published: [u64; QUEUES_MAX],
+     pub(crate) cq_waits: u64,
++    /// `g16_cq_split_us`, per client (VM slot): the VM id the entry belongs to (a slot reused
++    /// by a new VM starts afresh), its recent compute span in us, the queue of its last compute
++    /// publication, and the placements that kept a queue.
++    /// [`cqueue::CLIENTS`] entries on the heap: Engine is built and moved by value on the
++    /// boot path, whose stack frames must not grow.
++    pub(crate) cq_clients: KVec<cqueue::Client>,
++    pub(crate) cq_kept: u64,
+     /// Stage stamps of compute queues 1.., captured with the recovery snapshot.
+     pub(crate) cq_stage: [u32; QUEUES_MAX],
+     /// A ready prefix waits only for a record's consumption: repoll sooner.
+@@ -727,6 +734,8 @@ pub(crate) fn new() -> Result<Self> {
+             cq_last: 0,
+             cq_published: [0; QUEUES_MAX],
+             cq_waits: 0,
++            cq_clients: KVec::from_elem(cqueue::Client::NONE, cqueue::CLIENTS, GFP_KERNEL)?,
++            cq_kept: 0,
+             cq_stage: [0; QUEUES_MAX],
+             chan_wait: false,
+             window_wait: false,
+@@ -1861,9 +1870,32 @@ fn compute_queue_for(&mut self, job: &Job, index: u32, ahead: bool) -> Result<us
+                 .iter()
+                 .any(|f| f.computes != 0 && f.cq != 0),
+             waits_retired: job.waits_retired(index),
++            keep: None,
+         };
++        let split = params::cq_split_us();
++        let client = job.vm.slot as usize % cqueue::CLIENTS;
++        let mut state = state;
++        let (span, mine) = self
++            .engine
++            .cq_clients
++            .get(client)
++            .map_or((cqueue::SPAN_UNKNOWN, cqueue::QUEUE_NONE), |c| {
++                c.of(job.vm.id)
++            });
++        if cqueue::keeps_queue(split, span) {
++            state.keep = Some(match mine {
++                cqueue::QUEUE_NONE => self.engine.cq_last,
++                q => usize::from(q),
++            });
++        }
++        let rotate = (self.engine.cq_last + 1) % n;
+         match cqueue::place(&state) {
+-            cqueue::Place::Queue(q) => Ok(q),
++            cqueue::Place::Queue(q) => {
++                if state.keep.is_some() && state.ahead && q != rotate {
++                    self.engine.cq_kept += 1;
++                }
++                Ok(q)
++            }
+             cqueue::Place::Wait => {
+                 self.engine.cq_waits += 1;
+                 Err(EAGAIN)
+@@ -2198,6 +2230,13 @@ fn publish_prefix_into(
+         }
+         if !render {
+             self.engine.cq_last = f.cq;
++            // `g16_cq_split_us`: the client's queue (and its entry, if the slot has a new VM).
++            if params::compute_queues() > 1 {
++                let client = job.vm.slot as usize % cqueue::CLIENTS;
++                if let Some(c) = self.engine.cq_clients.get_mut(client) {
++                    c.published(job.vm.id, f.cq);
++                }
++            }
+             self.engine.cq_published[f.cq % QUEUES_MAX] += 1;
+         }
+         self.engine.events = self.events.compute_events;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index c783eec7e8..ab5edeb3a0 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2423,6 +2423,29 @@ pub(crate) fn check_once() -> u32 {
+     "G16: 1 = within one pass, check_hangs reuses the session check that pass already ran and passed (default 1; 0 = it checks again; runtime 0644)"
+ );
+ 
++/// Storage of `g16_cq_split_us` (runtime 0644, default 0).
++static CQ_SPLIT_US: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_cq_split_us` = N, with `g16_compute_queues` above 1: a compute command whose client
++/// (VM) ran its recent compute commands in less than N us of GPU time each (a moving average
++/// of the start and end stamps of its retired commands, [`super::cqueue::span_update`]) stays
++/// on the queue of that client's previous compute command; longer ones rotate as before. Short
++/// commands gain nothing from a second queue, and rotating them costs light compute about
++/// 1 us per command (experimental 1.1075). 0: off, every independent command rotates. Read
++/// at each placement.
++pub(crate) fn cq_split_us() -> u32 {
++    CQ_SPLIT_US.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    CQ_SPLIT_US_PARAM,
++    CQ_SPLIT_US_PARMTYPE,
++    CQ_SPLIT_US_PARM,
++    CQ_SPLIT_US,
++    "g16_cq_split_us",
++    "G16: with g16_compute_queues above 1, a client whose recent compute commands ran under N us each keeps its queue; longer ones rotate (default 0: off; runtime 0644)"
++);
++
+ /// Storage of `g16_submit_defer` (runtime 0644, default 16).
+ static SUBMIT_DEFER: AtomicU32 = AtomicU32::new(16);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index dc2413b9d9..50e61d851f 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1420,6 +1420,27 @@ pub(crate) fn log_fault(&self, state: &EngineState) {
+     /// Retire the oldest prefix's scheduling ownership. Only a full normal receipt retires
+     /// its storage; a passed abort quarantines it. Job failure independently drops remaining
+     /// unpublished commands even when the storage fully retired.
++    /// `g16_cq_split_us`: folds the GPU span of `f`'s compute command (its unit's start and end
++    /// stamps, which the firmware writes for every command) into its client's recent span.
++    fn note_compute_span(&mut self, f: &Flight) {
++        let Ok(arena) = f.job.resources.compute() else {
++            return;
++        };
++        let Some(unit) = arena.compute.get(f.claims.slot[0] as usize) else {
++            return;
++        };
++        let (Ok(start), Ok(end)) = (unit.its.r64(0), unit.its.r64(8)) else {
++            return;
++        };
++        let Some(us) = super::cqueue::span_us(start, end, super::hw::COMMAND_TIMESTAMP_HZ) else {
++            return;
++        };
++        let client = f.job.vm.slot as usize % super::cqueue::CLIENTS;
++        if let Some(c) = self.engine.cq_clients.get_mut(client) {
++            c.retired(f.job.vm.id, us);
++        }
++    }
++
+     pub(crate) fn retire_oldest(
+         &mut self,
+         receipt: Retirement,
+@@ -1439,6 +1460,11 @@ pub(crate) fn retire_oldest(
+         let timestamp_claims = f.claims;
+         if result.is_ok() {
+             self.stat_retire(&f);
++            // `g16_cq_split_us`: the client's recent compute span, from its unit's own start
++            // and end stamps, read before the unit is released.
++            if f.computes != 0 && params::cq_split_us() != 0 && params::compute_queues() > 1 {
++                self.note_compute_span(&f);
++            }
+         }
+         if receipt.owner_retired() {
+             if let Err(error) = self.slots.retire(&mut f.claims) {
+@@ -2085,6 +2111,12 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             self.engine.cq_last,
+             self.engine.cq_waits
+         )?;
++        writeln!(
++            f,
++            "cq_split: us {} kept {}",
++            super::params::cq_split_us(),
++            self.engine.cq_kept
++        )?;
+         writeln!(
+             f,
+             "render_seq: pool {} uncached {} cached {} select {}",
+-- 
+2.43.0
+

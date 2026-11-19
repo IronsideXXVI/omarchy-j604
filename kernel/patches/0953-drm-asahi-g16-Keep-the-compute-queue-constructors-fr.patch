@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 19 Nov 2026 08:17:18 +0000
+Subject: [PATCH] drm/asahi: g16: Keep the compute queue constructors'
+ frames small
+
+The compute queue commits added three functions whose frames reached
+256 bytes or more: ComputeGraph::new with its nine inlined object
+allocations, new_compute_extra holding each further queue's graph and
+its boot line, and the debug record print, which is not carried here.
+
+Keep alloc_queue_obj and ComputeGraph::new out of line, box each further
+queue's graph as it is made in a small helper, so that one copy of it
+sits on one frame, and print the boot line from a cold helper. The
+objects, their order, the boot line and every queue's behaviour are
+unchanged; the largest of these frames is now 176 bytes.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/graph.rs | 48 ++++++++++++++++++++++--------
+ 1 file changed, 35 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index cb1105a0f0..6da1973a88 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -139,7 +139,9 @@ fn new(o: &mut Objects) -> Result<Self> {
+     }
+ }
+ 
+-/// One queue object, sized and placed as the queues have always had it.
++/// One queue object, sized and placed as the queues have always had it. Not inlined: each of
++/// [`ComputeGraph::new`]'s nine calls then stays a call, out of that function's frame.
++#[inline(never)]
+ fn alloc_queue_obj(o: &mut Objects, obj: Obj) -> Result<Arc<FwObject>> {
+     let (size, class) = match obj {
+         Obj::QInfo => (qinfo::SIZE, cmd_fw(tuning::FWC_QUEUE)),
+@@ -184,7 +186,10 @@ fn init_notifier(page: &FwObject, threshold: &FwObject) -> Result {
+ impl ComputeGraph {
+     /// One firmware compute queue, every object its own ([`cqueue::queue_set`]). Queue 0 and
+     /// each further `g16_compute_queues` queue are made by this, as macOS gives every compute
+-    /// queue its own scheduling context; the render queues are made under queue 0's.
++    /// queue its own scheduling context; the render queues are made under queue 0's. Not
++    /// inlined, so that its frame stays out of its callers' (the boot path and
++    /// [`new_compute_extra`]).
++    #[inline(never)]
+     fn new(o: &mut Objects) -> Result<Self> {
+         let s = cqueue::queue_set(|obj| alloc_queue_obj(o, obj))?;
+         Ok(Self {
+@@ -298,8 +303,8 @@ pub(crate) struct Graphs {
+     pub(crate) compute: ComputeGraph,
+     pub(crate) render: RenderGraph,
+     /// `g16_compute_queues`: compute queues 1.. (queue 0 is `compute`), empty with one queue;
+-    /// each has its own scheduling context.
+-    pub(crate) compute_extra: KVec<ComputeGraph>,
++    /// each has its own scheduling context, boxed as it is made.
++    pub(crate) compute_extra: KVec<KBox<ComputeGraph>>,
+     /// `g16_render_queues` 2: a second render queue set under its own scheduling context.
+     pub(crate) render2: Option<RenderGraph>,
+     /// `g16_render_seq_pool`: one TA and one FS microsequence slot per render unit, in an
+@@ -365,22 +370,39 @@ pub(crate) struct Graphs {
+ /// own scheduling context. Not inlined: [`Graphs::new`] is inlined into the boot path, whose
+ /// stack frames must not grow.
+ #[inline(never)]
+-fn new_compute_extra(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<KVec<ComputeGraph>> {
++fn new_compute_extra(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<KVec<KBox<ComputeGraph>>> {
+     let mut compute_extra = KVec::new();
+     for _ in 1..super::params::compute_queues() {
+-        compute_extra.push(ComputeGraph::new(o)?, GFP_KERNEL)?;
++        push_compute_graph(&mut compute_extra, o)?;
+     }
+     if !compute_extra.is_empty() {
+-        dev_info!(
+-            dev.as_ref(),
+-            "G16: g16_compute_queues={}: compute queue ids 15..={}, each with its own scheduling context\n",
+-            compute_extra.len() + 1,
+-            15 + compute_extra.len()
+-        );
++        note_compute_extra(dev, compute_extra.len());
+     }
+     Ok(compute_extra)
+ }
+ 
++/// One more compute queue for [`new_compute_extra`]: the box first and the graph written into
++/// it, so that one copy of the graph sits on a frame, and that frame is not the loop's.
++#[inline(never)]
++fn push_compute_graph(extra: &mut KVec<KBox<ComputeGraph>>, o: &mut Objects) -> Result {
++    let slot = KBox::new_uninit(GFP_KERNEL)?;
++    extra.push(KBox::write(slot, ComputeGraph::new(o)?), GFP_KERNEL)?;
++    Ok(())
++}
++
++/// The boot line of [`new_compute_extra`], out of line so that its formatting is not in that
++/// function's frame.
++#[cold]
++#[inline(never)]
++fn note_compute_extra(dev: &AsahiDrmDevice, extra: usize) {
++    dev_info!(
++        dev.as_ref(),
++        "G16: g16_compute_queues={}: compute queue ids 15..={}, each with its own scheduling context\n",
++        extra + 1,
++        15 + extra
++    );
++}
++
+ /// `g16_compute_seq_pool`: one more pair for each compute queue 1.. when queue 0 has one. Not
+ /// inlined, as [`new_compute_extra`].
+ #[inline(never)]
+@@ -501,7 +523,7 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+     pub(crate) fn compute_q(&self, q: usize) -> Result<&ComputeGraph> {
+         match q {
+             0 => Ok(&self.compute),
+-            _ => self.compute_extra.get(q - 1).ok_or(EINVAL),
++            _ => self.compute_extra.get(q - 1).map(|g| &**g).ok_or(EINVAL),
+         }
+     }
+ 
+-- 
+2.43.0
+

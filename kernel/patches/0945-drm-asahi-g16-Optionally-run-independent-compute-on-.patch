@@ -1,0 +1,923 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 17:30:04 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally run independent compute on
+ more firmware queues
+
+The firmware runs the commands of one compute queue one at a time:
+StartCompute sets the queue's busy bit and the wait op parks the queue
+until it clears, whatever the depth. Different queues run at once. macOS
+gives one client two to four compute queues on one channel and rotates
+its commands over them; all of ours go to one queue.
+
+Add g16_compute_queues (default 1, latched at the engine start). With 2
+to 4, every extra queue is made as the first one is (queue info, state,
+ring, job list, notifier page, threshold and stamps) under the shared
+scheduling context. It registers with its first submit record on an
+idle engine, under queue id 16, 17 or 18.
+
+A compute command goes to the queue after its predecessor's only when
+every barrier, historical prior and in-fence it names has retired, so it
+names no running command; a command naming running work waits for it to
+retire. With g16_job_ahead or g16_same_queue_nowait every command stays
+on queue 0. More than one queue needs g16_compute_shared_pool 2 and
+the compute sequence pool off.
+
+Flights still retire in publication order. Each is proved on its own
+queue's stamp, cursors and notifier stamp, which no other queue writes,
+and on its own unit's timestamp pair. The shared completion count of
+mode 2 stays a necessary term but never proves a flight alone, because
+a later command on another queue may finish first. Recovery snapshots
+and affected-work entries are taken per queue as well.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/cqueue.rs         | 277 ++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/engine.rs         | 133 +++++++++-
+ drivers/gpu/drm/asahi/g16/event.rs          |  11 +
+ drivers/gpu/drm/asahi/g16/graph.rs          |  52 ++++
+ drivers/gpu/drm/asahi/g16/job.rs            |  20 ++
+ drivers/gpu/drm/asahi/g16/mod.rs            |   1 +
+ drivers/gpu/drm/asahi/g16/params.rs         |  39 +++
+ drivers/gpu/drm/asahi/g16/poll.rs           |  30 ++-
+ drivers/gpu/drm/asahi/g16/recovery.rs       |   4 +-
+ drivers/gpu/drm/asahi/g16/recovery/logic.rs |   4 +-
+ 10 files changed, 553 insertions(+), 18 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/cqueue.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/cqueue.rs b/drivers/gpu/drm/asahi/g16/cqueue.rs
+new file mode 100644
+index 0000000000..377cf4f9bd
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/cqueue.rs
+@@ -0,0 +1,277 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! `g16_compute_queues`: the firmware compute queue a compute command goes to. Core only, so
++//! the rule runs as a host test together with the retirement model below.
++//!
++//! The firmware runs the commands of one queue one at a time (StartCompute sets the queue's
++//! busy bit and the wait op parks that queue until it clears) and different queues at once.
++//! A command therefore goes to a queue other than its predecessor's only when it names no
++//! command still running. Retirement stays in publication order, and each flight is proved
++//! with the stamps and cursors of its own queue, which no other queue writes.
++
++/// Firmware compute queues at most.
++pub(crate) const QUEUES_MAX: usize = 4;
++
++/// Firmware queue ids (the submit record's event byte) of compute queues 0, 1, 2 and 3: 15
++/// as before, then 16, 17 and 18. Their busy bits (id mod 64) differ from render's 0x70 and
++/// 0x71 (48 and 49) and from `g16_render_qids` 0x13 and 0x14.
++pub(crate) const QUEUE_IDS: [u8; QUEUES_MAX] = [15, 16, 17, 18];
++
++/// Where the next compute command goes.
++#[derive(Copy, Clone, Debug, PartialEq, Eq)]
++pub(crate) enum Place {
++    /// On this queue.
++    Queue(usize),
++    /// Not now: it is published once the running flights it may depend on have retired.
++    Wait,
++}
++
++/// What [`place`] decides from.
++#[derive(Copy, Clone, Debug)]
++pub(crate) struct State<'a> {
++    /// Latched queues, 1 up to [`QUEUES_MAX`].
++    pub(crate) queues: usize,
++    /// Queue of the most recent compute publication.
++    pub(crate) last: usize,
++    /// Queues whose first (registering) submit record was published.
++    pub(crate) registered: &'a [bool],
++    /// Some flight is running: the command would go behind it.
++    pub(crate) ahead: bool,
++    /// `g16_job_ahead` or `g16_same_queue_nowait` is on: a command may rely on the order of
++    /// its queue instead of a retirement, so every command uses queue 0.
++    pub(crate) queue_order: bool,
++    /// Some running compute flight is on a queue other than 0.
++    pub(crate) running_off_zero: bool,
++    /// Every barrier, historical prior and in-fence of the command has retired.
++    pub(crate) waits_retired: bool,
++}
++
++/// The queue for the next compute command. With one queue always queue 0, as before.
++pub(crate) fn place(s: &State<'_>) -> Place {
++    let n = s.queues.clamp(1, QUEUES_MAX).min(s.registered.len());
++    if n <= 1 {
++        return Place::Queue(0);
++    }
++    if s.queue_order {
++        return if s.ahead && s.running_off_zero {
++            Place::Wait
++        } else {
++            Place::Queue(0)
++        };
++    }
++    if !s.ahead {
++        // Nothing runs: a queue is registered on an idle engine, as queue 0 always was.
++        if let Some(q) = (0..n).find(|&q| !s.registered[q]) {
++            return Place::Queue(q);
++        }
++        return Place::Queue((s.last + 1) % n);
++    }
++    if !s.waits_retired {
++        // It names a running command. Not reached while queue_order is off: a command goes
++        // behind running flights only once everything it names has retired.
++        return Place::Wait;
++    }
++    let next = (s.last + 1) % n;
++    if s.registered[next] {
++        Place::Queue(next)
++    } else {
++        Place::Queue(s.last % n)
++    }
++}
++
++#[cfg(test)]
++#[path = "recovery/logic.rs"]
++#[allow(dead_code)]
++mod logic;
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn st(queues: usize, last: usize, registered: &[bool], ahead: bool) -> State<'_> {
++        State {
++            queues,
++            last,
++            registered,
++            ahead,
++            queue_order: false,
++            running_off_zero: false,
++            waits_retired: true,
++        }
++    }
++
++    #[test]
++    fn one_queue_is_queue_zero() {
++        for ahead in [false, true] {
++            let mut s = st(1, 0, &[true, true], ahead);
++            assert_eq!(place(&s), Place::Queue(0));
++            s.waits_retired = false;
++            s.queue_order = true;
++            s.running_off_zero = true;
++            assert_eq!(place(&s), Place::Queue(0));
++        }
++    }
++
++    #[test]
++    fn queues_register_only_on_an_idle_engine() {
++        assert_eq!(place(&st(2, 0, &[false, false], false)), Place::Queue(0));
++        assert_eq!(place(&st(2, 0, &[true, false], false)), Place::Queue(1));
++        // Behind running work an unregistered queue is never the target.
++        assert_eq!(place(&st(2, 0, &[true, false], true)), Place::Queue(0));
++        assert_eq!(
++            place(&st(4, 1, &[true, true, false, false], true)),
++            Place::Queue(1)
++        );
++    }
++
++    #[test]
++    fn independent_commands_rotate() {
++        let r = [true; 4];
++        assert_eq!(place(&st(2, 0, &r, true)), Place::Queue(1));
++        assert_eq!(place(&st(2, 1, &r, true)), Place::Queue(0));
++        assert_eq!(place(&st(4, 3, &r, true)), Place::Queue(0));
++        assert_eq!(place(&st(3, 1, &r, false)), Place::Queue(2));
++    }
++
++    #[test]
++    fn a_command_naming_running_work_waits() {
++        let r = [true; 2];
++        let mut s = st(2, 0, &r, true);
++        s.waits_retired = false;
++        assert_eq!(place(&s), Place::Wait);
++        // Alone, nothing it names can still run.
++        s.ahead = false;
++        assert_eq!(place(&s), Place::Queue(1));
++    }
++
++    #[test]
++    fn recovery_names_each_queue_id() {
++        let last = [Some(0x500), None, None];
++        for id in QUEUE_IDS {
++            assert!(logic::last_retired_target(&last, u32::from(id), 0x500));
++            assert!(!logic::last_retired_target(&last, u32::from(id), 0x600));
++        }
++        assert!(!logic::last_retired_target(&last, 0x13, 0x500));
++    }
++
++    #[test]
++    fn queue_order_modes_keep_queue_zero() {
++        let r = [true; 2];
++        let mut s = st(2, 1, &r, true);
++        s.queue_order = true;
++        assert_eq!(place(&s), Place::Queue(0));
++        s.running_off_zero = true;
++        assert_eq!(place(&s), Place::Wait);
++        s.ahead = false;
++        assert_eq!(place(&s), Place::Queue(0));
++    }
++
++    // Retirement model: commands 1..=N rotate over two queues; each queue finishes its own
++    // commands in order (one at a time), the queues in any interleaving. The host retires the
++    // oldest flight only when its OWN queue's stamp cell reached its target within that
++    // queue's newest target. A shared cell or the shared completion count alone would not do.
++    fn stamp(n: u64) -> u32 {
++        (n as u32).wrapping_mul(0x100)
++    }
++
++    /// Every interleaving of two in-order sequences of lengths a and b, as queue choices.
++    fn interleavings(a: usize, b: usize, cur: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
++        if a == 0 && b == 0 {
++            out.push(cur.clone());
++            return;
++        }
++        if a > 0 {
++            cur.push(0);
++            interleavings(a - 1, b, cur, out);
++            cur.pop();
++        }
++        if b > 0 {
++            cur.push(1);
++            interleavings(a, b - 1, cur, out);
++            cur.pop();
++        }
++    }
++
++    struct Run {
++        early_per_queue: usize,
++        early_shared_cell: usize,
++        early_count_alone: usize,
++        retired: usize,
++    }
++
++    fn run(n: u64, base: u64, finish: &[usize]) -> Run {
++        // Command i (base + 1 ..= base + n) goes to queue (i - base - 1) % 2.
++        let cmds: Vec<(u64, usize)> = (1..=n)
++            .map(|i| (base + i, ((i - 1) % 2) as usize))
++            .collect();
++        let mut tail = [0u32; 2];
++        for &(c, q) in cmds.iter() {
++            tail[q] = stamp(c);
++        }
++        let mut cell = [stamp(base), stamp(base)];
++        let mut count = 0u64;
++        let mut finished = vec![false; n as usize];
++        let mut next = [0usize; 2];
++        let per_queue: Vec<Vec<usize>> = (0..2)
++            .map(|q| (0..n as usize).filter(|&i| cmds[i].1 == q).collect())
++            .collect();
++        let mut oldest = 0usize;
++        let mut r = Run {
++            early_per_queue: 0,
++            early_shared_cell: 0,
++            early_count_alone: 0,
++            retired: 0,
++        };
++        for &q in finish {
++            let i = per_queue[q][next[q]];
++            next[q] += 1;
++            finished[i] = true;
++            cell[q] = stamp(cmds[i].0);
++            // One shared cell would hold whichever command finished last.
++            let shared = stamp(cmds[i].0);
++            count += 1;
++            while oldest < n as usize {
++                let (c, oq) = cmds[oldest];
++                let own = logic::stamp_reached(cell[oq], stamp(c), tail[oq]);
++                let via_shared = logic::stamp_reached(shared, stamp(c), stamp(base + n));
++                let via_count = count >= oldest as u64 + 1;
++                if !finished[oldest] {
++                    r.early_per_queue += usize::from(own);
++                    r.early_shared_cell += usize::from(via_shared);
++                    r.early_count_alone += usize::from(via_count);
++                }
++                if !(own && via_count) {
++                    break;
++                }
++                assert!(finished[oldest], "retired before its own command finished");
++                oldest += 1;
++                r.retired += 1;
++            }
++        }
++        r
++    }
++
++    #[test]
++    fn out_of_order_finishes_never_retire_early() {
++        for (n, base) in [(6u64, 0u64), (7, 41), (6, (1u64 << 24) - 3)] {
++            let a = n.div_ceil(2) as usize;
++            let b = (n / 2) as usize;
++            let mut all = Vec::new();
++            interleavings(a, b, &mut Vec::new(), &mut all);
++            let (mut shared_hits, mut count_hits) = (0, 0);
++            for finish in all.iter() {
++                let r = run(n, base, finish);
++                assert_eq!(r.early_per_queue, 0);
++                assert_eq!(
++                    r.retired, n as usize,
++                    "every flight retires once all finished"
++                );
++                shared_hits += r.early_shared_cell;
++                count_hits += r.early_count_alone;
++            }
++            // Negative controls: one shared cell, or the shared count alone, would retire a
++            // command whose own work had not finished in some interleaving.
++            assert!(shared_hits > 0 && count_hits > 0);
++        }
++    }
++}
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 1616bdc107..82909ef77e 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -16,6 +16,7 @@
+ 
+ use super::channel::Channel;
+ use super::command::{Command, ComputeCommand, RenderCommand};
++use super::cqueue::{self, QUEUES_MAX};
+ use super::encode::{self, ComputeRefs, Geometry, RenderRefs};
+ use super::fw::channels::{SubmitRecord, RING_SLOTS};
+ use super::fw::graph::{notifier_page, qstate};
+@@ -215,6 +216,8 @@ pub(crate) struct Flight {
+     pub(crate) target: u32,
+     pub(crate) head: u32,
+     pub(crate) c_start: u32,
++    /// `g16_compute_queues`: the firmware compute queue of its compute command (0 with one).
++    pub(crate) cq: usize,
+     /// The render's fragment sequence has no timestamp records (`g16_fs_short`).
+     pub(crate) fs_short: bool,
+     /// `g16_render_work_pool`: where the render's work records went (0: its unit's own work
+@@ -265,6 +268,7 @@ fn new(job: Arc<Job>) -> Self {
+             target: 0,
+             head: 0,
+             c_start: 0,
++            cq: 0,
+             fs_short: false,
+             work_copy: 0,
+             cwork_copy: 0,
+@@ -638,6 +642,18 @@ pub(crate) struct Engine {
+     pub(crate) queue_registered: bool,
+     pub(crate) render_registered: bool,
+     pub(crate) ta_registered: bool,
++    /// `g16_compute_queues`: the newest published target and ring head and the registration
++    /// of compute queues 1.. (index 0 unused: queue 0 keeps `target`, `head` and
++    /// `queue_registered`), the queue of the latest compute publication, compute
++    /// publications per queue, and placements that waited for running work to retire.
++    pub(crate) cq_target: [u32; QUEUES_MAX],
++    pub(crate) cq_head: [u32; QUEUES_MAX],
++    pub(crate) cq_registered: [bool; QUEUES_MAX],
++    pub(crate) cq_last: usize,
++    pub(crate) cq_published: [u64; QUEUES_MAX],
++    pub(crate) cq_waits: u64,
++    /// Stage stamps of compute queues 1.., captured with the recovery snapshot.
++    pub(crate) cq_stage: [u32; QUEUES_MAX],
+     /// A ready prefix waits only for a record's consumption: repoll sooner.
+     pub(crate) chan_wait: bool,
+     /// Ready work waits for a running command to retire (`g16_window_poll_us`).
+@@ -700,6 +716,13 @@ pub(crate) fn new() -> Result<Self> {
+             queue_registered: false,
+             render_registered: false,
+             ta_registered: false,
++            cq_target: [0; QUEUES_MAX],
++            cq_head: [0; QUEUES_MAX],
++            cq_registered: [false; QUEUES_MAX],
++            cq_last: 0,
++            cq_published: [0; QUEUES_MAX],
++            cq_waits: 0,
++            cq_stage: [0; QUEUES_MAX],
+             chan_wait: false,
+             window_wait: false,
+             cbell_owed: false,
+@@ -721,6 +744,22 @@ pub(crate) fn oldest(&self) -> Option<&Flight> {
+         self.flights.first()
+     }
+ 
++    /// The newest published target and ring head of compute queue `q`.
++    pub(crate) fn c_tail(&self, q: usize) -> (u32, u32) {
++        match q {
++            0 => (self.target, self.head),
++            _ => (self.cq_target[q % QUEUES_MAX], self.cq_head[q % QUEUES_MAX]),
++        }
++    }
++
++    /// Whether compute queue `q` was registered by its first submit record.
++    pub(crate) fn c_registered(&self, q: usize) -> bool {
++        match q {
++            0 => self.queue_registered,
++            _ => self.cq_registered[q % QUEUES_MAX],
++        }
++    }
++
+     /// Jobs of the queue in published prefixes.
+     fn queue_published(&self, job: &Job) -> u32 {
+         self.flights
+@@ -1115,6 +1154,15 @@ pub(crate) fn register_render2(&mut self) -> Result {
+         ])
+     }
+ 
++    /// `g16_compute_queues`: the stage stamps of compute queues 1.., captured right after
++    /// [`Self::recovery_snapshot`] and before the host answers, for the same reason.
++    pub(crate) fn compute_stage_snapshot(&mut self) -> Result {
++        for q in 1..params::compute_queues().min(QUEUES_MAX) {
++            self.engine.cq_stage[q] = self.graph.compute_q(q)?.fw_stamp.r32(0)?;
++        }
++        Ok(())
++    }
++
+     /// Authenticate one firmware affected-work snapshot entry against its retained owner.
+     /// The pre-acknowledgement TPC cleanup is required only for an unfinished TA.
+     pub(crate) fn recovery_prepare(
+@@ -1138,7 +1186,12 @@ pub(crate) fn recovery_prepare(
+         // With two flights the notification may name the later one.
+         let ta_tail = self.engine.ta_target;
+         let Some(f) = self.engine.flights.iter_mut().find(|f| match event {
+-            15 => f.computes != 0 && f.target == target,
++            // `g16_compute_queues`: each compute queue reports under its own id.
++            15..=18 => {
++                f.computes != 0
++                    && u32::from(cqueue::QUEUE_IDS[f.cq % QUEUES_MAX]) == event
++                    && f.target == target
++            }
+             0x70 => f.renders != 0 && f.ta_target == target,
+             0x71 => f.renders != 0 && f.fs_target == target,
+             _ => false,
+@@ -1182,9 +1235,18 @@ pub(crate) fn recovery_prepare_suspects(
+         let reached = super::recovery::logic::stamp_reached;
+         let (c_tail, ta_tail, fs_tail) =
+             (self.engine.target, self.engine.ta_target, self.engine.fs_target);
++        // `g16_compute_queues`: a flight of another compute queue is judged on that queue's
++        // stamp and tail, never on queue 0's.
++        let mut c_stage = [stage[2]; QUEUES_MAX];
++        let mut c_tails = [c_tail; QUEUES_MAX];
++        for q in 1..params::compute_queues().min(QUEUES_MAX) {
++            c_stage[q] = self.engine.cq_stage[q];
++            c_tails[q] = self.engine.c_tail(q).0;
++        }
+         // Every flight (two with g16_flights = 2) that recovery may have caught unfinished.
+         for f in self.engine.flights.iter_mut() {
+-            let unfinished = (f.computes != 0 && !reached(stage[2], f.target, c_tail))
++            let q = f.cq % QUEUES_MAX;
++            let unfinished = (f.computes != 0 && !reached(c_stage[q], f.target, c_tails[q]))
+                 || (f.renders != 0
+                     && (!reached(stage[0], f.ta_target, ta_tail)
+                         || !reached(stage[1], f.fs_target, fs_tail)));
+@@ -1766,6 +1828,39 @@ fn render_refs(
+         ))
+     }
+ 
++    /// `g16_compute_queues`: the firmware queue of `job`'s compute command at `index`
++    /// ([`cqueue::place`]); EAGAIN while it must wait for running work to retire.
++    fn compute_queue_for(&mut self, job: &Job, index: u32, ahead: bool) -> Result<usize> {
++        let n = params::compute_queues().min(QUEUES_MAX);
++        if n <= 1 {
++            return Ok(0);
++        }
++        let mut registered = [false; QUEUES_MAX];
++        for (q, r) in registered.iter_mut().enumerate() {
++            *r = self.engine.c_registered(q);
++        }
++        let state = cqueue::State {
++            queues: n,
++            last: self.engine.cq_last,
++            registered: &registered[..n],
++            ahead,
++            queue_order: params::job_ahead() != 0 || params::same_queue_nowait(),
++            running_off_zero: self
++                .engine
++                .flights
++                .iter()
++                .any(|f| f.computes != 0 && f.cq != 0),
++            waits_retired: job.waits_retired(index),
++        };
++        match cqueue::place(&state) {
++            cqueue::Place::Queue(q) => Ok(q),
++            cqueue::Place::Wait => {
++                self.engine.cq_waits += 1;
++                Err(EAGAIN)
++            }
++        }
++    }
++
+     /// Publishes the next command of `job`. All images and ring entries precede the host
+     /// producer writes and queue kicks. EAGAIN defers while storage/channel state is held;
+     /// The error records whether firmware may see a counter/producer update, independently
+@@ -1810,6 +1905,11 @@ fn publish_prefix_into(
+         if job.vm.status.get() != 0 {
+             return Err(EIO);
+         }
++        let cq = if render {
++            0
++        } else {
++            self.compute_queue_for(job, index, ahead)?
++        };
+         if if render {
+             self.slots.render_exhausted()
+         } else {
+@@ -1855,7 +1955,7 @@ fn publish_prefix_into(
+         let mut prefix = Prefix {
+             n: self.engine.ordinal,
+             draw: self.engine.draw,
+-            c_head: self.graph.compute.qstate.r32(qstate::WRITE)?,
++            c_head: self.graph.compute_q(cq)?.qstate.r32(qstate::WRITE)?,
+             ta_head: self.graph.render.qstate[0].r32(qstate::WRITE)?,
+             fs_head: self.graph.render.qstate[1].r32(qstate::WRITE)?,
+             ..Default::default()
+@@ -1864,6 +1964,7 @@ fn publish_prefix_into(
+             return Err(super::boot::eproto());
+         }
+         f.c_start = prefix.c_head;
++        f.cq = cq;
+         f.ta_start = prefix.ta_head;
+         f.fs_start = prefix.fs_head;
+         match cmd {
+@@ -1948,7 +2049,10 @@ fn publish_prefix_into(
+                     Some(st) => st.counter.w64(0, f.uma_submitted)?,
+                     None => arena.compute[k].counter.w64(0, f.uma_submitted)?,
+                 }
+-                self.graph.compute.threshold.w32(0, prefix.n as u32)?;
++                self.graph
++                    .compute_q(f.cq)?
++                    .threshold
++                    .w32(0, prefix.n as u32)?;
+             }
+             wmb();
+             if render {
+@@ -1960,7 +2064,7 @@ fn publish_prefix_into(
+                 self.graph.render.qstate[1].w32(qstate::WRITE, prefix.fs_head)?;
+             } else {
+                 publish_producer(
+-                    &self.graph.compute.qstate,
++                    &self.graph.compute_q(f.cq)?.qstate,
+                     prefix.c_head,
+                     &mut self.engine.stats.publications[0],
+                 )?;
+@@ -1978,10 +2082,10 @@ fn publish_prefix_into(
+             for &channel in channels {
+                 let (qinfo, head, event, fresh) = match channel {
+                     Channel::Compute => (
+-                        self.graph.compute.qinfo.va,
++                        self.graph.compute_q(f.cq)?.qinfo.va,
+                         prefix.c_head,
+-                        15,
+-                        !self.engine.queue_registered,
++                        cqueue::QUEUE_IDS[f.cq % QUEUES_MAX],
++                        !self.engine.c_registered(f.cq),
+                     ),
+                     Channel::Ta => (
+                         self.graph.render.qinfo[0].va,
+@@ -2067,10 +2171,19 @@ fn publish_prefix_into(
+             self.engine.fs_head = f.fs_head;
+             self.engine.ta_registered = true;
+             self.engine.render_registered = true;
+-        } else {
++        } else if f.cq == 0 {
+             self.engine.target = f.target;
+             self.engine.head = f.head;
+             self.engine.queue_registered = true;
++        } else {
++            let q = f.cq % QUEUES_MAX;
++            self.engine.cq_target[q] = f.target;
++            self.engine.cq_head[q] = f.head;
++            self.engine.cq_registered[q] = true;
++        }
++        if !render {
++            self.engine.cq_last = f.cq;
++            self.engine.cq_published[f.cq % QUEUES_MAX] += 1;
+         }
+         self.engine.events = self.events.compute_events;
+         self.engine.stage_seen = self.events.stage_events;
+@@ -2139,7 +2252,7 @@ fn prefix_compute(
+         } else {
+             s
+         };
+-        let g = &self.graph.compute;
++        let g = self.graph.compute_q(f.cq)?;
+         let counter = match stream {
+             Some(st) => &st.counter,
+             None => &s.counter,
+diff --git a/drivers/gpu/drm/asahi/g16/event.rs b/drivers/gpu/drm/asahi/g16/event.rs
+index 26ef79a2c3..ef171c8140 100644
+--- a/drivers/gpu/drm/asahi/g16/event.rs
++++ b/drivers/gpu/drm/asahi/g16/event.rs
+@@ -112,6 +112,17 @@ pub(crate) fn drain(&mut self, dev: &device::Device, ring: &Ring) -> Result {
+                             self.compute_events = self.compute_events.wrapping_add(1);
+                         }
+                     }
++                    // `g16_compute_queues`: compute queues 1.. complete under their own ids.
++                    if super::params::compute_queues() > 1 {
++                        for event in &super::cqueue::QUEUE_IDS[1..] {
++                            let event = u32::from(*event);
++                            if words[1 + event as usize / 32] & (1u32 << (event % 32)) != 0 {
++                                self.event_ns[2] = now;
++                                self.stage_events = self.stage_events.wrapping_add(1);
++                                self.compute_events = self.compute_events.wrapping_add(1);
++                            }
++                        }
++                    }
+                 }
+                 4 => {
+                     self.recovery_started_ns.get_or_insert(now);
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index ff4ced561e..25f83ed973 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -194,8 +194,30 @@ fn new(o: &mut Objects) -> Result<Self> {
+             fw_stamp: q.fw_stamp,
+         })
+     }
++    /// `g16_compute_queues`: another compute queue, made as the first one is (its own queue
++    /// objects, notifier page, threshold and job list) but under the first one's scheduling
++    /// context, which the render queues share too.
++    fn new_on(o: &mut Objects, context: Arc<FwObject>) -> Result<Self> {
++        let q = QueueObjects::new(o)?;
++        Ok(Self {
++            sched_ctx: context,
++            notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
++            threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
++            job_list: alloc(o, job_list::SIZE, cmd_fw(tuning::FWC_QUEUE), None, 0, false)?,
++            qscratch: q.qinfo.clone(),
++            qinfo: q.qinfo,
++            qstate: q.qstate,
++            ring: q.ring,
++            user_stamp: q.user_stamp,
++            fw_stamp: q.fw_stamp,
++        })
++    }
+     fn init(&self) -> Result {
+         self.sched_ctx.write(0, &graph::context_image())?;
++        self.init_objects()
++    }
++    /// Everything of [`Self::init`] except the scheduling context image.
++    fn init_objects(&self) -> Result {
+         init_notifier(&self.notifier, &self.threshold)?;
+         self.notifier
+             .w64(notifier_page::COMPUTE_RECORD, self.threshold.va)?;
+@@ -289,6 +311,8 @@ pub(crate) struct Graphs {
+     pub(crate) dev: ARef<device::Device>,
+     pub(crate) compute: ComputeGraph,
+     pub(crate) render: RenderGraph,
++    /// `g16_compute_queues`: compute queues 1.. (queue 0 is `compute`), empty with one queue.
++    pub(crate) compute_extra: KVec<ComputeGraph>,
+     /// `g16_render_queues` 2: a second render queue set under its own scheduling context.
+     pub(crate) render2: Option<RenderGraph>,
+     /// `g16_render_seq_pool`: one TA and one FS microsequence slot per render unit, in an
+@@ -400,6 +424,22 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+         } else {
+             None
+         };
++        // Allocated last, so one queue keeps every earlier object where it was.
++        let mut compute_extra = KVec::new();
++        for _ in 1..super::params::compute_queues() {
++            compute_extra.push(
++                ComputeGraph::new_on(o, compute.sched_ctx.clone())?,
++                GFP_KERNEL,
++            )?;
++        }
++        if !compute_extra.is_empty() {
++            dev_info!(
++                dev.as_ref(),
++                "G16: g16_compute_queues={}: compute queue ids 15..={} on one scheduling context\n",
++                compute_extra.len() + 1,
++                15 + compute_extra.len()
++            );
++        }
+         // `g16_compute_work_pool`: allocated after everything else, so without it every object
+         // keeps its address.
+         let compute_work = if super::params::compute_work_pool() {
+@@ -425,6 +465,7 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+             dev: dev.as_ref().as_ref().into(),
+             compute,
+             render,
++            compute_extra,
+             render2,
+             render_seq,
+             render_work,
+@@ -434,6 +475,14 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+         })
+     }
+ 
++    /// Compute queue `q`'s objects: queue 0 is `compute`, the others `compute_extra`.
++    pub(crate) fn compute_q(&self, q: usize) -> Result<&ComputeGraph> {
++        match q {
++            0 => Ok(&self.compute),
++            _ => self.compute_extra.get(q - 1).ok_or(EINVAL),
++        }
++    }
++
+     /// The `g16_compute_seq_pool` slot of compute ordinal `n`: the object, the offset in it and
+     /// the copy (0 uncached, 1 ASC-cached, as `g16_compute_seq_cached` reads now). None without
+     /// the pool, so the sequence stays embedded in the unit's work page.
+@@ -522,6 +571,9 @@ pub(crate) fn init_graphs(&mut self) -> Result {
+             }
+         }
+         self.graph.compute.init()?;
++        for g in self.graph.compute_extra.iter() {
++            g.init_objects()?;
++        }
+         self.graph.render.init(super::params::render_row0(), 0)?;
+         self.slots.init()?;
+         self.init_render_pools(false)?;
+diff --git a/drivers/gpu/drm/asahi/g16/job.rs b/drivers/gpu/drm/asahi/g16/job.rs
+index 94237dd490..25c496d4b5 100644
+--- a/drivers/gpu/drm/asahi/g16/job.rs
++++ b/drivers/gpu/drm/asahi/g16/job.rs
+@@ -359,6 +359,26 @@ pub(crate) fn check_command_dependencies(&self, index: u32) -> Result {
+         Err(EAGAIN)
+     }
+ 
++    /// `g16_compute_queues`: every barrier and historical prior of the command at `index` has
++    /// retired and every in-fence has signalled, so it names no running command and may run
++    /// on another firmware queue than its predecessor.
++    pub(crate) fn waits_retired(&self, index: u32) -> bool {
++        let Some(order) = self.orders.get(index as usize) else {
++            return false;
++        };
++        let completed = self
++            .queue
++            .completed
++            .each_ref()
++            .map(|value| value.load(Ordering::Acquire));
++        super::fence::check_dependencies(&self.inputs).is_ok()
++            && order
++                .wait_through
++                .iter()
++                .zip(completed)
++                .all(|(prefix, observed)| prefix.is_none_or(|last| observed >= last))
++    }
++
+     /// Whether the command at `index` waits on a command of its own engine that has not yet
+     /// retired (it was published ahead by the queue-order rule).
+     pub(crate) fn own_wait_pending(&self, index: u32) -> bool {
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index b4fffd27a9..b718190ce8 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -49,6 +49,7 @@
+ mod channel;
+ mod check_once;
+ mod command;
++mod cqueue;
+ mod encode;
+ mod engine;
+ mod event;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 19af0b831b..797a4441bc 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -999,6 +999,45 @@ pub(crate) fn compute_units() -> usize {
+     "G16: compute units per VM, one compute command in flight each (default 32; 2..32 with g16_compute_shared_pool 1 or 2, where unit 0 holds the pool and the others only their save areas; 2..16 with g16_compute_shared_pool 0, ~33 MiB per unit, which takes 32 as 16; 16 up to 1.1056; latched at the engine start, set it as a module option)"
+ );
+ 
++/// Storage of `g16_compute_queues` (0644, default 1; latched at the engine start).
++static COMPUTE_QUEUES: AtomicU32 = AtomicU32::new(1);
++/// The latched compute queues, 0 until latched.
++static COMPUTE_QUEUES_LATCH: AtomicU32 = AtomicU32::new(0);
++
++/// Firmware compute queues of the engine, 1..=[`super::cqueue::QUEUES_MAX`]; read once, at
++/// the engine start. The firmware runs the commands of one queue one at a time and different
++/// queues at once, so with 2 or more a compute command that names no running command goes to
++/// the queue after its predecessor's ([`super::cqueue::place`]). Flights still retire in
++/// publication order, each proved on its own queue's stamps and cursors. Always 1 with
++/// `g16_compute_seq_pool`, whose cells belong to the one queue, and
++/// outside `g16_compute_shared_pool` mode 2: there every command of a VM binds the VM's one
++/// descriptor and the firmware saves its row only after the last counted command, on any
++/// queue, while in mode 1 the units of a VM share unit 0's freelist through descriptors of
++/// their own, which one queue never ran at once.
++pub(crate) fn compute_queues() -> usize {
++    let l = COMPUTE_QUEUES_LATCH.load(Ordering::Acquire);
++    if l != 0 {
++        return l as usize;
++    }
++    let mut v = COMPUTE_QUEUES
++        .load(Ordering::Relaxed)
++        .clamp(1, super::cqueue::QUEUES_MAX as u32);
++    if v > 1 && (compute_seq_pool() || !compute_one_descriptor()) {
++        v = 1;
++    }
++    let _ = COMPUTE_QUEUES_LATCH.compare_exchange(0, v, Ordering::AcqRel, Ordering::Acquire);
++    COMPUTE_QUEUES_LATCH.load(Ordering::Acquire) as usize
++}
++
++live_u32_param!(
++    COMPUTE_QUEUES_PARAM,
++    COMPUTE_QUEUES_PARMTYPE,
++    COMPUTE_QUEUES_PARM,
++    COMPUTE_QUEUES,
++    "g16_compute_queues",
++    "G16: firmware compute queues (default 1: one, as before; 2..4: a compute command that names no running command goes to the next queue, ids 16..18, each flight proved on its own queue; pool mode 2 only; latched at the engine start, set it as a module option)"
++);
++
+ /// Storage of `g16_compute_shared_pool` (0644, default 2; latched at its first read).
+ static COMPUTE_SHARED_POOL: AtomicU32 = AtomicU32::new(2);
+ /// 0 until latched, then 1 (mode 0), 2 (mode 1) or 3 (mode 2).
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index e4734cec01..43c7cd9bc1 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1224,17 +1224,20 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+         let behind = self.engine.flights.len() > 1;
+         let (mut rw_alone, mut rw_stamped, mut rw_target) = (false, false, 0);
+         if f.computes != 0 {
+-            let g = &self.graph.compute;
+-            let e = &self.engine;
++            // `g16_compute_queues`: the stamps, cursors and notifier below are the flight's own
++            // queue's, which no other queue writes (queue 0 is `compute`, as before); with
++            // completions out of order between queues, another queue's never proves this one.
++            let g = self.graph.compute_q(f.cq)?;
++            let (c_tail, c_head) = self.engine.c_tail(f.cq);
+             let passed = if behind {
+-                stamp_reached(g.fw_stamp.r32(0)?, f.target, e.target)
++                stamp_reached(g.fw_stamp.r32(0)?, f.target, c_tail)
+                     && self.queue_receipt_behind(
+                         Channel::Compute,
+                         &g.qstate,
+                         &g.qinfo,
+                         f.c_start,
+                         f.head,
+-                        e.head,
++                        c_head,
+                         f.rec[2],
+                     )?
+             } else {
+@@ -1275,7 +1278,7 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+             let note = g.notifier.r32(notifier_page::COMPUTE_STAMP)?;
+             let noted = if behind {
+                 // The record may already name the later command (same queue, same VM).
+-                stamp_reached(note, f.target, e.target)
++                stamp_reached(note, f.target, c_tail)
+             } else {
+                 note == f.target
+                     && g.notifier.r32(notifier_page::COMPUTE_CONTEXT)? == f.job.vm.slot
+@@ -1617,7 +1620,14 @@ pub(crate) fn progress(&mut self) {
+             |observed, own, tail| (!stamp_reached(observed, own, tail)).then_some(observed);
+         let (mut c, mut ta, mut fs) = (None, None, None);
+         if f.computes != 0 {
+-            c = pending(g.fw_stamp.r32(0).unwrap_or(0), f.target, e.target);
++            let stamp = match f.cq {
++                0 => g.fw_stamp.r32(0).unwrap_or(0),
++                q => self
++                    .graph
++                    .compute_q(q)
++                    .map_or(0, |g| g.fw_stamp.r32(0).unwrap_or(0)),
++            };
++            c = pending(stamp, f.target, e.c_tail(f.cq).0);
+         }
+         if f.renders != 0 {
+             ta = pending(r.fw_stamp[0].r32(0).unwrap_or(0), f.ta_target, e.ta_target);
+@@ -2066,6 +2076,14 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             RENDER_CHAINED.load(Ordering::Relaxed),
+             RENDER_NOWAIT.load(Ordering::Relaxed)
+         )?;
++        writeln!(
++            f,
++            "compute_queues: n {} published {:?} last {} waits {}",
++            super::params::compute_queues(),
++            self.engine.cq_published,
++            self.engine.cq_last,
++            self.engine.cq_waits
++        )?;
+         writeln!(
+             f,
+             "render_seq: pool {} uncached {} cached {} select {}",
+diff --git a/drivers/gpu/drm/asahi/g16/recovery.rs b/drivers/gpu/drm/asahi/g16/recovery.rs
+index 01a8527118..2f61954ffc 100644
+--- a/drivers/gpu/drm/asahi/g16/recovery.rs
++++ b/drivers/gpu/drm/asahi/g16/recovery.rs
+@@ -258,7 +258,8 @@ pub(crate) fn check_hangs(&mut self, done: &mut Completions) -> Result {
+                 // reached means the work finished and its receipt was never accepted on the host.
+                 if let Some(f) = self.engine.oldest() {
+                     let r = &self.graph.render;
+-                    let c = &self.graph.compute;
++                    // `g16_compute_queues`: the stamp of the oldest flight's own queue.
++                    let c = self.graph.compute_q(f.cq).unwrap_or(&self.graph.compute);
+                     dev_err!(
+                         self.dev(),
+                         "M4 GPU stall: oldest computes {} renders {} target c {:#x} ta {:#x} fs {:#x}; stamps c {:#x} ta {:#x} fs {:#x}; pending {:?}; flights {}\n",
+@@ -450,6 +451,7 @@ fn recover(&mut self) -> Result {
+         // These frontiers must be captured before the host answers 2: the
+         // firmware can force the stage target while aborting a work item.
+         let stage = self.recovery_snapshot()?;
++        self.compute_stage_snapshot()?;
+         let fault = self.session.regs.engine_state()?;
+         let asid = fault
+             .status
+diff --git a/drivers/gpu/drm/asahi/g16/recovery/logic.rs b/drivers/gpu/drm/asahi/g16/recovery/logic.rs
+index 4d8bcb716e..09219d75b8 100644
+--- a/drivers/gpu/drm/asahi/g16/recovery/logic.rs
++++ b/drivers/gpu/drm/asahi/g16/recovery/logic.rs
+@@ -116,7 +116,9 @@ pub(crate) fn decode(flags: u32, target: u32) -> Option<Self> {
+ /// A late snapshot can name the last complete receipt even after its flight was removed.
+ pub(crate) fn last_retired_target(last: &[Option<u32>; 3], event: u32, target: u32) -> bool {
+     let index = match event {
+-        15 => 0,
++        // Compute queue 0 is 15; `g16_compute_queues` adds 16, 17 and 18, whose targets
++        // are distinct ordinals too.
++        15..=18 => 0,
+         0x70 => 1,
+         0x71 => 2,
+         _ => return false,
+-- 
+2.43.0
+

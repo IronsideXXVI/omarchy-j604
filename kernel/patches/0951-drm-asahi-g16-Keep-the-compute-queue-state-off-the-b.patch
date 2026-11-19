@@ -1,0 +1,383 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 19 Nov 2026 01:48:46 +0000
+Subject: [PATCH] drm/asahi: g16: Keep the compute queue state off the
+ boot stack
+
+Engine and Graphs are built by value in Firmware::start_backend, and
+the whole Firmware is moved in Firmware::orphan_firmware. The compute
+queue fields added for g16_compute_queues and g16_cq_split_us
+(per-queue targets, ordinals, heads, registration, publication counts
+and stage stamps) and the code that makes the objects of compute
+queues 1.. made start_backend's frame 480 bytes larger than in the
+previous release kernel. A kernel stack overflow at boot was already
+seen once from such growth.
+
+Move these Engine fields into one heap object, ComputeQueues, built in
+its own non-inlined function, so that Engine carries only a pointer.
+Make the objects of compute queues 1.. in two non-inlined functions,
+called at the same points as before, so the allocation order and every
+object's address stay as they were. The fields keep their meaning;
+only their path changes from engine.cq_X to engine.cq.X. No behaviour
+change.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs | 116 ++++++++++++++++------------
+ drivers/gpu/drm/asahi/g16/graph.rs  |  67 ++++++++++------
+ drivers/gpu/drm/asahi/g16/poll.rs   |  10 +--
+ 3 files changed, 113 insertions(+), 80 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 7bf63e33cd..1d7f6beeb3 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -588,6 +588,48 @@ fn new() -> Result<Self> {
+     <&mut [u8; N]>::try_from(&mut v[..]).map_err(|_| EINVAL)
+ }
+ 
++/// `g16_compute_queues`: the newest published target and ring head and the registration of
++/// compute queues 1.. (index 0 unused: queue 0 keeps Engine's `target`, `head` and
++/// `queue_registered`), their last ordinals (queue 0 keeps `ordinal`, see
++/// [`cqueue::last_ordinal`]), the queue of the latest compute publication, compute publications
++/// per queue, placements that waited for running work to retire, and the stage stamps of queues
++/// 1.. captured with the recovery snapshot. `g16_cq_split_us`: one entry per client (VM slot) and
++/// the placements that kept a queue.
++pub(crate) struct ComputeQueues {
++    pub(crate) target: [u32; QUEUES_MAX],
++    pub(crate) ordinal: [u64; QUEUES_MAX],
++    pub(crate) head: [u32; QUEUES_MAX],
++    pub(crate) registered: [bool; QUEUES_MAX],
++    pub(crate) last: usize,
++    pub(crate) published: [u64; QUEUES_MAX],
++    pub(crate) waits: u64,
++    pub(crate) clients: KVec<cqueue::Client>,
++    pub(crate) kept: u64,
++    pub(crate) stage: [u32; QUEUES_MAX],
++}
++
++/// Built in its own frame, so that its by-value image never joins the boot path's frames.
++#[inline(never)]
++fn new_compute_queues() -> Result<KBox<ComputeQueues>> {
++    let clients = KVec::from_elem(cqueue::Client::NONE, cqueue::CLIENTS, GFP_KERNEL)?;
++    KBox::new(
++        ComputeQueues {
++            target: [0; QUEUES_MAX],
++            ordinal: [0; QUEUES_MAX],
++            head: [0; QUEUES_MAX],
++            registered: [false; QUEUES_MAX],
++            last: 0,
++            published: [0; QUEUES_MAX],
++            waits: 0,
++            clients,
++            kept: 0,
++            stage: [0; QUEUES_MAX],
++        },
++        GFP_KERNEL,
++    )
++    .map_err(|_| ENOMEM)
++}
++
+ /// Allocates the engine statistics. Not inlined, so the zeroed temporary lives in this
+ /// short-lived frame and never in the probe path's long-lived ones.
+ #[inline(never)]
+@@ -643,28 +685,10 @@ pub(crate) struct Engine {
+     pub(crate) queue_registered: bool,
+     pub(crate) render_registered: bool,
+     pub(crate) ta_registered: bool,
+-    /// `g16_compute_queues`: the newest published target and ring head and the registration
+-    /// of compute queues 1.. (index 0 unused: queue 0 keeps `target`, `head` and
+-    /// `queue_registered`), the queue of the latest compute publication, compute
+-    /// publications per queue, and placements that waited for running work to retire.
+-    pub(crate) cq_target: [u32; QUEUES_MAX],
+-    /// `g16_compute_queues`: the last compute ordinal of compute queues 1.. (index 0 unused:
+-    /// queue 0 keeps `ordinal`), see [`cqueue::last_ordinal`].
+-    pub(crate) cq_ordinal: [u64; QUEUES_MAX],
+-    pub(crate) cq_head: [u32; QUEUES_MAX],
+-    pub(crate) cq_registered: [bool; QUEUES_MAX],
+-    pub(crate) cq_last: usize,
+-    pub(crate) cq_published: [u64; QUEUES_MAX],
+-    pub(crate) cq_waits: u64,
+-    /// `g16_cq_split_us`, per client (VM slot): the VM id the entry belongs to (a slot reused
+-    /// by a new VM starts afresh), its recent compute span in us, the queue of its last compute
+-    /// publication, and the placements that kept a queue.
+-    /// [`cqueue::CLIENTS`] entries on the heap: Engine is built and moved by value on the
+-    /// boot path, whose stack frames must not grow.
+-    pub(crate) cq_clients: KVec<cqueue::Client>,
+-    pub(crate) cq_kept: u64,
+-    /// Stage stamps of compute queues 1.., captured with the recovery snapshot.
+-    pub(crate) cq_stage: [u32; QUEUES_MAX],
++    /// `g16_compute_queues` and `g16_cq_split_us`: compute queues 1.. and the queue split, in
++    /// one heap object ([`ComputeQueues`]). Engine is built and moved by value on the boot path,
++    /// whose stack frames must not grow.
++    pub(crate) cq: KBox<ComputeQueues>,
+     /// A ready prefix waits only for a record's consumption: repoll sooner.
+     pub(crate) chan_wait: bool,
+     /// Ready work waits for a running command to retire (`g16_window_poll_us`).
+@@ -727,16 +751,7 @@ pub(crate) fn new() -> Result<Self> {
+             queue_registered: false,
+             render_registered: false,
+             ta_registered: false,
+-            cq_target: [0; QUEUES_MAX],
+-            cq_ordinal: [0; QUEUES_MAX],
+-            cq_head: [0; QUEUES_MAX],
+-            cq_registered: [false; QUEUES_MAX],
+-            cq_last: 0,
+-            cq_published: [0; QUEUES_MAX],
+-            cq_waits: 0,
+-            cq_clients: KVec::from_elem(cqueue::Client::NONE, cqueue::CLIENTS, GFP_KERNEL)?,
+-            cq_kept: 0,
+-            cq_stage: [0; QUEUES_MAX],
++            cq: new_compute_queues()?,
+             chan_wait: false,
+             window_wait: false,
+             cbell_owed: false,
+@@ -762,20 +777,20 @@ pub(crate) fn oldest(&self) -> Option<&Flight> {
+     pub(crate) fn c_tail(&self, q: usize) -> (u32, u32) {
+         match q {
+             0 => (self.target, self.head),
+-            _ => (self.cq_target[q % QUEUES_MAX], self.cq_head[q % QUEUES_MAX]),
++            _ => (self.cq.target[q % QUEUES_MAX], self.cq.head[q % QUEUES_MAX]),
+         }
+     }
+ 
+     /// The last compute ordinal of compute queue `q`; each queue counts its own commands.
+     pub(crate) fn c_ordinal(&self, q: usize) -> u64 {
+-        cqueue::last_ordinal(q, self.ordinal, &self.cq_ordinal)
++        cqueue::last_ordinal(q, self.ordinal, &self.cq.ordinal)
+     }
+ 
+     /// Whether compute queue `q` was registered by its first submit record.
+     pub(crate) fn c_registered(&self, q: usize) -> bool {
+         match q {
+             0 => self.queue_registered,
+-            _ => self.cq_registered[q % QUEUES_MAX],
++            _ => self.cq.registered[q % QUEUES_MAX],
+         }
+     }
+ 
+@@ -1177,7 +1192,7 @@ pub(crate) fn register_render2(&mut self) -> Result {
+     /// [`Self::recovery_snapshot`] and before the host answers, for the same reason.
+     pub(crate) fn compute_stage_snapshot(&mut self) -> Result {
+         for q in 1..params::compute_queues().min(QUEUES_MAX) {
+-            self.engine.cq_stage[q] = self.graph.compute_q(q)?.fw_stamp.r32(0)?;
++            self.engine.cq.stage[q] = self.graph.compute_q(q)?.fw_stamp.r32(0)?;
+         }
+         Ok(())
+     }
+@@ -1259,7 +1274,7 @@ pub(crate) fn recovery_prepare_suspects(
+         let mut c_stage = [stage[2]; QUEUES_MAX];
+         let mut c_tails = [c_tail; QUEUES_MAX];
+         for q in 1..params::compute_queues().min(QUEUES_MAX) {
+-            c_stage[q] = self.engine.cq_stage[q];
++            c_stage[q] = self.engine.cq.stage[q];
+             c_tails[q] = self.engine.c_tail(q).0;
+         }
+         // Every flight (two with g16_flights = 2) that recovery may have caught unfinished.
+@@ -1860,7 +1875,7 @@ fn compute_queue_for(&mut self, job: &Job, index: u32, ahead: bool) -> Result<us
+         }
+         let state = cqueue::State {
+             queues: n,
+-            last: self.engine.cq_last,
++            last: self.engine.cq.last,
+             registered: &registered[..n],
+             ahead,
+             queue_order: params::job_ahead() != 0 || params::same_queue_nowait(),
+@@ -1877,27 +1892,28 @@ fn compute_queue_for(&mut self, job: &Job, index: u32, ahead: bool) -> Result<us
+         let mut state = state;
+         let (span, mine) = self
+             .engine
+-            .cq_clients
++            .cq
++            .clients
+             .get(client)
+             .map_or((cqueue::SPAN_UNKNOWN, cqueue::QUEUE_NONE), |c| {
+                 c.of(job.vm.id)
+             });
+         if cqueue::keeps_queue(split, span) {
+             state.keep = Some(match mine {
+-                cqueue::QUEUE_NONE => self.engine.cq_last,
++                cqueue::QUEUE_NONE => self.engine.cq.last,
+                 q => usize::from(q),
+             });
+         }
+-        let rotate = (self.engine.cq_last + 1) % n;
++        let rotate = (self.engine.cq.last + 1) % n;
+         match cqueue::place(&state) {
+             cqueue::Place::Queue(q) => {
+                 if state.keep.is_some() && state.ahead && q != rotate {
+-                    self.engine.cq_kept += 1;
++                    self.engine.cq.kept += 1;
+                 }
+                 Ok(q)
+             }
+             cqueue::Place::Wait => {
+-                self.engine.cq_waits += 1;
++                self.engine.cq.waits += 1;
+                 Err(EAGAIN)
+             }
+         }
+@@ -2208,7 +2224,7 @@ fn publish_prefix_into(
+             f.cq,
+             prefix.n,
+             &mut self.engine.ordinal,
+-            &mut self.engine.cq_ordinal,
++            &mut self.engine.cq.ordinal,
+         );
+         self.engine.draw = prefix.draw;
+         if render {
+@@ -2224,20 +2240,20 @@ fn publish_prefix_into(
+             self.engine.queue_registered = true;
+         } else {
+             let q = f.cq % QUEUES_MAX;
+-            self.engine.cq_target[q] = f.target;
+-            self.engine.cq_head[q] = f.head;
+-            self.engine.cq_registered[q] = true;
++            self.engine.cq.target[q] = f.target;
++            self.engine.cq.head[q] = f.head;
++            self.engine.cq.registered[q] = true;
+         }
+         if !render {
+-            self.engine.cq_last = f.cq;
++            self.engine.cq.last = f.cq;
+             // `g16_cq_split_us`: the client's queue (and its entry, if the slot has a new VM).
+             if params::compute_queues() > 1 {
+                 let client = job.vm.slot as usize % cqueue::CLIENTS;
+-                if let Some(c) = self.engine.cq_clients.get_mut(client) {
++                if let Some(c) = self.engine.cq.clients.get_mut(client) {
+                     c.published(job.vm.id, f.cq);
+                 }
+             }
+-            self.engine.cq_published[f.cq % QUEUES_MAX] += 1;
++            self.engine.cq.published[f.cq % QUEUES_MAX] += 1;
+         }
+         self.engine.events = self.events.compute_events;
+         self.engine.stage_seen = self.events.stage_events;
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index 2b203ff635..cb1105a0f0 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -361,6 +361,46 @@ pub(crate) struct Graphs {
+         && super::cwslot::UNITS >= sizes::COMPUTE_UNITS_MAX
+         && super::cwslot::BLOCK == super::fw::work::compute::BLOCK
+ );
++/// `g16_compute_queues`: the objects of compute queues 1.., each made as queue 0's are, with its
++/// own scheduling context. Not inlined: [`Graphs::new`] is inlined into the boot path, whose
++/// stack frames must not grow.
++#[inline(never)]
++fn new_compute_extra(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<KVec<ComputeGraph>> {
++    let mut compute_extra = KVec::new();
++    for _ in 1..super::params::compute_queues() {
++        compute_extra.push(ComputeGraph::new(o)?, GFP_KERNEL)?;
++    }
++    if !compute_extra.is_empty() {
++        dev_info!(
++            dev.as_ref(),
++            "G16: g16_compute_queues={}: compute queue ids 15..={}, each with its own scheduling context\n",
++            compute_extra.len() + 1,
++            15 + compute_extra.len()
++        );
++    }
++    Ok(compute_extra)
++}
++
++/// `g16_compute_seq_pool`: one more pair for each compute queue 1.. when queue 0 has one. Not
++/// inlined, as [`new_compute_extra`].
++#[inline(never)]
++fn new_compute_seq_extra(o: &mut Objects, seq: bool) -> Result<KVec<[Arc<FwObject>; 2]>> {
++    let mut compute_seq_extra = KVec::new();
++    if seq {
++        for _ in 1..super::params::compute_queues() {
++            let size = COMPUTE_SEQ_SLOTS * COMPUTE_SEQ_STRIDE;
++            compute_seq_extra.push(
++                [
++                    alloc(o, size, Class::Fw, None, 0, false)?,
++                    alloc(o, size, Class::FwCached, None, 0, false)?,
++                ],
++                GFP_KERNEL,
++            )?;
++        }
++    }
++    Ok(compute_seq_extra)
++}
++
+ impl Graphs {
+     pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+         let compute = ComputeGraph::new(o)?;
+@@ -418,18 +458,7 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+         };
+         // Allocated last, so one queue keeps every earlier object where it was. Each is made
+         // as queue 0 is, with its own scheduling context.
+-        let mut compute_extra = KVec::new();
+-        for _ in 1..super::params::compute_queues() {
+-            compute_extra.push(ComputeGraph::new(o)?, GFP_KERNEL)?;
+-        }
+-        if !compute_extra.is_empty() {
+-            dev_info!(
+-                dev.as_ref(),
+-                "G16: g16_compute_queues={}: compute queue ids 15..={}, each with its own scheduling context\n",
+-                compute_extra.len() + 1,
+-                15 + compute_extra.len()
+-            );
+-        }
++        let compute_extra = new_compute_extra(dev, o)?;
+         // `g16_compute_work_pool`: allocated after everything else, so without it every object
+         // keeps its address.
+         let compute_work = if super::params::compute_work_pool() {
+@@ -452,19 +481,7 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+             None
+         };
+         // `g16_compute_seq_pool`: one more pair for each further compute queue, allocated last.
+-        let mut compute_seq_extra = KVec::new();
+-        if compute_seq.is_some() {
+-            for _ in 1..super::params::compute_queues() {
+-                let size = COMPUTE_SEQ_SLOTS * COMPUTE_SEQ_STRIDE;
+-                compute_seq_extra.push(
+-                    [
+-                        alloc(o, size, Class::Fw, None, 0, false)?,
+-                        alloc(o, size, Class::FwCached, None, 0, false)?,
+-                    ],
+-                    GFP_KERNEL,
+-                )?;
+-            }
+-        }
++        let compute_seq_extra = new_compute_seq_extra(o, compute_seq.is_some())?;
+         Ok(Self {
+             dev: dev.as_ref().as_ref().into(),
+             compute,
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 50e61d851f..e123cf7ea7 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1436,7 +1436,7 @@ fn note_compute_span(&mut self, f: &Flight) {
+             return;
+         };
+         let client = f.job.vm.slot as usize % super::cqueue::CLIENTS;
+-        if let Some(c) = self.engine.cq_clients.get_mut(client) {
++        if let Some(c) = self.engine.cq.clients.get_mut(client) {
+             c.retired(f.job.vm.id, us);
+         }
+     }
+@@ -2107,15 +2107,15 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             f,
+             "compute_queues: n {} published {:?} last {} waits {}",
+             super::params::compute_queues(),
+-            self.engine.cq_published,
+-            self.engine.cq_last,
+-            self.engine.cq_waits
++            self.engine.cq.published,
++            self.engine.cq.last,
++            self.engine.cq.waits
+         )?;
+         writeln!(
+             f,
+             "cq_split: us {} kept {}",
+             super::params::cq_split_us(),
+-            self.engine.cq_kept
++            self.engine.cq.kept
+         )?;
+         writeln!(
+             f,
+-- 
+2.43.0
+

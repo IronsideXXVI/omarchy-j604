@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 22:40:20 +0000
+Subject: [PATCH] drm/asahi: g16: Give every compute queue its own
+ compute sequence slots
+
+g16_compute_seq_pool kept one set of 64 sequence slots, chosen by the
+compute ordinal, and therefore forced g16_compute_queues to 1.
+
+Keep queue 0's two objects and slots exactly as they are, and give
+every further queue its own pair of objects, allocated after every
+other object so that one queue leaves every address as it was. A
+command's sequence goes into slot (ordinal mod 64) of its own queue's
+pair. A slot then only ever holds sequences of one queue, whose END
+writes that queue's stamp, whether the queues share one ordinal or
+number their stamps separately, and a slot is written again only 64
+ordinals later, after its command retired. The sequence pool no longer
+forces one compute queue; pool modes other than 2 still do.
+
+The compute work pool needs no change: its slot is the compute unit
+index, and units are claimed from one ledger whatever their queue.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |  2 +-
+ drivers/gpu/drm/asahi/g16/graph.rs  | 39 +++++++++++++++++++++++++----
+ drivers/gpu/drm/asahi/g16/params.rs | 15 +++++------
+ 3 files changed, 43 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index fd0323623c..bd7c23cf1a 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -2253,7 +2253,7 @@ fn prefix_compute(
+         {
+             return Err(EAGAIN);
+         }
+-        let seq_slot = self.graph.compute_seq_slot(n);
++        let seq_slot = self.graph.compute_seq_slot(f.cq, n);
+         let index = self
+             .slots
+             .claim_compute(job.resources.compute()?, &mut f.claims, 0)?
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index 2ce1a9f2bf..2b203ff635 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -311,6 +311,11 @@ pub(crate) struct Graphs {
+     /// `g16_compute_seq_pool`: `COMPUTE_SEQ_SLOTS` compute microsequence slots, in an uncached
+     /// [0] and an ASC-cached [1] session object, never dropped while the session lives.
+     pub(crate) compute_seq: Option<[Arc<FwObject>; 2]>,
++    /// `g16_compute_seq_pool` with `g16_compute_queues` > 1: the same pair of objects for each
++    /// further queue ([q - 1] for queue q), allocated after every other object so that one
++    /// queue keeps queue 0's slots where they were. A slot holds one command's sequence, whose
++    /// END writes that command's stamp on its own queue, so two queues never share a slot.
++    pub(crate) compute_seq_extra: KVec<[Arc<FwObject>; 2]>,
+     /// Set by the first passed abort of a compute command: from then on compute commands keep
+     /// their sequence in their own unit's work page, so the aborted ordinal's slot is never
+     /// written again in this boot. The objects stay allocated for what is in flight.
+@@ -446,6 +451,20 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+         } else {
+             None
+         };
++        // `g16_compute_seq_pool`: one more pair for each further compute queue, allocated last.
++        let mut compute_seq_extra = KVec::new();
++        if compute_seq.is_some() {
++            for _ in 1..super::params::compute_queues() {
++                let size = COMPUTE_SEQ_SLOTS * COMPUTE_SEQ_STRIDE;
++                compute_seq_extra.push(
++                    [
++                        alloc(o, size, Class::Fw, None, 0, false)?,
++                        alloc(o, size, Class::FwCached, None, 0, false)?,
++                    ],
++                    GFP_KERNEL,
++                )?;
++            }
++        }
+         Ok(Self {
+             dev: dev.as_ref().as_ref().into(),
+             compute,
+@@ -455,6 +474,7 @@ pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+             render_seq,
+             render_work,
+             compute_seq,
++            compute_seq_extra,
+             compute_seq_off: false,
+             compute_work,
+         })
+@@ -468,14 +488,23 @@ pub(crate) fn compute_q(&self, q: usize) -> Result<&ComputeGraph> {
+         }
+     }
+ 
+-    /// The `g16_compute_seq_pool` slot of compute ordinal `n`: the object, the offset in it and
+-    /// the copy (0 uncached, 1 ASC-cached, as `g16_compute_seq_cached` reads now). None without
+-    /// the pool, so the sequence stays embedded in the unit's work page.
+-    pub(crate) fn compute_seq_slot(&self, n: u64) -> Option<(Arc<FwObject>, usize, usize)> {
++    /// The `g16_compute_seq_pool` slot of compute ordinal `n` on compute queue `q`: the object,
++    /// the offset in it and the copy (0 uncached, 1 ASC-cached, as `g16_compute_seq_cached`
++    /// reads now). Queue 0 uses `compute_seq` exactly as one queue does, queue q > 0 its own pair
++    /// in `compute_seq_extra`. None without the pool, after a passed compute abort or for a queue
++    /// without a pair, so the sequence stays embedded in the unit's work page.
++    pub(crate) fn compute_seq_slot(
++        &self,
++        q: usize,
++        n: u64,
++    ) -> Option<(Arc<FwObject>, usize, usize)> {
+         if self.compute_seq_off {
+             return None;
+         }
+-        let pool = self.compute_seq.as_ref()?;
++        let pool = match q {
++            0 => self.compute_seq.as_ref()?,
++            _ => self.compute_seq_extra.get(q - 1)?,
++        };
+         let copy = usize::from(super::params::compute_seq_cached());
+         let at = (n % COMPUTE_SEQ_SLOTS as u64) as usize * COMPUTE_SEQ_STRIDE;
+         Some((pool[copy].clone(), at, copy))
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 797a4441bc..c783eec7e8 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -764,10 +764,11 @@ pub(crate) fn render_seq_cached() -> bool {
+ /// `g16_compute_seq_pool` (load time, default 1). 1: at boot two session objects, one uncached
+ /// and one ASC-cached, each hold `graph::COMPUTE_SEQ_SLOTS` compute microsequence slots, and
+ /// every compute command writes its live microsequence into slot (compute ordinal mod
+-/// COMPUTE_SEQ_SLOTS) instead of its unit's per-VM work page. Compute units are per VM, so the
+-/// slot follows the device-wide ordinal: at most `sizes::FLIGHTS` commands are in flight and
+-/// flights retire in order, so a slot is reused only long after its command retired. The session
+-/// objects are never dropped, so a cached class never reaches a per-VM mapping.
++/// COMPUTE_SEQ_SLOTS) of its compute queue's pair instead of its unit's per-VM work page.
++/// Compute units are per VM, so the slot follows the ordinal: at most `sizes::FLIGHTS`
++/// commands are in flight and flights retire in order, so a slot is reused only long after its
++/// command retired. The session objects are never dropped, so a cached class never reaches a
++/// per-VM mapping.
+ pub(crate) fn compute_seq_pool() -> bool {
+     module_parameters::g16_compute_seq_pool.value() == 1
+ }
+@@ -1008,8 +1009,8 @@ pub(crate) fn compute_units() -> usize {
+ /// the engine start. The firmware runs the commands of one queue one at a time and different
+ /// queues at once, so with 2 or more a compute command that names no running command goes to
+ /// the queue after its predecessor's ([`super::cqueue::place`]). Flights still retire in
+-/// publication order, each proved on its own queue's stamps and cursors. Always 1 with
+-/// `g16_compute_seq_pool`, whose cells belong to the one queue, and
++/// publication order, each proved on its own queue's stamps and cursors. Every queue has its
++/// own sequence slots (`g16_compute_seq_pool`, graph.rs). Always 1
+ /// outside `g16_compute_shared_pool` mode 2: there every command of a VM binds the VM's one
+ /// descriptor and the firmware saves its row only after the last counted command, on any
+ /// queue, while in mode 1 the units of a VM share unit 0's freelist through descriptors of
+@@ -1022,7 +1023,7 @@ pub(crate) fn compute_queues() -> usize {
+     let mut v = COMPUTE_QUEUES
+         .load(Ordering::Relaxed)
+         .clamp(1, super::cqueue::QUEUES_MAX as u32);
+-    if v > 1 && (compute_seq_pool() || !compute_one_descriptor()) {
++    if v > 1 && !compute_one_descriptor() {
+         v = 1;
+     }
+     let _ = COMPUTE_QUEUES_LATCH.compare_exchange(0, v, Ordering::AcqRel, Ordering::Acquire);
+-- 
+2.43.0
+

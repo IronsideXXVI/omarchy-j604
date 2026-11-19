@@ -1373,3 +1373,7 @@ The base remains da8e1acf3656. Published 0001–0941 are unchanged. 0942 makes `
 # Kernel patch numbers: 1.1078 to 1.1088
 
 The base remains da8e1acf3656. Published 0001–0942 are unchanged. 0943 adds `g16_check_once` and 0944 makes 1 its default: within one pass the transport check reuses the session check that the same pass already ran and passed, and recovery and every path outside a pass still check in full. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1079 to 1.1087 were not released or published.
+
+# Kernel patch numbers: 1.1088 to 1.1091
+
+The base remains da8e1acf3656. Published 0001–0944 are unchanged. 0945 to 0954 let independent compute commands run on more than one firmware compute queue and make two queues the default: each queue has its own scheduling context, id, target stamps and compute sequence slots (0945 to 0949), `g16_cq_split_us` keeps clients with short commands on one queue (0950), 0951 to 0953 keep the queue state and the backend's graphs off the kernel stack, and 0954 sets `g16_compute_queues` to 2 and `g16_cq_split_us` to 100. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1089 to 1.1090 were not released or published.
