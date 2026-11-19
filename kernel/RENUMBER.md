@@ -1365,3 +1365,7 @@ The base remains da8e1acf3656. Published 0001–0935 are unchanged. 0936 adds co
 # Kernel patch numbers: 1.1070 to 1.1072
 
 The base remains da8e1acf3656. Published 0001–0938 are unchanged. 0939 adds compute work block slots in two session objects, an uncached and an ASC-cached copy (`g16_compute_work_pool`, with the copy selected by `g16_compute_work_cached`); 0940 adds `g16_submit_defer`, which leaves a compute submission to the poll pass when enough compute commands are outstanding; and 0941 makes the pool, the cached copy and a threshold of 16 the default. Applied source differs from the installed build only in the same nine comment lines as before. Version 1.1071 was not released or published.
+
+# Kernel patch numbers: 1.1072 to 1.1078
+
+The base remains da8e1acf3656. Published 0001–0941 are unchanged. 0942 makes `g16_resident_lazy` 2 and `g16_pb_lazy` 1 the default: a program's first frame builds two of its render units and a worker builds the others as it queues deeper, and the two larger units back 32 MiB of their parameter-buffer window and grow from there. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1073 to 1.1077 were not released or published.
