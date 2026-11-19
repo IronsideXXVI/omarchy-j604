@@ -1377,3 +1377,7 @@ The base remains da8e1acf3656. Published 0001–0942 are unchanged. 0943 adds `g
 # Kernel patch numbers: 1.1088 to 1.1091
 
 The base remains da8e1acf3656. Published 0001–0944 are unchanged. 0945 to 0954 let independent compute commands run on more than one firmware compute queue and make two queues the default: each queue has its own scheduling context, id, target stamps and compute sequence slots (0945 to 0949), `g16_cq_split_us` keeps clients with short commands on one queue (0950), 0951 to 0953 keep the queue state and the backend's graphs off the kernel stack, and 0954 sets `g16_compute_queues` to 2 and `g16_cq_split_us` to 100. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1089 to 1.1090 were not released or published.
+
+# Kernel patch numbers: 1.1091 to 1.1097
+
+The base remains da8e1acf3656. Published 0001–0954 are unchanged. 0955 and 0956 ring the render doorbells once per group of renders: 0955 adds `g16_render_bell_group` (default 0) with the rules that decide when a publication rings and its counters, and 0956 sets it to 4. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1092 to 1.1096 were not released or published.
