@@ -1,0 +1,290 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 19 Nov 2026 05:14:32 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally check the session once per
+ pass
+
+check_hangs opens with transport_error(), which runs Session::check:
+the latched failure, the RTKit and ASC state, the pstate register and a
+walk of the adopted UAT bindings. A submission's own publish pass has
+just run the same check, so it pays for it twice, and a poll pass runs
+it four times: its own check and three check_hangs calls, plus one per
+trailing poll. g16_pass_check_once removed publish()'s own repeat but
+not the one inside check_hangs.
+
+Add g16_check_once (runtime 0644, default 0). With 1, the transport
+check at the head of check_hangs reuses the session check that its own
+pass already ran and passed, and reads only the latched failure. A pass
+holds that verdict in a scope opened by Firmware::poll, or by publish()
+when publish runs its own check. A scope that is dropped restores the
+verdict that was there before. Every other path checks in full,
+including the recovery loop, which keeps calling transport_error()
+itself. The recovery, receipt and deadline checks of check_hangs run as
+before.
+
+The rule is in a core-only module with host tests. A stats line counts
+the full and the reused checks. Nothing changes while the word is 0.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/channel.rs    |  12 +++
+ drivers/gpu/drm/asahi/g16/check_once.rs | 116 ++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/engine.rs     |   6 +-
+ drivers/gpu/drm/asahi/g16/mod.rs        |   1 +
+ drivers/gpu/drm/asahi/g16/params.rs     |  19 ++++
+ drivers/gpu/drm/asahi/g16/poll.rs       |  10 ++
+ drivers/gpu/drm/asahi/g16/recovery.rs   |   2 +-
+ 7 files changed, 164 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/check_once.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/channel.rs b/drivers/gpu/drm/asahi/g16/channel.rs
+index 8fc7aac84f..acc238019d 100644
+--- a/drivers/gpu/drm/asahi/g16/channel.rs
++++ b/drivers/gpu/drm/asahi/g16/channel.rs
+@@ -522,6 +522,18 @@ pub(crate) fn transport_error(&self) -> Option<Error> {
+         self.session.check().err()
+     }
+ 
++    /// The same at the head of check_hangs: with `g16_check_once` it reuses the session check
++    /// its own pass already ran and passed, and reads only the latched failure.
++    pub(crate) fn transport_error_once(&self) -> Option<Error> {
++        use super::check_once as co;
++        if co::reuse(super::params::check_once(), co::verified()) {
++            co::count(1);
++            return self.session.shared.check().err();
++        }
++        co::count(0);
++        self.session.check().err()
++    }
++
+     /// Drains the receive rings and decodes events. Called first in every poll pass.
+     pub(crate) fn drain_rings(&mut self) -> Result {
+         let dev = self.session.dev.clone();
+diff --git a/drivers/gpu/drm/asahi/g16/check_once.rs b/drivers/gpu/drm/asahi/g16/check_once.rs
+new file mode 100644
+index 0000000000..623ab559d7
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/check_once.rs
+@@ -0,0 +1,116 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++//! `g16_check_once`: within one pass under the device lock, the transport check at the head of
++//! `check_hangs` may reuse the session check the same pass already ran and passed, instead of
++//! running it again. Core only, so the rules run as host tests.
++//!
++//! A pass opens a [`Pass`] scope; the scope starts unverified, the pass marks it verified after
++//! its own session check passes, and dropping the scope restores what was there before (a
++//! nested scope cannot leak a verdict outward). Without an open, verified scope every transport
++//! check runs in full, so a path that opens no scope behaves as before.
++
++use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++
++/// The verdict of the innermost open scope. Written only under the device lock.
++static VERIFIED: AtomicBool = AtomicBool::new(false);
++
++/// Counters: 0 transport checks run in full at the head of `check_hangs`, 1 reused.
++pub(crate) static N: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
++
++/// Whether a transport check may reuse the scope's verdict: the word is on and the scope is
++/// verified.
++pub(crate) fn reuse(word: u32, verified: bool) -> bool {
++    word != 0 && verified
++}
++
++/// One pass's scope for its session verdict.
++pub(crate) struct Pass {
++    prev: bool,
++}
++
++impl Pass {
++    /// Opens an unverified scope.
++    pub(crate) fn begin() -> Self {
++        Self {
++            prev: VERIFIED.swap(false, Ordering::Relaxed),
++        }
++    }
++}
++
++impl Drop for Pass {
++    fn drop(&mut self) {
++        VERIFIED.store(self.prev, Ordering::Relaxed);
++    }
++}
++
++/// Marks the open scope verified (its own session check has just passed).
++pub(crate) fn note_verified() {
++    VERIFIED.store(true, Ordering::Relaxed);
++}
++
++/// Whether the open scope is verified.
++pub(crate) fn verified() -> bool {
++    VERIFIED.load(Ordering::Relaxed)
++}
++
++/// Adds one to counter `i`.
++pub(crate) fn count(i: usize) {
++    if let Some(c) = N.get(i) {
++        c.fetch_add(1, Ordering::Relaxed);
++    }
++}
++
++/// Reads counter `i`.
++pub(crate) fn get(i: usize) -> u64 {
++    N.get(i).map_or(0, |c| c.load(Ordering::Relaxed))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn reuse_needs_word_and_verdict() {
++        assert!(!reuse(0, true));
++        assert!(!reuse(1, false));
++        assert!(reuse(1, true));
++    }
++
++    /// The event pass, the submit pass, a nested own check and paths outside any scope.
++    #[test]
++    fn scopes_never_leak_a_verdict() {
++        assert!(!verified());
++        {
++            // Event pass: opens, checks, marks; every check_hangs inside may reuse.
++            let _pass = Pass::begin();
++            assert!(!verified());
++            note_verified();
++            assert!(verified());
++            {
++                // publish() with its own check (pass_check_once 0) nests a scope.
++                let _own = Pass::begin();
++                assert!(!verified());
++                note_verified();
++                assert!(verified());
++            }
++            // The outer verdict is back after the nested scope.
++            assert!(verified());
++        }
++        // Outside any scope (sleep, resume, submit_retire, recovery): full checks.
++        assert!(!verified());
++        {
++            // Submit pass: publish() opens its own scope; a failed check never marks it.
++            let _own = Pass::begin();
++            assert!(!verified());
++        }
++        assert!(!verified());
++    }
++
++    #[test]
++    fn counters_count() {
++        let before = get(1);
++        count(1);
++        assert_eq!(get(1), before + 1);
++        count(7);
++        assert_eq!(get(7), 0);
++    }
++}
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index bd45ae716c..1616bdc107 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1390,8 +1390,12 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+         if self.session.shared.sleeping.load(core::sync::atomic::Ordering::Acquire) {
+             return Ok(());
+         }
+-        if !core::mem::take(&mut self.engine.pass_checked) {
++        // `g16_check_once`: a pass that runs its own session check holds its verdict here.
++        let own_check =
++            (!core::mem::take(&mut self.engine.pass_checked)).then(super::check_once::Pass::begin);
++        if own_check.is_some() {
+             self.session.check()?;
++            super::check_once::note_verified();
+             self.objects.health()?;
+         }
+         self.service_power()?;
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 238dfb78c4..b4fffd27a9 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -47,6 +47,7 @@
+ mod boot;
+ mod budget;
+ mod channel;
++mod check_once;
+ mod command;
+ mod encode;
+ mod engine;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 2fda47d1f5..b1ac6a7cf2 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2364,6 +2364,25 @@ pub(crate) fn submit_retire() -> bool {
+     "G16: 1 = a submission first retires the commands that completed since the last poll pass, without waiting for the firmware's event, then publishes (default 0: off; runtime 0644)"
+ );
+ 
++/// Storage of `g16_check_once` (runtime 0644, default 0).
++static CHECK_ONCE: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_check_once` = 1: the transport check at the head of check_hangs reuses the session
++/// check its own pass already ran and passed ([`super::check_once`]). 0: it runs the session
++/// check again. Read at each check.
++pub(crate) fn check_once() -> u32 {
++    CHECK_ONCE.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    CHECK_ONCE_PARAM,
++    CHECK_ONCE_PARMTYPE,
++    CHECK_ONCE_PARM,
++    CHECK_ONCE,
++    "g16_check_once",
++    "G16: 1 = within one pass, check_hangs reuses the session check that pass already ran and passed (default 0: it checks again; runtime 0644)"
++);
++
+ /// Storage of `g16_submit_defer` (runtime 0644, default 16).
+ static SUBMIT_DEFER: AtomicU32 = AtomicU32::new(16);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 140ef63f05..e4734cec01 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -894,8 +894,11 @@ pub(crate) fn poll(&mut self, evented: bool, done: &mut Completions) -> Result<b
+             self.drain_events()?;
+             early.lap(&mut self.engine.prof.drain_ns);
+         }
++        // `g16_check_once`: this pass's own session verdict, for its transport checks.
++        let _pass = super::check_once::Pass::begin();
+         let mut pre = Lap::start();
+         self.session.check()?;
++        super::check_once::note_verified();
+         pre.lap(&mut self.engine.prof.check_ns);
+         if pre.on() && !self.engine.flights.is_empty() {
+             if let Some(busy) = self
+@@ -2458,6 +2461,13 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             SUBMIT_DEFER_N[0].load(Ordering::Relaxed),
+             SUBMIT_DEFER_N[1].load(Ordering::Relaxed)
+         )?;
++        writeln!(
++            f,
++            "check_once: on {} full {} reused {}",
++            super::params::check_once(),
++            super::check_once::get(0),
++            super::check_once::get(1)
++        )?;
+         let ip = |i: usize| IDLEPASS[i].load(Ordering::Relaxed);
+         writeln!(
+             f,
+diff --git a/drivers/gpu/drm/asahi/g16/recovery.rs b/drivers/gpu/drm/asahi/g16/recovery.rs
+index 8a25cd9963..01a8527118 100644
+--- a/drivers/gpu/drm/asahi/g16/recovery.rs
++++ b/drivers/gpu/drm/asahi/g16/recovery.rs
+@@ -174,7 +174,7 @@ pub(crate) fn check_hangs(&mut self, done: &mut Completions) -> Result {
+             return Err(error);
+         }
+         let mut fault = core::mem::take(&mut self.recovery.receipt_fault);
+-        if let Some(error) = self.transport_error() {
++        if let Some(error) = self.transport_error_once() {
+             self.fail_stop(error, done);
+             return Err(error);
+         }
+-- 
+2.43.0
+

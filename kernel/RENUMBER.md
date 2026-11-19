@@ -1369,3 +1369,7 @@ The base remains da8e1acf3656. Published 0001–0938 are unchanged. 0939 adds co
 # Kernel patch numbers: 1.1072 to 1.1078
 
 The base remains da8e1acf3656. Published 0001–0941 are unchanged. 0942 makes `g16_resident_lazy` 2 and `g16_pb_lazy` 1 the default: a program's first frame builds two of its render units and a worker builds the others as it queues deeper, and the two larger units back 32 MiB of their parameter-buffer window and grow from there. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1073 to 1.1077 were not released or published.
+
+# Kernel patch numbers: 1.1078 to 1.1088
+
+The base remains da8e1acf3656. Published 0001–0942 are unchanged. 0943 adds `g16_check_once` and 0944 makes 1 its default: within one pass the transport check reuses the session check that the same pass already ran and passed, and recovery and every path outside a pass still check in full. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1079 to 1.1087 were not released or published.
