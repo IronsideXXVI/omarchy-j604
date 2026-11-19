@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 19 Nov 2026 09:06:48 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally defer compute submissions
+ only beside compute
+
+With g16_submit_defer 2 and g16_submit_kick 16, a compute submission
+that finds 2 to 15 compute flights out is left queued for a poll pass
+on the worker instead of running its own pass. With only compute in
+flight that pass publishes several submissions together and retires
+what has finished. Measured on linux-aurora-next 1.1089 (experimental),
+compute.light alone at depth 4 went from 50.28 to 42.55 us per
+submission and at depth 16 from 24.60 to 22.38 us.
+
+Beside a drawing client the same deferral only moves time between the
+clients. On 1.1089, with compute.light and render.light both at depth 8,
+compute went from 65.40 to 69.31 us per submission and render from
+164.11 to 141.60 us, with the commands per second of both together
+about unchanged (21.39k to 21.49k). Summed over that load, the GPU's
+compute stage time fell 4.7 % and its TA and FS stage times rose
+15.8 % and 16.1 %.
+
+Add g16_submit_defer_render (runtime 0644, default 0). With N, while any
+published flight holds a render, a compute submission is left queued
+only from N compute flights up and never asks for a pass; the pair
+applies as set only while every flight is compute. 16 gives a load with
+renders the deferral of the old defaults. Render submissions are not
+affected. A stats line counts the submissions decided with a render in
+flight and those the word kept from being deferred. Nothing changes
+while the word is 0.
+
+The rule is in a core-only module with host tests.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/mod.rs        |  1 +
+ drivers/gpu/drm/asahi/g16/params.rs     | 22 ++++++
+ drivers/gpu/drm/asahi/g16/poll.rs       | 31 ++++++++-
+ drivers/gpu/drm/asahi/g16/submit_mix.rs | 90 +++++++++++++++++++++++++
+ 4 files changed, 142 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/submit_mix.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 120a966079..fd52b4eb3d 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -75,6 +75,7 @@
+ mod sleep;
+ pub(crate) use sleep::register_reboot;
+ mod slots;
++mod submit_mix;
+ mod timestamp;
+ mod uat;
+ pub(crate) mod winscan;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index f2fcd05467..b56abddf48 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2522,6 +2522,28 @@ pub(crate) fn submit_kick() -> u32 {
+     "G16: K = a compute submission that g16_submit_defer leaves queued with fewer than K compute flights outstanding asks for a poll pass at once instead of waiting for the next firmware event or re-poll (default 0: never; runtime 0644)"
+ );
+ 
++/// Storage of `g16_submit_defer_render` (runtime 0644, default 0).
++static SUBMIT_DEFER_RENDER: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_submit_defer_render` = N: while any published flight holds a render, a compute
++/// submission is left queued only from N compute flights up and never asks for a pass;
++/// `g16_submit_defer` and `g16_submit_kick` apply as set only while every flight is compute
++/// ([`super::submit_mix`]). 16 gives a load with renders the deferral of the old defaults.
++/// 0: the two apply alike with or without renders. Read at each compute submission that
++/// `g16_submit_defer` can defer.
++pub(crate) fn submit_defer_render() -> u32 {
++    SUBMIT_DEFER_RENDER.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    SUBMIT_DEFER_RENDER_PARAM,
++    SUBMIT_DEFER_RENDER_PARMTYPE,
++    SUBMIT_DEFER_RENDER_PARM,
++    SUBMIT_DEFER_RENDER,
++    "g16_submit_defer_render",
++    "G16: N = while a render is in flight, a compute submission is queued only from N compute flights up and never kicked; g16_submit_defer and g16_submit_kick apply as set only while every flight is compute (default 0: they apply alike; runtime 0644)"
++);
++
+ /// Storage of `g16_lat_qos_us` (runtime 0644, default 0).
+ static LAT_QOS_US: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 3a861cb711..b65e83b207 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -571,12 +571,32 @@ pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+                 } else {
+                     0
+                 };
+-                let deferred = defer != 0 && cflights >= defer;
++                // g16_submit_defer_render: with a render in flight, its own threshold and no
++                // kick; the pair as set only while every flight is compute.
++                let rdefer = super::params::submit_defer_render() as usize;
++                let rendering = rdefer != 0
++                    && cflights != 0
++                    && firmware.engine.flights.iter().any(|f| f.renders != 0);
++                let (dlim, klim) = super::submit_mix::limits(
++                    defer,
++                    super::params::submit_kick() as usize,
++                    rdefer,
++                    rendering,
++                );
++                if rendering {
++                    super::submit_mix::count(0);
++                    if super::submit_mix::deferred(defer, cflights)
++                        && !super::submit_mix::deferred(dlim, cflights)
++                    {
++                        super::submit_mix::count(1);
++                    }
++                }
++                let deferred = super::submit_mix::deferred(dlim, cflights);
+                 if deferred {
+                     SUBMIT_DEFER_N[0].fetch_add(1, Ordering::Relaxed);
+                     // g16_submit_kick: below K flights the pass publishes it now, with whatever
+                     // else queued meanwhile; from K up it waits for the event's pass.
+-                    if cflights < super::params::submit_kick() as usize {
++                    if cflights < klim {
+                         SUBMIT_DEFER_N[2].fetch_add(1, Ordering::Relaxed);
+                         kick = true;
+                     }
+@@ -2588,6 +2608,13 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             super::params::submit_kick(),
+             SUBMIT_DEFER_N[2].load(Ordering::Relaxed)
+         )?;
++        writeln!(
++            f,
++            "submit_defer_render: n {} mixed {} spared {}",
++            super::params::submit_defer_render(),
++            super::submit_mix::get(0),
++            super::submit_mix::get(1)
++        )?;
+         writeln!(
+             f,
+             "check_once: on {} full {} reused {}",
+diff --git a/drivers/gpu/drm/asahi/g16/submit_mix.rs b/drivers/gpu/drm/asahi/g16/submit_mix.rs
+new file mode 100644
+index 0000000000..61a4e76d14
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/submit_mix.rs
+@@ -0,0 +1,90 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++//! `g16_submit_defer_render`: while a render is in flight, a compute submission is left queued
++//! only from that many compute flights up and never asks for a pass; `g16_submit_defer` and
++//! `g16_submit_kick` apply as set only while every flight is compute. A compute client beside a
++//! drawing client otherwise has part of its submissions published by a later worker pass while
++//! the renders take the firmware's time, so the pair moves time from one client to the other
++//! instead of saving it. Core only, so the rule runs as host tests.
++
++use core::sync::atomic::{AtomicU64, Ordering};
++
++/// Counters: 0 compute submissions decided with a render in flight while the word is on, 1 of
++/// those that `g16_submit_defer` alone would have left queued and the word did not.
++pub(crate) static N: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
++
++/// The deferral threshold and the kick limit for one compute submission: `defer` and `kick` as
++/// set, or `render_defer` and no kick while `rendering` (a flight holds a render) and the word
++/// is on.
++pub(crate) fn limits(
++    defer: usize,
++    kick: usize,
++    render_defer: usize,
++    rendering: bool,
++) -> (usize, usize) {
++    if render_defer != 0 && rendering {
++        (render_defer, 0)
++    } else {
++        (defer, kick)
++    }
++}
++
++/// Whether a threshold leaves the submission queued with `cflights` compute flights out; a
++/// threshold of 0 never does.
++pub(crate) fn deferred(threshold: usize, cflights: usize) -> bool {
++    threshold != 0 && cflights >= threshold
++}
++
++/// Adds one to counter `i`.
++pub(crate) fn count(i: usize) {
++    if let Some(c) = N.get(i) {
++        c.fetch_add(1, Ordering::Relaxed);
++    }
++}
++
++/// Reads counter `i`.
++pub(crate) fn get(i: usize) -> u64 {
++    N.get(i).map_or(0, |c| c.load(Ordering::Relaxed))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn off_keeps_the_pair() {
++        assert_eq!(limits(2, 16, 0, true), (2, 16));
++        assert_eq!(limits(2, 16, 0, false), (2, 16));
++    }
++
++    #[test]
++    fn compute_only_keeps_the_pair() {
++        assert_eq!(limits(2, 16, 16, false), (2, 16));
++    }
++
++    #[test]
++    fn a_render_in_flight_takes_the_old_defaults() {
++        let (d, k) = limits(2, 16, 16, true);
++        assert_eq!((d, k), (16, 0));
++        for c in 1..16 {
++            assert!(!deferred(d, c));
++        }
++        assert!(deferred(d, 16));
++    }
++
++    #[test]
++    fn zero_threshold_never_defers() {
++        assert!(!deferred(0, 0));
++        assert!(!deferred(0, 40));
++        assert!(deferred(2, 2));
++        assert!(!deferred(2, 1));
++    }
++
++    #[test]
++    fn counters_count() {
++        let before = get(1);
++        count(1);
++        assert_eq!(get(1), before + 1);
++        count(5);
++        assert_eq!(get(5), 0);
++    }
++}
+-- 
+2.43.0
+

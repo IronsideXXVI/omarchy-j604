@@ -1,0 +1,461 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 19 Nov 2026 12:59:31 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally keep the compute kick to a
+ queue alone
+
+g16_submit_defer, g16_submit_kick and g16_submit_defer_render move a
+compute submission that finds a few compute flights out onto a poll
+pass that the submission asks for at once. Alone, that pass publishes
+several records together. Beside another client the kicked pass can
+take the firmware just before the other client's record lands, and the
+other client waits a pass. Measured on linux-aurora-next 1.1093 with
+the three words at 2, 16 and 16 against 16, 0 and 0, on one boot:
+
+  render.light depth 1 beside compute.light depth 4:
+    307.67 -> 314.99 us per submission (+2.4 %, slower in 5 of 6
+    block pairs)
+  compute.light depth 1 beside compute.light depth 8:
+    408.80 -> 419.88 us per submission (+2.7 %)
+
+On another boot of 1.1093, compute.light alone at depth 8 went from
+32.64 to 29.85 us per submission.
+
+Add g16_submit_solo_us = W (runtime 0644, default 0). With W set, the
+three words act as set only for a compute submission whose queue is
+alone: every flight in the engine is its own, and no other queue has
+submitted, published or retired work within the last W us. Otherwise
+the submission takes the old rule, queued only from 16 compute flights
+up and never kicked. A queue is one client, so two processes and two
+queues of one process are both refused.
+
+The flights check shares the walk the submission already makes to
+count compute flights, which now also finds a render flight, so a
+submission walks the flights once instead of twice. The engine keeps
+the latest activity and the latest activity of another queue, which
+answers the window in constant time. A stats line counts the
+decisions: alone, kicked alone, refused for a flight of another queue
+and refused inside the window.
+
+The rule is in a core-only module with host tests. Nothing changes
+while the word is 0.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs |   9 ++
+ drivers/gpu/drm/asahi/g16/mod.rs    |   1 +
+ drivers/gpu/drm/asahi/g16/params.rs |  22 +++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  57 +++++++-
+ drivers/gpu/drm/asahi/g16/solo.rs   | 214 ++++++++++++++++++++++++++++
+ 5 files changed, 296 insertions(+), 7 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/solo.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 85ce4cadb3..49d570384b 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -64,6 +64,11 @@ pub(crate) fn rmb() {
+ }
+ 
+ /// `ktime_get_ns()`.
++/// `g16_submit_solo_us`: a queue's identity, the address of its state (solo.rs).
++pub(crate) fn queue_id(q: &super::queue::QueueState) -> usize {
++    core::ptr::from_ref(q) as usize
++}
++
+ pub(crate) fn now_ns() -> u64 {
+     <kernel::time::Monotonic as kernel::time::ClockSource>::ktime_get() as u64
+ }
+@@ -324,6 +329,8 @@ enum PublicationError {
+ /// Engine statistics, printed by `aurora-g16/stats`.
+ #[derive(Default)]
+ pub(crate) struct Stats {
++    /// `g16_submit_solo_us`: the latest activity and that of another queue (solo.rs).
++    pub(crate) solo: super::solo::Recent,
+     pub(crate) pub_ns: u64,
+     pub(crate) idle_from_ns: u64,
+     pub(crate) starve_from_ns: u64,
+@@ -2767,6 +2774,8 @@ fn prefix_render(
+     fn stat_publish(&mut self, f: &mut Flight) {
+         let s = &mut *self.engine.stats;
+         s.pub_ns = now_ns();
++        // g16_submit_solo_us: a publication is an activity of the flight's queue.
++        s.solo.note(queue_id(&f.job.queue), s.pub_ns);
+         f.published_ns = s.pub_ns;
+         f.published_ticks = counter_ticks();
+         s.prep_ns += s.pub_ns.wrapping_sub(s.prep_from_ns);
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index fd52b4eb3d..0936fe859a 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -75,6 +75,7 @@
+ mod sleep;
+ pub(crate) use sleep::register_reboot;
+ mod slots;
++mod solo;
+ mod submit_mix;
+ mod timestamp;
+ mod uat;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index b56abddf48..7032dd459e 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2544,6 +2544,28 @@ pub(crate) fn submit_defer_render() -> u32 {
+     "G16: N = while a render is in flight, a compute submission is queued only from N compute flights up and never kicked; g16_submit_defer and g16_submit_kick apply as set only while every flight is compute (default 0: they apply alike; runtime 0644)"
+ );
+ 
++/// Storage of `g16_submit_solo_us` (runtime 0644, default 0).
++static SUBMIT_SOLO_US: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_submit_solo_us` = W: `g16_submit_defer`, `g16_submit_kick` and
++/// `g16_submit_defer_render` act as set only for a compute submission whose queue is alone on
++/// the device: every flight is its own, and no other queue submitted, published or retired work
++/// within the last W us ([`super::solo`]). Otherwise the submission takes the old rule, queued
++/// only from 16 compute flights up and never kicked. Default 0: the rule is off and the three
++/// words act as set. Read at each compute submission that `g16_submit_defer` can defer.
++pub(crate) fn submit_solo_us() -> u32 {
++    SUBMIT_SOLO_US.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    SUBMIT_SOLO_US_PARAM,
++    SUBMIT_SOLO_US_PARMTYPE,
++    SUBMIT_SOLO_US_PARM,
++    SUBMIT_SOLO_US,
++    "g16_submit_solo_us",
++    "G16: W us = the kick words act only while the submitting queue is alone on the device (no other queue's flight out or work within W us); otherwise queued from 16 compute flights, never kicked (default 0: off)"
++);
++
+ /// Storage of `g16_lat_qos_us` (runtime 0644, default 0).
+ static LAT_QOS_US: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index b65e83b207..ad5ce22254 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -559,24 +559,33 @@ pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+                 .commands
+                 .iter()
+                 .all(|c| matches!(c, super::command::Command::Compute(_)));
++            // g16_submit_solo_us: the submitting queue.
++            let me = super::engine::queue_id(&job.queue);
+             let accepted = firmware.enqueue(job);
+             if accepted.is_ok() {
+                 // g16_submit_defer: with enough compute flights outstanding their retirement
+                 // brings a poll pass soon; leave this one queued for it instead of running a
+                 // pass (checks, then one record and one doorbell) on the submitting thread.
+                 let defer = super::params::submit_defer() as usize;
+-                // Compute flights outstanding, counted only where the deferral can apply.
+-                let cflights = if defer != 0 && compute_only && !firmware.engine.chan_wait {
+-                    firmware.engine.flights.iter().filter(|f| f.computes != 0).count()
++                // Compute flights outstanding, counted only where a deferral can apply. The same
++                // walk finds a render flight (g16_submit_defer_render) and a flight of another
++                // queue (g16_submit_solo_us).
++                let walked = defer != 0 && compute_only && !firmware.engine.chan_wait;
++                let (cflights, any_render, other_flight) = if walked {
++                    firmware.engine.flights.iter().fold((0, false, false), |(n, r, o), f| {
++                        (
++                            n + usize::from(f.computes != 0),
++                            r || f.renders != 0,
++                            o || super::engine::queue_id(&f.job.queue) != me,
++                        )
++                    })
+                 } else {
+-                    0
++                    (0, false, false)
+                 };
+                 // g16_submit_defer_render: with a render in flight, its own threshold and no
+                 // kick; the pair as set only while every flight is compute.
+                 let rdefer = super::params::submit_defer_render() as usize;
+-                let rendering = rdefer != 0
+-                    && cflights != 0
+-                    && firmware.engine.flights.iter().any(|f| f.renders != 0);
++                let rendering = rdefer != 0 && cflights != 0 && any_render;
+                 let (dlim, klim) = super::submit_mix::limits(
+                     defer,
+                     super::params::submit_kick() as usize,
+@@ -591,6 +600,26 @@ pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+                         super::submit_mix::count(1);
+                     }
+                 }
++                // g16_submit_solo_us: the kick words act only while this queue is alone on the
++                // device (solo.rs); otherwise the submission takes the old rule.
++                let solo_ns = u64::from(super::params::submit_solo_us()) * 1000;
++                let solo = if solo_ns != 0 {
++                    let now = super::engine::now_ns();
++                    let r = &mut firmware.engine.stats.solo;
++                    let d = (walked && defer != 0)
++                        .then(|| super::solo::decide(solo_ns, now, other_flight, r.others(me)));
++                    r.note(me, now);
++                    if let Some(d) = d {
++                        super::solo::count(super::solo::slot(d));
++                    }
++                    d
++                } else {
++                    None
++                };
++                let (dlim, klim) = match solo {
++                    Some(d) => super::solo::limits(d, (dlim, klim)),
++                    None => (dlim, klim),
++                };
+                 let deferred = super::submit_mix::deferred(dlim, cflights);
+                 if deferred {
+                     SUBMIT_DEFER_N[0].fetch_add(1, Ordering::Relaxed);
+@@ -598,6 +627,9 @@ pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+                     // else queued meanwhile; from K up it waits for the event's pass.
+                     if cflights < klim {
+                         SUBMIT_DEFER_N[2].fetch_add(1, Ordering::Relaxed);
++                        if solo == Some(super::solo::ALONE) {
++                            super::solo::count(1);
++                        }
+                         kick = true;
+                     }
+                 } else {
+@@ -1525,6 +1557,8 @@ pub(crate) fn retire_oldest(
+         let slot = self.engine.recent_next % self.engine.recent.len();
+         self.engine.recent[slot] = (f.job.vm.id, class, now_ns());
+         self.engine.recent_next = self.engine.recent_next.wrapping_add(1);
++        // g16_submit_solo_us: a retirement is an activity of the flight's queue.
++        self.engine.stats.solo.note(super::engine::queue_id(&f.job.queue), now_ns());
+         let timestamp_claims = f.claims;
+         if result.is_ok() {
+             self.stat_retire(&f);
+@@ -2615,6 +2649,15 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             super::submit_mix::get(0),
+             super::submit_mix::get(1)
+         )?;
++        writeln!(
++            f,
++            "solo: window_us {} alone {} kicked {} busy {} quiet {}",
++            super::params::submit_solo_us(),
++            super::solo::get(0),
++            super::solo::get(1),
++            super::solo::get(2),
++            super::solo::get(3)
++        )?;
+         writeln!(
+             f,
+             "check_once: on {} full {} reused {}",
+diff --git a/drivers/gpu/drm/asahi/g16/solo.rs b/drivers/gpu/drm/asahi/g16/solo.rs
+new file mode 100644
+index 0000000000..1622bf211d
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/solo.rs
+@@ -0,0 +1,214 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++//! `g16_submit_solo_us`: `g16_submit_defer`, `g16_submit_kick` and `g16_submit_defer_render`
++//! act only for a compute submission whose client is alone on the device.
++//!
++//! A client is one submitting queue ([`super::job::Job::queue`]): two processes are two
++//! clients, and so are two queues of one process. A submission is alone when every flight in
++//! the engine belongs to its queue and no other queue has submitted, published or retired work
++//! within the last W us. Otherwise it takes the old rule: queued only from 16 compute flights
++//! up, never kicked. Beside another client a kicked pass can take the firmware just before the
++//! other client's record lands, so the other client waits a pass: on 1.1093 a render at depth
++//! 1 beside compute at depth 4 paid 2.4 %, and compute at depth 1 beside compute at depth 8
++//! paid 2.7 %.
++//!
++//! [`Recent`] keeps the latest activity and the latest activity of a different queue, so the
++//! latest activity of every queue but one is known in O(1). The flights check rides on the walk
++//! the submission already makes to count compute flights. Core only, so the rules run as host
++//! tests.
++
++use core::sync::atomic::{AtomicU64, Ordering};
++
++/// The deferral of the old defaults: queued only from this many compute flights up.
++pub(crate) const OLD_DEFER: usize = 16;
++
++/// The submission's queue is alone: the words act as set.
++pub(crate) const ALONE: u8 = 0;
++/// A flight of another queue is out.
++pub(crate) const BUSY: u8 = 1;
++/// Another queue submitted, published or retired work within the window.
++pub(crate) const QUIET: u8 = 2;
++
++/// Counters: 0 submissions decided alone, 1 of those kicked, 2 refused because a flight of
++/// another queue was out, 3 refused inside the window.
++pub(crate) static N: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
++
++/// The latest activity on the device, and the latest activity of a queue other than that
++/// one's. Queue 0 means none.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(crate) struct Recent {
++    last: (usize, u64),
++    other: (usize, u64),
++}
++
++impl Recent {
++    /// Records an activity of `queue` (non-zero) at `now` (ns).
++    pub(crate) fn note(&mut self, queue: usize, now: u64) {
++        if queue == 0 {
++            return;
++        }
++        if self.last.0 != queue && self.last.0 != 0 {
++            self.other = self.last;
++        }
++        self.last = (queue, now);
++    }
++
++    /// The time of the latest activity of any queue but `queue`, if there was one.
++    pub(crate) fn others(&self, queue: usize) -> Option<u64> {
++        if self.last.0 == 0 {
++            None
++        } else if self.last.0 != queue {
++            Some(self.last.1)
++        } else if self.other.0 != 0 {
++            Some(self.other.1)
++        } else {
++            None
++        }
++    }
++}
++
++/// The rule for one compute submission: off (`window_ns` 0) is always ALONE; otherwise BUSY
++/// while a flight of another queue is out, QUIET while another queue acted less than
++/// `window_ns` before `now`, ALONE after that.
++pub(crate) fn decide(window_ns: u64, now: u64, other_flight: bool, others: Option<u64>) -> u8 {
++    if window_ns == 0 {
++        ALONE
++    } else if other_flight {
++        BUSY
++    } else if matches!(others, Some(t) if now.saturating_sub(t) < window_ns) {
++        QUIET
++    } else {
++        ALONE
++    }
++}
++
++/// The deferral threshold and kick limit: as the words set them while alone, the old rule
++/// (16, never kicked) otherwise.
++pub(crate) fn limits(decision: u8, set: (usize, usize)) -> (usize, usize) {
++    if decision == ALONE {
++        set
++    } else {
++        (OLD_DEFER, 0)
++    }
++}
++
++/// The counter a decision adds to.
++pub(crate) const fn slot(decision: u8) -> usize {
++    match decision {
++        ALONE => 0,
++        BUSY => 2,
++        _ => 3,
++    }
++}
++
++/// Adds one to counter `i`.
++pub(crate) fn count(i: usize) {
++    if let Some(c) = N.get(i) {
++        c.fetch_add(1, Ordering::Relaxed);
++    }
++}
++
++/// Reads counter `i`.
++pub(crate) fn get(i: usize) -> u64 {
++    N.get(i).map_or(0, |c| c.load(Ordering::Relaxed))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const US: u64 = 1000;
++
++    #[test]
++    fn off_is_always_alone() {
++        assert_eq!(decide(0, 10, true, Some(9)), ALONE);
++        assert_eq!(limits(decide(0, 10, true, Some(9)), (2, 16)), (2, 16));
++    }
++
++    #[test]
++    fn another_flight_or_recent_work_refuses() {
++        let w = 500 * US;
++        assert_eq!(decide(w, 1_000_000, true, None), BUSY);
++        assert_eq!(decide(w, 1_000_000, false, Some(1_000_000 - 499 * US)), QUIET);
++        assert_eq!(decide(w, 1_000_000, false, Some(1_000_000 - 500 * US)), ALONE);
++        assert_eq!(decide(w, 1_000_000, false, None), ALONE);
++        // A stamp at or after `now` is inside the window.
++        assert_eq!(decide(w, 1_000_000, false, Some(1_000_001)), QUIET);
++        assert_eq!(limits(BUSY, (2, 16)), (16, 0));
++        assert_eq!(limits(QUIET, (2, 16)), (16, 0));
++        assert_eq!(limits(ALONE, (2, 16)), (2, 16));
++        assert_eq!((slot(ALONE), slot(BUSY), slot(QUIET)), (0, 2, 3));
++    }
++
++    /// `others` equals the latest activity of a different queue in every sequence of up to
++    /// seven activities by three queues.
++    #[test]
++    fn recent_matches_the_history() {
++        for n in 0..=7u32 {
++            for code in 0..3u32.pow(n) {
++                let mut r = Recent::default();
++                let mut hist = [(0usize, 0u64); 7];
++                let mut c = code;
++                for i in 0..n as usize {
++                    let q = (c % 3) as usize + 1;
++                    c /= 3;
++                    let t = 10 * (i as u64 + 1);
++                    r.note(q, t);
++                    hist[i] = (q, t);
++                }
++                for q in 1..=4usize {
++                    let want = hist[..n as usize].iter().filter(|h| h.0 != q).map(|h| h.1).max();
++                    assert_eq!(r.others(q), want, "code {} n {} queue {}", code, n, q);
++                }
++            }
++        }
++    }
++
++    /// The two measured cases stay outside "alone": a shallow client that acts at least every
++    /// 420 us (compute at depth 1 beside compute at depth 8 read 419.88 us per command on
++    /// 1.1093) and whose command is out half of the time never leaves the deep client alone
++    /// with a window of 500 us; once it stops, the deep client is alone 500 us later.
++    #[test]
++    fn a_shallow_client_keeps_the_deep_one_out() {
++        let (deep, shallow, w) = (1usize, 2usize, 500 * US);
++        let mut r = Recent::default();
++        let mut alone = 0;
++        let mut t = 0u64;
++        for k in 0..1000u64 {
++            // The shallow client publishes at 420k us and retires 200 us later.
++            let pub_t = 420 * US * k;
++            let ret_t = pub_t + 200 * US;
++            while t < pub_t + 420 * US {
++                if t == pub_t {
++                    r.note(shallow, t);
++                }
++                if t == ret_t {
++                    r.note(shallow, t);
++                }
++                let out = t >= pub_t && t < ret_t;
++                r.note(deep, t);
++                if decide(w, t, out, r.others(deep)) == ALONE {
++                    alone += 1;
++                }
++                t += 10 * US;
++            }
++        }
++        assert_eq!(alone, 0);
++        // Its last activity was the retirement of its 1000th command.
++        let last = 420 * US * 999 + 200 * US;
++        assert_eq!(r.others(deep), Some(last));
++        assert_eq!(decide(w, last + 490 * US, false, r.others(deep)), QUIET);
++        assert_eq!(decide(w, last + 500 * US, false, r.others(deep)), ALONE);
++    }
++
++    #[test]
++    fn a_queue_never_refuses_itself() {
++        let mut r = Recent::default();
++        for i in 0..100u64 {
++            r.note(7, i * 13);
++            assert_eq!(r.others(7), None);
++            assert_eq!(decide(500 * US, i * 13, false, r.others(7)), ALONE);
++        }
++        r.note(0, 5000);
++        assert_eq!(r.others(7), None);
++    }
++}
+-- 
+2.43.0
+

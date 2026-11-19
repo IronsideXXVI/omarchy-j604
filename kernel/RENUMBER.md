@@ -1385,3 +1385,7 @@ The base remains da8e1acf3656. Published 0001–0954 are unchanged. 0955 and 095
 # Kernel patch numbers: 1.1097 to 1.1104
 
 The base remains da8e1acf3656. Published 0001–0956 are unchanged. 0957 to 0960 map the render notifier records cached: 0957 drops an unused field from the render graph, 0958 adds `g16_notifier_cached` (default 0), which puts the notifier records of a render in a session page the firmware maps cached, 0959 adds `g16_lone_ctx_skip` (default 0), which lets a render with nothing queued behind it finish without the cached record words, and 0960 sets both to 1. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1098 to 1.1103 were not released or published.
+
+# Kernel patch numbers: 1.1104 to 1.1105
+
+The base remains da8e1acf3656. Published 0001–0960 are unchanged. 0961 to 0964 let a queued compute submission ask for a poll pass at once: 0961 adds `g16_submit_kick` (default 0), 0962 adds `g16_submit_defer_render` (default 0), which keeps the old rule for compute submissions while a render is in flight, 0963 adds `g16_submit_solo_us` (default 0), which keeps the kick to a queue that is alone on the device, and 0964 sets `g16_submit_defer` to 2 and the three new words to 16, 16 and 500. Applied source differs from the installed build only in the same nine comment lines as before.

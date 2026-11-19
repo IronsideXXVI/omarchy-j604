@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 19 Nov 2026 03:59:00 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally ask for a poll pass for a
+ queued submission
+
+With g16_submit_defer, a compute submission that finds enough compute
+flights outstanding is only queued, and the poll pass after the next
+firmware event or completion re-poll publishes it. With many flights
+out that batches publications well. With a few out, the queue drains
+before that pass comes, so a low deferral threshold costs latency.
+
+Add g16_submit_kick = K (runtime, default 0). A submission that the
+deferral leaves queued while fewer than K compute flights are
+outstanding queues the poll work at once, after the device lock is
+dropped. Requests made while the work is pending run as one pass, so
+a burst of submissions is still published together, without waiting
+for the firmware. That pass also retires what has finished since the
+last one. From K flights up the submission waits for the event's pass
+as before, so a deep queue keeps that pass's batching. The value and
+the count of such submissions are added to the submit_defer stats
+line.
+
+With the default g16_submit_defer of 16 nothing changes until the
+deferral threshold is lowered as well.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 22 +++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   | 37 ++++++++++++++++++++++-------
+ 2 files changed, 50 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 72def1051f..f2fcd05467 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2500,6 +2500,28 @@ pub(crate) fn submit_defer() -> u32 {
+     "G16: N = a compute submission that finds at least N compute flights outstanding is only queued for the next poll pass (default 16; 0: off; runtime 0644)"
+ );
+ 
++/// Storage of `g16_submit_kick` (runtime 0644, default 0).
++static SUBMIT_KICK: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_submit_kick` = K: a submission that `g16_submit_defer` leaves queued while fewer than
++/// K compute flights are outstanding asks for a poll pass at once, instead of waiting for the
++/// next firmware event or completion re-poll. Passes asked for while one is still pending run
++/// as one, so a burst of submissions is published together behind one doorbell. From K
++/// flights up a queued submission waits for the event's pass as before, so a deep queue keeps
++/// that pass's batching. Default 0: never. Read at each deferred submission.
++pub(crate) fn submit_kick() -> u32 {
++    SUBMIT_KICK.load(Ordering::Relaxed).min(64)
++}
++
++live_u32_param!(
++    SUBMIT_KICK_PARAM,
++    SUBMIT_KICK_PARMTYPE,
++    SUBMIT_KICK_PARM,
++    SUBMIT_KICK,
++    "g16_submit_kick",
++    "G16: K = a compute submission that g16_submit_defer leaves queued with fewer than K compute flights outstanding asks for a poll pass at once instead of waiting for the next firmware event or re-poll (default 0: never; runtime 0644)"
++);
++
+ /// Storage of `g16_lat_qos_us` (runtime 0644, default 0).
+ static LAT_QOS_US: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index b03cbad9c0..3a861cb711 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -49,9 +49,10 @@
+     [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+ 
+ /// `g16_submit_defer`: compute submissions only queued [0], and published by their own pass
+-/// while the switch was on [1].
+-pub(crate) static SUBMIT_DEFER_N: [core::sync::atomic::AtomicU64; 2] =
+-    [const { core::sync::atomic::AtomicU64::new(0) }; 2];
++/// while the switch was on [1]; of the queued ones, those that asked for a pass at once
++/// (`g16_submit_kick`) [2].
++pub(crate) static SUBMIT_DEFER_N: [core::sync::atomic::AtomicU64; 3] =
++    [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+ 
+ /// How long after an EP 0x20 event `g16_tail_us` re-polls apply.
+ pub(crate) const TAIL_WINDOW_NS: u64 = 300_000;
+@@ -541,6 +542,8 @@ pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+         self.pmp_agx_sync();
+         let signalling = kernel::dma_fence::SignallingGuard::new();
+         let mut done = Completions::new();
++        // g16_submit_kick: a queued submission asks for a pass once the lock is dropped.
++        let mut kick = false;
+         let accepted = {
+             let mut state = self.state.lock();
+             let firmware = state.as_deref_mut().ok_or(ENODEV)?;
+@@ -562,12 +565,21 @@ pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+                 // brings a poll pass soon; leave this one queued for it instead of running a
+                 // pass (checks, then one record and one doorbell) on the submitting thread.
+                 let defer = super::params::submit_defer() as usize;
+-                let deferred = defer != 0
+-                    && compute_only
+-                    && !firmware.engine.chan_wait
+-                    && firmware.engine.flights.iter().filter(|f| f.computes != 0).count() >= defer;
++                // Compute flights outstanding, counted only where the deferral can apply.
++                let cflights = if defer != 0 && compute_only && !firmware.engine.chan_wait {
++                    firmware.engine.flights.iter().filter(|f| f.computes != 0).count()
++                } else {
++                    0
++                };
++                let deferred = defer != 0 && cflights >= defer;
+                 if deferred {
+                     SUBMIT_DEFER_N[0].fetch_add(1, Ordering::Relaxed);
++                    // g16_submit_kick: below K flights the pass publishes it now, with whatever
++                    // else queued meanwhile; from K up it waits for the event's pass.
++                    if cflights < super::params::submit_kick() as usize {
++                        SUBMIT_DEFER_N[2].fetch_add(1, Ordering::Relaxed);
++                        kick = true;
++                    }
+                 } else {
+                     if defer != 0 {
+                         SUBMIT_DEFER_N[1].fetch_add(1, Ordering::Relaxed);
+@@ -599,6 +611,11 @@ pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+         };
+         job::complete_all(done);
+         drop(signalling);
++        // Outside the device lock: brings the pass (or its pending backup) forward; a pass
++        // already pending absorbs this request.
++        if kick {
++            self.poll_now();
++        }
+         self.notify_wedged();
+         accepted
+     }
+@@ -2564,10 +2581,12 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         )?;
+         writeln!(
+             f,
+-            "submit_defer: n {} deferred {} published {}",
++            "submit_defer: n {} deferred {} published {} kick {} kicked {}",
+             super::params::submit_defer(),
+             SUBMIT_DEFER_N[0].load(Ordering::Relaxed),
+-            SUBMIT_DEFER_N[1].load(Ordering::Relaxed)
++            SUBMIT_DEFER_N[1].load(Ordering::Relaxed),
++            super::params::submit_kick(),
++            SUBMIT_DEFER_N[2].load(Ordering::Relaxed)
+         )?;
+         writeln!(
+             f,
+-- 
+2.43.0
+

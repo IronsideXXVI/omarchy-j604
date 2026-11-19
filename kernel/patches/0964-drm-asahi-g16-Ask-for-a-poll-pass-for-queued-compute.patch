@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 19 Nov 2026 07:19:44 +0000
+Subject: [PATCH] drm/asahi: g16: Ask for a poll pass for queued
+ compute work by default
+
+With g16_submit_defer at 16, a compute submission is queued only when
+16 or more compute flights are out. At depth 8 every submission runs
+its own publish pass, and every completion waits for the firmware's
+event.
+
+Make g16_submit_defer default to 2, g16_submit_kick to 16,
+g16_submit_defer_render to 16 and g16_submit_solo_us to 500. A compute
+submission whose queue is alone on the device (no flight of another
+queue out, no work of another queue in the last 500 us) and that finds
+2 to 15 compute flights out is queued and asks for a poll pass at once.
+That pass publishes it with whatever else is queued, and retires what
+has finished before the event comes. Beside any other queue, and while
+a render is in flight, compute submissions keep the old rule: queued
+only from 16 compute flights up, without a kick. Render submissions
+are never deferred. 500 us is above the 419.88 us per submission that
+compute.light at depth 1 read beside compute.light at depth 8 on
+1.1093, the slowest shallow client measured.
+
+Measured on linux-aurora-next 1.1093 (experimental), the three kick
+words against the old defaults with compute alone, on one boot,
+alternating blocks, in us per submission (noise: the spread between
+blocks of one setting, in us):
+
+  compute.light depth 8:   33.0 -> 29.9  (-9.3 %, noise 0.23)
+  compute.light depth 4:   50.57 -> 42.80 (-15.4 %, noise 0.42)
+  compute.light depth 16:  24.93 -> 22.71 (-8.9 %, noise 0.31)
+  compute.light depth 1:  154.7 -> 153.2 (-0.9 %, noise 2.14)
+  compute.light depth 2:   68.62 -> 67.51 (-1.6 %, noise 6.71)
+  compute.light depth 64:  19.2 -> 19.2  (noise 0.51)
+  render.light depth 1:   166.7 -> 168.3 (+0.9 %, noise 1.04)
+  render.light depth 8 and 64: within 0.3 %
+
+A second boot of 1.1093 read 32.64 -> 29.85 at depth 8. Under stress,
+the checks of cr.concurrent moved by -0.3 % and -0.1 % on the two
+boots.
+
+Without the solo rule, on a third boot of 1.1093, the kick cost a
+shallow client beside a deep one:
+render.light at depth 1 beside compute.light at depth 4 read 307.67 ->
+314.99 us (+2.4 %, slower in 5 of 6 block pairs), and compute.light at
+depth 1 beside compute.light at depth 8 read 408.80 -> 419.88 us
+(+2.7 %). With g16_submit_solo_us those loads mostly take the old
+rule.
+
+Measured with the solo rule on linux-aurora 1.1103 (experimental), the
+old words 16 0 0 0 against 2 16 16 500 set at run time, two boots,
+blocks old new new old old new on each, in us per submission over the
+six blocks of each setting (noise: the wider block spread of the two
+settings, in us):
+
+  render.light depth 1 beside compute.light depth 4:
+    305.87 -> 307.61 (+0.6 %, noise 15.50, slower in 3 of 6 pairs)
+  compute.light depth 1 beside compute.light depth 8:
+    408.47 -> 400.33 (-2.0 %, noise 16.23)
+  compute.light depth 4 beside render.light depth 1:
+    69.70 -> 69.77 (+0.1 %, noise 0.88)
+  compute.light depth 8 beside compute.light depth 1:
+    53.43 -> 53.09 (-0.6 %, noise 1.37)
+  compute.light depth 8 beside render.light depth 8:
+    63.18 -> 62.20 (-1.6 %, noise 3.95)
+  render.light depth 8 beside compute.light depth 8:
+    188.96 -> 195.24 (+3.3 %, noise 30.24)
+
+The last client moves between levels from block to block under either
+setting. On a third boot of 1.1103 that pair alone ran 12 times per
+setting, alternating: 179.06 -> 178.69 (-0.2 %, noise 17.37, slower in
+5 of 12 pairs).
+
+In the mixed cells of the first two boots the rule kept the old path
+2,059,558 times and kicked 971 times. Alone, on the same boots,
+compute.light at depth 8 read 32.93 -> 29.58 (-10.2 %), no other alone
+cell was more than 0.4 % slower, and the checks of cr.concurrent read
+99.9 % of the old words'. No fault line on any of the three boots.
+Every mixed client read under 500 us per submission. A client that
+submits less often than once per 500 us, with nothing in flight
+between, is not seen by the rule and was not measured.
+
+g16_submit_defer=16 g16_submit_kick=0 g16_submit_defer_render=0 at run
+time restores the old behaviour.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 34 ++++++++++++++---------------
+ 1 file changed, 17 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 7032dd459e..010c7ddb18 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2479,13 +2479,13 @@ pub(crate) fn cq_split_us() -> u32 {
+     "G16: with g16_compute_queues above 1, a client whose recent compute commands ran under N us each keeps its queue; longer ones rotate (default 100; 0: off; runtime 0644)"
+ );
+ 
+-/// Storage of `g16_submit_defer` (runtime 0644, default 16).
+-static SUBMIT_DEFER: AtomicU32 = AtomicU32::new(16);
++/// Storage of `g16_submit_defer` (runtime 0644, default 2).
++static SUBMIT_DEFER: AtomicU32 = AtomicU32::new(2);
+ 
+ /// `g16_submit_defer` = N: a compute submission that finds at least N compute flights
+ /// outstanding is only queued. The poll pass that follows their next retirement publishes it
+ /// with the others behind one doorbell, as it already does for submissions that arrive while
+-/// every unit is held. Default 16; 0: every submission runs its own publish pass, as before.
++/// every unit is held. Default 2; 0: every submission runs its own publish pass, as before.
+ /// Read at each submission.
+ pub(crate) fn submit_defer() -> u32 {
+     SUBMIT_DEFER.load(Ordering::Relaxed)
+@@ -2497,18 +2497,18 @@ pub(crate) fn submit_defer() -> u32 {
+     SUBMIT_DEFER_PARM,
+     SUBMIT_DEFER,
+     "g16_submit_defer",
+-    "G16: N = a compute submission that finds at least N compute flights outstanding is only queued for the next poll pass (default 16; 0: off; runtime 0644)"
++    "G16: N = a compute submission that finds at least N compute flights outstanding is only queued for the next poll pass (default 2; 0: off; runtime 0644)"
+ );
+ 
+-/// Storage of `g16_submit_kick` (runtime 0644, default 0).
+-static SUBMIT_KICK: AtomicU32 = AtomicU32::new(0);
++/// Storage of `g16_submit_kick` (runtime 0644, default 16).
++static SUBMIT_KICK: AtomicU32 = AtomicU32::new(16);
+ 
+ /// `g16_submit_kick` = K: a submission that `g16_submit_defer` leaves queued while fewer than
+ /// K compute flights are outstanding asks for a poll pass at once, instead of waiting for the
+ /// next firmware event or completion re-poll. Passes asked for while one is still pending run
+ /// as one, so a burst of submissions is published together behind one doorbell. From K
+ /// flights up a queued submission waits for the event's pass as before, so a deep queue keeps
+-/// that pass's batching. Default 0: never. Read at each deferred submission.
++/// that pass's batching. Default 16; 0: never. Read at each deferred submission.
+ pub(crate) fn submit_kick() -> u32 {
+     SUBMIT_KICK.load(Ordering::Relaxed).min(64)
+ }
+@@ -2519,17 +2519,17 @@ pub(crate) fn submit_kick() -> u32 {
+     SUBMIT_KICK_PARM,
+     SUBMIT_KICK,
+     "g16_submit_kick",
+-    "G16: K = a compute submission that g16_submit_defer leaves queued with fewer than K compute flights outstanding asks for a poll pass at once instead of waiting for the next firmware event or re-poll (default 0: never; runtime 0644)"
++    "G16: K = a compute submission that g16_submit_defer leaves queued with fewer than K compute flights outstanding asks for a poll pass at once instead of waiting for the next firmware event or re-poll (default 16; 0: never; runtime 0644)"
+ );
+ 
+-/// Storage of `g16_submit_defer_render` (runtime 0644, default 0).
+-static SUBMIT_DEFER_RENDER: AtomicU32 = AtomicU32::new(0);
++/// Storage of `g16_submit_defer_render` (runtime 0644, default 16).
++static SUBMIT_DEFER_RENDER: AtomicU32 = AtomicU32::new(16);
+ 
+ /// `g16_submit_defer_render` = N: while any published flight holds a render, a compute
+ /// submission is left queued only from N compute flights up and never asks for a pass;
+ /// `g16_submit_defer` and `g16_submit_kick` apply as set only while every flight is compute
+ /// ([`super::submit_mix`]). 16 gives a load with renders the deferral of the old defaults.
+-/// 0: the two apply alike with or without renders. Read at each compute submission that
++/// Default 16; 0: the two apply alike with or without renders. Read at each compute submission that
+ /// `g16_submit_defer` can defer.
+ pub(crate) fn submit_defer_render() -> u32 {
+     SUBMIT_DEFER_RENDER.load(Ordering::Relaxed)
+@@ -2541,18 +2541,18 @@ pub(crate) fn submit_defer_render() -> u32 {
+     SUBMIT_DEFER_RENDER_PARM,
+     SUBMIT_DEFER_RENDER,
+     "g16_submit_defer_render",
+-    "G16: N = while a render is in flight, a compute submission is queued only from N compute flights up and never kicked; g16_submit_defer and g16_submit_kick apply as set only while every flight is compute (default 0: they apply alike; runtime 0644)"
++    "G16: N = while a render is in flight, a compute submission is queued only from N compute flights up and never kicked; g16_submit_defer and g16_submit_kick apply as set only while every flight is compute (default 16; 0: they apply alike; runtime 0644)"
+ );
+ 
+-/// Storage of `g16_submit_solo_us` (runtime 0644, default 0).
+-static SUBMIT_SOLO_US: AtomicU32 = AtomicU32::new(0);
++/// Storage of `g16_submit_solo_us` (runtime 0644, default 500).
++static SUBMIT_SOLO_US: AtomicU32 = AtomicU32::new(500);
+ 
+ /// `g16_submit_solo_us` = W: `g16_submit_defer`, `g16_submit_kick` and
+ /// `g16_submit_defer_render` act as set only for a compute submission whose queue is alone on
+ /// the device: every flight is its own, and no other queue submitted, published or retired work
+ /// within the last W us ([`super::solo`]). Otherwise the submission takes the old rule, queued
+-/// only from 16 compute flights up and never kicked. Default 0: the rule is off and the three
+-/// words act as set. Read at each compute submission that `g16_submit_defer` can defer.
++/// only from 16 compute flights up and never kicked. Default 500; 0: the rule is off and the
++/// three words act as set. Read at each compute submission that `g16_submit_defer` can defer.
+ pub(crate) fn submit_solo_us() -> u32 {
+     SUBMIT_SOLO_US.load(Ordering::Relaxed)
+ }
+@@ -2563,7 +2563,7 @@ pub(crate) fn submit_solo_us() -> u32 {
+     SUBMIT_SOLO_US_PARM,
+     SUBMIT_SOLO_US,
+     "g16_submit_solo_us",
+-    "G16: W us = the kick words act only while the submitting queue is alone on the device (no other queue's flight out or work within W us); otherwise queued from 16 compute flights, never kicked (default 0: off)"
++    "G16: W us = the kick words act only while the submitting queue is alone on the device (no other queue's flight out or work within W us); otherwise queued from 16 compute flights, never kicked (default 500; 0: off)"
+ );
+ 
+ /// Storage of `g16_lat_qos_us` (runtime 0644, default 0).
+-- 
+2.43.0
+
