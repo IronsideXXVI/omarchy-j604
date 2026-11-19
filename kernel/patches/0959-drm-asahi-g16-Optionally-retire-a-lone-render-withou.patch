@@ -1,0 +1,236 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 19 Nov 2026 04:49:26 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally retire a lone render
+ without cached CONTEXT
+
+g16_lone_ctx_skip=1 (run time, default 0) acts only with
+g16_notifier_cached=1. Then the proof of a render with nothing
+published behind it no longer needs the TA and FS record CONTEXT words,
+the one host read of the ASC-cached record page. The firmware stores
+them there at every TA and FS post, and they reach memory only when it
+cleans that line, so the host may read an older value. The uncached
+firmware and service stamps, both queue receipts, the pool and the
+scene timestamps still prove the render, as they already prove a render
+with work behind it, whose proof never reads CONTEXT.
+
+With g16_notifier_cached=1 every lone proof pass that every uncached
+witness passed is counted by its CONTEXT words in the stats line
+"lone_ctx: skip S matched M held H skipped K": matched, held back
+(word 0), or retired without them (word 1). The rule is the pure
+function in lone_ctx.rs. Without g16_notifier_cached the proof is the
+old expression, unchanged.
+
+This is the release-line port of the experimental-line change. On this
+line the render pool witness is pool_retired(k), which both branches
+keep.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/lone_ctx.rs | 75 +++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/params.rs   | 22 ++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs     | 59 +++++++++++++++++----
+ 3 files changed, 146 insertions(+), 10 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/lone_ctx.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/lone_ctx.rs b/drivers/gpu/drm/asahi/g16/lone_ctx.rs
+new file mode 100644
+index 0000000000..55e80ae5b5
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/lone_ctx.rs
+@@ -0,0 +1,75 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! The proof of a render with nothing published behind it when its TA and FS notifier records
++//! are ASC-cached (`g16_notifier_cached`), as one pure rule.
++//!
++//! The firmware stores the record CONTEXT words at every TA and FS post into the cached line;
++//! they reach memory only when it cleans that line, so the host may read an older value. The
++//! uncached witnesses (firmware and service stamps, queue receipts, pool, scene timestamps)
++//! prove the render as they prove one with work behind it. `g16_lone_ctx_skip` (default 0)
++//! drops only the CONTEXT term; at 0 the rule is the old one, case for case.
++
++/// The stats counter a lone proof pass adds to: matched, held back, or retired without CONTEXT.
++pub(crate) const MATCHED: usize = 0;
++pub(crate) const HELD: usize = 1;
++pub(crate) const SKIPPED: usize = 2;
++
++/// `proved`: every uncached witness passed. `ctx`: both CONTEXT words equal the VM slot.
++/// `skip`: `g16_lone_ctx_skip` in force. Returns (retire, the counter to add to).
++pub(crate) fn lone_ctx(proved: bool, ctx: bool, skip: bool) -> (bool, Option<usize>) {
++    if !proved {
++        return (false, None);
++    }
++    match (ctx, skip) {
++        (true, _) => (true, Some(MATCHED)),
++        (false, false) => (false, Some(HELD)),
++        (false, true) => (true, Some(SKIPPED)),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const B: [bool; 2] = [false, true];
++
++    #[test]
++    fn off_is_the_old_rule_in_every_case() {
++        for proved in B {
++            for ctx in B {
++                assert_eq!(lone_ctx(proved, ctx, false).0, proved && ctx);
++            }
++        }
++    }
++
++    #[test]
++    fn never_retires_without_the_uncached_proof() {
++        for ctx in B {
++            for skip in B {
++                assert_eq!(lone_ctx(false, ctx, skip), (false, None));
++            }
++        }
++    }
++
++    #[test]
++    fn skip_drops_only_the_context_term() {
++        for proved in B {
++            for ctx in B {
++                assert_eq!(lone_ctx(proved, ctx, true).0, proved);
++            }
++        }
++    }
++
++    #[test]
++    fn a_matched_context_is_counted_the_same_either_way() {
++        for skip in B {
++            assert_eq!(lone_ctx(true, true, skip), (true, Some(MATCHED)));
++        }
++    }
++
++    #[test]
++    fn a_missed_context_is_held_at_0_and_skipped_at_1() {
++        assert_eq!(lone_ctx(true, false, false), (false, Some(HELD)));
++        assert_eq!(lone_ctx(true, false, true), (true, Some(SKIPPED)));
++    }
++}
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index f29da64662..80d1a079e5 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -3204,6 +3204,28 @@ pub(crate) fn render_work_cached() -> bool {
+     "G16: with g16_render_work_pool=1, publish renders with the ASC-cached copy of their unit's work record slot (default 1; 0: the uncached copy; runtime 0644)"
+ );
+ 
++/// Storage of `g16_lone_ctx_skip` (runtime 0644, default 0).
++static LONE_CTX_SKIP: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_lone_ctx_skip`: with `g16_notifier_cached`, 1 = the proof of a render with nothing
++/// published behind it does not need the TA and FS record CONTEXT words, which the host reads
++/// from the ASC-cached record page and so may see before the firmware cleans them. The
++/// uncached stamps, both queue receipts, the pool and the scene timestamps still prove it, as
++/// they prove a render with work behind it. Without `g16_notifier_cached`, or 0 (default): no
++/// change.
++pub(crate) fn lone_ctx_skip() -> bool {
++    LONE_CTX_SKIP.load(Ordering::Relaxed) == 1 && notifier_cached()
++}
++
++live_u32_param!(
++    LONE_CTX_SKIP_PARAM,
++    LONE_CTX_SKIP_PARMTYPE,
++    LONE_CTX_SKIP_PARM,
++    LONE_CTX_SKIP,
++    "g16_lone_ctx_skip",
++    "G16: 1 = with g16_notifier_cached, retire a render with nothing behind it without the cached record CONTEXT words; stamps, receipts and scene times still prove it (default 0)"
++);
++
+ /// Storage of `g16_behind_initbm` (runtime 0644, default 1).
+ static BEHIND_INITBM: AtomicU32 = AtomicU32::new(1);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 544c8a7e9c..b03cbad9c0 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -40,6 +40,14 @@
+ use super::regs::EngineState;
+ use super::{params, Firmware, Shared, POLL_WORK};
+ 
++#[path = "lone_ctx.rs"]
++pub(crate) mod lone_ctx;
++
++/// `g16_notifier_cached`: lone-render proof passes that every uncached witness passed, by their
++/// cached CONTEXT words: matched, held back, retired without them (`g16_lone_ctx_skip`).
++pub(crate) static LONE_CTX_N: [core::sync::atomic::AtomicU64; 3] =
++    [const { core::sync::atomic::AtomicU64::new(0) }; 3];
++
+ /// `g16_submit_defer`: compute submissions only queued [0], and published by their own pass
+ /// while the switch was on [1].
+ pub(crate) static SUBMIT_DEFER_N: [core::sync::atomic::AtomicU64; 2] =
+@@ -1357,16 +1365,39 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+             let ta_end = unit.scene.r64(0x608)?;
+             let fs_start = unit.scene.r64(0x620)?;
+             let fs_end = unit.scene.r64(0x628)?;
+-            full &= g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
+-                && g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
+-                && g.record_page().r32(notifier::CONTEXT)? == f.job.vm.slot
+-                && g.record_page()
+-                    .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
+-                    == f.job.vm.slot
+-                && f.job.resources.render()?.pool_retired(k)?
+-                && ta_start != 0
+-                && ta_end > ta_start
+-                && (f.fs_short || (fs_start != 0 && fs_end > fs_start));
++            if g.records.is_none() {
++                full &= g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
++                    && g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
++                    && g.record_page().r32(notifier::CONTEXT)? == f.job.vm.slot
++                    && g.record_page()
++                        .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
++                        == f.job.vm.slot
++                    && f.job.resources.render()?.pool_retired(k)?
++                    && ta_start != 0
++                    && ta_end > ta_start
++                    && (f.fs_short || (fs_start != 0 && fs_end > fs_start));
++            } else {
++                // `g16_notifier_cached`: the CONTEXT words are the one host read of the
++                // ASC-cached record page. The uncached witnesses first, then CONTEXT, counted;
++                // `g16_lone_ctx_skip` retires without it (lone_ctx.rs).
++                let proved = g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
++                    && g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
++                    && f.job.resources.render()?.pool_retired(k)?
++                    && ta_start != 0
++                    && ta_end > ta_start
++                    && (f.fs_short || (fs_start != 0 && fs_end > fs_start));
++                let ctx = proved
++                    && g.record_page().r32(notifier::CONTEXT)? == f.job.vm.slot
++                    && g.record_page()
++                        .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
++                        == f.job.vm.slot;
++                let (retire, counter) =
++                    lone_ctx::lone_ctx(proved, ctx, super::params::lone_ctx_skip());
++                if let Some(i) = counter {
++                    LONE_CTX_N[i].fetch_add(1, Ordering::Relaxed);
++                }
++                full &= retire;
++            }
+         }
+         if full {
+             if rw_alone {
+@@ -2523,6 +2554,14 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             s.tsplit_other_ns / 1000,
+             s.submit_retires
+         )?;
++        writeln!(
++            f,
++            "lone_ctx: skip {} matched {} held {} skipped {}",
++            u32::from(super::params::lone_ctx_skip()),
++            LONE_CTX_N[lone_ctx::MATCHED].load(Ordering::Relaxed),
++            LONE_CTX_N[lone_ctx::HELD].load(Ordering::Relaxed),
++            LONE_CTX_N[lone_ctx::SKIPPED].load(Ordering::Relaxed)
++        )?;
+         writeln!(
+             f,
+             "submit_defer: n {} deferred {} published {}",
+-- 
+2.43.0
+

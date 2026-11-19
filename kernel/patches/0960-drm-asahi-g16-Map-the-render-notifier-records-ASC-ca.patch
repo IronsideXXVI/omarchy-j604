@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 19 Nov 2026 15:45:14 +0000
+Subject: [PATCH] drm/asahi: g16: Map the render notifier records
+ ASC-cached by default
+
+Make g16_notifier_cached and g16_lone_ctx_skip default to 1. The render
+graph's TA and FS notifier records then live in their own session page
+in the ASC-cached class, the attribute index macOS gives its per-queue
+objects, and a render with nothing published behind it retires without
+the record CONTEXT words, the one host read of that page. The page is
+allocated once and never dropped, so no cached mapping is torn down
+when a client exits.
+
+Measured on linux-aurora 1.1103 (experimental), one boot with
+g16_notifier_cached=1 on the command line against three boots without
+it, one reading per cell and boot, in us per submission. The two
+values with the word are g16_lone_ctx_skip 0 and 1:
+
+  render.light depth 1:   173.8 -> 163.4, 163.2  (-6.0 %)
+  render.light depth 8:    60.0 ->  54.3,  54.4  (-9.5 %)
+  render.light depth 64:   59.2 ->  54.8,  54.9  (-7.5 %)
+  compute.light depth 1:  150.3 -> 154.8, 152.8
+  compute.light depth 8:   33.2 ->  33.2,  32.7
+  compute.light depth 64:  19.9 ->  19.5,  19.2
+
+The three boots without the word read render.light 172.9 to 174.3,
+59.8 to 60.5 and 58.9 to 59.5, and compute.light 149.8 to 151.0, 32.9
+to 33.5 and 19.2 to 20.3.
+
+On that boot a second render.light client was started every 10 s and
+stopped after 3 s beside one running at depth 1, three runs of 30 s
+with g16_lone_ctx_skip 0 and three with 1: no fault line. Over the
+boot 1,324,936 lone proof passes matched their CONTEXT words, none was
+held and none needed the skip.
+
+g16_notifier_cached=0 on the kernel command line restores the old
+mapping. g16_lone_ctx_skip=0 at run time brings the CONTEXT term back,
+and with it a hold that only the completion deadline bounds.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs   |  4 ++--
+ drivers/gpu/drm/asahi/g16/lone_ctx.rs |  2 +-
+ drivers/gpu/drm/asahi/g16/params.rs   | 14 ++++++++------
+ 3 files changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index 4567af8db8..0c0a662012 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -292,8 +292,8 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             description: "G16: 1 queue 2 compute 4 TA 8 FS 16 ring; 32/64/128 work/seq/barrier",
+         },
+         g16_notifier_cached: u32 {
+-            default: 0,
+-            description: "G16: 1 = render TA/FS notifier records ASC-cached (default 0; others: 0)",
++            default: 1,
++            description: "G16: 1 = render TA/FS notifier records ASC-cached (default 1; others: 0)",
+         },
+         g16_render_seq_pool: u32 {
+             default: 1,
+diff --git a/drivers/gpu/drm/asahi/g16/lone_ctx.rs b/drivers/gpu/drm/asahi/g16/lone_ctx.rs
+index 55e80ae5b5..9a1d425a62 100644
+--- a/drivers/gpu/drm/asahi/g16/lone_ctx.rs
++++ b/drivers/gpu/drm/asahi/g16/lone_ctx.rs
+@@ -6,7 +6,7 @@
+ //! The firmware stores the record CONTEXT words at every TA and FS post into the cached line;
+ //! they reach memory only when it cleans that line, so the host may read an older value. The
+ //! uncached witnesses (firmware and service stamps, queue receipts, pool, scene timestamps)
+-//! prove the render as they prove one with work behind it. `g16_lone_ctx_skip` (default 0)
++//! prove the render as they prove one with work behind it. `g16_lone_ctx_skip` (default 1)
+ //! drops only the CONTEXT term; at 0 the rule is the old one, case for case.
+ 
+ /// The stats counter a lone proof pass adds to: matched, held back, or retired without CONTEXT.
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 80d1a079e5..72def1051f 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -731,7 +731,7 @@ pub(crate) fn fw_cached_mask() -> u32 {
+     module_parameters::g16_fw_cached.value()
+ }
+ 
+-/// `g16_notifier_cached` (load time, default 0). 1: the render graph's TA and FS notifier
++/// `g16_notifier_cached` (load time, default 1). 1: the render graph's TA and FS notifier
+ /// records (the objects the work records name at +0x10 and +0x20) live in their own session
+ /// page mapped ASC-cached, the attribute index macOS gives its per-queue objects. The service
+ /// stamps the host reads (+0x620, +0x630) and the threshold cells stay in uncached objects.
+@@ -3204,15 +3204,17 @@ pub(crate) fn render_work_cached() -> bool {
+     "G16: with g16_render_work_pool=1, publish renders with the ASC-cached copy of their unit's work record slot (default 1; 0: the uncached copy; runtime 0644)"
+ );
+ 
+-/// Storage of `g16_lone_ctx_skip` (runtime 0644, default 0).
+-static LONE_CTX_SKIP: AtomicU32 = AtomicU32::new(0);
++/// Storage of `g16_lone_ctx_skip` (runtime 0644, default 1).
++static LONE_CTX_SKIP: AtomicU32 = AtomicU32::new(1);
+ 
+ /// `g16_lone_ctx_skip`: with `g16_notifier_cached`, 1 = the proof of a render with nothing
+ /// published behind it does not need the TA and FS record CONTEXT words, which the host reads
+ /// from the ASC-cached record page and so may see before the firmware cleans them. The
+ /// uncached stamps, both queue receipts, the pool and the scene timestamps still prove it, as
+-/// they prove a render with work behind it. Without `g16_notifier_cached`, or 0 (default): no
+-/// change.
++/// they prove a render with work behind it. 1 is the default. At 0 with `g16_notifier_cached`
++/// (the word is writable at run time) such a render is held until the firmware has cleaned its
++/// CONTEXT words, and only the completion deadline bounds that wait. Without
++/// `g16_notifier_cached`: no change.
+ pub(crate) fn lone_ctx_skip() -> bool {
+     LONE_CTX_SKIP.load(Ordering::Relaxed) == 1 && notifier_cached()
+ }
+@@ -3223,7 +3225,7 @@ pub(crate) fn lone_ctx_skip() -> bool {
+     LONE_CTX_SKIP_PARM,
+     LONE_CTX_SKIP,
+     "g16_lone_ctx_skip",
+-    "G16: 1 = with g16_notifier_cached, retire a render with nothing behind it without the cached record CONTEXT words; stamps, receipts and scene times still prove it (default 0)"
++    "G16: 1 = with g16_notifier_cached, retire a render with nothing behind it without the cached record CONTEXT words; stamps, receipts and scene times still prove it (default 1; 0 holds such a render until its cached CONTEXT words are cleaned)"
+ );
+ 
+ /// Storage of `g16_behind_initbm` (runtime 0644, default 1).
+-- 
+2.43.0
+

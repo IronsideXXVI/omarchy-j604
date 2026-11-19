@@ -1381,3 +1381,7 @@ The base remains da8e1acf3656. Published 0001–0944 are unchanged. 0945 to 0954
 # Kernel patch numbers: 1.1091 to 1.1097
 
 The base remains da8e1acf3656. Published 0001–0954 are unchanged. 0955 and 0956 ring the render doorbells once per group of renders: 0955 adds `g16_render_bell_group` (default 0) with the rules that decide when a publication rings and its counters, and 0956 sets it to 4. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1092 to 1.1096 were not released or published.
+
+# Kernel patch numbers: 1.1097 to 1.1104
+
+The base remains da8e1acf3656. Published 0001–0956 are unchanged. 0957 to 0960 map the render notifier records cached: 0957 drops an unused field from the render graph, 0958 adds `g16_notifier_cached` (default 0), which puts the notifier records of a render in a session page the firmware maps cached, 0959 adds `g16_lone_ctx_skip` (default 0), which lets a render with nothing queued behind it finish without the cached record words, and 0960 sets both to 1. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1098 to 1.1103 were not released or published.

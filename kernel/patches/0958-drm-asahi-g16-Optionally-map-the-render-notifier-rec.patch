@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 15:00:23 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally map the render notifier
+ records ASC-cached
+
+g16_notifier_cached=1 (load time, default 0) gives the render graph's TA
+and FS notifier records their own session page in the ASC-cached class,
+the attribute index macOS uses for its per-queue objects. The work
+records name that page at +0x10 and +0x20. The service stamps at +0x620
+and +0x630, which the host reads to retire a render, stay in the
+uncached notifier page, and so do the threshold cells the host writes.
+
+The firmware cleans and invalidates a record when it prepares the
+record's stage and in the scan's equality branch. The host never writes
+a record after init. It reads the record CONTEXT words only for a
+render with nothing published behind it. A CONTEXT read older than the
+firmware's holds that render: only a later render published behind it,
+or the completion deadline, which fail-stops the device, ends the hold.
+The next commit adds the word that retires such a render without
+CONTEXT. The page is never dropped, so no cached mapping is torn down
+at client exit.
+
+The stats file gains a notifier_cached line, and the boot log has one
+line when the switch is on. Value 0 behaves as before. Values other
+than 0 and 1 act as 0: the split records of the experimental line
+(value 2) are not supported on this kernel.
+
+This is the release-line port of the experimental-line commit of the
+same title.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/asahi_core.rs |  4 ++++
+ drivers/gpu/drm/asahi/g16/engine.rs |  2 +-
+ drivers/gpu/drm/asahi/g16/graph.rs  | 26 ++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/params.rs | 11 +++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |  9 +++++++--
+ 5 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/asahi_core.rs b/drivers/gpu/drm/asahi/asahi_core.rs
+index c0abe8905e..4567af8db8 100644
+--- a/drivers/gpu/drm/asahi/asahi_core.rs
++++ b/drivers/gpu/drm/asahi/asahi_core.rs
+@@ -291,6 +291,10 @@ fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+             default: 1,
+             description: "G16: 1 queue 2 compute 4 TA 8 FS 16 ring; 32/64/128 work/seq/barrier",
+         },
++        g16_notifier_cached: u32 {
++            default: 0,
++            description: "G16: 1 = render TA/FS notifier records ASC-cached (default 0; others: 0)",
++        },
+         g16_render_seq_pool: u32 {
+             default: 1,
+             description: "G16: 1 (default) = render microsequences in session slots per unit, uncached and ASC-cached copies; 0 = each unit's own sequence objects",
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 8618b6b640..85ce4cadb3 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1861,7 +1861,7 @@ fn render_refs(
+         let stage = draw.checked_mul(2).ok_or(EOVERFLOW)?;
+         Ok((
+             RenderRefs {
+-                notifier: r.notifier.va,
++                notifier: r.record_page().va,
+                 legacy_empty: r.legacy_empty.va,
+                 qinfo: [r.qinfo[0].va, r.qinfo[1].va],
+                 user_stamp: [
+diff --git a/drivers/gpu/drm/asahi/g16/graph.rs b/drivers/gpu/drm/asahi/g16/graph.rs
+index f97aeff0aa..f2d20e2e7f 100644
+--- a/drivers/gpu/drm/asahi/g16/graph.rs
++++ b/drivers/gpu/drm/asahi/g16/graph.rs
+@@ -242,11 +242,23 @@ pub(crate) struct RenderGraph {
+     /// Whole page: TA record +0, FS +0x200, service stamps +0x620/+0x630.
+     pub(crate) notifier: Arc<FwObject>,
+     pub(crate) threshold: Arc<FwObject>,
++    /// `g16_notifier_cached`: the TA (+0) and FS (+0x200) records the work records name, in an
++    /// ASC-cached session page; the stamps stay in `notifier`.
++    pub(crate) records: Option<Arc<FwObject>>,
+     pub(crate) job_list: [Arc<FwObject>; 2],
+     pub(crate) legacy_empty: Arc<FwObject>,
+     pub(crate) registration_barrier: Arc<FwObject>,
+ }
+ impl RenderGraph {
++    /// The object holding the TA (+0) and FS (+0x200) notifier records: the ASC-cached
++    /// `records` with `g16_notifier_cached`, else the notifier page itself.
++    pub(crate) fn record_page(&self) -> &FwObject {
++        match self.records.as_ref() {
++            Some(records) => records,
++            None => &self.notifier,
++        }
++    }
++
+     fn new(o: &mut Objects, context: Arc<FwObject>) -> Result<Self> {
+         let [ta, fs] = [QueueObjects::new(o)?, QueueObjects::new(o)?];
+         Ok(Self {
+@@ -258,6 +270,11 @@ fn new(o: &mut Objects, context: Arc<FwObject>) -> Result<Self> {
+             sched_ctx: context,
+             notifier: alloc(o, 0x1000, Class::Fw, None, 0, false)?,
+             threshold: alloc(o, 24, Class::Fw, None, 0, false)?,
++            records: if super::params::notifier_cached() {
++                Some(alloc(o, 0x1000, Class::FwCached, None, 0, false)?)
++            } else {
++                None
++            },
+             job_list: [
+                 alloc(o, job_list::SIZE, cmd_fw(tuning::FWC_QUEUE), None, 0, false)?,
+                 alloc(o, job_list::SIZE, cmd_fw(tuning::FWC_QUEUE), None, 0, false)?,
+@@ -276,6 +293,9 @@ fn new(o: &mut Objects, context: Arc<FwObject>) -> Result<Self> {
+     /// `row0`: scheduling row 0 for both queues; `id`: if not 0, the client id at +0x4c.
+     fn init(&self, row0: bool, id: u32) -> Result {
+         init_notifier(&self.notifier, &self.threshold)?;
++        if let Some(records) = self.records.as_ref() {
++            init_notifier(records, &self.threshold)?;
++        }
+         for e in 0..2 {
+             self.job_list[e].w64(job_list::SELF, self.job_list[e].va)?;
+             init_queue(
+@@ -424,6 +444,12 @@ impl Graphs {
+     pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
+         let compute = ComputeGraph::new(o)?;
+         let render = RenderGraph::new(o, compute.sched_ctx.clone())?;
++        if render.records.is_some() {
++            dev_info!(
++                dev.as_ref(),
++                "G16: g16_notifier_cached=1: render notifier records ASC-cached\n"
++            );
++        }
+         let render2 = if super::params::render_queues() >= 2 {
+             let context = alloc(
+                 o,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 101816bfa7..f29da64662 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -731,6 +731,17 @@ pub(crate) fn fw_cached_mask() -> u32 {
+     module_parameters::g16_fw_cached.value()
+ }
+ 
++/// `g16_notifier_cached` (load time, default 0). 1: the render graph's TA and FS notifier
++/// records (the objects the work records name at +0x10 and +0x20) live in their own session
++/// page mapped ASC-cached, the attribute index macOS gives its per-queue objects. The service
++/// stamps the host reads (+0x620, +0x630) and the threshold cells stay in uncached objects.
++/// The firmware cleans and invalidates a record at each stage's prepare and in the scan's
++/// equality branch. The session page is never dropped. Values other than 0 and 1 act as 0: the
++/// split records (2) are not supported on this kernel.
++pub(crate) fn notifier_cached() -> bool {
++    module_parameters::g16_notifier_cached.value() == 1
++}
++
+ /// `g16_render_seq_pool` (load time, default 1). 1: at boot two session objects, one uncached
+ /// and one ASC-cached, each hold one TA and one FS microsequence slot per render unit, and every
+ /// render writes its live microsequences into its unit's slot instead of the unit's per-VM
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 57cbab2387..544c8a7e9c 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1359,8 +1359,8 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+             let fs_end = unit.scene.r64(0x628)?;
+             full &= g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
+                 && g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
+-                && g.notifier.r32(notifier::CONTEXT)? == f.job.vm.slot
+-                && g.notifier
++                && g.record_page().r32(notifier::CONTEXT)? == f.job.vm.slot
++                && g.record_page()
+                     .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
+                     == f.job.vm.slot
+                 && f.job.resources.render()?.pool_retired(k)?
+@@ -2130,6 +2130,11 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             super::params::cq_split_us(),
+             self.engine.cq.kept
+         )?;
++        writeln!(
++            f,
++            "notifier_cached: {}",
++            u32::from(super::params::notifier_cached())
++        )?;
+         writeln!(
+             f,
+             "render_seq: pool {} uncached {} cached {} select {}",
+-- 
+2.43.0
+
