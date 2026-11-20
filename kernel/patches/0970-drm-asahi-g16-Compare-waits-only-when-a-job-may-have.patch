@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 20 Nov 2026 07:37:52 +0000
+Subject: [PATCH] drm/asahi: g16: Compare waits only when a job may
+ have aged
+
+With g16_age_ms set, every pick read the clock and, for each pending
+job, its own stamp and its queue's stamp. On 1.1117 the word at 1000
+against 0 moved render.light at 64 queued from 52.00 to 52.55 us and
+compute.light at 64 queued from 19.00 to 19.20 us, with no job aged
+during the runs.
+
+The pending list is in the order jobs were queued, and each job is
+stamped as it is queued, so the first job's stamp is the oldest and no
+job has waited longer than the time since it. Read the clock once at
+the start of a publish pass and compare it with that stamp. While no
+job can have waited the age, the pass picks in the order without the
+word and reads no job's stamps. Otherwise it compares the waits as
+before, against the clock read at the start of the pass.
+
+The stats line adds the publish passes that compared waits.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/age.rs    | 89 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/engine.rs | 39 +++++++++++--
+ drivers/gpu/drm/asahi/g16/params.rs |  3 +-
+ drivers/gpu/drm/asahi/g16/poll.rs   |  5 +-
+ 4 files changed, 128 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/age.rs b/drivers/gpu/drm/asahi/g16/age.rs
+index 4fec956a09..c017c36442 100644
+--- a/drivers/gpu/drm/asahi/g16/age.rs
++++ b/drivers/gpu/drm/asahi/g16/age.rs
+@@ -25,6 +25,19 @@ pub(crate) fn waited(now: u64, pending_ns: u64, served_ns: u64) -> u64 {
+     now.saturating_sub(pending_ns.max(served_ns))
+ }
+ 
++/// The age a publish pass compares, read once at its start: `age_ns` if a pending job may have
++/// waited it, else 0, and the pass then picks in the order without the word, reading no job's
++/// stamps. `oldest_ns` is the stamp of the job pending longest. Every pending job has waited
++/// at most `now - oldest_ns` ([`waited`] counts from the later of its two stamps), so a 0 here
++/// never hides a job that has waited `age_ns`.
++pub(crate) fn pass_age(age_ns: u64, now: u64, oldest_ns: u64) -> u64 {
++    if age_ns != 0 && now.saturating_sub(oldest_ns) >= age_ns {
++        age_ns
++    } else {
++        0
++    }
++}
++
+ /// Whether `a` is picked before `b`, the best so far. With `age_ns` 0: the higher priority, then
+ /// the queue served less recently; a tie keeps `b`, the earlier in submission order. With
+ /// `age_ns` above 0, a job that has waited `age_ns` or longer goes before every job that has
+@@ -162,6 +175,82 @@ fn waited_counts_from_the_later_stamp() {
+         );
+     }
+ 
++    /// Random pending lists in queue order (stamps ascending, served stamps anywhere): when the
++    /// pass gate gives 0, no job has waited the age and the pick is the order without the word;
++    /// when a job has waited the age, the gate never gives 0.
++    #[test]
++    fn the_pass_gate_is_exact_where_it_matters() {
++        let mut seed = 23u64;
++        let mut next = || {
++            seed = seed
++                .wrapping_mul(6364136223846793005)
++                .wrapping_add(1442695040888963407);
++            seed >> 16
++        };
++        let (mut fast, mut slow) = (0u32, 0u32);
++        for _ in 0..20_000 {
++            let age = [100 * MS, 250 * MS, 1000 * MS][(next() % 3) as usize];
++            let n = (next() % 64 + 1) as usize;
++            let now = 5_000 * MS + next() % (3_000 * MS);
++            let mut p = [0u64; 64];
++            let mut s = [0u64; 64];
++            let mut v = [c(0, 0, 0); 64];
++            let mut at = next() % now;
++            for i in 0..n {
++                at += next() % (40 * MS);
++                p[i] = at.min(now);
++                s[i] = next() % (now + 10 * MS);
++            }
++            let gate = pass_age(age, now, p[0]);
++            let mut any_aged = false;
++            for i in 0..n {
++                let w = waited(now, p[i], s[i]);
++                any_aged |= w >= age;
++                v[i] = c((next() % 3) as u32 + 1, next() % 9, w);
++            }
++            if gate == 0 {
++                fast += 1;
++                assert!(!any_aged, "the gate hid an aged job");
++                assert_eq!(pick(&v[..n], age), old(&v[..n]));
++            } else {
++                slow += 1;
++                assert_eq!(gate, age);
++            }
++        }
++        assert!(
++            fast > 1000 && slow > 1000,
++            "both arms exercised: {fast} {slow}"
++        );
++    }
++
++    /// The engine's pass ([`pass_age`] once, then the pick) over a medium client that queues a
++    /// job every ms beside one low job queued at 0: the low job is picked at the age, as with
++    /// the rule read at every pick, and only that one pass compares waits.
++    #[test]
++    fn the_pass_gate_keeps_the_age_and_compares_only_when_due() {
++        for &age in &[0u64, 100 * MS, 250 * MS, 1000 * MS] {
++            let (mut now, mut med_served, mut low_at, mut compared) = (0u64, 0u64, None, 0u32);
++            for t in 0..20_000u64 {
++                // Queue order: the low job (queued at 0), then the medium job queued now.
++                let a = pass_age(age, now, 0);
++                compared += u32::from(a != 0);
++                let w = |p: u64, s: u64| if a != 0 { waited(now, p, s) } else { 0 };
++                let low = c(3, 0, w(0, 0));
++                let med = c(2, t, w(now, med_served));
++                if pick(&[low, med], a) == Some(0) {
++                    low_at = Some(now);
++                    break;
++                }
++                med_served = now;
++                now += MS;
++            }
++            match age {
++                0 => assert_eq!((low_at, compared), (None, 0)),
++                a => assert_eq!((low_at, compared), (Some(a), 1)),
++            }
++        }
++    }
++
+     /// A medium client that always has a job pending beside one low job; each pick serves one
+     /// job for 1 ms. Off, the low job is never picked in 20 s. On, it goes first once it has
+     /// waited the age, and it is never picked earlier.
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 74efecc98c..5313481c4f 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -716,6 +716,11 @@ pub(crate) struct Engine {
+     pub(crate) cq: KBox<ComputeQueues>,
+     /// `g16_age_ms`: jobs published after they had waited the age or longer.
+     pub(crate) aged: u64,
++    /// `g16_age_ms` in this publish pass ([`Engine::arm_age`]): the age its picks compare, 0
++    /// while no pending job can have waited it, and the clock read at the pass's start.
++    pub(crate) age_pass: (u64, u64),
++    /// `g16_age_ms`: publish passes that compared waits.
++    pub(crate) age_passes: u64,
+     /// A ready prefix waits only for a record's consumption: repoll sooner.
+     pub(crate) chan_wait: bool,
+     /// Ready work waits for a running command to retire (`g16_window_poll_us`).
+@@ -780,6 +785,8 @@ pub(crate) fn new() -> Result<Self> {
+             ta_registered: false,
+             cq: new_compute_queues()?,
+             aged: 0,
++            age_pass: (0, 0),
++            age_passes: 0,
+             chan_wait: false,
+             window_wait: false,
+             cbell_owed: false,
+@@ -840,11 +847,32 @@ fn pick(&self) -> Option<usize> {
+         self.pick_in(None)
+     }
+ 
++    /// `g16_age_ms`, once at the start of a publish pass: sets `age_pass`. `pending` is in the
++    /// order jobs were queued and only [`Firmware::enqueue`] adds to it, stamping each job as
++    /// it does, so the first job's stamp is the oldest ([`age::pass_age`]). One clock read; none
++    /// while the word is 0 or nothing is pending.
++    fn arm_age(&mut self) {
++        self.age_pass = (0, 0);
++        let age_ns = u64::from(params::age_ms()) * 1_000_000;
++        if age_ns == 0 {
++            return;
++        }
++        if let Some(first) = self.pending.first() {
++            let now = now_ns();
++            let oldest = first.progress.pending_ns.load(Ordering::Relaxed);
++            let age_ns = age::pass_age(age_ns, now, oldest);
++            if age_ns != 0 {
++                self.age_pass = (age_ns, now);
++                self.age_passes += 1;
++            }
++        }
++    }
++
+     /// [`Self::pick`] among the jobs of VM `vm` only, if one is given.
+     fn pick_in(&self, vm: Option<u64>) -> Option<usize> {
+-        // `g16_age_ms`: one clock read per pick, none while it is 0.
+-        let age_ns = u64::from(params::age_ms()) * 1_000_000;
+-        let now = if age_ns != 0 { now_ns() } else { 0 };
++        // `g16_age_ms`: 0 unless this pass found a job that may have waited the age; then a
++        // pick reads no stamps, as with the word at 0.
++        let (age_ns, now) = self.age_pass;
+         let mut best: Option<(usize, age::Cand)> = None;
+         for (i, job) in self.pending.iter().enumerate() {
+             if vm.is_some_and(|v| v != job.vm.id) {
+@@ -1556,6 +1584,7 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+         self.engine.chan_wait = false;
+         // g16_compute_onebell: a new publish pass; its first compute record may ring (mode 2).
+         self.engine.cbell_rung = false;
++        self.engine.arm_age();
+         while self.recovery.failed().is_none()
+             && !self.engine.frozen
+             && !self.engine.pending.is_empty()
+@@ -1714,10 +1743,10 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+             job.queue.turn.store(self.engine.turn, Ordering::Relaxed);
+             // `g16_age_ms`: whether this job had aged, and when its queue was served.
+             let served = now_ns();
+-            let age_ns = u64::from(params::age_ms()) * 1_000_000;
++            let (age_ns, now) = self.engine.age_pass;
+             if age_ns != 0
+                 && age::waited(
+-                    served,
++                    now,
+                     job.progress.pending_ns.load(Ordering::Relaxed),
+                     job.queue.served_ns.load(Ordering::Relaxed),
+                 ) >= age_ns
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 3e217923fa..dcba7e4762 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2446,7 +2446,8 @@ pub(crate) fn submit_retire() -> bool {
+ /// low-priority client beside a higher-priority one that always has a job pending is never
+ /// picked. A job waits from when it was queued or its queue was last served. Default 1000,
+ /// above the longest wait measured between clients of equal priority. 0: off, the order by
+-/// priority alone. Read at each pick.
++/// priority alone. Read once per publish pass; while no pending job can have waited N ms,
++/// the pass picks as at 0.
+ pub(crate) fn age_ms() -> u32 {
+     AGE_MS.load(Ordering::Relaxed)
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 60edd084f1..def9450074 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -2294,9 +2294,10 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         )?;
+         writeln!(
+             f,
+-            "age: ms {} aged {}",
++            "age: ms {} aged {} passes {}",
+             super::params::age_ms(),
+-            self.engine.aged
++            self.engine.aged,
++            self.engine.age_passes
+         )?;
+         writeln!(
+             f,
+-- 
+2.43.0
+

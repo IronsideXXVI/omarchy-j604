@@ -1397,3 +1397,7 @@ The base remains da8e1acf3656. Published 0001–0964 are unchanged. 0965 to 0967
 # Kernel patch numbers: 1.1115 to 1.1121
 
 The base remains da8e1acf3656. Published 0001–0967 are unchanged. 0968 and 0969 bound how long a ready job waits: 0968 adds `g16_age_ms` (default 0), under which a job that has waited that many milliseconds is picked before every job that has not, and 0969 sets it to 1000. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1116 to 1.1120 were not released or published.
+
+# Kernel patch numbers: 1.1121 to 1.1125
+
+The base remains da8e1acf3656. Published 0001–0969 are unchanged. 0970 makes the wait comparison of `g16_age_ms` once per publish pass, and only when the oldest pending job can have waited that long (`g16_age_ms` stays 1000), and 0971 adds the scheduler's debugfs setting `misfit_pull_idle` (0, which changes nothing). Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1122 to 1.1124 were not released or published.
