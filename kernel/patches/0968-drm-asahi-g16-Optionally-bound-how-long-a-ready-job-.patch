@@ -1,0 +1,480 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 20 Nov 2026 06:37:17 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally bound how long a ready job
+ waits
+
+The engine orders its pending jobs by three keys: the higher priority,
+then the queue served least recently, then submission order. The fair
+turns between VMs go only to the job it picked, so a low-priority
+client beside a higher-priority one that always has a job pending is
+never picked. On 1.1088, and on 1.1091 with one compute queue and with
+two, a stress test's low-priority compute queue beside a compute client
+64 deep got no completion for 15 s on every seed.
+
+The starvation needs no such client. gpubench-stress-vk queue.depth
+runs its mixed-priority phase, with low-, medium- and high-priority
+devices, from 40 % of its run on, and fails when a queue completes
+nothing for 15 s. The release stress run gives the test 8.0 s, so that
+phase lasts about 4.8 s and cannot reach the limit. Run alone for 60 s,
+the phase begins at 24 s and the limit falls at 39 s: the run failed
+at 39.1 s in each of five runs on 1.1115 (seeds 0, 1, 2, 3 and 0) and
+at 39 s in each of five runs on 1.1117.
+
+Add g16_age_ms (runtime, default 0). When set, a ready job that has
+waited that many ms, since it was queued or its queue was last served,
+is picked ahead of every job that has not, whatever the priorities; of
+two such jobs the one that waited longer goes first. While no job has
+waited that long, the order is the three keys above. The stats file
+counts the jobs published after they aged. The order itself is in
+age.rs, a core module with host tests.
+
+Each job and queue now records when it was queued or served: two clock
+reads per job, whatever the word.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/age.rs    | 204 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/engine.rs |  60 +++++---
+ drivers/gpu/drm/asahi/g16/mod.rs    |   1 +
+ drivers/gpu/drm/asahi/g16/params.rs |  22 +++
+ drivers/gpu/drm/asahi/g16/poll.rs   |   6 +
+ drivers/gpu/drm/asahi/g16/queue.rs  |   3 +
+ 6 files changed, 280 insertions(+), 16 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/age.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/age.rs b/drivers/gpu/drm/asahi/g16/age.rs
+new file mode 100644
+index 0000000000..4fec956a09
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/age.rs
+@@ -0,0 +1,204 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! The order in which the engine picks its pending jobs, and `g16_age_ms`, an optional bound on
++//! how long a ready job waits behind higher priorities. Core only, so the host tests run it.
++//!
++//! The engine picks by priority alone. A low-priority client beside a higher-priority one that
++//! always has a job pending (a compute client 64 deep holds 32 pending beside its 32 flights)
++//! is then never picked, and the fair turns between VMs never reach it, because a turn goes only
++//! to the job that was picked.
++
++/// One pending job as [`before`] compares it.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Cand {
++    /// `DRM_ASAHI_PRIORITY_REALTIME - priority`: smaller is served first.
++    pub(crate) priority: u32,
++    /// The engine turn at which its queue was last served: smaller is served first.
++    pub(crate) turn: u64,
++    /// ns waited ([`waited`]); 0 when `g16_age_ms` is 0.
++    pub(crate) waited_ns: u64,
++}
++
++/// ns a job has waited at `now`: since it entered the pending list, or since its queue was last
++/// served if that is later.
++pub(crate) fn waited(now: u64, pending_ns: u64, served_ns: u64) -> u64 {
++    now.saturating_sub(pending_ns.max(served_ns))
++}
++
++/// Whether `a` is picked before `b`, the best so far. With `age_ns` 0: the higher priority, then
++/// the queue served less recently; a tie keeps `b`, the earlier in submission order. With
++/// `age_ns` above 0, a job that has waited `age_ns` or longer goes before every job that has
++/// not, whatever the priorities, and of two such jobs the one that waited longer goes first.
++/// While no job has waited `age_ns` the order is the one without it.
++pub(crate) fn before(a: &Cand, b: &Cand, age_ns: u64) -> bool {
++    if age_ns != 0 {
++        let (aa, ba) = (a.waited_ns >= age_ns, b.waited_ns >= age_ns);
++        if aa != ba {
++            return aa;
++        }
++        if aa && a.waited_ns != b.waited_ns {
++            return a.waited_ns > b.waited_ns;
++        }
++    }
++    a.priority < b.priority || (a.priority == b.priority && a.turn < b.turn)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const MS: u64 = 1_000_000;
++
++    fn c(priority: u32, turn: u64, waited_ns: u64) -> Cand {
++        Cand {
++            priority,
++            turn,
++            waited_ns,
++        }
++    }
++
++    /// The engine's loop: the first candidate, replaced by any later one [`before`] it.
++    fn pick(cands: &[Cand], age_ns: u64) -> Option<usize> {
++        let mut best: Option<usize> = None;
++        for (i, x) in cands.iter().enumerate() {
++            if best.is_none_or(|b| before(x, &cands[b], age_ns)) {
++                best = Some(i);
++            }
++        }
++        best
++    }
++
++    /// The rule before `g16_age_ms`, as the engine wrote it.
++    fn old(cands: &[Cand]) -> Option<usize> {
++        let mut best: Option<usize> = None;
++        for (i, x) in cands.iter().enumerate() {
++            let better = match best {
++                None => true,
++                Some(b) => {
++                    let y = &cands[b];
++                    x.priority < y.priority || (x.priority == y.priority && x.turn < y.turn)
++                }
++            };
++            if better {
++                best = Some(i);
++            }
++        }
++        best
++    }
++
++    #[test]
++    fn off_is_the_old_order() {
++        let mut seed = 7u64;
++        for _ in 0..2000 {
++            let mut v = [c(0, 0, 0); 6];
++            for x in v.iter_mut() {
++                seed = seed
++                    .wrapping_mul(6364136223846793005)
++                    .wrapping_add(1442695040888963407);
++                *x = c(
++                    (seed >> 33) as u32 % 3 + 1,
++                    (seed >> 40) % 5,
++                    (seed >> 20) % (900 * MS),
++                );
++            }
++            assert_eq!(pick(&v, 0), old(&v));
++        }
++    }
++
++    #[test]
++    fn on_but_nothing_aged_is_the_old_order() {
++        let mut seed = 11u64;
++        for _ in 0..2000 {
++            let mut v = [c(0, 0, 0); 6];
++            for x in v.iter_mut() {
++                seed = seed
++                    .wrapping_mul(6364136223846793005)
++                    .wrapping_add(1442695040888963407);
++                *x = c(
++                    (seed >> 33) as u32 % 3 + 1,
++                    (seed >> 40) % 5,
++                    (seed >> 20) % (250 * MS - 1),
++                );
++            }
++            assert_eq!(pick(&v, 250 * MS), old(&v));
++        }
++    }
++
++    #[test]
++    fn an_aged_low_job_goes_before_medium() {
++        let v = [c(2, 1, 5 * MS), c(3, 0, 300 * MS), c(2, 2, 1 * MS)];
++        assert_eq!(pick(&v, 0), Some(0));
++        assert_eq!(pick(&v, 250 * MS), Some(1));
++        assert_eq!(pick(&v, 400 * MS), Some(0));
++    }
++
++    #[test]
++    fn of_two_aged_jobs_the_longer_wait_goes_first() {
++        let v = [c(2, 0, 260 * MS), c(3, 1, 900 * MS)];
++        assert_eq!(pick(&v, 250 * MS), Some(1));
++        let w = [c(3, 0, 300 * MS), c(2, 1, 300 * MS)];
++        assert_eq!(
++            pick(&w, 250 * MS),
++            Some(1),
++            "equal waits fall back to priority"
++        );
++    }
++
++    #[test]
++    fn a_tie_keeps_submission_order() {
++        let v = [c(2, 4, 300 * MS), c(2, 4, 300 * MS)];
++        assert_eq!(pick(&v, 0), Some(0));
++        assert_eq!(pick(&v, 250 * MS), Some(0));
++    }
++
++    #[test]
++    fn waited_counts_from_the_later_stamp() {
++        assert_eq!(waited(10 * MS, 2 * MS, 7 * MS), 3 * MS);
++        assert_eq!(waited(10 * MS, 7 * MS, 2 * MS), 3 * MS);
++        assert_eq!(
++            waited(1 * MS, 7 * MS, 2 * MS),
++            0,
++            "a stamp after now waits 0"
++        );
++    }
++
++    /// A medium client that always has a job pending beside one low job; each pick serves one
++    /// job for 1 ms. Off, the low job is never picked in 20 s. On, it goes first once it has
++    /// waited the age, and it is never picked earlier.
++    #[test]
++    fn the_low_job_starves_without_it_and_waits_one_age_with_it() {
++        for &age in &[0u64, 100 * MS, 250 * MS, 1000 * MS] {
++            let (mut now, low_pending, mut med_served, mut low_at) = (0u64, 0u64, 0u64, None);
++            for t in 0..20_000u64 {
++                let med = c(
++                    2,
++                    t,
++                    if age != 0 {
++                        waited(now, now, med_served)
++                    } else {
++                        0
++                    },
++                );
++                let low = c(
++                    3,
++                    0,
++                    if age != 0 {
++                        waited(now, low_pending, 0)
++                    } else {
++                        0
++                    },
++                );
++                if pick(&[med, low], age) == Some(1) {
++                    low_at = Some(now);
++                    break;
++                }
++                med_served = now;
++                now += MS;
++            }
++            match age {
++                0 => assert_eq!(low_at, None),
++                a => assert_eq!(low_at, Some(a)),
++            }
++        }
++    }
++}
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 7bcaeb700f..74efecc98c 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -10,10 +10,11 @@
+ //! Firmware failure retains every possibly reachable owner. Completions are signalled only
+ //! after dropping the device lock.
+ 
+-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
++use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+ 
+ use kernel::{prelude::*, sync::Arc};
+ 
++use super::age;
+ use super::channel::Channel;
+ use super::command::{Command, ComputeCommand, RenderCommand};
+ use super::cqueue::{self, QUEUES_MAX};
+@@ -158,6 +159,8 @@ pub(crate) struct Progress {
+     pub(crate) next: AtomicU32,
+     /// Waiting in `Engine::pending`.
+     pub(crate) pending: AtomicBool,
++    /// When it last entered `Engine::pending` (`g16_age_ms`).
++    pub(crate) pending_ns: AtomicU64,
+     /// The fence was signalled: [`Job::complete`] runs once.
+     pub(crate) signaled: AtomicBool,
+ }
+@@ -169,6 +172,7 @@ pub(crate) fn new(commands: usize) -> Self {
+             sent: AtomicU32::new(0),
+             next: AtomicU32::new(0),
+             pending: AtomicBool::new(false),
++            pending_ns: AtomicU64::new(0),
+             signaled: AtomicBool::new(false),
+         }
+     }
+@@ -710,6 +714,8 @@ pub(crate) struct Engine {
+     /// one heap object ([`ComputeQueues`]). Engine is built and moved by value on the boot path,
+     /// whose stack frames must not grow.
+     pub(crate) cq: KBox<ComputeQueues>,
++    /// `g16_age_ms`: jobs published after they had waited the age or longer.
++    pub(crate) aged: u64,
+     /// A ready prefix waits only for a record's consumption: repoll sooner.
+     pub(crate) chan_wait: bool,
+     /// Ready work waits for a running command to retire (`g16_window_poll_us`).
+@@ -773,6 +779,7 @@ pub(crate) fn new() -> Result<Self> {
+             render_registered: false,
+             ta_registered: false,
+             cq: new_compute_queues()?,
++            aged: 0,
+             chan_wait: false,
+             window_wait: false,
+             cbell_owed: false,
+@@ -827,14 +834,18 @@ fn queue_published(&self, job: &Job) -> u32 {
+     /// Index in `pending` of the next ready job: highest queue priority, then the queue served
+     /// least recently, then submission order. `QueueState::priority` is
+     /// `DRM_ASAHI_PRIORITY_REALTIME - priority` as `file.rs` passes it, so a smaller value
+-    /// outranks.
++    /// outranks. With `g16_age_ms`, a job that has waited that long goes first
++    /// ([`age::before`]).
+     fn pick(&self) -> Option<usize> {
+         self.pick_in(None)
+     }
+ 
+     /// [`Self::pick`] among the jobs of VM `vm` only, if one is given.
+     fn pick_in(&self, vm: Option<u64>) -> Option<usize> {
+-        let mut best: Option<usize> = None;
++        // `g16_age_ms`: one clock read per pick, none while it is 0.
++        let age_ns = u64::from(params::age_ms()) * 1_000_000;
++        let now = if age_ns != 0 { now_ns() } else { 0 };
++        let mut best: Option<(usize, age::Cand)> = None;
+         for (i, job) in self.pending.iter().enumerate() {
+             if vm.is_some_and(|v| v != job.vm.id) {
+                 continue;
+@@ -845,22 +856,25 @@ fn pick_in(&self, vm: Option<u64>) -> Option<usize> {
+             {
+                 continue;
+             }
+-            let better = match best {
+-                None => true,
+-                Some(b) => {
+-                    let (q, bq) = (&job.queue, &self.pending[b].queue);
+-                    let (t, bt) = (
+-                        q.turn.load(Ordering::Relaxed),
+-                        bq.turn.load(Ordering::Relaxed),
+-                    );
+-                    q.priority < bq.priority || (q.priority == bq.priority && t < bt)
+-                }
++            let q = &job.queue;
++            let cand = age::Cand {
++                priority: q.priority,
++                turn: q.turn.load(Ordering::Relaxed),
++                waited_ns: if age_ns != 0 {
++                    age::waited(
++                        now,
++                        job.progress.pending_ns.load(Ordering::Relaxed),
++                        q.served_ns.load(Ordering::Relaxed),
++                    )
++                } else {
++                    0
++                },
+             };
+-            if better {
+-                best = Some(i);
++            if best.is_none_or(|(_, b)| age::before(&cand, &b, age_ns)) {
++                best = Some((i, cand));
+             }
+         }
+-        best
++        best.map(|(i, _)| i)
+     }
+ 
+     /// Removes `job` from `pending`.
+@@ -1348,6 +1362,7 @@ pub(crate) fn enqueue(&mut self, job: Arc<Job>) -> Result {
+             // publication rather than allocating beneath the signalling mutex.
+             return Err(EIO);
+         }
++        job.progress.pending_ns.store(now_ns(), Ordering::Relaxed);
+         self.engine.pending.push(job.clone(), GFP_NOWAIT)?;
+         job.progress.set_pending(true);
+         let q = &job.queue;
+@@ -1697,6 +1712,19 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+             }
+             self.engine.turn += 1;
+             job.queue.turn.store(self.engine.turn, Ordering::Relaxed);
++            // `g16_age_ms`: whether this job had aged, and when its queue was served.
++            let served = now_ns();
++            let age_ns = u64::from(params::age_ms()) * 1_000_000;
++            if age_ns != 0
++                && age::waited(
++                    served,
++                    job.progress.pending_ns.load(Ordering::Relaxed),
++                    job.queue.served_ns.load(Ordering::Relaxed),
++                ) >= age_ns
++            {
++                self.engine.aged += 1;
++            }
++            job.queue.served_ns.store(served, Ordering::Relaxed);
+             let behind = self.engine.flights.len() as u64;
+             let compute = matches!(command(&job, job.progress.sent()), Some(Command::Compute(_)));
+             let own_prior = job.own_prior(job.progress.sent());
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 492b5b219d..b0f8b5b737 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -43,6 +43,7 @@
+ //!   `mmu.rs`, `pgtable.rs`).
+ 
+ mod adt;
++mod age;
+ mod bell_group;
+ mod board;
+ mod boot;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index d123703261..365944ecae 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2437,6 +2437,28 @@ pub(crate) fn submit_retire() -> bool {
+     "G16: 1 = a submission first retires the commands that completed since the last poll pass, without waiting for the firmware's event, then publishes (default 0: off; runtime 0644)"
+ );
+ 
++/// Storage of `g16_age_ms` (runtime 0644, default 0).
++static AGE_MS: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_age_ms` = N: a ready job that has waited N ms or longer is picked ahead of every job
++/// that has not, whatever the priorities; of two such jobs the one that waited longer goes
++/// first ([`super::age::before`]). The engine otherwise picks by priority alone, so a
++/// low-priority client beside a higher-priority one that always has a job pending is never
++/// picked. A job waits from when it was queued or its queue was last served. 0: off, the
++/// order by priority alone. Read at each pick.
++pub(crate) fn age_ms() -> u32 {
++    AGE_MS.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    AGE_MS_PARAM,
++    AGE_MS_PARMTYPE,
++    AGE_MS_PARM,
++    AGE_MS,
++    "g16_age_ms",
++    "G16: a ready job that has waited N ms is picked ahead of priority (default 0: off, priority alone; runtime 0644)"
++);
++
+ /// Storage of `g16_check_once` (runtime 0644, default 1).
+ static CHECK_ONCE: AtomicU32 = AtomicU32::new(1);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index f7039a6c52..60edd084f1 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -2292,6 +2292,12 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             super::params::cq_split_us(),
+             self.engine.cq.kept
+         )?;
++        writeln!(
++            f,
++            "age: ms {} aged {}",
++            super::params::age_ms(),
++            self.engine.aged
++        )?;
+         writeln!(
+             f,
+             "notifier_cached: {}",
+diff --git a/drivers/gpu/drm/asahi/g16/queue.rs b/drivers/gpu/drm/asahi/g16/queue.rs
+index 34b4e37be5..05cfb746b0 100644
+--- a/drivers/gpu/drm/asahi/g16/queue.rs
++++ b/drivers/gpu/drm/asahi/g16/queue.rs
+@@ -52,6 +52,8 @@ pub(crate) struct QueueState {
+     cancelled_at: [AtomicU64; 2],
+     /// Engine service turn of this queue (least recently served first).
+     pub(crate) turn: AtomicU64,
++    /// When the engine last served this queue (`g16_age_ms`).
++    pub(crate) served_ns: AtomicU64,
+     /// Exact successful firmware receipts, independently for render and compute. These
+     /// survive aggregate-fence publication and never advance on aborted/failed commands.
+     pub(crate) completed: [AtomicU64; 2],
+@@ -146,6 +148,7 @@ pub(crate) fn new(
+                 usc_base: usc_exec_base,
+                 cancelled_at: [const { AtomicU64::new(0) }; 2],
+                 turn: AtomicU64::new(0),
++                served_ns: AtomicU64::new(0),
+                 completed: [const { AtomicU64::new(0) }; 2],
+                 published: [const { AtomicU64::new(0) }; 2],
+                 compute_end: AtomicU64::new(0),
+-- 
+2.43.0
+

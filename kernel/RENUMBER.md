@@ -1393,3 +1393,7 @@ The base remains da8e1acf3656. Published 0001–0960 are unchanged. 0961 to 0964
 # Kernel patch numbers: 1.1105 to 1.1115
 
 The base remains da8e1acf3656. Published 0001–0964 are unchanged. 0965 to 0967 drop the timestamp records of a render that asks for no timestamps: 0965 adds `g16_ta_short` (default 0), which publishes such a render with no TA end timestamp target, 0966 adds `g16_short_acct` (default 0), which keeps about one such render in N of each queue in the full forms and credits its measured times to the others, and 0967 sets `g16_fs_short` and `g16_ta_short` to 1 and `g16_short_acct` to 16. The message of 0965 has one sentence that does not apply to this kernel: it names an order watch and `g16_fs_keyed`, and this kernel has neither. The sentence came with the change from a development line; the code is not affected. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1106 to 1.1114 were not released or published.
+
+# Kernel patch numbers: 1.1115 to 1.1121
+
+The base remains da8e1acf3656. Published 0001–0967 are unchanged. 0968 and 0969 bound how long a ready job waits: 0968 adds `g16_age_ms` (default 0), under which a job that has waited that many milliseconds is picked before every job that has not, and 0969 sets it to 1000. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1116 to 1.1120 were not released or published.
