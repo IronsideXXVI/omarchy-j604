@@ -1,0 +1,391 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 19 Nov 2026 23:39:02 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally pay the compute bell group
+ at pass end
+
+With g16_compute_bell_group k, a compute record posted while at least
+k compute commands are in flight skips its doorbell, and the k-th such
+record rings for all of them, inside the publish pass. The default
+g16_compute_onebell 2 already rings at most twice per pass: for the
+first compute record and at the pass end. Once a pass publishes more
+than 2k records, the group rings more often than onebell alone. On
+1.1103 the group at 4 read 0.95 us per submission faster at 8 queued
+and 4 to 8 % slower at 64 queued, where passes are long.
+
+Add g16_compute_bell_late (runtime, default 0). At 1, with a group,
+a compute record with at least k in flight is always posted without
+a doorbell, and the end of the publish pass rings once if k or more
+records are owed. The existing rule still rings owed records once
+fewer than k compute commands are in flight, so none is left unrung
+when the queues drain. A pass therefore rings at most once for its
+deferred records. A pass that returns early at the publication
+deadline rings every owed record first, as it already does for the
+onebell records. The effect of the word has not been measured yet.
+
+At 0, or with the group off, nothing changes. A new statistics line
+reads "compute_bell_late: on W paid N exits N".
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/compute_bell.rs | 167 +++++++++++++++++++---
+ drivers/gpu/drm/asahi/g16/engine.rs       |  30 +++-
+ drivers/gpu/drm/asahi/g16/params.rs       |  21 +++
+ drivers/gpu/drm/asahi/g16/poll.rs         |   8 ++
+ 4 files changed, 202 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/compute_bell.rs b/drivers/gpu/drm/asahi/g16/compute_bell.rs
+index 616345e2bf..a2dd1a701c 100644
+--- a/drivers/gpu/drm/asahi/g16/compute_bell.rs
++++ b/drivers/gpu/drm/asahi/g16/compute_bell.rs
+@@ -19,6 +19,15 @@
+ //!
+ //! There is one group for the engine: both firmware compute queues are rung through the same
+ //! compute submit channel, and each record names its own queue.
++//!
++//! `g16_compute_bell_late` (with a group): the group is paid once, at the end of the publish
++//! pass, instead of by the k-th deferred record inside it. A record with at least k compute
++//! commands ahead is always posted without a doorbell, and the pass end rings once when k or
++//! more records are owed, or, as without the word, once fewer than k compute commands are in
++//! flight. A pass then rings at most once for its deferred records, never more often than
++//! `g16_compute_onebell` 2 (its first record and its end). Without the word a long pass rings
++//! about once per k records, more often than onebell alone once a pass publishes more than 2k.
++//! A pass that returns before its end (the publication deadline) rings every owed record first.
+ 
+ use core::sync::atomic::{AtomicU32, AtomicU64};
+ 
+@@ -35,6 +44,9 @@
+ /// Compute rings in the post loop that were not a group's payment, publications deferred,
+ /// rings that paid a group, and owed rings paid at the end of a publish pass (statistics).
+ pub(crate) static N: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
++/// `g16_compute_bell_late`: publish passes whose end paid k or more owed records, and passes
++/// that rang owed records before returning early (statistics).
++pub(crate) static LATE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+ 
+ /// The group size in effect: 0 (off) unless the word is 2 to 16.
+ pub(crate) const fn group(word: u32) -> u32 {
+@@ -46,12 +58,12 @@ pub(crate) const fn group(word: u32) -> u32 {
+ }
+ 
+ /// What a compute publication does, from the group size `k`, the compute commands already in
+-/// flight and the publications owed so far.
+-pub(crate) const fn decide(k: u32, ahead: usize, owed: u32) -> u8 {
++/// flight and the publications owed so far. With `late` it never pays: the pass end does.
++pub(crate) const fn decide(k: u32, ahead: usize, owed: u32, late: bool) -> u8 {
+     let k = group(k);
+     if k == 0 || ahead < k as usize {
+         RING
+-    } else if owed + 1 >= k {
++    } else if !late && owed + 1 >= k {
+         PAY
+     } else {
+         DEFER
+@@ -59,10 +71,18 @@ pub(crate) const fn decide(k: u32, ahead: usize, owed: u32) -> u8 {
+ }
+ 
+ /// Whether owed records are rung at the end of a publish pass: always when the word is off
+-/// (owed only after it was turned off), else once fewer than k compute commands are in flight.
+-pub(crate) const fn settle(k: u32, owed: u32, in_flight: usize) -> bool {
++/// (owed only after it was turned off), else once fewer than k compute commands are in flight,
++/// and with `late` also once k or more are owed.
++pub(crate) const fn settle(k: u32, owed: u32, in_flight: usize, late: bool) -> bool {
+     let k = group(k);
+-    owed != 0 && (k == 0 || in_flight < k as usize)
++    owed != 0 && (k == 0 || in_flight < k as usize || (late && owed >= k))
++}
++
++/// Whether an end-of-pass ring that `settle` allowed is a late payment (k or more owed with at
++/// least k in flight) rather than a settle of the queue draining.
++pub(crate) const fn late_pays(k: u32, in_flight: usize, late: bool) -> bool {
++    let k = group(k);
++    late && k != 0 && in_flight >= k as usize
+ }
+ 
+ #[cfg(test)]
+@@ -73,33 +93,33 @@ mod tests {
+     fn off_rings_every_publication() {
+         for ahead in 0..20 {
+             for w in [0, 1, 17, 100] {
+-                assert_eq!(decide(w, ahead, 0), RING);
++                assert_eq!(decide(w, ahead, 0, false), RING);
+             }
+         }
+     }
+ 
+     #[test]
+     fn defers_behind_k_and_pays_the_kth() {
+-        assert_eq!(decide(4, 4, 0), DEFER);
+-        assert_eq!(decide(4, 6, 1), DEFER);
+-        assert_eq!(decide(4, 7, 2), DEFER);
+-        assert_eq!(decide(4, 8, 3), PAY);
+-        assert_eq!(decide(2, 5, 0), DEFER);
+-        assert_eq!(decide(2, 5, 1), PAY);
++        assert_eq!(decide(4, 4, 0, false), DEFER);
++        assert_eq!(decide(4, 6, 1, false), DEFER);
++        assert_eq!(decide(4, 7, 2, false), DEFER);
++        assert_eq!(decide(4, 8, 3, false), PAY);
++        assert_eq!(decide(2, 5, 0, false), DEFER);
++        assert_eq!(decide(2, 5, 1, false), PAY);
+     }
+ 
+     #[test]
+     fn rings_with_fewer_than_k_ahead() {
+-        assert_eq!(decide(4, 3, 2), RING);
+-        assert_eq!(decide(4, 0, 0), RING);
++        assert_eq!(decide(4, 3, 2, false), RING);
++        assert_eq!(decide(4, 0, 0, false), RING);
+     }
+ 
+     #[test]
+     fn settle_rules() {
+-        assert!(!settle(4, 0, 0));
+-        assert!(!settle(4, 2, 5));
+-        assert!(settle(4, 2, 3));
+-        assert!(settle(0, 1, 9));
++        assert!(!settle(4, 0, 0, false));
++        assert!(!settle(4, 2, 5, false));
++        assert!(settle(4, 2, 3, false));
++        assert!(settle(0, 1, 9, false));
+     }
+ 
+     /// A long run of publications with at least k ahead never owes more than k - 1, and once
+@@ -109,15 +129,120 @@ fn never_owes_k_and_always_settles() {
+         for k in 2..=16u32 {
+             let mut owed = 0u32;
+             for i in 0..200usize {
+-                match decide(k, k as usize + i % 5, owed) {
++                match decide(k, k as usize + i % 5, owed, false) {
+                     DEFER => owed += 1,
+                     _ => owed = 0,
+                 }
+                 assert!(owed < k);
+                 if owed != 0 {
+-                    assert!(settle(k, owed, owed as usize));
++                    assert!(settle(k, owed, owed as usize, false));
+                 }
+             }
+         }
+     }
++
++    #[test]
++    fn late_never_pays_inside_a_pass() {
++        for owed in 0..40 {
++            assert_eq!(decide(4, 8, owed, true), DEFER);
++            assert_eq!(decide(4, 3, owed, true), RING);
++            assert_eq!(decide(0, 8, owed, true), RING);
++        }
++    }
++
++    #[test]
++    fn late_settle_pays_k_or_more() {
++        assert!(settle(4, 4, 9, true));
++        assert!(settle(4, 15, 60, true));
++        assert!(!settle(4, 3, 9, true));
++        assert!(settle(4, 3, 3, true));
++        assert!(!settle(4, 0, 0, true));
++        assert!(!settle(4, 15, 60, false));
++        assert!(late_pays(4, 9, true));
++        assert!(!late_pays(4, 3, true));
++        assert!(!late_pays(4, 9, false));
++        assert!(!late_pays(0, 9, true));
++    }
++
++    /// Rings of one publish pass under the engine's rules: `g16_compute_onebell` 2 (a record
++    /// due to ring does so at once if it is the first compute ring of the pass, else it waits for
++    /// the pass end), any compute ring covering the group's owed records, then the group's
++    /// end-of-pass rule. `ahead` compute commands are in flight when the pass starts and it
++    /// publishes `p` registered compute records. Returns (rings, owed after the pass).
++    fn pass(k: u32, late: bool, ahead: usize, p: usize, mut owed: u32) -> (u32, u32) {
++        let (mut rings, mut rung, mut cbell_owed) = (0u32, false, false);
++        for i in 0..p {
++            match decide(k, ahead + i, owed, late) {
++                DEFER => owed += 1,
++                PAY => {
++                    rings += 1;
++                    rung = true;
++                    owed = 0;
++                }
++                _ => {
++                    if rung {
++                        cbell_owed = true;
++                    } else {
++                        rings += 1;
++                        rung = true;
++                        owed = 0;
++                    }
++                }
++            }
++        }
++        if cbell_owed {
++            rings += 1;
++            owed = 0;
++        }
++        if settle(k, owed, ahead + p, late) {
++            rings += 1;
++            owed = 0;
++        }
++        (rings, owed)
++    }
++
++    fn passes(k: u32, late: bool, ahead: usize, p: usize, n: usize) -> u32 {
++        let (mut total, mut owed) = (0u32, 0u32);
++        for _ in 0..n {
++            let (r, o) = pass(k, late, ahead, p, owed);
++            total += r;
++            owed = o;
++            assert!(owed < k.max(1));
++        }
++        total
++    }
++
++    /// 8 queued: passes of 3 behind 5 in flight. 12 passes (36 records): onebell rings 24,
++    /// the group 9 (one per 4 records), the late group 6 (one per 6, every second pass end).
++    #[test]
++    fn rings_per_pass_at_8_queued() {
++        assert_eq!(passes(0, false, 5, 3, 12), 24);
++        assert_eq!(passes(4, false, 5, 3, 12), 9);
++        assert_eq!(passes(4, true, 5, 3, 12), 6);
++    }
++
++    /// 64 queued: passes of 15 behind 49 in flight. 12 passes (180 records): onebell rings
++    /// 24, the group 45 (inside the passes, more than onebell), the late group 12 (one per pass).
++    #[test]
++    fn rings_per_pass_at_64_queued() {
++        assert_eq!(passes(0, false, 49, 15, 12), 24);
++        assert_eq!(passes(4, false, 49, 15, 12), 45);
++        assert_eq!(passes(4, true, 49, 15, 12), 12);
++        for k in 2..=16u32 {
++            for p in 1..40usize {
++                let (r, _) = pass(k, true, 64, p, k - 1);
++                assert!(r <= 1);
++            }
++        }
++    }
++
++    /// With late, any owed records are rung once the queue drains below k.
++    #[test]
++    fn late_always_settles_when_draining() {
++        for k in 2..=16u32 {
++            for owed in 1..=40u32 {
++                assert!(settle(k, owed, (k - 1) as usize, true));
++            }
++        }
++    }
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index c5366b6258..5fb668f499 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -989,17 +989,39 @@ fn ring_owed_compute(&mut self) -> Result {
+         Ok(())
+     }
+     /// `g16_compute_bell_group`: rings the compute pipe for records posted without a
+-    /// doorbell, once fewer than the group's compute commands are in flight.
++    /// doorbell, once fewer than the group's compute commands are in flight, or, with
++    /// `g16_compute_bell_late`, once the pass owes k or more (the group's one payment).
+     fn ring_owed_compute_group(&mut self) -> Result {
+         let owed = super::compute_bell::OWED.load(Ordering::Relaxed);
+         let in_flight = self.engine.flights.iter().filter(|x| x.computes != 0).count();
+-        if !super::compute_bell::settle(params::compute_bell_group(), owed, in_flight) {
++        let k = params::compute_bell_group();
++        let late = params::compute_bell_late() != 0;
++        if !super::compute_bell::settle(k, owed, in_flight, late) {
+             return Ok(());
+         }
+         self.session.ring(Channel::Compute)?;
+         self.engine.cbell_rung = true;
+         super::compute_bell::OWED.store(0, Ordering::Relaxed);
+-        super::compute_bell::N[3].fetch_add(1, Ordering::Relaxed);
++        if super::compute_bell::late_pays(k, in_flight, late) {
++            super::compute_bell::LATE[0].fetch_add(1, Ordering::Relaxed);
++        } else {
++            super::compute_bell::N[3].fetch_add(1, Ordering::Relaxed);
++        }
++        Ok(())
++    }
++
++    /// `g16_compute_bell_late`: a publish pass that returns before its end rings every owed
++    /// compute record first, since its end would have paid them.
++    fn ring_owed_compute_late_exit(&mut self) -> Result {
++        if params::compute_bell_late() == 0
++            || super::compute_bell::OWED.load(Ordering::Relaxed) == 0
++        {
++            return Ok(());
++        }
++        self.session.ring(Channel::Compute)?;
++        self.engine.cbell_rung = true;
++        super::compute_bell::OWED.store(0, Ordering::Relaxed);
++        super::compute_bell::LATE[1].fetch_add(1, Ordering::Relaxed);
+         Ok(())
+     }
+ 
+@@ -1819,6 +1841,7 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+                     if super::recovery::logic::expired(now_ns(), deadline) {
+                         // Records posted earlier in this pass still get their doorbell.
+                         self.ring_owed_compute()?;
++                        self.ring_owed_compute_late_exit()?;
+                         return Err(ETIMEDOUT);
+                     }
+                     break;
+@@ -2292,6 +2315,7 @@ fn publish_prefix_into(
+                     params::compute_bell_group(),
+                     self.engine.flights.iter().filter(|x| x.computes != 0).count(),
+                     super::compute_bell::OWED.load(Ordering::Relaxed),
++                    params::compute_bell_late() != 0,
+                 )
+             };
+             for &channel in channels {
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 29da828ef2..fb57fec3a3 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -3380,6 +3380,27 @@ pub(crate) fn compute_bell_group() -> u32 {
+     "G16: k = compute records behind k others ring once per k publications (2-16; default 0, off)"
+ );
+ 
++/// Storage of `g16_compute_bell_late` (runtime 0644, default 0).
++static COMPUTE_BELL_LATE: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_compute_bell_late` 1, with `g16_compute_bell_group` k: the group is paid once at the end
++/// of each publish pass that owes k or more records, instead of by the k-th deferred record
++/// inside the pass, so a pass rings at most once for its deferred records (compute_bell.rs).
++/// 0 (default) or any other value: the k-th record pays, as before. No effect while the group
++/// is off. Read at each compute publication and publish pass.
++pub(crate) fn compute_bell_late() -> u32 {
++    u32::from(COMPUTE_BELL_LATE.load(Ordering::Relaxed) == 1)
++}
++
++live_u32_param!(
++    COMPUTE_BELL_LATE_PARAM,
++    COMPUTE_BELL_LATE_PARMTYPE,
++    COMPUTE_BELL_LATE_PARM,
++    COMPUTE_BELL_LATE,
++    "g16_compute_bell_late",
++    "G16: 1 = pay the compute bell group once at the end of each publish pass (default 0)"
++);
++
+ /// Storage of `g16_ta_short` (runtime 0644, default 1).
+ static TA_SHORT: AtomicU32 = AtomicU32::new(1);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 525cac003d..3ba4be94bc 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -2290,6 +2290,14 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                 cb[2].load(Ordering::Relaxed),
+                 cb[3].load(Ordering::Relaxed)
+             )?;
++            let cbl = &super::compute_bell::LATE;
++            writeln!(
++                f,
++                "compute_bell_late: on {} paid {} exits {}",
++                params::compute_bell_late(),
++                cbl[0].load(Ordering::Relaxed),
++                cbl[1].load(Ordering::Relaxed)
++            )?;
+         }
+         writeln!(
+             f,
+-- 
+2.43.0
+

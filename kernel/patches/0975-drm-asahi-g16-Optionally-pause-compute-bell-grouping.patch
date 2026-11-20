@@ -1,0 +1,264 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 20 Nov 2026 06:09:01 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally pause compute bell
+ grouping beside render
+
+With g16_compute_bell_group 4 and g16_compute_bell_late 1,
+compute.light at 8 queued reads 27.84 and 27.86 us against 30.45
+and 29.79 us with both off (1.1117). Beside render.light at 8 queued
+the same words cost render 6.47 % (90 % bounds +4.66 / +8.29,
+128.93 to 137.28 us, 20 + 20 mixed rows, 1.1117), while compute's
+share of the submissions rose from 63.9 to 65.9 %.
+
+Add g16_compute_bell_solo_us (runtime, default 0). With N > 0, the
+two words act only while no submission holding a render command was
+made within the last N us. While one was, every compute publication
+and every pass end decides as with the group off: each compute
+record rings, and a pass end rings anything still owed. A render
+submission stores its time before it takes the device lock, so the
+compute side steps aside from the next decision on, also in the
+middle of a pass. At 0 nothing is stored and no clock is read.
+
+The cost, at N > 0: one atomic store and one clock read per render
+submission, and one atomic load, one clock read and a compare per
+compute publication and per pass end.
+
+Not yet measured: the word has not run on a device.
+
+The rule is pure functions in compute_bell.rs with host tests. The
+stats gain a "compute_bell_solo:" line: compute publications decided
+alone and with a render submission recent.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/compute_bell.rs | 76 +++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/engine.rs       | 35 +++++++++--
+ drivers/gpu/drm/asahi/g16/params.rs       | 21 +++++++
+ drivers/gpu/drm/asahi/g16/poll.rs         | 16 +++++
+ 4 files changed, 144 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/compute_bell.rs b/drivers/gpu/drm/asahi/g16/compute_bell.rs
+index a2dd1a701c..6e223db760 100644
+--- a/drivers/gpu/drm/asahi/g16/compute_bell.rs
++++ b/drivers/gpu/drm/asahi/g16/compute_bell.rs
+@@ -47,6 +47,12 @@
+ /// `g16_compute_bell_late`: publish passes whose end paid k or more owed records, and passes
+ /// that rang owed records before returning early (statistics).
+ pub(crate) static LATE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
++/// `g16_compute_bell_solo_us`: the time (`now_ns`) of the latest submission holding a render
++/// command, stored only while the word is on. 0: none yet.
++pub(crate) static LAST_RENDER_NS: AtomicU64 = AtomicU64::new(0);
++/// `g16_compute_bell_solo_us`: compute publications decided with no render submission inside
++/// the window, and with one inside it (statistics).
++pub(crate) static SOLO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+ 
+ /// The group size in effect: 0 (off) unless the word is 2 to 16.
+ pub(crate) const fn group(word: u32) -> u32 {
+@@ -85,6 +91,23 @@ pub(crate) const fn late_pays(k: u32, in_flight: usize, late: bool) -> bool {
+     late && k != 0 && in_flight >= k as usize
+ }
+ 
++/// `g16_compute_bell_solo_us` = `window_us`: whether a render submission made at `last_render`
++/// (ns, 0: none) is younger than the window at `now`. A window of 0 is never recent. A stamp
++/// ahead of `now` (another CPU's clock read) counts as recent.
++pub(crate) const fn recent(window_us: u32, now: u64, last_render: u64) -> bool {
++    window_us != 0 && last_render != 0 && now.saturating_sub(last_render) < window_us as u64 * 1000
++}
++
++/// The group size and late pay in force: while a render submission is recent, the shipped
++/// rule (group 0, late off: every compute record rings); otherwise the words as set.
++pub(crate) const fn in_force(k: u32, late: bool, recent: bool) -> (u32, bool) {
++    if recent {
++        (0, false)
++    } else {
++        (k, late)
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -245,4 +268,57 @@ fn late_always_settles_when_draining() {
+             }
+         }
+     }
++
++    #[test]
++    fn solo_window_off_is_never_recent() {
++        for last in [0, 1, 999, 5_000_000] {
++            assert!(!recent(0, 5_000_000, last));
++        }
++        for k in [0, 2, 4, 16] {
++            for late in [false, true] {
++                assert_eq!(in_force(k, late, false), (k, late));
++            }
++        }
++    }
++
++    #[test]
++    fn render_inside_the_window_is_recent() {
++        let now = 1_000_000_000;
++        assert!(recent(100_000, now, now));
++        assert!(recent(100_000, now, now - 99_999_999));
++        assert!(recent(100_000, now, now + 1));
++        assert!(!recent(100_000, now, now - 100_000_000));
++        assert!(!recent(100_000, now, 0));
++        assert!(!recent(1, now, now - 1000));
++        assert!(recent(1, now, now - 999));
++        // The largest window (about 71 min) neither overflows nor wraps.
++        assert!(!recent(u32::MAX, u64::MAX, 1));
++        assert!(recent(u32::MAX, 4_000_000_000_000, 1));
++    }
++
++    /// Behind a recent render submission the shipped rule holds: every compute record rings,
++    /// and a pass end rings anything still owed from before.
++    #[test]
++    fn recent_render_is_the_shipped_rule() {
++        for k in 2..=16u32 {
++            for late in [false, true] {
++                let (k0, late0) = in_force(k, late, true);
++                assert_eq!((k0, late0), (0, false));
++                for ahead in 0..64 {
++                    for owed in 0..k {
++                        assert_eq!(
++                            decide(k0, ahead, owed, late0),
++                            decide(0, ahead, owed, false)
++                        );
++                        assert_eq!(decide(k0, ahead, owed, late0), RING);
++                    }
++                }
++                for owed in 1..=40u32 {
++                    for in_flight in 0..64 {
++                        assert!(settle(k0, owed, in_flight, late0));
++                    }
++                }
++            }
++        }
++    }
+ }
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 5fb668f499..773ed546a0 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -994,8 +994,19 @@ fn ring_owed_compute(&mut self) -> Result {
+     fn ring_owed_compute_group(&mut self) -> Result {
+         let owed = super::compute_bell::OWED.load(Ordering::Relaxed);
+         let in_flight = self.engine.flights.iter().filter(|x| x.computes != 0).count();
+-        let k = params::compute_bell_group();
+-        let late = params::compute_bell_late() != 0;
++        // g16_compute_bell_solo_us: the shipped rule while a render submission is recent.
++        let solo = params::compute_bell_solo_us();
++        let recent = solo != 0
++            && super::compute_bell::recent(
++                solo,
++                now_ns(),
++                super::compute_bell::LAST_RENDER_NS.load(Ordering::Relaxed),
++            );
++        let (k, late) = super::compute_bell::in_force(
++            params::compute_bell_group(),
++            params::compute_bell_late() != 0,
++            recent,
++        );
+         if !super::compute_bell::settle(k, owed, in_flight, late) {
+             return Ok(());
+         }
+@@ -2311,11 +2322,27 @@ fn publish_prefix_into(
+             let cgroup = if render {
+                 super::compute_bell::RING
+             } else {
+-                super::compute_bell::decide(
++                // g16_compute_bell_solo_us: the shipped rule while a render submission is recent.
++                let solo = params::compute_bell_solo_us();
++                let recent = solo != 0
++                    && super::compute_bell::recent(
++                        solo,
++                        now_ns(),
++                        super::compute_bell::LAST_RENDER_NS.load(Ordering::Relaxed),
++                    );
++                if solo != 0 {
++                    super::compute_bell::SOLO[usize::from(recent)].fetch_add(1, Ordering::Relaxed);
++                }
++                let (k, late) = super::compute_bell::in_force(
+                     params::compute_bell_group(),
++                    params::compute_bell_late() != 0,
++                    recent,
++                );
++                super::compute_bell::decide(
++                    k,
+                     self.engine.flights.iter().filter(|x| x.computes != 0).count(),
+                     super::compute_bell::OWED.load(Ordering::Relaxed),
+-                    params::compute_bell_late() != 0,
++                    late,
+                 )
+             };
+             for &channel in channels {
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index fb57fec3a3..9e34aeee09 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -3401,6 +3401,27 @@ pub(crate) fn compute_bell_late() -> u32 {
+     "G16: 1 = pay the compute bell group once at the end of each publish pass (default 0)"
+ );
+ 
++/// Storage of `g16_compute_bell_solo_us` (runtime 0644, default 0).
++static COMPUTE_BELL_SOLO_US: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_compute_bell_solo_us` = N: `g16_compute_bell_group` and `g16_compute_bell_late` act
++/// only while no submission holding a render command was made within the last N us; while one
++/// was, every compute record rings, as with the group off (compute_bell.rs). 0 (default): the
++/// two words act as set. Read at each compute publication, each publish pass end, and each
++/// submission.
++pub(crate) fn compute_bell_solo_us() -> u32 {
++    COMPUTE_BELL_SOLO_US.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    COMPUTE_BELL_SOLO_US_PARAM,
++    COMPUTE_BELL_SOLO_US_PARMTYPE,
++    COMPUTE_BELL_SOLO_US_PARM,
++    COMPUTE_BELL_SOLO_US,
++    "g16_compute_bell_solo_us",
++    "G16: N > 0 = the compute bell group and late pay act only with no render submission in the last N us (default 0)"
++);
++
+ /// Storage of `g16_ta_short` (runtime 0644, default 1).
+ static TA_SHORT: AtomicU32 = AtomicU32::new(1);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 3ba4be94bc..afc51c8767 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -543,6 +543,15 @@ pub(crate) fn run_poll(self: Arc<Self>) {
+     pub(crate) fn submit(self: &Arc<Self>, job: Arc<Job>) -> Result {
+         // Before the fence-signalling section: the PMP round trip sleeps.
+         self.pmp_agx_sync();
++        // g16_compute_bell_solo_us: a render submission sets compute's bell group aside.
++        if params::compute_bell_solo_us() != 0
++            && job
++                .commands
++                .iter()
++                .any(|c| matches!(c, super::command::Command::Render(_)))
++        {
++            super::compute_bell::LAST_RENDER_NS.store(super::engine::now_ns(), Ordering::Relaxed);
++        }
+         let signalling = kernel::dma_fence::SignallingGuard::new();
+         let mut done = Completions::new();
+         // g16_submit_kick: a queued submission asks for a pass once the lock is dropped.
+@@ -2298,6 +2307,13 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                 cbl[0].load(Ordering::Relaxed),
+                 cbl[1].load(Ordering::Relaxed)
+             )?;
++            writeln!(
++                f,
++                "compute_bell_solo: us {} alone {} recent {}",
++                params::compute_bell_solo_us(),
++                super::compute_bell::SOLO[0].load(Ordering::Relaxed),
++                super::compute_bell::SOLO[1].load(Ordering::Relaxed)
++            )?;
+         }
+         writeln!(
+             f,
+-- 
+2.43.0
+

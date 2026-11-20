@@ -1,0 +1,336 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 19 Nov 2026 11:14:34 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally ring compute doorbells
+ once per group
+
+Every compute record rings the compute channel within its own publish
+pass: with g16_compute_onebell 2 the first record of a pass rings at
+once and the pass end rings for the rest. Each doorbell starts a
+firmware scheduler call. At depth 8 on 1.1089, with g16_submit_defer 2
+and g16_submit_kick 16, that was 1.15 compute records per doorbell. On
+1.1093, ringing render doorbells once per group of 4 renders (0.26 rings
+per render) took light drawing at depth 8 down by 3.2 us per render and
+at depth 64 by 2.1 us.
+
+Add g16_compute_bell_group (runtime 0644, default 0; 2 to 16). With k,
+a compute publication made while at least k compute commands are in
+flight posts its record without a doorbell, and the k-th such
+publication rings for all of them. A publication with fewer than k in
+flight rings as before, and any compute ring covers the owed records.
+At the end of every publish pass, owed records are rung once fewer
+than k compute commands are in flight, so a record is never left
+unrung: at most k - 1 are owed at any time. Both firmware compute
+queues share the one compute channel, so there is one group for the
+engine. Records that register a queue always ring. After a fail-stop
+nothing is rung. A stats line counts rings, deferred records, group
+payments and end-of-pass payments. Nothing changes while the word is 0.
+
+The rule is in a core-only module with host tests.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/compute_bell.rs | 123 ++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/engine.rs       |  55 +++++++++-
+ drivers/gpu/drm/asahi/g16/mod.rs          |   1 +
+ drivers/gpu/drm/asahi/g16/params.rs       |  23 ++++
+ drivers/gpu/drm/asahi/g16/poll.rs         |  13 +++
+ 5 files changed, 214 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/compute_bell.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/compute_bell.rs b/drivers/gpu/drm/asahi/g16/compute_bell.rs
+new file mode 100644
+index 0000000000..616345e2bf
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/compute_bell.rs
+@@ -0,0 +1,123 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! `g16_compute_bell_group`: compute doorbells rung for a group of publications, as pure rules.
++//!
++//! Every compute publication posts a submit record on the one compute channel and, with
++//! `g16_compute_onebell` 2, the first record of each publish pass rings and the pass end rings
++//! for the rest. Each doorbell starts a firmware scheduler call, which launches every record
++//! visible at that moment. At depth the compute queues already hold several commands, so a new
++//! one need not be launched at once; ringing once for a group of publications lets one
++//! scheduler call take the whole group, as the render group does (bell_group.rs).
++//!
++//! With group size k (2 to 16): a publication made while at least k compute commands are
++//! already in flight posts its record without a doorbell; the k-th such publication rings for
++//! all of them. A publication made with fewer than k in flight rings as before (onebell rules),
++//! and any compute ring covers every owed record, the end-of-pass onebell ring included. At the
++//! end of every publish pass, owed records are rung once fewer than k compute commands are in
++//! flight, so a record is never left unrung once the queues drain: at most k - 1 are owed at
++//! any time, so when every rung command has retired the rule rings.
++//!
++//! There is one group for the engine: both firmware compute queues are rung through the same
++//! compute submit channel, and each record names its own queue.
++
++use core::sync::atomic::{AtomicU32, AtomicU64};
++
++/// The publication rings (covering any owed records).
++pub(crate) const RING: u8 = 0;
++/// The publication posts its record without a doorbell.
++pub(crate) const DEFER: u8 = 1;
++/// The publication completes a group: it rings for the group's records.
++pub(crate) const PAY: u8 = 2;
++
++/// Compute publications posted without a doorbell since the last compute ring. Written only
++/// under the device lock.
++pub(crate) static OWED: AtomicU32 = AtomicU32::new(0);
++/// Compute rings in the post loop that were not a group's payment, publications deferred,
++/// rings that paid a group, and owed rings paid at the end of a publish pass (statistics).
++pub(crate) static N: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
++
++/// The group size in effect: 0 (off) unless the word is 2 to 16.
++pub(crate) const fn group(word: u32) -> u32 {
++    if word >= 2 && word <= 16 {
++        word
++    } else {
++        0
++    }
++}
++
++/// What a compute publication does, from the group size `k`, the compute commands already in
++/// flight and the publications owed so far.
++pub(crate) const fn decide(k: u32, ahead: usize, owed: u32) -> u8 {
++    let k = group(k);
++    if k == 0 || ahead < k as usize {
++        RING
++    } else if owed + 1 >= k {
++        PAY
++    } else {
++        DEFER
++    }
++}
++
++/// Whether owed records are rung at the end of a publish pass: always when the word is off
++/// (owed only after it was turned off), else once fewer than k compute commands are in flight.
++pub(crate) const fn settle(k: u32, owed: u32, in_flight: usize) -> bool {
++    let k = group(k);
++    owed != 0 && (k == 0 || in_flight < k as usize)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn off_rings_every_publication() {
++        for ahead in 0..20 {
++            for w in [0, 1, 17, 100] {
++                assert_eq!(decide(w, ahead, 0), RING);
++            }
++        }
++    }
++
++    #[test]
++    fn defers_behind_k_and_pays_the_kth() {
++        assert_eq!(decide(4, 4, 0), DEFER);
++        assert_eq!(decide(4, 6, 1), DEFER);
++        assert_eq!(decide(4, 7, 2), DEFER);
++        assert_eq!(decide(4, 8, 3), PAY);
++        assert_eq!(decide(2, 5, 0), DEFER);
++        assert_eq!(decide(2, 5, 1), PAY);
++    }
++
++    #[test]
++    fn rings_with_fewer_than_k_ahead() {
++        assert_eq!(decide(4, 3, 2), RING);
++        assert_eq!(decide(4, 0, 0), RING);
++    }
++
++    #[test]
++    fn settle_rules() {
++        assert!(!settle(4, 0, 0));
++        assert!(!settle(4, 2, 5));
++        assert!(settle(4, 2, 3));
++        assert!(settle(0, 1, 9));
++    }
++
++    /// A long run of publications with at least k ahead never owes more than k - 1, and once
++    /// every rung command has retired (in flight = owed) the end-of-pass rule rings.
++    #[test]
++    fn never_owes_k_and_always_settles() {
++        for k in 2..=16u32 {
++            let mut owed = 0u32;
++            for i in 0..200usize {
++                match decide(k, k as usize + i % 5, owed) {
++                    DEFER => owed += 1,
++                    _ => owed = 0,
++                }
++                assert!(owed < k);
++                if owed != 0 {
++                    assert!(settle(k, owed, owed as usize));
++                }
++            }
++        }
++    }
++}
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 5313481c4f..c5366b6258 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -984,6 +984,22 @@ fn ring_owed_compute(&mut self) -> Result {
+         self.session.ring(Channel::Compute)?;
+         self.engine.cbell_rung = true;
+         self.engine.stats.cbell[1] += 1;
++        // g16_compute_bell_group: the ring covers the group's owed records too.
++        super::compute_bell::OWED.store(0, Ordering::Relaxed);
++        Ok(())
++    }
++    /// `g16_compute_bell_group`: rings the compute pipe for records posted without a
++    /// doorbell, once fewer than the group's compute commands are in flight.
++    fn ring_owed_compute_group(&mut self) -> Result {
++        let owed = super::compute_bell::OWED.load(Ordering::Relaxed);
++        let in_flight = self.engine.flights.iter().filter(|x| x.computes != 0).count();
++        if !super::compute_bell::settle(params::compute_bell_group(), owed, in_flight) {
++            return Ok(());
++        }
++        self.session.ring(Channel::Compute)?;
++        self.engine.cbell_rung = true;
++        super::compute_bell::OWED.store(0, Ordering::Relaxed);
++        super::compute_bell::N[3].fetch_add(1, Ordering::Relaxed);
+         Ok(())
+     }
+ 
+@@ -1851,6 +1867,17 @@ pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+         } else {
+             super::bell_group::OWED.store(0, Ordering::Relaxed);
+         }
++        // g16_compute_bell_group: compute records posted without a doorbell are rung once
++        // fewer than the group's compute commands are in flight (compute_bell.rs).
++        if self.recovery.failed().is_none() {
++            if let Err(e) = self.ring_owed_compute_group() {
++                if result.is_ok() {
++                    result = Err(e);
++                }
++            }
++        } else {
++            super::compute_bell::OWED.store(0, Ordering::Relaxed);
++        }
+         // Work left pending behind running flights waits for one of them to retire.
+         self.engine.window_wait =
+             !self.engine.pending.is_empty() && !self.engine.flights.is_empty();
+@@ -2256,6 +2283,17 @@ fn publish_prefix_into(
+             } else {
+                 super::bell_group::RING
+             };
++            // g16_compute_bell_group: a compute record behind enough compute commands may wait
++            // for a later compute doorbell (compute_bell.rs); one group for the compute channel.
++            let cgroup = if render {
++                super::compute_bell::RING
++            } else {
++                super::compute_bell::decide(
++                    params::compute_bell_group(),
++                    self.engine.flights.iter().filter(|x| x.computes != 0).count(),
++                    super::compute_bell::OWED.load(Ordering::Relaxed),
++                )
++            };
+             for &channel in channels {
+                 let (qinfo, head, event, fresh) = match channel {
+                     Channel::Compute => (
+@@ -2298,7 +2336,18 @@ fn publish_prefix_into(
+                 if onebell == 0 {
+                     // g16_compute_onebell: a registered compute queue's record may wait for the
+                     // one doorbell at the end of this publish pass.
+-                    if channel == Channel::Compute && !fresh && self.defer_compute_bell() {
++                    if channel == Channel::Compute
++                        && !fresh
++                        && cgroup == super::compute_bell::DEFER
++                    {
++                        // g16_compute_bell_group: owed; a later compute ring covers it.
++                        super::compute_bell::OWED.fetch_add(1, Ordering::Relaxed);
++                        super::compute_bell::N[1].fetch_add(1, Ordering::Relaxed);
++                    } else if channel == Channel::Compute
++                        && !fresh
++                        && cgroup != super::compute_bell::PAY
++                        && self.defer_compute_bell()
++                    {
+                         self.engine.cbell_owed = true;
+                         self.engine.stats.cbell[0] += 1;
+                     } else if group == super::bell_group::DEFER && channel != Channel::Compute {
+@@ -2308,6 +2357,10 @@ fn publish_prefix_into(
+                         if channel == Channel::Compute {
+                             self.engine.cbell_rung = true;
+                             self.engine.cbell_owed = false;
++                            // g16_compute_bell_group: this ring covers every owed record.
++                            super::compute_bell::OWED.store(0, Ordering::Relaxed);
++                            let i = usize::from(cgroup == super::compute_bell::PAY) * 2;
++                            super::compute_bell::N[i].fetch_add(1, Ordering::Relaxed);
+                         }
+                     }
+                 }
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index b0f8b5b737..0b53828414 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -51,6 +51,7 @@
+ mod channel;
+ mod check_once;
+ mod command;
++mod compute_bell;
+ mod cqueue;
+ mod encode;
+ mod engine;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 6930aa64bf..29da828ef2 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -3357,6 +3357,29 @@ pub(crate) fn lone_ctx_skip() -> bool {
+     "G16: 1 = with g16_notifier_cached, retire a render with nothing behind it without the cached record CONTEXT words; stamps, receipts and scene times still prove it (default 1; 0 holds such a render until its cached CONTEXT words are cleaned)"
+ );
+ 
++/// Storage of `g16_compute_bell_group` (runtime 0644, default 0).
++static COMPUTE_BELL_GROUP: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_compute_bell_group` k (2 to 16): a compute publication made while at least k compute
++/// commands are already in flight posts its record without ringing; the k-th such publication
++/// rings for all of them, so one firmware scheduler call takes the group. Any compute ring
++/// covers the owed records, and they are rung at the end of any publish pass that finds fewer
++/// than k compute commands in flight (compute_bell.rs). 0 (default) or any other value: every
++/// compute publication rings as `g16_compute_onebell` says, as before. Read at each compute
++/// publication and publish pass.
++pub(crate) fn compute_bell_group() -> u32 {
++    COMPUTE_BELL_GROUP.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    COMPUTE_BELL_GROUP_PARAM,
++    COMPUTE_BELL_GROUP_PARMTYPE,
++    COMPUTE_BELL_GROUP_PARM,
++    COMPUTE_BELL_GROUP,
++    "g16_compute_bell_group",
++    "G16: k = compute records behind k others ring once per k publications (2-16; default 0, off)"
++);
++
+ /// Storage of `g16_ta_short` (runtime 0644, default 1).
+ static TA_SHORT: AtomicU32 = AtomicU32::new(1);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index def9450074..525cac003d 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -2278,6 +2278,19 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                 bg[3].load(Ordering::Relaxed)
+             )?;
+         }
++        {
++            let cb = &super::compute_bell::N;
++            writeln!(
++                f,
++                "compute_bell: group {} owed {} rung {} deferred {} paid {} settled {}",
++                super::compute_bell::group(params::compute_bell_group()),
++                super::compute_bell::OWED.load(Ordering::Relaxed),
++                cb[0].load(Ordering::Relaxed),
++                cb[1].load(Ordering::Relaxed),
++                cb[2].load(Ordering::Relaxed),
++                cb[3].load(Ordering::Relaxed)
++            )?;
++        }
+         writeln!(
+             f,
+             "compute_queues: n {} published {:?} last {} waits {}",
+-- 
+2.43.0
+
