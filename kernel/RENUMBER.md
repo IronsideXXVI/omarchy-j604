@@ -1401,3 +1401,7 @@ The base remains da8e1acf3656. Published 0001–0967 are unchanged. 0968 and 096
 # Kernel patch numbers: 1.1121 to 1.1125
 
 The base remains da8e1acf3656. Published 0001–0969 are unchanged. 0970 makes the wait comparison of `g16_age_ms` once per publish pass, and only when the oldest pending job can have waited that long (`g16_age_ms` stays 1000), and 0971 adds the scheduler's debugfs setting `misfit_pull_idle` (0, which changes nothing). Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1122 to 1.1124 were not released or published.
+
+# Kernel patch numbers: 1.1125 to 1.1129
+
+The base remains da8e1acf3656. Published 0001–0971 are unchanged. 0972 makes render units back their parameter buffer heaps lazily from 64 blocks (8 MiB): `g16_pb_lazy` goes from 1 to 64 and the new `g16_pb_lazy_compact` (compact units) is 64. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1126 to 1.1128 were not released or published.

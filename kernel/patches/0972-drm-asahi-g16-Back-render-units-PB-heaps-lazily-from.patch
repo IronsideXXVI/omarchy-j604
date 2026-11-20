@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 20 Nov 2026 17:33:57 +0000
+Subject: [PATCH] drm/asahi: g16: Back render units' PB heaps lazily
+ from 8 MiB
+
+A compact render unit backs its whole 16 MiB parameter buffer heap
+when it is built, and a full unit backs 32 MiB from the g16_pb_lazy
+floor. On experimental 1.1126 the idle desktop held 766.2 MiB of
+driver memory in 12 render units, read 424 s after boot with no
+benchmark before it. macOS on the same machine reported 12.4 MiB of
+parameter buffer for the whole system.
+
+Add g16_pb_lazy_compact (module option). With N > 0 and g16_pb_lazy
+on, a compact unit backs only its first N blocks (at least 64,
+rounded up to 16) and SUBMIT grows it by the g16_pb_lazy rule, as
+for a full unit. The pb_lazy: stats line gains the floor. Make 64
+blocks (8 MiB) the default of both g16_pb_lazy and
+g16_pb_lazy_compact.
+
+On 1.1126 with both words at 64 the same read gave 606.2 MiB, 160.0
+MiB less, with 12 units, no heap growth and 0 fault lines.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/params.rs | 45 +++++++++++++++++++++++++++--
+ drivers/gpu/drm/asahi/g16/pools.rs  | 19 ++++++++----
+ 2 files changed, 56 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index dcba7e4762..6930aa64bf 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -1657,8 +1657,8 @@ pub(crate) fn pb_heap16() -> bool {
+     "G16: back the PB heap of the full render units 0 and 1 with 16 MiB (128 blocks) as the compact units, instead of 256 MiB each (default 0; latched at the first render unit built, set it as a module option)"
+ );
+ 
+-/// Storage of `g16_pb_lazy` (0644, default 1; latched at its first read).
+-static PB_LAZY: AtomicU32 = AtomicU32::new(1);
++/// Storage of `g16_pb_lazy` (0644, default 64; latched at its first read).
++static PB_LAZY: AtomicU32 = AtomicU32::new(64);
+ /// 0 until latched, then the latched value plus one.
+ static PB_LAZY_LATCH: AtomicU32 = AtomicU32::new(0);
+ 
+@@ -1701,7 +1701,46 @@ pub(crate) fn pb_lazy() -> Option<u32> {
+     PB_LAZY_PARM,
+     PB_LAZY,
+     "g16_pb_lazy",
+-    "G16: back the full render units' PB heap lazily from a floor of N blocks (128 KiB each; 1 = 256 = 32 MiB) and grow it in SUBMIT to three times the blocks in use, or to the whole window once a render held 3/4 of its manager (default 1; 0: whole heap at build; latched at the first read, set it as a module option)"
++    "G16: back the full render units' PB heap lazily from a floor of N blocks (128 KiB each; 1 = 256 = 32 MiB) and grow it in SUBMIT to three times the blocks in use, or to the whole window once a render held 3/4 of its manager (default 64; 0: whole heap at build; latched at the first read, set it as a module option)"
++);
++
++/// Storage of `g16_pb_lazy_compact` (0644, default 64; latched at its first read).
++static PB_LAZY_COMPACT: AtomicU32 = AtomicU32::new(64);
++/// 0 until latched, then the latched value plus one.
++static PB_LAZY_COMPACT_LATCH: AtomicU32 = AtomicU32::new(0);
++
++/// The floor, in blocks, of a compact render unit's PB heap, if `g16_pb_lazy_compact` is set
++/// and `g16_pb_lazy` is on: a compact unit then backs only the first `floor` blocks of its
++/// 16 MiB heap when built, and SUBMIT grows it by `g16_pb_lazy`'s rule, as for a full unit.
++/// 0: the whole heap at build. The default is 64 (8 MiB). Other values are rounded up to 16 blocks
++/// within the manager's minimum and the compact heap.
++pub(crate) fn pb_lazy_compact() -> Option<u32> {
++    pb_lazy()?;
++    let mut l = PB_LAZY_COMPACT_LATCH.load(Ordering::Acquire);
++    if l == 0 {
++        let v = PB_LAZY_COMPACT.load(Ordering::Relaxed);
++        let _ = PB_LAZY_COMPACT_LATCH.compare_exchange(
++            0,
++            v.saturating_add(1),
++            Ordering::AcqRel,
++            Ordering::Acquire,
++        );
++        l = PB_LAZY_COMPACT_LATCH.load(Ordering::Acquire);
++    }
++    let window = (hw::client::COMPACT_PB_HEAP_SIZE / super::fw::buffer::BLOCK_BYTES) as u32;
++    match l.wrapping_sub(1) {
++        0 => None,
++        v => Some((v.clamp(super::fw::buffer::MIN_BLOCKS, window).div_ceil(16) * 16).min(window)),
++    }
++}
++
++live_u32_param!(
++    PB_LAZY_COMPACT_PARAM,
++    PB_LAZY_COMPACT_PARMTYPE,
++    PB_LAZY_COMPACT_PARM,
++    PB_LAZY_COMPACT,
++    "g16_pb_lazy_compact",
++    "G16: with g16_pb_lazy, back the compact render units' 16 MiB PB heap lazily too, from a floor of N blocks (128 KiB each, at least 64), grown in SUBMIT by the same rule (default 64; 0: the whole heap at build; latched at the first read, set it as a module option)"
+ );
+ 
+ /// Storage of `g16_cwork_pack` (0644, default 0; latched at its first read).
+diff --git a/drivers/gpu/drm/asahi/g16/pools.rs b/drivers/gpu/drm/asahi/g16/pools.rs
+index e16173be3d..cee51a4420 100644
+--- a/drivers/gpu/drm/asahi/g16/pools.rs
++++ b/drivers/gpu/drm/asahi/g16/pools.rs
+@@ -36,14 +36,16 @@
+ pub(crate) fn write_lazy_stats(f: &mut impl fmt::Write) -> fmt::Result {
+     writeln!(
+         f,
+-        "pb_lazy: floor {} grows {} grown_blocks {} fails {} near_full {} total_us {} max_us {}",
++        "pb_lazy: floor {} grows {} grown_blocks {} fails {} near_full {} total_us {} max_us {} \
++         compact_floor {}",
+         super::params::pb_lazy().unwrap_or(0),
+         LAZY_PB[0].load(Ordering::Relaxed),
+         LAZY_PB[1].load(Ordering::Relaxed),
+         LAZY_PB[2].load(Ordering::Relaxed),
+         LAZY_PB[3].load(Ordering::Relaxed),
+         LAZY_PB[4].load(Ordering::Relaxed) / 1000,
+-        LAZY_PB[5].load(Ordering::Relaxed) / 1000
++        LAZY_PB[5].load(Ordering::Relaxed) / 1000,
++        super::params::pb_lazy_compact().unwrap_or(0)
+     )
+ }
+ 
+@@ -379,9 +381,16 @@ fn new(o: &mut Objects, k: u64, compact: bool) -> Result<Self> {
+         let submitted = alloc(o, 0x40, Class::Fw, None, true)?;
+         // g16_pb_lazy: a full unit backs only the floor of its window now (see Self::grow).
+         let window = (heap_size / buffer::BLOCK_BYTES) as u32;
+-        let lazy = !compact && super::params::pb_lazy().is_some();
+-        let first = match super::params::pb_lazy() {
+-            Some(floor) if lazy => floor.min(window),
++        // g16_pb_lazy_compact: a compact unit's heap is lazy too, from its own floor.
++        let compact_floor = if compact {
++            super::params::pb_lazy_compact()
++        } else {
++            None
++        };
++        let lazy = (!compact && super::params::pb_lazy().is_some()) || compact_floor.is_some();
++        let first = match (compact_floor, super::params::pb_lazy()) {
++            (Some(floor), _) => floor.min(window),
++            (None, Some(floor)) if lazy => floor.min(window),
+             _ => window,
+         };
+         let heap = alloc(
+-- 
+2.43.0
+

@@ -1,0 +1,113 @@
+From 389e5aafa811455a09bf725131058b4d8ebfada9 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 20 Nov 2026 03:04:50 -0600
+Subject: [PATCH] buffer, surface, encode: bound coded sizes and hold the
+ encoder input
+
+A coded buffer stores its size in an unsigned int: compute the total in
+size_t and refuse what the field cannot hold, so a large request can no
+longer wrap into a one-byte allocation. An encoder reads its input
+surface at EndPicture: refuse to destroy that surface while the picture
+is open. The indirect coded buffer of a picture must belong to the
+encoding context.
+
+Assisted-by: LLM
+---
+ src/buffer.c       | 10 ++++++++--
+ src/encode.c       |  9 ++++++++-
+ src/surface.c      |  5 +++++
+ src/v4l2_request.h |  2 ++
+ 4 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/src/buffer.c b/src/buffer.c
+index 8a5d945..3ef5bda 100644
+--- a/src/buffer.c
++++ b/src/buffer.c
+@@ -10,6 +10,7 @@
+  * SPDX-License-Identifier: GPL-3.0-or-later
+  */
+ 
++#include <limits.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/mman.h>
+@@ -70,13 +71,18 @@ VAStatus v4l2r_CreateBuffer(VADriverContextP va_ctx, VAContextID context_id,
+ 	/* A coded buffer maps to a VACodedBufferSegment list: keep the one
+ 	 * segment in front of the data the encoder writes (encode.c). */
+ 	if (type == VAEncCodedBufferType) {
+-		if ((size_t)size * num_elements > SIZE_MAX - sizeof(VACodedBufferSegment)) {
++		/* element_size is an unsigned int: compute in size_t and
++		 * refuse a total the field cannot hold. */
++		size_t total = (size_t)size * num_elements;
++		if (num_elements && total / num_elements != size)
++			total = SIZE_MAX;
++		if (total > UINT_MAX - sizeof(VACodedBufferSegment)) {
+ 			pthread_mutex_lock(&drv->mutex);
+ 			v4l2r_handles_free(&drv->buffers, id);
+ 			pthread_mutex_unlock(&drv->mutex);
+ 			return VA_STATUS_ERROR_ALLOCATION_FAILED;
+ 		}
+-		buffer->element_size = size * num_elements + sizeof(VACodedBufferSegment);
++		buffer->element_size = (unsigned int)(total + sizeof(VACodedBufferSegment));
+ 		buffer->nb_elements = 1;
+ 		buffer->data = calloc(1, buffer->element_size);
+ 		if (!buffer->data) {
+diff --git a/src/encode.c b/src/encode.c
+index 4c6f56f..ffe36f2 100644
+--- a/src/encode.c
++++ b/src/encode.c
+@@ -231,6 +231,12 @@ void v4l2r_enc_destroy(struct v4l2r_context *ctx)
+ 	ctx->enc = NULL;
+ }
+ 
++bool v4l2r_enc_holds(const struct v4l2r_context *ctx,
++		     const struct v4l2r_surface *surface)
++{
++	return ctx->enc && ctx->enc->input == surface;
++}
++
+ VAStatus v4l2r_enc_begin_picture(struct v4l2r_context *ctx,
+ 				 struct v4l2r_surface *input)
+ {
+@@ -612,7 +618,8 @@ VAStatus v4l2r_enc_end_picture(struct v4l2r_context *ctx)
+ 		return VA_STATUS_ERROR_INVALID_PARAMETER;
+ 
+ 	coded = V4L2R_BUFFER_GET(drv, enc->coded_buf);
+-	if (!coded || coded->type != VAEncCodedBufferType)
++	if (!coded || coded->type != VAEncCodedBufferType ||
++	    coded->context_id != ctx->id)
+ 		return VA_STATUS_ERROR_INVALID_BUFFER;
+ 
+ 	status = v4l2r_surface_ready(enc->input);
+diff --git a/src/surface.c b/src/surface.c
+index 3dff5de..42a8c4e 100644
+--- a/src/surface.c
++++ b/src/surface.c
+@@ -122,6 +122,11 @@ VAStatus v4l2r_DestroySurfaces(VADriverContextP va_ctx, VASurfaceID *surface_lis
+ 				vpp_busy = true;
+ 				break;
+ 			}
++			/* An encoder reads its input at EndPicture. */
++			if (ctx->in_picture && v4l2r_enc_holds(ctx, surface)) {
++				vpp_busy = true;
++				break;
++			}
+ 		}
+ 		pthread_mutex_unlock(&drv->mutex);
+ 		if (!surface)
+diff --git a/src/v4l2_request.h b/src/v4l2_request.h
+index b14090b..ea66528 100644
+--- a/src/v4l2_request.h
++++ b/src/v4l2_request.h
+@@ -857,6 +857,8 @@ uint32_t v4l2r_encoder_attribute(VAProfile profile, VAConfigAttribType type);
+ VAStatus v4l2r_enc_create(struct v4l2r_context *ctx,
+ 			  const struct v4l2r_config *config);
+ void v4l2r_enc_destroy(struct v4l2r_context *ctx);
++bool v4l2r_enc_holds(const struct v4l2r_context *ctx,
++		     const struct v4l2r_surface *surface);
+ VAStatus v4l2r_enc_begin_picture(struct v4l2r_context *ctx,
+ 				 struct v4l2r_surface *input);
+ VAStatus v4l2r_enc_render_buffer(struct v4l2r_context *ctx,
+-- 
+2.55.0
+
