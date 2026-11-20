@@ -1,0 +1,477 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 19 Nov 2026 01:01:01 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally account short renders'
+ stage time by sampling
+
+With g16_fs_short a render that asks for no timestamps writes no FS
+start and end stamps, and with g16_ta_short no TA end stamp. Retirement
+charges the client's fdinfo vertex and fragment time from those stamps,
+so with the words on that time stopped advancing for nearly every
+render, and the stage statistics lost those renders as well.
+
+Add g16_short_acct (runtime, default 0). With N above 0 and a short
+word on, about one render in N of a queue that would be published short
+keeps both long forms, at a jittered interval of N - N/4 to N + N/4 so
+that a workload with a period cannot align with it. Its TA and FS
+spans, measured by its own stamps as before, update that queue's moving
+averages, each new sample weighing 1/8. Every short render of the queue
+is credited those averages for the stage it lacks, in the client's
+fdinfo engine time and in a new short_acct: statistics line, from the
+queue's first retired sample on. The stage: line keeps measured spans
+only.
+
+The credit is an estimate. For a steady workload the client's total
+converges to its measured total; after a change it lags by about eight
+samples; before the queue's first sample retires it is zero. Renders
+with timestamp outputs are measured exactly and do not feed the
+average.
+
+With g16_short_acct=0, the default, or with both short words off,
+nothing changes.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs     |  20 ++-
+ drivers/gpu/drm/asahi/g16/mod.rs        |   1 +
+ drivers/gpu/drm/asahi/g16/params.rs     |  26 +++
+ drivers/gpu/drm/asahi/g16/poll.rs       |  61 +++++++
+ drivers/gpu/drm/asahi/g16/queue.rs      |   3 +
+ drivers/gpu/drm/asahi/g16/short_acct.rs | 210 ++++++++++++++++++++++++
+ 6 files changed, 319 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/short_acct.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 12bd4e5aa4..7bcaeb700f 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -229,6 +229,9 @@ pub(crate) struct Flight {
+     pub(crate) fs_short: bool,
+     /// The render's TA work names no internal end timestamp target (`g16_ta_short`).
+     pub(crate) ta_short: bool,
++    /// `g16_short_acct`: the render would have been short and keeps both long forms as its
++    /// queue's sample.
++    pub(crate) acct_sample: bool,
+     /// `g16_render_work_pool`: where the render's work records went (0: its unit's own work
+     /// objects; 1 / 2: the uncached / ASC-cached pool copy).
+     pub(crate) work_copy: u8,
+@@ -280,6 +283,7 @@ fn new(job: Arc<Job>) -> Self {
+             cq: 0,
+             fs_short: false,
+             ta_short: false,
++            acct_sample: false,
+             work_copy: 0,
+             cwork_copy: 0,
+             ta_target: 0,
+@@ -346,6 +350,11 @@ pub(crate) struct Stats {
+     /// Internal stage durations of retired prefixes (24 MHz ticks).
+     pub(crate) ta_ticks: u64,
+     pub(crate) fs_ticks: u64,
++    /// `g16_short_acct`: per stage (TA, FS) the ticks credited to short renders and their
++    /// count, and the renders sampled.
++    pub(crate) acct_ticks: [u64; 2],
++    pub(crate) acct_credited: [u64; 2],
++    pub(crate) acct_sampled: u64,
+     pub(crate) cdm_ticks: u64,
+     pub(crate) span_ticks: u64,
+     /// Retired prefixes whose stage stamps, converted from the stage clock to the
+@@ -2585,7 +2594,14 @@ fn prefix_render(
+         let behind = !self.engine.flights.is_empty();
+         // Without timestamp outputs nothing reads the fragment timestamp records but the
+         // retirement check, which then relies on the stamps and receipts alone.
+-        let short = params::fs_short() && cmd.timestamp_outputs.is_empty();
++        // `g16_short_acct`: a render that would be short in either stage may be its queue's
++        // sample, which keeps both long forms.
++        let eligible =
++            cmd.timestamp_outputs.is_empty() && (params::fs_short() || params::ta_short());
++        let acct = params::short_acct();
++        let sampled = eligible && acct != 0 && job.queue.short.sample_due(acct);
++        f.acct_sample = sampled;
++        let short = params::fs_short() && cmd.timestamp_outputs.is_empty() && !sampled;
+         f.fs_short = short;
+         f.work_copy = work_slot.as_ref().map_or(0, |s| s.3 as u8 + 1);
+         FS_FORMS[usize::from(short)].fetch_add(1, Ordering::Relaxed);
+@@ -2619,7 +2635,7 @@ fn prefix_render(
+         // g16_ta_short: no TA end timestamp target (TA work +0x8d0, the end half of
+         // internal_pair()) for a render without timestamp outputs, as macOS's TA pair. A flight
+         // carries one render (pass[0]), whose receipt reads f.ta_short.
+-        let ta_short = params::ta_short() && cmd.timestamp_outputs.is_empty();
++        let ta_short = params::ta_short() && cmd.timestamp_outputs.is_empty() && !sampled;
+         if ta_short {
+             scratch.ta.get_mut(0x8d0..0x8d8).ok_or(EINVAL)?.fill(0);
+         }
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 0936fe859a..492b5b219d 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -72,6 +72,7 @@
+ mod recovery;
+ mod regs;
+ mod resources;
++mod short_acct;
+ mod sleep;
+ pub(crate) use sleep::register_reboot;
+ mod slots;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 366b4aa7b9..5e96058967 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -3315,6 +3315,32 @@ pub(crate) fn ta_short() -> bool {
+     "G16: 1 = renders without timestamp outputs name no TA end timestamp target, as macOS; their receipt needs the TA start only (default 0)"
+ );
+ 
++/// Storage of `g16_short_acct` (runtime 0644, default 0).
++static SHORT_ACCT: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_short_acct` = N (2 to 1024; 1 counts as 2), with `g16_fs_short` or `g16_ta_short`: about
++/// one render in N of a queue that would be published short (no timestamp outputs) keeps both
++/// long forms, a jittered interval from N - N/4 to N + N/4, and its measured TA and FS spans
++/// update that queue's moving averages; every short render of the queue is credited those
++/// averages in the client's fdinfo engine time and in the short_acct: statistics line
++/// (short_acct.rs). 0 (default): off, and nothing changes. Read at each render's publication and
++/// retirement.
++pub(crate) fn short_acct() -> u32 {
++    match SHORT_ACCT.load(Ordering::Relaxed) {
++        0 => 0,
++        n => n.clamp(2, super::short_acct::N_MAX),
++    }
++}
++
++live_u32_param!(
++    SHORT_ACCT_PARAM,
++    SHORT_ACCT_PARMTYPE,
++    SHORT_ACCT_PARM,
++    SHORT_ACCT,
++    "g16_short_acct",
++    "G16: N = one render in about N that g16_fs_short or g16_ta_short would shorten keeps its stamps; short renders are credited its queue's mean stage time (default 0: off; runtime 0644)"
++);
++
+ /// Storage of `g16_behind_initbm` (runtime 0644, default 1).
+ static BEHIND_INITBM: AtomicU32 = AtomicU32::new(1);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 57e71f51ab..f7039a6c52 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1835,6 +1835,17 @@ fn publish_timestamps(&self, flight: &Flight, claims: &super::slots::Claims) ->
+     /// A retired prefix: publication to retirement (including any wait behind its
+     /// predecessor), event times, internal stage times of its members.
+     fn stat_retire(&mut self, f: &Flight) {
++        // One stage interval (start, end) from internal timestamp cells, if written and in order.
++        fn stage_cells(o: &super::object::FwObject, off: usize) -> Option<(u64, u64)> {
++            let (Ok(start_lo), Ok(start_hi), Ok(end_lo), Ok(end_hi)) =
++                (o.r32(off), o.r32(off + 4), o.r32(off + 8), o.r32(off + 12))
++            else {
++                return None;
++            };
++            let start = u64::from(start_hi) << 32 | u64::from(start_lo);
++            let end = u64::from(end_hi) << 32 | u64::from(end_lo);
++            (start != 0 && end > start).then_some((start, end))
++        }
+         let now = now_ns();
+         let d = now.wrapping_sub(f.published_ns);
+         let kind = if f.computes != 0 && f.renders != 0 {
+@@ -1897,6 +1908,43 @@ fn stat_retire(&mut self, f: &Flight) {
+                 1,
+             );
+         }
++        // `g16_short_acct`: a sampled render's measured spans feed its queue's averages; a short
++        // render's missing stage is credited them, in fdinfo and in the short_acct: line. The
++        // stage: line keeps measured spans only.
++        if params::short_acct() != 0 && f.renders != 0 {
++            let q = &f.job.queue;
++            let hz = super::hw::COMMAND_TIMESTAMP_HZ as u32;
++            for k in 0..f.renders as usize {
++                let cells = f
++                    .job
++                    .resources
++                    .render
++                    .as_ref()
++                    .and_then(|a| a.pass(f.claims.pass[k] as usize))
++                    .map(|p| [0x600usize, 0x620].map(|off| stage_cells(&p.scene, off)));
++                if f.acct_sample {
++                    s.acct_sampled += 1;
++                    for (stage, c) in cells.iter().flatten().enumerate() {
++                        if let Some((start, end)) = c {
++                            q.short.note(stage, end - start);
++                        }
++                    }
++                }
++                for (stage, short, engine) in [
++                    (0, f.ta_short, crate::usage::Engine::Vertex),
++                    (1, f.fs_short, crate::usage::Engine::Fragment),
++                ] {
++                    if !short {
++                        continue;
++                    }
++                    if let Some(t) = q.short.credit(stage) {
++                        q.usage.add(engine, 1, 1 + u64::from(t), hz);
++                        s.acct_ticks[stage] = s.acct_ticks[stage].saturating_add(u64::from(t));
++                        s.acct_credited[stage] += 1;
++                    }
++                }
++            }
++        }
+         for k in 0..(f.computes as usize).min(f.claims.slot_count as usize) {
+             let Some(arena) = f.job.resources.compute.as_ref() else {
+                 return;
+@@ -2342,6 +2390,19 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             ta[1].load(Ordering::Relaxed),
+             ta[0].load(Ordering::Relaxed)
+         )?;
++        if params::short_acct() != 0 && (params::fs_short() || params::ta_short()) {
++            let st = &*self.engine.stats;
++            writeln!(
++                f,
++                "short_acct: every {} sampled {} credited ta {} fs {} est ta_us {} fs_us {}",
++                params::short_acct(),
++                st.acct_sampled,
++                st.acct_credited[0],
++                st.acct_credited[1],
++                st.acct_ticks[0] / 24,
++                st.acct_ticks[1] / 24
++            )?;
++        }
+         let lazy = &super::resources::LAZY_STATS;
+         writeln!(
+             f,
+diff --git a/drivers/gpu/drm/asahi/g16/queue.rs b/drivers/gpu/drm/asahi/g16/queue.rs
+index aff2abba08..34b4e37be5 100644
+--- a/drivers/gpu/drm/asahi/g16/queue.rs
++++ b/drivers/gpu/drm/asahi/g16/queue.rs
+@@ -64,6 +64,8 @@ pub(crate) struct QueueState {
+     /// engine when a job arrives.
+     pub(crate) owned: [AtomicU32; 32],
+     pub(crate) owned_index: AtomicU32,
++    /// `g16_short_acct`: this queue's sampling and mean stage spans.
++    pub(crate) short: super::short_acct::State,
+ }
+ 
+ impl QueueState {
+@@ -149,6 +151,7 @@ pub(crate) fn new(
+                 compute_end: AtomicU64::new(0),
+                 owned: [const { AtomicU32::new(0) }; 32],
+                 owned_index: AtomicU32::new(0),
++                short: super::short_acct::State::new(),
+             },
+             GFP_KERNEL,
+         )?;
+diff --git a/drivers/gpu/drm/asahi/g16/short_acct.rs b/drivers/gpu/drm/asahi/g16/short_acct.rs
+new file mode 100644
+index 0000000000..c2e752ad44
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/short_acct.rs
+@@ -0,0 +1,210 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++//! `g16_short_acct`: stage time for renders published with the short sequences. Core only, so
++//! the rules run as host tests.
++//!
++//! With `g16_fs_short` a render that asks for no timestamps has no FS start and end stamps, and
++//! with `g16_ta_short` no TA end stamp, so the client's fdinfo fragment and vertex time and the
++//! stage statistics stop advancing for such renders. With N = `g16_short_acct` one eligible
++//! render of a queue in about N (a jittered interval, so that a workload with a period cannot
++//! align with the samples) keeps both long forms and is measured by its own stamps, exactly as
++//! with the words off. Every short render of that queue is credited the moving average of its
++//! queue's sampled spans, per stage. Credit starts once the queue's first sample retired.
++
++use core::sync::atomic::{AtomicU32, Ordering};
++
++/// Stages with a short form: 0 TA (vertex), 1 FS (fragment).
++pub(crate) const STAGES: usize = 2;
++/// A new sample weighs 1/8 in the average.
++pub(crate) const EMA_SHIFT: u32 = 3;
++/// Largest sampling interval.
++pub(crate) const N_MAX: u32 = 1024;
++/// Largest span averaged, in stamp ticks (0.7 s at 24 MHz); the average keeps 8 fraction bits.
++pub(crate) const SPAN_MAX: u32 = (1 << 24) - 1;
++
++/// Per-queue sampling and averages. Read and written under the engine lock; the atomics only
++/// make the state shareable through the queue's `Arc`.
++pub(crate) struct State {
++    /// Eligible renders still to publish short before the next sample.
++    until: AtomicU32,
++    /// Jitter generator state.
++    rng: AtomicU32,
++    /// Moving average of the sampled spans, per stage, in 1/256 stamp ticks (0: no sample yet).
++    mean: [AtomicU32; STAGES],
++}
++
++impl State {
++    pub(crate) const fn new() -> Self {
++        Self {
++            until: AtomicU32::new(0),
++            rng: AtomicU32::new(0x9e37_79b9),
++            mean: [const { AtomicU32::new(0) }; STAGES],
++        }
++    }
++
++    /// Called once per eligible render (no timestamp outputs, a short word on) at publication,
++    /// with `n` = `g16_short_acct`: whether this render is a sample and keeps the long forms.
++    /// The first eligible render of a queue is always a sample. `n` 0: never.
++    pub(crate) fn sample_due(&self, n: u32) -> bool {
++        if n == 0 {
++            return false;
++        }
++        let until = self.until.load(Ordering::Relaxed);
++        if until > 0 {
++            self.until.store(until - 1, Ordering::Relaxed);
++            return false;
++        }
++        let (next, rng) = interval(self.rng.load(Ordering::Relaxed), n);
++        self.rng.store(rng, Ordering::Relaxed);
++        self.until.store(next - 1, Ordering::Relaxed);
++        true
++    }
++
++    /// Folds a sampled render's measured span of `stage` into the average.
++    pub(crate) fn note(&self, stage: usize, ticks: u64) {
++        if let Some(m) = self.mean.get(stage) {
++            let t = ticks.clamp(1, u64::from(SPAN_MAX)) as u32;
++            m.store(ema(m.load(Ordering::Relaxed), t), Ordering::Relaxed);
++        }
++    }
++
++    /// The span a short render of this queue is credited for `stage`; None before the first
++    /// sample.
++    pub(crate) fn credit(&self, stage: usize) -> Option<u32> {
++        self.mean
++            .get(stage)
++            .map(|m| m.load(Ordering::Relaxed))
++            .filter(|&m| m != 0)
++            .map(|m| ((m + 128) >> 8).max(1))
++    }
++}
++
++/// The renders until the next sample with `n` = `g16_short_acct` (2 to [`N_MAX`]; 1 counts as
++/// 2), drawn evenly from n - n/4 to n + n/4, and the generator's next state.
++pub(crate) fn interval(rng: u32, n: u32) -> (u32, u32) {
++    let n = n.clamp(2, N_MAX);
++    let next = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
++    let lo = n - n / 4;
++    let span = 2 * (n / 4) + 1;
++    (lo + (next >> 16) % span, next)
++}
++
++/// The moving average (1/256 ticks) after one more sample of `sample` ticks: the first sample
++/// as it is, then each new one weighing 1 / 2^[`EMA_SHIFT`]. The step rounds toward zero in
++/// both directions, so it has no drift of its own.
++pub(crate) fn ema(mean: u32, sample: u32) -> u32 {
++    let s = i64::from(sample.min(SPAN_MAX)) << 8;
++    if mean == 0 {
++        return s.max(1) as u32;
++    }
++    let m = i64::from(mean);
++    (m + (s - m) / (1 << EMA_SHIFT)).clamp(1, i64::from(u32::MAX)) as u32
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Publishes `count` eligible renders whose true spans are `span(i)`, samples retiring
++    /// `lag` renders later, and returns (credited total, true total of the short renders,
++    /// samples).
++    fn run(n: u32, count: usize, lag: usize, span: impl Fn(usize) -> u32) -> (u64, u64, u32) {
++        let st = State::new();
++        let mut sampled = vec![false; count];
++        let (mut credit, mut truth, mut samples) = (0u64, 0u64, 0u32);
++        for i in 0..count + lag {
++            if i < count {
++                sampled[i] = st.sample_due(n);
++            }
++            // Retire render i - lag.
++            if i >= lag {
++                let r = i - lag;
++                if sampled[r] {
++                    st.note(1, u64::from(span(r)));
++                    samples += 1;
++                } else if let Some(c) = st.credit(1) {
++                    credit += u64::from(c);
++                    truth += u64::from(span(r));
++                }
++            }
++        }
++        (credit, truth, samples)
++    }
++
++    #[test]
++    fn off_never_samples_and_credits_nothing() {
++        let st = State::new();
++        assert!((0..1000).all(|_| !st.sample_due(0)));
++        assert_eq!(st.credit(0), None);
++        assert_eq!(st.credit(1), None);
++    }
++
++    #[test]
++    fn the_first_render_is_a_sample_and_the_rate_is_one_in_n() {
++        for n in [2u32, 8, 16, 64] {
++            let st = State::new();
++            assert!(st.sample_due(n));
++            let k = (0..100_000).filter(|_| st.sample_due(n)).count() as f64;
++            let rate = 100_000.0 / k;
++            assert!(
++                (rate - f64::from(n)).abs() <= f64::from(n) * 0.05,
++                "n {n}: one in {rate}"
++            );
++        }
++    }
++
++    #[test]
++    fn intervals_stay_within_a_quarter_of_n() {
++        let mut rng = 1;
++        for _ in 0..10_000 {
++            let (k, r) = interval(rng, 16);
++            assert!((12..=20).contains(&k), "{k}");
++            rng = r;
++        }
++        assert_eq!(interval(5, 1).0, interval(5, 2).0);
++        assert!(interval(5, u32::MAX).0 <= N_MAX + N_MAX / 4);
++    }
++
++    #[test]
++    fn a_steady_stream_is_credited_its_own_total() {
++        // render.light: about 2.5 us of FS (60 ticks) with +-10 % noise, 64 in flight.
++        let (credit, truth, samples) = run(16, 20_000, 64, |i| 54 + (i * 7919 % 13) as u32);
++        assert!(samples > 1000);
++        let err = (credit as f64 - truth as f64) / truth as f64;
++        assert!(err.abs() < 0.02, "error {err}");
++    }
++
++    #[test]
++    fn jitter_breaks_a_period_that_divides_n() {
++        // Two passes per frame, 10 and 30 ticks: a fixed interval of 16 would sample one kind
++        // only and credit 10 or 30 for every render; the jittered one credits about 20.
++        let (credit, truth, _) = run(16, 40_000, 8, |i| if i % 2 == 0 { 10 } else { 30 });
++        let err = (credit as f64 - truth as f64) / truth as f64;
++        assert!(err.abs() < 0.05, "error {err}");
++        let st = State::new();
++        let fixed = (0..40_000).map(|i| (i % 16 == 0, if i % 2 == 0 { 10 } else { 30 }));
++        for (s, v) in fixed {
++            if s {
++                st.note(1, v);
++            }
++        }
++        assert_eq!(
++            st.credit(1),
++            Some(10),
++            "the fixed interval sees one kind only"
++        );
++    }
++
++    #[test]
++    fn a_step_in_the_workload_is_followed() {
++        // 60 ticks, then 120: after the step the credit converges to the new span.
++        let st = State::new();
++        for v in [60u64; 200].iter().chain([120u64; 200].iter()) {
++            st.note(1, *v);
++        }
++        let c = st.credit(1).unwrap();
++        assert!((115..=120).contains(&c), "{c}");
++        assert_eq!(ema(0, 0), 1);
++        assert_eq!(ema(60 << 8, 60), 60 << 8);
++        assert_eq!(ema(0, u32::MAX), SPAN_MAX << 8);
++    }
++}
+-- 
+2.43.0
+

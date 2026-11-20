@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Wed, 18 Nov 2026 22:45:43 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally drop the TA end timestamp
+ target of renders
+
+Every render's TA work names an internal timestamp pair, start and end,
+in its pass scene (TA work +0x8c8 and +0x8d0), and the firmware writes
+both. The TA pair of macOS 26B123's render.light names no end target,
+and the stage-complete op that writes our TA end runs between the TA end
+and the FS start.
+
+Add the run-time word g16_ta_short (default 0). At 1 a render without
+timestamp outputs is published with an end target of 0, so its TA end
+time is never written:
+ - its receipt needs the TA start, fresh because the scene image is
+   rewritten at publication, and no longer a TA end after it; the rule
+   for all three receipt paths is the pure function in stage_stamps.rs,
+   which is the old expression when the word is 0;
+ - its vertex time is missing from the stage statistics and the
+   client's usage, which already skip a pair without an end;
+ - the order watch does not compare it (a 0 stamp is not compared), so
+   the word is not meant to run together with g16_fs_keyed.
+Renders with timestamp outputs never change. A flight carries one
+render, the one its receipt reads. The stats line "ta_short: on S short
+N long M" counts both forms.
+
+Ported from 70deb94e3e on the 1.1040 line without its sampled form (2).
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs       | 14 +++++
+ drivers/gpu/drm/asahi/g16/params.rs       | 21 +++++++
+ drivers/gpu/drm/asahi/g16/poll.rs         | 38 +++++++++---
+ drivers/gpu/drm/asahi/g16/stage_stamps.rs | 74 +++++++++++++++++++++++
+ 4 files changed, 138 insertions(+), 9 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/stage_stamps.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 49d570384b..12bd4e5aa4 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -28,6 +28,8 @@
+ 
+ /// Renders encoded with the long fragment sequence ([0]) and the short one ([1], `g16_fs_short`).
+ pub(crate) static FS_FORMS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
++/// Renders published with ([0]) and without ([1]) a TA end timestamp target (`g16_ta_short`).
++pub(crate) static TA_FORMS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+ 
+ /// `g16_compute_seq_pool`: compute commands published with their microsequence in the uncached
+ /// [0] and in the ASC-cached [1] slot copy.
+@@ -225,6 +227,8 @@ pub(crate) struct Flight {
+     pub(crate) cq: usize,
+     /// The render's fragment sequence has no timestamp records (`g16_fs_short`).
+     pub(crate) fs_short: bool,
++    /// The render's TA work names no internal end timestamp target (`g16_ta_short`).
++    pub(crate) ta_short: bool,
+     /// `g16_render_work_pool`: where the render's work records went (0: its unit's own work
+     /// objects; 1 / 2: the uncached / ASC-cached pool copy).
+     pub(crate) work_copy: u8,
+@@ -275,6 +279,7 @@ fn new(job: Arc<Job>) -> Self {
+             c_start: 0,
+             cq: 0,
+             fs_short: false,
++            ta_short: false,
+             work_copy: 0,
+             cwork_copy: 0,
+             ta_target: 0,
+@@ -2611,6 +2616,15 @@ fn prefix_render(
+             image(&mut scratch.fs)?,
+             &mut scratch.fss[..],
+         );
++        // g16_ta_short: no TA end timestamp target (TA work +0x8d0, the end half of
++        // internal_pair()) for a render without timestamp outputs, as macOS's TA pair. A flight
++        // carries one render (pass[0]), whose receipt reads f.ta_short.
++        let ta_short = params::ta_short() && cmd.timestamp_outputs.is_empty();
++        if ta_short {
++            scratch.ta.get_mut(0x8d0..0x8d8).ok_or(EINVAL)?.fill(0);
++        }
++        f.ta_short = ta_short;
++        TA_FORMS[usize::from(ta_short)].fetch_add(1, Ordering::Relaxed);
+         // g16_first_kick_idle: a render queued behind running work needs no per-pass
+         // notification; its receipts are proven from the stamps (TA block at +0x878, FS block
+         // at +0xbc0, the word at +0x1c of each, see encode::render metadata()).
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 010c7ddb18..366b4aa7b9 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -3294,6 +3294,27 @@ pub(crate) fn lone_ctx_skip() -> bool {
+     "G16: 1 = with g16_notifier_cached, retire a render with nothing behind it without the cached record CONTEXT words; stamps, receipts and scene times still prove it (default 1; 0 holds such a render until its cached CONTEXT words are cleaned)"
+ );
+ 
++/// Storage of `g16_ta_short` (runtime 0644, default 0).
++static TA_SHORT: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_ta_short` 1: a render without timestamp outputs is published with no TA END timestamp
++/// target (TA work +0x8d0 = 0), as macOS's TA pair names none. Its receipt then needs the TA start
++/// and not a TA end after it (stage_stamps.rs); its vertex time is missing from the stage
++/// statistics and the client's usage. Renders with timestamp outputs never change. 0 (default):
++/// no change. Read at each render's publication.
++pub(crate) fn ta_short() -> bool {
++    TA_SHORT.load(Ordering::Relaxed) == 1
++}
++
++live_u32_param!(
++    TA_SHORT_PARAM,
++    TA_SHORT_PARMTYPE,
++    TA_SHORT_PARM,
++    TA_SHORT,
++    "g16_ta_short",
++    "G16: 1 = renders without timestamp outputs name no TA end timestamp target, as macOS; their receipt needs the TA start only (default 0)"
++);
++
+ /// Storage of `g16_behind_initbm` (runtime 0644, default 1).
+ static BEHIND_INITBM: AtomicU32 = AtomicU32::new(1);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index ad5ce22254..57e71f51ab 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -179,6 +179,9 @@ fn wbig_stats(f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ /// Renders whose microsequences went to a `g16_render_seq_pool` slot: [0] the uncached copy,
+ /// [1] the ASC-cached copy.
+ /// `g16_render_work_pool`: renders whose work records went to the uncached / ASC-cached copy.
++#[path = "stage_stamps.rs"]
++pub(crate) mod stage_stamps;
++
+ pub(crate) static RENDER_WORK: [core::sync::atomic::AtomicU64; 2] =
+     [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+ pub(crate) static RENDER_SEQ: [core::sync::atomic::AtomicU64; 2] =
+@@ -1404,9 +1407,12 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+             full &= stamp_reached(ta_note, f.ta_target, e.ta_target)
+                 && stamp_reached(fs_note, f.fs_target, e.fs_target)
+                 && f.job.resources.render()?.pool_retired(k)?
+-                && ta_start != 0
+-                && ta_end > ta_start
+-                && (f.fs_short || (fs_start != 0 && fs_end > fs_start));
++                && stage_stamps::proved(
++                    f.ta_short,
++                    f.fs_short,
++                    (ta_start, ta_end),
++                    (fs_start, fs_end),
++                );
+         } else if f.renders != 0 {
+             let g = &self.graph.render;
+             if g.fw_stamp[0].r32(0)? != f.ta_target
+@@ -1442,9 +1448,12 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+                         .r32(notifier_page::FS_RECORD + notifier::CONTEXT)?
+                         == f.job.vm.slot
+                     && f.job.resources.render()?.pool_retired(k)?
+-                    && ta_start != 0
+-                    && ta_end > ta_start
+-                    && (f.fs_short || (fs_start != 0 && fs_end > fs_start));
++                    && stage_stamps::proved(
++                        f.ta_short,
++                        f.fs_short,
++                        (ta_start, ta_end),
++                        (fs_start, fs_end),
++                    );
+             } else {
+                 // `g16_notifier_cached`: the CONTEXT words are the one host read of the
+                 // ASC-cached record page. The uncached witnesses first, then CONTEXT, counted;
+@@ -1452,9 +1461,12 @@ fn retired_snapshot(&mut self) -> Result<Retirement> {
+                 let proved = g.notifier.r32(notifier_page::TA_STAMP)? == f.ta_target
+                     && g.notifier.r32(notifier_page::FS_STAMP)? == f.fs_target
+                     && f.job.resources.render()?.pool_retired(k)?
+-                    && ta_start != 0
+-                    && ta_end > ta_start
+-                    && (f.fs_short || (fs_start != 0 && fs_end > fs_start));
++                    && stage_stamps::proved(
++                        f.ta_short,
++                        f.fs_short,
++                        (ta_start, ta_end),
++                        (fs_start, fs_end),
++                    );
+                 let ctx = proved
+                     && g.record_page().r32(notifier::CONTEXT)? == f.job.vm.slot
+                     && g.record_page()
+@@ -2322,6 +2334,14 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             forms[1].load(Ordering::Relaxed),
+             forms[0].load(Ordering::Relaxed)
+         )?;
++        let ta = &super::engine::TA_FORMS;
++        writeln!(
++            f,
++            "ta_short: on {} short {} long {}",
++            u32::from(params::ta_short()),
++            ta[1].load(Ordering::Relaxed),
++            ta[0].load(Ordering::Relaxed)
++        )?;
+         let lazy = &super::resources::LAZY_STATS;
+         writeln!(
+             f,
+diff --git a/drivers/gpu/drm/asahi/g16/stage_stamps.rs b/drivers/gpu/drm/asahi/g16/stage_stamps.rs
+new file mode 100644
+index 0000000000..198ce3f2b7
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/stage_stamps.rs
+@@ -0,0 +1,74 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! The stage-stamp part of a render's receipt (poll.rs retired_snapshot), as one pure rule.
++//!
++//! The firmware writes a render's internal timestamp pairs into its pass scene: TA start and end
++//! at +0x600 / +0x608, FS start and end at +0x620 / +0x628. The scene image is rewritten at
++//! publication, so a non-zero start is this render's. `g16_fs_short` drops the FS pair's records;
++//! `g16_ta_short` drops only the TA END target (TA work +0x8d0 = 0, as macOS's TA pair), so the
++//! TA start stays required. With both off the rule is the old one, case for case.
++
++/// `ta_short` / `fs_short`: the render was published in that form. `ta` and `fs`: the (start,
++/// end) stamps read from its scene.
++pub(crate) const fn proved(ta_short: bool, fs_short: bool, ta: (u64, u64), fs: (u64, u64)) -> bool {
++    ta.0 != 0 && (ta_short || ta.1 > ta.0) && (fs_short || (fs.0 != 0 && fs.1 > fs.0))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const V: [u64; 4] = [0, 1, 0x1_0000_0000, 0x1_0000_0030];
++
++    fn old(fs_short: bool, ta: (u64, u64), fs: (u64, u64)) -> bool {
++        ta.0 != 0 && ta.1 > ta.0 && (fs_short || (fs.0 != 0 && fs.1 > fs.0))
++    }
++
++    #[test]
++    fn ta_short_off_is_the_old_rule_in_every_case() {
++        for fs_short in [false, true] {
++            for a in V {
++                for b in V {
++                    for c in V {
++                        for d in V {
++                            assert_eq!(proved(false, fs_short, (a, b), (c, d)), old(fs_short, (a, b), (c, d)));
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn the_ta_start_is_always_required() {
++        for ta_short in [false, true] {
++            for fs_short in [false, true] {
++                for b in V {
++                    assert!(!proved(ta_short, fs_short, (0, b), (V[2], V[3])));
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn ta_short_drops_only_the_ta_end() {
++        let fs = (V[2], V[3]);
++        assert!(proved(true, false, (V[2], 0), fs));
++        assert!(!proved(false, false, (V[2], 0), fs));
++        // The FS pair is still required without fs_short.
++        assert!(!proved(true, false, (V[2], 0), (0, 0)));
++        assert!(!proved(true, false, (V[2], 0), (V[3], V[2])));
++    }
++
++    #[test]
++    fn both_short_need_the_ta_start_only() {
++        assert!(proved(true, true, (V[2], 0), (0, 0)));
++        assert!(!proved(true, true, (0, 0), (V[2], V[3])));
++    }
++
++    #[test]
++    fn a_stale_or_reversed_ta_pair_fails_without_ta_short() {
++        assert!(!proved(false, true, (V[3], V[2]), (0, 0)));
++        assert!(!proved(false, true, (V[2], V[2]), (0, 0)));
++    }
++}
+-- 
+2.43.0
+
