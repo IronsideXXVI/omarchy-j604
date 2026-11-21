@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 20 Nov 2026 07:43:45 +0000
+Subject: [PATCH] media: apple: avd: Test switch for the T8132 MCW
+ block
+
+T8132's decoder is macOS's Daisy generation: AppleAVD on this J604's
+macOS 26B123 logs deviceType 416 (0x1a0) and constructs
+CAvdApCommDaisy at boot. After its bridge tables, Daisy's
+loadTunables writes a two-entry table picked by the ADT's
+active-mcc-bit-vector. The J604 ADT has no such property, so macOS
+takes index 1: MCW_BLK_CTL_STS bits 12:8 cleared and
+MCW_BLK_ACTIVE_MCC_MAP set to 0xff, at AVD +0x1004000.
+
+Linux never touches this block. Add apple_avd.mcw_mode, read at each
+power-up before the decoder CPU starts: 0 (the default) makes no
+access, 1 reads and logs both registers, 2 writes macOS's values
+under their masks and reads them back. With the default the driver
+behaves as before; the block is only ioremapped at probe.
+
+Assisted-by: LLM
+---
+ .../platform/apple/avd/avd-backend-open.c     |  1 +
+ drivers/media/platform/apple/avd/avd-drv.c    |  3 +
+ .../media/platform/apple/avd/avd-pm-test.c    | 17 ++++
+ drivers/media/platform/apple/avd/avd-pm.c     | 86 ++++++++++++++++++-
+ drivers/media/platform/apple/avd/avd-pm.h     |  6 ++
+ 5 files changed, 110 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/platform/apple/avd/avd-backend-open.c b/drivers/media/platform/apple/avd/avd-backend-open.c
+index ea7c4af8a3c..1b933396698 100644
+--- a/drivers/media/platform/apple/avd/avd-backend-open.c
++++ b/drivers/media/platform/apple/avd/avd-backend-open.c
+@@ -261,6 +261,7 @@ int avd_backend_boot(struct avd_dev *avd)
+ 	int ret;
+ 
+ 	avd_pm_apply_axi_tunables(avd);
++	avd_pm_apply_mcw(avd);
+ 	if (!avd_backend_is_apple(avd)) {
+ 		avd_pm_prepare_piodma(avd);
+ 		avd_qfw_prepare_boot(avd);
+diff --git a/drivers/media/platform/apple/avd/avd-drv.c b/drivers/media/platform/apple/avd/avd-drv.c
+index e9b2050366a..892a77b624e 100644
+--- a/drivers/media/platform/apple/avd/avd-drv.c
++++ b/drivers/media/platform/apple/avd/avd-drv.c
+@@ -727,6 +727,9 @@ static int avd_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 	ret = avd_pm_map_axi2af(avd);
++	if (ret)
++		return ret;
++	ret = avd_pm_map_mcw(avd);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/media/platform/apple/avd/avd-pm-test.c b/drivers/media/platform/apple/avd/avd-pm-test.c
+index 237412fd4d6..34eb7025dc2 100644
+--- a/drivers/media/platform/apple/avd/avd-pm-test.c
++++ b/drivers/media/platform/apple/avd/avd-pm-test.c
+@@ -405,6 +405,22 @@ static void avd_pm_axi_tunables_test(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, readl(base + 0x401c), 1U);
+ }
+ 
++/* macOS's index-1 MCW values land under their masks; other bits are kept. */
++static void avd_pm_mcw_tunables_test(struct kunit *test)
++{
++	void __iomem *base = (__force void __iomem *)kunit_kzalloc(test, 0x10, GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, (__force void *)base);
++	writel(0xffffffff, base + 0x0);
++	writel(0xabcd000f, base + 0x8);
++	writel(0x12345678, base + 0x4);
++	KUNIT_EXPECT_EQ(test, avd_pm_write_mcw_tunables(base), AVD_MCW_TUNABLES);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x0), 0xffffe0ffU);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x8), 0xabcd00ffU);
++	/* Nothing between the two registers is written. */
++	KUNIT_EXPECT_EQ(test, readl(base + 0x4), 0x12345678U);
++}
++
+ static struct kunit_case avd_pm_test_cases[] = {
+ 	KUNIT_CASE(avd_pm_suspend_gate_test),
+ 	KUNIT_CASE(avd_pm_resume_order_test),
+@@ -418,6 +434,7 @@ static struct kunit_case avd_pm_test_cases[] = {
+ 	KUNIT_CASE(avd_pm_recovery_boot_test),
+ 	KUNIT_CASE(avd_pm_parked_resume_test),
+ 	KUNIT_CASE(avd_pm_axi_tunables_test),
++	KUNIT_CASE(avd_pm_mcw_tunables_test),
+ 	{}
+ };
+ 
+diff --git a/drivers/media/platform/apple/avd/avd-pm.c b/drivers/media/platform/apple/avd/avd-pm.c
+index d8e3c2d9f67..055ddb7e4de 100644
+--- a/drivers/media/platform/apple/avd/avd-pm.c
++++ b/drivers/media/platform/apple/avd/avd-pm.c
+@@ -291,12 +291,14 @@ static const struct avd_tunable avd_t8132_axi2af[AVD_AXI_TUNABLES] = {
+ 	{ 0x401c, 0x00000001, 0x00000001 }, /* KEEP_ALIVE_AXI2AF_OUTSTANDING_ENA */
+ };
+ 
+-unsigned int avd_pm_write_axi_tunables(void __iomem *base)
++static unsigned int avd_pm_write_tunables(void __iomem *base,
++					  const struct avd_tunable *table,
++					  unsigned int count)
+ {
+ 	unsigned int ok = 0;
+ 
+-	for (unsigned int i = 0; i < ARRAY_SIZE(avd_t8132_axi2af); i++) {
+-		const struct avd_tunable *t = &avd_t8132_axi2af[i];
++	for (unsigned int i = 0; i < count; i++) {
++		const struct avd_tunable *t = &table[i];
+ 		u32 v = readl(base + t->off);
+ 
+ 		writel((v & ~t->mask) | (t->val & t->mask), base + t->off);
+@@ -306,6 +308,12 @@ unsigned int avd_pm_write_axi_tunables(void __iomem *base)
+ 	return ok;
+ }
+ 
++unsigned int avd_pm_write_axi_tunables(void __iomem *base)
++{
++	return avd_pm_write_tunables(base, avd_t8132_axi2af,
++				     ARRAY_SIZE(avd_t8132_axi2af));
++}
++
+ int avd_pm_map_axi2af(struct avd_dev *avd)
+ {
+ 	struct resource *ctrl;
+@@ -332,6 +340,78 @@ void avd_pm_apply_axi_tunables(struct avd_dev *avd)
+ 			     ok, AVD_AXI_TUNABLES);
+ }
+ 
++/*
++ * T8132 is macOS's Daisy generation (AppleAVD deviceType 0x1a0,
++ * CAvdApCommDaisy). After the bridge tables, its loadTunables writes one
++ * more two-entry table, picked by the ADT's active-mcc-bit-vector: the
++ * memory-cache write (MCW) block's status bits and its active MCC map.
++ * The J604 ADT has no such property, so macOS uses index 1:
++ * CTL_STS bits 12:8 cleared and ACTIVE_MCC_MAP = 0xff. The block is at
++ * AVD +0x1004000 (ctrl - 0xfc000), in the window that also holds the
++ * decoder DART and the CM3 code. Linux never touches it.
++ *
++ * Test switch, read at each power-up before the decoder CPU starts:
++ * 0 = no access (default), 1 = read both registers and log them only,
++ * 2 = write macOS's values under their masks and read them back.
++ */
++static unsigned int mcw_mode;
++module_param(mcw_mode, uint, 0644);
++MODULE_PARM_DESC(mcw_mode,
++		 "Test only: T8132 decoder MCW block: 0 off, 1 read only, 2 program as macOS does (default 0)");
++
++#define AVD_MCW_CTRL_OFFSET	0xfc000
++#define AVD_MCW_SIZE		0x10
++#define AVD_MCW_CTL_STS		0x0
++#define AVD_MCW_ACTIVE_MCC_MAP	0x8
++
++static const struct avd_tunable avd_t8132_mcw[AVD_MCW_TUNABLES] = {
++	{ AVD_MCW_CTL_STS, 0x00001f00, 0x00000000 }, /* MCW_BLK_CTL_STS */
++	{ AVD_MCW_ACTIVE_MCC_MAP, 0x000000ff, 0x000000ff }, /* ACTIVE_MCC_MAP */
++};
++
++unsigned int avd_pm_write_mcw_tunables(void __iomem *base)
++{
++	return avd_pm_write_tunables(base, avd_t8132_mcw,
++				     ARRAY_SIZE(avd_t8132_mcw));
++}
++
++int avd_pm_map_mcw(struct avd_dev *avd)
++{
++	struct resource *ctrl;
++
++	if (!of_device_is_compatible(avd->dev->of_node, "apple,t8132-avd"))
++		return 0;
++	ctrl = platform_get_resource_byname(avd->pdev, IORESOURCE_MEM, "ctrl");
++	if (!ctrl || ctrl->start < AVD_MCW_CTRL_OFFSET)
++		return 0;
++	avd->pm.mcw = devm_ioremap(avd->dev, ctrl->start - AVD_MCW_CTRL_OFFSET,
++				   AVD_MCW_SIZE);
++	return avd->pm.mcw ? 0 : -ENOMEM;
++}
++
++/* At every firmware boot, after the bridge, as macOS orders its tables. */
++void avd_pm_apply_mcw(struct avd_dev *avd)
++{
++	unsigned int mode = READ_ONCE(mcw_mode);
++	unsigned int ok;
++	u32 sts, map;
++
++	if (!avd->pm.mcw || !mode || mode > 2)
++		return;
++	sts = readl(avd->pm.mcw + AVD_MCW_CTL_STS);
++	map = readl(avd->pm.mcw + AVD_MCW_ACTIVE_MCC_MAP);
++	if (mode == 1) {
++		dev_info_ratelimited(avd->dev,
++				     "MCW read: CTL_STS 0x%08x ACTIVE_MCC_MAP 0x%08x\n",
++				     sts, map);
++		return;
++	}
++	ok = avd_pm_write_mcw_tunables(avd->pm.mcw);
++	dev_info_ratelimited(avd->dev,
++			     "MCW tunables applied: %u of %u read back (was CTL_STS 0x%08x ACTIVE_MCC_MAP 0x%08x)\n",
++			     ok, AVD_MCW_TUNABLES, sts, map);
++}
++
+ void avd_pm_prepare_piodma(struct avd_dev *avd)
+ {
+ 	/* Public CM3 boot ABI: replay the SRAM base after every power loss/reset. */
+diff --git a/drivers/media/platform/apple/avd/avd-pm.h b/drivers/media/platform/apple/avd/avd-pm.h
+index 2acbe4b5a75..2bb94290b04 100644
+--- a/drivers/media/platform/apple/avd/avd-pm.h
++++ b/drivers/media/platform/apple/avd/avd-pm.h
+@@ -45,6 +45,7 @@ struct avd_pm {
+ 	unsigned int irq_gen;
+ 	void __iomem *piodma;
+ 	void __iomem *axi2af; /* T8132: the decoder's AXI-to-fabric bridge */
++	void __iomem *mcw; /* T8132: the decoder's memory-cache write block */
+ 	phys_addr_t sram_phys;
+ 	wait_queue_head_t idle_wait;
+ 	/* Protected by queue_lock; counts drain operations, not stopped streams. */
+@@ -65,6 +66,11 @@ void avd_pm_apply_axi_tunables(struct avd_dev *avd);
+ /* Exposed for KUnit: program @base, return how many entries read back. */
+ unsigned int avd_pm_write_axi_tunables(void __iomem *base);
+ #define AVD_AXI_TUNABLES 34
++int avd_pm_map_mcw(struct avd_dev *avd);
++void avd_pm_apply_mcw(struct avd_dev *avd);
++/* Exposed for KUnit: program @base, return how many entries read back. */
++unsigned int avd_pm_write_mcw_tunables(void __iomem *base);
++#define AVD_MCW_TUNABLES 2
+ /* After queue cleanup: release deferred DMA mappings before the final off. */
+ void avd_pm_disable(struct avd_dev *avd);
+ /* Called in process context, after the last frame has retired its mapping. */
+-- 
+2.43.0
+

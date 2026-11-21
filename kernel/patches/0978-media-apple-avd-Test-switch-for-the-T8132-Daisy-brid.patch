@@ -1,0 +1,261 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 20 Nov 2026 08:13:22 +0000
+Subject: [PATCH] media: apple: avd: Test switch for the T8132 Daisy
+ bridge tables
+
+On this J604's macOS 26B123, AppleAVD constructs CAvdApCommDaisy and
+logs deviceType 416 (0x1a0). Daisy's loadTunables programs the
+decoder's bridge from its own tables: 13 upstream and 2 downstream
+flow-control entries without read-back, then the 346 decoder entries
+(our CM3 firmware already applies the same 346, avd-fw
+tunables_v5t1.h), then 32 AXI2AF entries with read-back, then a check
+of both flow-control groups. axi_tunables writes Tansy's values, of
+another generation.
+
+Add apple_avd.axi_daisy, a boot-only parameter read at each power-up
+before the decoder CPU starts: 0 (the default) makes no access, 1 logs
+every planned write and touches nothing, 2 reads each register once
+and logs it, 3 writes the tables in macOS's order. It refuses to run
+while axi_tunables is set.
+
+Assisted-by: LLM
+---
+ .../platform/apple/avd/avd-backend-open.c     |   1 +
+ .../media/platform/apple/avd/avd-pm-test.c    |  19 +++
+ drivers/media/platform/apple/avd/avd-pm.c     | 154 ++++++++++++++++++
+ drivers/media/platform/apple/avd/avd-pm.h     |   4 +
+ 4 files changed, 178 insertions(+)
+
+diff --git a/drivers/media/platform/apple/avd/avd-backend-open.c b/drivers/media/platform/apple/avd/avd-backend-open.c
+index 1b933396698..0014b442775 100644
+--- a/drivers/media/platform/apple/avd/avd-backend-open.c
++++ b/drivers/media/platform/apple/avd/avd-backend-open.c
+@@ -261,6 +261,7 @@ int avd_backend_boot(struct avd_dev *avd)
+ 	int ret;
+ 
+ 	avd_pm_apply_axi_tunables(avd);
++	avd_pm_apply_axi_daisy(avd);
+ 	avd_pm_apply_mcw(avd);
+ 	if (!avd_backend_is_apple(avd)) {
+ 		avd_pm_prepare_piodma(avd);
+diff --git a/drivers/media/platform/apple/avd/avd-pm-test.c b/drivers/media/platform/apple/avd/avd-pm-test.c
+index 34eb7025dc2..a5263a6e6e4 100644
+--- a/drivers/media/platform/apple/avd/avd-pm-test.c
++++ b/drivers/media/platform/apple/avd/avd-pm-test.c
+@@ -405,6 +405,24 @@ static void avd_pm_axi_tunables_test(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, readl(base + 0x401c), 1U);
+ }
+ 
++/* Daisy's 47 values land under their masks; neighbour bits are kept. */
++static void avd_pm_daisy_tunables_test(struct kunit *test)
++{
++	void __iomem *base = (__force void __iomem *)kunit_kzalloc(test, 0x4020, GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, (__force void *)base);
++	writel(0x7f00ff00, base + 0x8);
++	writel(0xffffffff, base + 0x400c);
++	writel(0x0000ffff, base + 0x108);
++	KUNIT_EXPECT_EQ(test, avd_pm_write_daisy_tunables(base), AVD_DAISY_TUNABLES);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x8), 0xff26ff05U);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x20), 0x80260003U);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x400c), 0xffffffffU);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x108), 0x0010fff9U);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x848), 0x01400080U);
++	KUNIT_EXPECT_EQ(test, readl(base + 0x4008), 0U);
++}
++
+ /* macOS's index-1 MCW values land under their masks; other bits are kept. */
+ static void avd_pm_mcw_tunables_test(struct kunit *test)
+ {
+@@ -435,6 +453,7 @@ static struct kunit_case avd_pm_test_cases[] = {
+ 	KUNIT_CASE(avd_pm_parked_resume_test),
+ 	KUNIT_CASE(avd_pm_axi_tunables_test),
+ 	KUNIT_CASE(avd_pm_mcw_tunables_test),
++	KUNIT_CASE(avd_pm_daisy_tunables_test),
+ 	{}
+ };
+ 
+diff --git a/drivers/media/platform/apple/avd/avd-pm.c b/drivers/media/platform/apple/avd/avd-pm.c
+index 055ddb7e4de..4ece3194daf 100644
+--- a/drivers/media/platform/apple/avd/avd-pm.c
++++ b/drivers/media/platform/apple/avd/avd-pm.c
+@@ -340,6 +340,160 @@ void avd_pm_apply_axi_tunables(struct avd_dev *avd)
+ 			     ok, AVD_AXI_TUNABLES);
+ }
+ 
++/*
++ * T8132 is Daisy (see the MCW block below). macOS's CAvdApCommDaisy
++ * loadTunables, for tunablesIdx 1 to 4, programs the bridge from these
++ * tables, in this order: upstream and downstream flow control without
++ * read-back, then the decoder tables our CM3 firmware already applies
++ * (avd-fw tunables_v5t1.h equals macOS's 346 entries), then the AXI2AF
++ * table with read-back, then it checks both flow-control groups. The
++ * axi_tunables switch above writes another generation's (Tansy's)
++ * values and is not used with this one.
++ *
++ * Boot-only test switch, read at each power-up before the decoder CPU
++ * starts: 0 = no access (default), 1 = log every planned write and touch
++ * nothing, 2 = read each register once and log it (an access to the
++ * bridge window), 3 = program the tables in macOS's order.
++ */
++static unsigned int axi_daisy;
++module_param(axi_daisy, uint, 0444);
++MODULE_PARM_DESC(axi_daisy,
++		 "Test only: T8132 bridge as macOS's Daisy: 0 off, 1 log only, 2 read, 3 program (boot only, default 0)");
++
++static const struct avd_tunable avd_daisy_flow_up[] = {
++	{ 0x0000, 0x800000ff, 0x80000026 }, /* UP_CMD_CREDIT_GS_ALLOC */
++	{ 0x0004, 0x80ff00ff, 0x80260003 }, /* UP_CMD_CREDIT_BULKRD_REQ0_ALLOC */
++	{ 0x0008, 0x80ff00ff, 0x80260005 }, /* UP_CMD_CREDIT_BULKWR_REQ0_ALLOC */
++	{ 0x000c, 0x80ff00ff, 0x80260005 }, /* UP_CMD_CREDIT_LLT_REQ0_ALLOC */
++	{ 0x0010, 0x80ff00ff, 0x80260003 }, /* UP_CMD_CREDIT_VCP_REQ1_ALLOC */
++	{ 0x0014, 0x80ff00ff, 0x80260003 }, /* UP_CMD_CREDIT_VCP_CPL_ALLOC */
++	{ 0x0018, 0x800000ff, 0x8000001f }, /* UP_CMD_TOKEN_ALLOC */
++	{ 0x001c, 0x800000ff, 0x80000026 }, /* UP_DATA_CREDIT_GS_ALLOC */
++	{ 0x0020, 0x80ff00ff, 0x80260003 }, /* UP_DATA_CREDIT_BULKWR_REQ0_ALLOC */
++	{ 0x0024, 0x80ff00ff, 0x801d0007 }, /* UP_DATA_CREDIT_LLT_REQ0_ALLOC */
++	{ 0x0028, 0x80ff00ff, 0x80260003 }, /* UP_DATA_CREDIT_VCP_REQ1_ALLOC */
++	{ 0x002c, 0x80ff00ff, 0x80260003 }, /* UP_DATA_CREDIT_VCP_CPL_ALLOC */
++	{ 0x0030, 0x800000ff, 0x8000001f }, /* UP_DATA_TOKEN_ALLOC */
++};
++
++static const struct avd_tunable avd_daisy_flow_dn[] = {
++	{ 0x0034, 0x800000ff, 0x8000001f }, /* DN_CMD_FLOW_TOKEN_ALLOC */
++	{ 0x0038, 0x800000ff, 0x8000001f }, /* DN_PULL_TOKEN_ALLOC */
++};
++
++static const struct avd_tunable avd_daisy_axi2af[] = {
++	{ 0x0100, 0x000000ff, 0x000000ff }, /* LINK_MGMT_CPG_CG_ENA */
++	{ 0x0108, 0xffff0006, 0x00100000 }, /* LINK_MGMT_CPG_LINK_TEARDOWN */
++	{ 0x0304, 0x3f3f0000, 0x02020000 }, /* AIU_UP_ARB_RESOURCE_THRESHOLD_A */
++	{ 0x0308, 0x000fffff, 0x00001681 }, /* AIU_UP_ARB_GC_SATURATION */
++	{ 0x030c, 0x000fffff, 0x00001680 }, /* AIU_UP_ARB_GC_SATURATION_ADJ */
++	{ 0x0310, 0x70000fff, 0x000001e0 }, /* AIU_UP_ARB_M_LLT_AR_WEIGHT */
++	{ 0x0314, 0xf0000fff, 0x800001e0 }, /* AIU_UP_ARB_M_LLT_AW_WEIGHT */
++	{ 0x0318, 0x70000fff, 0x000005a0 }, /* AIU_UP_ARB_M_BULK_AR_WEIGHT */
++	{ 0x031c, 0xf0000fff, 0x800005a0 }, /* AIU_UP_ARB_M_BULK_AW_WEIGHT */
++	{ 0x0320, 0x70000fff, 0x000005a0 }, /* AIU_UP_ARB_S_R_WEIGHT */
++	{ 0x0324, 0x70000fff, 0x000005a0 }, /* AIU_UP_ARB_S_B_WEIGHT */
++	{ 0x0328, 0x70000fff, 0x000005a0 }, /* AIU_UP_ARB_PIO_CPL_WEIGHT */
++	{ 0x0330, 0xffffffff, 0x0000ffff }, /* AIU_UP_ARB_SHARED_TLIMIT0 */
++	{ 0x0334, 0xffffffff, 0x0000ffff }, /* AIU_UP_ARB_SHARED_TLIMIT1 */
++	{ 0x0408, 0xffff0020, 0x00220020 }, /* AIU_DN_ARB_PULL_CFG */
++	{ 0x040c, 0x000fffff, 0x00001681 }, /* AIU_DN_ARB_PULL_GC_SATURATION */
++	{ 0x0410, 0x000fffff, 0x00001680 }, /* AIU_DN_ARB_PULL_GC_SATURATION_ADJ */
++	{ 0x0414, 0x70000fff, 0x000001e0 }, /* AIU_DN_ARB_PULL_M_LLT_R_WEIGHT */
++	{ 0x0418, 0x70000fff, 0x000001e0 }, /* AIU_DN_ARB_PULL_M_LLT_B_WEIGHT */
++	{ 0x041c, 0x70000fff, 0x000005a0 }, /* AIU_DN_ARB_PULL_M_BULK_R_WEIGHT */
++	{ 0x0420, 0x70000fff, 0x000005a0 }, /* AIU_DN_ARB_PULL_M_BULK_B_WEIGHT */
++	{ 0x0424, 0x70000fff, 0x000005a0 }, /* AIU_DN_ARB_PULL_S_AR_WEIGHT */
++	{ 0x0428, 0x70000fff, 0x000005a0 }, /* AIU_DN_ARB_PULL_S_AW_WEIGHT */
++	{ 0x042c, 0x70000fff, 0x000005a0 }, /* AIU_DN_ARB_PULL_PIO_NP_WEIGHT */
++	{ 0x0748, 0x07ff07ff, 0x00300000 }, /* AXI_M_LLT_TLIMIT */
++	{ 0x0848, 0x07ff07ff, 0x01400080 }, /* AXI_M_BULK_TLIMIT */
++	{ 0x0a00, 0xffffffff, 0x7fffffff }, /* DEBUG_CG_ENA */
++	{ 0x4008, 0x00000001, 0x00000000 }, /* KEEP_ALIVE_AGENT_FLOOR_ENA */
++	{ 0x400c, 0x00000001, 0x00000001 }, /* KEEP_ALIVE_AF_LINK_FLOOR_ENA */
++	{ 0x4014, 0x00000001, 0x00000000 }, /* KEEP_ALIVE_AGENT_PERF_POWER_ENA */
++	{ 0x4018, 0x00000001, 0x00000000 }, /* KEEP_ALIVE_AGENT_OUTSTANDING_ENA */
++	{ 0x401c, 0x00000001, 0x00000001 }, /* KEEP_ALIVE_AXI2AF_OUTSTANDING_ENA */
++};
++
++static void avd_pm_daisy_log(struct avd_dev *avd, const char *what,
++			     const struct avd_tunable *t, unsigned int n,
++			     void __iomem *base)
++{
++	for (unsigned int i = 0; i < n; i++) {
++		if (base)
++			dev_info(avd->dev, "AXI daisy %s +0x%04x reads 0x%08x\n",
++				 what, t[i].off, readl(base + t[i].off));
++		else
++			dev_info(avd->dev, "AXI daisy %s +0x%04x mask 0x%08x value 0x%08x (not written)\n",
++				 what, t[i].off, t[i].mask, t[i].val);
++	}
++}
++
++static void avd_pm_daisy_write(void __iomem *base, const struct avd_tunable *t,
++			       unsigned int n)
++{
++	for (unsigned int i = 0; i < n; i++) {
++		u32 v = readl(base + t[i].off);
++
++		writel((v & ~t[i].mask) | (t[i].val & t[i].mask), base + t[i].off);
++	}
++}
++
++static unsigned int avd_pm_daisy_check(void __iomem *base,
++				       const struct avd_tunable *t,
++				       unsigned int n)
++{
++	unsigned int ok = 0;
++
++	for (unsigned int i = 0; i < n; i++)
++		if ((readl(base + t[i].off) & t[i].mask) == (t[i].val & t[i].mask))
++			ok++;
++	return ok;
++}
++
++/* Exposed for KUnit: program @base in macOS's order, return entries that read back. */
++unsigned int avd_pm_write_daisy_tunables(void __iomem *base)
++{
++	unsigned int ok;
++
++	avd_pm_daisy_write(base, avd_daisy_flow_up, ARRAY_SIZE(avd_daisy_flow_up));
++	avd_pm_daisy_write(base, avd_daisy_flow_dn, ARRAY_SIZE(avd_daisy_flow_dn));
++	ok = avd_pm_write_tunables(base, avd_daisy_axi2af,
++				   ARRAY_SIZE(avd_daisy_axi2af));
++	ok += avd_pm_daisy_check(base, avd_daisy_flow_up,
++				 ARRAY_SIZE(avd_daisy_flow_up));
++	ok += avd_pm_daisy_check(base, avd_daisy_flow_dn,
++				 ARRAY_SIZE(avd_daisy_flow_dn));
++	return ok;
++}
++
++void avd_pm_apply_axi_daisy(struct avd_dev *avd)
++{
++	unsigned int ok;
++
++	if (!axi_daisy || axi_daisy > 3 || !avd->pm.axi2af)
++		return;
++	if (READ_ONCE(axi_tunables)) {
++		dev_warn_ratelimited(avd->dev, "AXI daisy refused: axi_tunables is set\n");
++		return;
++	}
++	if (axi_daisy == 1 || axi_daisy == 2) {
++		void __iomem *base = axi_daisy == 2 ? avd->pm.axi2af : NULL;
++
++		avd_pm_daisy_log(avd, "up", avd_daisy_flow_up,
++				 ARRAY_SIZE(avd_daisy_flow_up), base);
++		avd_pm_daisy_log(avd, "dn", avd_daisy_flow_dn,
++				 ARRAY_SIZE(avd_daisy_flow_dn), base);
++		avd_pm_daisy_log(avd, "axi2af", avd_daisy_axi2af,
++				 ARRAY_SIZE(avd_daisy_axi2af), base);
++		return;
++	}
++	ok = avd_pm_write_daisy_tunables(avd->pm.axi2af);
++	dev_info_ratelimited(avd->dev, "AXI daisy tables applied: %u of %u read back\n",
++			     ok, AVD_DAISY_TUNABLES);
++}
++
+ /*
+  * T8132 is macOS's Daisy generation (AppleAVD deviceType 0x1a0,
+  * CAvdApCommDaisy). After the bridge tables, its loadTunables writes one
+diff --git a/drivers/media/platform/apple/avd/avd-pm.h b/drivers/media/platform/apple/avd/avd-pm.h
+index 2bb94290b04..429ce69cfa5 100644
+--- a/drivers/media/platform/apple/avd/avd-pm.h
++++ b/drivers/media/platform/apple/avd/avd-pm.h
+@@ -71,6 +71,10 @@ void avd_pm_apply_mcw(struct avd_dev *avd);
+ /* Exposed for KUnit: program @base, return how many entries read back. */
+ unsigned int avd_pm_write_mcw_tunables(void __iomem *base);
+ #define AVD_MCW_TUNABLES 2
++void avd_pm_apply_axi_daisy(struct avd_dev *avd);
++/* Exposed for KUnit: program @base, return how many entries read back. */
++unsigned int avd_pm_write_daisy_tunables(void __iomem *base);
++#define AVD_DAISY_TUNABLES 47
+ /* After queue cleanup: release deferred DMA mappings before the final off. */
+ void avd_pm_disable(struct avd_dev *avd);
+ /* Called in process context, after the last frame has retired its mapping. */
+-- 
+2.43.0
+
