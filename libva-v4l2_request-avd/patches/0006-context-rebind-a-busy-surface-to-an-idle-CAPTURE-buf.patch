@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 21 Nov 2026 18:31:14 +0000
+Subject: [PATCH 6/9] context: rebind a busy surface to an idle CAPTURE buffer
+
+A surface keeps its CAPTURE buffer for its whole life. When the client
+hands a surface back for a new frame while that buffer is still busy,
+because its last decode has not completed or a submitted frame still
+references its contents, binding waits for the decoder to catch up. A
+client that does not sync its output surfaces, such as FFmpeg decoding
+without a download, gets surfaces back from its pool as soon as they
+leave the DPB. Each wait drains the queue down to the frame that was
+using the buffer.
+
+With V4L2R_REBIND=<n>, decode into an idle buffer instead: the oldest
+idle orphan on the free list, or a new buffer while fewer than n orphans
+are waiting. The old buffer is orphaned as a destroyed surface's would
+be. Its contents and last_ref_seq stay intact, so frames already
+submitted still find it by its timestamp, and it is only recycled once
+they are done. This only applies to decoder-allocated (MMAP) buffers
+without a format converter that nobody has exported, because an
+exported buffer's memory is what the client sees for that surface. n is
+capped at 8; 0, the default for now, keeps the wait.
+
+Assisted-by: LLM
+---
+ src/context.c      | 79 ++++++++++++++++++++++++++++++++++++++++++++++
+ src/v4l2_request.h |  4 +++
+ 2 files changed, 83 insertions(+)
+
+diff --git a/src/context.c b/src/context.c
+index 2a9b305..73e5e75 100644
+--- a/src/context.c
++++ b/src/context.c
+@@ -499,6 +499,46 @@ static int free_list_pop(struct v4l2r_context *ctx)
+ 	return index;
+ }
+ 
++/*
++ * A buffer can be decoded into without waiting: its own last decode has
++ * completed and no submitted frame still references its contents.
++ */
++static bool capture_idle(struct v4l2r_context *ctx, int index)
++{
++	bool idle;
++
++	pthread_mutex_lock(&ctx->mutex);
++	idle = !(ctx->queued_capture & (UINT64_C(1) << index)) &&
++	       ctx->captures[index].last_ref_seq <= ctx->completed;
++	pthread_mutex_unlock(&ctx->mutex);
++	return idle;
++}
++
++static bool capture_exported(const struct v4l2r_capture_buffer *capture)
++{
++	for (unsigned int i = 0; i < capture->nb_planes; i++)
++		if (capture->dmabuf_fd[i] >= 0)
++			return true;
++	return false;
++}
++
++/* Take the oldest idle buffer off the free list, keeping the others' order. */
++static int free_list_take_idle(struct v4l2r_context *ctx)
++{
++	unsigned int count = ctx->free_count;
++	int found = -1;
++
++	for (unsigned int i = 0; i < count; i++) {
++		int index = free_list_pop(ctx);
++
++		if (found < 0 && capture_idle(ctx, index))
++			found = index;
++		else
++			free_list_push(ctx, index);
++	}
++	return found;
++}
++
+ /* Per-CAPTURE-buffer size implied by the negotiated format, in bytes. */
+ static size_t capture_format_bytes(const struct v4l2_format *fmt)
+ {
+@@ -858,6 +898,38 @@ static int capture_buffer_bind(struct v4l2r_context *ctx,
+ 			  surface->id, index, recycled ? "recycled" : "new");
+ 	}
+ 
++	/*
++	 * The client handed back a surface whose buffer is still busy: its
++	 * last decode is in flight, or a submitted frame still references
++	 * its contents. With V4L2R_REBIND set, decode into an idle buffer
++	 * instead of waiting. The old buffer is orphaned with its contents
++	 * and last_ref_seq intact, so frames already submitted still find it
++	 * by its timestamp, and it is only recycled once they are done. Only
++	 * for decoder-allocated buffers nobody has exported: an exported
++	 * buffer's memory is what the client sees for this surface. At most
++	 * rebind_spare buffers are added beyond the bound ones.
++	 */
++	if (ctx->rebind_spare && ctx->capture_memory == V4L2_MEMORY_MMAP &&
++	    !ctx->conv && !capture_exported(&ctx->captures[index]) &&
++	    !capture_idle(ctx, index)) {
++		int idle = free_list_take_idle(ctx);
++
++		if (idle < 0 && ctx->free_count < ctx->rebind_spare)
++			idle = capture_buffer_new(ctx);
++		if (idle >= 0) {
++			int old = index;
++
++			v4l2r_context_release_capture(ctx, old);
++			ctx->captures[idle].surface = surface;
++			surface->capture_index = idle;
++			index = idle;
++			v4l2r_trace("rebind surface 0x%08x: CAPTURE buffer #%d "
++				    "busy, now #%d (pool %u, free %u)\n",
++				    surface->id, old, idle, ctx->nb_captures,
++				    ctx->free_count);
++		}
++	}
++
+ 	/* Do not overwrite the buffer while its own last decode is in flight,
+ 	 * while any frame still references its current contents, or while
+ 	 * the format converter is still reading it. */
+@@ -1182,6 +1254,13 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
+ 		if (ioctl(ctx->video_fd, VIDIOC_QUERYCAP, &capability) < 0)
+ 			goto next;
+ 		ctx->is_avd = !strcmp((const char *)capability.driver, "avd");
++		{
++			const char *rebind = getenv("V4L2R_REBIND");
++			int spare = rebind ? atoi(rebind) : V4L2R_REBIND_DEFAULT;
++
++			ctx->rebind_spare = spare < 0 ? 0 :
++				spare > V4L2R_REBIND_MAX ? V4L2R_REBIND_MAX : spare;
++		}
+ 
+ 		capabilities = (capability.capabilities & V4L2_CAP_DEVICE_CAPS) ?
+ 			       capability.device_caps : capability.capabilities;
+diff --git a/src/v4l2_request.h b/src/v4l2_request.h
+index 50ca7a8..d286e3b 100644
+--- a/src/v4l2_request.h
++++ b/src/v4l2_request.h
+@@ -66,6 +66,9 @@ static inline uint64_t v4l2r_now_ns(void)
+  * per-frame buffer pool the count reaches roughly the client's live surface
+  * count plus the pipeline depth, so keep headroom up to the 64-bit bitmask. */
+ #define V4L2R_MAX_CAPTURE_BUFFERS	64
++/* Spare CAPTURE buffers a busy surface may be rebound to (V4L2R_REBIND). */
++#define V4L2R_REBIND_DEFAULT 0
++#define V4L2R_REBIND_MAX 8
+ 
+ /* Upper bound on any single wait for the hardware (buffer/request/fence). */
+ #define V4L2R_POLL_TIMEOUT_MS		2000
+@@ -408,6 +411,7 @@ struct v4l2r_context {
+ 	int video_fd;
+ 	int media_fd;
+ 	bool is_avd;
++	unsigned int rebind_spare;	/* V4L2R_REBIND: 0 = wait for busy buffers */
+ 
+ 	unsigned int picture_width;
+ 	unsigned int picture_height;

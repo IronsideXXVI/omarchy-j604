@@ -1417,3 +1417,7 @@ The base remains da8e1acf3656. Published 0001–0976 are unchanged. 0977 to 0982
 # Kernel patch numbers: 1.1143 to 1.1196
 
 The base remains da8e1acf3656. Published 0001–0982 are unchanged. 0983 to 0989 let a GPU client's render units share one memory pool and give idle memory back, and fix the speaker amplifiers' power-down: 0983 lets later render units build on unit 0's pool, 0984 lets render unit 1 do the same, 0985 lets units 0 and 1 start with a small TPC and tilemap, 0986 lets an idle client give back the later units it built (each off by default), 0987 turns all four on by default, 0988 treats a changed register as success on the `tas2764` power-down path, and 0989 keeps the first error in that sequence and always undoes its temporary setting. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1144 to 1.1195 were not released or published.
+
+# Kernel patch numbers: 1.1196 to 1.1212
+
+The base remains da8e1acf3656. Published 0001–0989 are unchanged. 0990 lets a closed GPU client give back the render units it built after its first ones, at once instead of never (`g16_close_trim`, on by default). Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1197 to 1.1211 were not released or published.

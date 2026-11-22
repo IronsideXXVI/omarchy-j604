@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 21 Nov 2026 20:42:50 +0000
+Subject: [PATCH 7/9] context: do not enter DMABUF mode for a probe-only
+ backing
+
+The first surface decoded into fixes the CAPTURE queue memory type:
+DMABUF when that surface already has standalone backing, because a
+client exported it before its first decode, MMAP otherwise.
+
+FFmpeg gives one pool surface standalone backing without exporting it.
+When it creates the frames context it derives an image of the first
+surface to probe whether vaDeriveImage() works, destroys the image, and
+returns the surface to its pool, from which the decoder takes it first.
+Every FFmpeg VA-API decode therefore runs the queue in DMABUF mode and
+prints "surface ... was exported before its first decode". Rebinding a
+busy surface to an idle buffer (V4L2R_REBIND) only works on decoder
+allocated MMAP buffers, so it never engages under FFmpeg.
+
+Remember which surfaces vaExportSurfaceHandle() handed out. With
+V4L2R_REBIND set, drop standalone backing that was never exported and
+has no live derived image before the first decode into the surface; the
+decode replaces its contents anyway. Clients that do export before
+decoding keep DMABUF mode. V4L2R_REBIND=0 keeps the old behaviour.
+
+Assisted-by: LLM
+---
+ src/context.c      | 17 +++++++++++++++++
+ src/surface.c      |  2 ++
+ src/v4l2_request.h |  2 ++
+ 3 files changed, 21 insertions(+)
+
+diff --git a/src/context.c b/src/context.c
+index 73e5e75..b5156ee 100644
+--- a/src/context.c
++++ b/src/context.c
+@@ -840,6 +840,23 @@ static int capture_buffer_bind(struct v4l2r_context *ctx,
+ 	 * The format converter chain has its own backing rules, keep MMAP
+ 	 * there.
+ 	 */
++	/*
++	 * Standalone backing that no client holds is not an export.
++	 * FFmpeg derives an image of one pool surface to probe whether
++	 * vaDeriveImage() works and destroys it at once; that surface is
++	 * then the first one decoded into, and its leftover backing would
++	 * put the whole queue in DMABUF mode, where busy surfaces cannot
++	 * be rebound. With V4L2R_REBIND set, drop such backing before the
++	 * first decode: the decoder output replaces its contents anyway.
++	 */
++	if (ctx->rebind_spare && !ctx->conv && index < 0 &&
++	    surface->backing && !surface->client_exported &&
++	    !surface->image_refs) {
++		v4l2r_trace("drop unexported backing of surface 0x%08x\n",
++			    surface->id);
++		v4l2r_surface_free_backing(surface);
++	}
++
+ 	if (!ctx->capture_memory) {
+ 		if (!ctx->conv && surface->backing) {
+ 			ctx->capture_memory = V4L2_MEMORY_DMABUF;
+diff --git a/src/surface.c b/src/surface.c
+index dfeafd9..12118e9 100644
+--- a/src/surface.c
++++ b/src/surface.c
+@@ -1073,6 +1073,8 @@ VAStatus v4l2r_ExportSurfaceHandle(VADriverContextP va_ctx, VASurfaceID surface_
+ 	if (status != VA_STATUS_SUCCESS)
+ 		return status;
+ 
++	surface->client_exported = true;
++
+ 	return fill_prime_descriptor(&view, flags, descriptor);
+ }
+ 
+diff --git a/src/v4l2_request.h b/src/v4l2_request.h
+index d286e3b..c301198 100644
+--- a/src/v4l2_request.h
++++ b/src/v4l2_request.h
+@@ -299,6 +299,8 @@ struct v4l2r_surface {
+ 	VAStatus decode_status;
+ 	/* Derived images pin their source surface; protected by drv->mutex. */
+ 	unsigned int image_refs;
++	/* Handed to a client by vaExportSurfaceHandle(). */
++	bool client_exported;
+ 	struct v4l2r_surface_backing *backing;
+ 	/* A finished decode still needs (or is undergoing) format conversion
+ 	 * into the backing. Protected by ctx->mutex. */

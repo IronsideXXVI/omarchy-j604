@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 21 Nov 2026 21:35:57 +0000
+Subject: [PATCH] drm/asahi: g16: give back a closed VM's later render
+ units at close
+
+A client that queued deep (a bench at depth 64) builds up to
+g16_resident lazy render units of 10.5 MiB each (6 on the 8-unit cap, 16
+with the burst window at 18). g16_unit_trim gives them back only at the
+VM's next submit after the trim delay, and a closed VM never submits
+again. Its file closes, but the last-owner lease on each unit index it
+published on keeps the VM state, and with it the whole render arena,
+until another publication lands on that index. A two-unit client only
+publishes on indices 0 and 1, so the leases on indices 2 and up are
+never displaced and the lazy units stay resident for the rest of the
+session.
+
+Add g16_close_trim (runtime 0644, default 1). When any VM closes, every
+closed VM that still holds a render lease gives back the units it built
+after its first ones, from the top, through the same arena trim and the
+same per-index rule as g16_unit_trim. The leases themselves, the PB
+managers and the first units stay where they are, so the binding the
+firmware keeps to the last publisher's descriptor is untouched.
+
+Lifetime: vm_closed runs from the file's Vm drop after the user ranges
+are unmapped, which closes admission (is_closed), so prepare() refuses
+any later submission of that VM. trim_closed takes the VM's resource
+mutex and requires render_out == 0 under it, so no job of the VM exists
+that could read the units, and it takes the arena's building flag so the
+lazy worker stays out. An index is freed only when unit_free_ok allows
+it: no flight on the index, nothing pending there, and if the closed VM
+is still that index's last owner the index must be fully retired (its
+last command passed the complete normal receipt). This is the rule the
+idle trim already relies on for a VM's own leased units. A close with
+jobs still in flight skips the VM; it is visited again at the next VM
+close.
+
+The owners are collected under the device lock into a vector reserved
+before it, and trimmed after the lock is dropped, so nothing allocates
+or frees under the device lock. Counters: "close_trim: on N visits N
+units N held N" in the stats file.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/mod.rs       | 19 ++++++++++++
+ drivers/gpu/drm/asahi/g16/params.rs    | 22 ++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs      |  9 ++++++
+ drivers/gpu/drm/asahi/g16/resources.rs | 40 ++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/slots.rs     | 14 +++++++++
+ 5 files changed, 104 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 24d585a62e3..595753eb75b 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -797,13 +797,32 @@ fn new_vm_for_file(&self, kernel_range: Range<u64>, file_id: u64) -> Result<mmu:
+         vm::new_vm(self, kernel_range, file_id)
+     }
+     fn vm_closed(&self, vm: &mmu::Vm) {
++        // g16_close_trim: room for every unit's lease owner, reserved before the device lock.
++        let mut owners = if params::close_trim() {
++            KVec::with_capacity(hw::sizes::RENDER_UNITS, GFP_KERNEL).ok()
++        } else {
++            None
++        };
+         let registry = self.shared.state.lock().as_deref_mut().map(|state| {
+             state.slots.release_closed(vm.id());
++            if let Some(owners) = owners.as_mut() {
++                state.slots.closed_pass_owners(owners);
++            }
+             state.vms.clone()
+         });
+         if let Some(registry) = registry {
+             registry.close(vm.id());
+         }
++        // Outside every lock: each closed VM still leasing a unit (this one and any earlier
++        // one whose later units could not go yet) gives back its later units. The leases,
++        // and with them the VMs and their first units, stay until displaced as before.
++        if let Some(owners) = owners {
++            for o in owners.iter() {
++                if let Some(cache) = o.resources.as_ref() {
++                    cache.trim_closed(o, &self.shared);
++                }
++            }
++        }
+     }
+ 
+     fn new_queue(
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 8f37a48fcc7..6763bca6248 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -3144,6 +3144,28 @@ pub(crate) fn unit_trim_ms() -> u32 {
+     "G16: N ms = a VM idle that long gives back the render units it built later at its next submission (default 5000; 0: kept until it closes)"
+ );
+ 
++/// Storage of `g16_close_trim` (runtime 0644, default 1).
++static CLOSE_TRIM: AtomicU32 = AtomicU32::new(1);
++
++/// `g16_close_trim`: when any VM's handle closes, every closed VM that still holds a render
++/// unit's last-owner lease gives back the render units it built after its first render,
++/// under the same per-index rule as `g16_unit_trim` (resources.rs `Cache::trim_closed`). A
++/// closed VM never submits again, so the idle trim never reaches it, and a client that built
++/// only its first units never publishes on the higher indices whose leases keep it alive.
++/// 0: those units stay until a client deep enough publishes on every one of them.
++pub(crate) fn close_trim() -> bool {
++    CLOSE_TRIM.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    CLOSE_TRIM_PARAM,
++    CLOSE_TRIM_PARMTYPE,
++    CLOSE_TRIM_PARM,
++    CLOSE_TRIM,
++    "g16_close_trim",
++    "G16: 1 = a VM handle close gives back the later render units of closed VMs that still hold unit leases (default 1; 0: kept until a deep client displaces them)"
++);
++
+ /// Storage of `g16_loader_macos` (0644, default 7; read once, when initdata is built).
+ static LOADER_MACOS: AtomicU32 = AtomicU32::new(7);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index e0bb66bc5bb..733e24fa47e 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -2479,6 +2479,15 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             trim[1].load(Ordering::Relaxed),
+             trim[2].load(Ordering::Relaxed)
+         )?;
++        let ct = &super::resources::CLOSE_TRIM_STATS;
++        writeln!(
++            f,
++            "close_trim: on {} visits {} units {} held {}",
++            params::close_trim() as u32,
++            ct[0].load(Ordering::Relaxed),
++            ct[1].load(Ordering::Relaxed),
++            ct[2].load(Ordering::Relaxed)
++        )?;
+         let w: [u64; 8] = core::array::from_fn(|i| FS_WORDS[i].load(Ordering::Relaxed));
+         writeln!(
+             f,
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index d3a1d98c950..309da12f7e6 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -37,6 +37,10 @@
+ /// that could not go yet stopped (its index busy, pending or quarantined).
+ pub(crate) static TRIM_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+ 
++/// `g16_close_trim`: closed VMs visited, the units they gave back, and visits that freed
++/// nothing while later units remained (an index busy, pending or quarantined, or a job left).
++pub(crate) static CLOSE_TRIM_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
++
+ /// A render unit built after the VM's first render (`g16_resident_lazy`): its pass slot, its
+ /// UMA pool and PB heap, and the objects that map them.
+ pub(crate) struct ExtUnit {
+@@ -509,6 +513,42 @@ pub(crate) fn close_pool(&self) -> KVec<Arc<PbEpoch>> {
+         pool.closed = true;
+         core::mem::take(&mut pool.items)
+     }
++    /// `g16_close_trim`: VM `vm` (this cache's VM, its handle closed) gives back the render
++    /// units it built after its first render, from the top, while each index allows it
++    /// ([`super::Shared::unit_free_mask`], the `g16_unit_trim` rule). Its first units, its PB
++    /// managers and its last-owner leases stay. Called outside the device lock.
++    pub(crate) fn trim_closed(&self, vm: &VmState, shared: &super::Shared) {
++        if !vm.vm.is_closed() {
++            return;
++        }
++        let ready = self.ready.lock();
++        let Some(arena) = ready.render.as_ref() else {
++            return;
++        };
++        let first = arena.first_count();
++        let built = arena.unit_count();
++        if built <= first {
++            return;
++        }
++        CLOSE_TRIM_STATS[0].fetch_add(1, Ordering::Relaxed);
++        if self.render_out.load(Ordering::Relaxed) != 0
++            || arena.building.swap(true, Ordering::AcqRel)
++        {
++            CLOSE_TRIM_STATS[2].fetch_add(1, Ordering::Relaxed);
++            return;
++        }
++        let ok = shared.unit_free_mask(vm.id, first, built);
++        // SAFETY: the VM's handle is closed, so prepare() refuses every later submission,
++        // and render_out is 0 under the VM's resource mutex, so no job of the VM exists to
++        // read its units; `building` keeps the lazy worker out. The same contract as the
++        // idle trim in prepare().
++        let freed = unsafe { arena.trim(first, built, ok) };
++        arena.building.store(false, Ordering::Release);
++        if freed == 0 {
++            CLOSE_TRIM_STATS[2].fetch_add(1, Ordering::Relaxed);
++        }
++        CLOSE_TRIM_STATS[1].fetch_add(freed as u64, Ordering::Relaxed);
++    }
+     pub(crate) fn prepare(
+         &self,
+         vm: &Arc<VmState>,
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index 043f19483e6..5b7bf6ab978 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -787,6 +787,20 @@ pub(crate) fn release_closed(&mut self, id: u64) {
+         }
+     }
+ 
++    /// `g16_close_trim`: one reference to each distinct closed VM that still holds a render
++    /// unit's last-owner lease, into `out` (capacity reserved by the caller; never allocates
++    /// under the device lock). The caller trims them and drops the references outside it.
++    pub(crate) fn closed_pass_owners(&self, out: &mut KVec<Arc<super::vm::VmState>>) {
++        for o in self.pass_owner.iter().flatten() {
++            if !o.vm.is_closed() || out.iter().any(|v| v.id == o.id) {
++                continue;
++            }
++            if out.push_within_capacity(o.clone()).is_err() {
++                break;
++            }
++        }
++    }
++
+     /// `g16_unit_trim`: whether VM `vm`'s render unit on index `k` may be freed: no flight on
+     /// the index, no publication pending there, and not the VM's own last render left
+     /// quarantined there (resources::unit_trim::may_free).
+-- 
+2.43.0
+

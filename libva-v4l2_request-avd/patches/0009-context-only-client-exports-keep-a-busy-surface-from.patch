@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 21 Nov 2026 20:59:43 +0000
+Subject: [PATCH 9/9] context: only client exports keep a busy surface from
+ rebinding
+
+Rebinding skips CAPTURE buffers that have been exported, because an
+exported buffer's memory is what the client sees for that surface. But
+the driver also exports a buffer for its own mapping whenever the client
+reads a surface through vaDeriveImage() or vaGetImage(), so a client
+that downloads every frame, such as FFmpeg with hwdownload, ends up with
+every buffer exported and never rebinds. That client holds no dma-buf
+of the surface, only an image it destroys after the copy.
+
+Mark a buffer as client exported in vaExportSurfaceHandle() and only
+skip those. The flag stays set while the buffer exists, like the export
+itself.
+
+Assisted-by: LLM
+---
+ src/context.c      | 13 ++++++++-----
+ src/surface.c      |  2 ++
+ src/v4l2_request.h |  3 +++
+ 3 files changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/src/context.c b/src/context.c
+index b5156ee..e5cb486 100644
+--- a/src/context.c
++++ b/src/context.c
+@@ -466,6 +466,7 @@ static void capture_buffer_cleanup(struct v4l2r_context *ctx,
+ 			capture->dmabuf_fd[i] = -1;
+ 		}
+ 	}
++	capture->client_exported = false;
+ 
+ 	if (capture->surface) {
+ 		capture->surface->ctx = NULL;
+@@ -514,12 +515,14 @@ static bool capture_idle(struct v4l2r_context *ctx, int index)
+ 	return idle;
+ }
+ 
++/*
++ * Whether a client holds this buffer's memory as the surface's dma-buf.
++ * Image access (vaDeriveImage, vaGetImage) exports the buffer for the
++ * driver's own mapping too, but no client keeps that as the surface.
++ */
+ static bool capture_exported(const struct v4l2r_capture_buffer *capture)
+ {
+-	for (unsigned int i = 0; i < capture->nb_planes; i++)
+-		if (capture->dmabuf_fd[i] >= 0)
+-			return true;
+-	return false;
++	return capture->client_exported;
+ }
+ 
+ /* Take the oldest idle buffer off the free list, keeping the others' order. */
+@@ -922,7 +925,7 @@ static int capture_buffer_bind(struct v4l2r_context *ctx,
+ 	 * instead of waiting. The old buffer is orphaned with its contents
+ 	 * and last_ref_seq intact, so frames already submitted still find it
+ 	 * by its timestamp, and it is only recycled once they are done. Only
+-	 * for decoder-allocated buffers nobody has exported: an exported
++	 * for decoder-allocated buffers no client has exported: an exported
+ 	 * buffer's memory is what the client sees for this surface. At most
+ 	 * rebind_spare buffers are added beyond the bound ones.
+ 	 */
+diff --git a/src/surface.c b/src/surface.c
+index 12118e9..702e088 100644
+--- a/src/surface.c
++++ b/src/surface.c
+@@ -1074,6 +1074,8 @@ VAStatus v4l2r_ExportSurfaceHandle(VADriverContextP va_ctx, VASurfaceID surface_
+ 		return status;
+ 
+ 	surface->client_exported = true;
++	if (surface->ctx && surface->capture_index >= 0)
++		surface->ctx->captures[surface->capture_index].client_exported = true;
+ 
+ 	return fill_prime_descriptor(&view, flags, descriptor);
+ }
+diff --git a/src/v4l2_request.h b/src/v4l2_request.h
+index bbed0ee..abd22e7 100644
+--- a/src/v4l2_request.h
++++ b/src/v4l2_request.h
+@@ -346,6 +346,9 @@ struct v4l2r_capture_buffer {
+ 	uint32_t plane_size[VIDEO_MAX_PLANES];
+ 	int dmabuf_fd[VIDEO_MAX_PLANES];	/* exported lazily, -1 if not */
+ 	void *map[VIDEO_MAX_PLANES];		/* mmap()ed lazily, NULL if not */
++	/* Handed to a client by vaExportSurfaceHandle(); the driver's own
++	 * exports for image access do not count. */
++	bool client_exported;
+ 	/* Submission count of the most recent frame that used this buffer as a
+ 	 * reference. A new decode may not overwrite the buffer until
+ 	 * ctx->completed reaches this value, i.e. until every frame that
