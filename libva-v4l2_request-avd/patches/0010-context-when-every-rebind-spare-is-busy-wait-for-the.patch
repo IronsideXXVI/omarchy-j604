@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 21 Nov 2026 21:34:57 +0000
+Subject: [PATCH] context: when every rebind spare is busy, wait for the first
+ to free
+
+A busy surface is rebound to an idle spare CAPTURE buffer, up to
+V4L2R_REBIND spares. When all of them are still busy, the bind falls
+back to waiting for the surface's own buffer. Its last reader can be the
+newest frame in flight, so that wait drains the whole queue and the
+decoder starts the next frame from idle.
+
+Frames complete in submission order. Track the submission count of each
+buffer's own decode next to its last reference, and wait for the spare
+whose last use completes first, then rebind to it. The frames submitted
+after it stay queued, and the pool does not grow.
+
+On by default; V4L2R_REBIND_FIRST=0 restores the old wait.
+---
+ src/context.c      | 56 ++++++++++++++++++++++++++++++++++++++++++++++
+ src/decode.c       |  1 +
+ src/v4l2_request.h |  4 ++++
+ 3 files changed, 61 insertions(+)
+
+diff --git a/src/context.c b/src/context.c
+index e5cb486..2691b30 100644
+--- a/src/context.c
++++ b/src/context.c
+@@ -467,6 +467,7 @@ static void capture_buffer_cleanup(struct v4l2r_context *ctx,
+ 		}
+ 	}
+ 	capture->client_exported = false;
++	capture->decode_seq = 0;
+ 
+ 	if (capture->surface) {
+ 		capture->surface->ctx = NULL;
+@@ -542,6 +543,55 @@ static int free_list_take_idle(struct v4l2r_context *ctx)
+ 	return found;
+ }
+ 
++/* The submission count after which nothing still reads or writes the buffer. */
++static uint64_t capture_free_seq(const struct v4l2r_capture_buffer *capture)
++{
++	return capture->decode_seq > capture->last_ref_seq ?
++	       capture->decode_seq : capture->last_ref_seq;
++}
++
++/*
++ * Every rebind spare is busy. Waiting for the bound buffer can drain the
++ * whole queue when its last reader is the newest frame in flight, and the
++ * decoder then starts the next frame from idle. Frames complete in
++ * submission order, so wait instead for the spare that frees first and
++ * leave the frames after it queued. Returns that spare, off the free list,
++ * or -1 when no spare frees before the bound buffer does.
++ */
++static int free_list_take_first(struct v4l2r_context *ctx, int bound)
++{
++	unsigned int count = ctx->free_count;
++	uint64_t best_seq;
++	int best = -1;
++
++	pthread_mutex_lock(&ctx->mutex);
++	best_seq = capture_free_seq(&ctx->captures[bound]);
++	for (unsigned int i = 0; i < count; i++) {
++		int index = free_list_pop(ctx);
++		uint64_t seq = capture_free_seq(&ctx->captures[index]);
++
++		if (seq < best_seq) {
++			best_seq = seq;
++			best = index;
++		}
++		free_list_push(ctx, index);
++	}
++	pthread_mutex_unlock(&ctx->mutex);
++
++	if (best < 0 || v4l2r_wait_completed(ctx, best_seq) != VA_STATUS_SUCCESS)
++		return -1;
++
++	for (unsigned int i = 0; i < count; i++) {
++		int index = free_list_pop(ctx);
++
++		if (index != best)
++			free_list_push(ctx, index);
++	}
++	v4l2r_trace("rebind: all spares busy, waited for CAPTURE buffer #%d "
++		    "(seq %llu)\n", best, (unsigned long long)best_seq);
++	return best;
++}
++
+ /* Per-CAPTURE-buffer size implied by the negotiated format, in bytes. */
+ static size_t capture_format_bytes(const struct v4l2_format *fmt)
+ {
+@@ -936,6 +986,8 @@ static int capture_buffer_bind(struct v4l2r_context *ctx,
+ 
+ 		if (idle < 0 && ctx->free_count < ctx->rebind_spare)
+ 			idle = capture_buffer_new(ctx);
++		if (idle < 0 && ctx->rebind_first)
++			idle = free_list_take_first(ctx, index);
+ 		if (idle >= 0) {
+ 			int old = index;
+ 
+@@ -1280,6 +1332,10 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
+ 
+ 			ctx->rebind_spare = spare < 0 ? 0 :
+ 				spare > V4L2R_REBIND_MAX ? V4L2R_REBIND_MAX : spare;
++			const char *first = getenv("V4L2R_REBIND_FIRST");
++
++			ctx->rebind_first = first ? atoi(first) != 0 :
++					    V4L2R_REBIND_FIRST_DEFAULT;
+ 		}
+ 
+ 		capabilities = (capability.capabilities & V4L2_CAP_DEVICE_CAPS) ?
+diff --git a/src/decode.c b/src/decode.c
+index 85f8866..fdba49d 100644
+--- a/src/decode.c
++++ b/src/decode.c
+@@ -662,6 +662,7 @@ static VAStatus queue_decode(struct v4l2r_context *ctx,
+ 			goto fail;
+ 		}
+ 		target->decode_status = VA_STATUS_SUCCESS;
++		ctx->captures[target->capture_index].decode_seq = ctx->submitted;
+ 
+ 		/* ctx->submitted is now this frame's sequence number. Mark every
+ 		 * buffer it references as needed until this frame completes, so a
+diff --git a/src/v4l2_request.h b/src/v4l2_request.h
+index abd22e7..9360a3a 100644
+--- a/src/v4l2_request.h
++++ b/src/v4l2_request.h
+@@ -69,6 +69,7 @@ static inline uint64_t v4l2r_now_ns(void)
+ /* Spare CAPTURE buffers a busy surface may be rebound to (V4L2R_REBIND). */
+ #define V4L2R_REBIND_DEFAULT 4
+ #define V4L2R_REBIND_MAX 8
++#define V4L2R_REBIND_FIRST_DEFAULT 1
+ 
+ /* Upper bound on any single wait for the hardware (buffer/request/fence). */
+ #define V4L2R_POLL_TIMEOUT_MS		2000
+@@ -354,6 +355,8 @@ struct v4l2r_capture_buffer {
+ 	 * ctx->completed reaches this value, i.e. until every frame that
+ 	 * references its current contents has finished decoding. */
+ 	uint64_t last_ref_seq;
++	/* Submission count of the most recent decode into this buffer. */
++	uint64_t decode_seq;
+ };
+ 
+ struct v4l2r_output_buffer {
+@@ -417,6 +420,7 @@ struct v4l2r_context {
+ 	int media_fd;
+ 	bool is_avd;
+ 	unsigned int rebind_spare;	/* V4L2R_REBIND: 0 = wait for busy buffers */
++	bool rebind_first;	/* V4L2R_REBIND_FIRST: spares busy = wait for the first */
+ 
+ 	unsigned int picture_width;
+ 	unsigned int picture_height;
