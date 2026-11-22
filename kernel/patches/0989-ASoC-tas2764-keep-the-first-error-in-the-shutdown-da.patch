@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 21 Nov 2026 16:34:53 +0000
+Subject: [PATCH] ASoC: tas2764: keep the first error in the shutdown
+ dance and always undo it
+
+tas2764_do_quirky_pwr_ctrl_change() chained its steps on !ret, and the
+shutdown write in the middle is an update_bits() that returns 1 when it
+changes the register. So on every real ACTIVE or MUTE -> SHUTDOWN
+transition the post sequence was skipped: 0xfd:0x64 stayed at 4. The
+final update_bits() then overwrote ret, so a failed pre sequence was
+lost as well.
+
+Treat only a negative value as an error, keep the first one, and always
+run the post sequence once the pre sequence has been tried, so 0xfd:0x64
+goes back to 0 and the hidden page is deselected even when a step before
+it failed. Return 0 on success. The helper is reachable from the device
+tree for the first time with apple,shutdown-dance.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+(cherry picked from commit 66ffe5f045541c94024c8824256b4dd1793154a1)
+(cherry picked from commit 5891a3f9c63656d21ab184c71117a778e14d9903)
+---
+ sound/soc/codecs/tas2764-quirks.h | 35 ++++++++++++++++++++-----------
+ 1 file changed, 23 insertions(+), 12 deletions(-)
+
+diff --git a/sound/soc/codecs/tas2764-quirks.h b/sound/soc/codecs/tas2764-quirks.h
+index 7a62b3ba5b4..25d2e8d5313 100644
+--- a/sound/soc/codecs/tas2764-quirks.h
++++ b/sound/soc/codecs/tas2764-quirks.h
+@@ -120,7 +120,7 @@ static int tas2764_do_quirky_pwr_ctrl_change(struct tas2764_priv *tas2764,
+ 					     unsigned int target)
+ {
+ 	unsigned int curr;
+-	int ret;
++	int ret, err;
+ 
+ 	curr = snd_soc_component_read_field(tas2764->component,
+ 					       TAS2764_PWR_CTRL,
+@@ -129,26 +129,37 @@ static int tas2764_do_quirky_pwr_ctrl_change(struct tas2764_priv *tas2764,
+ 	if (target == curr)
+ 		return 0;
+ 
+-	/* Handle power state transition to shutdown */
++	/*
++	 * Handle power state transition to shutdown. update_bits() returns 1
++	 * when it changed the register, so only a negative value is an error.
++	 * Keep the first error, and always run the post sequence so that
++	 * 0xfd:0x64 is put back and the hidden page deselected, even when a
++	 * step before it failed.
++	 */
+ 	if (target == TAS2764_PWR_CTRL_SHUTDOWN &&
+ 	   (curr == TAS2764_PWR_CTRL_MUTE || curr == TAS2764_PWR_CTRL_ACTIVE)) {
+ 		ret = regmap_multi_reg_write(tas2764->regmap, tas2764_pre_shutdown_seq,
+ 					ARRAY_SIZE(tas2764_pre_shutdown_seq));
++		if (!ret) {
++			err = snd_soc_component_update_bits(tas2764->component,
++							    TAS2764_PWR_CTRL,
++							    TAS2764_PWR_CTRL_MASK,
++							    TAS2764_PWR_CTRL_SHUTDOWN);
++			if (err < 0)
++				ret = err;
++		}
++		err = regmap_multi_reg_write(tas2764->regmap,
++					     tas2764_post_shutdown_seq,
++					     ARRAY_SIZE(tas2764_post_shutdown_seq));
+ 		if (!ret)
+-			ret = snd_soc_component_update_bits(tas2764->component,
+-							TAS2764_PWR_CTRL,
+-							TAS2764_PWR_CTRL_MASK,
+-							TAS2764_PWR_CTRL_SHUTDOWN);
+-		if (!ret)
+-			ret = regmap_multi_reg_write(tas2764->regmap,
+-						tas2764_post_shutdown_seq,
+-						ARRAY_SIZE(tas2764_post_shutdown_seq));
++			ret = err;
++		return ret;
+ 	}
+ 
+ 	ret = snd_soc_component_update_bits(tas2764->component, TAS2764_PWR_CTRL,
+-						    TAS2764_PWR_CTRL_MASK, target);
++					    TAS2764_PWR_CTRL_MASK, target);
+ 
+-	return ret;
++	return ret < 0 ? ret : 0;
+ }
+ 
+ /*
+-- 
+2.43.0
+

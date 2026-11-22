@@ -1,0 +1,479 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 19 Nov 2026 02:14:52 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally give back the later render
+ units of idle VMs
+
+With g16_resident_lazy a VM builds one more render unit whenever it has
+more render commands outstanding than units, and keeps every unit until
+it closes. A compositor that once queued eight frames holds eight units
+for good: on a J604 desktop with lazy units, one desktop VM held all
+eight and the other three, 715 MiB of pinned memory, where one or two
+frames in flight need two units each.
+
+Add the run-time word g16_unit_trim (milliseconds, default 0). At N, a
+VM that has had no render command outstanding for N ms first gives back
+the units it built after its first render, from the top, down to what
+that render built or what the submission needs, before that submission
+can name any of them. The trim runs in SUBMIT under the VM's resource
+mutex with no job of the VM alive and the build worker held off, so
+nothing else reads those units. A unit stays while a flight runs on its
+index, a publication is pending there, or the VM's own last render left
+the index quarantined, as read under the device lock. The units grow
+again on demand as before.
+
+The later units now sit in slots that can be emptied (unit_slot.rs)
+instead of SetOnce, with the same reads. The rules are pure functions
+in unit_trim.rs. A unit_trim: stats line counts the trims, the units
+given back and the trims a unit that could not go yet stopped.
+
+At the default nothing is trimmed and the arena behaves as before.
+
+On this base the later units are sized by RENDER_UNITS, and the stats line
+keeps only unit_trim: (the render arena line of the original needs words
+this base does not have).
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/mod.rs       |  16 ++++
+ drivers/gpu/drm/asahi/g16/params.rs    |  21 +++++
+ drivers/gpu/drm/asahi/g16/poll.rs      |   9 ++
+ drivers/gpu/drm/asahi/g16/queue.rs     |   2 +-
+ drivers/gpu/drm/asahi/g16/resources.rs |  83 +++++++++++++++--
+ drivers/gpu/drm/asahi/g16/slots.rs     |  15 ++++
+ drivers/gpu/drm/asahi/g16/unit_slot.rs |   1 -
+ drivers/gpu/drm/asahi/g16/unit_trim.rs | 119 +++++++++++++++++++++++++
+ 8 files changed, 258 insertions(+), 8 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/unit_trim.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 0b538284142..24d585a62e3 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -304,6 +304,22 @@ fn run(this: Arc<Shared>) {
+ }
+ 
+ impl Shared {
++    /// `g16_unit_trim`: the indices in `lo..hi` whose unit of VM `vm` may be freed now, from
++    /// the render units' state under the device lock (slots.rs); none while a system sleep
++    /// is under way or without a running backend.
++    pub(crate) fn unit_free_mask(&self, vm: u64, lo: usize, hi: usize) -> u32 {
++        if self.sleeping.load(Ordering::Acquire) {
++            return 0;
++        }
++        let state = self.state.lock();
++        let Some(fw) = state.as_deref() else {
++            return 0;
++        };
++        (lo..hi.min(32))
++            .filter(|&k| fw.slots.unit_free_ok(vm, k))
++            .fold(0, |m, k| m | 1 << k)
++    }
++
+     /// Queues the poll work immediately. Callable from any context.
+     pub(crate) fn kick(self: &Arc<Self>) {
+         self.event_ticks.store(engine::counter_ticks(), Ordering::Relaxed);
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 885ae6e3381..610352786f7 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -3123,6 +3123,27 @@ pub(crate) fn resident_lazy_async() -> bool {
+     "G16: a VM's first render builds only its two full render units; the others are built when it queues deeper: 1 in SUBMIT, 2 by a worker (default 2; 0: all at the first render; read when a VM builds units)"
+ );
+ 
++/// Storage of `g16_unit_trim` (runtime 0644, default 0).
++static UNIT_TRIM: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_unit_trim` N: the next submission of a VM that has had no render command outstanding
++/// for N ms first gives back the render units it built after its first render, from the
++/// top, down to what that render built or what the submission needs (resources.rs,
++/// unit_trim.rs). A unit stays while its index is busy, pending or left quarantined by the
++/// VM. 0 (default): a VM keeps every unit it built until it closes, as before.
++pub(crate) fn unit_trim_ms() -> u32 {
++    UNIT_TRIM.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    UNIT_TRIM_PARAM,
++    UNIT_TRIM_PARMTYPE,
++    UNIT_TRIM_PARM,
++    UNIT_TRIM,
++    "g16_unit_trim",
++    "G16: N ms = a VM idle that long gives back the render units it built later at its next submission (default 0: kept until it closes)"
++);
++
+ /// Storage of `g16_loader_macos` (0644, default 7; read once, when initdata is built).
+ static LOADER_MACOS: AtomicU32 = AtomicU32::new(7);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 0dd8b6f29ac..e0bb66bc5bb 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -2470,6 +2470,15 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                 large[3].load(Ordering::Relaxed)
+             )?;
+         }
++        let trim = &super::resources::TRIM_STATS;
++        writeln!(
++            f,
++            "unit_trim: ms {} trims {} units {} held {}",
++            params::unit_trim_ms(),
++            trim[0].load(Ordering::Relaxed),
++            trim[1].load(Ordering::Relaxed),
++            trim[2].load(Ordering::Relaxed)
++        )?;
+         let w: [u64; 8] = core::array::from_fn(|i| FS_WORDS[i].load(Ordering::Relaxed));
+         writeln!(
+             f,
+diff --git a/drivers/gpu/drm/asahi/g16/queue.rs b/drivers/gpu/drm/asahi/g16/queue.rs
+index 05cfb746b01..15166fe48eb 100644
+--- a/drivers/gpu/drm/asahi/g16/queue.rs
++++ b/drivers/gpu/drm/asahi/g16/queue.rs
+@@ -237,7 +237,7 @@ fn submit_job(
+             .resources
+             .as_ref()
+             .ok_or(EIO)?
+-            .prepare(&self.vm, &submission.commands)?;
++            .prepare(&self.vm, &submission.commands, &self.shared)?;
+         let fence = self.timeline.next()?;
+         // file::submit -> Queue::submit -> submit_job is synchronous ioctl context.
+         let identity = super::host_records::Identity::submit(id);
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 81c6c0c8674..d3a1d98c950 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -17,7 +17,7 @@
+ use kernel::{
+     new_mutex, new_spinlock,
+     prelude::*,
+-    sync::{Arc, Mutex, SetOnce, SpinLock},
++    sync::{Arc, Mutex, SpinLock},
+ };
+ 
+ /// `g16_resident_lazy`: render units built after a VM's first render, the nanoseconds those
+@@ -30,6 +30,13 @@
+ #[path = "unit_slot.rs"]
+ pub(crate) mod unit_slot;
+ 
++#[path = "unit_trim.rs"]
++pub(crate) mod unit_trim;
++
++/// `g16_unit_trim`: trims that gave units back, the units they gave back, and trims a unit
++/// that could not go yet stopped (its index busy, pending or quarantined).
++pub(crate) static TRIM_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
++
+ /// A render unit built after the VM's first render (`g16_resident_lazy`): its pass slot, its
+ /// UMA pool and PB heap, and the objects that map them.
+ pub(crate) struct ExtUnit {
+@@ -205,7 +212,7 @@ pub(crate) struct RenderInner {
+     /// `g16_rwork_pack`: the units' TA and FS work blocks, later units' included.
+     work_pack: Option<Arc<FwObject>>,
+     /// Units built later (`g16_resident_lazy`), at their unit index; dropped before the bind.
+-    ext: [SetOnce<KBox<ExtUnit>>; super::hw::sizes::RENDER_UNITS],
++    ext: [unit_slot::UnitSlot<KBox<ExtUnit>>; super::hw::sizes::RENDER_UNITS],
+     /// A worker is building the next unit (`g16_resident_lazy` 2).
+     building: AtomicBool,
+     /// `g16_unit_large_lazy`: the objects that hold unit 0's large set.
+@@ -259,7 +266,7 @@ fn new(
+                 passes,
+                 pools,
+                 work_pack,
+-                ext: [const { SetOnce::new() }; super::hw::sizes::RENDER_UNITS],
++                ext: [const { unit_slot::UnitSlot::new() }; super::hw::sizes::RENDER_UNITS],
+                 building: AtomicBool::new(false),
+                 large_objects: unit_slot::UnitSlot::new(),
+                 tpc_dirty: [const { AtomicU64::new(0) }; super::hw::sizes::RENDER_UNITS],
+@@ -394,6 +401,31 @@ pub(crate) fn pass(&self, k: usize) -> Option<&PassSlot> {
+             .get(k)
+             .or_else(|| self.ext.get(k)?.as_ref().map(|u| &u.pass))
+     }
++    /// The units the VM's first render built (never trimmed).
++    pub(crate) fn first_count(&self) -> usize {
++        self.passes.len()
++    }
++    /// `g16_unit_trim`: empties the later units' slots from the top, down to `target`, while
++    /// `ok` has the unit's bit, and returns how many went; their dirty sizes start again.
++    ///
++    /// # Safety
++    ///
++    /// No job of the VM may exist and no other thread may touch these slots: the caller
++    /// holds the VM's resource mutex with no render command outstanding, and `building`.
++    unsafe fn trim(&self, target: usize, built: usize, ok: u32) -> usize {
++        let lo = unit_trim::remain(target.max(self.passes.len()), built, ok);
++        let mut freed = 0;
++        for k in (lo..built).rev() {
++            // SAFETY: the caller's guarantee; the unit's objects are dropped here, outside
++            // the device lock.
++            if unsafe { self.ext[k].take() }.is_some() {
++                freed += 1;
++            }
++            self.tpc_dirty[k].store(0, Ordering::Relaxed);
++            self.tilemap_dirty[k].store(0, Ordering::Relaxed);
++        }
++        freed
++    }
+     /// Every built unit's pass slot.
+     pub(crate) fn units(&self) -> impl Iterator<Item = &PassSlot> {
+         (0..self.unit_count()).filter_map(move |k| self.pass(k))
+@@ -447,6 +479,8 @@ pub(crate) struct Cache {
+     pool: Arc<SpinLock<EpochPool>>,
+     /// Render commands accepted and not yet dropped (`g16_resident_lazy` demand).
+     render_out: Arc<AtomicU32>,
++    /// When `render_out` last fell to 0 (ns; 0 before), for `g16_unit_trim`.
++    idle_since: Arc<AtomicU64>,
+ }
+ impl Cache {
+     pub(crate) fn new(
+@@ -461,9 +495,10 @@ pub(crate) fn new(
+             GFP_KERNEL,
+         )?;
+         let render_out = Arc::new(AtomicU32::new(0), GFP_KERNEL)?;
++        let idle_since = Arc::new(AtomicU64::new(0), GFP_KERNEL)?;
+         Arc::pin_init(
+             pin_init!(Self { ready <- new_mutex!(Ready::default(), "g16::resources"),
+-            factory, bind, live, budget, pool, render_out }),
++            factory, bind, live, budget, pool, render_out, idle_since }),
+             GFP_KERNEL,
+         )
+     }
+@@ -474,7 +509,12 @@ pub(crate) fn close_pool(&self) -> KVec<Arc<PbEpoch>> {
+         pool.closed = true;
+         core::mem::take(&mut pool.items)
+     }
+-    pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<Prepared> {
++    pub(crate) fn prepare(
++        &self,
++        vm: &Arc<VmState>,
++        commands: &[Command],
++        shared: &super::Shared,
++    ) -> Result<Prepared> {
+         let compute = commands.iter().any(|c| matches!(c, Command::Compute(_)));
+         let render_count = commands
+             .iter()
+@@ -525,6 +565,30 @@ pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<
+                     &self.live,
+                 )?);
+             }
++            // g16_unit_trim: after the trim delay with no render command outstanding, give
++            // back the units built later, from the top, before this submission can name any
++            // (unit_trim.rs). With no job of the VM and this mutex held, nothing reads them.
++            if let (true, Some(arena)) = (render, ready.render.as_ref()) {
++                let built = arena.unit_count();
++                let target = unit_trim::target(arena.first_count(), built, render_count);
++                if target < built
++                    && self.render_out.load(Ordering::Relaxed) == 0
++                    && unit_trim::idle_long(
++                        self.idle_since.load(Ordering::Relaxed),
++                        super::engine::now_ns(),
++                        super::params::unit_trim_ms(),
++                    )
++                    && !arena.building.swap(true, Ordering::AcqRel)
++                {
++                    let ok = shared.unit_free_mask(vm.id, target, built);
++                    // SAFETY: render_out is 0 under the VM's resource mutex, so no job of
++                    // the VM exists to read its units, and `building` keeps the worker out.
++                    let freed = unsafe { arena.trim(target, built, ok) };
++                    arena.building.store(false, Ordering::Release);
++                    TRIM_STATS[usize::from(freed == 0) * 2].fetch_add(1, Ordering::Relaxed);
++                    TRIM_STATS[1].fetch_add(freed as u64, Ordering::Relaxed);
++                }
++            }
+             // g16_resident_lazy: one more unit when this VM has more render commands
+             // outstanding than units built, up to the resident depth in effect (the latched
+             // units when that is off). A failed build leaves the built units in use.
+@@ -601,6 +665,7 @@ pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<
+             pb,
+             pool: Some(self.pool.clone()),
+             render_out: Some((self.render_out.clone(), renders)),
++            idle: Some(self.idle_since.clone()),
+         })
+     }
+ }
+@@ -612,6 +677,8 @@ pub(crate) struct Prepared {
+     pb: KVec<Option<Arc<PbEpoch>>>,
+     pool: Option<Arc<SpinLock<EpochPool>>>,
+     render_out: Option<(Arc<AtomicU32>, u32)>,
++    /// `g16_unit_trim`: the VM's idle time, set when its last render command drops.
++    idle: Option<Arc<AtomicU64>>,
+ }
+ impl Drop for Prepared {
+     /// Returns the job's PB managers the firmware never saw to the VM's pool (bounded by
+@@ -620,7 +687,11 @@ impl Drop for Prepared {
+     /// leased one it reused, and the PB-slot lease takes exposed managers only.
+     fn drop(&mut self) {
+         if let Some((out, renders)) = self.render_out.take() {
+-            out.fetch_sub(renders, Ordering::Relaxed);
++            if out.fetch_sub(renders, Ordering::Relaxed) == renders && renders != 0 {
++                if let Some(idle) = self.idle.as_ref() {
++                    idle.store(super::engine::now_ns(), Ordering::Relaxed);
++                }
++            }
+         }
+         let Some(pool) = self.pool.take() else {
+             return;
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index d87427cc46c..043f19483e6 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -787,6 +787,21 @@ pub(crate) fn release_closed(&mut self, id: u64) {
+         }
+     }
+ 
++    /// `g16_unit_trim`: whether VM `vm`'s render unit on index `k` may be freed: no flight on
++    /// the index, no publication pending there, and not the VM's own last render left
++    /// quarantined there (resources::unit_trim::may_free).
++    pub(crate) fn unit_free_ok(&self, vm: u64, k: usize) -> bool {
++        if k >= sizes::RENDER_UNITS {
++            return false;
++        }
++        super::resources::unit_trim::may_free(
++            self.pass_busy & (1 << k) != 0,
++            self.pending_pass_owner[k].is_some(),
++            self.pass_owner[k].as_ref().is_some_and(|o| o.id == vm),
++            self.pass_lifetime.is_retired(k),
++        )
++    }
++
+     /// Read-only: every unit that still holds a last-owner lease, by VM id (and, for compute,
+     /// the leased compute arena's bytes in MiB). Under the device lock, like all stats.
+     pub(crate) fn write_leases(&self, f: &mut impl core::fmt::Write) -> core::fmt::Result {
+diff --git a/drivers/gpu/drm/asahi/g16/unit_slot.rs b/drivers/gpu/drm/asahi/g16/unit_slot.rs
+index f2d48226ec2..f748fc47934 100644
+--- a/drivers/gpu/drm/asahi/g16/unit_slot.rs
++++ b/drivers/gpu/drm/asahi/g16/unit_slot.rs
+@@ -62,7 +62,6 @@ pub(crate) fn populate(&self, value: T) -> bool {
+     ///
+     /// No reference returned by `as_ref` may be alive, and no other thread may call any method
+     /// of this slot until `take` returns (the module rules).
+-    #[cfg(test)]
+     pub(crate) unsafe fn take(&self) -> Option<T> {
+         self.full.store(false, Ordering::Release);
+         // SAFETY: the caller guarantees exclusive access.
+diff --git a/drivers/gpu/drm/asahi/g16/unit_trim.rs b/drivers/gpu/drm/asahi/g16/unit_trim.rs
+new file mode 100644
+index 00000000000..91ff43c4540
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/unit_trim.rs
+@@ -0,0 +1,119 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! `g16_unit_trim`: a live VM gives back the render units it built later, as pure rules.
++//!
++//! With `g16_resident_lazy` a VM builds one more unit whenever it has more render commands
++//! outstanding than units, and it used to keep every unit until it closed: a compositor that
++//! once queued eight frames held eight units for good. With the word, the next submission of a
++//! VM that has had no render command outstanding for the trim delay first gives back its later
++//! units, from the top, down to what its first render builds or what this submission needs.
++//!
++//! A unit's memory may go when (all CODE): no job of the VM exists (render_out 0 under the VM's
++//! resource mutex), no build worker runs, and on the unit's index no flight runs, no
++//! publication is pending, and either another VM's render last retired there or the VM's own
++//! last render there passed its full receipt (not quarantined). After a full receipt the
++//! firmware has cleared the index's UMA binding and saved its row into the descriptor (GPU-FW
++//! 1824Z); a skipped retire keeps the binding and leaves the index quarantined. Whether the
++//! firmware reads a PB manager or heap after the render's retire is not decoded (TO-VERIFY).
++
++/// The unit count to trim down to: what the first render builds (`keep`), or this
++/// submission's renders if more, never more than is built.
++pub(crate) const fn target(keep: usize, built: usize, renders: usize) -> usize {
++    let want = if renders > keep { renders } else { keep };
++    if want < built {
++        want
++    } else {
++        built
++    }
++}
++
++/// Whether the VM has been idle long enough: `since` (ns, 0 never idle yet) at least `ms`
++/// milliseconds before `now`.
++pub(crate) const fn idle_long(since: u64, now: u64, ms: u32) -> bool {
++    ms != 0 && since != 0 && now >= since && now - since >= ms as u64 * 1_000_000
++}
++
++/// Whether the VM's unit on index `k` may be freed, from the index's state under the device
++/// lock: no flight on it, no publication pending on it, and not the VM's own last render left
++/// quarantined there.
++pub(crate) const fn may_free(busy: bool, pending: bool, mine: bool, retired: bool) -> bool {
++    !busy && !pending && (!mine || retired)
++}
++
++/// How many units remain after trimming from the top: units `target..built` go while their
++/// bit in `ok` is set; the first unit that may not go stops the trim (units stay in order).
++pub(crate) const fn remain(target: usize, built: usize, ok: u32) -> usize {
++    let mut n = built;
++    while n > target && n <= 32 && ok & (1 << (n - 1)) != 0 {
++        n -= 1;
++    }
++    n
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn targets() {
++        assert_eq!(target(2, 8, 1), 2);
++        assert_eq!(target(2, 8, 5), 5);
++        assert_eq!(target(2, 3, 9), 3);
++        assert_eq!(target(1, 8, 1), 1);
++        assert_eq!(target(2, 2, 1), 2);
++        assert_eq!(target(2, 1, 1), 1);
++    }
++
++    #[test]
++    fn idle_needs_the_whole_delay() {
++        assert!(!idle_long(0, 10_000_000_000, 100));
++        assert!(!idle_long(5, 10_000_000_000, 0));
++        assert!(!idle_long(1_000_000_000, 1_099_999_999, 100));
++        assert!(idle_long(1_000_000_000, 1_100_000_000, 100));
++        assert!(!idle_long(2_000_000_000, 1_000_000_000, 1));
++    }
++
++    #[test]
++    fn a_unit_in_use_or_quarantined_stays() {
++        assert!(may_free(false, false, false, false));
++        assert!(may_free(false, false, true, true));
++        assert!(!may_free(true, false, false, true));
++        assert!(!may_free(false, true, false, true));
++        assert!(!may_free(false, false, true, false));
++    }
++
++    #[test]
++    fn trims_from_the_top_and_stops_at_the_first_unit_that_stays() {
++        assert_eq!(remain(2, 8, 0xff), 2);
++        assert_eq!(remain(2, 8, 0b1011_1111), 7);
++        assert_eq!(remain(2, 8, 0b0111_1111), 8);
++        assert_eq!(remain(2, 8, 0b1110_1111), 5);
++        assert_eq!(remain(2, 2, 0xff), 2);
++        assert_eq!(remain(0, 32, u32::MAX), 0);
++        assert_eq!(remain(4, 40, u32::MAX), 40);
++    }
++
++    /// A VM through bursts and idle gaps: units are freed only while idle, only down to the
++    /// target, and never below what its first render built.
++    #[test]
++    fn a_model_of_bursts_and_idle() {
++        let keep = 2;
++        let mut built = keep;
++        let mut seed = 7u64;
++        for step in 0..10_000u64 {
++            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
++            let renders = 1 + (seed >> 33) as usize % 8;
++            let idle = (seed >> 40) % 3 == 0;
++            let ok = (seed >> 7) as u32;
++            if idle {
++                let t = target(keep, built, renders);
++                let n = remain(t, built, ok);
++                assert!(n >= t && n <= built && n >= keep, "step {step}");
++                built = n;
++            }
++            if renders > built {
++                built = renders.min(8);
++            }
++        }
++    }
++}
+-- 
+2.43.0
+

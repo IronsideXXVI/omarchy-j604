@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 21 Nov 2026 07:31:45 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally build later render units
+ on unit 0's pool
+
+Every render unit of a VM owns a 32 MiB render UMA pool. At the idle
+desktop, 426 s after boot with no benchmark before it, 1.1132 held
+563.2 MiB of driver memory, 554 MiB of it in 11 render units for two
+render clients. Nine of those units were built after their VM's first
+render, on demand, each with its own pool.
+
+Add g16_unit_one_pool (runtime, default 0). When it is set, a unit
+built after its VM's first render binds unit 0's descriptor, pool and
+submitted counter, and builds only its own PB heap and scene list. The
+shared count runs ahead while other units' renders are in flight, so
+every unit that shares it retires on the count its own publication
+wrote. The switch is read when a unit is built: units built before it
+was set keep their own pool. Nothing changes while it is 0.
+
+Not yet measured on a device.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/params.rs    | 20 ++++++
+ drivers/gpu/drm/asahi/g16/pools.rs     | 94 ++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/resources.rs |  7 +-
+ 3 files changed, 120 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 02cb42c77cf..b980ee37c2b 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2941,6 +2941,26 @@ pub(crate) fn pb_pool() -> u32 {
+     "G16: PB managers a VM keeps for reuse instead of building one per render command in SUBMIT (default 8; 0: one per command, as before; max 16; runtime 0644)"
+ );
+ 
++/// Storage of `g16_unit_one_pool` (runtime 0644, default 0; read when a unit is built).
++static UNIT_ONE_POOL: AtomicU32 = AtomicU32::new(0);
++
++/// Whether a render unit a VM builds after its first render (`g16_resident_lazy`, unit 2 on)
++/// binds unit 0's render UMA descriptor, pool and submitted counter instead of building its
++/// own 32 MiB pool; it then builds only its own PB heap and scene list. Read when the unit is
++/// built, so units built before the switch was set keep their own pool.
++pub(crate) fn unit_one_pool() -> bool {
++    UNIT_ONE_POOL.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    UNIT_ONE_POOL_PARAM,
++    UNIT_ONE_POOL_PARMTYPE,
++    UNIT_ONE_POOL_PARM,
++    UNIT_ONE_POOL,
++    "g16_unit_one_pool",
++    "G16: render units a VM builds after its first render share unit 0's render UMA pool instead of a 32 MiB pool each (default 0; read when a unit is built; runtime 0644)"
++);
++
+ /// Storage of `g16_resident` (runtime 0644, default 8).
+ static RESIDENT: AtomicU32 = AtomicU32::new(8);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/pools.rs b/drivers/gpu/drm/asahi/g16/pools.rs
+index cee51a4420f..111043ae147 100644
+--- a/drivers/gpu/drm/asahi/g16/pools.rs
++++ b/drivers/gpu/drm/asahi/g16/pools.rs
+@@ -128,6 +128,11 @@ pub(crate) struct Allocator {
+     heap: Arc<FwObject>,
+     scene_list: Arc<FwObject>,
+     published: AtomicBool,
++    /// `g16_unit_one_pool`: this allocator's descriptor and counter are shared with another
++    /// unit (unit 0 once a later unit binds them, and every such later unit).
++    shared_uma: AtomicBool,
++    /// The count this unit's last publication wrote: its flight's retirement point.
++    flight: AtomicU64,
+     id: u32,
+     /// The firmware UMA slot this allocator's descriptor binds (lifetime::uma_slot).
+     uma_slot: u32,
+@@ -429,6 +434,8 @@ fn new(o: &mut Objects, k: u64, compact: bool) -> Result<Self> {
+             heap,
+             scene_list,
+             published: AtomicBool::new(false),
++            shared_uma: AtomicBool::new(false),
++            flight: AtomicU64::new(0),
+             id: k as u32,
+             uma_slot,
+             backed: AtomicU32::new(first),
+@@ -438,6 +445,76 @@ fn new(o: &mut Objects, k: u64, compact: bool) -> Result<Self> {
+             grown: [const { SetOnce::new() }; GROW_STEPS],
+         })
+     }
++    /// `g16_unit_one_pool`: unit `k` (built after the VM's first render) on `first`'s (unit
++    /// 0's) render UMA descriptor, pool and submitted counter. It builds only its own PB heap
++    /// and scene list, at the places [`Self::new`] gives them, and keeps PB id `k`.
++    fn new_shared(o: &mut Objects, k: u64, compact: bool, first: &Allocator) -> Result<Self> {
++        let compact = compact && k >= 2;
++        let (scene_va, heap_va, heap_size) = if compact {
++            (
++                client::compact_window(k) + client::COMPACT_ALLOC_OFF + 0x2070000,
++                client::compact_window(k) + client::COMPACT_PB_HEAP_OFF,
++                client::COMPACT_PB_HEAP_SIZE,
++            )
++        } else {
++            let size = if let Some(n) = super::params::pb_blocks() {
++                u64::from(n) * buffer::BLOCK_BYTES
++            } else if super::params::pb_heap16() {
++                client::COMPACT_PB_HEAP_SIZE
++            } else {
++                client::PB_HEAP_SIZE
++            };
++            (client::render_base(k) + 0x2070000, client::pb_heap(k), size)
++        };
++        let nc = |va| Some((va, pte::LEAF_NC));
++        let window = (heap_size / buffer::BLOCK_BYTES) as u32;
++        let compact_floor = if compact {
++            super::params::pb_lazy_compact()
++        } else {
++            None
++        };
++        let lazy = (!compact && super::params::pb_lazy().is_some()) || compact_floor.is_some();
++        let backed = match (compact_floor, super::params::pb_lazy()) {
++            (Some(floor), _) => floor.min(window),
++            (None, Some(floor)) if lazy => floor.min(window),
++            _ => window,
++        };
++        let heap = alloc(
++            o,
++            (u64::from(backed) * buffer::BLOCK_BYTES) as usize,
++            Class::Shared,
++            nc(heap_va),
++            false,
++        )?;
++        let scene_list = alloc(
++            o,
++            buffer::SCENE_LIST_SIZE,
++            Class::Shared,
++            nc(scene_va),
++            true,
++        )?;
++        first.shared_uma.store(true, Ordering::Release);
++        Ok(Self {
++            descriptor: first.descriptor.clone(),
++            auxiliary: first.auxiliary.clone(),
++            pool: first.pool.clone(),
++            state: first.state.clone(),
++            list: first.list.clone(),
++            submitted: first.submitted.clone(),
++            heap,
++            scene_list,
++            published: AtomicBool::new(false),
++            shared_uma: AtomicBool::new(true),
++            flight: AtomicU64::new(0),
++            id: k as u32,
++            uma_slot: first.uma_slot,
++            backed: AtomicU32::new(backed),
++            window,
++            heap_va,
++            lazy,
++            grown: [const { SetOnce::new() }; GROW_STEPS],
++        })
++    }
+     fn refs(&self) -> Result<AllocatorRefs> {
+         let prior = read64(&self.submitted, 0)?;
+         if prior & 1 != 0 {
+@@ -460,6 +537,13 @@ fn refs(&self) -> Result<AllocatorRefs> {
+         })
+     }
+     pub(crate) fn retired(&self) -> Result<bool> {
++        // g16_unit_one_pool: the shared count runs ahead while other units' renders are in
++        // flight, so a unit's flight is retired once the firmware completed its own count.
++        if self.shared_uma.load(Ordering::Acquire) {
++            let flight = self.flight.load(Ordering::Acquire);
++            let completed = read64(&self.descriptor, uma_manager::COMPLETED)?;
++            return Ok(flight != 0 && completed >= flight);
++        }
+         let submitted = read64(&self.submitted, 0)?;
+         let completed = read64(&self.descriptor, uma_manager::COMPLETED)?;
+         Ok(submitted != 0 && submitted == completed)
+@@ -485,6 +569,7 @@ pub(crate) fn publish_unit(&self, submitted: u64) -> Result {
+             return Err(EINVAL);
+         }
+         self.submitted.w64(0, submitted)?;
++        self.flight.store(submitted, Ordering::Release);
+         self.published.store(true, Ordering::Release);
+         Ok(())
+     }
+@@ -577,6 +662,15 @@ pub(crate) fn get(&self, k: usize) -> Option<&Allocator> {
+     pub(crate) fn build_unit(o: &mut Objects, k: usize, compact: bool) -> Result<Allocator> {
+         Allocator::new(o, k as u64, compact)
+     }
++    /// `g16_unit_one_pool`: unit `k`, built later on this set's unit 0 descriptor and pool.
++    pub(crate) fn build_shared(
++        &self,
++        o: &mut Objects,
++        k: usize,
++        compact: bool,
++    ) -> Result<Allocator> {
++        Allocator::new_shared(o, k as u64, compact, self.units.first().ok_or(EINVAL)?)
++    }
+     pub(crate) fn new(o: &mut Objects, count: usize, compact: bool) -> Result<Self> {
+         let count = count.clamp(2, super::hw::sizes::RENDER_UNITS);
+         let mut units = KVec::with_capacity(count, GFP_KERNEL)?;
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index fc9feb7f9c4..5515504693d 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -275,7 +275,12 @@ fn extend(&self, factory: &Factory, vm: &mmu::Vm, k: usize) -> Result {
+         let compact = super::params::resident_compact();
+         let mut objects = factory.objects(vm);
+         let pass = PassSlot::new(&mut objects, k as u64, 1, compact, self.work_pack.as_ref())?;
+-        let alloc = PoolSet::build_unit(&mut objects, k, compact)?;
++        // g16_unit_one_pool: the unit binds unit 0's render UMA pool instead of its own.
++        let alloc = if super::params::unit_one_pool() {
++            self.pools.build_shared(&mut objects, k, compact)?
++        } else {
++            PoolSet::build_unit(&mut objects, k, compact)?
++        };
+         objects.finish_private()?;
+         let unit = KBox::new(
+             ExtUnit {
+-- 
+2.43.0
+

@@ -1,0 +1,622 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Fri, 20 Nov 2026 17:55:42 +0000
+Subject: [PATCH] drm/asahi: g16: Optionally start render units 0 and 1
+ with a small TPC
+
+Render units 0 and 1 of every render VM back a 16 MiB TPC and an 8 MiB
+tilemap from their first render, 48 MiB per client, although a desktop
+client's renders fit the 1 MiB TPC and tilemap a compact unit has. At
+the idle desktop 1.1132 held 563.2 MiB of driver memory for two render
+clients.
+
+Add g16_unit_large_lazy (runtime, default 0). When it is set, a VM's
+units 0 and 1 are built with a 1 MiB TPC and a 1 MiB tilemap at their
+usual addresses. The first render that fits no unit's own set has a
+16 MiB TPC and an 8 MiB tilemap built for unit 0 in SUBMIT, before
+publication, which unit 0 then keeps for the life of the arena. The
+switch is read when a VM builds its first render units: VMs that
+already rendered keep the units they have. Nothing changes while it is
+0; its stats line is printed only once it was used.
+
+Not yet measured on a device.
+
+Assisted-by: LLM
+---
+ drivers/gpu/drm/asahi/g16/engine.rs    |   8 +-
+ drivers/gpu/drm/asahi/g16/object.rs    |  77 ++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/params.rs    |  22 +++++
+ drivers/gpu/drm/asahi/g16/poll.rs      |  13 +++
+ drivers/gpu/drm/asahi/g16/resources.rs |  74 ++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/slots.rs     |  62 ++++++++++++--
+ drivers/gpu/drm/asahi/g16/unit_slot.rs | 110 +++++++++++++++++++++++++
+ 7 files changed, 352 insertions(+), 14 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/unit_slot.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index 773ed546a0c..de67147f095 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -1373,10 +1373,10 @@ pub(crate) fn recovery_prepare(
+                 Some((obj, ta_at)) => obj.r64(ta_at + work::ta::TPC_BYTES)?,
+                 None => pass.ta_r64(work::ta::TPC_BYTES)?,
+             };
+-            if bytes == 0 || bytes > pass.tpc.size as u64 {
++            if bytes == 0 || bytes > pass.tpc().size as u64 {
+                 return Err(ERANGE);
+             }
+-            pass.tpc.fill(0, 0, bytes as usize)?;
++            pass.tpc().fill(0, 0, bytes as usize)?;
+             wmb();
+         }
+         f.doomed = true;
+@@ -2196,7 +2196,7 @@ fn publish_prefix_into(
+                 let geometry = Geometry::new(&r.cmd, 0);
+                 if job.resources.render()?.units().all(|slot| {
+                     geometry
+-                        .validate_capacity(slot.tpc.size as u64, slot.tilemap.size as u64)
++                        .validate_capacity(slot.tpc().size as u64, slot.tilemap().size as u64)
+                         .is_err()
+                 }) {
+                     return Err(E2BIG);
+@@ -2748,7 +2748,7 @@ fn prefix_render(
+             cmd.cmd.ppp_multisamplectl,
+             u64::from(cmd.cmd.width_px) | u64::from(cmd.cmd.height_px) << 16,
+         ]);
+-        geometry.validate_capacity(p.tpc.size as u64, p.tilemap.size as u64)?;
++        geometry.validate_capacity(p.tpc().size as u64, p.tilemap().size as u64)?;
+         job.resources
+             .render()?
+             .set_dirty(k, geometry.tpc_bytes, geometry.tilemap_bytes)?;
+diff --git a/drivers/gpu/drm/asahi/g16/object.rs b/drivers/gpu/drm/asahi/g16/object.rs
+index b4aa7b2b8d0..63fc8ec6771 100644
+--- a/drivers/gpu/drm/asahi/g16/object.rs
++++ b/drivers/gpu/drm/asahi/g16/object.rs
+@@ -19,7 +19,8 @@
+ //! retained for their ownership epoch. Session initdata and uncertain owners stay until
+ //! reboot; private NC arenas can unmap after full retirement and distinct displacement.
+ 
+-use core::ptr::NonNull;
++use core::mem::MaybeUninit;
++use core::ptr::{addr_of_mut, NonNull};
+ 
+ use kernel::{
+     new_mutex,
+@@ -315,12 +316,65 @@ pub(crate) fn objects(&self, vm: &mmu::Vm) -> Objects {
+             error: None,
+             pages: 0,
+             backing_limit: usize::MAX,
++            client_align_shift: PAGE_SHIFT,
+             backing_charged: 0,
+         }
+     }
++
++    /// [`Factory::objects`] written field by field into `out`, so no whole [`Objects`] value is
++    /// built on the caller's frame. Every field of `out` is initialised when this returns.
++    pub(crate) fn objects_into(&self, vm: &mmu::Vm, out: &mut MaybeUninit<Objects>) {
++        // Does not compile when a field is added to `Objects` and not written below.
++        #[allow(dead_code)]
++        fn all_fields(o: &Objects) {
++            let Objects {
++                dev: _,
++                uat: _,
++                window: _,
++                private: _,
++                sealed: _,
++                fw_next: _,
++                retained: _,
++                clients: _,
++                mappings: _,
++                error: _,
++                pages: _,
++                backing_limit: _,
++                client_align_shift: _,
++                backing_charged: _,
++            } = o;
++        }
++        let p = out.as_mut_ptr();
++        // SAFETY: `p` comes from `out`, so it is valid, aligned and exclusive for one `Objects`.
++        // Each field is written exactly once through `addr_of_mut!`, which neither reads nor
++        // drops the uninitialised old value.
++        unsafe {
++            addr_of_mut!((*p).dev).write(self.dev.clone());
++            addr_of_mut!((*p).uat).write(self.uat.clone());
++            addr_of_mut!((*p).window).write(self.window.clone());
++            addr_of_mut!((*p).private).write(Some(Private {
++                vm: vm.clone(),
++                firmware: self.firmware.clone(),
++                pending: None,
++            }));
++            addr_of_mut!((*p).sealed).write(false);
++            addr_of_mut!((*p).fw_next).write(self.firmware.start);
++            addr_of_mut!((*p).retained).write(KVec::new());
++            addr_of_mut!((*p).clients).write(KVec::new());
++            addr_of_mut!((*p).mappings).write(KVec::new());
++            addr_of_mut!((*p).error).write(None);
++            addr_of_mut!((*p).pages).write(0);
++            addr_of_mut!((*p).backing_limit).write(usize::MAX);
++            addr_of_mut!((*p).client_align_shift).write(PAGE_SHIFT);
++            addr_of_mut!((*p).backing_charged).write(0);
++        }
++    }
+ }
+ 
+ /// The firmware object allocator and the set of retained objects.
++/// log2 of [`hw::PAGE`], the default client mapping alignment of `Objects::alloc_private_in`.
++const PAGE_SHIFT: u8 = hw::PAGE.trailing_zeros() as u8;
++
+ pub(crate) struct Objects {
+     dev: ARef<AsahiDrmDevice>,
+     uat: Arc<mmu::Uat>,
+@@ -343,6 +397,10 @@ pub(crate) struct Objects {
+     /// Host-window pages backed by objects.
+     pages: usize,
+     backing_limit: usize,
++    /// log2 of the client mapping alignment of `alloc_private_in` ([`PAGE_SHIFT`] except while
++    /// `alloc_dynamic_client_aligned` runs). A `u8`, so it takes the padding after `sealed` and
++    /// the boot frames that hold an `Objects` keep their size.
++    client_align_shift: u8,
+     backing_charged: usize,
+ }
+ 
+@@ -365,6 +423,7 @@ pub(crate) fn new(
+             error: None,
+             pages: 0,
+             backing_limit: usize::MAX,
++            client_align_shift: PAGE_SHIFT,
+             backing_charged: 0,
+         })
+     }
+@@ -387,6 +446,20 @@ fn alloc_private(&mut self, req: Request) -> Result<Arc<FwObject>> {
+         self.alloc_private_in(req, None)
+     }
+ 
++    /// `alloc_dynamic_client` with the client mapping aligned to `align` (a power of two).
++    pub(crate) fn alloc_dynamic_client_aligned(
++        &mut self,
++        size: usize,
++        align: u64,
++    ) -> Result<Arc<FwObject>> {
++        if !align.is_power_of_two() || align < hw::PAGE {
++            return Err(EINVAL);
++        }
++        self.client_align_shift = align.trailing_zeros() as u8;
++        let r = self.alloc_dynamic_client(size);
++        self.client_align_shift = PAGE_SHIFT;
++        r
++    }
+     pub(crate) fn alloc_dynamic_client(&mut self, size: usize) -> Result<Arc<FwObject>> {
+         self.alloc_private_in(
+             Request {
+@@ -479,7 +552,7 @@ fn alloc_private_in(
+             let mapping = private.vm.map_in_range(
+                 &backing.gem,
+                 0..bytes,
+-                hw::PAGE,
++                1u64 << self.client_align_shift,
+                 range,
+                 mmu::Prot::from_pte(pte::LEAF_NC),
+                 true,
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 71ff27614fa..885ae6e3381 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -3001,6 +3001,28 @@ pub(crate) fn resident_compact() -> bool {
+     resident_latch() & 0x100 != 0
+ }
+ 
++/// Storage of `g16_unit_large_lazy` (runtime 0644, default 0; read when a VM builds its first
++/// render units).
++static UNIT_LARGE_LAZY: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_unit_large_lazy` 1: render units 0 and 1 get a 1 MiB TPC and a 1 MiB tilemap at their
++/// usual addresses instead of 16 / 8 MiB; the first render no unit's own set fits builds a
++/// 16 MiB TPC and an 8 MiB tilemap for unit 0 (in SUBMIT, before publication), which unit 0
++/// then uses for the life of the arena. Read when a VM builds its first render units, so VMs
++/// that already rendered keep the units they have.
++pub(crate) fn unit_large_lazy() -> bool {
++    UNIT_LARGE_LAZY.load(Ordering::Relaxed) == 1
++}
++
++live_u32_param!(
++    UNIT_LARGE_LAZY_PARAM,
++    UNIT_LARGE_LAZY_PARMTYPE,
++    UNIT_LARGE_LAZY_PARM,
++    UNIT_LARGE_LAZY,
++    "g16_unit_large_lazy",
++    "G16: 1 = render units 0/1 start with a 1 MiB TPC and tilemap; unit 0 builds the full set on demand (default 0; read when a VM builds its first render units; runtime 0644)"
++);
++
+ /// The latch word: units | compact << 8, set once from `g16_resident` and
+ /// `g16_resident_compact` (full-size units: at most [`hw::sizes::FULL_RESIDENT_UNITS`];
+ /// compact: at most [`hw::sizes::RENDER_UNITS`]).
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index afc51c87672..0dd8b6f29ac 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -2457,6 +2457,19 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             lazy[2].load(Ordering::Relaxed) / 1000,
+             lazy[3].load(Ordering::Relaxed)
+         )?;
++        // g16_unit_large_lazy: printed once the word is on or a large set was asked for.
++        let large = &super::resources::LARGE_STATS;
++        if params::unit_large_lazy() || large[3].load(Ordering::Relaxed) != 0 {
++            writeln!(
++                f,
++                "large_units: on {} builds {} fails {} total_us {} asked {}",
++                u32::from(params::unit_large_lazy()),
++                large[0].load(Ordering::Relaxed),
++                large[1].load(Ordering::Relaxed),
++                large[2].load(Ordering::Relaxed) / 1000,
++                large[3].load(Ordering::Relaxed)
++            )?;
++        }
+         let w: [u64; 8] = core::array::from_fn(|i| FS_WORDS[i].load(Ordering::Relaxed));
+         writeln!(
+             f,
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 5515504693d..81c6c0c8674 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -24,6 +24,11 @@
+ /// builds took, the longest one (the first-use stall when built in SUBMIT), and the builds
+ /// handed to a worker (`g16_resident_lazy` 2).
+ pub(crate) static LAZY_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
++/// `g16_unit_large_lazy`: large sets built, failed builds, total ns, renders that asked.
++pub(crate) static LARGE_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
++
++#[path = "unit_slot.rs"]
++pub(crate) mod unit_slot;
+ 
+ /// A render unit built after the VM's first render (`g16_resident_lazy`): its pass slot, its
+ /// UMA pool and PB heap, and the objects that map them.
+@@ -203,6 +208,8 @@ pub(crate) struct RenderInner {
+     ext: [SetOnce<KBox<ExtUnit>>; super::hw::sizes::RENDER_UNITS],
+     /// A worker is building the next unit (`g16_resident_lazy` 2).
+     building: AtomicBool,
++    /// `g16_unit_large_lazy`: the objects that hold unit 0's large set.
++    large_objects: unit_slot::UnitSlot<Option<KBox<Objects>>>,
+     pub(crate) tpc_dirty: [AtomicU64; super::hw::sizes::RENDER_UNITS],
+     pub(crate) tilemap_dirty: [AtomicU64; super::hw::sizes::RENDER_UNITS],
+     /// `g16_pb_lazy`: the blocks this VM's renders were seen holding, per PB slot.
+@@ -254,6 +261,7 @@ fn new(
+                 work_pack,
+                 ext: [const { SetOnce::new() }; super::hw::sizes::RENDER_UNITS],
+                 building: AtomicBool::new(false),
++                large_objects: unit_slot::UnitSlot::new(),
+                 tpc_dirty: [const { AtomicU64::new(0) }; super::hw::sizes::RENDER_UNITS],
+                 tilemap_dirty: [const { AtomicU64::new(0) }; super::hw::sizes::RENDER_UNITS],
+                 pb_hint: LazyHint::new()?,
+@@ -299,9 +307,70 @@ fn extend(&self, factory: &Factory, vm: &mmu::Vm, k: usize) -> Result {
+         LAZY_STATS[2].fetch_max(ns, Ordering::Relaxed);
+         Ok(())
+     }
++    /// `g16_unit_large_lazy`: builds unit 0's large set when a render of `commands` fits no
++    /// unit's own set but fits the large one. Called in SUBMIT under the VM's resource lock.
++    fn large_for(&self, factory: &Factory, vm: &mmu::Vm, commands: &[Command]) {
++        let Some(p0) = self.passes.first() else {
++            return;
++        };
++        if !p0.large_lazy || p0.large.as_ref().is_some() {
++            return;
++        }
++        if !self.large_wanted(commands) {
++            return;
++        }
++        LARGE_STATS[3].fetch_add(1, Ordering::Relaxed);
++        let start = super::engine::now_ns();
++        let r = Self::large_objects_new(factory, vm).and_then(|mut objects| {
++            p0.build_large(&mut objects)?;
++            objects.finish_private()?;
++            Ok(objects)
++        });
++        if let Ok(objects) = r {
++            // The mappings live with the arena, as the first units' do.
++            let _ = self.large_objects.populate(Some(objects));
++            LARGE_STATS[0].fetch_add(1, Ordering::Relaxed);
++            LARGE_STATS[2].fetch_add(
++                super::engine::now_ns().wrapping_sub(start),
++                Ordering::Relaxed,
++            );
++        } else {
++            LARGE_STATS[1].fetch_add(1, Ordering::Relaxed);
++        }
++    }
++
++    /// `g16_unit_large_lazy`: true when a render of `commands` fits no unit's own set but fits
++    /// the large one. Out of line, so its geometry stays off the frame of `large_for`.
++    #[inline(never)]
++    fn large_wanted(&self, commands: &[Command]) -> bool {
++        let units = self.unit_count();
++        commands.iter().any(|c| match c {
++            Command::Render(r) => {
++                let g = super::encode::Geometry::new(&r.cmd, 0);
++                (0..units).filter_map(|k| self.pass(k)).all(|p| {
++                    g.validate_capacity(p.tpc().size as u64, p.tilemap().size as u64)
++                        .is_err()
++                }) && g
++                    .validate_capacity(super::hw::client::TPC_SIZE, super::hw::client::TILEMAP_SIZE)
++                    .is_ok()
++            }
++            _ => false,
++        })
++    }
++
++    /// `g16_unit_large_lazy`: the object set for unit 0's large set, built on the heap. Out of
++    /// line, so the set itself never sits on the frame of `large_for`.
++    #[inline(never)]
++    fn large_objects_new(factory: &Factory, vm: &mmu::Vm) -> Result<KBox<Objects>> {
++        // Allocated first and initialised field by field in place: no Objects on this frame.
++        let mut objects = KBox::<Objects>::new_uninit(GFP_KERNEL)?;
++        factory.objects_into(vm, &mut objects);
++        // SAFETY: `objects_into` initialised every field of `objects`.
++        Ok(unsafe { objects.assume_init() })
++    }
+     pub(crate) fn set_dirty(&self, k: usize, tpc: u64, tilemap: u64) -> Result {
+         let pass = self.pass(k).ok_or(EINVAL)?;
+-        if tpc > pass.tpc.size as u64 || tilemap > pass.tilemap.size as u64 {
++        if tpc > pass.tpc().size as u64 || tilemap > pass.tilemap().size as u64 {
+             return Err(E2BIG);
+         }
+         self.tpc_dirty[k].fetch_max(tpc, Ordering::Relaxed);
+@@ -485,6 +554,9 @@ pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<
+                 } else if want && !arena.building.load(Ordering::Acquire) {
+                     let _ = arena.extend(&self.factory, &vm.vm, built);
+                 }
++                // g16_unit_large_lazy: unit 0's large set for a render no unit's set fits.
++                // Under the VM's resource lock; the set is populated once.
++                arena.large_for(&self.factory, &vm.vm, commands);
+                 if super::params::pb_lazy().is_some() {
+                     arena.grow_pb(&self.factory, &vm.vm);
+                 }
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index 5b7a6c18a6b..d87427cc46c 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -185,6 +185,12 @@ fn scrub(&self) -> Result {
+ }
+ 
+ /// One render pass slot.
++/// `g16_unit_large_lazy`: unit 0's large TPC and tilemap.
++pub(crate) struct LargeSet {
++    pub(crate) tpc: Arc<FwObject>,
++    pub(crate) tilemap: Arc<FwObject>,
++}
++
+ pub(crate) struct PassSlot {
+     /// `g16_rwork_pack`: the shared buffer and the offsets of this slot's TA and FS work
+     /// blocks; `ta_work` / `fs_work` are then unused.
+@@ -193,6 +199,10 @@ pub(crate) struct PassSlot {
+     pub(crate) pre: KVec<Arc<FwObject>>,
+     pub(crate) tpc: Arc<FwObject>,
+     pub(crate) tilemap: Arc<FwObject>,
++    /// `g16_unit_large_lazy`: this unit started small and may take the large set (unit 0).
++    pub(crate) large_lazy: bool,
++    /// `g16_unit_large_lazy`: unit 0's 16 MiB TPC and 8 MiB tilemap, once built.
++    pub(crate) large: super::resources::unit_slot::UnitSlot<KBox<LargeSet>>,
+     pub(crate) heap: Arc<FwObject>,
+     pub(crate) scene_user: Arc<FwObject>,
+     pub(crate) fs_scratch: Arc<FwObject>,
+@@ -252,6 +262,13 @@ pub(crate) fn new(
+             (client::TILEMAP + ps, client::TILEMAP_SIZE)
+         };
+         let _ = pre_records;
++        // g16_unit_large_lazy: units 0 and 1 start with the compact sizes at their own addresses.
++        let large_lazy = !compact && i < 2 && super::params::unit_large_lazy();
++        let (tpc, tilemap) = if large_lazy {
++            (client::COMPACT_TPC_SIZE, client::COMPACT_TILEMAP_SIZE)
++        } else {
++            (tpc, tilemap)
++        };
+ 
+         let aux = alloc(
+             o,
+@@ -341,6 +358,8 @@ pub(crate) fn new(
+             pre,
+             tpc,
+             tilemap,
++            large_lazy: large_lazy && i == 0,
++            large: super::resources::unit_slot::UnitSlot::new(),
+             heap,
+             scene_user,
+             fs_scratch,
+@@ -387,9 +406,10 @@ fn scrub(
+         self.ta_scratch.fill(0, 0, 0x10000)?;
+         self.fs_scratch.fill(0, 0, 0x10000)?;
+         self.its.fill(0, 0, 32)?;
+-        self.tpc.fill(0, 0, tpc_dirty as usize)?;
++        let (tpc_set, tilemap_set) = self.sets();
++        tpc_set.fill(0, 0, tpc_dirty as usize)?;
+         stats.tpc_clear_bytes = stats.tpc_clear_bytes.saturating_add(tpc_dirty);
+-        self.tilemap.fill(0, 0, tilemap_dirty as usize)?;
++        tilemap_set.fill(0, 0, tilemap_dirty as usize)?;
+         stats.tilemap_clear_bytes = stats.tilemap_clear_bytes.saturating_add(tilemap_dirty);
+         self.aux.fill(0, 0, 0x20000)?;
+         self.heap.fill(0, 0, 0x4000)?;
+@@ -448,8 +468,36 @@ pub(crate) fn ta_r64(&self, offset: usize) -> Result<u64> {
+             None => self.ta_work.r64(offset),
+         }
+     }
++    /// The TPC and tilemap a render of this unit uses: the large set once built, else its own.
++    pub(crate) fn sets(&self) -> (&Arc<FwObject>, &Arc<FwObject>) {
++        match self.large.as_ref() {
++            Some(l) => (&l.tpc, &l.tilemap),
++            None => (&self.tpc, &self.tilemap),
++        }
++    }
++    pub(crate) fn tpc(&self) -> &Arc<FwObject> {
++        self.sets().0
++    }
++    pub(crate) fn tilemap(&self) -> &Arc<FwObject> {
++        self.sets().1
++    }
++    /// `g16_unit_large_lazy`: builds unit 0's large set (16 MiB TPC, 8 MiB tilemap, client
++    /// mappings 32 MiB aligned as the fixed sets are). A second build is dropped unpublished.
++    pub(crate) fn build_large(&self, o: &mut Objects) -> Result {
++        if !self.large_lazy || self.large.as_ref().is_some() {
++            return Err(EINVAL);
++        }
++        let tpc = o.alloc_dynamic_client_aligned(client::TPC_SIZE as usize, 0x2000000)?;
++        let tilemap = o.alloc_dynamic_client_aligned(client::TILEMAP_SIZE as usize, 0x2000000)?;
++        let set = KBox::new(LargeSet { tpc, tilemap }, GFP_KERNEL)?;
++        if !self.large.populate(set) {
++            return Err(EBUSY);
++        }
++        Ok(())
++    }
+     /// The addresses the render encoders name.
+     pub(crate) fn refs(&self) -> PassRefs {
++        let (tpc_set, tilemap_set) = self.sets();
+         PassRefs {
+             ta_work: self.ta_va(),
+             ta_work_gva: self.ta_gva(),
+@@ -458,8 +506,8 @@ pub(crate) fn refs(&self) -> PassRefs {
+             ta_seq: self.ta_seq.va,
+             fs_seq: self.fs_seq.va,
+             scene: self.scene.va,
+-            tpc_gva: self.tpc.gva.unwrap_or(0),
+-            tilemap_gva: self.tilemap.gva.unwrap_or(0),
++            tpc_gva: tpc_set.gva.unwrap_or(0),
++            tilemap_gva: tilemap_set.gva.unwrap_or(0),
+             heap_gva: self.heap.gva.unwrap_or(0),
+             scene_user_gva: self.scene_user.gva.unwrap_or(0),
+             pre_gva: [
+@@ -471,7 +519,7 @@ pub(crate) fn refs(&self) -> PassRefs {
+             aux_gva: self.aux.gva.unwrap_or(0),
+             its: self.its.va,
+             ta_scratch: self.ta_scratch.va,
+-            tpc_fw: self.tpc.va,
++            tpc_fw: tpc_set.va,
+             scratch_fw: self.scene_user.va,
+         }
+     }
+@@ -669,8 +717,8 @@ pub(crate) fn pick_pass(
+             };
+             if (self.pass_busy | picked) & (1 << k) == 0
+                 && self.pass_lifetime.available(k)
+-                && geo.tpc_bytes <= p.tpc.size as u64
+-                && geo.tilemap_bytes <= p.tilemap.size as u64
++                && geo.tpc_bytes <= p.tpc().size as u64
++                && geo.tilemap_bytes <= p.tilemap().size as u64
+             {
+                 return Some(k);
+             }
+diff --git a/drivers/gpu/drm/asahi/g16/unit_slot.rs b/drivers/gpu/drm/asahi/g16/unit_slot.rs
+new file mode 100644
+index 00000000000..f2d48226ec2
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/unit_slot.rs
+@@ -0,0 +1,110 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! A render unit built after a VM's first render, in a slot that can be emptied again
++//! (`g16_unit_trim`).
++//!
++//! The arena's later units used to sit in `SetOnce` slots: filled once, never emptied, read
++//! without a lock. This slot keeps those reads (an acquire load, then a shared reference) and
++//! adds `take`, which empties it. The rules, kept by resources.rs:
++//! - One writer at a time fills a slot: the SUBMIT path under the VM's resource mutex, or the
++//!   one build worker the arena's `building` flag admits.
++//! - `take` runs only under that mutex, with `building` held and no render command of the VM
++//!   outstanding. Every reader of a unit outside resources.rs reaches it through a job of the
++//!   VM (publication, retirement, statistics of a flight), so no reader exists then.
++
++use core::cell::UnsafeCell;
++use core::sync::atomic::{AtomicBool, Ordering};
++
++/// One later unit of a render arena: empty, then filled, and possibly emptied again.
++pub(crate) struct UnitSlot<T> {
++    full: AtomicBool,
++    cell: UnsafeCell<Option<T>>,
++}
++
++// SAFETY: the value is written only while no reader exists (see the module rules) and read
++// through shared references after an acquire load of `full`.
++unsafe impl<T: Send + Sync> Sync for UnitSlot<T> {}
++// SAFETY: as above; the slot owns its value.
++unsafe impl<T: Send> Send for UnitSlot<T> {}
++
++impl<T> UnitSlot<T> {
++    pub(crate) const fn new() -> Self {
++        Self {
++            full: AtomicBool::new(false),
++            cell: UnsafeCell::new(None),
++        }
++    }
++
++    /// The unit, if the slot holds one.
++    pub(crate) fn as_ref(&self) -> Option<&T> {
++        if !self.full.load(Ordering::Acquire) {
++            return None;
++        }
++        // SAFETY: `full` is set only after the value was written, and the value is replaced
++        // only by `take`, which no reader can overlap.
++        unsafe { (*self.cell.get()).as_ref() }
++    }
++
++    /// Fills an empty slot. False (and `value` dropped) when it already holds a unit.
++    pub(crate) fn populate(&self, value: T) -> bool {
++        if self.full.load(Ordering::Acquire) {
++            return false;
++        }
++        // SAFETY: one writer at a time (module rules), and no reader looks at an empty slot.
++        unsafe { *self.cell.get() = Some(value) };
++        self.full.store(true, Ordering::Release);
++        true
++    }
++
++    /// Empties the slot and returns its unit.
++    ///
++    /// # Safety
++    ///
++    /// No reference returned by `as_ref` may be alive, and no other thread may call any method
++    /// of this slot until `take` returns (the module rules).
++    #[cfg(test)]
++    pub(crate) unsafe fn take(&self) -> Option<T> {
++        self.full.store(false, Ordering::Release);
++        // SAFETY: the caller guarantees exclusive access.
++        unsafe { (*self.cell.get()).take() }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn empty_filled_emptied_filled() {
++        let s: UnitSlot<u32> = UnitSlot::new();
++        assert!(s.as_ref().is_none());
++        assert!(s.populate(7));
++        assert_eq!(s.as_ref(), Some(&7));
++        // A racing second build is refused and leaves the first unit in place.
++        assert!(!s.populate(8));
++        assert_eq!(s.as_ref(), Some(&7));
++        // SAFETY: single-threaded test, no reference alive.
++        assert_eq!(unsafe { s.take() }, Some(7));
++        assert!(s.as_ref().is_none());
++        // SAFETY: as above.
++        assert_eq!(unsafe { s.take() }, None);
++        assert!(s.populate(9));
++        assert_eq!(s.as_ref(), Some(&9));
++    }
++
++    #[test]
++    fn take_drops_nothing_twice() {
++        use std::rc::Rc;
++        let v = Rc::new(1);
++        let s = UnitSlot::new();
++        assert!(s.populate(v.clone()));
++        assert_eq!(Rc::strong_count(&v), 2);
++        // SAFETY: single-threaded test.
++        let t = unsafe { s.take() };
++        assert_eq!(Rc::strong_count(&v), 2);
++        drop(t);
++        assert_eq!(Rc::strong_count(&v), 1);
++        drop(s);
++        assert_eq!(Rc::strong_count(&v), 1);
++    }
++}
+-- 
+2.43.0
+
