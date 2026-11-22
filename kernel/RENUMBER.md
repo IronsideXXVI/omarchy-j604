@@ -1421,3 +1421,7 @@ The base remains da8e1acf3656. Published 0001–0982 are unchanged. 0983 to 0989
 # Kernel patch numbers: 1.1196 to 1.1212
 
 The base remains da8e1acf3656. Published 0001–0989 are unchanged. 0990 lets a closed GPU client give back the render units it built after its first ones, at once instead of never (`g16_close_trim`, on by default). Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1197 to 1.1211 were not released or published.
+
+# Kernel patch numbers: 1.1212 to 1.1230
+
+The base remains da8e1acf3656. Published 0001–0990 are unchanged. 0991 lets a closed GPU program give back its idle render units at once (`g16_close_disp`, off in 0991); 0992 turns it on. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1213 to 1.1229 were not released or published.

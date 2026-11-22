@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 22 Nov 2026 00:25:36 +0000
+Subject: [PATCH] drm/asahi: g16: drop a closed VM's unit leases on
+ idle retired indices
+
+g16_close_trim gives back a closed VM's later render units at close,
+but it stops at the first index it may not free, and it never touches
+the VM's first units or its leases. A deep client closed next to a
+running compositor still keeps about five units (52.6 MiB) resident for
+the rest of the session: the last-owner lease on each unit index it
+published on (Slots::pass_owner, and the PB-slot lease in Pools, whose
+PbEpoch holds the VM too) keeps the VM state, and with it the whole
+render arena, until another publication retires on that index. Indices
+above the depth of the clients still running never see one.
+
+Add g16_close_disp (runtime 0644, default 0). When any VM closes, every
+render and PB-slot lease a closed VM holds is dropped on each unit
+index with no flight, no publication pending and its last publication
+fully retired. That is the rule g16_unit_trim already frees a unit's
+memory under: after the full receipt the firmware has cleared the
+index's UMA binding. The shared slot-0 manager follows index 0. Busy or
+pending indices are displaced by their next retire as before, and
+quarantined indices keep their lease. Those leases are the last
+references to the closed VM's state, so its arena goes with them, first
+units included.
+
+The leases are moved under the device lock into vectors reserved before
+it, and dropped after the lock is released, PB managers first. With
+the switch at 0 nothing changes. The existing render_leases and
+pb_leases lines in the stats file show what is left.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ drivers/gpu/drm/asahi/g16/mod.rs    | 23 +++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/params.rs | 23 +++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/pools.rs  | 23 +++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/slots.rs  | 31 +++++++++++++++++++++++++++++
+ 4 files changed, 100 insertions(+)
+
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 595753eb75b..14e10006908 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -803,11 +803,27 @@ fn vm_closed(&self, vm: &mmu::Vm) {
+         } else {
+             None
+         };
++        // g16_close_disp: room for the render and PB-slot leases taken from closed VMs.
++        let mut disp = if params::close_disp() {
++            match (
++                KVec::with_capacity(hw::sizes::RENDER_UNITS, GFP_KERNEL),
++                KVec::with_capacity(hw::sizes::RENDER_UNITS + 1, GFP_KERNEL),
++            ) {
++                (Ok(pass), Ok(pb)) => Some((pass, pb)),
++                _ => None,
++            }
++        } else {
++            None
++        };
+         let registry = self.shared.state.lock().as_deref_mut().map(|state| {
+             state.slots.release_closed(vm.id());
+             if let Some(owners) = owners.as_mut() {
+                 state.slots.closed_pass_owners(owners);
+             }
++            if let Some((pass, pb)) = disp.as_mut() {
++                let idle = state.slots.take_closed_pass(pass);
++                state.pools.take_closed(idle, pb);
++            }
+             state.vms.clone()
+         });
+         if let Some(registry) = registry {
+@@ -823,6 +839,13 @@ fn vm_closed(&self, vm: &mmu::Vm) {
+                 }
+             }
+         }
++        // Outside every lock: the taken leases go, PB managers first (each unmaps its records
++        // before its VM reference goes), then the render leases; a closed VM whose last
++        // lease this was releases its render arena through the deferred cleanup.
++        if let Some((pass, pb)) = disp {
++            drop(pb);
++            drop(pass);
++        }
+     }
+ 
+     fn new_queue(
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 6763bca6248..f149da455fc 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -3166,6 +3166,29 @@ pub(crate) fn close_trim() -> bool {
+     "G16: 1 = a VM handle close gives back the later render units of closed VMs that still hold unit leases (default 1; 0: kept until a deep client displaces them)"
+ );
+ 
++/// Storage of `g16_close_disp` (runtime 0644, default 0).
++static CLOSE_DISP: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_close_disp`: when any VM's handle closes, the render and PB-slot last-owner leases
++/// that closed VMs still hold are dropped on every unit index with no flight, no publication
++/// pending and its last publication fully retired (slots.rs `Slots::take_closed_pass`,
++/// pools.rs `Pools::take_closed`). Those leases are the last references to a closed VM's
++/// state, so its whole render arena goes with them, first units included. Indices that are
++/// busy or pending are displaced by their next retire as before; quarantined ones keep their
++/// lease. 0: the leases stay until another publication retires on each index.
++pub(crate) fn close_disp() -> bool {
++    CLOSE_DISP.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    CLOSE_DISP_PARAM,
++    CLOSE_DISP_PARMTYPE,
++    CLOSE_DISP_PARM,
++    CLOSE_DISP,
++    "g16_close_disp",
++    "G16: 1 = a VM handle close drops closed VMs' render and PB-slot leases on idle, fully retired unit indices, freeing their arenas (default 0: kept until another publication retires there)"
++);
++
+ /// Storage of `g16_loader_macos` (0644, default 7; read once, when initdata is built).
+ static LOADER_MACOS: AtomicU32 = AtomicU32::new(7);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/pools.rs b/drivers/gpu/drm/asahi/g16/pools.rs
+index 94886820b06..9955065a7dc 100644
+--- a/drivers/gpu/drm/asahi/g16/pools.rs
++++ b/drivers/gpu/drm/asahi/g16/pools.rs
+@@ -828,6 +828,29 @@ pub(crate) fn would_reuse(&self, k: usize, vm: &Arc<super::vm::VmState>) -> bool
+             && epoch.ring_words().is_ok_and(|w| w[0] == w[1])
+             && size_holds(k, epoch.seeded_blocks(), epoch.capacity_blocks())
+     }
++    /// `g16_close_disp`: moves each PB-slot lease of a closed VM on an index in `idle`
++    /// ([`super::slots::Slots::take_closed_pass`]), and the shared slot-0 manager of a closed
++    /// VM when index 0 is in `idle`, into `out` (capacity reserved by the caller; never
++    /// allocates under the device lock). The caller drops them outside the lock.
++    pub(crate) fn take_closed(&mut self, idle: u32, out: &mut KVec<Arc<PbEpoch>>) {
++        for (k, slot) in self.owners.iter_mut().enumerate() {
++            if idle & (1 << k) == 0 || !slot.as_ref().is_some_and(|e| e._vm.vm.is_closed()) {
++                continue;
++            }
++            if let Some(e) = slot.take() {
++                if let Err(e) = out.push_within_capacity(e) {
++                    *slot = Some(e.0);
++                }
++            }
++        }
++        if idle & 1 != 0 && self.shared.as_ref().is_some_and(|e| e._vm.vm.is_closed()) {
++            if let Some(e) = self.shared.take() {
++                if let Err(e) = out.push_within_capacity(e) {
++                    self.shared = Some(e.0);
++                }
++            }
++        }
++    }
+     pub(crate) fn retire_binding(&mut self, k: usize, epoch: &Arc<PbEpoch>) -> Result {
+         *self.owners.get_mut(k).ok_or(EINVAL)? = Some(epoch.clone());
+         Ok(())
+diff --git a/drivers/gpu/drm/asahi/g16/slots.rs b/drivers/gpu/drm/asahi/g16/slots.rs
+index 5b7bf6ab978..e0caf9778f2 100644
+--- a/drivers/gpu/drm/asahi/g16/slots.rs
++++ b/drivers/gpu/drm/asahi/g16/slots.rs
+@@ -801,6 +801,37 @@ pub(crate) fn closed_pass_owners(&self, out: &mut KVec<Arc<super::vm::VmState>>)
+         }
+     }
+ 
++    /// `g16_close_disp`: the unit indices with no flight, no publication pending and their last
++    /// publication fully retired (after that receipt the firmware has cleared the index's UMA
++    /// binding, GPU-FW 1824Z; the rule `g16_unit_trim` frees a unit's memory under). Moves
++    /// each closed VM's render last-owner lease on such an index into `out` (capacity reserved
++    /// by the caller; never allocates under the device lock) and returns the mask of those
++    /// indices, for the PB-slot leases. The caller drops what it took outside the lock.
++    pub(crate) fn take_closed_pass(&mut self, out: &mut KVec<Arc<super::vm::VmState>>) -> u32 {
++        let mut idle = 0u32;
++        for k in 0..sizes::RENDER_UNITS {
++            if self.pass_busy & (1 << k) != 0
++                || self.pending_pass_owner[k].is_some()
++                || !self.pass_lifetime.is_retired(k)
++            {
++                continue;
++            }
++            idle |= 1 << k;
++            if !self.pass_owner[k]
++                .as_ref()
++                .is_some_and(|o| o.vm.is_closed())
++            {
++                continue;
++            }
++            if let Some(o) = self.pass_owner[k].take() {
++                if let Err(e) = out.push_within_capacity(o) {
++                    self.pass_owner[k] = Some(e.0);
++                }
++            }
++        }
++        idle
++    }
++
+     /// `g16_unit_trim`: whether VM `vm`'s render unit on index `k` may be freed: no flight on
+     /// the index, no publication pending there, and not the VM's own last render left
+     /// quarantined there (resources::unit_trim::may_free).
+-- 
+2.43.0
+
