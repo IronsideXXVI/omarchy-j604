@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 22 Nov 2026 13:56:41 +0000
+Subject: [PATCH] drm/asahi: g16: Batch FS only when the run fills in
+ this pass
+
+With g16_render_fs_run set, a render joins an FS batch as soon as a
+run of FS work is queued ahead of it. At depth 64 that saves the FS
+barrier, submit record and doorbell per run. At depth 8, though, the
+renders behind the first one are often not yet pending when it is
+published, so the batch opens and never fills: the later renders wait
+on a partial run and depth 8 gets slower.
+
+Defer to the batch only when the renders already waiting behind the
+one being published fill the run in this pass (RUN - 1 or more). Count
+the Render commands still pending after this command in the same job,
+and the unsent Render commands of the other pending jobs, capped at
+RUN - 1. The deep-queue rule (ahead_ok) is unchanged and still has to
+hold.
+
+Add a unit test for the pure rule: RUN - 2 renders behind never
+defers, RUN - 1 behind with a full queue ahead defers, and a shallow
+queue ahead never defers whatever is behind.
+---
+ drivers/gpu/drm/asahi/g16/engine.rs   | 34 +++++++++++++++++++++++----
+ drivers/gpu/drm/asahi/g16/fs_batch.rs | 26 ++++++++++++++++++++
+ 2 files changed, 56 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index c4827f356e..c209c92480 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -2107,9 +2107,34 @@ fn compute_queue_for(&mut self, job: &Job, index: u32, ahead: bool) -> Result<us
+         }
+     }
+ 
++    /// `g16_render_fs_run`: render commands still waiting in `pending` behind command `index`
++    /// of `job`, counted up to `cap`. `job` is still in `pending` here (publish_pass unpends it
++    /// only after its last command is published), so its own later commands count from
++    /// `index + 1` and every other pending job from its next unsent command.
++    fn renders_behind(&self, job: &Arc<Job>, index: u32, cap: u32) -> u32 {
++        let mut n = 0u32;
++        for j in self.engine.pending.iter() {
++            let from = if Arc::ptr_eq(j, job) {
++                index.saturating_add(1)
++            } else {
++                j.progress.sent()
++            };
++            for k in from..j.progress.count() {
++                if matches!(command(j, k), Some(Command::Render(_))) {
++                    n += 1;
++                    if n >= cap {
++                        return n;
++                    }
++                }
++            }
++        }
++        n
++    }
++
+     /// `g16_render_fs_run`: whether a render that would defer its FS finds at least one run of
+-    /// exposed renders whose FS has not finished, read from the FS stamp (fs_batch.rs).
+-    fn fs_ahead_ok(&self) -> Result<bool> {
++    /// exposed renders whose FS has not finished, read from the FS stamp, and at least
++    /// `RUN - 1` renders waiting behind it so the batch fills in this pass (fs_batch.rs).
++    fn fs_ahead_ok(&self, job: &Arc<Job>, index: u32) -> Result<bool> {
+         let seen = self.graph.render.fw_stamp[1].r32(0)?;
+         let tail = self.engine.fs_target;
+         let reached = super::recovery::logic::stamp_reached;
+@@ -2123,7 +2148,8 @@ fn fs_ahead_ok(&self) -> Result<bool> {
+             u32::try_from(unfinished).unwrap_or(u32::MAX),
+             self.engine.fs_batch.renders,
+         );
+-        let ok = super::fs_batch::ahead_ok(q);
++        let behind = self.renders_behind(job, index, super::fs_batch::RUN - 1);
++        let ok = super::fs_batch::defer_in_pass(q, behind);
+         super::fs_batch::AHEAD_HIST[super::fs_batch::ahead_slot(q)].fetch_add(1, Ordering::Relaxed);
+         super::fs_batch::AHEAD_N[usize::from(!ok)].fetch_add(1, Ordering::Relaxed);
+         Ok(ok)
+@@ -2285,7 +2311,7 @@ fn publish_prefix_into(
+                 params::onebell(),
+                 params::render_quiet(),
+             );
+-        let fs_defer = fs_defer && self.fs_ahead_ok()?;
++        let fs_defer = fs_defer && self.fs_ahead_ok(job, index)?;
+         if render && super::fs_batch::flush_first(&self.engine.fs_batch, fs_defer, fs_word) {
+             self.flush_fs_batch()?;
+         }
+diff --git a/drivers/gpu/drm/asahi/g16/fs_batch.rs b/drivers/gpu/drm/asahi/g16/fs_batch.rs
+index 60b6f6335c..c80a35257e 100644
+--- a/drivers/gpu/drm/asahi/g16/fs_batch.rs
++++ b/drivers/gpu/drm/asahi/g16/fs_batch.rs
+@@ -123,6 +123,18 @@ pub(crate) fn ahead_ok(queued: u32) -> bool {
+     queued >= RUN
+ }
+ 
++/// Whether a batch opened or joined now fills in this pass: at least `RUN - 1` render commands
++/// still wait in `pending` behind the one being published. A shallow stream (d8: its frames
++/// sit in firmware flights, nothing waits behind) keeps the per-render form.
++pub(crate) fn fills_in_pass(behind: u32) -> bool {
++    behind >= RUN - 1
++}
++
++/// The full deferral test: a run of FS work queued ahead and a run's worth of renders behind.
++pub(crate) fn defer_in_pass(queued: u32, behind: u32) -> bool {
++    ahead_ok(queued) && fills_in_pass(behind)
++}
++
+ /// Histogram slot of `n` exposed renders with FS queued.
+ pub(crate) fn ahead_slot(n: u32) -> usize {
+     match n {
+@@ -285,6 +297,20 @@ fn capped_batches_order_every_fs_and_cost_one_barrier_per_cap() {
+         }
+     }
+ 
++    #[test]
++    fn renders_waiting_behind_gate_the_batch() {
++        // RUN - 2 renders waiting behind the published one: the batch cannot fill, no defer.
++        assert!(!fills_in_pass(RUN - 2));
++        assert!(!defer_in_pass(RUN, RUN - 2));
++        assert!(!defer_in_pass(9, 0));
++        // RUN - 1 behind with a run of FS queued ahead: defer.
++        assert!(fills_in_pass(RUN - 1));
++        assert!(defer_in_pass(RUN, RUN - 1));
++        assert!(defer_in_pass(RUN, 60));
++        // Enough behind but a shallow FS queue ahead still publishes at once.
++        assert!(!defer_in_pass(RUN - 1, RUN - 1));
++    }
++
+     #[test]
+     fn a_run_of_queued_fs_gates_the_batch() {
+         // A drained or shallow FS queue publishes at once; a run of queued FS work batches.
+-- 
+2.43.0
+

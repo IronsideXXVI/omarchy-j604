@@ -1,0 +1,798 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 21 Nov 2026 12:39:27 +0000
+Subject: [PATCH] drm/asahi: g16: Order FS work once per firmware run
+ behind queued FS
+
+Every render writes a Stamp barrier on the FS ring ahead of its FS
+work, plus its own FS submit record and FS doorbell. The barrier holds
+the FS queue until the render's TA has finished. On this firmware it is
+required: with the FS barrier dropped an FS has started before its own
+TA ended, and a render at depth 1 faulted the firmware.
+
+A hypervisor trace of macOS's render queues on the same machine shows
+no barrier work in 1693 work buffers and one submit record per render.
+The firmware runs renders in runs of four (class 2, eight starts). So
+at depth 64 we pay four FS barriers, eight submit records and four FS
+doorbells per run where macOS pays no barrier and four records.
+
+Add g16_render_fs_run (runtime 0644, default 0). With it set, a render
+published behind running flights and behind at least one run of FS
+work that is exposed and not yet finished (read from the FS stamp)
+joins a batch of at most one run. The first render of the batch writes
+its barrier entry, the later ones only their FS work. The FS WRITE
+cursor, the one FS submit record and the one FS doorbell follow at the
+end of the publish pass, after the opening barrier is re-encoded to
+wait for the newest render's TA target. TA targets rise with the draw
+ordinal and the TA ring is consumed in order, so when that barrier
+passes every TA of the batch has finished. Per run at depth 64 this is
+one barrier, five records and one FS doorbell.
+
+A render with less than one run of FS work ahead first exposes any
+open batch, then publishes with its own barrier, record and doorbell,
+as before. An earlier form batched every render of a pass. On the
+device it read 2.7% better at depth 64 and 4.3% worse at depth 8. Both
+costs of a batch, the exposure at the end of the pass and the wait for
+the newest TA, are hidden behind queued FS work at depth 64. At depth 8
+the FS queue drains between refills, so they idle the FS. With the
+gate, a shallow queue keeps the per-render form and gains no wait;
+depth 1 never batches.
+
+The rules are pure functions in fs_batch.rs. Host tests run a ring
+model in which TAs finish in order and the FS queue consumes entries up
+to WRITE; every mix of batched and per-render publications over ten
+renders orders each FS behind its TA and writes at most one barrier
+per render. The stats file gains a render_fs_run line: renders that
+batched, renders that kept their own barrier, and a histogram of the
+FS work found queued at each decision.
+---
+ drivers/gpu/drm/asahi/g16/engine.rs   | 146 ++++++++-
+ drivers/gpu/drm/asahi/g16/fs_batch.rs | 422 ++++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/mod.rs      |   1 +
+ drivers/gpu/drm/asahi/g16/params.rs   |  22 ++
+ drivers/gpu/drm/asahi/g16/poll.rs     |  15 +
+ 5 files changed, 603 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/fs_batch.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/engine.rs b/drivers/gpu/drm/asahi/g16/engine.rs
+index de67147f09..c4827f356e 100644
+--- a/drivers/gpu/drm/asahi/g16/engine.rs
++++ b/drivers/gpu/drm/asahi/g16/engine.rs
+@@ -24,6 +24,7 @@
+ use super::fw::work::{self, BarrierType};
+ use super::hw::sizes;
+ use super::job::{Completions, Job};
++use super::object::FwObject;
+ use super::slots::Claims;
+ use super::{params, Firmware, Shared};
+ 
+@@ -329,6 +330,12 @@ struct Prefix {
+     draw: u64,
+     last_ct: u32,
+     last_fs: u32,
++    /// `g16_render_fs_run`: the FS record waits for the end of the pass (`fs_defer`); a
++    /// render joining an open batch writes no barrier entry (`fs_join`). The render's own
++    /// barrier object and uuid, kept by the render that opens a batch.
++    fs_defer: bool,
++    fs_join: bool,
++    own_barrier: Option<(Arc<FwObject>, u32)>,
+ }
+ 
+ /// Error provenance must remain independent of errno: EIO can be an ordinary failed VM
+@@ -703,6 +710,10 @@ pub(crate) struct Engine {
+     pub(crate) fs_target: u32,
+     pub(crate) ta_head: u32,
+     pub(crate) fs_head: u32,
++    /// `g16_render_fs_run`: the FS batch open in this publish pass (fs_batch.rs) and the
++    /// opening render's barrier object and uuid, re-encoded at the flush.
++    pub(crate) fs_batch: super::fs_batch::Batch,
++    pub(crate) fs_batch_barrier: Option<(Arc<FwObject>, u32)>,
+     /// Event counts at the tail's publication.
+     pub(crate) events: u32,
+     pub(crate) stage_seen: u32,
+@@ -778,6 +789,8 @@ pub(crate) fn new() -> Result<Self> {
+             fs_target: 0,
+             ta_head: 0,
+             fs_head: 0,
++            fs_batch: Default::default(),
++            fs_batch_barrier: None,
+             events: 0,
+             stage_seen: 0,
+             queue_registered: false,
+@@ -1610,6 +1623,16 @@ fn render_ahead_refusal(&self) -> usize {
+     /// and latches the device failed. Dependency errors and exhausted resource classes are handled
+     /// separately before preparation, without failing an otherwise healthy engine class.
+     pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
++        let result = self.publish_pass(done);
++        // g16_render_fs_run: every exit of the pass, the deadline and error paths
++        // included, exposes the FS batch it opened (fs_batch.rs).
++        match self.flush_fs_batch() {
++            Err(e) if result.is_ok() => Err(e),
++            _ => result,
++        }
++    }
++
++    fn publish_pass(&mut self, done: &mut Completions) -> Result {
+         // What arrives during a system sleep waits for its end.
+         if self.session.shared.sleeping.load(core::sync::atomic::Ordering::Acquire) {
+             return Ok(());
+@@ -2084,6 +2107,81 @@ fn compute_queue_for(&mut self, job: &Job, index: u32, ahead: bool) -> Result<us
+         }
+     }
+ 
++    /// `g16_render_fs_run`: whether a render that would defer its FS finds at least one run of
++    /// exposed renders whose FS has not finished, read from the FS stamp (fs_batch.rs).
++    fn fs_ahead_ok(&self) -> Result<bool> {
++        let seen = self.graph.render.fw_stamp[1].r32(0)?;
++        let tail = self.engine.fs_target;
++        let reached = super::recovery::logic::stamp_reached;
++        let unfinished = self
++            .engine
++            .flights
++            .iter()
++            .filter(|f| f.renders != 0 && !reached(seen, f.fs_target, tail))
++            .count();
++        let q = super::fs_batch::queued(
++            u32::try_from(unfinished).unwrap_or(u32::MAX),
++            self.engine.fs_batch.renders,
++        );
++        let ok = super::fs_batch::ahead_ok(q);
++        super::fs_batch::AHEAD_HIST[super::fs_batch::ahead_slot(q)].fetch_add(1, Ordering::Relaxed);
++        super::fs_batch::AHEAD_N[usize::from(!ok)].fetch_add(1, Ordering::Relaxed);
++        Ok(ok)
++    }
++
++    /// `g16_render_fs_run`: exposes the open FS batch (fs_batch.rs). The opening barrier is
++    /// re-encoded to wait for the newest render's TA stamp before the FS WRITE cursor and the
++    /// one FS submit record make any FS entry of the batch visible. After a fail-stop the
++    /// entries stay unexposed with the retained flights.
++    fn flush_fs_batch(&mut self) -> Result {
++        let barrier = self.engine.fs_batch_barrier.take();
++        let Some(b) = self.engine.fs_batch.take() else {
++            return Ok(());
++        };
++        if self.recovery.failed().is_some() {
++            return Ok(());
++        }
++        let (obj, uuid) = barrier.ok_or(EINVAL)?;
++        let r = &self.graph.render;
++        let own = encode::barrier(
++            r.fw_stamp[0].va,
++            b.wait,
++            0x70,
++            b.own,
++            uuid,
++            BarrierType::Stamp,
++        );
++        obj.write(0, &own)?;
++        r.ring[1].w64(8 * b.slot as usize, obj.va)?;
++        wmb();
++        r.qstate[1].w32(qstate::WRITE, b.head)?;
++        wmb();
++        let record = SubmitRecord {
++            unk_0: submit_time(),
++            qinfo: r.qinfo[1].va,
++            kind: Channel::Fs as u32,
++            head: b.head as u16,
++            event: 0x71,
++            new_queue: 0,
++        };
++        // Room was checked at every render of the batch and no FS record was posted since.
++        let new = self.channels.post_ahead(Channel::Fs, &record)?;
++        let mut left = b.renders;
++        for f in self.engine.flights.iter_mut().rev() {
++            if left == 0 {
++                break;
++            }
++            if f.renders != 0 {
++                f.rec[1] = new;
++                left -= 1;
++            }
++        }
++        if super::params::subgen() {
++            self.subgen_bump(Channel::Fs as usize);
++        }
++        self.session.ring(Channel::Fs)
++    }
++
+     /// Publishes the next command of `job`. All images and ring entries precede the host
+     /// producer writes and queue kicks. EAGAIN defers while storage/channel state is held;
+     /// The error records whether firmware may see a counter/producer update, independently
+@@ -2174,13 +2272,36 @@ fn publish_prefix_into(
+         if self.engine.scratch.is_none() {
+             return Err(EIO);
+         }
++        // g16_render_fs_run: a render behind running flights and at least one run of queued FS
++        // work defers its FS record to the end of the pass and shares the batch's one FS
++        // barrier (fs_batch.rs). Any other render, or one finding the batch full, first
++        // exposes the open batch and keeps its own barrier, record and doorbell.
++        let fs_word = params::render_fs_run();
++        let fs_defer = render
++            && super::fs_batch::defer(
++                fs_word,
++                ahead,
++                self.engine.ta_registered && self.engine.render_registered,
++                params::onebell(),
++                params::render_quiet(),
++            );
++        let fs_defer = fs_defer && self.fs_ahead_ok()?;
++        if render && super::fs_batch::flush_first(&self.engine.fs_batch, fs_defer, fs_word) {
++            self.flush_fs_batch()?;
++        }
+         self.engine.stats.prep_from_ns = now_ns();
+         let mut prefix = Prefix {
+             n: self.engine.c_ordinal(cq),
+             draw: self.engine.draw,
+             c_head: self.graph.compute_q(cq)?.qstate.r32(qstate::WRITE)?,
+             ta_head: self.graph.render.qstate[0].r32(qstate::WRITE)?,
+-            fs_head: self.graph.render.qstate[1].r32(qstate::WRITE)?,
++            // The FS WRITE cursor is stale while an FS batch is open.
++            fs_head: match self.engine.fs_batch.join_head() {
++                Some(h) => h,
++                None => self.graph.render.qstate[1].r32(qstate::WRITE)?,
++            },
++            fs_defer,
++            fs_join: fs_defer && self.engine.fs_batch.is_open(),
+             ..Default::default()
+         };
+         if prefix.c_head >= 256 || prefix.ta_head >= 256 || prefix.fs_head >= 256 {
+@@ -2284,7 +2405,9 @@ fn publish_prefix_into(
+                     prefix.ta_head,
+                     &mut self.engine.stats.publications[1],
+                 )?;
+-                self.graph.render.qstate[1].w32(qstate::WRITE, prefix.fs_head)?;
++                if !prefix.fs_defer {
++                    self.graph.render.qstate[1].w32(qstate::WRITE, prefix.fs_head)?;
++                }
+             } else {
+                 publish_producer(
+                     &self.graph.compute_q(f.cq)?.qstate,
+@@ -2346,6 +2469,10 @@ fn publish_prefix_into(
+                 )
+             };
+             for &channel in channels {
++                // g16_render_fs_run: the batch's one FS record is posted at the flush.
++                if channel == Channel::Fs && prefix.fs_defer {
++                    continue;
++                }
+                 let (qinfo, head, event, fresh) = match channel {
+                     Channel::Compute => (
+                         self.graph.compute_q(f.cq)?.qinfo.va,
+@@ -2449,6 +2576,14 @@ fn publish_prefix_into(
+         })();
+         if publication.is_ok() {
+             self.slots.note_published(&f.claims);
++            if prefix.fs_defer {
++                if !self.engine.fs_batch.is_open() {
++                    self.engine.fs_batch_barrier = prefix.own_barrier.take();
++                }
++                self.engine
++                    .fs_batch
++                    .note(f.fs_start, f.fs_head, f.ta_target);
++            }
+         }
+         // From the first counter/WRITE onward an error is uncertain. Keep the complete
+         // retained flight even when a later channel store or doorbell fails.
+@@ -2917,6 +3052,9 @@ fn prefix_render(
+             BarrierType::Stamp,
+         );
+         p.own_barrier.write(0, &own)?;
++        if pf.fs_defer {
++            pf.own_barrier = Some((p.own_barrier.clone(), refs.uuid));
++        }
+         // g16_render_chain: a render published ahead of a render it waits on starts its TA only
+         // after the previous render's FS stamp (FS event 0x71), as the G15 backend's predecessor
+         // barrier does; the previous render is the last one published (pf.draw).
+@@ -2948,7 +3086,9 @@ fn prefix_render(
+         pf.ta_head = (pf.ta_head + 1) % cap;
+         // g16_render_quiet 2: no FS-ring barrier record; the FS follows its TA by the
+         // firmware's own pairing, as macOS's records have no such record.
+-        if quiet < 2 {
++        // g16_render_fs_run: a render joining an open batch writes no barrier entry; the
++        // opening one always does, its barrier re-encoded at the flush (fs_batch.rs).
++        if (quiet < 2 || pf.fs_defer) && !pf.fs_join {
+             r.ring[1].w64(8 * pf.fs_head as usize, p.own_barrier.va)?;
+             pf.fs_head = (pf.fs_head + 1) % cap;
+         }
+diff --git a/drivers/gpu/drm/asahi/g16/fs_batch.rs b/drivers/gpu/drm/asahi/g16/fs_batch.rs
+new file mode 100644
+index 0000000000..60b6f6335c
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/fs_batch.rs
+@@ -0,0 +1,422 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! `g16_render_fs_run`: FS ordering once per firmware run, as pure rules.
++//!
++//! Every render writes a Stamp barrier on the FS ring ahead of its FS work. The barrier holds
++//! the FS queue until the TA stamp (`fw_stamp[0]`, written when the render's TA finishes)
++//! reaches the render's own target, so no FS starts before its TA. On this firmware the
++//! barrier is required: without it an FS has started before its own TA ended. macOS's render
++//! queues carry no barrier work at all; its firmware orders the pair itself.
++//!
++//! With the switch on, a render published behind at least one firmware run of FS work that is
++//! already exposed and not finished joins a batch of at most one run (`RUN`). The first render
++//! of the batch writes its barrier entry and its FS work; the later ones write only their FS
++//! work. The FS WRITE cursor, the FS submit record and the FS doorbell wait for the end of the
++//! pass, and the opening barrier is then re-encoded to wait for the newest render's target.
++//! Targets rise with the draw ordinal and the TA ring is consumed in order, so when the barrier
++//! passes, the TA of every render in the batch has finished.
++//!
++//! Both costs of a batch, the later exposure and the wait for the newest TA, are hidden only
++//! while older FS work is still queued. A render that finds less than one run of FS work ahead
++//! first exposes any open batch and then publishes with its own barrier, record and doorbell,
++//! so a shallow queue keeps the per-render form and gains no wait.
++
++use core::sync::atomic::AtomicU64;
++
++/// Renders per firmware run (class-2 limit of 8 TA and FS starts, 25G83 0x595c8).
++pub(crate) const RUN: u32 = 4;
++
++/// The open batch: renders whose FS entries are written but not yet exposed.
++#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Batch {
++    /// Renders in the batch; 0 = no batch open.
++    pub(crate) renders: u32,
++    /// FS ring index of the batch's one barrier entry.
++    pub(crate) slot: u32,
++    /// FS ring head after the newest FS work entry.
++    pub(crate) head: u32,
++    /// Own stamp value of the opening render (the barrier's `own` field).
++    pub(crate) own: u32,
++    /// Target of the newest render: the wait value of the batch's barrier.
++    pub(crate) wait: u32,
++}
++
++impl Batch {
++    /// Whether a batch is open.
++    pub(crate) fn is_open(&self) -> bool {
++        self.renders != 0
++    }
++
++    /// The FS ring head the next entry is written at while a batch is open (the FS WRITE
++    /// cursor is stale until the flush).
++    pub(crate) fn join_head(&self) -> Option<u32> {
++        if self.is_open() {
++            Some(self.head)
++        } else {
++            None
++        }
++    }
++
++    /// Notes a render published into the batch: the FS ring head before (`start`) and after
++    /// (`head`) its entries, and its TA stamp target.
++    pub(crate) fn note(&mut self, start: u32, head: u32, target: u32) {
++        if self.renders == 0 {
++            self.slot = start;
++            self.own = target;
++        }
++        self.renders = self.renders.saturating_add(1);
++        self.head = head;
++        self.wait = target;
++    }
++
++    /// Closes the batch and returns it, if one was open.
++    pub(crate) fn take(&mut self) -> Option<Batch> {
++        if self.is_open() {
++            Some(core::mem::take(self))
++        } else {
++            None
++        }
++    }
++}
++
++/// Most renders in one batch for switch value `word`: 0 = off; otherwise one firmware run.
++pub(crate) fn cap(word: u32) -> u32 {
++    if word == 0 {
++        0
++    } else {
++        RUN
++    }
++}
++
++/// Whether a render publication defers its FS record into the batch: the switch is on, the
++/// render goes behind running flights, both render queues are registered (no registering
++/// first record), each pipe has its own doorbell (`g16_onebell` 0) and the FS barrier is in
++/// use (`g16_render_quiet` below 2).
++pub(crate) fn defer(word: u32, ahead: bool, registered: bool, onebell: u32, quiet: u32) -> bool {
++    cap(word) != 0 && ahead && registered && onebell == 0 && quiet < 2
++}
++
++/// Whether the open batch must be exposed before the next render: it is open and either that
++/// render does not defer or the batch holds `cap(word)` renders.
++pub(crate) fn flush_first(b: &Batch, defer: bool, word: u32) -> bool {
++    b.is_open() && (!defer || b.renders >= cap(word))
++}
++
++/// `g16_render_fs_run`: renders behind running flights that found a run of FS work ahead
++/// (they batch), and those that did not (they publish with their own barrier, record and
++/// doorbell).
++pub(crate) static AHEAD_N: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
++
++/// Exposed renders with FS work queued at each decision: 0, 1, 2, 3-4, 5-8, 9 and more.
++pub(crate) static AHEAD_HIST: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
++
++/// Exposed renders whose FS has not finished: the `unfinished` render flights (FS stamp below
++/// their target) less the `batched` ones still held in the open batch.
++pub(crate) fn queued(unfinished: u32, batched: u32) -> u32 {
++    unfinished.saturating_sub(batched)
++}
++
++/// Whether a render may join or open a batch: only with at least one run of exposed renders'
++/// FS work still queued ahead of it. With the FS queue drained, the batch's pass-end exposure
++/// and its wait for the newest render's TA would idle the FS.
++pub(crate) fn ahead_ok(queued: u32) -> bool {
++    queued >= RUN
++}
++
++/// Histogram slot of `n` exposed renders with FS queued.
++pub(crate) fn ahead_slot(n: u32) -> usize {
++    match n {
++        0 => 0,
++        1 => 1,
++        2 => 2,
++        3..=4 => 3,
++        5..=8 => 4,
++        _ => 5,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const CAP: u32 = 256;
++    const STEP: u32 = 0x100;
++
++    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++    enum Entry {
++        Barrier(u32),
++        Fs(u32),
++    }
++
++    /// Writes `n` renders (targets `t0`, `t0 + STEP`, ...) from FS ring head `start`, as the
++    /// engine does; `wrong` keeps the opening render's target as the batch wait. Returns the
++    /// FS WRITE cursor at the end of the pass.
++    fn publish(
++        batch: bool,
++        wrong: bool,
++        start: u32,
++        t0: u32,
++        n: u32,
++        ring: &mut [Option<Entry>],
++    ) -> u32 {
++        publish_cap(u32::from(batch), wrong, start, t0, n, ring)
++    }
++
++    fn close(b: &mut Batch, wrong: bool, ring: &mut [Option<Entry>]) {
++        if let Some(t) = b.take() {
++            let wait = if wrong { t.own } else { t.wait };
++            ring[t.slot as usize] = Some(Entry::Barrier(wait));
++        }
++    }
++
++    /// As the engine with switch value `word` (0 = per-render barriers): a full batch is
++    /// exposed before the next render opens a new one.
++    fn publish_cap(
++        word: u32,
++        wrong: bool,
++        start: u32,
++        t0: u32,
++        n: u32,
++        ring: &mut [Option<Entry>],
++    ) -> u32 {
++        let batch = cap(word) != 0;
++        let mut b = Batch::default();
++        let mut head = start;
++        for i in 0..n {
++            let target = t0 + STEP * i;
++            if flush_first(&b, batch, word) {
++                close(&mut b, wrong, ring);
++            }
++            let s = if batch {
++                b.join_head().unwrap_or(head)
++            } else {
++                head
++            };
++            let mut h = s;
++            if !(batch && b.is_open()) {
++                ring[h as usize] = Some(Entry::Barrier(target));
++                h = (h + 1) % CAP;
++            }
++            ring[h as usize] = Some(Entry::Fs(target));
++            h = (h + 1) % CAP;
++            if batch {
++                b.note(s, h, target);
++            }
++            head = h;
++        }
++        if batch {
++            assert_eq!(b.head, head);
++            assert_eq!(b.renders, (n - 1) % cap(word) + 1);
++        }
++        close(&mut b, wrong, ring);
++        assert!(!b.is_open());
++        head
++    }
++
++    /// Firmware model: the TAs finish in ring order, one per step, each raising the TA stamp
++    /// to its target; between steps the FS queue consumes entries up to WRITE, a barrier
++    /// holding while the stamp is below its wait. False if an FS is consumed before its TA
++    /// finished, or the queue never drains.
++    fn run(ring: &[Option<Entry>], start: u32, write: u32, t0: u32, n: u32) -> bool {
++        let mut stamp = t0 - STEP;
++        let mut read = start;
++        for done in 0..=n {
++            if done > 0 {
++                stamp = t0 + STEP * (done - 1);
++            }
++            while read != write {
++                match ring[read as usize] {
++                    Some(Entry::Barrier(w)) if stamp < w => break,
++                    Some(Entry::Barrier(_)) => {}
++                    Some(Entry::Fs(t)) if stamp < t => return false,
++                    Some(Entry::Fs(_)) => {}
++                    None => return false,
++                }
++                read = (read + 1) % CAP;
++            }
++        }
++        read == write
++    }
++
++    fn entries(start: u32, write: u32) -> u32 {
++        write.wrapping_add(CAP).wrapping_sub(start) % CAP
++    }
++
++    #[test]
++    fn per_render_barriers_order_every_fs() {
++        for &start in &[0, 100, 250] {
++            for n in 1..=8 {
++                let mut ring = [None; CAP as usize];
++                let w = publish(false, false, start, 5 * STEP, n, &mut ring);
++                assert_eq!(entries(start, w), 2 * n);
++                assert!(run(&ring, start, w, 5 * STEP, n));
++            }
++        }
++    }
++
++    #[test]
++    fn batch_orders_every_fs_behind_its_ta() {
++        for &start in &[0, 100, 250, 255] {
++            for n in 1..=RUN {
++                let mut ring = [None; CAP as usize];
++                let w = publish(true, false, start, 5 * STEP, n, &mut ring);
++                assert_eq!(entries(start, w), n + 1);
++                assert_eq!(
++                    ring[start as usize],
++                    Some(Entry::Barrier(5 * STEP + STEP * (n - 1)))
++                );
++                assert!(run(&ring, start, w, 5 * STEP, n));
++            }
++        }
++    }
++
++    #[test]
++    fn capped_batches_order_every_fs_and_cost_one_barrier_per_cap() {
++        for word in [1, 2, 99] {
++            let k = cap(word);
++            for &start in &[0, 250] {
++                for n in 1..=24 {
++                    let mut ring = [None; CAP as usize];
++                    let w = publish_cap(word, false, start, 5 * STEP, n, &mut ring);
++                    assert_eq!(entries(start, w), n + n.div_ceil(k));
++                    assert!(run(&ring, start, w, 5 * STEP, n));
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn a_run_of_queued_fs_gates_the_batch() {
++        // A drained or shallow FS queue publishes at once; a run of queued FS work batches.
++        for q in 0..RUN {
++            assert!(!ahead_ok(q));
++        }
++        assert!(ahead_ok(RUN));
++        assert!(ahead_ok(7));
++        // Renders held in the open batch are not queued at the FS yet.
++        assert_eq!(queued(5, 2), 3);
++        assert_eq!(queued(1, 3), 0);
++        assert_eq!(ahead_slot(0), 0);
++        assert_eq!(ahead_slot(2), 2);
++        assert_eq!(ahead_slot(4), 3);
++        assert_eq!(ahead_slot(8), 4);
++        assert_eq!(ahead_slot(9), 5);
++    }
++
++    #[test]
++    fn cap_values() {
++        assert_eq!(
++            (cap(0), cap(1), cap(2), cap(16), cap(99)),
++            (0, RUN, RUN, RUN, RUN)
++        );
++        let mut b = Batch::default();
++        assert!(!flush_first(&b, true, 1) && !flush_first(&b, false, 1));
++        for i in 0..RUN {
++            assert!(!flush_first(&b, true, 1));
++            b.note(i, i + 1, i);
++        }
++        assert!(flush_first(&b, true, 1));
++        assert!(flush_first(&b, true, 5));
++        assert!(flush_first(&b, false, 5));
++    }
++
++    /// As the engine with the switch on and a per-render decision: bit `i` of `pattern` set
++    /// means render `i` found a run of FS work ahead and joins or opens the batch; clear means
++    /// it first exposes the open batch and publishes with its own barrier. Returns the FS WRITE
++    /// cursor at the end of the pass and the barrier entries written.
++    fn publish_mixed(pattern: u32, start: u32, t0: u32, n: u32, ring: &mut [Option<Entry>]) -> (u32, u32) {
++        let mut b = Batch::default();
++        let mut head = start;
++        let mut barriers = 0;
++        for i in 0..n {
++            let target = t0 + STEP * i;
++            let defer = pattern & (1 << i) != 0;
++            if flush_first(&b, defer, 1) {
++                close(&mut b, false, ring);
++            }
++            let s = if defer {
++                b.join_head().unwrap_or(head)
++            } else {
++                head
++            };
++            let mut h = s;
++            if !(defer && b.is_open()) {
++                ring[h as usize] = Some(Entry::Barrier(target));
++                barriers += 1;
++                h = (h + 1) % CAP;
++            }
++            ring[h as usize] = Some(Entry::Fs(target));
++            h = (h + 1) % CAP;
++            if defer {
++                b.note(s, h, target);
++            }
++            head = h;
++        }
++        close(&mut b, false, ring);
++        (head, barriers)
++    }
++
++    #[test]
++    fn mixed_own_and_batched_renders_order_every_fs() {
++        // Every mix of shallow (own barrier) and deep (batched) renders over 10 publications
++        // orders each FS behind its TA and writes no more barriers than per-render publication.
++        let n = 10;
++        for pattern in 0..(1u32 << n) {
++            for &start in &[0, 250] {
++                let mut ring = [None; CAP as usize];
++                let (w, barriers) = publish_mixed(pattern, start, 5 * STEP, n, &mut ring);
++                assert_eq!(entries(start, w), n + barriers);
++                assert!(barriers <= n);
++                assert!(run(&ring, start, w, 5 * STEP, n));
++            }
++        }
++        // All deep: one barrier per run.
++        let mut ring = [None; CAP as usize];
++        let (_, barriers) = publish_mixed(u32::MAX, 0, 5 * STEP, 8, &mut ring);
++        assert_eq!(barriers, 8 / RUN);
++    }
++
++    #[test]
++    fn model_catches_an_fs_before_its_ta() {
++        // The 1.1004 hazard: a batch barrier keyed on the opening render alone lets the
++        // second FS run before its TA. The model must reject it.
++        for n in 2..=8 {
++            let mut ring = [None; CAP as usize];
++            let w = publish(true, true, 0, 5 * STEP, n, &mut ring);
++            assert!(!run(&ring, 0, w, 5 * STEP, n));
++        }
++    }
++
++    #[test]
++    fn note_keeps_opening_slot_and_newest_wait() {
++        let mut b = Batch::default();
++        assert_eq!(b.join_head(), None);
++        b.note(10, 12, 0x500);
++        b.note(12, 13, 0x600);
++        b.note(13, 14, 0x700);
++        assert_eq!(b.join_head(), Some(14));
++        assert_eq!(
++            b.take(),
++            Some(Batch {
++                renders: 3,
++                slot: 10,
++                head: 14,
++                own: 0x500,
++                wait: 0x700
++            })
++        );
++        assert_eq!(b.take(), None);
++    }
++
++    #[test]
++    fn defer_only_when_switched_on_behind_registered_queues() {
++        assert!(defer(1, true, true, 0, 0));
++        assert!(defer(1, true, true, 0, 1));
++        assert!(!defer(0, true, true, 0, 0));
++        assert!(defer(2, true, true, 0, 0));
++        assert!(!defer(1, false, true, 0, 0));
++        assert!(!defer(1, true, false, 0, 0));
++        assert!(!defer(1, true, true, 1, 0));
++        assert!(!defer(1, true, true, 0, 2));
++    }
++}
+diff --git a/drivers/gpu/drm/asahi/g16/mod.rs b/drivers/gpu/drm/asahi/g16/mod.rs
+index 14e1000690..2fb365a920 100644
+--- a/drivers/gpu/drm/asahi/g16/mod.rs
++++ b/drivers/gpu/drm/asahi/g16/mod.rs
+@@ -57,6 +57,7 @@
+ mod engine;
+ mod event;
+ mod fence;
++mod fs_batch;
+ pub(crate) mod fw;
+ mod gate;
+ mod graph;
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 27a6beeca6..aa059d6e55 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -2438,6 +2438,28 @@ pub(crate) fn render_bell_group() -> u32 {
+     "G16: k = renders behind k others ring once per k publications (2-16; default 4; 0 = off)"
+ );
+ 
++/// Storage of `g16_render_fs_run` (runtime 0644, default 0).
++static RENDER_FS_RUN: AtomicU32 = AtomicU32::new(0);
++
++/// `g16_render_fs_run`: a render published behind running flights and at least one firmware
++/// run (4 renders) of exposed, unfinished FS work shares one FS-ring Stamp barrier, re-encoded
++/// when the batch is exposed to wait for the newest render's TA stamp, and one FS submit record
++/// and doorbell with the other renders of its run (fs_batch.rs). A render with less FS work
++/// ahead keeps its own barrier, record and doorbell. 0: one barrier, record and doorbell per
++/// render, as before. Read at each render publication.
++pub(crate) fn render_fs_run() -> u32 {
++    RENDER_FS_RUN.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    RENDER_FS_RUN_PARAM,
++    RENDER_FS_RUN_PARMTYPE,
++    RENDER_FS_RUN_PARM,
++    RENDER_FS_RUN,
++    "g16_render_fs_run",
++    "G16: one FS barrier, record and doorbell per firmware run of renders behind a run of queued FS work (1 = on, 0 = off)"
++);
++
+ /// Storage of `g16_window_poll_us` (runtime 0644, default 0).
+ static WINDOW_POLL_US: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 733e24fa47..4adf463669 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -2434,6 +2434,21 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             ta[1].load(Ordering::Relaxed),
+             ta[0].load(Ordering::Relaxed)
+         )?;
++        let fa = &super::fs_batch::AHEAD_N;
++        let fh = &super::fs_batch::AHEAD_HIST;
++        writeln!(
++            f,
++            "render_fs_run: on {} batched {} own {} queued 0:{} 1:{} 2:{} 3-4:{} 5-8:{} 9+:{}",
++            params::render_fs_run(),
++            fa[0].load(Ordering::Relaxed),
++            fa[1].load(Ordering::Relaxed),
++            fh[0].load(Ordering::Relaxed),
++            fh[1].load(Ordering::Relaxed),
++            fh[2].load(Ordering::Relaxed),
++            fh[3].load(Ordering::Relaxed),
++            fh[4].load(Ordering::Relaxed),
++            fh[5].load(Ordering::Relaxed)
++        )?;
+         if params::short_acct() != 0 && (params::fs_short() || params::ta_short()) {
+             let st = &*self.engine.stats;
+             writeln!(
+-- 
+2.43.0
+

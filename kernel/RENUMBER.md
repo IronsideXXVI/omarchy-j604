@@ -1429,3 +1429,7 @@ The base remains da8e1acf3656. Published 0001–0990 are unchanged. 0991 lets a 
 # Kernel patch numbers: 1.1230 to 1.1258
 
 The base remains da8e1acf3656. Published 0001–0992 are unchanged. 0993 keeps the speaker volumes across a sleep and wake: they are saved wherever the system-sleep lock is taken and set back at the unlock. Applied source differs from the installed build only in the same nine comment lines as before. Versions 1.1231 to 1.1257 were not released or published.
+
+# Kernel patch numbers: 1.1258 to 1.1289
+
+The base remains da8e1acf3656. Published 0001–0993 are unchanged. 0994 lets a draw queued behind at least one run of unfinished fragment work join a batch of at most one run, with one barrier, one submit record and one doorbell for the batch (`g16_render_fs_run`, off in 0994); 0995 batches only when the draws already waiting fill the run in the same pass; 0996 turns it on. The patch files are the ones the installed build applied, with the series numbering taken out of their subject lines. Versions 1.1259 to 1.1288 were not released or published.
