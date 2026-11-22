@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 22 Nov 2026 10:40:48 +0000
+Subject: [PATCH] asahi: release deleted textures and finished batches at flush
+
+An idle compositor deletes its full-screen work render targets and then
+flushes, but the memory stays resident until it draws again, which can be
+minutes later:
+
+- The context keeps the last bound sampler views until the next draw
+  revalidates them, and each view holds its texture.
+- A submitted batch keeps its BO references and framebuffer key until
+  agx_cleanup_batches() reaps it. That only happens at the next submit or
+  when a batch slot is needed, and it reaps one batch per call.
+
+At pipe->flush, drop bound sampler views that only this context holds and
+whose texture only that view holds. Such a texture has been deleted, and the
+frontend unbinds a deleted texture before any draw that could sample it, so
+no later draw uses the slot without rebinding it. Then retire every batch
+whose syncobj has signalled. Both steps are non-blocking.
+---
+ src/gallium/drivers/asahi/agx_pipe.c  | 10 +++++++
+ src/gallium/drivers/asahi/agx_state.c | 43 +++++++++++++++++++++++++++
+ src/gallium/drivers/asahi/agx_state.h |  1 +
+ 3 files changed, 54 insertions(+)
+
+diff --git a/src/gallium/drivers/asahi/agx_pipe.c b/src/gallium/drivers/asahi/agx_pipe.c
+index 62874050d55..f2bde270c15 100644
+--- a/src/gallium/drivers/asahi/agx_pipe.c
++++ b/src/gallium/drivers/asahi/agx_pipe.c
+@@ -1870,6 +1870,16 @@ agx_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
+ 
+    agx_flush_all(ctx, "Gallium flush");
+ 
++   /* Release resources the application has already let go of, even if no
++    * new work follows (an idle compositor): first the sampler views only this
++    * context still holds, then every batch that has finished on the GPU, so
++    * its BO references and framebuffer key go now and not at the next submit.
++    * agx_cleanup_batches() does not wait and skips quarantined slots.
++    */
++   agx_release_unused_sampler_views(ctx);
++   while (agx_cleanup_batches(ctx) >= 0)
++      ;
++
+    if ((flags & PIPE_FLUSH_END_OF_FRAME) &&
+        unlikely(screen->dev.debug & AGX_DBG_PERF)) {
+       perf_debug_ctx(ctx, "[Queue %u Frame %" PRIu64 "] draws=%" PRIu64
+diff --git a/src/gallium/drivers/asahi/agx_state.c b/src/gallium/drivers/asahi/agx_state.c
+index 4bd62f78997..b926f14d696 100644
+--- a/src/gallium/drivers/asahi/agx_state.c
++++ b/src/gallium/drivers/asahi/agx_state.c
+@@ -1238,6 +1238,49 @@ agx_set_sampler_views(struct pipe_context *pctx, mesa_shader_stage shader,
+    ctx->stage[shader].dirty |= AGX_STAGE_DIRTY_IMAGE;
+ }
+ 
++/*
++ * Drop bound sampler views that only this context still holds and whose
++ * texture only that view still holds.  Such a texture has been deleted by the
++ * application, and the frontend unbinds a deleted texture before any draw that
++ * could sample it, so no later draw can use the slot without rebinding it.
++ * Without this, the binding keeps the texture (often a full-screen render
++ * target) alive until the next draw, which an idle compositor may not issue
++ * for a long time.
++ */
++void
++agx_release_unused_sampler_views(struct agx_context *ctx)
++{
++   /* u_blitter holds its own references to the views it saved. */
++   if (ctx->blitter && ctx->blitter->running)
++      return;
++
++   for (unsigned s = 0; s < ARRAY_SIZE(ctx->stage); ++s) {
++      struct agx_stage *st = &ctx->stage[s];
++      unsigned new_nr = 0;
++      bool dropped = false;
++
++      for (unsigned i = 0; i < st->texture_count; ++i) {
++         struct agx_sampler_view *v = st->textures[i];
++
++         if (v && v->base.texture &&
++             p_atomic_read(&v->base.reference.count) == 1 &&
++             p_atomic_read(&v->base.texture->reference.count) == 1) {
++            pipe_sampler_view_reference(
++               (struct pipe_sampler_view **)&st->textures[i], NULL);
++            dropped = true;
++         }
++
++         if (st->textures[i])
++            new_nr = i + 1;
++      }
++
++      if (dropped) {
++         st->texture_count = new_nr;
++         st->dirty |= AGX_STAGE_DIRTY_IMAGE;
++      }
++   }
++}
++
+ static void
+ agx_sampler_view_destroy(struct pipe_context *ctx,
+                          struct pipe_sampler_view *pview)
+diff --git a/src/gallium/drivers/asahi/agx_state.h b/src/gallium/drivers/asahi/agx_state.h
+index 1e886440f56..3c009cd003d 100644
+--- a/src/gallium/drivers/asahi/agx_state.h
++++ b/src/gallium/drivers/asahi/agx_state.h
+@@ -1517,6 +1517,7 @@ void agx_flush_batch(struct agx_context *ctx, struct agx_batch *batch);
+ void agx_flush_batch_for_reason(struct agx_context *ctx,
+                                 struct agx_batch *batch, const char *reason);
+ void agx_flush_all(struct agx_context *ctx, const char *reason);
++void agx_release_unused_sampler_views(struct agx_context *ctx);
+ void agx_flush_readers(struct agx_context *ctx, struct agx_resource *rsrc,
+                        const char *reason);
+ void agx_flush_writer(struct agx_context *ctx, struct agx_resource *rsrc,
+-- 
+2.43.0
+
