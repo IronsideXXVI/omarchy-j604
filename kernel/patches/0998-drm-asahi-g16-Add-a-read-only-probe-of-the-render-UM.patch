@@ -1,0 +1,241 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 21 Nov 2026 21:00:49 +0000
+Subject: [PATCH] drm/asahi: g16: Add a read-only probe of the render
+ UMA pool
+
+Every render unit maps a 32 MiB UMA pool and seeds the firmware's free
+list with all 8192 of its 4 KiB pages at build time. That rules out
+backing the pool on first use. The only way to make it smaller is a
+smaller seed, and nobody knows yet how many pages a render really takes.
+
+Add g16_uma_probe (runtime, default 0). When it is on, one unit
+preparation in 32 reads, in SUBMIT:
+ - the constant UMA descriptor words that differ from the image the
+   driver seeded,
+ - the descriptor's +0x24 and +0x2c page counts,
+ - how many free-list entries below the seed count are no longer their
+   seeded page, and how far past the seed count non-zero entries reach.
+
+The results go into the stats file's uma_probe line. Nothing is written
+to the firmware's records.
+
+---
+ drivers/gpu/drm/asahi/g16/params.rs |  19 ++++
+ drivers/gpu/drm/asahi/g16/poll.rs   |   1 +
+ drivers/gpu/drm/asahi/g16/pools.rs  | 134 +++++++++++++++++++++++++++-
+ 3 files changed, 151 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 7f2cc89998b..57df446cc4e 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -3383,6 +3383,25 @@ pub(crate) fn pb_probe() -> bool {
+     "G16: read the PB manager and counter words at each render retirement and the free-block ring words while renders run, into the stats file; reads only (default 0; runtime 0644)"
+ );
+ 
++/// Storage of `g16_uma_probe` (runtime 0644, default 0).
++static UMA_PROBE_ON: AtomicU32 = AtomicU32::new(0);
++
++/// Read-only render UMA pool probe: on one unit preparation in 32, in SUBMIT, the descriptor
++/// words the firmware changed from their seed, its +0x24 and +0x2c words, and how much of the
++/// free list in the unit's state is off its seed. Measurement only: nothing is written.
++pub(crate) fn uma_probe() -> bool {
++    UMA_PROBE_ON.load(Ordering::Relaxed) != 0
++}
++
++live_u32_param!(
++    UMA_PROBE_PARAM,
++    UMA_PROBE_PARMTYPE,
++    UMA_PROBE_PARM,
++    UMA_PROBE_ON,
++    "g16_uma_probe",
++    "G16: read the render UMA descriptor and free list on one unit preparation in 32, into the stats file's uma_probe line (default 0; measurement only)"
++);
++
+ /// Storage of `g16_pb_grow` (runtime 0644, default 1).
+ static PB_GROW: AtomicU32 = AtomicU32::new(1);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 3d60f34a157..d54c73dd982 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -2426,6 +2426,7 @@ pub(crate) fn write_stats(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         writeln!(f)?;
+         super::pools::write_size_stats(f)?;
+         super::pools::write_lazy_stats(f)?;
++        super::pools::write_uma_probe_stats(f)?;
+         tailcut_stats(f)?;
+         let forms = &super::engine::FS_FORMS;
+         writeln!(
+diff --git a/drivers/gpu/drm/asahi/g16/pools.rs b/drivers/gpu/drm/asahi/g16/pools.rs
+index 440ba771459..26f54bcaef7 100644
+--- a/drivers/gpu/drm/asahi/g16/pools.rs
++++ b/drivers/gpu/drm/asahi/g16/pools.rs
+@@ -180,11 +180,8 @@ pub(crate) struct AllocatorRefs {
+ pub(crate) struct Allocator {
+     descriptor: Arc<FwObject>,
+     auxiliary: Arc<FwObject>,
+-    #[allow(dead_code)]
+     pool: Arc<FwObject>,
+-    #[allow(dead_code)]
+     state: Arc<FwObject>,
+-    #[allow(dead_code)]
+     list: Arc<FwObject>,
+     submitted: Arc<FwObject>,
+     heap: Arc<FwObject>,
+@@ -241,6 +238,71 @@ pub(crate) struct PoolSet {
+ /// in-flight samples, [4] the widest free-block ring distance a sample saw, [5] that
+ /// sample's two ring words (first << 32 | second).
+ pub(crate) static PROBE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
++/// `g16_uma_probe`: [0] unit preparations seen, [1] of them read, [2] descriptor words (one
++/// bit per u32) found different from the unit's seed image, [3] the fewest and [4] the most
++/// free-list entries below `uma_manager::SEEDS` found off their seed, [5] one past the highest
++/// state entry at or above `SEEDS` found non-zero, counted from `SEEDS`, [6] the lowest +0x24
++/// and [7] the lowest +0x2c word read, [8] the last pair read (+0x24 << 32 | +0x2c).
++pub(crate) static UMA_PROBE: [AtomicU64; 9] = [
++    AtomicU64::new(0),
++    AtomicU64::new(0),
++    AtomicU64::new(0),
++    AtomicU64::new(u64::MAX),
++    AtomicU64::new(0),
++    AtomicU64::new(0),
++    AtomicU64::new(u64::MAX),
++    AtomicU64::new(u64::MAX),
++    AtomicU64::new(0),
++];
++/// `g16_uma_probe` reads one unit preparation in this many.
++const UMA_PROBE_EVERY: u64 = 32;
++
++/// The `g16_uma_probe` stats line. Every value is decimal; `last` is +0x24 << 32 | +0x2c.
++pub(crate) fn write_uma_probe_stats(f: &mut impl fmt::Write) -> fmt::Result {
++    const NAMES: [&str; 9] = [
++        "seen",
++        "read",
++        "desc_changed",
++        "off_seed_min",
++        "off_seed_max",
++        "tail_end",
++        "w24_min",
++        "w2c_min",
++        "last",
++    ];
++    write!(f, "uma_probe: on {}", u32::from(super::params::uma_probe()))?;
++    for (i, name) in NAMES.iter().enumerate() {
++        // The minima start at u64::MAX: shown as 0 until a read lands.
++        let v = match UMA_PROBE[i].load(Ordering::Relaxed) {
++            u64::MAX => 0,
++            v => v,
++        };
++        uma_probe_field(f, name, v)?;
++    }
++    writeln!(f)
++}
++
++/// One ` name value` pair of the `g16_uma_probe` line, in decimal. Out of line and not
++/// generic, so the stats writer's frame stays small.
++#[inline(never)]
++fn uma_probe_field(f: &mut dyn fmt::Write, name: &str, v: u64) -> fmt::Result {
++    write!(f, " {} {}", name, v)
++}
++
++/// The seed `buffer::uma_manager_image` writes into UMA descriptor word `w` when it is a
++/// constant; `None` for the pointers and the slot, which `prepare_unit` checks itself.
++fn uma_seed_word(w: usize) -> Option<u32> {
++    match w * 4 {
++        0 | 4 | 8 | 0x14 | 0x18 | 0x30 | 0x34 | 0x4c | 0x50 => None,
++        0x10 | 0x94 => Some(2),
++        0x1c => Some(16384),
++        0x24 | 0x2c => Some(uma_manager::SEEDS),
++        0x40 => Some(4),
++        0x48 => Some(128),
++        0x84 => Some(1),
++        _ => Some(0),
++    }
++}
+ /// The manager words of the last probed retirement.
+ pub(crate) static PROBE_MGR: [AtomicU32; MGR_WORDS] = [const { AtomicU32::new(0) }; MGR_WORDS];
+ /// The counter words of the last probed retirement.
+@@ -617,6 +679,9 @@ pub(crate) fn prepare_unit(&self) -> Result<AllocatorRefs> {
+         if self.published.load(Ordering::Acquire) && !self.retired()? {
+             return Err(EBUSY);
+         }
++        if super::params::uma_probe() {
++            let _ = self.uma_probe();
++        }
+         // Descriptor pointer/counter and slot must still identify this exact retained unit.
+         if read64(&self.descriptor, 0)? != self.descriptor.va
+             || self.descriptor.r32(8)? != self.uma_slot
+@@ -626,6 +691,69 @@ pub(crate) fn prepare_unit(&self) -> Result<AllocatorRefs> {
+         }
+         self.refs()
+     }
++    /// `g16_uma_probe`, in SUBMIT before this unit is prepared again: which descriptor words
++    /// the firmware changed and how much of the UMA free list in the unit's state is off its
++    /// seed. Reads only. With `g16_unit_one_pool` another unit's render may be in flight.
++    /// Kept out of line, and in small parts, so no frame on the SUBMIT path grows.
++    #[inline(never)]
++    fn uma_probe(&self) -> Result {
++        let seen = UMA_PROBE[0].fetch_add(1, Ordering::Relaxed);
++        if seen % UMA_PROBE_EVERY != 0 {
++            return Ok(());
++        }
++        let seeds = uma_manager::SEEDS as usize;
++        let entries = self.state.bytes() / 8;
++        if entries < seeds || entries % 8 != 0 {
++            return Err(EINVAL);
++        }
++        UMA_PROBE[1].fetch_add(1, Ordering::Relaxed);
++        self.uma_probe_descriptor()?;
++        self.uma_probe_list(seeds, entries)
++    }
++    /// `g16_uma_probe`: the descriptor words off their constant seed, and its page counts.
++    #[inline(never)]
++    fn uma_probe_descriptor(&self) -> Result {
++        let mut changed = 0u64;
++        for w in 0..uma_manager::SIZE / 4 {
++            if let Some(seed) = uma_seed_word(w) {
++                if self.descriptor.r32(w * 4)? != seed {
++                    changed |= 1 << w;
++                }
++            }
++        }
++        UMA_PROBE[2].fetch_or(changed, Ordering::Relaxed);
++        let w24 = u64::from(self.descriptor.r32(0x24)?);
++        let w2c = u64::from(self.descriptor.r32(0x2c)?);
++        UMA_PROBE[6].fetch_min(w24, Ordering::Relaxed);
++        UMA_PROBE[7].fetch_min(w2c, Ordering::Relaxed);
++        UMA_PROBE[8].store(w24 << 32 | w2c, Ordering::Relaxed);
++        Ok(())
++    }
++    /// `g16_uma_probe`: how much of the free list in the unit's state is off its seed.
++    #[inline(never)]
++    fn uma_probe_list(&self, seeds: usize, entries: usize) -> Result {
++        let pool = gva(&self.pool)?;
++        let mut chunk = [0u8; 64];
++        let (mut off, mut tail) = (0u64, 0u64);
++        for first in (0..entries).step_by(8) {
++            self.state.read(first * 8, &mut chunk)?;
++            for (j, v) in chunk.chunks_exact(8).enumerate() {
++                let i = first + j;
++                let v = u64::from_le_bytes(v.try_into().map_err(|_| EINVAL)?);
++                if i < seeds {
++                    if v != pool + i as u64 * 0x1000 {
++                        off += 1;
++                    }
++                } else if v != 0 {
++                    tail = (i + 1 - seeds) as u64;
++                }
++            }
++        }
++        UMA_PROBE[3].fetch_min(off, Ordering::Relaxed);
++        UMA_PROBE[4].fetch_max(off, Ordering::Relaxed);
++        UMA_PROBE[5].fetch_max(tail, Ordering::Relaxed);
++        Ok(())
++    }
+     /// [`PoolSet::publish`] for this unit.
+     pub(crate) fn publish_unit(&self, submitted: u64) -> Result {
+         let next = read64(&self.submitted, 0)?;
+-- 
+2.43.0
+

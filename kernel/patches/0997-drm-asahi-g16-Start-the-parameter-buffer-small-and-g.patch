@@ -1,0 +1,489 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 21 Nov 2026 20:01:47 +0000
+Subject: [PATCH] drm/asahi: g16: Start the parameter buffer small and
+ grow it on the overflow count
+
+Every lazily backed parameter-buffer heap starts at the g16_pb_lazy floor
+of 64 blocks (8 MiB). Hyprland and quickshell each hold two full units,
+so an idle desktop keeps 32 MiB of parameter buffer. macOS idles at
+8.25 MiB for all of its clients together and grows from there under load.
+
+The floor exists because nothing else could grow the heap: the in-flight
+free-block ring words are a save image that the firmware rewrites at the
+fragment post, so they always read the seed and the 3x growth rule never
+fires. A render that needs more than its manager holds is finished by the
+hardware in several passes; it does not fault.
+
+The fragment start record points the firmware at a word in the render's
+pass scene (+0x54), in the slot where the G14X start record points at the
+render's TVB overflow count. With g16_pb_grow on, that word is read when
+the render retires. A non-zero value marks the unit's slot, and the VM's
+next submit asks for twice the unit's current backing through the
+existing growth step, capped at the heap window. Leased managers prepared
+below the new backing are not reused, so the new blocks reach the next
+render. With the overflow count to grow on, a lazily backed heap now
+starts at 16 blocks (2 MiB) when its unit is built, and a full unit
+reaches its 2048-block window in seven doublings, within the eight
+growth steps.
+
+g16_pb_grow defaults to 1. 0 reads nothing and keeps the g16_pb_lazy
+floor, as before. A manager may now be seeded with as few as 16 blocks,
+and g16_pb_size no longer asks for more blocks than the heap holds.
+
+---
+ drivers/gpu/drm/asahi/g16/params.rs    |  22 ++++
+ drivers/gpu/drm/asahi/g16/pb_grow.rs   | 157 +++++++++++++++++++++++++
+ drivers/gpu/drm/asahi/g16/poll.rs      |   9 ++
+ drivers/gpu/drm/asahi/g16/pools.rs     | 108 ++++++++++++++++-
+ drivers/gpu/drm/asahi/g16/resources.rs |   9 +-
+ 5 files changed, 301 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/gpu/drm/asahi/g16/pb_grow.rs
+
+diff --git a/drivers/gpu/drm/asahi/g16/params.rs b/drivers/gpu/drm/asahi/g16/params.rs
+index 54ea29b344c..7f2cc89998b 100644
+--- a/drivers/gpu/drm/asahi/g16/params.rs
++++ b/drivers/gpu/drm/asahi/g16/params.rs
+@@ -3383,6 +3383,28 @@ pub(crate) fn pb_probe() -> bool {
+     "G16: read the PB manager and counter words at each render retirement and the free-block ring words while renders run, into the stats file; reads only (default 0; runtime 0644)"
+ );
+ 
++/// Storage of `g16_pb_grow` (runtime 0644, default 1).
++static PB_GROW: AtomicU32 = AtomicU32::new(1);
++
++/// Parameter-buffer growth from the firmware's overflow word: at each render retirement the word
++/// the fragment start record points at in the render's pass scene (+0x54) is read; a non-zero
++/// word doubles that unit's heap backing at the VM's next submit, up to its window, and leased
++/// managers prepared below the new backing are not reused. Needs `g16_pb_lazy`. On, a lazily
++/// backed heap also starts at `pb_grow::FLOOR_BLOCKS` (2 MiB) instead of the `g16_pb_lazy`
++/// floor, when its unit is built. 0 reads nothing and keeps the `g16_pb_lazy` floor.
++pub(crate) fn pb_grow() -> u32 {
++    PB_GROW.load(Ordering::Relaxed)
++}
++
++live_u32_param!(
++    PB_GROW_PARAM,
++    PB_GROW_PARMTYPE,
++    PB_GROW_PARM,
++    PB_GROW,
++    "g16_pb_grow",
++    "G16: non-zero reads each render's overflow word at retirement and doubles that unit's parameter-buffer backing at the next submit, up to its window, and starts lazily backed heaps at 16 blocks (2 MiB) when their unit is built; needs g16_pb_lazy (default 1; 0: the g16_pb_lazy floor, no reads)"
++);
++
+ /// Storage of `g16_pb_size` (runtime 0644, default 0).
+ static PB_SIZE: AtomicU32 = AtomicU32::new(0);
+ 
+diff --git a/drivers/gpu/drm/asahi/g16/pb_grow.rs b/drivers/gpu/drm/asahi/g16/pb_grow.rs
+new file mode 100644
+index 00000000000..c4714f1f753
+--- /dev/null
++++ b/drivers/gpu/drm/asahi/g16/pb_grow.rs
+@@ -0,0 +1,157 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++
++//! `g16_pb_grow`: the parameter-buffer growth rule (pools.rs), as pure functions.
++//!
++//! The fragment start record points the firmware at a word in the render's pass scene, at the
++//! place where upstream's G14X start record points at the render's TVB overflow count. A render
++//! whose word is not zero at retirement asks its unit's heap backing to double at the VM's
++//! next submit; the allocator caps the step at the heap window. The scene image is rewritten
++//! at publication, so the word read at retirement is that render's.
++
++/// The blocks a lazily backed heap starts with while `g16_pb_grow` is on: 2 MiB, the size the
++/// firmware's overflow word then grows from. macOS idles at 66 blocks (8.25 MiB) of parameter
++/// buffer for all its clients together; four heaps at this floor hold 64.
++pub(crate) const FLOOR_BLOCKS: u32 = 16;
++
++/// The blocks a unit's heap is backed with when the unit is built: `FLOOR_BLOCKS` for a lazily
++/// backed heap with growth on (at most its window), else `first` (the `g16_pb_lazy` floor or
++/// the whole window).
++pub(crate) const fn start(first: u32, lazy: bool, grow: bool, window: u32) -> u32 {
++    if lazy && grow {
++        if FLOOR_BLOCKS < window {
++            FLOOR_BLOCKS
++        } else {
++            window
++        }
++    } else {
++        first
++    }
++}
++
++/// Offset in the pass scene of the word the fragment start record points at (start +0x34).
++pub(crate) const SCENE_OVERFLOWS: usize = 0x54;
++
++/// Whether a render's overflow word asks for growth.
++pub(crate) const fn overflowed(count: u32) -> bool {
++    count != 0
++}
++
++/// The blocks a unit asks for in SUBMIT: at least twice its current backing after a render on
++/// its slot overflowed, else `base` (the `g16_pb_lazy` want). The allocator caps it.
++pub(crate) const fn want(base: u32, backed: u32, overflowed: bool) -> u32 {
++    let twice = backed.saturating_mul(2);
++    if overflowed && twice > base {
++        twice
++    } else {
++        base
++    }
++}
++
++/// Whether a leased manager prepared with `capacity` backed blocks may be reused once its
++/// slot's heap is backed to `backed` blocks: not after a growth step past it, or the new
++/// blocks would reach no render.
++pub(crate) const fn holds(capacity: u32, backed: u32) -> bool {
++    backed <= capacity
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// The allocator's step (pools.rs `Allocator::grow`): rounded up to 16, at most the window.
++    fn step(want: u32, backed: u32, window: u32) -> u32 {
++        let t = (want.min(window).div_ceil(16) * 16).min(window);
++        if t <= backed {
++            backed
++        } else {
++            t
++        }
++    }
++
++    #[test]
++    fn no_overflow_asks_the_old_want() {
++        for (base, backed) in [(0, 256), (768, 256), (u32::MAX, 2048)] {
++            assert_eq!(want(base, backed, false), base);
++        }
++    }
++
++    #[test]
++    fn an_overflow_asks_twice_the_backing_or_more() {
++        assert_eq!(want(0, 256, true), 512);
++        assert_eq!(want(4096, 256, true), 4096);
++        assert_eq!(want(0, u32::MAX, true), u32::MAX);
++    }
++
++    #[test]
++    fn a_full_unit_reaches_its_window_in_three_steps_and_stops() {
++        let (window, mut backed, mut steps) = (2048, 256, 0);
++        for _ in 0..10 {
++            let next = step(want(0, backed, true), backed, window);
++            if next == backed {
++                break;
++            }
++            backed = next;
++            steps += 1;
++        }
++        assert_eq!((backed, steps), (2048, 3));
++    }
++
++    #[test]
++    fn a_compact_unit_stops_at_its_window() {
++        let (window, mut backed) = (1024, 128);
++        for _ in 0..10 {
++            backed = step(want(0, backed, true), backed, window);
++        }
++        assert_eq!(backed, 1024);
++    }
++
++    #[test]
++    fn growth_on_starts_a_lazy_heap_at_the_floor() {
++        assert_eq!(start(64, true, true, 2048), 16);
++        assert_eq!(start(64, true, true, 1024), 16);
++        assert_eq!(start(64, true, true, 8), 8);
++    }
++
++    #[test]
++    fn growth_off_or_an_eager_heap_keeps_the_old_start() {
++        assert_eq!(start(64, true, false, 2048), 64);
++        assert_eq!(start(2048, false, true, 2048), 2048);
++        assert_eq!(start(1024, false, false, 1024), 1024);
++    }
++
++    #[test]
++    fn a_full_unit_reaches_its_window_from_the_floor_within_the_growth_steps() {
++        let (window, mut backed, mut steps) = (2048, start(64, true, true, 2048), 0);
++        for _ in 0..20 {
++            let next = step(want(0, backed, true), backed, window);
++            if next == backed {
++                break;
++            }
++            backed = next;
++            steps += 1;
++        }
++        // pools.rs GROW_STEPS is 8: 16 -> 32 -> ... -> 2048 takes 7.
++        assert_eq!((backed, steps), (2048, 7));
++    }
++
++    #[test]
++    fn the_floor_is_a_whole_number_of_growth_rounds() {
++        assert_eq!(FLOOR_BLOCKS % 16, 0);
++        assert!(FLOOR_BLOCKS * 4 <= 66);
++    }
++
++    #[test]
++    fn only_a_non_zero_word_overflows() {
++        assert!(!overflowed(0));
++        assert!(overflowed(1));
++        assert!(overflowed(u32::MAX));
++    }
++
++    #[test]
++    fn a_manager_holds_until_a_step_passes_it() {
++        assert!(holds(256, 0));
++        assert!(holds(256, 256));
++        assert!(!holds(256, 512));
++        assert!(holds(512, 512));
++    }
++}
+diff --git a/drivers/gpu/drm/asahi/g16/poll.rs b/drivers/gpu/drm/asahi/g16/poll.rs
+index 4adf4636696..3d60f34a157 100644
+--- a/drivers/gpu/drm/asahi/g16/poll.rs
++++ b/drivers/gpu/drm/asahi/g16/poll.rs
+@@ -1608,6 +1608,15 @@ pub(crate) fn retire_oldest(
+                     if params::pb_probe() {
+                         let _ = epoch.probe_retired();
+                     }
++                    if params::pb_grow() != 0 {
++                        // The overflow word of this render's pass scene (rewritten at publication).
++                        let k = timestamp_claims.pass[0] as usize;
++                        if let Some(pass) = f.job.resources.render().ok().and_then(|r| r.pass(k)) {
++                            if let Ok(n) = pass.scene.r32(super::pools::pb_grow::SCENE_OVERFLOWS) {
++                                epoch.overflow_note(n);
++                            }
++                        }
++                    }
+                     let slot = super::params::pb_slot(timestamp_claims.pass[0] as usize);
+                     self.pools.retire_binding(slot, epoch)
+                 });
+diff --git a/drivers/gpu/drm/asahi/g16/pools.rs b/drivers/gpu/drm/asahi/g16/pools.rs
+index 9955065a7dc..440ba771459 100644
+--- a/drivers/gpu/drm/asahi/g16/pools.rs
++++ b/drivers/gpu/drm/asahi/g16/pools.rs
+@@ -32,6 +32,14 @@
+ /// and [5] longest nanoseconds a step took in SUBMIT.
+ pub(crate) static LAZY_PB: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+ 
++#[path = "pb_grow.rs"]
++pub(crate) mod pb_grow;
++
++/// `g16_pb_grow`: [0] render retirements read, [1] of them with a non-zero overflow word,
++/// [2] the sum and [3] the largest of those words, [4] doublings asked in SUBMIT, [5] leased
++/// managers not reused because a growth step passed their backing.
++pub(crate) static GROW_PB: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
++
+ /// `g16_pb_lazy` stats line.
+ pub(crate) fn write_lazy_stats(f: &mut impl fmt::Write) -> fmt::Result {
+     writeln!(
+@@ -46,6 +54,17 @@ pub(crate) fn write_lazy_stats(f: &mut impl fmt::Write) -> fmt::Result {
+         LAZY_PB[4].load(Ordering::Relaxed) / 1000,
+         LAZY_PB[5].load(Ordering::Relaxed) / 1000,
+         super::params::pb_lazy_compact().unwrap_or(0)
++    )?;
++    writeln!(
++        f,
++        "pb_grow: on {} read {} overflowed {} overflow_sum {} overflow_max {} doublings {} reuse_refused {}",
++        super::params::pb_grow(),
++        GROW_PB[0].load(Ordering::Relaxed),
++        GROW_PB[1].load(Ordering::Relaxed),
++        GROW_PB[2].load(Ordering::Relaxed),
++        GROW_PB[3].load(Ordering::Relaxed),
++        GROW_PB[4].load(Ordering::Relaxed),
++        GROW_PB[5].load(Ordering::Relaxed)
+     )
+ }
+ 
+@@ -56,6 +75,10 @@ pub(crate) struct LazyHint {
+     hw: [AtomicU32; super::hw::sizes::RENDER_UNITS],
+     /// A manager on this slot was seen holding 3/4 of its seeded blocks.
+     near: [AtomicBool; super::hw::sizes::RENDER_UNITS],
++    /// `g16_pb_grow`: a render on this slot overflowed since the slot last asked to grow.
++    over: [AtomicBool; super::hw::sizes::RENDER_UNITS],
++    /// `g16_pb_grow`: the slot's heap backing after its last growth step in SUBMIT.
++    backed: [AtomicU32; super::hw::sizes::RENDER_UNITS],
+ }
+ impl LazyHint {
+     pub(crate) fn new() -> Result<Arc<Self>> {
+@@ -63,6 +86,8 @@ pub(crate) fn new() -> Result<Arc<Self>> {
+             Self {
+                 hw: [const { AtomicU32::new(0) }; super::hw::sizes::RENDER_UNITS],
+                 near: [const { AtomicBool::new(false) }; super::hw::sizes::RENDER_UNITS],
++                over: [const { AtomicBool::new(false) }; super::hw::sizes::RENDER_UNITS],
++                backed: [const { AtomicU32::new(0) }; super::hw::sizes::RENDER_UNITS],
+             },
+             GFP_KERNEL,
+         )?)
+@@ -76,6 +101,43 @@ pub(crate) fn want(&self, k: usize) -> u32 {
+             _ => 0,
+         }
+     }
++    /// `g16_pb_grow`, at a render's retirement (atomics only): a render on `slot` overflowed.
++    fn overflowed(&self, slot: usize) {
++        if let Some(over) = self.over.get(slot) {
++            over.store(true, Ordering::Relaxed);
++        }
++    }
++    /// `g16_pb_grow`, in SUBMIT: the blocks unit `k` asks for with `backed` blocks backed now
++    /// ([`Self::want`] with the word off). Takes the slot's overflow flag, so a failed step is
++    /// asked again only after a later overflow.
++    pub(crate) fn grow_want(&self, k: usize, backed: u32) -> u32 {
++        if super::params::pb_grow() == 0 {
++            return self.want(k);
++        }
++        let over = self
++            .over
++            .get(k)
++            .is_some_and(|o| o.swap(false, Ordering::Relaxed));
++        if over {
++            GROW_PB[4].fetch_add(1, Ordering::Relaxed);
++        }
++        pb_grow::want(self.want(k), backed, over)
++    }
++    /// `g16_pb_grow`, in SUBMIT after `grow`: unit `k`'s heap is backed to `blocks` (nothing
++    /// with the word off).
++    pub(crate) fn grown(&self, k: usize, blocks: u32) {
++        if super::params::pb_grow() == 0 {
++            return;
++        }
++        if let Some(b) = self.backed.get(k) {
++            b.fetch_max(blocks, Ordering::Relaxed);
++        }
++    }
++    fn holds(&self, slot: usize, capacity: u32) -> bool {
++        self.backed.get(slot).map_or(true, |b| {
++            pb_grow::holds(capacity, b.load(Ordering::Relaxed))
++        })
++    }
+     fn sample(&self, slot: usize, used: u32, seeded: u32) {
+         if let Some(hw) = self.hw.get(slot) {
+             hw.fetch_max(used, Ordering::Relaxed);
+@@ -231,7 +293,7 @@ pub(crate) fn sized_blocks(slot: usize, unit: u32) -> u32 {
+             .max(SIZE_START)
+             .max(last)
+     };
+-    let blocks = want.clamp(buffer::MIN_BLOCKS, unit);
++    let blocks = want.clamp(buffer::MIN_BLOCKS.min(unit), unit);
+     if last != 0 && blocks > last {
+         SIZE[1].fetch_add(1, Ordering::Relaxed);
+     } else if last != 0 && blocks < last {
+@@ -398,6 +460,7 @@ fn new(o: &mut Objects, k: u64, compact: bool) -> Result<Self> {
+             (None, Some(floor)) if lazy => floor.min(window),
+             _ => window,
+         };
++        let first = pb_grow::start(first, lazy, super::params::pb_grow() != 0, window);
+         let heap = alloc(
+             o,
+             (u64::from(first) * buffer::BLOCK_BYTES) as usize,
+@@ -479,6 +542,7 @@ fn new_shared(o: &mut Objects, k: u64, compact: bool, first: &Allocator) -> Resu
+             (None, Some(floor)) if lazy => floor.min(window),
+             _ => window,
+         };
++        let backed = pb_grow::start(backed, lazy, super::params::pb_grow() != 0, window);
+         let heap = alloc(
+             o,
+             (u64::from(backed) * buffer::BLOCK_BYTES) as usize,
+@@ -771,6 +835,11 @@ pub(crate) fn shared(
+             self.stats.fresh += 1;
+             return None;
+         }
++        if !epoch.grow_holds() {
++            GROW_PB[5].fetch_add(1, Ordering::Relaxed);
++            self.stats.fresh += 1;
++            return None;
++        }
+         self.stats.reused += 1;
+         Some(epoch.clone())
+     }
+@@ -813,6 +882,11 @@ pub(crate) fn reusable(
+             self.stats.fresh += 1;
+             return None;
+         }
++        if !epoch.grow_holds() {
++            GROW_PB[5].fetch_add(1, Ordering::Relaxed);
++            self.stats.fresh += 1;
++            return None;
++        }
+         self.stats.reused += 1;
+         Some(epoch.clone())
+     }
+@@ -827,6 +901,7 @@ pub(crate) fn would_reuse(&self, k: usize, vm: &Arc<super::vm::VmState>) -> bool
+             && epoch.is_exposed()
+             && epoch.ring_words().is_ok_and(|w| w[0] == w[1])
+             && size_holds(k, epoch.seeded_blocks(), epoch.capacity_blocks())
++            && epoch.grow_holds()
+     }
+     /// `g16_close_disp`: moves each PB-slot lease of a closed VM on an index in `idle`
+     /// ([`super::slots::Slots::take_closed_pass`]), and the shared slot-0 manager of a closed
+@@ -942,10 +1017,11 @@ pub(crate) fn new(
+     /// Seed only unpublished storage. A retry may choose another physical slot; after
+     /// exposure neither the manager nor any of its firmware-mutated lists is reset.
+     /// `blocks` is the heap's block count: buffer::MAX_BLOCKS (the qualified manager), or
+-    /// fewer (a compact resident unit; at least buffer::MIN_BLOCKS).
++    /// fewer (a compact resident unit or a lazily backed heap; at least
++    /// pb_grow::FLOOR_BLOCKS).
+     pub(crate) fn prepare(&self, k: usize, heap: u64, blocks: u32, capacity: u32) -> Result {
+         if k >= super::hw::sizes::RENDER_UNITS
+-            || !(buffer::MIN_BLOCKS..=buffer::MAX_BLOCKS).contains(&blocks)
++            || !(pb_grow::FLOOR_BLOCKS..=buffer::MAX_BLOCKS).contains(&blocks)
+             || !(blocks..=buffer::MAX_BLOCKS).contains(&capacity)
+             || self.exposed.load(Ordering::Acquire)
+         {
+@@ -1051,6 +1127,32 @@ pub(crate) fn probe_flight(&self) -> Result {
+         }
+         Ok(())
+     }
++    /// `g16_pb_grow` at this render's retirement: `count` is the overflow word the firmware
++    /// wrote into the render's pass scene. Atomics only: this runs in the fence-signalling
++    /// section of the poll pass.
++    pub(crate) fn overflow_note(&self, count: u32) {
++        GROW_PB[0].fetch_add(1, Ordering::Relaxed);
++        if !pb_grow::overflowed(count) {
++            return;
++        }
++        GROW_PB[1].fetch_add(1, Ordering::Relaxed);
++        GROW_PB[2].fetch_add(u64::from(count), Ordering::Relaxed);
++        GROW_PB[3].fetch_max(u64::from(count), Ordering::Relaxed);
++        if let Some(hint) = self.hint.as_ref() {
++            hint.overflowed(self.assigned.load(Ordering::Acquire) as usize);
++        }
++    }
++    /// `g16_pb_grow`: whether this leased manager was prepared with at least its slot's heap
++    /// backing after the last growth step. Always true with the word off.
++    pub(crate) fn grow_holds(&self) -> bool {
++        if super::params::pb_grow() == 0 {
++            return true;
++        }
++        let slot = self.assigned.load(Ordering::Acquire) as usize;
++        self.hint
++            .as_ref()
++            .map_or(true, |hint| hint.holds(slot, self.capacity_blocks()))
++    }
+     /// `g16_pb_size` while a render binding this manager is in flight: the free-block ring
+     /// distance, at most the seeded blocks, as the high water of the manager's PB slot.
+     pub(crate) fn size_sample(&self) -> Result {
+diff --git a/drivers/gpu/drm/asahi/g16/resources.rs b/drivers/gpu/drm/asahi/g16/resources.rs
+index 309da12f7e6..6c770a00a7b 100644
+--- a/drivers/gpu/drm/asahi/g16/resources.rs
++++ b/drivers/gpu/drm/asahi/g16/resources.rs
+@@ -458,10 +458,17 @@ pub(crate) fn heap_blocks(&self, k: usize) -> Result<u32> {
+     /// `g16_pb_lazy`: backs each built unit's PB heap up to what this VM's renders were seen
+     /// holding (in SUBMIT, under the VM's resource lock). A failed step leaves the backing as
+     /// it was; managers are then seeded within it.
++    /// `g16_pb_grow`: a unit whose renders overflowed asks for twice its backing instead, and
++    /// the backing after the step is recorded for the manager reuse checks.
+     fn grow_pb(&self, factory: &Factory, vm: &mmu::Vm) {
+         for k in 0..self.unit_count() {
+             if let Ok(unit) = self.alloc_unit(k) {
+-                let _ = unit.grow(factory, vm, self.pb_hint.want(k));
++                let _ = unit.grow(
++                    factory,
++                    vm,
++                    self.pb_hint.grow_want(k, unit.heap_blocks_unit()),
++                );
++                self.pb_hint.grown(k, unit.heap_blocks_unit());
+             }
+         }
+     }
+-- 
+2.43.0
+

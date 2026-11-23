@@ -1433,3 +1433,7 @@ The base remains da8e1acf3656. Published 0001–0992 are unchanged. 0993 keeps t
 # Kernel patch numbers: 1.1258 to 1.1289
 
 The base remains da8e1acf3656. Published 0001–0993 are unchanged. 0994 lets a draw queued behind at least one run of unfinished fragment work join a batch of at most one run, with one barrier, one submit record and one doorbell for the batch (`g16_render_fs_run`, off in 0994); 0995 batches only when the draws already waiting fill the run in the same pass; 0996 turns it on. The patch files are the ones the installed build applied, with the series numbering taken out of their subject lines. Versions 1.1259 to 1.1288 were not released or published.
+
+# Kernel patch numbers: 1.1289 to 1.1307
+
+The base remains da8e1acf3656. Published 0001–0996 are unchanged. 0997 starts a lazily backed parameter buffer at 16 blocks (2 MiB) and doubles a unit's backing when a render reports an overflow (`g16_pb_grow`, default 1); 0998 is a read-only probe of the render UMA pool (`g16_uma_probe`, default 0); 0999 makes the UMA pool seed a runtime switch (`g16_uma_seed_pages`, default 8192, so nothing changes). The patch files are the ones the installed build applied, with the series numbering taken out of their subject lines. Versions 1.1290 to 1.1306 were not released or published.
