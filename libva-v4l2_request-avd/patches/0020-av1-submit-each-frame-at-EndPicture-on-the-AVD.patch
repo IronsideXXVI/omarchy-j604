@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 23 Nov 2026 21:43:42 +0000
+Subject: [PATCH] av1: submit each frame at EndPicture on the AVD
+
+The AV1 path holds every frame back until the next frame's picture
+parameters arrive, because VA-API does not carry refresh_frame_flags
+and the next frame's reference map is the only exact source for it.
+A frame whose surface is read first is submitted with a guessed mask.
+
+The AVD does not need the mask. It takes a picture's inherited CDFs
+from the named reference slot's timestamp and never reads
+refresh_frame_flags. On the AVD the hold only costs time: when FFmpeg's
+decoder thread blocks on a full output queue, its newest frame stays
+held, the decoder runs dry, and the thread that maps frames for display
+submits the held one and then waits a whole decode for it. In a 1500
+frame AV1 4K export run, 40 to 48 % of the frames went out that way,
+and they were 70 to 98 % of the submits that found the decoder idle.
+
+Submit at EndPicture when the decoder is the AVD. Other decoders keep
+the hold. V4L2R_AV1_HOLD=1 restores it on the AVD; V4L2R_AV1_HOLD=0
+turns it off elsewhere.
+
+The reftrace test builds its context by hand, so it now sets the hold
+for the cases that test it, and a new nohold case checks that each
+picture is queued at EndPicture and that a later flush queues nothing.
+
+Dylan Ironside
+dylan@dylanironside.io
+---
+ src/codec_av1.c      |  7 +++++++
+ src/context.c        |  8 ++++++++
+ src/v4l2_request.h   |  3 +++
+ tests/av1-reftrace.c | 28 ++++++++++++++++++++++++++++
+ tests/meson.build    |  2 +-
+ 5 files changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/src/codec_av1.c b/src/codec_av1.c
+index e8076ee..6e1fcbe 100644
+--- a/src/codec_av1.c
++++ b/src/codec_av1.c
+@@ -946,6 +946,13 @@ static VAStatus av1_end_picture(struct v4l2r_context *ctx)
+ 		ctx->pic.target->status = VASurfaceRendering;
+ 	}
+ 
++	/* A decoder that does not read refresh_frame_flags gains nothing from
++	 * the hold. Holding costs it: when the client stops decoding ahead (a
++	 * full output queue), the held frame waits until the client reads it,
++	 * and the decoder runs dry in between. Submit it now. */
++	if (!ctx->av1_hold)
++		return av1_submit_pending(ctx, codec->pend_fallback);
++
+ 	return VA_STATUS_SUCCESS;
+ }
+ 
+diff --git a/src/context.c b/src/context.c
+index 0f4876b..4fa3253 100644
+--- a/src/context.c
++++ b/src/context.c
+@@ -1361,6 +1361,14 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
+ 		if (ioctl(ctx->video_fd, VIDIOC_QUERYCAP, &capability) < 0)
+ 			goto next;
+ 		ctx->is_avd = !strcmp((const char *)capability.driver, "avd");
++		{
++			const char *hold = getenv("V4L2R_AV1_HOLD");
++
++			/* The AVD picks a picture's inherited CDFs from the named
++			 * reference slot's timestamp and never reads
++			 * refresh_frame_flags, so it has no use for the hold. */
++			ctx->av1_hold = hold ? atoi(hold) > 0 : !ctx->is_avd;
++		}
+ 		{
+ 			const char *rebind = getenv("V4L2R_REBIND");
+ 			int spare = rebind ? atoi(rebind) : V4L2R_REBIND_DEFAULT;
+diff --git a/src/v4l2_request.h b/src/v4l2_request.h
+index c651863..5ae3c3d 100644
+--- a/src/v4l2_request.h
++++ b/src/v4l2_request.h
+@@ -451,6 +451,9 @@ struct v4l2r_context {
+ 	bool export_cached;
+ 	/* V4L2R_SYNC_UNLOCKED: CAPTURE waits drop ctx->mutex across poll(). */
+ 	bool sync_unlocked;
++	/* AV1: hold each frame until the next one's references are known
++	 * (V4L2R_AV1_HOLD, default on unless the decoder is the AVD). */
++	bool av1_hold;
+ 	/* Threads inside an unlocked CAPTURE wait; teardown waits for zero. */
+ 	unsigned int waiters;
+ 	pthread_cond_t waiters_cond;
+diff --git a/tests/av1-reftrace.c b/tests/av1-reftrace.c
+index 33c428a..09c7123 100644
+--- a/tests/av1-reftrace.c
++++ b/tests/av1-reftrace.c
+@@ -160,6 +160,7 @@ static void setup(void)
+     ctx->codec_priv = &codec;
+     ctx->bit_depth = 8;
+     ctx->is_avd = true;
++    ctx->av1_hold = true; /* The cases below test the hold; "nohold" clears it. */
+     ctx->video_fd = 100;
+     ctx->media_fd = -1;
+     ctx->streaming = true;
+@@ -421,6 +422,33 @@ int main(int argc, char **argv)
+         printf("PASS %s trace=%s primary-reference admission and queue boundary\n", argv[1], argv[2]);
+         return 0;
+     }
++    if (!strcmp(argv[1], "nohold")) {
++        ctx->av1_hold = false;
++        picture(0, 0, 0);
++        assert(assemble() == VA_STATUS_SUCCESS);
++        assert(requests_queued == 1 && log_count == 1 && !codec.pend_valid);
++        picture(1, 1, 4);
++        for (unsigned int i = 0; i < 8; i++)
++            pic.ref_frame_map[i] = sid[0];
++        pic.primary_ref_frame = 0;
++        assert(assemble() == VA_STATUS_SUCCESS);
++        assert(requests_queued == 2 && log_count == 2 && !codec.pend_valid);
++        assert(frame(1)->reference_frame_ts[0] == 1000);
++        assert(av1_flush(ctx, NULL) == VA_STATUS_SUCCESS && requests_queued == 2);
++        for (unsigned int n = 0; n < 2; n++)
++            assert(fifo_cap[n] == n && log_[n].request_fd == 200 + (int)n);
++        snapshot(argv[3]);
++        fflush(stderr);
++        rewind(sink);
++        text[fread(text, 1, sizeof(text) - 1, sink)] = 0;
++        if (!enabled) assert(!strstr(text, "AV1 job"));
++        else assert(strstr(text, "job=1 target=") && strstr(text, "job=2 target="));
++        teardown();
++        log_reset();
++        fclose(sink);
++        printf("PASS nohold trace=%s each picture submitted at EndPicture\n", argv[2]);
++        return 0;
++    }
+     picture(0, 0, 0);
+     assert(assemble() == VA_STATUS_SUCCESS);
+     assert(!requests_queued); /* EndPicture defers the key picture. */
+diff --git a/tests/meson.build b/tests/meson.build
+index e03c8d4..9dafad2 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -395,7 +395,7 @@ if conf.get('HAVE_V4L2_CTRL_AV1') == 1
+   foreach case : ['basic', 'default', 'default-missing', 'default-foreign', 'failure',
+                   'required-missing', 'required-foreign', 'required-failed', 'required-detached',
+                   'primary-bounds', 'slot-bounds', 'valid-primary', 'key-default',
+-                  'intra-default', 'resilient-default', 'none-default']
++                  'intra-default', 'resilient-default', 'none-default', 'nohold']
+     foreach tracing : ['on', 'off']
+       test('av1-reftrace-' + case + '-' + tracing, av1_reftrace,
+            args: [case, tracing, meson.current_build_dir() / ('av1-' + case + '-' + tracing + '.controls')], timeout: 15)
