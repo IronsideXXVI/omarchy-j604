@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 05:51:31 +0000
+Subject: [PATCH 19/19] encode: match the encoder's PPS QP and deblocking
+ words, report its HEVC tools
+
+With the frame_num and POC words matched, an H.264 file still decodes to
+different pictures from its container header: FFmpeg's PPS carries its
+CQP quality as pic_init_qp (20 by default) while the encoder codes
+slice_qp_delta against 26. apple-ave now takes pic_init_qp and
+deblocking_filter_control_present_flag as controls; copy both from the
+client's picture parameters and offer packed sequence headers only when
+all five H.264 controls are there.
+
+For HEVC, report the coding tools the encoder actually uses through
+VAConfigAttribEncHEVCFeatures (SAO, temporal MVP, CU QP deltas) and
+VAConfigAttribEncHEVCBlockSizes (32x32 CTBs, 8x8 CBs, 4x4 to 32x32
+transforms, hierarchy depth 1 inter / 0 intra), so a client that builds
+its own SPS stops guessing them, and turn the encoder's scaling lists off
+when the client builds the header (FFmpeg never enables them). HEVC packed
+headers stay off for now: the encoder also uses wavefront entry points and
+SPS reference picture sets, which the kernel cannot change yet, and a
+header that disagrees with the stream is worse than none.
+---
+ src/encode.c | 72 ++++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 67 insertions(+), 5 deletions(-)
+
+diff --git a/src/encode.c b/src/encode.c
+index 94dd4a2..3a9956c 100644
+--- a/src/encode.c
++++ b/src/encode.c
+@@ -48,6 +48,10 @@
+ #define V4L2R_CID_H264_POC_TYPE			(V4L2R_CID_AVE_BASE + 2)
+ #define V4L2R_CID_H264_LOG2_MAX_POC_LSB_MINUS4	(V4L2R_CID_AVE_BASE + 3)
+ #define V4L2R_CID_HEVC_LOG2_MAX_POC_LSB_MINUS4	(V4L2R_CID_AVE_BASE + 4)
++/* PPS words (QP itself, 0-51; flags 0-1), same -1 rule */
++#define V4L2R_CID_H264_PIC_INIT_QP		(V4L2R_CID_AVE_BASE + 5)
++#define V4L2R_CID_H264_DEBLOCKING_CONTROL_PRESENT	(V4L2R_CID_AVE_BASE + 6)
++#define V4L2R_CID_HEVC_SCALING_LIST_ENABLED	(V4L2R_CID_AVE_BASE + 7)
+ #define V4L2R_ENC_TIMEOUT_MS		2000
+ 
+ struct v4l2r_enc {
+@@ -72,7 +76,7 @@ struct v4l2r_enc {
+ 	 * enc_sps_word, -1 for the encoder's own value.
+ 	 */
+ 	bool client_sps;
+-	int32_t sps[4];
++	int32_t sps[6];
+ 	uint32_t packed_type;	/* of the next packed header data buffer */
+ 
+ 	void *cap_map[V4L2R_ENC_CAPTURE_BUFFERS];
+@@ -92,6 +96,9 @@ enum enc_sps_word {
+ 	ENC_SPS_H264_POC_TYPE,
+ 	ENC_SPS_H264_LOG2_MAX_POC_LSB_MINUS4,
+ 	ENC_SPS_HEVC_LOG2_MAX_POC_LSB_MINUS4,
++	ENC_SPS_H264_PIC_INIT_QP,
++	ENC_SPS_H264_DEBLOCKING_CONTROL_PRESENT,
++	ENC_SPS_COUNT,
+ };
+ 
+ /* --- encoder device discovery --- */
+@@ -156,9 +163,17 @@ static void probe_encoder(struct v4l2r_driver *drv)
+ 				drv->encoder.sps_h264 = h264 &&
+ 					sps_ctrl_listed(fd, V4L2R_CID_H264_LOG2_MAX_FRAME_NUM_MINUS4) &&
+ 					sps_ctrl_listed(fd, V4L2R_CID_H264_POC_TYPE) &&
+-					sps_ctrl_listed(fd, V4L2R_CID_H264_LOG2_MAX_POC_LSB_MINUS4);
+-				drv->encoder.sps_hevc = hevc &&
+-					sps_ctrl_listed(fd, V4L2R_CID_HEVC_LOG2_MAX_POC_LSB_MINUS4);
++					sps_ctrl_listed(fd, V4L2R_CID_H264_LOG2_MAX_POC_LSB_MINUS4) &&
++					sps_ctrl_listed(fd, V4L2R_CID_H264_PIC_INIT_QP) &&
++					sps_ctrl_listed(fd, V4L2R_CID_H264_DEBLOCKING_CONTROL_PRESENT);
++				/*
++				 * HEVC still differs in words the kernel cannot set yet:
++				 * the encoder uses wavefront entry points and reference
++				 * picture sets in the SPS, FFmpeg codes neither. Packed
++				 * HEVC headers stay off until those words exist, so no
++				 * container header that disagrees with the stream is made.
++				 */
++				drv->encoder.sps_hevc = false;
+ 				drv->has_encoder = true;
+ 				close(fd);
+ 				v4l2r_diag(NULL, V4L2R_DIAG_LEVEL_INFO, V4L2R_DIAG_INFO,
+@@ -238,6 +253,41 @@ uint32_t v4l2r_encoder_attribute(struct v4l2r_driver *drv, VAProfile profile,
+ 		return 1;
+ 	case VAConfigAttribEncMaxSlices:
+ 		return 1;
++#if VA_CHECK_VERSION(1, 13, 0)
++	case VAConfigAttribEncHEVCFeatures: {
++		/*
++		 * What the Apple encoder writes (its SPS/PPS as macOS sets them):
++		 * SAO, temporal MVP and CU QP deltas on; AMP, PCM, transform skip,
++		 * scaling lists and the rest off. A client that builds its own
++		 * SPS (FFmpeg) takes these instead of its defaults.
++		 */
++		VAConfigAttribValEncHEVCFeatures f = { .value = 0 };
++
++		if (profile != VAProfileHEVCMain)
++			return VA_ATTRIB_NOT_SUPPORTED;
++		f.bits.sao = VA_FEATURE_REQUIRED;
++		f.bits.temporal_mvp = VA_FEATURE_REQUIRED;
++		f.bits.cu_qp_delta = VA_FEATURE_REQUIRED;
++		return f.value;
++	}
++	case VAConfigAttribEncHEVCBlockSizes: {
++		/* 32x32 CTBs, 8x8 minimum CBs, 4x4-32x32 TBs, depth 1 inter / 0 intra */
++		VAConfigAttribValEncHEVCBlockSizes b = { .value = 0 };
++
++		if (profile != VAProfileHEVCMain)
++			return VA_ATTRIB_NOT_SUPPORTED;
++		b.bits.log2_max_coding_tree_block_size_minus3 = 2;
++		b.bits.log2_min_coding_tree_block_size_minus3 = 2;
++		b.bits.log2_min_luma_coding_block_size_minus3 = 0;
++		b.bits.log2_max_luma_transform_block_size_minus2 = 3;
++		b.bits.log2_min_luma_transform_block_size_minus2 = 0;
++		b.bits.max_max_transform_hierarchy_depth_inter = 1;
++		b.bits.min_max_transform_hierarchy_depth_inter = 1;
++		b.bits.max_max_transform_hierarchy_depth_intra = 0;
++		b.bits.min_max_transform_hierarchy_depth_intra = 0;
++		return b.value;
++	}
++#endif
+ 	case VAConfigAttribMaxPictureWidth:
+ 		return 4096;
+ 	case VAConfigAttribMaxPictureHeight:
+@@ -270,7 +320,7 @@ VAStatus v4l2r_enc_create(struct v4l2r_context *ctx,
+ 			 config->attributes[i].value != VA_ATTRIB_NOT_SUPPORTED &&
+ 			 (config->attributes[i].value & VA_ENC_PACKED_HEADER_SEQUENCE))
+ 			enc->client_sps = true;
+-	for (int i = 0; i < 4; i++)
++	for (int i = 0; i < 6; i++)
+ 		enc->sps[i] = -1;
+ 	enc->qp = 26;
+ 	enc->bitrate = 8000000;
+@@ -509,6 +559,12 @@ VAStatus v4l2r_enc_render_buffer(struct v4l2r_context *ctx,
+ 				enc->qp = p->pic_init_qp;
+ 				enc->rc_dirty = true;
+ 			}
++			/* The PPS words the client's header carries */
++			if (enc->client_sps && p->pic_init_qp <= 51) {
++				enc->sps[ENC_SPS_H264_PIC_INIT_QP] = p->pic_init_qp;
++				enc->sps[ENC_SPS_H264_DEBLOCKING_CONTROL_PRESENT] =
++					p->pic_fields.bits.deblocking_filter_control_present_flag;
++			}
+ 		} else {
+ 			const VAEncPictureParameterBufferHEVC *p = buf->data;
+ 
+@@ -693,10 +749,16 @@ static VAStatus enc_configure(struct v4l2r_context *ctx,
+ 			 enc->sps[ENC_SPS_H264_POC_TYPE]);
+ 		set_ctrl(enc->fd, V4L2R_CID_H264_LOG2_MAX_POC_LSB_MINUS4,
+ 			 enc->sps[ENC_SPS_H264_LOG2_MAX_POC_LSB_MINUS4]);
++		set_ctrl(enc->fd, V4L2R_CID_H264_PIC_INIT_QP,
++			 enc->sps[ENC_SPS_H264_PIC_INIT_QP]);
++		set_ctrl(enc->fd, V4L2R_CID_H264_DEBLOCKING_CONTROL_PRESENT,
++			 enc->sps[ENC_SPS_H264_DEBLOCKING_CONTROL_PRESENT]);
+ 	} else if (enc->client_sps && enc->coded == V4L2_PIX_FMT_HEVC &&
+ 		   drv->encoder.sps_hevc) {
+ 		set_ctrl(enc->fd, V4L2R_CID_HEVC_LOG2_MAX_POC_LSB_MINUS4,
+ 			 enc->sps[ENC_SPS_HEVC_LOG2_MAX_POC_LSB_MINUS4]);
++		/* FFmpeg never enables scaling lists in its SPS */
++		set_ctrl(enc->fd, V4L2R_CID_HEVC_SCALING_LIST_ENABLED, 0);
+ 	}
+ 	set_ctrl(enc->fd, V4L2_CID_MPEG_VIDEO_GOP_SIZE,
+ 		 enc->intra_period ? (int32_t)enc->intra_period : 0);

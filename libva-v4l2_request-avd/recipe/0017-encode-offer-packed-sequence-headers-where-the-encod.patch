@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 16 Nov 2026 03:47:51 +0000
+Subject: [PATCH 17/19] encode: offer packed sequence headers where the encoder
+ takes the client's SPS words
+
+FFmpeg's VA-API encoders build extradata (avcC, hvcC) only when the driver
+offers VA_ENC_PACKED_HEADER_SEQUENCE, and Matroska refuses a stream without
+it. Offering the bit unconditionally is wrong, though: the stateful encoder
+writes its own parameter sets in band, and they differ from the client's
+(FFmpeg codes log2_max_frame_num_minus4 = 4 and pic_order_cnt_type = 2 for
+H.264, log2_max_pic_order_cnt_lsb_minus4 = 8 for HEVC; apple-ave writes 1,
+0 and 7). A decoder that takes the container's copy then reads the slice
+headers with the wrong widths.
+
+apple-ave exposes those words as integer controls (-1 keeps its own value).
+Query them when the encoder is probed, and offer packed sequence headers
+only for a codec whose controls are all there. Other encoders, and kernels
+without the controls, keep VA_ENC_PACKED_HEADER_NONE.
+---
+ src/driver.c       |  5 ++--
+ src/encode.c       | 70 +++++++++++++++++++++++++++++++++++++++++-----
+ src/v4l2_request.h |  6 +++-
+ 3 files changed, 70 insertions(+), 11 deletions(-)
+
+diff --git a/src/driver.c b/src/driver.c
+index 0adfc46..874c22c 100644
+--- a/src/driver.c
++++ b/src/driver.c
+@@ -930,15 +930,14 @@ VAStatus v4l2r_GetConfigAttributes(VADriverContextP va_ctx, VAProfile profile,
+ 				   VAEntrypoint entrypoint,
+ 				   VAConfigAttrib *attrib_list, int num_attribs)
+ {
+-	(void)va_ctx;
+-
+ 	if (num_attribs < 0 || (num_attribs && !attrib_list))
+ 		return VA_STATUS_ERROR_INVALID_PARAMETER;
+ 
+ 	if (entrypoint == VAEntrypointEncSlice) {
+ 		for (int i = 0; i < num_attribs; i++)
+ 			attrib_list[i].value =
+-				v4l2r_encoder_attribute(profile, attrib_list[i].type);
++				v4l2r_encoder_attribute(v4l2r_driver(va_ctx), profile,
++							attrib_list[i].type);
+ 		return VA_STATUS_SUCCESS;
+ 	}
+ 
+diff --git a/src/encode.c b/src/encode.c
+index 4990a4b..16a981b 100644
+--- a/src/encode.c
++++ b/src/encode.c
+@@ -10,8 +10,10 @@
+  * client asks for what such an encoder does by itself: no B-frames (the
+  * driver reports one forward reference only), the picture types the
+  * encoder picks (a periodic IDR at the client's intra period, a forced IDR
+- * when the client asks for one), and no packed headers (the encoder writes
+- * its own SPS/PPS/VPS in front of every IDR, in the bitstream).
++ * when the client asks for one), and the encoder's own SPS/PPS/VPS in front
++ * of every IDR, in the bitstream. Packed sequence headers are offered only
++ * where the encoder can take the client's frame_num and POC words, so that
++ * the parameter sets a client puts in its container match the stream.
+  *
+  * Like the video processing path (convert.c) every picture is one
+  * synchronous job: vaEndPicture() queues the input surface's dma-buf,
+@@ -35,6 +37,17 @@
+ #include <va/va_enc_hevc.h>
+ 
+ #define V4L2R_ENC_CAPTURE_BUFFERS	2
++
++/*
++ * apple-ave's sequence parameter set controls (drivers/media/platform/apple/
++ * ave/ave.h): -1 keeps the encoder's own value, otherwise the syntax element
++ * value is coded.
++ */
++#define V4L2R_CID_AVE_BASE			(V4L2_CTRL_CLASS_CODEC | 0x1200)
++#define V4L2R_CID_H264_LOG2_MAX_FRAME_NUM_MINUS4	(V4L2R_CID_AVE_BASE + 1)
++#define V4L2R_CID_H264_POC_TYPE			(V4L2R_CID_AVE_BASE + 2)
++#define V4L2R_CID_H264_LOG2_MAX_POC_LSB_MINUS4	(V4L2R_CID_AVE_BASE + 3)
++#define V4L2R_CID_HEVC_LOG2_MAX_POC_LSB_MINUS4	(V4L2R_CID_AVE_BASE + 4)
+ #define V4L2R_ENC_TIMEOUT_MS		2000
+ 
+ struct v4l2r_enc {
+@@ -77,6 +90,16 @@ static bool fmt_listed(int fd, enum v4l2_buf_type type, uint32_t fourcc)
+ 	return false;
+ }
+ 
++/* An integer control with -1 (keep the encoder's value) in its range. */
++static bool sps_ctrl_listed(int fd, uint32_t id)
++{
++	struct v4l2_queryctrl q = { .id = id };
++
++	return ioctl(fd, VIDIOC_QUERYCTRL, &q) == 0 && q.id == id &&
++	       q.type == V4L2_CTRL_TYPE_INTEGER && q.minimum <= -1 &&
++	       !(q.flags & (V4L2_CTRL_FLAG_DISABLED | V4L2_CTRL_FLAG_READ_ONLY));
++}
++
+ static void probe_encoder(struct v4l2r_driver *drv)
+ {
+ 	char path[32];
+@@ -114,12 +137,21 @@ static void probe_encoder(struct v4l2r_driver *drv)
+ 					 "%s", cap.card);
+ 				drv->encoder.h264 = h264;
+ 				drv->encoder.hevc = hevc;
++				drv->encoder.sps_h264 = h264 &&
++					sps_ctrl_listed(fd, V4L2R_CID_H264_LOG2_MAX_FRAME_NUM_MINUS4) &&
++					sps_ctrl_listed(fd, V4L2R_CID_H264_POC_TYPE) &&
++					sps_ctrl_listed(fd, V4L2R_CID_H264_LOG2_MAX_POC_LSB_MINUS4);
++				drv->encoder.sps_hevc = hevc &&
++					sps_ctrl_listed(fd, V4L2R_CID_HEVC_LOG2_MAX_POC_LSB_MINUS4);
+ 				drv->has_encoder = true;
+ 				close(fd);
+ 				v4l2r_diag(NULL, V4L2R_DIAG_LEVEL_INFO, V4L2R_DIAG_INFO,
+-					   "encoder", 0, "encoder %s [%s]: H.264 %s, HEVC %s",
++					   "encoder", 0,
++					   "encoder %s [%s]: H.264 %s, HEVC %s, client SPS H.264 %s, HEVC %s",
+ 					   path, cap.card, h264 ? "yes" : "no",
+-					   hevc ? "yes" : "no");
++					   hevc ? "yes" : "no",
++					   drv->encoder.sps_h264 ? "yes" : "no",
++					   drv->encoder.sps_hevc ? "yes" : "no");
+ 				return;
+ 			}
+ 		}
+@@ -151,7 +183,23 @@ bool v4l2r_encoder_supports(struct v4l2r_driver *drv, VAProfile profile)
+ 	return ok;
+ }
+ 
+-uint32_t v4l2r_encoder_attribute(VAProfile profile, VAConfigAttribType type)
++/* The encoder can code the client's SPS words for @profile. */
++static bool encoder_client_sps(struct v4l2r_driver *drv, VAProfile profile)
++{
++	bool ok;
++
++	pthread_mutex_lock(&drv->mutex);
++	if (!drv->encoder_probed)
++		probe_encoder(drv);
++	ok = drv->has_encoder &&
++	     (profile == VAProfileHEVCMain ? drv->encoder.sps_hevc :
++					    drv->encoder.sps_h264);
++	pthread_mutex_unlock(&drv->mutex);
++	return ok;
++}
++
++uint32_t v4l2r_encoder_attribute(struct v4l2r_driver *drv, VAProfile profile,
++				 VAConfigAttribType type)
+ {
+ 	switch (type) {
+ 	case VAConfigAttribRTFormat:
+@@ -159,8 +207,16 @@ uint32_t v4l2r_encoder_attribute(VAProfile profile, VAConfigAttribType type)
+ 	case VAConfigAttribRateControl:
+ 		return VA_RC_CQP | VA_RC_CBR | VA_RC_VBR;
+ 	case VAConfigAttribEncPackedHeaders:
+-		/* The encoder writes its own parameter sets in band. */
+-		return VA_ENC_PACKED_HEADER_NONE;
++		/*
++		 * The encoder writes its own parameter sets in band, in front of
++		 * every IDR. Where it takes the client's frame_num and POC words
++		 * those match the ones the client builds, so offer packed
++		 * sequence headers: FFmpeg writes extradata (avcC, hvcC) only
++		 * with this bit, and Matroska refuses a stream without it. The
++		 * packed buffers are not inserted (the in-band copy is the same).
++		 */
++		return encoder_client_sps(drv, profile) ? VA_ENC_PACKED_HEADER_SEQUENCE :
++							 VA_ENC_PACKED_HEADER_NONE;
+ 	case VAConfigAttribEncMaxRefFrames:
+ 		/* One forward reference, no backward: no B-frames. */
+ 		return 1;
+diff --git a/src/v4l2_request.h b/src/v4l2_request.h
+index f6211d5..464a7c4 100644
+--- a/src/v4l2_request.h
++++ b/src/v4l2_request.h
+@@ -234,6 +234,9 @@ struct v4l2r_encoder {
+ 	char card[32];
+ 	bool h264;
+ 	bool hevc;
++	/* The encoder takes the client's SPS frame_num and POC words. */
++	bool sps_h264;
++	bool sps_hevc;
+ };
+ 
+ struct v4l2r_converter {
+@@ -907,7 +910,8 @@ struct v4l2r_vpp {
+ 
+ struct v4l2r_enc;
+ bool v4l2r_encoder_supports(struct v4l2r_driver *drv, VAProfile profile);
+-uint32_t v4l2r_encoder_attribute(VAProfile profile, VAConfigAttribType type);
++uint32_t v4l2r_encoder_attribute(struct v4l2r_driver *drv, VAProfile profile,
++				 VAConfigAttribType type);
+ VAStatus v4l2r_enc_create(struct v4l2r_context *ctx,
+ 			  const struct v4l2r_config *config);
+ void v4l2r_enc_destroy(struct v4l2r_context *ctx);

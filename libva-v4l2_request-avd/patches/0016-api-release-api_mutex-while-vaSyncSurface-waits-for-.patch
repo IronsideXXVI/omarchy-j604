@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 23 Nov 2026 18:28:31 +0000
+Subject: [PATCH] api: release api_mutex while vaSyncSurface waits for the
+ decoder
+
+Dropping ctx->mutex around the CAPTURE poll() was not enough. Every
+surface and context entrypoint runs under the driver-wide api_mutex, and
+vaSyncSurface() and vaExportSurfaceHandle() hold it for their whole wait
+on the decoder. vaBeginPicture() for the next frame takes the same lock.
+A client that syncs every mapped frame from another thread (FFmpeg hwmap
+to DRM PRIME) still could not submit frame N+1 until frame N finished.
+On the AVD, about half of the decode jobs then started on an empty
+queue.
+
+Release api_mutex too, but only for the poll() of the CAPTURE wait in
+those two entrypoints. The reorder flush and everything after the wait
+still run under it. The waiter is counted in ctx->waiters before it lets
+go of either lock, and it takes api_mutex again before ctx->mutex, the
+usual order. DestroyContext waits for those waiters without holding
+api_mutex, because a waiter has to take it again before it can leave.
+
+V4L2R_SYNC_UNLOCKED=0 keeps both locks held across the wait, as before.
+---
+ src/api.c          | 33 +++++++++++++++++++++++++++++++++
+ src/context.c      | 11 ++++++++++-
+ src/decode.c       |  6 ++++++
+ src/surface.c      | 13 ++++++++++++-
+ src/v4l2_request.h | 11 +++++++++++
+ 5 files changed, 72 insertions(+), 2 deletions(-)
+
+diff --git a/src/api.c b/src/api.c
+index 63e344a..ed6ec84 100644
+--- a/src/api.c
++++ b/src/api.c
+@@ -12,6 +12,9 @@
+  */
+ #include "v4l2_request.h"
+ 
++_Thread_local struct v4l2r_driver *v4l2r_api_holder;
++_Thread_local bool v4l2r_api_drop_ok;
++
+ #define LOCKED(name, params, args) \
+ static VAStatus locked_##name params \
+ { \
+@@ -20,11 +23,13 @@ static VAStatus locked_##name params \
+ 					    memory_order_relaxed); \
+ 	VAStatus result; \
+ 	pthread_mutex_lock(&drv->api_mutex); \
++	v4l2r_api_holder = drv; \
+ 	if (overlap) \
+ 		v4l2r_overlap_locked_enter(); \
+ 	result = v4l2r_##name args; \
+ 	if (overlap) \
+ 		v4l2r_overlap_locked_exit(); \
++	v4l2r_api_holder = NULL; \
+ 	pthread_mutex_unlock(&drv->api_mutex); \
+ 	return result; \
+ }
+@@ -170,3 +175,31 @@ unsigned v4l2r_overlap_locked_active(void)
+ {
+ 	return atomic_load(&overlap_locked_active);
+ }
++
++/* --- api_mutex released across a CAPTURE wait ---
++ *
++ * Only a wait in vaSyncSurface()/vaExportSurfaceHandle() (v4l2r_api_drop_ok)
++ * and the DestroyContext drain of such waiters release it. The waiter keeps
++ * its context alive through ctx->waiters and takes api_mutex again before
++ * ctx->mutex, the usual order. The overlap counters see the wait as outside
++ * the locked section, which it is. */
++struct v4l2r_driver *v4l2r_api_drop(bool any)
++{
++	struct v4l2r_driver *drv = v4l2r_api_holder;
++
++	if (!drv || (!any && !v4l2r_api_drop_ok))
++		return NULL;
++	if (atomic_load_explicit(&v4l2r_overlap_enabled, memory_order_relaxed))
++		v4l2r_overlap_locked_exit();
++	v4l2r_api_holder = NULL;
++	pthread_mutex_unlock(&drv->api_mutex);
++	return drv;
++}
++
++void v4l2r_api_retake(struct v4l2r_driver *drv)
++{
++	pthread_mutex_lock(&drv->api_mutex);
++	v4l2r_api_holder = drv;
++	if (atomic_load_explicit(&v4l2r_overlap_enabled, memory_order_relaxed))
++		v4l2r_overlap_locked_enter();
++}
+diff --git a/src/context.c b/src/context.c
+index 1e34c2b..0f4876b 100644
+--- a/src/context.c
++++ b/src/context.c
+@@ -1591,8 +1591,17 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
+ 	/* No thread may still poll this context's fd once STREAMOFF and
+ 	 * close() begin. */
+ 	pthread_mutex_lock(&ctx->mutex);
+-	while (ctx->waiters)
++	while (ctx->waiters) {
++		/* A waiter that released api_mutex needs it again to leave. */
++		struct v4l2r_driver *api = v4l2r_api_drop(true);
++
+ 		pthread_cond_wait(&ctx->waiters_cond, &ctx->mutex);
++		if (api) {
++			pthread_mutex_unlock(&ctx->mutex);
++			v4l2r_api_retake(api);
++			pthread_mutex_lock(&ctx->mutex);
++		}
++	}
+ 	pthread_mutex_unlock(&ctx->mutex);
+ 
+ 	if (ctx->video_fd >= 0 && (ctx->streaming || ctx->output_streaming)) {
+diff --git a/src/decode.c b/src/decode.c
+index 03d2d5c..c3825d7 100644
+--- a/src/decode.c
++++ b/src/decode.c
+@@ -327,8 +327,14 @@ static int poll_capture_unlocked(struct v4l2r_context *ctx, uint64_t deadline)
+ 	int ret;
+ 
+ 	ctx->waiters++;
++	/* vaSyncSurface()/vaExportSurfaceHandle() run under api_mutex, which
++	 * vaBeginPicture() also takes: release it too, or the next frame still
++	 * cannot be submitted during the wait. Taken again before ctx->mutex. */
++	struct v4l2r_driver *api = v4l2r_api_drop(false);
+ 	pthread_mutex_unlock(&ctx->mutex);
+ 	ret = v4l2r_poll_until(fd, POLLIN, slice < deadline ? slice : deadline);
++	if (api)
++		v4l2r_api_retake(api);
+ 	pthread_mutex_lock(&ctx->mutex);
+ 	if (--ctx->waiters == 0)
+ 		pthread_cond_broadcast(&ctx->waiters_cond);
+diff --git a/src/surface.c b/src/surface.c
+index b3607a2..37ab308 100644
+--- a/src/surface.c
++++ b/src/surface.c
+@@ -174,7 +174,10 @@ VAStatus v4l2r_SyncSurface(VADriverContextP va_ctx, VASurfaceID render_target)
+ 	if (!surface)
+ 		return VA_STATUS_ERROR_INVALID_SURFACE;
+ 
+-	return v4l2r_surface_ready(surface);
++	v4l2r_api_drop_ok = true;
++	VAStatus status = v4l2r_surface_ready(surface);
++	v4l2r_api_drop_ok = false;
++	return status;
+ }
+ 
+ VAStatus v4l2r_QuerySurfaceStatus(VADriverContextP va_ctx,
+@@ -319,6 +322,10 @@ VAStatus v4l2r_QuerySurfaceAttributes(VADriverContextP va_ctx, VAConfigID config
+ VAStatus v4l2r_surface_ready(struct v4l2r_surface *surface)
+ {
+ 	VAStatus status;
++	/* Only the CAPTURE wait below may release api_mutex, never the flush. */
++	bool drop_api = v4l2r_api_drop_ok;
++
++	v4l2r_api_drop_ok = false;
+ 
+ 	/* BeginPicture reserves the target before there is a queued request to
+ 	 * wait on. Reading/exporting it now would expose old or partial pixels. */
+@@ -334,7 +341,9 @@ VAStatus v4l2r_surface_ready(struct v4l2r_surface *surface)
+ 		return surface->decode_status;
+ 
+ 	uint64_t t0 = v4l2r_now_ns();
++	v4l2r_api_drop_ok = drop_api;
+ 	status = v4l2r_sync_capture(surface->ctx, surface->capture_index);
++	v4l2r_api_drop_ok = false;
+ 	v4l2r_trace("export sync (surface 0x%08x buf #%d): %.2f ms\n",
+ 		    surface->id, surface->capture_index,
+ 		    (v4l2r_now_ns() - t0) / 1e6);
+@@ -1065,7 +1074,9 @@ VAStatus v4l2r_ExportSurfaceHandle(VADriverContextP va_ctx, VASurfaceID surface_
+ 	 * conversion) to finish so a consumer that does not vaSyncSurface()
+ 	 * itself (e.g. --vo=dmabuf-wayland) cannot read a partially decoded
+ 	 * frame. No-op for unbound or already-idle surfaces. */
++	v4l2r_api_drop_ok = true;
+ 	status = v4l2r_surface_ready(surface);
++	v4l2r_api_drop_ok = false;
+ 	if (status != VA_STATUS_SUCCESS)
+ 		return status;
+ 
+diff --git a/src/v4l2_request.h b/src/v4l2_request.h
+index a191f46..f6211d5 100644
+--- a/src/v4l2_request.h
++++ b/src/v4l2_request.h
+@@ -678,6 +678,17 @@ struct v4l2r_driver {
+ };
+ 
+ void v4l2r_lock_surface_api(struct VADriverVTable *vtable);
++/* The driver whose api_mutex this thread holds inside a locked entrypoint
++ * (NULL outside one, or while a wait has released it). */
++extern _Thread_local struct v4l2r_driver *v4l2r_api_holder;
++/* Set around the CAPTURE wait of vaSyncSurface()/vaExportSurfaceHandle():
++ * that wait may release api_mutex, so a thread mapping one frame does not
++ * block another thread submitting the next. */
++extern _Thread_local bool v4l2r_api_drop_ok;
++/* Release api_mutex for a wait if this thread holds it (and the wait is
++ * allowed to, or any); returns the driver to pass to v4l2r_api_retake(). */
++struct v4l2r_driver *v4l2r_api_drop(bool any);
++void v4l2r_api_retake(struct v4l2r_driver *drv);
+ 
+ static inline struct v4l2r_driver *v4l2r_driver(VADriverContextP va_ctx)
+ {

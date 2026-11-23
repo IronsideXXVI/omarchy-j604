@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Mon, 23 Nov 2026 18:04:14 +0000
+Subject: [PATCH] decode: wait for CAPTURE completions without holding the
+ context lock
+
+vaSyncSurface() on a decoded frame held ctx->mutex for the whole poll()
+on the decoder. Every submission path (BeginPicture binding a CAPTURE
+buffer, the OUTPUT ring, queueing the decode) takes the same mutex, so
+a client that syncs each frame from another thread (FFmpeg hwmap to
+DRM PRIME, which syncs every mapped frame) kept the decoding thread from
+queueing frame N+1 until frame N had finished. The decoder then ran
+with an empty queue for about half of the jobs and paid the full job
+latency on each.
+
+Drop the mutex around the poll() in the CAPTURE and completion waits.
+Under the mutex again, the waiter re-checks its condition: its buffer
+may have been dequeued by another thread, and queued again for a later
+frame (a per-buffer queue generation tells the two apart). The poll is
+cut into 2 ms slices so a completion dequeued by another thread just
+before the waiter enters poll() costs at most one slice. A count of
+threads inside an unlocked wait lets DestroyContext wait for them
+before STREAMOFF and close().
+
+V4L2R_SYNC_UNLOCKED=0 keeps the mutex held across the wait, as before.
+---
+ src/context.c      | 15 ++++++++++++
+ src/decode.c       | 58 ++++++++++++++++++++++++++++++++++++++++++++++
+ src/v4l2_request.h | 15 ++++++++++++
+ 3 files changed, 88 insertions(+)
+
+diff --git a/src/context.c b/src/context.c
+index 35d889d..1e34c2b 100644
+--- a/src/context.c
++++ b/src/context.c
+@@ -1299,6 +1299,13 @@ VAStatus v4l2r_CreateContext(VADriverContextP va_ctx, VAConfigID config_id,
+ 	ctx->video_fd = -1;
+ 	ctx->media_fd = -1;
+ 	pthread_mutex_init(&ctx->mutex, NULL);
++	pthread_cond_init(&ctx->waiters_cond, NULL);
++	{
++		const char *unlocked = getenv("V4L2R_SYNC_UNLOCKED");
++
++		ctx->sync_unlocked = unlocked ? atoi(unlocked) > 0 :
++				     V4L2R_SYNC_UNLOCKED_DEFAULT;
++	}
+ 	for (unsigned int i = 0; i < V4L2R_OUTPUT_BUFFERS; i++)
+ 		ctx->output[i].request_fd = -1;
+ 	/* A failed QUERYBUF can leave a hole before the next kernel index.
+@@ -1581,6 +1588,13 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
+ 		}
+ 	}
+ 
++	/* No thread may still poll this context's fd once STREAMOFF and
++	 * close() begin. */
++	pthread_mutex_lock(&ctx->mutex);
++	while (ctx->waiters)
++		pthread_cond_wait(&ctx->waiters_cond, &ctx->mutex);
++	pthread_mutex_unlock(&ctx->mutex);
++
+ 	if (ctx->video_fd >= 0 && (ctx->streaming || ctx->output_streaming)) {
+ 		type = ctx->output_format.type;
+ 		ioctl(ctx->video_fd, VIDIOC_STREAMOFF, &type);
+@@ -1620,6 +1634,7 @@ VAStatus v4l2r_DestroyContext(VADriverContextP va_ctx, VAContextID context_id)
+ 	if (ctx->codec && ctx->codec->uninit && ctx->codec_priv)
+ 		ctx->codec->uninit(ctx);
+ 	free(ctx->codec_priv);
++	pthread_cond_destroy(&ctx->waiters_cond);
+ 	pthread_mutex_destroy(&ctx->mutex);
+ 
+ 	pthread_mutex_lock(&drv->mutex);
+diff --git a/src/decode.c b/src/decode.c
+index fdba49d..03d2d5c 100644
+--- a/src/decode.c
++++ b/src/decode.c
+@@ -191,6 +191,7 @@ static int queue_buffer(struct v4l2r_context *ctx, struct v4l2_buffer *buffer)
+ 			  buffer->request_fd);
+ 	} else {
+ 		ctx->queued_capture |= UINT64_C(1) << buffer->index;
++		ctx->captures[buffer->index].queue_gen++;
+ 		/* Count decode submissions on the CAPTURE queue: one per frame,
+ 		 * and completed only when the decode (and thus its reference
+ 		 * reads) actually finishes, unlike the OUTPUT bitstream buffer
+@@ -312,9 +313,35 @@ static int dequeue_completed_buffers(struct v4l2r_context *ctx,
+ 	}
+ }
+ 
++/*
++ * Poll for a CAPTURE completion with ctx->mutex dropped, so the decoding
++ * thread can queue the next frame while another thread (a client syncing a
++ * frame it maps) waits; holding the mutex here drained the decoder between
++ * frames. Returns with the mutex held. A slice that ends before the deadline
++ * returns 0 so the caller re-checks its condition under the mutex.
++ */
++static int poll_capture_unlocked(struct v4l2r_context *ctx, uint64_t deadline)
++{
++	uint64_t slice = v4l2r_now_ns() + (uint64_t)V4L2R_SYNC_SLICE_MS * 1000000;
++	int fd = ctx->video_fd;
++	int ret;
++
++	ctx->waiters++;
++	pthread_mutex_unlock(&ctx->mutex);
++	ret = v4l2r_poll_until(fd, POLLIN, slice < deadline ? slice : deadline);
++	pthread_mutex_lock(&ctx->mutex);
++	if (--ctx->waiters == 0)
++		pthread_cond_broadcast(&ctx->waiters_cond);
++
++	if (ret == -ETIMEDOUT && v4l2r_now_ns() < deadline)
++		return 0;
++	return ret;
++}
++
+ static int wait_on_capture_locked(struct v4l2r_context *ctx, uint32_t index)
+ {
+ 	uint64_t deadline = v4l2r_now_ns() + (uint64_t)V4L2R_POLL_TIMEOUT_MS * 1000000;
++	uint64_t gen = ctx->captures[index].queue_gen;
+ 	if (ctx->queued_capture) {
+ 		int ret = dequeue_completed_buffers(ctx, ctx->capture_format.type);
+ 		if (ret < 0)
+@@ -322,6 +349,23 @@ static int wait_on_capture_locked(struct v4l2r_context *ctx, uint32_t index)
+ 	}
+ 
+ 	while (ctx->queued_capture & (UINT64_C(1) << index)) {
++		if (ctx->sync_unlocked) {
++			int ret = poll_capture_unlocked(ctx, deadline);
++			/* Another thread may have dequeued this frame (and queued
++			 * the buffer again for a later one) while unlocked. */
++			if (!(ctx->queued_capture & (UINT64_C(1) << index)) ||
++			    ctx->captures[index].queue_gen != gen)
++				return 0;
++			if (ctx->failed)
++				return -EIO;
++			if (ret < 0)
++				return ret;
++			ret = dequeue_buffer(ctx, ctx->capture_format.type);
++			if (ret < 0 && ret != -EAGAIN && ret != -EINTR)
++				return ret;
++			continue;
++		}
++
+ 		int ret = v4l2r_poll_until(ctx->video_fd, POLLIN, deadline);
+ 		if (ret < 0)
+ 			return ret;
+@@ -389,6 +433,20 @@ static int wait_completed_locked(struct v4l2r_context *ctx, uint64_t target)
+ 	 * Completion is in submission order, so this drains exactly the frames
+ 	 * submitted up to the target sequence. */
+ 	while (ctx->completed < target && ctx->queued_capture) {
++		if (ctx->sync_unlocked) {
++			int ret = poll_capture_unlocked(ctx, deadline);
++			if (ctx->completed >= target || !ctx->queued_capture)
++				break;
++			if (ctx->failed)
++				return -EIO;
++			if (ret < 0)
++				return ret;
++			ret = dequeue_buffer(ctx, ctx->capture_format.type);
++			if (ret < 0 && ret != -EAGAIN && ret != -EINTR)
++				return ret;
++			continue;
++		}
++
+ 		int ret = v4l2r_poll_until(ctx->video_fd, POLLIN, deadline);
+ 		if (ret < 0)
+ 			return ret;
+diff --git a/src/v4l2_request.h b/src/v4l2_request.h
+index e462ed0..a191f46 100644
+--- a/src/v4l2_request.h
++++ b/src/v4l2_request.h
+@@ -73,6 +73,13 @@ static inline uint64_t v4l2r_now_ns(void)
+ /* Rebind the exported buffers of surfaces re-exported after every decode
+  * (V4L2R_REBIND_EXPORTED); 0 keeps every exported buffer pinned. */
+ #define V4L2R_REBIND_EXPORTED_DEFAULT 1
++/* Wait for CAPTURE completions with ctx->mutex dropped (V4L2R_SYNC_UNLOCKED),
++ * so a thread syncing one frame does not block another thread submitting the
++ * next; 0 keeps the mutex held across the wait. */
++#define V4L2R_SYNC_UNLOCKED_DEFAULT 1
++/* An unlocked wait re-checks its buffer under the mutex at least this often,
++ * covering a completion dequeued by another thread just before the poll. */
++#define V4L2R_SYNC_SLICE_MS 2
+ 
+ /* Upper bound on any single wait for the hardware (buffer/request/fence). */
+ #define V4L2R_POLL_TIMEOUT_MS		2000
+@@ -366,6 +373,9 @@ struct v4l2r_capture_buffer {
+ 	uint64_t last_ref_seq;
+ 	/* Submission count of the most recent decode into this buffer. */
+ 	uint64_t decode_seq;
++	/* Bumped on every QBUF: an unlocked waiter whose buffer was dequeued
++	 * and queued again by another thread sees its own frame completed. */
++	uint64_t queue_gen;
+ };
+ 
+ struct v4l2r_output_buffer {
+@@ -436,6 +446,11 @@ struct v4l2r_context {
+ 	/* A client decoded into an exported surface again without exporting
+ 	 * it anew: it keeps the old dma-buf, so exported buffers stay pinned. */
+ 	bool export_cached;
++	/* V4L2R_SYNC_UNLOCKED: CAPTURE waits drop ctx->mutex across poll(). */
++	bool sync_unlocked;
++	/* Threads inside an unlocked CAPTURE wait; teardown waits for zero. */
++	unsigned int waiters;
++	pthread_cond_t waiters_cond;
+ 
+ 	unsigned int picture_width;
+ 	unsigned int picture_height;
