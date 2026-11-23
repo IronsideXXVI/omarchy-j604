@@ -1,0 +1,460 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 22 Nov 2026 12:28:37 +0000
+Subject: [PATCH] egl/wayland: free the spare buffers of idle window surfaces
+
+Spare colour buffers are only trimmed in update_buffers(), which runs
+when the client draws again. A surface that stops drawing, such as a
+wallpaper or an idle panel, keeps every buffer it ever needed for triple
+buffering for as long as it lives: one or two full-size buffers that the
+compositor has already released.
+
+Add one thread per display that waits until a window surface has not
+swapped for 3 seconds, takes in the releases already queued for it and
+frees every colour buffer that is not locked, not on screen and not the
+back buffer. If the compositor still holds a spare at that point, the
+thread looks again after 1, 2 and 4 seconds and then leaves the surface
+alone until its next swap, so an idle surface costs at most four
+wakeups. The next swap allocates a back buffer as it does after a
+resize, and query_buffer_age reports 0 for it, so clients repaint fully.
+
+The thread only sees releases that have already been read from the
+display socket, so a client that never reads its display keeps its
+buffers as before.
+
+Every path that touches color_buffers or dispatches the surface queue
+(image_get_buffers, swap after the glthread flush, query_buffer_age) now
+holds a per-surface lock. The thread only try-locks it and never waits
+on a surface that is drawing. The thread takes trim_mtx and then
+try-locks trim_lock, while the swap path takes trim_lock and then
+trim_mtx; because the thread never blocks on trim_lock while it holds
+trim_mtx, the two orders cannot deadlock.
+
+The wait uses a monotonic condition variable, so a change of the wall
+clock neither stretches nor skips it.
+
+At 3024x1964 (an M4 MacBook Pro panel) each such buffer is 23 MiB.
+
+A surface leaves the trim list before its DRI drawable is destroyed, so
+the thread never walks a surface that is being torn down.
+
+---
+ src/egl/drivers/dri2/egl_dri2.h         |  17 ++
+ src/egl/drivers/dri2/platform_wayland.c | 240 ++++++++++++++++++++++--
+ 2 files changed, 238 insertions(+), 19 deletions(-)
+
+diff --git a/src/egl/drivers/dri2/egl_dri2.h b/src/egl/drivers/dri2/egl_dri2.h
+index aa5692ab1ae..f4ffeb08fef 100644
+--- a/src/egl/drivers/dri2/egl_dri2.h
++++ b/src/egl/drivers/dri2/egl_dri2.h
+@@ -94,7 +94,10 @@ struct zwp_linux_dmabuf_feedback_v1;
+ #include "eglsurface.h"
+ #include "eglsync.h"
+ 
++#include "c11/threads.h"
+ #include "util/bitset.h"
++#include "util/cnd_monotonic.h"
++#include "util/list.h"
+ #include "util/u_dynarray.h"
+ #include "util/u_vector.h"
+ #include "util/format/u_format.h"
+@@ -289,6 +292,13 @@ struct dri2_egl_display {
+    char *device_name;
+    bool is_render_node;
+    clockid_t presentation_clock_id;
++   /* Frees the spare colour buffers of idle window surfaces. */
++   thrd_t trim_thread;
++   mtx_t trim_mtx;
++   struct u_cnd_monotonic trim_cnd;
++   struct list_head trim_surfaces;
++   bool trim_started;
++   bool trim_stop;
+ #endif
+ 
+ #ifdef HAVE_ANDROID_PLATFORM
+@@ -336,6 +346,13 @@ struct dri2_egl_surface {
+    int format;
+    bool resized;
+    bool received_dmabuf_feedback;
++   /* Held by every path that uses color_buffers or dispatches wl_queue. */
++   mtx_t trim_lock;
++   struct list_head trim_link;
++   int64_t trim_last_swap;
++   bool trim_armed;
++   unsigned trim_retries;
++   bool trim_listed;
+ #endif
+ 
+ #ifdef HAVE_DRM_PLATFORM
+diff --git a/src/egl/drivers/dri2/platform_wayland.c b/src/egl/drivers/dri2/platform_wayland.c
+index cdc790bf5a5..ebdff86d787 100644
+--- a/src/egl/drivers/dri2/platform_wayland.c
++++ b/src/egl/drivers/dri2/platform_wayland.c
+@@ -42,7 +42,10 @@
+ #include <vulkan/vulkan_wayland.h>
+ 
+ #include "util/anon_file.h"
++#include "util/os_time.h"
+ #include "util/perf/cpu_trace.h"
++#include "util/timespec.h"
++#include "util/u_thread.h"
+ #include "util/u_vector.h"
+ #include "util/format/u_formats.h"
+ #include "main/glconfig.h"
+@@ -297,6 +300,11 @@ server_supports_fourcc(struct dri2_wl_formats *formats, uint32_t fourcc)
+    return server_supports_format(formats, dri2_wl_visual_idx_from_fourcc(fourcc));
+ }
+ 
++static const struct dri2_egl_display_vtbl dri2_wl_display_vtbl;
++static void
++dri2_wl_trim_register(struct dri2_egl_display *dri2_dpy,
++                      struct dri2_egl_surface *dri2_surf);
++
+ static int
+ roundtrip(struct dri2_egl_display *dri2_dpy)
+ {
+@@ -843,8 +851,18 @@ dri2_wl_create_window_surface(_EGLDisplay *disp, _EGLConfig *conf,
+    if (!dri2_create_drawable(dri2_dpy, config, dri2_surf, dri2_surf))
+       goto cleanup_dmabuf_feedback;
+ 
++   if (mtx_init(&dri2_surf->trim_lock, mtx_plain | mtx_recursive) !=
++       thrd_success) {
++      driDestroyDrawable(dri2_surf->dri_drawable);
++      goto cleanup_dmabuf_feedback;
++   }
++   list_inithead(&dri2_surf->trim_link);
++
+    dri2_surf->base.SwapInterval = dri2_dpy->default_swap_interval;
+ 
++   if (dri2_dpy->vtbl == &dri2_wl_display_vtbl)
++      dri2_wl_trim_register(dri2_dpy, dri2_surf);
++
+    return &dri2_surf->base;
+ 
+ cleanup_dmabuf_feedback:
+@@ -942,8 +960,19 @@ dri2_wl_create_pixmap_surface(_EGLDisplay *disp, _EGLConfig *conf,
+ static EGLBoolean
+ dri2_wl_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
+ {
++   struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
+    struct dri2_egl_surface *dri2_surf = dri2_egl_surface(surf);
+ 
++   /* Leave the trim list first: the trim thread walks it under trim_mtx,
++    * so once we are off it the thread can no longer touch this surface.
++    */
++   if (dri2_surf->trim_listed) {
++      mtx_lock(&dri2_dpy->trim_mtx);
++      list_del(&dri2_surf->trim_link);
++      dri2_surf->trim_listed = false;
++      mtx_unlock(&dri2_dpy->trim_mtx);
++   }
++
+    driDestroyDrawable(dri2_surf->dri_drawable);
+ 
+    if (dri2_surf->base.Type == EGL_PBUFFER_BIT) {
+@@ -989,6 +1018,7 @@ dri2_wl_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
+    }
+    wl_event_queue_destroy(dri2_surf->wl_queue);
+ 
++   mtx_destroy(&dri2_surf->trim_lock);
+    dri2_fini_surface(surf);
+    free(surf);
+ 
+@@ -1501,6 +1531,32 @@ back_bo_to_dri_buffer(struct dri2_egl_surface *dri2_surf, __DRIbuffer *buffer)
+  */
+ #define BUFFER_TRIM_AGE_HYSTERESIS 20
+ 
++/* A window surface that has not swapped for this long gives back every
++ * colour buffer the compositor has released, keeping only the one on screen.
++ * The next swap allocates a back buffer again, as after a resize.
++ */
++#define BUFFER_TRIM_IDLE_NS (3ull * 1000000000ull)
++
++/* While the compositor still holds a spare buffer, look again after 1, 2
++ * and 4 seconds, then leave the surface alone until it swaps again.
++ */
++#define BUFFER_TRIM_RETRY_NS 1000000000ll
++#define BUFFER_TRIM_MAX_RETRIES 3
++
++static void
++free_color_buffer(struct dri2_egl_display *dri2_dpy,
++                  struct dri2_egl_buffer *buffer)
++{
++   loader_wayland_buffer_destroy(&buffer->wayland_buffer);
++   dri2_destroy_image(buffer->dri_image);
++   if (dri2_dpy->fd_render_gpu != dri2_dpy->fd_display_gpu)
++      dri2_destroy_image(buffer->linear_copy);
++   buffer->wayland_buffer.buffer = NULL;
++   buffer->dri_image = NULL;
++   buffer->linear_copy = NULL;
++   buffer->age = 0;
++}
++
+ static int
+ update_buffers(struct dri2_egl_surface *dri2_surf,
+                struct mesa_trace_flow *flow)
+@@ -1539,17 +1595,8 @@ update_buffers(struct dri2_egl_surface *dri2_surf,
+    for (int i = 0; i < ARRAY_SIZE(dri2_surf->color_buffers); i++) {
+       if (!dri2_surf->color_buffers[i].locked &&
+           dri2_surf->color_buffers[i].wayland_buffer.buffer &&
+-          dri2_surf->color_buffers[i].age > BUFFER_TRIM_AGE_HYSTERESIS) {
+-         loader_wayland_buffer_destroy(&dri2_surf->color_buffers[i].wayland_buffer);
+-         dri2_destroy_image(dri2_surf->color_buffers[i].dri_image);
+-         if (dri2_dpy->fd_render_gpu != dri2_dpy->fd_display_gpu)
+-            dri2_destroy_image(
+-               dri2_surf->color_buffers[i].linear_copy);
+-         dri2_surf->color_buffers[i].wayland_buffer.buffer = NULL;
+-         dri2_surf->color_buffers[i].dri_image = NULL;
+-         dri2_surf->color_buffers[i].linear_copy = NULL;
+-         dri2_surf->color_buffers[i].age = 0;
+-      }
++          dri2_surf->color_buffers[i].age > BUFFER_TRIM_AGE_HYSTERESIS)
++         free_color_buffer(dri2_dpy, &dri2_surf->color_buffers[i]);
+    }
+ 
+    return 0;
+@@ -1567,6 +1614,124 @@ update_buffers_if_needed(struct dri2_egl_surface *dri2_surf,
+    return update_buffers(dri2_surf, flow);
+ }
+ 
++/* Gives back the colour buffers of a surface that stopped drawing. Only
++ * update_buffers() trims spare buffers, and it runs only when the client
++ * draws again, so a static surface (a wallpaper, an idle panel) would keep
++ * its spare and previous buffers for as long as it lives. Returns true
++ * when a spare is still held by the compositor, so it must be looked at
++ * again. Called with trim_lock held.
++ */
++static bool
++dri2_wl_trim_idle_buffers(struct dri2_egl_display *dri2_dpy,
++                          struct dri2_egl_surface *dri2_surf)
++{
++   /* Take in the releases the compositor has already sent. */
++   wl_display_dispatch_queue_pending(dri2_dpy->wl_dpy, dri2_surf->wl_queue);
++
++   bool held = false;
++
++   for (int i = 0; i < ARRAY_SIZE(dri2_surf->color_buffers); i++) {
++      struct dri2_egl_buffer *buffer = &dri2_surf->color_buffers[i];
++
++      if (buffer == dri2_surf->current || buffer == dri2_surf->back ||
++          !buffer->wayland_buffer.buffer)
++         continue;
++      if (buffer->locked) {
++         held = true;
++         continue;
++      }
++      free_color_buffer(dri2_dpy, buffer);
++   }
++
++   return held;
++}
++
++static int
++dri2_wl_trim_thread(void *data)
++{
++   struct dri2_egl_display *dri2_dpy = data;
++
++   u_thread_setname("egl-wl-trim");
++
++   mtx_lock(&dri2_dpy->trim_mtx);
++   while (!dri2_dpy->trim_stop) {
++      int64_t now = os_time_get_nano();
++      int64_t next = INT64_MAX;
++
++      list_for_each_entry(struct dri2_egl_surface, dri2_surf,
++                          &dri2_dpy->trim_surfaces, trim_link) {
++         if (!dri2_surf->trim_armed)
++            continue;
++         /* Never wait on a surface that is drawing: try again soon. */
++         if (mtx_trylock(&dri2_surf->trim_lock) != thrd_success) {
++            next = MIN2(next, now + 100000000ll);
++            continue;
++         }
++         int64_t due = dri2_surf->trim_last_swap + BUFFER_TRIM_IDLE_NS;
++         if (now >= due) {
++            if (dri2_wl_trim_idle_buffers(dri2_dpy, dri2_surf) &&
++                dri2_surf->trim_retries < BUFFER_TRIM_MAX_RETRIES) {
++               /* The compositor has not released a spare yet: look again
++                * after 1, 2 and 4 seconds. A spare it keeps longer than
++                * that waits for the next time the surface goes idle.
++                */
++               int64_t delay = BUFFER_TRIM_RETRY_NS << dri2_surf->trim_retries++;
++               dri2_surf->trim_last_swap =
++                  now + delay - (int64_t)BUFFER_TRIM_IDLE_NS;
++               next = MIN2(next, now + delay);
++            } else {
++               dri2_surf->trim_armed = false;
++            }
++         } else {
++            next = MIN2(next, due);
++         }
++         mtx_unlock(&dri2_surf->trim_lock);
++      }
++
++      if (next == INT64_MAX) {
++         u_cnd_monotonic_wait(&dri2_dpy->trim_cnd, &dri2_dpy->trim_mtx);
++      } else {
++         struct timespec ts;
++
++         timespec_from_nsec(&ts, next);
++         u_cnd_monotonic_timedwait(&dri2_dpy->trim_cnd, &dri2_dpy->trim_mtx,
++                                   &ts);
++      }
++   }
++   mtx_unlock(&dri2_dpy->trim_mtx);
++
++   return 0;
++}
++
++/* Called with the EGL display locked, so trim_started needs no lock. */
++static void
++dri2_wl_trim_register(struct dri2_egl_display *dri2_dpy,
++                      struct dri2_egl_surface *dri2_surf)
++{
++   if (!dri2_dpy->trim_started) {
++      if (mtx_init(&dri2_dpy->trim_mtx, mtx_plain) != thrd_success)
++         return;
++      if (u_cnd_monotonic_init(&dri2_dpy->trim_cnd) != thrd_success) {
++         mtx_destroy(&dri2_dpy->trim_mtx);
++         return;
++      }
++      list_inithead(&dri2_dpy->trim_surfaces);
++      dri2_dpy->trim_stop = false;
++      if (u_thread_create(&dri2_dpy->trim_thread, dri2_wl_trim_thread,
++                          dri2_dpy) != thrd_success) {
++         u_cnd_monotonic_destroy(&dri2_dpy->trim_cnd);
++         mtx_destroy(&dri2_dpy->trim_mtx);
++         return;
++      }
++      dri2_dpy->trim_started = true;
++   }
++
++   mtx_lock(&dri2_dpy->trim_mtx);
++   list_addtail(&dri2_surf->trim_link, &dri2_dpy->trim_surfaces);
++   dri2_surf->trim_listed = true;
++   mtx_unlock(&dri2_dpy->trim_mtx);
++}
++
+ static int
+ image_get_buffers(struct dri_drawable *driDrawable, unsigned int format,
+                   uint32_t *stamp, void *loaderPrivate, uint32_t buffer_mask,
+@@ -1589,11 +1754,15 @@ image_get_buffers(struct dri_drawable *driDrawable, unsigned int format,
+       return 1;
+    }
+ 
+-   if (update_buffers_if_needed(dri2_surf, &flow) < 0)
++   mtx_lock(&dri2_surf->trim_lock);
++   if (update_buffers_if_needed(dri2_surf, &flow) < 0) {
++      mtx_unlock(&dri2_surf->trim_lock);
+       return 0;
++   }
+ 
+    buffers->image_mask = __DRI_IMAGE_BUFFER_BACK;
+    buffers->back = dri2_surf->back->dri_image;
++   mtx_unlock(&dri2_surf->trim_lock);
+ 
+    return 1;
+ }
+@@ -1829,6 +1998,7 @@ dri2_wl_swap_buffers_with_damage(_EGLDisplay *disp, _EGLSurface *draw,
+    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
+    struct dri2_egl_surface *dri2_surf = dri2_egl_surface(draw);
+    struct mesa_trace_flow flow = { 0 };
++   EGLBoolean ret = EGL_TRUE;
+ 
+    if (!dri2_surf->wl_win)
+       return _eglError(EGL_BAD_NATIVE_WINDOW, "dri2_swap_buffers");
+@@ -1851,8 +2021,12 @@ dri2_wl_swap_buffers_with_damage(_EGLDisplay *disp, _EGLSurface *draw,
+    dri2_flush_drawable_for_swapbuffers(disp, draw);
+    dri_invalidate_drawable(dri2_surf->dri_drawable);
+ 
+-   if (dri2_surf->throttle_callback && throttle(dri2_dpy, dri2_surf) == -1)
+-      return -1;
++   mtx_lock(&dri2_surf->trim_lock);
++
++   if (dri2_surf->throttle_callback && throttle(dri2_dpy, dri2_surf) == -1) {
++      ret = -1;
++      goto out;
++   }
+ 
+    for (int i = 0; i < ARRAY_SIZE(dri2_surf->color_buffers); i++)
+       if (dri2_surf->color_buffers[i].age > 0)
+@@ -1860,8 +2034,10 @@ dri2_wl_swap_buffers_with_damage(_EGLDisplay *disp, _EGLSurface *draw,
+ 
+    /* Make sure we have a back buffer in case we're swapping without ever
+     * rendering. */
+-   if (update_buffers_if_needed(dri2_surf, &flow) < 0)
+-      return _eglError(EGL_BAD_ALLOC, "dri2_swap_buffers");
++   if (update_buffers_if_needed(dri2_surf, &flow) < 0) {
++      ret = _eglError(EGL_BAD_ALLOC, "dri2_swap_buffers");
++      goto out;
++   }
+ 
+    if (draw->SwapInterval > 0) {
+       dri2_surf->throttle_callback =
+@@ -1884,8 +2060,10 @@ dri2_wl_swap_buffers_with_damage(_EGLDisplay *disp, _EGLSurface *draw,
+          image = dri2_surf->current->dri_image;
+ 
+       buffer = create_wl_buffer(dri2_dpy, dri2_surf, image);
+-      if (buffer == NULL)
+-         return _eglError(EGL_BAD_ALLOC, "dri2_swap_buffers");
++      if (buffer == NULL) {
++         ret = _eglError(EGL_BAD_ALLOC, "dri2_swap_buffers");
++         goto out;
++      }
+       loader_wayland_wrap_buffer(&dri2_surf->current->wayland_buffer, buffer);
+ 
+       dri2_surf->current->wl_release = false;
+@@ -1945,7 +2123,18 @@ dri2_wl_swap_buffers_with_damage(_EGLDisplay *disp, _EGLSurface *draw,
+ 
+    wl_display_flush(dri2_dpy->wl_dpy);
+ 
+-   return EGL_TRUE;
++   dri2_surf->trim_last_swap = os_time_get_nano();
++   dri2_surf->trim_retries = 0;
++   if (dri2_surf->trim_listed && !dri2_surf->trim_armed) {
++      mtx_lock(&dri2_dpy->trim_mtx);
++      dri2_surf->trim_armed = true;
++      u_cnd_monotonic_signal(&dri2_dpy->trim_cnd);
++      mtx_unlock(&dri2_dpy->trim_mtx);
++   }
++
++out:
++   mtx_unlock(&dri2_surf->trim_lock);
++   return ret;
+ }
+ 
+ static EGLint
+@@ -1959,10 +2148,13 @@ dri2_wl_query_buffer_age(_EGLDisplay *disp, _EGLSurface *surface)
+    if (dri2_surf->base.Type == EGL_PBUFFER_BIT)
+       return 0;
+ 
++   mtx_lock(&dri2_surf->trim_lock);
+    if (update_buffers_if_needed(dri2_surf, &flow) < 0) {
++      mtx_unlock(&dri2_surf->trim_lock);
+       _eglError(EGL_BAD_ALLOC, "dri2_query_buffer_age");
+       return -1;
+    }
++   mtx_unlock(&dri2_surf->trim_lock);
+ 
+    return dri2_surf->back->age;
+ }
+@@ -3306,6 +3498,16 @@ dri2_initialize_wayland(_EGLDisplay *disp)
+ void
+ dri2_teardown_wayland(struct dri2_egl_display *dri2_dpy)
+ {
++   if (dri2_dpy->trim_started) {
++      mtx_lock(&dri2_dpy->trim_mtx);
++      dri2_dpy->trim_stop = true;
++      u_cnd_monotonic_signal(&dri2_dpy->trim_cnd);
++      mtx_unlock(&dri2_dpy->trim_mtx);
++      thrd_join(dri2_dpy->trim_thread, NULL);
++      u_cnd_monotonic_destroy(&dri2_dpy->trim_cnd);
++      mtx_destroy(&dri2_dpy->trim_mtx);
++      dri2_dpy->trim_started = false;
++   }
+    dri2_wl_formats_fini(&dri2_dpy->formats);
+    if (dri2_dpy->wp_presentation)
+       wp_presentation_destroy(dri2_dpy->wp_presentation);
+-- 
+2.43.0
+
