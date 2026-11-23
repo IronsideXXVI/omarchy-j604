@@ -1,0 +1,209 @@
+From 3f97b94ddd518ee6809f0e127f535836a5ea5dce Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 08:19:15 +0000
+Subject: [PATCH 21/24] omarchy-mac: give Apple Silicon power profiles the CPU
+ frequency floor
+
+omarchy-power-profiles-daemon keeps Apple Silicon on schedutil in every profile, as it does Snapdragon X, and the energy-aware scheduler starts short-lived threads on the efficiency cores, so single-thread work loses most of the performance cores' speed. The runtime's omarchy-powerprofiles-floor (omacom/omarchy#18745) already fixes this on Snapdragon with a utilisation clamp floor that follows the profile; its unit is installed by a Qualcomm hardware leaf. Apple Silicon's own setup ships here, so the package carries the unit and its setup instead of a leaf under the runtime's install/hardware/apple/, which holds Intel Mac quirks (this replaces omacom/omarchy#18946).
+
+Measured on a 14" M4 MacBook Pro (J604), AC, profile performance, one-thread STREAM-style copy and triad: no floor 47.3 and 53.5 GB/s, floor 768 67.8 and 85.5 GB/s, floor 1024 69.0 and 94.5 GB/s. Idle system power went from 4.99 W to 5.04 W with the 768 floor.
+
+omarchy-mac-powerprofiles-floor.service runs the runtime's command, with the same sandbox as the runtime's unit, a platform ExecCondition like every other package service, and a ConditionPathExists on the command so a runtime without it skips the unit instead of failing it. The unit name differs from the runtime's so neither shadows the other. omarchy-mac-setup-system enables it once and records that with a marker written only after the enable succeeds, so a failed enable is retried on the next run and a later disable or mask stays the administrator's choice; on a runtime without the command it defers. On a live system it starts the unit with --no-block, which also covers an image's first boot, whose start jobs are already queued.
+
+powerprofiles-floor-test stages the package and covers the deferral, the enable, the retry after a failed enable, a disable and a mask that survive, another platform, and systemd-analyze verify. The README and the manual's hardware page say what the floor does and how a Mac installed earlier gets it.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ mac-manual/content/12-hardware.md             |  2 +-
+ omarchy-mac/README.md                         |  2 +
+ omarchy-mac/bin/omarchy-mac-setup-system      | 20 +++++
+ omarchy-mac/test/powerprofiles-floor-test.sh  | 88 +++++++++++++++++++
+ .../omarchy-mac-powerprofiles-floor.service   | 20 +++++
+ 5 files changed, 131 insertions(+), 1 deletion(-)
+ create mode 100644 omarchy-mac/test/powerprofiles-floor-test.sh
+ create mode 100644 omarchy-mac/vendor/systemd/system/omarchy-mac-powerprofiles-floor.service
+
+diff --git a/mac-manual/content/12-hardware.md b/mac-manual/content/12-hardware.md
+index 9f0c783..89ccc3b 100644
+--- a/mac-manual/content/12-hardware.md
++++ b/mac-manual/content/12-hardware.md
+@@ -59,7 +59,7 @@ This is the status on the reference Macs. <span class="status ok">works</span> i
+ | Wi-Fi, Bluetooth | <span class="status ok">works</span> | NetworkManager with the iwd backend. Wi-Fi on BCM4378 and BCM4387 chips recovers after resume. Wi-Fi 6E Macs join on 2.4 and 5 GHz: a 6 GHz join passes no traffic with the current firmware. On the MacBook Neo's MT7932, NetworkManager rather than iwd reconnects, so a connect the firmware rejects is retried. |
+ | Speakers, microphone, headphones | <span class="status ok">works</span> | Asahi's DSP chain with `speakersafetyd` protecting the speakers. The microphone array is mapped, and a headset microphone takes priority when plugged in. If the microphone is still missing 30 s after the session starts, or when an update changes its DSP chain, one restart of the audio session is attempted to bring it back without a reboot. |
+ | Suspend and resume | <span class="status ok">works</span> | Open the lid or press the power button to wake the Mac. A key press or trackpad click does not wake it: the kernel drivers for the built-in keyboard and trackpad do not register as a wakeup source on M1 or M2 MacBooks. Closed in a bag, it stays asleep. |
+-| Battery, lid, power profiles | <span class="status ok">works</span> | |
++| Battery, lid, power profiles | <span class="status ok">works</span> | The power profile also sets a CPU frequency floor for your programs (none in power-saver, higher in balanced and performance), so short bursts of work run on the performance cores at speed instead of waiting for the clock to ramp. It is turned on by setup; on a Mac installed before it, run `sudo omarchy-mac-setup-system` once. `sudo systemctl disable --now omarchy-mac-powerprofiles-floor` turns it off for good. |
+ | External displays | <span class="status ok">works</span> | HDMI on models that have it, USB4 and DisplayPort alt-mode through the Aurora kernel. Five displays on the M2 Max. A third and fourth display rely on an aquamarine fix carried until Hyprland releases it. |
+ | Variable refresh rate, camera (ISP), always-on processor | <span class="status ok">works</span> | Aurora kernel |
+ | Hardware video decode | <span class="status wip">in progress</span> | VA-API decoding of H.264, HEVC Main and Main10, and VP9 8 and 10-bit, tested on a 13" M1 MacBook Pro; 8-bit H.264, HEVC and VP9 also on a 16" M2 Max with the Aurora kernel. mpv uses it by default for H.264, HEVC and VP9, at about a quarter of the CPU of software decoding at 1080p; `hwdec=no` in `~/.config/mpv/mpv.conf` turns it off. To change the system default, edit `/etc/mpv/mpv.conf` rather than deleting it, since a deleted copy comes back at the next boot. An unedited copy of the earlier default, which lacks `gpu-sw=yes`, is the one exception: setup replaces it with the current default, which lets mpv play on Macs whose GPU has no driver yet. An upgrade alone does not run setup, so on a Mac that already had the earlier default, run `sudo omarchy-mac-setup-system`, or rerun hardware setup, to apply it. Browser acceleration is still open. No hardware encoding. |
+diff --git a/omarchy-mac/README.md b/omarchy-mac/README.md
+index af4bf76..3295c7a 100644
+--- a/omarchy-mac/README.md
++++ b/omarchy-mac/README.md
+@@ -61,6 +61,8 @@ A set limit is saved as `CHARGE_CONTROL_END_THRESHOLD=` in `/etc/udev/macsmc-bat
+ 
+ asahi-scripts' path unit starts `macsmc-battery-charge-control-end-threshold.service`, which saves the limit, on every SMC battery event, so plugging in the charger or resuming can start it more than five times in ten seconds and leave it `failed` with `start-limit-hit`. Since it only rewrites the same line, the package's drop-in removes its start limit; the drop-in goes once AsahiLinux/asahi-scripts#78 fixes the unit upstream.
+ 
++Apple Silicon runs `schedutil` in every power profile, and the energy-aware scheduler starts short-lived threads on the efficiency cores, so single-thread work loses most of the performance cores' speed, as it did on Snapdragon X. `omarchy-mac-powerprofiles-floor.service` runs the runtime's `omarchy-powerprofiles-floor`, which gives every logged-in user's processes a utilisation clamp floor that follows the power profile (768 in balanced, 1024 in performance, none in power-saver); idle cores still drop to their lowest clock. On a 14" M4 MacBook Pro, on AC in performance, a one-thread STREAM-style copy went from 47.3 to 67.8 GB/s and triad from 53.5 to 85.5 GB/s with a 768 floor, for about 0.05 W more at idle. `omarchy-mac-setup-system` enables the unit once, with a marker, so a later disable or mask stays; on a runtime without the command it defers until the next setup, and the unit's condition keeps it from failing if the command goes. An upgrade alone does not run setup: on a Mac installed earlier, run `sudo omarchy-mac-setup-system`, or rerun hardware setup.
++
+ ## Keyboard function-key mode
+ 
+ The built-in keyboard binds to `hid_apple`, whose `fnmode` decides what the top row sends. Apple Silicon uses the kernel's default, `fnmode=3` (auto): Apple keyboards send mute, volume, brightness and media first with F1-F12 behind Fn, as in macOS, and the non-Apple boards `hid_apple` recognises (Keychron and similar) keep F-keys first. The package ships no `hid_apple` option and the desktop install leaf writes none on Apple Silicon, so any option the owner sets wins, whatever its file name. For F-keys first on the Mac, write `options hid_apple fnmode=2` to `/etc/modprobe.d/hid_apple.conf` and rebuild the boot image (`sudo mkinitcpio -P`, or `sudo omarchy-mac-boot-update` on a Limine Mac): `hid_apple` loads from the initramfs with the options it was built with.
+diff --git a/omarchy-mac/bin/omarchy-mac-setup-system b/omarchy-mac/bin/omarchy-mac-setup-system
+index 25d6f50..20b185f 100755
+--- a/omarchy-mac/bin/omarchy-mac-setup-system
++++ b/omarchy-mac/bin/omarchy-mac-setup-system
+@@ -94,6 +94,22 @@ if [[ ! -f $safety_marker ]]; then
+   fi
+ fi
+ 
++# schedutil ramps too slowly for bursty work on Apple Silicon; the runtime's
++# omarchy-powerprofiles-floor gives users' processes a floor that follows the
++# profile. Enabled once, so a later disable or mask stays the administrator's.
++floor=omarchy-mac-powerprofiles-floor.service
++floor_marker="$root/var/lib/omarchy-mac/powerprofiles-floor-configured"
++if [[ ! -f $floor_marker ]]; then
++  if [[ ! -x $root/usr/bin/omarchy-powerprofiles-floor ]]; then
++    echo "Deferring the CPU frequency floor: this Omarchy has no omarchy-powerprofiles-floor"
++  elif [[ $(systemctl --root="${root:-/}" is-enabled "$floor" 2>/dev/null) == masked* ]]; then
++    echo "Preserving masked CPU frequency floor unit: $floor"
++  else
++    systemctl --root="${root:-/}" enable "$floor"
++    install -Dm644 /dev/null "$floor_marker"
++  fi
++fi
++
+ if [[ -z $root && -d /run/systemd/system ]]; then
+   systemctl daemon-reload
+   # cat exits nonzero for an intentional mask; report it without failing setup.
+@@ -105,6 +121,10 @@ if [[ -z $root && -d /run/systemd/system ]]; then
+     systemctl reset-failed "$safety" || true
+     systemctl start "$safety" || echo "Warning: speakersafetyd did not start; the speakers stay muted." >&2
+   fi
++  # An image's first boot has queued its start jobs already, so start it there too.
++  if systemctl is-enabled --quiet "$floor" && ! systemctl is-active --quiet "$floor"; then
++    systemctl start --no-block "$floor" || echo "Warning: the CPU frequency floor did not start." >&2
++  fi
+ fi
+ 
+ # The Electron launchers and Steam's FEX launcher are the live machine's, so a
+diff --git a/omarchy-mac/test/powerprofiles-floor-test.sh b/omarchy-mac/test/powerprofiles-floor-test.sh
+new file mode 100644
+index 0000000..ae5de87
+--- /dev/null
++++ b/omarchy-mac/test/powerprofiles-floor-test.sh
+@@ -0,0 +1,88 @@
++#!/bin/bash
++set -euo pipefail
++source "$(dirname "$0")/base-test.sh"
++# This base-test.sh predates the helper (it came with a later main commit): define it here.
++declare -F stub_systemd_boot_targets >/dev/null ||
++stub_systemd_boot_targets() {
++  local units=$1/usr/lib/systemd/system
++  mkdir -p "$units"
++  printf '[Unit]\nDescription=Fixture system initialization\nDefaultDependencies=no\n' >"$units/sysinit.target"
++}
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++mkdir -p "$work/bin"
++printf '#!/bin/bash\necho "${PLATFORM:-aarch64-apple}"\n' >"$work/bin/omarchy-hw-platform"
++stub_apple_predicate "$work/bin"
++printf '#!/bin/bash\necho 14e4:4433\n' >"$work/bin/lspci"
++chmod +x "$work/bin/"*
++
++root="$work/root"
++"$ROOT"/install "$root"
++setup="$root/usr/bin/omarchy-mac-setup-system"
++unit=omarchy-mac-powerprofiles-floor.service
++wants="$root/etc/systemd/system/multi-user.target.wants/$unit"
++marker="$root/var/lib/omarchy-mac/powerprofiles-floor-configured"
++# Arch disables every unit no preset names.
++mkdir -p "$root/usr/lib/systemd/system-preset"
++echo 'disable *' >"$root/usr/lib/systemd/system-preset/99-default.preset"
++floor() { PATH="$work/bin:$PATH" "$setup" "$root" 2>&1; }
++
++[[ -f $root/usr/lib/systemd/system/$unit ]] || fail 'the package ships the floor unit'
++grep -qx 'ExecStart=/usr/bin/omarchy-powerprofiles-floor monitor' "$root/usr/lib/systemd/system/$unit" ||
++  fail 'the unit runs the runtime command'
++grep -qx 'ConditionPathExists=/usr/bin/omarchy-powerprofiles-floor' "$root/usr/lib/systemd/system/$unit" ||
++  fail 'the unit is skipped, not failed, without the runtime command'
++pass 'the package ships a floor unit that runs the runtime command'
++
++output=$(floor)
++[[ ! -e $wants && ! -e $marker ]] || fail 'setup waits for a runtime with omarchy-powerprofiles-floor'
++[[ $output == *"Deferring the CPU frequency floor"* ]] || fail 'setup says it defers the floor' "$output"
++pass 'setup defers the floor on a runtime without the command'
++
++install -Dm755 /dev/null "$root/usr/bin/omarchy-powerprofiles-floor"
++floor >/dev/null
++[[ $(readlink "$wants") == "/usr/lib/systemd/system/$unit" && -f $marker ]] || fail 'setup enables the floor and records it'
++pass 'setup enables the floor once the runtime has the command'
++
++# A failed enable leaves no marker, so the next run enables it.
++rm "$wants" "$marker"
++printf '#!/bin/bash\nfor argument in "$@"; do [[ $argument == "enable" ]] && exit 1; done\nexec /usr/bin/systemctl "$@"\n' >"$work/bin/systemctl"
++chmod +x "$work/bin/systemctl"
++floor >/dev/null && fail 'a failed enable fails setup'
++[[ ! -e $marker ]] || fail 'a failed enable records nothing'
++rm "$work/bin/systemctl"
++floor >/dev/null
++[[ $(readlink "$wants") == "/usr/lib/systemd/system/$unit" && -f $marker ]] || fail 'a rerun after a failed enable enables the floor'
++pass 'a rerun after a failed enable enables the floor'
++
++systemctl --root="$root" disable "$unit" >/dev/null 2>&1
++floor >/dev/null
++[[ ! -e $wants ]] || fail 'an explicit disable after setup survives'
++pass 'an explicit disable after setup survives'
++
++rm "$marker"
++ln -s /dev/null "$root/etc/systemd/system/$unit"
++floor >/dev/null || fail 'a masked floor unit does not fail setup'
++[[ $(readlink "$root/etc/systemd/system/$unit") == /dev/null && ! -e $wants && ! -e $marker ]] || fail 'a masked floor unit stays masked'
++pass 'a masked floor unit stays masked'
++
++other="$work/other"
++"$ROOT"/install "$other"
++install -Dm755 /dev/null "$other/usr/bin/omarchy-powerprofiles-floor"
++PLATFORM=aarch64-qualcomm PATH="$work/bin:$PATH" "$other/usr/bin/omarchy-mac-setup-system" "$other" >/dev/null 2>&1
++[[ ! -e $other/etc/systemd/system/multi-user.target.wants/$unit && ! -e $other/var/lib/omarchy-mac/powerprofiles-floor-configured ]] ||
++  fail 'another platform gets no Apple floor'
++pass 'another platform gets no Apple floor'
++
++# verify warns about a setting systemd ignores but still exits 0, so any output
++# fails, unless a trivial unit fails too, as in emulated containers.
++stub_systemd_boot_targets "$other"
++install -Dm755 /dev/null "$other/usr/bin/omarchy-hw-apple-silicon"
++printf '[Service]\nExecStart=sh -c true\n' >"$other/usr/lib/systemd/system/probe.service"
++if verify=$(systemd-analyze --root="$other" verify --man=no "/usr/lib/systemd/system/$unit" 2>&1) && [[ -z $verify ]]; then
++  pass 'systemd accepts the floor unit without warnings'
++elif probe=$(systemd-analyze --root="$other" verify --man=no /usr/lib/systemd/system/probe.service 2>&1) && [[ -z $probe ]]; then
++  fail 'systemd accepts the floor unit without warnings' "$verify"
++else
++  pass 'systemd-analyze cannot verify units here; floor unit verification not run'
++fi
+diff --git a/omarchy-mac/vendor/systemd/system/omarchy-mac-powerprofiles-floor.service b/omarchy-mac/vendor/systemd/system/omarchy-mac-powerprofiles-floor.service
+new file mode 100644
+index 0000000..c2769e7
+--- /dev/null
++++ b/omarchy-mac/vendor/systemd/system/omarchy-mac-powerprofiles-floor.service
+@@ -0,0 +1,20 @@
++[Unit]
++Description=Omarchy CPU frequency floor for the power profile on Apple Silicon
++After=power-profiles-daemon.service systemd-logind.service
++ConditionPathExists=/usr/bin/omarchy-powerprofiles-floor
++
++[Service]
++ExecCondition=/usr/bin/omarchy-hw-apple-silicon
++ExecStart=/usr/bin/omarchy-powerprofiles-floor monitor
++ExecStopPost=/usr/bin/omarchy-powerprofiles-floor release
++Restart=on-failure
++RestartSec=2
++# Setting another process's utilisation clamp needs CAP_SYS_NICE, and only that
++CapabilityBoundingSet=CAP_SYS_NICE
++NoNewPrivileges=yes
++PrivateTmp=yes
++ProtectHome=yes
++ProtectSystem=strict
++
++[Install]
++WantedBy=multi-user.target

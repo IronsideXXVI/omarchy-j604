@@ -1,0 +1,582 @@
+From 5c54a590d79ee0cc9ef6c3bf7b35928f17aef02e Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 15:04:43 +0000
+Subject: [PATCH 20/24] Carry the keyboard light loop under its own name
+
+Omarchy's Mac checks (omarchy-m-test input.ambient-light and
+input.auto-keyboard-light) look for omarchy-brightness-keyboard-auto and
+its user unit, the team's loop from omarchy-mac. The extraction left it
+out, so the keyboard followed the room only through
+omarchy-mac-brightness-auto and both checks failed by name.
+
+Carry Scott Jones's helper and unit under their names, with two
+changes: a Mac whose brightness table has KBD_CURVE follows that curve
+(the MacBook Pro 14" M4: macOS's keyboard curve, 24 % dark, 69 % at
+70-160 lux, never off), and an off that stock omarchy-brightness-keyboard
+recorded (the lock's blank, idle) is not taken as the user's choice,
+while keys stepped to off stay off until the room changes enough. The
+keyboard half leaves omarchy-mac-brightness-auto, so one loop drives the
+keyboard.
+---
+ omarchy-mac/ORIGINS.md                        |   1 +
+ .../bin/omarchy-brightness-keyboard-auto      | 290 ++++++++++++++++++
+ omarchy-mac/bin/omarchy-mac-brightness-auto   |  31 --
+ .../omarchy-mac/brightness/apple,j604.conf    |   3 +-
+ omarchy-mac/test/brightness-auto-test.sh      |  18 +-
+ .../test/brightness-keyboard-auto-test.sh     |  77 +++++
+ .../omarchy-brightness-keyboard-auto.service  |   1 +
+ .../omarchy-brightness-keyboard-auto.service  |  16 +
+ 8 files changed, 387 insertions(+), 50 deletions(-)
+ create mode 100755 omarchy-mac/bin/omarchy-brightness-keyboard-auto
+ create mode 100644 omarchy-mac/test/brightness-keyboard-auto-test.sh
+ create mode 120000 omarchy-mac/vendor/systemd/user/graphical-session.target.wants/omarchy-brightness-keyboard-auto.service
+ create mode 100644 omarchy-mac/vendor/systemd/user/omarchy-brightness-keyboard-auto.service
+
+diff --git a/omarchy-mac/ORIGINS.md b/omarchy-mac/ORIGINS.md
+index aec48d9..2e107f0 100644
+--- a/omarchy-mac/ORIGINS.md
++++ b/omarchy-mac/ORIGINS.md
+@@ -20,3 +20,4 @@ The network backend default follows Marcelo Alcantara's Apple Silicon integratio
+ - Display hints (`displays.conf`): Marcelo Alcantara's Apple Silicon backlight choice (`9cf789df6`, Detect Apple Silicon and its panel, trackpad and battery) and DDC skip (`108caf56a`, Skip DDC on Mac monitors without a DDC channel), moved from the runtime's `omarchy-hw-display` and `omarchy-brightness-display` into directives the runtime reads from the platform root.
+ - fprintd access to Touch ID: Chris Kearney, iconidentify/aurora-linux `fdd47ca26e` (`tools/aurora-sep/aurora-touchid/fprintd-aurora.conf`). The wait for `/dev/sep-bio` is retained, moved into its own unit that `fprintd` starts after; the allowance itself now comes from `libfprint-git` (omacom/omarchy-pkgs#1342). Ordering after the activation unit and waiting only where the Secure Enclave driver has a device are new.
+ - Touch ID readiness: the four `diag` attributes and their values follow the Secure Enclave driver's ABI document, omacom/linux-aurora `Documentation/ABI/testing/sysfs-driver-apple-sep` (Ryan Murray, Chris Kearney). Recording them in a status file for the runtime's detector is new.
++- Keyboard backlight from the ambient light sensor (`omarchy-brightness-keyboard-auto`, its user unit and the lux-to-level line): Scott Jones, omacom/omarchy-mac quattro-upstream `8abd0da30f` (Drive keyboard backlight from the ambient light sensor) to `686a5e9a68`, under its original helper and unit names. Changed here: a model curve (`KBD_CURVE` in the brightness table) replaces the line where a Mac has one, and a blank that stock `omarchy-brightness-keyboard off` recorded (lock, idle) is not a choice while keys stepped to off are.
+diff --git a/omarchy-mac/bin/omarchy-brightness-keyboard-auto b/omarchy-mac/bin/omarchy-brightness-keyboard-auto
+new file mode 100755
+index 0000000..bbabf09
+--- /dev/null
++++ b/omarchy-mac/bin/omarchy-brightness-keyboard-auto
+@@ -0,0 +1,290 @@
++#!/bin/bash
++
++# omarchy:summary=Drive keyboard backlight from the ambient light sensor
++# omarchy:args=[--once|--available|--map-lux N]
++# omarchy:examples=omarchy brightness keyboard auto --once | omarchy brightness keyboard auto --map-lux 12
++
++# Inverse of display auto-brightness: dark rooms need the keys lit, bright
++# rooms do not. Dedicated keyboard-brightness keys (or any other write to the
++# LED) pause auto until ambient light moves enough that the old choice no
++# longer fits. Keys left off by something other than those keys (lock
++# blanking, a restored 0, a 1% leftover) are not a choice: auto resumes.
++
++set -euo pipefail
++
++# Off Apple Silicon there is nothing to drive (and --available says so).
++if ! omarchy-hw-apple-silicon 2>/dev/null; then
++  [[ " $* " == *" --available "* ]] && exit 1
++  exit 0
++fi
++
++POLL_SECONDS=5
++DARK_LUX=8
++BRIGHT_LUX=180
++DEADBAND_PERCENT=4
++OVERRIDE_LUX_DELTA=20
++OVERRIDE_LUX_RATIO=40
++# 2/255 is 1% and invisible, so that band counts as off.
++EFFECTIVELY_OFF_PERCENT=2
++MANUAL_LEVEL_FILE="${XDG_RUNTIME_DIR:-/tmp}/omarchy-brightness-keyboard-manual"
++
++# A Mac with a curve of its own in its brightness table (KBD_CURVE, "lux:fraction ...", the share of the
++# LED's maximum, macOS's own keyboard curve) follows that instead of the dark/bright line below.
++model_curve() {
++  local compatible=${OMARCHY_MAC_DT_COMPATIBLE:-/proc/device-tree/compatible} model file
++  [[ -r $compatible ]] || return 0
++  model=$(tr '\0' '\n' <"$compatible" | head -n1) || true
++  file="${OMARCHY_MAC_BRIGHTNESS_DIR:-/usr/share/omarchy-mac/brightness}/$model.conf"
++  [[ -n $model && -r $file ]] || return 0
++  sed -n 's/^KBD_CURVE="\([^"]*\)".*/\1/p' "$file" | head -n1
++}
++KBD_CURVE=$(model_curve)
++
++once=0
++available_only=0
++map_lux=""
++
++while (($#)); do
++  case "$1" in
++    --once)
++      once=1
++      shift
++      ;;
++    --available)
++      available_only=1
++      shift
++      ;;
++    --map-lux)
++      if [[ -z ${2:-} ]]; then
++        echo "Usage: omarchy-brightness-keyboard-auto --map-lux N" >&2
++        exit 1
++      fi
++      map_lux=$2
++      shift 2
++      ;;
++    -h|--help)
++      echo "Usage: omarchy-brightness-keyboard-auto [--once|--available|--map-lux N]"
++      exit 0
++      ;;
++    *)
++      echo "Unknown option: $1" >&2
++      echo "Usage: omarchy-brightness-keyboard-auto [--once|--available|--map-lux N]" >&2
++      exit 1
++      ;;
++  esac
++done
++
++lux_to_percent() {
++  local lux=$1
++  (( lux < 0 )) && lux=0
++
++  if [[ -n ${KBD_CURVE:-} ]]; then
++    # Between points a straight line, held flat past the ends; a share above zero stays at least 1 %.
++    awk -v lux="$lux" -v curve="$KBD_CURVE" 'BEGIN {
++      n = split(curve, p, " ")
++      for (i = 1; i <= n; i++) { split(p[i], kv, ":"); x[i] = kv[1]; y[i] = kv[2] }
++      if (lux <= x[1]) f = y[1]
++      else if (lux >= x[n]) f = y[n]
++      else for (i = 2; i <= n; i++) if (lux <= x[i]) { f = y[i-1] + (y[i] - y[i-1]) * (lux - x[i-1]) / (x[i] - x[i-1]); break }
++      pc = int(f * 100 + 0.5); if (f > 0 && pc < 1) pc = 1; print pc
++    }'
++    return 0
++  fi
++
++  if (( lux <= DARK_LUX )); then
++    echo 100
++  elif (( lux >= BRIGHT_LUX )); then
++    echo 0
++  else
++    echo $(( (100 * (BRIGHT_LUX - lux)) / (BRIGHT_LUX - DARK_LUX) ))
++  fi
++}
++
++if [[ -n $map_lux ]]; then
++  [[ $map_lux =~ ^[0-9]+$ ]] || {
++    echo "lux must be a non-negative integer" >&2
++    exit 1
++  }
++  lux_to_percent "$map_lux"
++  exit 0
++fi
++
++find_als() {
++  local d name
++  local iio_devices_dir=${OMARCHY_IIO_DEVICES_DIR:-/sys/bus/iio/devices}
++
++  # Prefer a device that names itself as ALS. Apple AOP exposes the lid-angle
++  # sensor (aop-sensors-las) next to the illuminance sensor (aop-sensors-als);
++  # walking sysfs in device-number order would otherwise pick whichever one
++  # happens to publish an illuminance channel first.
++  for d in "$iio_devices_dir"/iio:device*; do
++    [[ -r $d/name ]] || continue
++    name=$(<"$d/name")
++    [[ $name == *als* ]] || continue
++    if [[ -r $d/in_illuminance_input ]]; then
++      printf '%s\n' "$d/in_illuminance_input"
++      return 0
++    fi
++    if [[ -r $d/in_illuminance_raw ]]; then
++      printf '%s\n' "$d/in_illuminance_raw"
++      return 0
++    fi
++  done
++
++  for d in "$iio_devices_dir"/iio:device*; do
++    if [[ -r $d/in_illuminance_input ]]; then
++      printf '%s\n' "$d/in_illuminance_input"
++      return 0
++    fi
++    if [[ -r $d/in_illuminance_raw ]]; then
++      printf '%s\n' "$d/in_illuminance_raw"
++      return 0
++    fi
++  done
++  return 1
++}
++
++find_kbd() {
++  local candidate
++  local leds_dir=${OMARCHY_LEDS_DIR:-/sys/class/leds}
++
++  for candidate in "$leds_dir"/*kbd_backlight*; do
++    if [[ -e $candidate/brightness && -r $candidate/max_brightness ]]; then
++      printf '%s\n' "$candidate"
++      return 0
++    fi
++  done
++  return 1
++}
++
++als_path=$(find_als || true)
++kbd_path=$(find_kbd || true)
++
++if [[ $available_only == 1 ]]; then
++  if [[ -n $als_path && -n $kbd_path ]]; then
++    exit 0
++  else
++    exit 1
++  fi
++fi
++
++if [[ -z $als_path || -z $kbd_path ]]; then
++  exit 0
++fi
++
++device=$(basename "$kbd_path")
++max=$(<"$kbd_path/max_brightness")
++[[ $max =~ ^[1-9][0-9]*$ ]] || exit 0
++
++last_set=""
++paused=0
++pause_lux=0
++
++session_locked() {
++  omarchy-hyprland-session-locked >/dev/null 2>&1
++}
++
++lid_closed() {
++  omarchy-hw-laptop-closed >/dev/null 2>&1
++}
++
++read_lux() {
++  local raw
++  raw=$(<"$als_path") || return 1
++  raw=${raw%%.*}
++  [[ $raw =~ ^[0-9]+$ ]] || return 1
++  printf '%s\n' "$raw"
++}
++
++apply_percent() {
++  local percent=$1
++  local target current delta
++
++  (( percent < 0 )) && percent=0
++  (( percent > 100 )) && percent=100
++  target=$(( max * percent / 100 ))
++
++  current=$(brightnessctl -d "$device" get) || return 0
++  delta=$(( current - target ))
++  (( delta < 0 )) && delta=$(( -delta ))
++  if (( delta * 100 < max * DEADBAND_PERCENT )); then
++    last_set=$current
++    return 0
++  fi
++
++  brightnessctl -d "$device" set "$target" >/dev/null
++  # Auto has overridden any level set by hand, so that record is stale.
++  rm -f "$MANUAL_LEVEL_FILE"
++  last_set=$(brightnessctl -d "$device" get || echo "$target")
++}
++
++# Off by accident rather than by the keyboard-brightness keys, which record
++# every level they set.
++left_off() {
++  local current=$1 manual=""
++
++  (( current * 100 <= max * EFFECTIVELY_OFF_PERCENT )) || return 1
++  # Stock omarchy-brightness-keyboard keeps the level from before an "off" (the lock's blank, idle)
++  # until its "restore": a blank with that record was not the user's choice.
++  [[ -s "${XDG_RUNTIME_DIR:-/tmp}/omarchy-brightness-keyboard-$device" ]] && return 0
++  # A keyboard-brightness command that records every level it sets (MANUAL_LEVEL_FILE) says which
++  # off was set by hand; stock steps to off with the keys leave no record, and that off is a choice.
++  [[ -r $MANUAL_LEVEL_FILE ]] || return 1
++  manual=$(<"$MANUAL_LEVEL_FILE")
++  [[ $manual != "$current" ]]
++}
++
++tick() {
++  local lux current delta threshold
++
++  lux=$(read_lux) || return 0
++
++  if session_locked || lid_closed; then
++    return 0
++  fi
++
++  current=$(brightnessctl -d "$device" get) || return 0
++
++  if [[ -n $last_set && $current != "$last_set" ]]; then
++    last_set=$current
++    if left_off "$current"; then
++      paused=0
++    else
++      paused=1
++      pause_lux=$lux
++      return 0
++    fi
++  fi
++
++  if (( paused )); then
++    delta=$(( lux - pause_lux ))
++    (( delta < 0 )) && delta=$(( -delta ))
++    threshold=$OVERRIDE_LUX_DELTA
++    if (( pause_lux * OVERRIDE_LUX_RATIO / 100 > threshold )); then
++      threshold=$(( pause_lux * OVERRIDE_LUX_RATIO / 100 ))
++    fi
++    if (( delta < threshold )); then
++      return 0
++    fi
++    paused=0
++  fi
++
++  apply_percent "$(lux_to_percent "$lux")"
++}
++
++tick
++
++if (( once )); then
++  exit 0
++fi
++
++while true; do
++  sleep "$POLL_SECONDS"
++  als_path=$(find_als || true)
++  kbd_path=$(find_kbd || true)
++  [[ -n $als_path && -n $kbd_path ]] || continue
++  device=$(basename "$kbd_path")
++  max=$(<"$kbd_path/max_brightness")
++  [[ $max =~ ^[1-9][0-9]*$ ]] || continue
++  tick
++done
+diff --git a/omarchy-mac/bin/omarchy-mac-brightness-auto b/omarchy-mac/bin/omarchy-mac-brightness-auto
+index a76ba43..77dae6c 100755
+--- a/omarchy-mac/bin/omarchy-mac-brightness-auto
++++ b/omarchy-mac/bin/omarchy-mac-brightness-auto
+@@ -9,8 +9,6 @@
+ # curve, in /usr/share/omarchy-mac/brightness named after the device tree's first compatible)
+ # and moves the backlight there over the ramp macOS uses. A brightness the user sets by hand
+ # becomes the new level for the room: the curve is scaled by it, as macOS scales its curve.
+-# With KBD_LED and KBD_CURVE in the table the keyboard backlight follows the room the same way
+-# (macOS's keyboard curve); a keyboard light that is off (by hand, idle or a dark panel) stays off.
+ # Runs only on a Mac with a table and a light sensor, and steps aside while Omarchy's own
+ # omarchy-brightness-auto service runs.
+ 
+@@ -21,14 +19,11 @@ omarchy-hw-apple-silicon 2>/dev/null || exit 0
+ table_dir=${OMARCHY_MAC_BRIGHTNESS_DIR:-/usr/share/omarchy-mac/brightness}
+ iio_root=${OMARCHY_MAC_IIO_ROOT:-/sys/bus/iio/devices}
+ backlight_root=${OMARCHY_MAC_BACKLIGHT_ROOT:-/sys/class/backlight}
+-leds_root=${OMARCHY_MAC_LEDS_ROOT:-/sys/class/leds}
+ compatible_file=${OMARCHY_MAC_DT_COMPATIBLE:-/proc/device-tree/compatible}
+ config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-mac
+ off_file=$config_dir/brightness-auto-off
+ scale_file=$config_dir/brightness-auto-scale
+ state_file=${XDG_RUNTIME_DIR:-/tmp}/omarchy-mac-brightness-auto.last
+-kbd_state=${XDG_RUNTIME_DIR:-/tmp}/omarchy-mac-brightness-auto.kbd
+-kbd_scale_file=$config_dir/brightness-auto-kbd-scale
+ once=${OMARCHY_MAC_BRIGHTNESS_ONCE:-}
+ step_sleep=${OMARCHY_MAC_BRIGHTNESS_STEP_SLEEP:-}
+ 
+@@ -85,31 +80,6 @@ curve_at() {
+   }'
+ }
+ 
+-# The keyboard backlight for a room at $1 lux: the curve's share of the LED's maximum, times the user's scale.
+-kbd_auto() {
+-  local dir=$leds_root/${KBD_LED:-} cur kmax last scale frac want
+-  [[ -n ${KBD_LED:-} && -n ${KBD_CURVE:-} && -r $dir/brightness && -r $dir/max_brightness ]] || return 0
+-  cur=$(<"$dir/brightness"); kmax=$(<"$dir/max_brightness")
+-  (( cur > 0 && kmax > 0 )) || return 0
+-  frac=$(curve_at "$1" "$KBD_CURVE")
+-  last=$(cat "$kbd_state" 2>/dev/null || echo "")
+-  scale=$(cat "$kbd_scale_file" 2>/dev/null || echo 1)
+-  if [[ -n $last ]] && (( cur > last + 1 || cur < last - 1 )); then
+-    scale=$(awk -v c="$cur" -v m="$kmax" -v f="$frac" 'BEGIN {
+-      if (f < 0.001) f = 0.001; s = (c / m) / f; if (s < 0.1) s = 0.1; if (s > 10) s = 10; printf "%.4f\n", s }')
+-    mkdir -p "$config_dir" && echo "$scale" >"$kbd_scale_file"
+-    echo "$cur" >"$kbd_state"
+-    return 0
+-  fi
+-  want=$(awk -v f="$frac" -v s="$scale" -v m="$kmax" 'BEGIN { w = int(f * s * m + 0.5); if (w < 1) w = 1; if (w > m) w = m; print w }')
+-  if awk -v w="$want" -v c="$cur" -v p="$HYSTERESIS_PERCENT" 'BEGIN {
+-       d = w - c; if (d < 0) d = -d; l = c * p / 100; if (l < 2) l = 2; exit !(d > l) }'; then
+-    brightnessctl -q -d "$KBD_LED" set "$want" >/dev/null 2>&1 && echo "$want" >"$kbd_state"
+-  elif [[ -z $last ]]; then
+-    echo "$cur" >"$kbd_state"
+-  fi
+-}
+-
+ nits_to_raw() { awk -v n="$1" -v m="$2" -v hi="$MAX_NITS" 'BEGIN { r = int(n * m / hi + 0.5); if (r < 1) r = 1; if (r > m) r = m; print r }'; }
+ 
+ status() {
+@@ -160,7 +130,6 @@ while :; do
+           echo "$raw" >"$state_file"
+         fi
+       fi
+-      kbd_auto "$smoothed"
+     fi
+   fi
+   [[ -n $once ]] && exit 0
+diff --git a/omarchy-mac/share/omarchy-mac/brightness/apple,j604.conf b/omarchy-mac/share/omarchy-mac/brightness/apple,j604.conf
+index a6babc6..e7af2e2 100644
+--- a/omarchy-mac/share/omarchy-mac/brightness/apple,j604.conf
++++ b/omarchy-mac/share/omarchy-mac/brightness/apple,j604.conf
+@@ -19,10 +19,9 @@ SMOOTHING=0.25            # TO-VERIFY
+ HYSTERESIS_PERCENT=5      # TO-VERIFY: macOS LuxThreshold 78.5
+ # Seconds between sensor reads (the sensor reports every 0.2 s).
+ POLL_SECONDS=1
+-# The keyboard backlight follows the room as macOS's keyboard curve does (CoreBrightness
++# The keyboard backlight (omarchy-brightness-keyboard-auto reads KBD_CURVE) follows the room as macOS's keyboard curve does (CoreBrightness
+ # KeyboardBacklightAdjustedBrightnessCurve, MEASURED): lux 0 / 70 / 160 / 300 against 3.665 / 10.17 / 10.17 /
+ # 0.147 nits. The kernel drives the LED on macOS's own scale (max_brightness = macOS's top level, 35 % PWM duty;
+ # 0..max on macOS's duty line, MEASURED), where macOS's level is (nits - 0.10) / 14.56 (MEASURED at 1.01 / 3.74 /
+ # 7.38 / 11.02 / 14.66 nits), so the points are 0.2448 / 0.6916 / 0.6916 / 0.0032 of max_brightness.
+-KBD_LED=kbd_backlight
+ KBD_CURVE="0:0.2448 70:0.6916 160:0.6916 300:0.0032"
+diff --git a/omarchy-mac/test/brightness-auto-test.sh b/omarchy-mac/test/brightness-auto-test.sh
+index e697dee..a237c4d 100755
+--- a/omarchy-mac/test/brightness-auto-test.sh
++++ b/omarchy-mac/test/brightness-auto-test.sh
+@@ -41,8 +41,6 @@ kb() { cat "$t/leds/kbd_backlight/brightness"; }
+   fail "shipped table"
+ # 150 lux is macOS's 223.1 nits, reached in 20 steps (the 1.94 s ramp).
+ run 150; [[ $(b) == 223 ]] || fail "150 lux -> 223 nits: $(b)"
+-# The keyboard: 150 lux sits on macOS's flat 70-160 lux part, 0.6916 of 255 = 176.
+-[[ $(kb) == 176 ]] || fail "keyboard at 150 lux -> 176: $(kb)"
+ [[ $(wc -l <"$t/writes") == 20 ]] || fail "ramp steps: $(wc -l <"$t/writes")"
+ # A dark room: macOS's 139.44 nits.
+ run 0; [[ $(b) == 139 ]] || fail "0 lux -> 139 nits: $(b)"
+@@ -52,13 +50,8 @@ run 75; [[ $(b) == 181 ]] || fail "75 lux -> 181 nits: $(b)"
+ : >"$t/writes"; run 77; [[ ! -s $t/writes ]] || fail "jitter moved the panel: $(b)"
+ # Bright light: the line carried on to the panel's 600 nits, and held there.
+ run 1000; [[ $(b) == 600 ]] || fail "1000 lux -> 600 nits: $(b)"
+-# macOS nearly turns the keyboard off in bright light (0.0032 of 255, under 1), never to 0.
+-[[ $(kb) == 1 ]] || fail "keyboard at 1000 lux -> 1: $(kb)"
+-# Between points: 230 lux -> 0.6916 + (0.0032 - 0.6916) * 70 / 140 = 0.3474 -> 89.
+-run 230; [[ $(kb) == 89 ]] || fail "keyboard at 230 lux -> 89: $(kb)"
+ # Covered sensor and back: down to the dark level, then back up.
+ run 0; [[ $(b) == 139 ]] || fail "covered: $(b)"
+-[[ $(kb) == 62 ]] || fail "keyboard in the dark -> 0.2448 of 255 = 62: $(kb)"
+ run 75; [[ $(b) == 181 ]] || fail "uncovered: $(b)"
+ # The user sets 362 nits at 75 lux (twice the curve): the curve doubles for every room.
+ echo 362 >"$t/bl/apple-panel-bl/brightness"; run 75
+@@ -70,17 +63,8 @@ run 150 off >/dev/null; run 0; [[ $(b) == 446 ]] || fail "off stays off: $(b)"
+ run 0 on >/dev/null; run 0; [[ $(b) == 139 ]] || fail "on resumes: $(b)"
+ # Omarchy's own automatic brightness running: step aside.
+ touch "$t/stock"; run 150; [[ $(b) == 139 ]] || fail "stock service wins: $(b)"; rm "$t/stock"
+-# The keyboard set by hand to 31 in the dark (half the curve): it halves for every room.
+-echo 31 >"$t/leds/kbd_backlight/brightness"; run 0
+-[[ $(cat "$t/config/omarchy-mac/brightness-auto-kbd-scale") == 0.4966 ]] || fail "kbd scale: $(cat "$t/config/omarchy-mac/brightness-auto-kbd-scale")"
+-run 75; [[ $(kb) == 88 ]] || fail "scaled keyboard at 75 lux -> 88: $(kb)"
+-rm "$t/config/omarchy-mac/brightness-auto-kbd-scale"
+-# A keyboard light turned off (by hand or idle) stays off.
+-echo 0 >"$t/leds/kbd_backlight/brightness"; run 1000; run 0; [[ $(kb) == 0 ]] || fail "keyboard off stays off: $(kb)"
+-echo 100 >"$t/leds/kbd_backlight/brightness"; rm -f "$t/run/omarchy-mac-brightness-auto.kbd"
+-# A panel that is off (0) is not woken, nor is the keyboard moved.
++# A panel that is off (0) is not woken.
+ echo 0 >"$t/bl/apple-panel-bl/brightness"; run 150; [[ $(b) == 0 ]] || fail "panel off: $(b)"
+-[[ $(kb) == 100 ]] || fail "keyboard moved with the panel off: $(kb)"
+ # A Mac without a table, or without a sensor: nothing happens.
+ echo 100 >"$t/bl/apple-panel-bl/brightness"; rm -f "$t/run/"*
+ printf 'apple,j313\0' >"$t/compatible"; run 150; [[ $(b) == 100 ]] || fail "no table: $(b)"
+diff --git a/omarchy-mac/test/brightness-keyboard-auto-test.sh b/omarchy-mac/test/brightness-keyboard-auto-test.sh
+new file mode 100644
+index 0000000..923d069
+--- /dev/null
++++ b/omarchy-mac/test/brightness-keyboard-auto-test.sh
+@@ -0,0 +1,77 @@
++#!/bin/bash
++set -euo pipefail
++source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
++
++auto="$ROOT/bin/omarchy-brightness-keyboard-auto"
++[[ -x $auto ]] || fail "omarchy-brightness-keyboard-auto is executable"
++grep -F 'Drive keyboard backlight from the ambient light sensor' "$auto" >/dev/null || fail "command metadata"
++pass "the helper and its user unit carry the stock names omarchy-m-test looks for"
++[[ -f $ROOT/vendor/systemd/user/omarchy-brightness-keyboard-auto.service ]] || fail "user unit"
++[[ -L $ROOT/vendor/systemd/user/graphical-session.target.wants/omarchy-brightness-keyboard-auto.service ]] || fail "unit enabled"
++! grep -q -E 'kbd_auto|KBD_LED' "$ROOT/bin/omarchy-mac-brightness-auto" || fail "brightness-auto still drives the keyboard"
++
++t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
++mkdir -p "$t/bin"; printf '#!/bin/bash\nexit 0\n' >"$t/bin/omarchy-hw-apple-silicon"; chmod +x "$t/bin/omarchy-hw-apple-silicon"
++export PATH="$t/bin:$PATH"
++map() { OMARCHY_MAC_DT_COMPATIBLE="$t/compatible" OMARCHY_MAC_BRIGHTNESS_DIR="$ROOT/share/omarchy-mac/brightness" "$auto" --map-lux "$1"; }
++# The J604's table: macOS's keyboard curve (0.2448 / 0.6916 / 0.6916 / 0.0032 at 0 / 70 / 160 / 300 lux), never 0.
++printf 'apple,j604\0apple,t8132\0' >"$t/compatible"
++[[ $(map 0) == 24 && $(map 150) == 69 && $(map 230) == 35 && $(map 1000) == 1 ]] ||
++  fail "J604 curve" "$(map 0) $(map 150) $(map 230) $(map 1000)"
++# A Mac without a table keeps the team's dark/bright line.
++printf 'apple,j313\0' >"$t/compatible"
++[[ $(map 0) == 100 && $(map 94) == 50 && $(map 400) == 0 ]] || fail "default line" "$(map 0) $(map 94) $(map 400)"
++"$auto" --map-lux >/dev/null 2>&1 && fail "map-lux without a value should fail"
++pass "lux maps to the model's keyboard curve, or the team's line"
++
++mkdir -p "$t/iio/iio:device0" "$t/leds/kbd_backlight" "$t/bin" "$t/run"
++printf 'aop-sensors-als\n' >"$t/iio/iio:device0/name"; echo 0 >"$t/iio/iio:device0/in_illuminance_input"
++echo 255 >"$t/leds/kbd_backlight/max_brightness"; echo 0 >"$t/leds/kbd_backlight/brightness"
++OMARCHY_IIO_DEVICES_DIR="$t/iio" OMARCHY_LEDS_DIR="$t/leds" "$auto" --available || fail "--available with sensor and LED"
++OMARCHY_IIO_DEVICES_DIR="$t/iio" OMARCHY_LEDS_DIR="$t/nothing" "$auto" --available && fail "--available without an LED"
++pass "--available answers for the sensor and the LED"
++
++# The loop's tick against stand-ins for brightnessctl and stock omarchy-brightness-keyboard (off keeps the
++# level in $XDG_RUNTIME_DIR/omarchy-brightness-keyboard-<device> until restore; the keys step by a tenth).
++cat >"$t/bin/brightnessctl" <<'SH'
++#!/bin/bash
++[[ $1 == -d ]] && { d=$2; shift 2; }
++led="$OMARCHY_LEDS_DIR/$d"
++case $1 in get) cat "$led/brightness" ;; max) cat "$led/max_brightness" ;; set) echo "$2" >"$led/brightness" ;; esac
++SH
++cat >"$t/bin/stock-keyboard" <<'SH'
++#!/bin/bash
++led="$OMARCHY_LEDS_DIR/kbd_backlight"; saved="$XDG_RUNTIME_DIR/omarchy-brightness-keyboard-kbd_backlight"
++case $1 in
++  off) [[ -s $saved ]] || cat "$led/brightness" >"$saved"; echo 0 >"$led/brightness" ;;
++  restore) [[ -f $saved ]] && { cat "$saved" >"$led/brightness"; rm -f "$saved"; } ;;
++  down) v=$(( $(<"$led/brightness") - 25 )); (( v < 0 )) && v=0; echo $v >"$led/brightness" ;;
++esac
++SH
++printf '#!/bin/bash\n[[ ${LOCKED:-0} == 1 ]]\n' >"$t/bin/omarchy-hyprland-session-locked"
++printf '#!/bin/bash\nexit 1\n' >"$t/bin/omarchy-hw-laptop-closed"
++chmod +x "$t/bin/"*
++export PATH="$t/bin:$PATH" OMARCHY_LEDS_DIR="$t/leds" XDG_RUNTIME_DIR="$t/run"
++printf 'apple,j604\0' >"$t/compatible"
++export OMARCHY_MAC_DT_COMPATIBLE="$t/compatible" OMARCHY_MAC_BRIGHTNESS_DIR="$ROOT/share/omarchy-mac/brightness"
++eval "$(grep -E '^(DARK_LUX|BRIGHT_LUX|DEADBAND_PERCENT|OVERRIDE_LUX_DELTA|OVERRIDE_LUX_RATIO|EFFECTIVELY_OFF_PERCENT|MANUAL_LEVEL_FILE)=' "$auto")"
++for fn in model_curve lux_to_percent read_lux session_locked lid_closed apply_percent left_off tick; do
++  eval "$(sed -n "/^$fn()/,/^}/p" "$auto")"
++done
++KBD_CURVE=$(model_curve)
++als_path="$t/iio/iio:device0/in_illuminance_input"; device=kbd_backlight; max=255; last_set=""; paused=0; pause_lux=0
++led() { cat "$t/leds/kbd_backlight/brightness"; }
++lux() { echo "$1" >"$als_path"; }
++
++tick; (( $(led) == 61 )) || fail "a dark room lights the keys at macOS's 24 %" "got $(led)"
++# omarchy-m-test's lock-style blank: stock off, the lock, then the room still wants the keys.
++stock-keyboard off; LOCKED=1 tick; (( $(led) == 0 )) || fail "locked: the keys stay blank" "got $(led)"
++tick; (( $(led) == 61 )) || fail "keys blanked by the lock light up again" "got $(led)"
++stock-keyboard restore; tick; (( $(led) == 61 )) || fail "restore leaves the room's level" "got $(led)"
++pass "keys blanked by the lock screen light up again in a room that wants them"
++# Off with the keys (stock leaves no record): a choice, kept until the room changes a lot.
++for _ in 1 2 3; do stock-keyboard down; tick; done
++(( $(led) == 0 )) || fail "the keys step to off" "got $(led)"
++tick; tick; (( $(led) == 0 )) || fail "keys turned off by hand stay off" "got $(led)"
++lux 150; tick; (( $(led) == 175 )) || fail "a big change in the room resumes (69 % of 255)" "got $(led)"
++pass "keys turned off by hand stay off until the room changes enough"
+diff --git a/omarchy-mac/vendor/systemd/user/graphical-session.target.wants/omarchy-brightness-keyboard-auto.service b/omarchy-mac/vendor/systemd/user/graphical-session.target.wants/omarchy-brightness-keyboard-auto.service
+new file mode 120000
+index 0000000..caa859d
+--- /dev/null
++++ b/omarchy-mac/vendor/systemd/user/graphical-session.target.wants/omarchy-brightness-keyboard-auto.service
+@@ -0,0 +1 @@
++../omarchy-brightness-keyboard-auto.service
+\ No newline at end of file
+diff --git a/omarchy-mac/vendor/systemd/user/omarchy-brightness-keyboard-auto.service b/omarchy-mac/vendor/systemd/user/omarchy-brightness-keyboard-auto.service
+new file mode 100644
+index 0000000..8fe70d3
+--- /dev/null
++++ b/omarchy-mac/vendor/systemd/user/omarchy-brightness-keyboard-auto.service
+@@ -0,0 +1,16 @@
++[Unit]
++Description=Omarchy keyboard backlight from ambient light
++After=graphical-session.target
++PartOf=graphical-session.target
++ConditionEnvironment=WAYLAND_DISPLAY
++
++[Service]
++Type=simple
++ExecCondition=/usr/bin/omarchy-hw-apple-silicon
++ExecCondition=/usr/bin/omarchy-brightness-keyboard-auto --available
++ExecStart=/usr/bin/omarchy-brightness-keyboard-auto
++Restart=on-failure
++RestartSec=5
++
++[Install]
++WantedBy=graphical-session.target

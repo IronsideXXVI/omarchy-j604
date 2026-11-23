@@ -1,0 +1,276 @@
+From 31e06d86cb7a9e55562def6d72a09fd81254fbbd Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 02:52:27 +0000
+Subject: [PATCH 13/24] Match the built-in display's white to the room light
+ (True Tone)
+
+macOS moves the display's white point with the colour temperature of the
+room on Macs whose ambient light sensor reports colour. On Linux the
+MacBook Pro 14" M4's sensor (aop-als) already exposes the illuminance and
+a colour temperature channel, and Hyprland's CTM protocol, through the
+hyprsunset Omarchy runs for night light, can move the white.
+
+omarchy-mac-truetone reads both channels and moves hyprsunset's
+temperature toward a white between the panel's own and the room's, in
+steps, from a per-model table under /usr/share/omarchy-mac/truetone. It
+writes only above the point Omarchy reads as night light (6000 K) and
+never while night light holds a lower temperature, so the two never
+fight and the night light indicator stays right. A Mac with no table, or
+no colour channel, is left alone. "omarchy-mac-truetone off" gives the
+panel its own white back; "on" resumes. A user unit runs it with the
+graphical session.
+---
+ omarchy-mac/bin/omarchy-mac-truetone          | 110 ++++++++++++++++++
+ .../omarchy-mac/truetone/apple,j604.conf      |  23 ++++
+ omarchy-mac/test/truetone-test.sh             |  62 ++++++++++
+ .../omarchy-mac-truetone.service              |   1 +
+ .../systemd/user/omarchy-mac-truetone.service |  15 +++
+ 5 files changed, 211 insertions(+)
+ create mode 100755 omarchy-mac/bin/omarchy-mac-truetone
+ create mode 100644 omarchy-mac/share/omarchy-mac/truetone/apple,j604.conf
+ create mode 100644 omarchy-mac/test/truetone-test.sh
+ create mode 120000 omarchy-mac/vendor/systemd/user/graphical-session.target.wants/omarchy-mac-truetone.service
+ create mode 100644 omarchy-mac/vendor/systemd/user/omarchy-mac-truetone.service
+
+diff --git a/omarchy-mac/bin/omarchy-mac-truetone b/omarchy-mac/bin/omarchy-mac-truetone
+new file mode 100755
+index 0000000..fcf506b
+--- /dev/null
++++ b/omarchy-mac/bin/omarchy-mac-truetone
+@@ -0,0 +1,110 @@
++#!/bin/bash
++
++# omarchy:summary=Match the built-in display's white to the room light (True Tone)
++# omarchy:args=[on|off|status]
++# omarchy:examples=omarchy mac truetone status | omarchy mac truetone off | omarchy mac truetone on
++
++# The ambient light sensor's colour temperature moves the display's white through hyprsunset, the
++# same tool and Hyprland CTM protocol Omarchy's night light uses. True Tone writes only within its
++# model table's range (6000-6500 K on the J604), above the point Omarchy reads as night light, and
++# never while night light is on: a temperature it did not set below that point is night light's.
++# Runs only on a Mac with a table in /usr/share/omarchy-mac/truetone (named after the device tree's
++# first compatible) and an ambient light sensor with a colour temperature channel.
++
++set -u
++
++omarchy-hw-apple-silicon 2>/dev/null || exit 0
++
++table_dir=${OMARCHY_MAC_TRUETONE_DIR:-/usr/share/omarchy-mac/truetone}
++iio_root=${OMARCHY_MAC_IIO_ROOT:-/sys/bus/iio/devices}
++compatible_file=${OMARCHY_MAC_DT_COMPATIBLE:-/proc/device-tree/compatible}
++config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-mac
++off_file=$config_dir/truetone-off
++once=${OMARCHY_MAC_TRUETONE_ONCE:-}
++
++model() { tr '\0' '\n' <"$compatible_file" 2>/dev/null | head -n1; }
++
++load_table() {
++  local file
++  file="$table_dir/$(model).conf"
++  [[ -r $file ]] || return 1
++  # shellcheck disable=SC1090
++  source "$file"
++}
++
++sensor() {
++  local dir
++  for dir in "$iio_root"/iio:device*; do
++    [[ -r $dir/in_colortemp_input && -r $dir/in_illuminance_input ]] && { echo "$dir"; return 0; }
++  done
++  return 1
++}
++
++current_kelvin() { hyprctl hyprsunset temperature 2>/dev/null | grep -oE '[0-9]+' | head -n1; }
++set_kelvin() { hyprctl hyprsunset temperature "$1" >/dev/null 2>&1; }
++
++# The white for a room at $1 K: STRENGTH of the way from the panel's white to the room's colour in
++# CIE xy (the room on the Planckian locus, Kim et al.), back to kelvin (McCamy), in range.
++target_kelvin() {
++  awk -v T="$1" -v rx="$REFERENCE_X" -v ry="$REFERENCE_Y" -v s="$STRENGTH" -v lo="$MIN_KELVIN" -v hi="$MAX_KELVIN" 'BEGIN {
++    if (T < 1667) T = 1667
++    if (T > 25000) T = 25000
++    if (T <= 4000) x = -0.2661239e9 / T^3 - 0.2343589e6 / T^2 + 0.8776956e3 / T + 0.179910
++    else x = -3.0258469e9 / T^3 + 2.1070379e6 / T^2 + 0.2226347e3 / T + 0.240390
++    if (T <= 2222) y = -1.1063814 * x^3 - 1.34811020 * x^2 + 2.18555832 * x - 0.20219683
++    else if (T <= 4000) y = -0.9549476 * x^3 - 1.37418593 * x^2 + 2.09137015 * x - 0.16748867
++    else y = 3.0817580 * x^3 - 5.87338670 * x^2 + 3.75112997 * x - 0.37001483
++    wx = rx + s * (x - rx); wy = ry + s * (y - ry)
++    n = (wx - 0.3320) / (0.1858 - wy)
++    t = 449 * n^3 + 3525 * n^2 + 6823.3 * n + 5520.33
++    if (t < lo) t = lo
++    if (t > hi) t = hi
++    printf "%d\n", t + 0.5
++  }'
++}
++
++status() {
++  local enabled=true
++  [[ -e $off_file ]] && enabled=false
++  echo "True Tone: $([[ $enabled == true ]] && echo on || echo off), white $(current_kelvin || echo '?') K"
++}
++
++case ${1:-run} in
++  status) status; exit 0 ;;
++  off)
++    mkdir -p "$config_dir" && touch "$off_file"
++    # Give the panel its own white back unless night light holds it.
++    k=$(current_kelvin); [[ -n $k ]] && load_table && (( k >= MIN_KELVIN )) && set_kelvin "$REFERENCE_KELVIN"
++    status; exit 0 ;;
++  on) rm -f "$off_file"; status; exit 0 ;;
++  run) ;;
++  *) echo "Usage: omarchy-mac-truetone [on|off|status]" >&2; exit 2 ;;
++esac
++
++load_table || exit 0
++dir=$(sensor) || exit 0
++
++last_set=""
++step_per_poll=$(awk -v r="$RAMP_SECONDS" -v p="$POLL_SECONDS" -v lo="$MIN_KELVIN" -v hi="$MAX_KELVIN" \
++  'BEGIN { s = (hi - lo) * p / r; if (s < 1) s = 1; printf "%d\n", s + 0.5 }')
++
++while :; do
++  if [[ ! -e $off_file ]]; then
++    lux=$(<"$dir/in_illuminance_input") 2>/dev/null || lux=""
++    room=$(<"$dir/in_colortemp_input") 2>/dev/null || room=""
++    current=$(current_kelvin)
++    if [[ -n $current && -n $lux && -n $room ]]; then
++      if (( current < MIN_KELVIN )) && [[ $current != "$last_set" ]]; then
++        last_set=""   # night light is on: it owns the white
++      elif awk -v l="$lux" -v m="$MIN_LUX" -v r="$room" 'BEGIN { exit !(l >= m && r > 0) }'; then
++        target=$(target_kelvin "${room%.*}")
++        next=$current
++        if (( target > current )); then next=$(( current + step_per_poll )); (( next > target )) && next=$target; fi
++        if (( target < current )); then next=$(( current - step_per_poll )); (( next < target )) && next=$target; fi
++        if (( next != current )); then set_kelvin "$next" && last_set=$next; fi
++      fi
++    fi
++  fi
++  [[ -n $once ]] && exit 0
++  sleep "$POLL_SECONDS"
++done
+diff --git a/omarchy-mac/share/omarchy-mac/truetone/apple,j604.conf b/omarchy-mac/share/omarchy-mac/truetone/apple,j604.conf
+new file mode 100644
+index 0000000..39af385
+--- /dev/null
++++ b/omarchy-mac/share/omarchy-mac/truetone/apple,j604.conf
+@@ -0,0 +1,23 @@
++# True Tone for the MacBook Pro 14" M4 (J604), read by omarchy-mac-truetone.
++# The display's white point follows the colour temperature of the room, as macOS does on this panel:
++# macOS moves the white STRENGTH of the way from the panel's white toward the room's colour in CIE xy.
++# Its own numbers on this Mac (CoreBrightness status): ColorAdaptationStrength 0.2, and in a warm room
++# at night a white of x 0.3382, y 0.3517 (about 5270 K); 0.2 of the way toward a 3000 K room is 5288 K.
++
++# The panel's own white (no adaptation): D65, in CIE xy and kelvin.
++REFERENCE_X=0.3127
++REFERENCE_Y=0.3290
++REFERENCE_KELVIN=6500
++# The lowest white True Tone moves to. Night light (omarchy-toggle-nightlight) owns everything below
++# 6000 K, and the shell reads a temperature below that as night light on, so True Tone stays above it
++# (macOS itself goes to about 5100-5300 K in a 2700-3200 K room).
++MIN_KELVIN=6000
++MAX_KELVIN=6500
++# Fraction of the way from the panel's white to the room's colour (ColorAdaptationStrength).
++STRENGTH=0.2
++# Below this illuminance the reading's colour is not trusted and the white holds where it is.
++MIN_LUX=5               # TO-VERIFY
++# Seconds for a full move between MIN_KELVIN and MAX_KELVIN (macOS's PCCRampTime is 2 s).
++RAMP_SECONDS=2
++# Seconds between sensor reads (the sensor reports every 0.2 s).
++POLL_SECONDS=1
+diff --git a/omarchy-mac/test/truetone-test.sh b/omarchy-mac/test/truetone-test.sh
+new file mode 100644
+index 0000000..ecd198a
+--- /dev/null
++++ b/omarchy-mac/test/truetone-test.sh
+@@ -0,0 +1,62 @@
++#!/bin/bash
++set -euo pipefail
++root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
++t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
++fail() { echo "truetone-test: $*" >&2; exit 1; }
++
++mkdir -p "$t/bin" "$t/iio/iio:device0" "$t/config"
++printf 'apple,j604\0apple,t8132\0apple,arm-platform\0' >"$t/compatible"
++echo 6500 >"$t/kelvin"
++cat >"$t/bin/hyprctl" <<EOF
++#!/bin/bash
++[[ \$1 == hyprsunset && \$2 == temperature ]] || exit 1
++if [[ -n \${3:-} ]]; then echo "\$3" >"$t/kelvin"; echo ok; else cat "$t/kelvin"; fi
++EOF
++chmod +x "$t/bin/hyprctl"
++printf '#!/bin/bash\nexit 0\n' >"$t/bin/omarchy-hw-apple-silicon"; chmod +x "$t/bin/omarchy-hw-apple-silicon"
++
++run() { # lux kelvin-of-room
++  echo "$1" >"$t/iio/iio:device0/in_illuminance_input"
++  echo "$2" >"$t/iio/iio:device0/in_colortemp_input"
++  PATH="$t/bin:$PATH" HOME="$t" XDG_CONFIG_HOME="$t/config" OMARCHY_MAC_TRUETONE_ONCE=1 \
++    OMARCHY_MAC_TRUETONE_DIR="${TT_DIR:-$root/share/omarchy-mac/truetone}" OMARCHY_MAC_IIO_ROOT="$t/iio" \
++    OMARCHY_MAC_DT_COMPATIBLE="$t/compatible" bash "$root/bin/omarchy-mac-truetone" "${@:3}"
++}
++k() { cat "$t/kelvin"; }
++
++# The xy model without the range (MIN/MAX opened): a 3000 K room -> 5288 K, beside macOS's own
++# 5269 K white in a warm room at night.
++sed -e 's/^MIN_KELVIN=.*/MIN_KELVIN=1000/' -e 's/^MAX_KELVIN=.*/MAX_KELVIN=20000/' -e 's/^RAMP_SECONDS=.*/RAMP_SECONDS=0.01/' \
++  "$root/share/omarchy-mac/truetone/apple,j604.conf" >"$t/open.conf"
++mkdir -p "$t/open"; cp "$t/open.conf" "$t/open/apple,j604.conf"
++TT_DIR="$t/open" run 200 3000; [[ $(k) == 5288 ]] || fail "xy model, 3000 K room -> 5288 K: $(k)"
++echo 6500 >"$t/kelvin"
++# A warm room moves the white down one ramp step per poll (500 K over 2 s, 1 s polls = 250 K).
++run 120.5 3200.0; [[ $(k) == 6250 ]] || fail "first step in a warm room: $(k)"
++run 120.5 3200.0; run 120.5 3200.0
++[[ $(k) == 6000 ]] || fail "a warm room settles at the floor, 6000 K: $(k)"
++# A daylight room brings it back, never above the panel's white.
++for _ in 1 2 3; do run 300 9000; done
++[[ $(k) == 6500 ]] || fail "daylight returns to 6500 K: $(k)"
++# A middle room: 0.2 of the way from D65 toward 5700 K in xy = 6331 K.
++for _ in 1 2; do run 200 5700; done
++[[ $(k) == 6331 ]] || fail "5700 K room -> 6331 K: $(k)"
++# Too dark to trust the colour: hold.
++run 1 2000; [[ $(k) == 6331 ]] || fail "dark room holds: $(k)"
++# Night light on (4000 K, not set by True Tone): untouched.
++echo 4000 >"$t/kelvin"; run 200 9000; [[ $(k) == 4000 ]] || fail "night light wins: $(k)"
++# Night light off (6500 K): True Tone resumes.
++echo 6500 >"$t/kelvin"; run 200 3000; [[ $(k) == 6250 ]] || fail "resumes after night light: $(k)"
++# Off: the panel's own white, and no further moves; on again resumes.
++run 200 3000 off >/dev/null; [[ $(k) == 6500 ]] || fail "off restores 6500 K: $(k)"
++run 200 3000; [[ $(k) == 6500 ]] || fail "off stays off: $(k)"
++run 200 3000 on >/dev/null; run 200 3000; [[ $(k) == 6250 ]] || fail "on resumes: $(k)"
++# A Mac without a table, or without a colour channel: nothing happens.
++printf 'apple,j313\0' >"$t/compatible"; echo 6500 >"$t/kelvin"; run 200 3000; [[ $(k) == 6500 ]] || fail "no table: $(k)"
++printf 'apple,j604\0' >"$t/compatible"; rm "$t/iio/iio:device0/in_colortemp_input"
++echo 200 >"$t/iio/iio:device0/in_illuminance_input"
++PATH="$t/bin:$PATH" HOME="$t" XDG_CONFIG_HOME="$t/config" OMARCHY_MAC_TRUETONE_ONCE=1 \
++  OMARCHY_MAC_TRUETONE_DIR="$root/share/omarchy-mac/truetone" OMARCHY_MAC_IIO_ROOT="$t/iio" \
++  OMARCHY_MAC_DT_COMPATIBLE="$t/compatible" bash "$root/bin/omarchy-mac-truetone"
++[[ $(k) == 6500 ]] || fail "no colour channel: $(k)"
++echo "truetone-test: ok"
+diff --git a/omarchy-mac/vendor/systemd/user/graphical-session.target.wants/omarchy-mac-truetone.service b/omarchy-mac/vendor/systemd/user/graphical-session.target.wants/omarchy-mac-truetone.service
+new file mode 120000
+index 0000000..6e8910e
+--- /dev/null
++++ b/omarchy-mac/vendor/systemd/user/graphical-session.target.wants/omarchy-mac-truetone.service
+@@ -0,0 +1 @@
++../omarchy-mac-truetone.service
+\ No newline at end of file
+diff --git a/omarchy-mac/vendor/systemd/user/omarchy-mac-truetone.service b/omarchy-mac/vendor/systemd/user/omarchy-mac-truetone.service
+new file mode 100644
+index 0000000..a297eb4
+--- /dev/null
++++ b/omarchy-mac/vendor/systemd/user/omarchy-mac-truetone.service
+@@ -0,0 +1,15 @@
++[Unit]
++Description=Match the built-in display's white to the room light (True Tone)
++# hyprsunset holds Hyprland's CTM protocol; Omarchy starts it with the session.
++After=graphical-session.target
++PartOf=graphical-session.target
++
++[Service]
++Type=simple
++ExecCondition=/usr/bin/omarchy-hw-apple-silicon
++ExecStart=/usr/bin/omarchy-mac-truetone
++Restart=on-failure
++RestartSec=10
++
++[Install]
++WantedBy=graphical-session.target

@@ -1,0 +1,490 @@
+From 870b0541bf06c02f9c134545e7ec6bb3464cfb88 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 13:04:39 +0000
+Subject: [PATCH 18/24] Send True Tone to the panel as macOS does, beside the
+ night light
+
+macOS's True Tone on the MacBook Pro 14" M4 is a full 3x3 colour matrix
+sent to the panel once per frame over an eased 1.9 s ramp, and it adds up
+with Night Shift. omarchy-mac-truetone moved hyprsunset's temperature
+instead: a diagonal only, nothing at all until hyprsunset was running
+(Omarchy starts it with the night light, not at login), and it had to
+stay above 6000 K so the shell would not read it as night light.
+
+The display driver now holds a panel white-point adaptation beside the
+compositor's colour matrix and sends their product (panel_adaptation).
+True Tone writes there from a system service, so the night light keeps
+hyprsunset and Hyprland's CTM to itself and the two add up: adaptation
+x night light, as on macOS. The white still goes 0.2 of the way from
+the panel's white to the room's colour; the matrix for it is a von
+Kries adaptation fitted to macOS's own matrices on this panel (every
+coefficient within 0.003 of macOS's at its whites), and each move runs
+macOS's per-frame curve (58 % of the move left at 0.5 s, 13 % at 1 s,
+done at 1.93 s). "omarchy-mac-truetone off" gives the panel its own white
+back through the same ramp; on resumes. A kernel without
+panel_adaptation leaves True Tone off.
+---
+ omarchy-mac/bin/omarchy-mac-truetone          | 167 ++++++++++++------
+ .../omarchy-mac/truetone/apple,j604.conf      |  33 ++--
+ omarchy-mac/test/truetone-test.sh             | 108 ++++++-----
+ .../omarchy-mac-truetone.service              |   1 +
+ .../system/omarchy-mac-truetone.service       |  17 ++
+ .../omarchy-mac-truetone.service              |   1 -
+ .../systemd/user/omarchy-mac-truetone.service |  15 --
+ 7 files changed, 208 insertions(+), 134 deletions(-)
+ create mode 120000 omarchy-mac/vendor/systemd/system/multi-user.target.wants/omarchy-mac-truetone.service
+ create mode 100644 omarchy-mac/vendor/systemd/system/omarchy-mac-truetone.service
+ delete mode 120000 omarchy-mac/vendor/systemd/user/graphical-session.target.wants/omarchy-mac-truetone.service
+ delete mode 100644 omarchy-mac/vendor/systemd/user/omarchy-mac-truetone.service
+
+diff --git a/omarchy-mac/bin/omarchy-mac-truetone b/omarchy-mac/bin/omarchy-mac-truetone
+index 61ba6e8..6c7293f 100755
+--- a/omarchy-mac/bin/omarchy-mac-truetone
++++ b/omarchy-mac/bin/omarchy-mac-truetone
+@@ -4,12 +4,15 @@
+ # omarchy:args=[on|off|status]
+ # omarchy:examples=omarchy mac truetone status | omarchy mac truetone off | omarchy mac truetone on
+ 
+-# The ambient light sensor's colour temperature moves the display's white through hyprsunset, the
+-# same tool and Hyprland CTM protocol Omarchy's night light uses. True Tone writes only within its
+-# model table's range (6000-6500 K on the J604), above the point Omarchy reads as night light, and
+-# never while night light is on: a temperature it did not set below that point is night light's.
+-# Runs only on a Mac with a table in /usr/share/omarchy-mac/truetone (named after the device tree's
+-# first compatible) and an ambient light sensor with a colour temperature channel.
++# The ambient light sensor's colour temperature moves the display's white point as macOS's True Tone
++# does: STRENGTH of the way from the panel's white toward the room's colour, as a full 3x3 colour
++# matrix sent to the panel's own white-point adaptation (the display driver's panel_adaptation).
++# The driver multiplies it with the compositor's colour matrix, so Omarchy's night light keeps its
++# own matrix and the two add up (adaptation x night light), as macOS adds up True Tone and Night
++# Shift. Each change runs macOS's ramp: one matrix per frame along its eased 1.9 s curve.
++# Runs as a system service only on a Mac with a table in /usr/share/omarchy-mac/truetone (named after
++# the device tree's first compatible), an ambient light sensor with a colour temperature channel and a
++# display driver with panel_adaptation.
+ 
+ set -u
+ 
+@@ -18,10 +21,12 @@ omarchy-hw-apple-silicon 2>/dev/null || exit 0
+ table_dir=${OMARCHY_MAC_TRUETONE_DIR:-/usr/share/omarchy-mac/truetone}
+ iio_root=${OMARCHY_MAC_IIO_ROOT:-/sys/bus/iio/devices}
+ compatible_file=${OMARCHY_MAC_DT_COMPATIBLE:-/proc/device-tree/compatible}
+-config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-mac
+-off_file=$config_dir/truetone-off
++adapt_glob=${OMARCHY_MAC_PANEL_ADAPTATION:-/sys/bus/platform/drivers/apple-dcp/*/panel_adaptation}
++off_file=${OMARCHY_MAC_TRUETONE_OFF:-/etc/omarchy-mac/truetone-off}
++white_file=${OMARCHY_MAC_TRUETONE_WHITE:-/run/omarchy-mac/truetone-white}
+ once=${OMARCHY_MAC_TRUETONE_ONCE:-}
+-step_sleep=${OMARCHY_MAC_TRUETONE_STEP_SLEEP:-}
++frame_sleep=${OMARCHY_MAC_TRUETONE_FRAME_SLEEP:-}
++identity="4294967296 0 0 0 4294967296 0 0 0 4294967296"
+ 
+ model() { tr '\0' '\n' <"$compatible_file" 2>/dev/null | head -n1; }
+ 
+@@ -41,13 +46,16 @@ sensor() {
+   return 1
+ }
+ 
+-current_kelvin() { hyprctl hyprsunset temperature 2>/dev/null | grep -oE '[0-9]+' | head -n1; }
+-set_kelvin() { hyprctl hyprsunset temperature "$1" >/dev/null 2>&1; }
++adapt_file() {
++  local f
++  for f in $adapt_glob; do [[ -e $f ]] && { echo "$f"; return 0; }; done
++  return 1
++}
+ 
+-# The white for a room at $1 K: STRENGTH of the way from the panel's white to the room's colour in
+-# CIE xy (the room on the Planckian locus, Kim et al.), back to kelvin (McCamy), in range.
+-target_kelvin() {
+-  awk -v T="$1" -v rx="$REFERENCE_X" -v ry="$REFERENCE_Y" -v s="$STRENGTH" -v lo="$MIN_KELVIN" -v hi="$MAX_KELVIN" 'BEGIN {
++# The white "x y" for a room at $1 K: STRENGTH of the way from the panel's white to the room's colour
++# in CIE xy (the room on the Planckian locus, Kim et al.).
++room_white() {
++  awk -v T="$1" -v rx="$REFERENCE_X" -v ry="$REFERENCE_Y" -v s="$STRENGTH" 'BEGIN {
+     if (T < 1667) T = 1667
+     if (T > 25000) T = 25000
+     if (T <= 4000) x = -0.2661239e9 / T^3 - 0.2343589e6 / T^2 + 0.8776956e3 / T + 0.179910
+@@ -55,63 +63,112 @@ target_kelvin() {
+     if (T <= 2222) y = -1.1063814 * x^3 - 1.34811020 * x^2 + 2.18555832 * x - 0.20219683
+     else if (T <= 4000) y = -0.9549476 * x^3 - 1.37418593 * x^2 + 2.09137015 * x - 0.16748867
+     else y = 3.0817580 * x^3 - 5.87338670 * x^2 + 3.75112997 * x - 0.37001483
+-    wx = rx + s * (x - rx); wy = ry + s * (y - ry)
+-    n = (wx - 0.3320) / (0.1858 - wy)
+-    t = 449 * n^3 + 3525 * n^2 + 6823.3 * n + 5520.33
+-    if (t < lo) t = lo
+-    if (t > hi) t = hi
+-    printf "%d\n", t + 0.5
++    printf "%.6f %.6f\n", rx + s * (x - rx), ry + s * (y - ry)
+   }'
+ }
+ 
+-status() {
+-  local enabled=true
+-  [[ -e $off_file ]] && enabled=false
+-  echo "True Tone: $([[ $enabled == true ]] && echo on || echo off), white $(current_kelvin || echo '?') K"
++# One panel_adaptation line (nine S31.32 values) per frame from white "$1 $2" to white "$3 $4", along
++# RAMP_CURVE (the share of the matrix's move still to go against seconds); the last line is the target.
++ramp_lines() {
++  awk -v x0="$1" -v y0="$2" -v x1="$3" -v y1="$4" -v rx="$REFERENCE_X" -v ry="$REFERENCE_Y" \
++      -v lms="$ADAPT_LMS" -v pm="$ADAPT_P" -v qm="$ADAPT_Q" -v curve="$RAMP_CURVE" \
++      -v total="$RAMP_SECONDS" -v frame="$FRAME_SECONDS" -v id="$identity" '
++    function left(t,   i) {
++      if (t <= ct[1]) return cv[1]
++      for (i = 2; i <= nc; i++) if (t <= ct[i]) return cv[i-1] + (cv[i] - cv[i-1]) * (t - ct[i-1]) / (ct[i] - ct[i-1])
++      return 0
++    }
++    function cone(x, y, o,   X, Z) {
++      X = x / y; Z = (1 - x - y) / y
++      o[1] = L[1] * X + L[2] + L[3] * Z; o[2] = L[4] * X + L[5] + L[6] * Z; o[3] = L[7] * X + L[8] + L[9] * Z
++    }
++    # The adaptation for white x y into r[1..9] (plain numbers).
++    function mat(x, y, r,   c, g, i, j, k, v, m, rs, top) {
++      if ((x - rx)^2 + (y - ry)^2 < 1e-10) { for (i = 1; i <= 9; i++) r[i] = (i % 4 == 1) ? 1 : 0; return }
++      cone(x, y, c)
++      for (k = 1; k <= 3; k++) g[k] = c[k] / d[k]
++      top = 0
++      for (i = 1; i <= 3; i++) {
++        rs = 0
++        for (j = 1; j <= 3; j++) {
++          v = 0
++          for (k = 1; k <= 3; k++) v += P[(i-1)*3+k] * g[k] * Q[(k-1)*3+j]
++          m[i, j] = v; rs += v
++        }
++        if (rs > top) top = rs
++      }
++      for (i = 1; i <= 3; i++) for (j = 1; j <= 3; j++) r[(i-1)*3+j] = m[i, j] / top
++    }
++    function fmt(r,   i, out) {
++      out = sprintf("%.0f", r[1] * 4294967296)
++      for (i = 2; i <= 9; i++) out = out sprintf(" %.0f", r[i] * 4294967296)
++      return out
++    }
++    BEGIN {
++      split(lms, L, " "); split(pm, P, " "); split(qm, Q, " ")
++      cone(rx, ry, d)
++      nc = split(curve, cp, " ")
++      for (i = 1; i <= nc; i++) { split(cp[i], kv, ":"); ct[i] = kv[1]; cv[i] = kv[2] }
++      mat(x0, y0, a); mat(x1, y1, b)
++      n = int(total / frame + 0.5); if (n < 1) n = 1
++      # macOS moves the matrix itself along the curve (MEASURED on its red gain per frame).
++      for (s = 1; s < n; s++) {
++        f = 1 - left(s * frame)
++        for (i = 1; i <= 9; i++) r[i] = a[i] + (b[i] - a[i]) * f
++        print fmt(r)
++      }
++      if ((x1 - rx)^2 + (y1 - ry)^2 < 1e-10) print id; else print fmt(b)
++    }'
+ }
+ 
++white_now() { cat "$white_file" 2>/dev/null || echo "$REFERENCE_X $REFERENCE_Y"; }
++
++as_root() { if (( EUID == 0 )); then "$@"; else sudo "$@"; fi; }
++
+ case ${1:-run} in
+-  status) status; exit 0 ;;
+-  off)
+-    mkdir -p "$config_dir" && touch "$off_file"
+-    # Give the panel its own white back unless night light holds it.
+-    k=$(current_kelvin); [[ -n $k ]] && load_table && (( k >= MIN_KELVIN )) && set_kelvin "$REFERENCE_KELVIN"
+-    status; exit 0 ;;
+-  on) rm -f "$off_file"; status; exit 0 ;;
++  status)
++    load_table >/dev/null 2>&1; REFERENCE_X=${REFERENCE_X:-0.3127}; REFERENCE_Y=${REFERENCE_Y:-0.3290}
++    echo "True Tone: $([[ -e $off_file ]] && echo off || echo on), white x y $(white_now)"; exit 0 ;;
++  off) as_root /usr/bin/install -D -m 0644 /dev/null "$off_file" && echo "True Tone: off (the panel's own white within 2 s)"; exit 0 ;;
++  on) as_root /usr/bin/rm -f "$off_file" && echo "True Tone: on"; exit 0 ;;
++  # The matrices one move would send, one per frame (for checking the ramp): ramp x0 y0 x1 y1
++  ramp) load_table || exit 1; ramp_lines "$2" "$3" "$4" "$5"; exit 0 ;;
+   run) ;;
+   *) echo "Usage: omarchy-mac-truetone [on|off|status]" >&2; exit 2 ;;
+ esac
+ 
+ load_table || exit 0
+ dir=$(sensor) || exit 0
++out=$(adapt_file) || exit 0
++[[ -n $frame_sleep ]] || frame_sleep=$FRAME_SECONDS
++mkdir -p "$(dirname "$white_file")" 2>/dev/null
++
++# The white this loop starts from: the one it last set, or the panel's own if the driver holds none.
++read -r cx cy < <(white_now)
++[[ $(<"$out") == "$identity" ]] && { cx=$REFERENCE_X; cy=$REFERENCE_Y; }
++
++move_to() { # x y: run the ramp, then remember the white
++  local l
++  while read -r l; do
++    printf '%s\n' "$l" >"$out" 2>/dev/null || return 1
++    [[ $frame_sleep == 0 ]] || sleep "$frame_sleep"
++  done < <(ramp_lines "$cx" "$cy" "$1" "$2")
++  cx=$1; cy=$2
++  echo "$cx $cy" >"$white_file" 2>/dev/null
++}
+ 
+-last_set=""
+-steps=${RAMP_STEPS:-20}
+-deadband=${DEADBAND_KELVIN:-25}
+-[[ -n $step_sleep ]] || step_sleep=$(awk -v r="$RAMP_SECONDS" -v s="$steps" 'BEGIN { printf "%.3f\n", r / s }')
++far() { awk -v a="$1" -v b="$2" -v c="$3" -v d="$4" -v e="$DEADBAND_XY" 'BEGIN { exit !((a - c)^2 + (b - d)^2 > e^2) }'; }
+ 
+ while :; do
+-  if [[ ! -e $off_file ]]; then
++  if [[ -e $off_file ]]; then
++    far "$cx" "$cy" "$REFERENCE_X" "$REFERENCE_Y" && move_to "$REFERENCE_X" "$REFERENCE_Y"
++  else
+     lux=$(<"$dir/in_illuminance_input") 2>/dev/null || lux=""
+     room=$(<"$dir/in_colortemp_input") 2>/dev/null || room=""
+-    current=$(current_kelvin)
+-    if [[ -n $current && -n $lux && -n $room ]]; then
+-      if (( current < MIN_KELVIN )) && [[ $current != "$last_set" ]]; then
+-        last_set=""   # night light is on: it owns the white
+-      elif awk -v l="$lux" -v m="$MIN_LUX" -v r="$room" 'BEGIN { exit !(l >= m && r > 0) }'; then
+-        target=$(target_kelvin "${room%.*}")
+-        # macOS reaches each new white in its ramp time (PCCRampTime) in small steps; moves inside the
+-        # dead band (sensor noise) are left alone.
+-        if (( target - current > deadband || current - target > deadband )) ||
+-           { (( target != current )) && (( target == MIN_KELVIN || target == MAX_KELVIN )); }; then
+-          prev=$current
+-          for (( i = 1; i <= steps; i++ )); do
+-            k=$(( current + (target - current) * i / steps ))
+-            if (( k != prev )); then set_kelvin "$k" || break; last_set=$k; prev=$k; fi
+-            (( i < steps )) && sleep "$step_sleep"
+-          done
+-        fi
+-      fi
++    # Below MIN_LUX the reading's colour is not trusted and the white holds where it is.
++    if [[ -n $lux && -n $room ]] && awk -v l="$lux" -v m="$MIN_LUX" -v r="$room" 'BEGIN { exit !(l >= m && r > 0) }'; then
++      read -r tx ty < <(room_white "${room%.*}")
++      far "$cx" "$cy" "$tx" "$ty" && move_to "$tx" "$ty"
+     fi
+   fi
+   [[ -n $once ]] && exit 0
+diff --git a/omarchy-mac/share/omarchy-mac/truetone/apple,j604.conf b/omarchy-mac/share/omarchy-mac/truetone/apple,j604.conf
+index f1ec239..9c2f1f6 100644
+--- a/omarchy-mac/share/omarchy-mac/truetone/apple,j604.conf
++++ b/omarchy-mac/share/omarchy-mac/truetone/apple,j604.conf
+@@ -1,26 +1,31 @@
+ # True Tone for the MacBook Pro 14" M4 (J604), read by omarchy-mac-truetone.
+ # The display's white point follows the colour temperature of the room, as macOS does on this panel:
+-# macOS moves the white STRENGTH of the way from the panel's white toward the room's colour in CIE xy.
++# macOS moves the white STRENGTH of the way from the panel's white toward the room's colour in CIE xy
++# and sends it as a 3x3 colour matrix, one per frame over its ramp (set_matrix at location 9, the
++# same place the display driver sends panel_adaptation x the compositor's matrix).
+ # Its own numbers on this Mac (CoreBrightness status): ColorAdaptationStrength 0.2, and in a warm room
+ # at night a white of x 0.3382, y 0.3517 (about 5270 K); 0.2 of the way toward a 3000 K room is 5288 K.
+ 
+-# The panel's own white (no adaptation): D65, in CIE xy and kelvin.
++# The panel's own white (no adaptation): D65.
+ REFERENCE_X=0.3127
+ REFERENCE_Y=0.3290
+-REFERENCE_KELVIN=6500
+-# The lowest white True Tone moves to. Night light (omarchy-toggle-nightlight) owns everything below
+-# 6000 K, and the shell reads a temperature below that as night light on, so True Tone stays above it
+-# (macOS itself goes to about 5100-5300 K in a 2700-3200 K room).
+-MIN_KELVIN=6000
+-MAX_KELVIN=6500
+-# Fraction of the way from the panel's white to the room's colour (ColorAdaptationStrength).
++# Fraction of the way from the panel's white to the room's colour (ColorAdaptationStrength, at 0 lux;
++# other rooms TO-VERIFY).
+ STRENGTH=0.2
+ # Below this illuminance the reading's colour is not trusted and the white holds where it is.
+ MIN_LUX=5               # TO-VERIFY
+-# macOS reaches each new white in 2 s (PCCRampTime; MEASURED q6-rows-tt-2: off and on each a 2 s burst of
+-# about 90 colour matrix updates), here in RAMP_STEPS steps. Smaller moves than DEADBAND_KELVIN are noise.
+-RAMP_SECONDS=2
+-RAMP_STEPS=20
+-DEADBAND_KELVIN=25      # TO-VERIFY
++# White to matrix: a von Kries adaptation from D65 to the white in the panel's RGB, matrix = P x
++# diag(LMS(white) / LMS(D65)) x Q, scaled so no row adds above 1. LMS, P and Q are a fit to macOS's
++# own matrices on this panel (three whites, every coefficient within 0.003 of macOS's).
++ADAPT_LMS="0.40024 0.70760 -0.08081 -0.22630 1.16532 0.04570 0 0 0.91822"
++ADAPT_P="3.7988582 -2.7212530 -0.0776150 -0.5897890 1.5835038 0.0062846 0.0036388 -0.2191743 1.2155425"
++ADAPT_Q="0.3595802 0.6206726 0.0197510 0.1338371 0.8620760 0.0040887 0.0230557 0.1535828 0.8233561"
++# macOS's ramp to each new white: one matrix per frame, the share of the move still to go against
++# seconds (MEASURED: its set_matrix payloads per frame when True Tone switches).
++RAMP_CURVE="0:1 0.33:0.767 0.5:0.584 0.665:0.391 0.83:0.238 1.0:0.131 1.165:0.057 1.33:0.014 1.93:0"
++RAMP_SECONDS=1.93
++FRAME_SECONDS=0.0167
++# Moves smaller than this distance in CIE xy are sensor noise (about 25 K near 6000 K).
++DEADBAND_XY=0.0015      # TO-VERIFY
+ # Seconds between sensor reads (the sensor reports every 0.2 s).
+ POLL_SECONDS=1
+diff --git a/omarchy-mac/test/truetone-test.sh b/omarchy-mac/test/truetone-test.sh
+index 2540df5..cd380f1 100644
+--- a/omarchy-mac/test/truetone-test.sh
++++ b/omarchy-mac/test/truetone-test.sh
+@@ -4,59 +4,69 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+ t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
+ fail() { echo "truetone-test: $*" >&2; exit 1; }
+ 
+-mkdir -p "$t/bin" "$t/iio/iio:device0" "$t/config"
++mkdir -p "$t/bin" "$t/iio/iio:device0" "$t/dcp" "$t/etc"
+ printf 'apple,j604\0apple,t8132\0apple,arm-platform\0' >"$t/compatible"
+-echo 6500 >"$t/kelvin"
+-cat >"$t/bin/hyprctl" <<EOF
+-#!/bin/bash
+-[[ \$1 == hyprsunset && \$2 == temperature ]] || exit 1
+-if [[ -n \${3:-} ]]; then echo "\$3" >"$t/kelvin"; echo "\$3" >>"$t/kwrites"; echo ok; else cat "$t/kelvin"; fi
+-EOF
+-chmod +x "$t/bin/hyprctl"
+ printf '#!/bin/bash\nexit 0\n' >"$t/bin/omarchy-hw-apple-silicon"; chmod +x "$t/bin/omarchy-hw-apple-silicon"
++id="4294967296 0 0 0 4294967296 0 0 0 4294967296"
++echo "$id" >"$t/dcp/panel_adaptation"
+ 
+-run() { # lux kelvin-of-room
++run() { # lux kelvin-of-room [args]
+   echo "$1" >"$t/iio/iio:device0/in_illuminance_input"
+   echo "$2" >"$t/iio/iio:device0/in_colortemp_input"
+-  PATH="$t/bin:$PATH" HOME="$t" XDG_CONFIG_HOME="$t/config" OMARCHY_MAC_TRUETONE_ONCE=1 OMARCHY_MAC_TRUETONE_STEP_SLEEP=0 \
+-    OMARCHY_MAC_TRUETONE_DIR="${TT_DIR:-$root/share/omarchy-mac/truetone}" OMARCHY_MAC_IIO_ROOT="$t/iio" \
+-    OMARCHY_MAC_DT_COMPATIBLE="$t/compatible" bash "$root/bin/omarchy-mac-truetone" "${@:3}"
++  PATH="$t/bin:$PATH" OMARCHY_MAC_TRUETONE_ONCE=1 OMARCHY_MAC_TRUETONE_FRAME_SLEEP=0 \
++    OMARCHY_MAC_TRUETONE_DIR="$root/share/omarchy-mac/truetone" OMARCHY_MAC_IIO_ROOT="$t/iio" \
++    OMARCHY_MAC_DT_COMPATIBLE="$t/compatible" OMARCHY_MAC_PANEL_ADAPTATION="$t/dcp/panel_adaptation" \
++    OMARCHY_MAC_TRUETONE_OFF="$t/etc/truetone-off" OMARCHY_MAC_TRUETONE_WHITE="$t/white" \
++    bash "$root/bin/omarchy-mac-truetone" "${@:3}"
+ }
+-k() { cat "$t/kelvin"; }
+-
+-# The xy model without the range (MIN/MAX opened): a 3000 K room -> 5288 K, beside macOS's own
+-# 5269 K white in a warm room at night.
+-sed -e 's/^MIN_KELVIN=.*/MIN_KELVIN=1000/' -e 's/^MAX_KELVIN=.*/MAX_KELVIN=20000/' -e 's/^RAMP_SECONDS=.*/RAMP_SECONDS=0.01/' \
+-  "$root/share/omarchy-mac/truetone/apple,j604.conf" >"$t/open.conf"
+-mkdir -p "$t/open"; cp "$t/open.conf" "$t/open/apple,j604.conf"
+-TT_DIR="$t/open" run 200 3000; [[ $(k) == 5288 ]] || fail "xy model, 3000 K room -> 5288 K: $(k)"
+-echo 6500 >"$t/kelvin"
+-# A warm room: the white ramps to the floor (6000 K) in one go, in 20 steps (macOS's 2 s ramp).
+-: >"$t/kwrites"; run 120.5 3200.0; [[ $(k) == 6000 ]] || fail "a warm room ramps to the floor, 6000 K: $(k)"
+-[[ $(wc -l <"$t/kwrites") == 20 ]] || fail "ramp steps: $(wc -l <"$t/kwrites")"
+-# A daylight room brings it back, never above the panel's white.
+-run 300 9000
+-[[ $(k) == 6500 ]] || fail "daylight returns to 6500 K: $(k)"
+-# A middle room: 0.2 of the way from D65 toward 5700 K in xy = 6331 K.
+-run 200 5700; [[ $(k) == 6331 ]] || fail "5700 K room -> 6331 K: $(k)"
+-# The same room again: nothing written (inside the dead band).
+-: >"$t/kwrites"; run 200 5700; [[ ! -s $t/kwrites ]] || fail "steady room wrote: $(cat "$t/kwrites" | tr '\n' ' ')"
+-# Too dark to trust the colour: hold.
+-run 1 2000; [[ $(k) == 6331 ]] || fail "dark room holds: $(k)"
+-# Night light on (4000 K, not set by True Tone): untouched.
+-echo 4000 >"$t/kelvin"; run 200 9000; [[ $(k) == 4000 ]] || fail "night light wins: $(k)"
+-# Night light off (6500 K): True Tone resumes.
+-echo 6500 >"$t/kelvin"; run 200 3000; [[ $(k) == 6000 ]] || fail "resumes after night light: $(k)"
+-# Off: the panel's own white, and no further moves; on again resumes.
+-run 200 3000 off >/dev/null; [[ $(k) == 6500 ]] || fail "off restores 6500 K: $(k)"
+-run 200 3000; [[ $(k) == 6500 ]] || fail "off stays off: $(k)"
+-run 200 3000 on >/dev/null; run 200 3000; [[ $(k) == 6000 ]] || fail "on resumes: $(k)"
+-# A Mac without a table, or without a colour channel: nothing happens.
+-printf 'apple,j313\0' >"$t/compatible"; echo 6500 >"$t/kelvin"; run 200 3000; [[ $(k) == 6500 ]] || fail "no table: $(k)"
+-printf 'apple,j604\0' >"$t/compatible"; rm "$t/iio/iio:device0/in_colortemp_input"
+-echo 200 >"$t/iio/iio:device0/in_illuminance_input"
+-PATH="$t/bin:$PATH" HOME="$t" XDG_CONFIG_HOME="$t/config" OMARCHY_MAC_TRUETONE_ONCE=1 \
+-  OMARCHY_MAC_TRUETONE_DIR="$root/share/omarchy-mac/truetone" OMARCHY_MAC_IIO_ROOT="$t/iio" \
+-  OMARCHY_MAC_DT_COMPATIBLE="$t/compatible" bash "$root/bin/omarchy-mac-truetone"
+-[[ $(k) == 6500 ]] || fail "no colour channel: $(k)"
++m() { cat "$t/dcp/panel_adaptation"; }
++# Largest difference between the driver's matrix (S31.32) and a reference in plain numbers.
++diff9() { awk -v a="$(m)" -v b="$1" 'BEGIN { split(a, x, " "); split(b, y, " "); for (i = 1; i <= 9; i++) {
++  d = x[i] / 4294967296 - y[i]; if (d < 0) d = -d; if (d > w) w = d }; printf "%.4f\n", w }'; }
++
++# A warm room at night (3000 K): the white goes 0.2 of the way (macOS's strength) along CIE xy, to
++# 5288 K (macOS's own white in such a room is 5269 K at x 0.3382, y 0.3517: its y sits above the
++# Planckian locus, which the room points of q10-rows-tt-5 settle). The matrix is the fitted von Kries
++# adaptation for that white (within 0.003 of macOS's matrices at macOS's own whites, catfit.py).
++want="0.90672 0.08312 0.01015 -0.00737 0.84637 -0.00102 -0.00327 -0.02199 0.74088"
++run 150 3000
++w=$(diff9 "$want"); awk -v w="$w" 'BEGIN { exit !(w <= 0.0002) }' || fail "3000 K room matrix: $w off"
++read -r x y <"$t/white"; awk -v x="$x" -v y="$y" 'BEGIN { exit !(x > 0.337 && x < 0.338 && y > 0.343 && y < 0.345) }' ||
++  fail "white for a 3000 K room: $x $y"
++# A full 3x3, not a diagonal: the off-diagonal terms macOS uses are there.
++awk -v a="$(m)" 'BEGIN { split(a, x, " "); exit !(x[2] / 4294967296 > 0.05) }' || fail "no off-diagonal term: $(m)"
++
++# The ramp: one matrix per frame over macOS's 1.93 s, each closer to the target, along its curve.
++PATH="$t/bin:$PATH" OMARCHY_MAC_TRUETONE_DIR="$root/share/omarchy-mac/truetone" OMARCHY_MAC_DT_COMPATIBLE="$t/compatible" \
++  bash "$root/bin/omarchy-mac-truetone" ramp 0.3127 0.3290 $(cat "$t/white") >"$t/frames"
++n=$(grep -c . "$t/frames"); (( n == 116 )) || fail "ramp frames: $n (1.93 s at 60 Hz = 116)"
++# At 0.5 s (frame 30) macOS has 58 % of the move still to go: the red gain is that far from the end.
++awk -v f="$(sed -n 30p "$t/frames")" -v e="$(tail -1 "$t/frames")" 'BEGIN { split(f, a, " "); split(e, b, " ");
++  left = 1 - (a[1] - 4294967296) / (b[1] - 4294967296); exit !(left > 0.57 && left < 0.60) }' ||
++  fail "ramp shape at 0.5 s: $(sed -n 30p "$t/frames" | cut -d" " -f1)"
++
++# The same room again: inside the dead band, nothing is written.
++cp "$t/dcp/panel_adaptation" "$t/before"
++run 150 3010
++cmp -s "$t/before" "$t/dcp/panel_adaptation" || fail "a 10 K wobble moved the white"
++# Too dark to trust the colour: the white holds.
++run 1 6500; cmp -s "$t/before" "$t/dcp/panel_adaptation" || fail "a 1 lux reading moved the white"
++# Daylight (6500 K, on the Planckian locus just below D65): back beside the panel's own white.
++run 800 6504; w=$(diff9 "1 0 0 0 1 0 0 0 1"); awk -v w="$w" 'BEGIN { exit !(w < 0.01) }' || fail "6500 K room: $w from the panel's white"
++
++# Off: the panel's own white, and it stays there whatever the room; on resumes.
++run 150 3000; touch "$t/etc/truetone-off"; run 150 3000
++[[ $(m) == "$id" ]] || fail "off did not give the panel its white back: $(m)"
++run 150 2700; [[ $(m) == "$id" ]] || fail "off moved with the room: $(m)"
++rm "$t/etc/truetone-off"; run 150 3000
++w=$(diff9 "$want"); awk -v w="$w" 'BEGIN { exit !(w <= 0.0002) }' || fail "on did not resume: $w"
++
++# Night light is not touched: the script never calls hyprsunset/hyprctl.
++! grep -q -E 'hyprctl|hyprsunset' "$root/bin/omarchy-mac-truetone" || fail "True Tone still drives hyprsunset"
++
++# No table, no sensor or no panel_adaptation (an older kernel): nothing happens.
++echo "$id" >"$t/dcp/panel_adaptation"
++printf 'apple,j313\0' >"$t/compatible"; run 150 3000; [[ $(m) == "$id" ]] || fail "no table: $(m)"
++printf 'apple,j604\0' >"$t/compatible"; mv "$t/dcp/panel_adaptation" "$t/dcp/gone"; run 150 3000
++[[ ! -e $t/dcp/panel_adaptation ]] || fail "wrote without panel_adaptation"
+ echo "truetone-test: ok"
+diff --git a/omarchy-mac/vendor/systemd/system/multi-user.target.wants/omarchy-mac-truetone.service b/omarchy-mac/vendor/systemd/system/multi-user.target.wants/omarchy-mac-truetone.service
+new file mode 120000
+index 0000000..6e8910e
+--- /dev/null
++++ b/omarchy-mac/vendor/systemd/system/multi-user.target.wants/omarchy-mac-truetone.service
+@@ -0,0 +1 @@
++../omarchy-mac-truetone.service
+\ No newline at end of file
+diff --git a/omarchy-mac/vendor/systemd/system/omarchy-mac-truetone.service b/omarchy-mac/vendor/systemd/system/omarchy-mac-truetone.service
+new file mode 100644
+index 0000000..2803b99
+--- /dev/null
++++ b/omarchy-mac/vendor/systemd/system/omarchy-mac-truetone.service
+@@ -0,0 +1,17 @@
++# True Tone: the panel's white follows the room light through the display driver's panel_adaptation,
++# which the driver composes with the compositor's colour matrix (night light stays the compositor's).
++# A system service because panel_adaptation is a root-only sysfs attribute; the switch is
++# /etc/omarchy-mac/truetone-off ("omarchy-mac-truetone off|on").
++[Unit]
++Description=Match the built-in display's white to the room light (True Tone)
++After=systemd-udev-settle.service multi-user.target
++
++[Service]
++Type=simple
++ExecCondition=/usr/bin/omarchy-hw-apple-silicon
++ExecStart=/usr/bin/omarchy-mac-truetone
++Restart=on-failure
++RestartSec=10
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/omarchy-mac/vendor/systemd/user/graphical-session.target.wants/omarchy-mac-truetone.service b/omarchy-mac/vendor/systemd/user/graphical-session.target.wants/omarchy-mac-truetone.service
+deleted file mode 120000
+index 6e8910e..0000000
+--- a/omarchy-mac/vendor/systemd/user/graphical-session.target.wants/omarchy-mac-truetone.service
++++ /dev/null
+@@ -1 +0,0 @@
+-../omarchy-mac-truetone.service
+\ No newline at end of file
+diff --git a/omarchy-mac/vendor/systemd/user/omarchy-mac-truetone.service b/omarchy-mac/vendor/systemd/user/omarchy-mac-truetone.service
+deleted file mode 100644
+index a297eb4..0000000
+--- a/omarchy-mac/vendor/systemd/user/omarchy-mac-truetone.service
++++ /dev/null
+@@ -1,15 +0,0 @@
+-[Unit]
+-Description=Match the built-in display's white to the room light (True Tone)
+-# hyprsunset holds Hyprland's CTM protocol; Omarchy starts it with the session.
+-After=graphical-session.target
+-PartOf=graphical-session.target
+-
+-[Service]
+-Type=simple
+-ExecCondition=/usr/bin/omarchy-hw-apple-silicon
+-ExecStart=/usr/bin/omarchy-mac-truetone
+-Restart=on-failure
+-RestartSec=10
+-
+-[Install]
+-WantedBy=graphical-session.target

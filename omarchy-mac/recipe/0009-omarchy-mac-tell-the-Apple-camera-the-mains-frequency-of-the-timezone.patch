@@ -1,0 +1,136 @@
+From 875f7e44feaad080df43b4210702e54e536ccf9b Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 00:18:22 +0000
+Subject: [PATCH 10/24] omarchy-mac: tell the Apple camera the mains frequency
+ of the timezone
+
+The Apple ISP camera's auto exposure avoids the flicker of lights on
+50 Hz mains unless it is told the mains run at 60 Hz, which is the
+driver's default. macOS sets it from the region: on the J604 its ISP
+firmware logs "AE FlickerFreqUpdateCurrentSet freq=3276800" (50 Hz in
+16.16) for the session it runs at boot and "freq=3932160" (60 Hz) for
+the user's camera session. Under 60 Hz lighting the 50 Hz default
+leaves rolling bands in the picture.
+
+A udev rule runs a helper as the camera appears. The helper looks up
+the country of the system timezone in tzdata's zone.tab and, for a
+country on 60 Hz mains, sets V4L2_CID_POWER_LINE_FREQUENCY to 60 Hz.
+Japan, split between 50 and 60 Hz within one timezone, keeps the
+default, as does anything unexpected; the event never fails.
+
+---
+ omarchy-mac/lib/camera-mains                  | 38 ++++++++++++++
+ omarchy-mac/test/camera-mains-test.sh         | 49 +++++++++++++++++++
+ .../rules.d/94-omarchy-mac-camera-mains.rules |  2 +
+ 3 files changed, 89 insertions(+)
+ create mode 100755 omarchy-mac/lib/camera-mains
+ create mode 100644 omarchy-mac/test/camera-mains-test.sh
+ create mode 100644 omarchy-mac/vendor/udev/rules.d/94-omarchy-mac-camera-mains.rules
+
+diff --git a/omarchy-mac/lib/camera-mains b/omarchy-mac/lib/camera-mains
+new file mode 100755
+index 0000000..4866fd3
+--- /dev/null
++++ b/omarchy-mac/lib/camera-mains
+@@ -0,0 +1,38 @@
++#!/bin/bash
++# udev runs this as the Apple ISP camera appears. Its auto exposure avoids the
++# flicker of lights on 50 Hz mains unless it is told the mains run at 60 Hz;
++# macOS takes that from the region, so this takes it from the country of the
++# system timezone. It never fails the event: anything unexpected keeps 50 Hz.
++set -uo pipefail
++
++omarchy-hw-apple-silicon 2>/dev/null || exit 0
++
++device=${1:-}
++localtime=${CAMERA_MAINS_LOCALTIME:-/etc/localtime}
++zonetab=${CAMERA_MAINS_ZONETAB:-/usr/share/zoneinfo/zone.tab}
++python=${CAMERA_MAINS_PYTHON:-python3}
++
++[[ -c $device ]] || exit 0
++zone=$(readlink -f -- "$localtime" 2>/dev/null) || exit 0
++[[ $zone == */zoneinfo/* && -r $zonetab ]] || exit 0
++zone=${zone#*/zoneinfo/}
++country=$(awk -v zone="$zone" '$1 !~ /^#/ && $3 == zone { print $1; exit }' "$zonetab")
++
++# Countries whose mains run at 60 Hz. Japan is split between 50 and 60 Hz by
++# region within one timezone, so it keeps the 50 Hz default.
++case $country in
++  US | CA | MX | GT | BZ | SV | HN | NI | CR | PA | CU | DO | HT | PR | BS | TT | AG | KN | AW | BM | KY | TC | VG | VI | \
++    AS | GU | MP | UM | CO | VE | EC | PE | BR | SR | GY | SA | KR | TW | PH | LR | FM | MH | PW) ;;
++  *) exit 0 ;;
++esac
++
++# VIDIOC_S_CTRL with V4L2_CID_POWER_LINE_FREQUENCY = V4L2_CID_POWER_LINE_FREQUENCY_60HZ.
++"$python" - "$device" <<'EOF' || true
++import fcntl, os, struct, sys
++fd = os.open(sys.argv[1], os.O_RDWR | os.O_NONBLOCK)
++try:
++    fcntl.ioctl(fd, 0xC008561C, struct.pack("Ii", 0x00980918, 2))
++finally:
++    os.close(fd)
++EOF
++exit 0
+diff --git a/omarchy-mac/test/camera-mains-test.sh b/omarchy-mac/test/camera-mains-test.sh
+new file mode 100644
+index 0000000..2e76dc8
+--- /dev/null
++++ b/omarchy-mac/test/camera-mains-test.sh
+@@ -0,0 +1,49 @@
++#!/bin/bash
++set -euo pipefail
++source "$(dirname "$0")/base-test.sh"
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++stage="$work/stage"
++"$ROOT/install" "$stage"
++rule="$stage/usr/lib/udev/rules.d/94-omarchy-mac-camera-mains.rules"
++helper="$stage/usr/lib/omarchy-mac/camera-mains"
++[[ -x $helper && -f $rule ]] || fail 'stages the camera mains helper and udev rule'
++grep -Fxq 'ACTION=="add", SUBSYSTEM=="video4linux", DRIVERS=="apple-isp", RUN+="/usr/lib/omarchy-mac/camera-mains $devnode"' "$rule" ||
++  fail 'rule runs the staged helper only for the Apple ISP camera'
++if command -v udevadm >/dev/null && udevadm verify --help >/dev/null 2>&1; then
++  udevadm verify --resolve-names=never "$rule" >/dev/null || fail 'udev rule verifies'
++fi
++pass 'stages a udev rule that sets the mains frequency for the Apple ISP camera only'
++
++zoneinfo="$work/usr/share/zoneinfo"
++mkdir -p "$zoneinfo/America" "$zoneinfo/Europe" "$zoneinfo/Asia"
++printf '#code\tcoordinates\tTZ\tcomments\nUS\t+415100-0873900\tAmerica/Chicago\tCentral (most areas)\nDE\t+5230+01322\tEurope/Berlin\tmost of Germany\nJP\t+353916+1394441\tAsia/Tokyo\n' >"$zoneinfo/zone.tab"
++: >"$zoneinfo/America/Chicago"; : >"$zoneinfo/Europe/Berlin"; : >"$zoneinfo/Asia/Tokyo"
++cat >"$work/python" <<'STUB'
++#!/bin/bash
++printf '%s\n' "$2" >>"$SET_LOG"
++cat >/dev/null
++STUB
++chmod +x "$work/python"
++mkdir -p "$work/bin"
++printf '#!/bin/bash\necho aarch64-apple\n' >"$work/bin/omarchy-hw-platform"
++chmod +x "$work/bin/omarchy-hw-platform"
++stub_apple_predicate "$work/bin"
++export PATH="$work/bin:$PATH"
++export CAMERA_MAINS_ZONETAB="$zoneinfo/zone.tab" CAMERA_MAINS_PYTHON="$work/python" SET_LOG="$work/set.log"
++
++run() { # zone -> number of 60 Hz writes
++  : >"$SET_LOG"
++  ln -sfn "$zoneinfo/$1" "$work/localtime"
++  CAMERA_MAINS_LOCALTIME="$work/localtime" "$helper" /dev/null || fail "helper fails the event for $1"
++  wc -l <"$SET_LOG"
++}
++[[ $(run America/Chicago) == 1 ]] || fail 'a 60 Hz country sets 60 Hz'
++[[ $(run Europe/Berlin) == 0 ]] || fail 'a 50 Hz country keeps the default'
++[[ $(run Asia/Tokyo) == 0 ]] || fail 'Japan keeps the default'
++: >"$SET_LOG"
++CAMERA_MAINS_LOCALTIME="$work/missing" "$helper" /dev/null || fail 'a missing timezone fails the event'
++[[ ! -s $SET_LOG ]] || fail 'a missing timezone keeps the default'
++CAMERA_MAINS_LOCALTIME="$work/localtime" "$helper" "$work/not-a-device" || fail 'a missing device fails the event'
++[[ ! -s $SET_LOG ]] || fail 'a missing device writes nothing'
++pass 'sets 60 Hz only for the timezone of a 60 Hz country'
+diff --git a/omarchy-mac/vendor/udev/rules.d/94-omarchy-mac-camera-mains.rules b/omarchy-mac/vendor/udev/rules.d/94-omarchy-mac-camera-mains.rules
+new file mode 100644
+index 0000000..6386961
+--- /dev/null
++++ b/omarchy-mac/vendor/udev/rules.d/94-omarchy-mac-camera-mains.rules
+@@ -0,0 +1,2 @@
++# Tell the Apple ISP camera's auto exposure the mains frequency of the system timezone's country.
++ACTION=="add", SUBSYSTEM=="video4linux", DRIVERS=="apple-isp", RUN+="/usr/lib/omarchy-mac/camera-mains $devnode"

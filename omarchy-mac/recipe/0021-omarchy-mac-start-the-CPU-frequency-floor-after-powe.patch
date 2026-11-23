@@ -1,0 +1,103 @@
+From 48d6977dd6f1ac260b00756bc45c425382453f48 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 10:16:18 +0000
+Subject: [PATCH 22/24] omarchy-mac: start the CPU frequency floor after
+ power-profiles-daemon without a cycle
+
+The floor unit was wanted by multi-user.target and ordered after
+power-profiles-daemon.service, whose stock unit starts after
+multi-user.target. That is an ordering cycle: at every boot systemd
+logged "Found ordering cycle" and deleted the floor's start job, so the
+unit stayed enabled and inactive and no process got a floor (MacBook
+Pro 14-inch M4, Hyprland util.min 0 in performance).
+
+Want it from graphical.target instead, which power-profiles-daemon
+starts before, as the runtime's own Snapdragon unit now does
+(omacom/omarchy#18978, f928a2f12605). omarchy-mac-setup-system moves a unit an earlier package
+linked into multi-user.target; a disable or mask has no such link and
+stays as the administrator left it.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ omarchy-mac/bin/omarchy-mac-setup-system         |  6 ++++++
+ omarchy-mac/test/powerprofiles-floor-test.sh     | 16 ++++++++++++++--
+ .../omarchy-mac-powerprofiles-floor.service      |  4 +++-
+ 3 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/omarchy-mac/bin/omarchy-mac-setup-system b/omarchy-mac/bin/omarchy-mac-setup-system
+index 20b185f..6fba117 100755
+--- a/omarchy-mac/bin/omarchy-mac-setup-system
++++ b/omarchy-mac/bin/omarchy-mac-setup-system
+@@ -109,6 +109,12 @@ if [[ ! -f $floor_marker ]]; then
+     install -Dm644 /dev/null "$floor_marker"
+   fi
+ fi
++# 0.2.3-2.32 linked the unit into multi-user.target, a cycle with power-profiles-daemon that
++# systemd broke by dropping the floor at every boot. Move such a link; a disable or mask has none.
++if [[ -L $root/etc/systemd/system/multi-user.target.wants/$floor ]]; then
++  echo "Moving the CPU frequency floor unit from multi-user.target to graphical.target"
++  systemctl --root="${root:-/}" reenable "$floor"
++fi
+ 
+ if [[ -z $root && -d /run/systemd/system ]]; then
+   systemctl daemon-reload
+diff --git a/omarchy-mac/test/powerprofiles-floor-test.sh b/omarchy-mac/test/powerprofiles-floor-test.sh
+index ae5de87..e05c608 100644
+--- a/omarchy-mac/test/powerprofiles-floor-test.sh
++++ b/omarchy-mac/test/powerprofiles-floor-test.sh
+@@ -20,7 +20,8 @@ root="$work/root"
+ "$ROOT"/install "$root"
+ setup="$root/usr/bin/omarchy-mac-setup-system"
+ unit=omarchy-mac-powerprofiles-floor.service
+-wants="$root/etc/systemd/system/multi-user.target.wants/$unit"
++wants="$root/etc/systemd/system/graphical.target.wants/$unit"
++old_wants="$root/etc/systemd/system/multi-user.target.wants/$unit"
+ marker="$root/var/lib/omarchy-mac/powerprofiles-floor-configured"
+ # Arch disables every unit no preset names.
+ mkdir -p "$root/usr/lib/systemd/system-preset"
+@@ -32,6 +33,8 @@ grep -qx 'ExecStart=/usr/bin/omarchy-powerprofiles-floor monitor' "$root/usr/lib
+   fail 'the unit runs the runtime command'
+ grep -qx 'ConditionPathExists=/usr/bin/omarchy-powerprofiles-floor' "$root/usr/lib/systemd/system/$unit" ||
+   fail 'the unit is skipped, not failed, without the runtime command'
++grep -qx 'WantedBy=graphical.target' "$root/usr/lib/systemd/system/$unit" ||
++  fail 'the unit is wanted by graphical.target, after power-profiles-daemon, without a cycle'
+ pass 'the package ships a floor unit that runs the runtime command'
+ 
+ output=$(floor)
+@@ -55,6 +58,15 @@ floor >/dev/null
+ [[ $(readlink "$wants") == "/usr/lib/systemd/system/$unit" && -f $marker ]] || fail 'a rerun after a failed enable enables the floor'
+ pass 'a rerun after a failed enable enables the floor'
+ 
++# A 2.32 install: the marker and a multi-user.target link. Setup moves the link.
++rm "$wants"
++mkdir -p "$(dirname "$old_wants")"
++ln -s "/usr/lib/systemd/system/$unit" "$old_wants"
++output=$(floor)
++[[ ! -e $old_wants && $(readlink "$wants") == "/usr/lib/systemd/system/$unit" ]] ||
++  fail 'setup moves a 2.32 multi-user.target link to graphical.target' "$output"
++pass 'setup moves a 2.32 multi-user.target link to graphical.target'
++
+ systemctl --root="$root" disable "$unit" >/dev/null 2>&1
+ floor >/dev/null
+ [[ ! -e $wants ]] || fail 'an explicit disable after setup survives'
+@@ -70,7 +82,7 @@ other="$work/other"
+ "$ROOT"/install "$other"
+ install -Dm755 /dev/null "$other/usr/bin/omarchy-powerprofiles-floor"
+ PLATFORM=aarch64-qualcomm PATH="$work/bin:$PATH" "$other/usr/bin/omarchy-mac-setup-system" "$other" >/dev/null 2>&1
+-[[ ! -e $other/etc/systemd/system/multi-user.target.wants/$unit && ! -e $other/var/lib/omarchy-mac/powerprofiles-floor-configured ]] ||
++[[ ! -e $other/etc/systemd/system/graphical.target.wants/$unit && ! -e $other/var/lib/omarchy-mac/powerprofiles-floor-configured ]] ||
+   fail 'another platform gets no Apple floor'
+ pass 'another platform gets no Apple floor'
+ 
+diff --git a/omarchy-mac/vendor/systemd/system/omarchy-mac-powerprofiles-floor.service b/omarchy-mac/vendor/systemd/system/omarchy-mac-powerprofiles-floor.service
+index c2769e7..371e0ba 100644
+--- a/omarchy-mac/vendor/systemd/system/omarchy-mac-powerprofiles-floor.service
++++ b/omarchy-mac/vendor/systemd/system/omarchy-mac-powerprofiles-floor.service
+@@ -17,4 +17,6 @@ ProtectHome=yes
+ ProtectSystem=strict
+ 
+ [Install]
+-WantedBy=multi-user.target
++# power-profiles-daemon orders itself after multi-user.target, so wanting this
++# there made a cycle that systemd broke by dropping this start job every boot
++WantedBy=graphical.target

@@ -1,0 +1,140 @@
+From e5592baf6bc2d028a9b8bee2e260a319117cfbd2 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sat, 14 Nov 2026 04:47:03 +0000
+Subject: [PATCH 15/24] Move True Tone's white in macOS's two-second ramp
+
+macOS reaches each new True Tone white in two seconds, in many small
+colour matrix updates: switching True Tone off and on again on the
+MacBook Pro 14" M4 gives a two-second burst of about 90 updates each
+way, and its colour ramp time (PCCRampTime) reads 2 s.
+
+omarchy-mac-truetone moved the white 250 K per one-second poll, so a
+change came in one or two visible jumps. It now ramps to each new white
+in two seconds in 20 steps, as macOS does, and leaves moves smaller
+than 25 K (sensor noise) alone.
+---
+ omarchy-mac/bin/omarchy-mac-truetone          | 21 +++++++++++++-----
+ .../omarchy-mac/truetone/apple,j604.conf      |  5 ++++-
+ omarchy-mac/test/truetone-test.sh             | 22 +++++++++----------
+ 3 files changed, 30 insertions(+), 18 deletions(-)
+
+diff --git a/omarchy-mac/bin/omarchy-mac-truetone b/omarchy-mac/bin/omarchy-mac-truetone
+index fcf506b..61ba6e8 100755
+--- a/omarchy-mac/bin/omarchy-mac-truetone
++++ b/omarchy-mac/bin/omarchy-mac-truetone
+@@ -21,6 +21,7 @@ compatible_file=${OMARCHY_MAC_DT_COMPATIBLE:-/proc/device-tree/compatible}
+ config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-mac
+ off_file=$config_dir/truetone-off
+ once=${OMARCHY_MAC_TRUETONE_ONCE:-}
++step_sleep=${OMARCHY_MAC_TRUETONE_STEP_SLEEP:-}
+ 
+ model() { tr '\0' '\n' <"$compatible_file" 2>/dev/null | head -n1; }
+ 
+@@ -85,8 +86,9 @@ load_table || exit 0
+ dir=$(sensor) || exit 0
+ 
+ last_set=""
+-step_per_poll=$(awk -v r="$RAMP_SECONDS" -v p="$POLL_SECONDS" -v lo="$MIN_KELVIN" -v hi="$MAX_KELVIN" \
+-  'BEGIN { s = (hi - lo) * p / r; if (s < 1) s = 1; printf "%d\n", s + 0.5 }')
++steps=${RAMP_STEPS:-20}
++deadband=${DEADBAND_KELVIN:-25}
++[[ -n $step_sleep ]] || step_sleep=$(awk -v r="$RAMP_SECONDS" -v s="$steps" 'BEGIN { printf "%.3f\n", r / s }')
+ 
+ while :; do
+   if [[ ! -e $off_file ]]; then
+@@ -98,10 +100,17 @@ while :; do
+         last_set=""   # night light is on: it owns the white
+       elif awk -v l="$lux" -v m="$MIN_LUX" -v r="$room" 'BEGIN { exit !(l >= m && r > 0) }'; then
+         target=$(target_kelvin "${room%.*}")
+-        next=$current
+-        if (( target > current )); then next=$(( current + step_per_poll )); (( next > target )) && next=$target; fi
+-        if (( target < current )); then next=$(( current - step_per_poll )); (( next < target )) && next=$target; fi
+-        if (( next != current )); then set_kelvin "$next" && last_set=$next; fi
++        # macOS reaches each new white in its ramp time (PCCRampTime) in small steps; moves inside the
++        # dead band (sensor noise) are left alone.
++        if (( target - current > deadband || current - target > deadband )) ||
++           { (( target != current )) && (( target == MIN_KELVIN || target == MAX_KELVIN )); }; then
++          prev=$current
++          for (( i = 1; i <= steps; i++ )); do
++            k=$(( current + (target - current) * i / steps ))
++            if (( k != prev )); then set_kelvin "$k" || break; last_set=$k; prev=$k; fi
++            (( i < steps )) && sleep "$step_sleep"
++          done
++        fi
+       fi
+     fi
+   fi
+diff --git a/omarchy-mac/share/omarchy-mac/truetone/apple,j604.conf b/omarchy-mac/share/omarchy-mac/truetone/apple,j604.conf
+index 39af385..f1ec239 100644
+--- a/omarchy-mac/share/omarchy-mac/truetone/apple,j604.conf
++++ b/omarchy-mac/share/omarchy-mac/truetone/apple,j604.conf
+@@ -17,7 +17,10 @@ MAX_KELVIN=6500
+ STRENGTH=0.2
+ # Below this illuminance the reading's colour is not trusted and the white holds where it is.
+ MIN_LUX=5               # TO-VERIFY
+-# Seconds for a full move between MIN_KELVIN and MAX_KELVIN (macOS's PCCRampTime is 2 s).
++# macOS reaches each new white in 2 s (PCCRampTime; MEASURED q6-rows-tt-2: off and on each a 2 s burst of
++# about 90 colour matrix updates), here in RAMP_STEPS steps. Smaller moves than DEADBAND_KELVIN are noise.
+ RAMP_SECONDS=2
++RAMP_STEPS=20
++DEADBAND_KELVIN=25      # TO-VERIFY
+ # Seconds between sensor reads (the sensor reports every 0.2 s).
+ POLL_SECONDS=1
+diff --git a/omarchy-mac/test/truetone-test.sh b/omarchy-mac/test/truetone-test.sh
+index ecd198a..2540df5 100644
+--- a/omarchy-mac/test/truetone-test.sh
++++ b/omarchy-mac/test/truetone-test.sh
+@@ -10,7 +10,7 @@ echo 6500 >"$t/kelvin"
+ cat >"$t/bin/hyprctl" <<EOF
+ #!/bin/bash
+ [[ \$1 == hyprsunset && \$2 == temperature ]] || exit 1
+-if [[ -n \${3:-} ]]; then echo "\$3" >"$t/kelvin"; echo ok; else cat "$t/kelvin"; fi
++if [[ -n \${3:-} ]]; then echo "\$3" >"$t/kelvin"; echo "\$3" >>"$t/kwrites"; echo ok; else cat "$t/kelvin"; fi
+ EOF
+ chmod +x "$t/bin/hyprctl"
+ printf '#!/bin/bash\nexit 0\n' >"$t/bin/omarchy-hw-apple-silicon"; chmod +x "$t/bin/omarchy-hw-apple-silicon"
+@@ -18,7 +18,7 @@ printf '#!/bin/bash\nexit 0\n' >"$t/bin/omarchy-hw-apple-silicon"; chmod +x "$t/
+ run() { # lux kelvin-of-room
+   echo "$1" >"$t/iio/iio:device0/in_illuminance_input"
+   echo "$2" >"$t/iio/iio:device0/in_colortemp_input"
+-  PATH="$t/bin:$PATH" HOME="$t" XDG_CONFIG_HOME="$t/config" OMARCHY_MAC_TRUETONE_ONCE=1 \
++  PATH="$t/bin:$PATH" HOME="$t" XDG_CONFIG_HOME="$t/config" OMARCHY_MAC_TRUETONE_ONCE=1 OMARCHY_MAC_TRUETONE_STEP_SLEEP=0 \
+     OMARCHY_MAC_TRUETONE_DIR="${TT_DIR:-$root/share/omarchy-mac/truetone}" OMARCHY_MAC_IIO_ROOT="$t/iio" \
+     OMARCHY_MAC_DT_COMPATIBLE="$t/compatible" bash "$root/bin/omarchy-mac-truetone" "${@:3}"
+ }
+@@ -31,26 +31,26 @@ sed -e 's/^MIN_KELVIN=.*/MIN_KELVIN=1000/' -e 's/^MAX_KELVIN=.*/MAX_KELVIN=20000
+ mkdir -p "$t/open"; cp "$t/open.conf" "$t/open/apple,j604.conf"
+ TT_DIR="$t/open" run 200 3000; [[ $(k) == 5288 ]] || fail "xy model, 3000 K room -> 5288 K: $(k)"
+ echo 6500 >"$t/kelvin"
+-# A warm room moves the white down one ramp step per poll (500 K over 2 s, 1 s polls = 250 K).
+-run 120.5 3200.0; [[ $(k) == 6250 ]] || fail "first step in a warm room: $(k)"
+-run 120.5 3200.0; run 120.5 3200.0
+-[[ $(k) == 6000 ]] || fail "a warm room settles at the floor, 6000 K: $(k)"
++# A warm room: the white ramps to the floor (6000 K) in one go, in 20 steps (macOS's 2 s ramp).
++: >"$t/kwrites"; run 120.5 3200.0; [[ $(k) == 6000 ]] || fail "a warm room ramps to the floor, 6000 K: $(k)"
++[[ $(wc -l <"$t/kwrites") == 20 ]] || fail "ramp steps: $(wc -l <"$t/kwrites")"
+ # A daylight room brings it back, never above the panel's white.
+-for _ in 1 2 3; do run 300 9000; done
++run 300 9000
+ [[ $(k) == 6500 ]] || fail "daylight returns to 6500 K: $(k)"
+ # A middle room: 0.2 of the way from D65 toward 5700 K in xy = 6331 K.
+-for _ in 1 2; do run 200 5700; done
+-[[ $(k) == 6331 ]] || fail "5700 K room -> 6331 K: $(k)"
++run 200 5700; [[ $(k) == 6331 ]] || fail "5700 K room -> 6331 K: $(k)"
++# The same room again: nothing written (inside the dead band).
++: >"$t/kwrites"; run 200 5700; [[ ! -s $t/kwrites ]] || fail "steady room wrote: $(cat "$t/kwrites" | tr '\n' ' ')"
+ # Too dark to trust the colour: hold.
+ run 1 2000; [[ $(k) == 6331 ]] || fail "dark room holds: $(k)"
+ # Night light on (4000 K, not set by True Tone): untouched.
+ echo 4000 >"$t/kelvin"; run 200 9000; [[ $(k) == 4000 ]] || fail "night light wins: $(k)"
+ # Night light off (6500 K): True Tone resumes.
+-echo 6500 >"$t/kelvin"; run 200 3000; [[ $(k) == 6250 ]] || fail "resumes after night light: $(k)"
++echo 6500 >"$t/kelvin"; run 200 3000; [[ $(k) == 6000 ]] || fail "resumes after night light: $(k)"
+ # Off: the panel's own white, and no further moves; on again resumes.
+ run 200 3000 off >/dev/null; [[ $(k) == 6500 ]] || fail "off restores 6500 K: $(k)"
+ run 200 3000; [[ $(k) == 6500 ]] || fail "off stays off: $(k)"
+-run 200 3000 on >/dev/null; run 200 3000; [[ $(k) == 6250 ]] || fail "on resumes: $(k)"
++run 200 3000 on >/dev/null; run 200 3000; [[ $(k) == 6000 ]] || fail "on resumes: $(k)"
+ # A Mac without a table, or without a colour channel: nothing happens.
+ printf 'apple,j313\0' >"$t/compatible"; echo 6500 >"$t/kelvin"; run 200 3000; [[ $(k) == 6500 ]] || fail "no table: $(k)"
+ printf 'apple,j604\0' >"$t/compatible"; rm "$t/iio/iio:device0/in_colortemp_input"

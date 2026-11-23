@@ -1,0 +1,102 @@
+From a7c4bc1546f177d596756fc10c80276762b7879f Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Sun, 15 Nov 2026 15:18:00 +0000
+Subject: [PATCH 23/24] omarchy-mac: write no True Tone white while the
+ built-in panel is off
+
+While the built-in panel is blanked, the display driver may power the
+display coprocessor down, and a panel_adaptation write it gets then can
+end the display session. omarchy-mac-truetone writes on every white-point
+ramp, and after a lid wake the room light has changed, so a ramp often
+runs while the panel is still off.
+
+Read the built-in panel's connector (card*-eDP-1/enabled; overridable
+with OMARCHY_MAC_PANEL_CONNECTOR). While it is not enabled the poll loop
+writes nothing and a ramp under way stops before its next frame; once the
+panel is lit, the next poll moves to the room's white as it is then.
+Without a connector file it behaves as before. truetone-test gains the
+off/lit case.
+
+Signed-off-by: Dylan Ironside <dylan@dylanironside.io>
+---
+ omarchy-mac/bin/omarchy-mac-truetone | 18 +++++++++++++++++-
+ omarchy-mac/test/truetone-test.sh    |  9 +++++++++
+ 2 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/omarchy-mac/bin/omarchy-mac-truetone b/omarchy-mac/bin/omarchy-mac-truetone
+index 6c7293f..653d947 100755
+--- a/omarchy-mac/bin/omarchy-mac-truetone
++++ b/omarchy-mac/bin/omarchy-mac-truetone
+@@ -22,6 +22,7 @@ table_dir=${OMARCHY_MAC_TRUETONE_DIR:-/usr/share/omarchy-mac/truetone}
+ iio_root=${OMARCHY_MAC_IIO_ROOT:-/sys/bus/iio/devices}
+ compatible_file=${OMARCHY_MAC_DT_COMPATIBLE:-/proc/device-tree/compatible}
+ adapt_glob=${OMARCHY_MAC_PANEL_ADAPTATION:-/sys/bus/platform/drivers/apple-dcp/*/panel_adaptation}
++panel_glob=${OMARCHY_MAC_PANEL_CONNECTOR:-/sys/class/drm/card*-eDP-1/enabled}
+ off_file=${OMARCHY_MAC_TRUETONE_OFF:-/etc/omarchy-mac/truetone-off}
+ white_file=${OMARCHY_MAC_TRUETONE_WHITE:-/run/omarchy-mac/truetone-white}
+ once=${OMARCHY_MAC_TRUETONE_ONCE:-}
+@@ -123,6 +124,18 @@ ramp_lines() {
+ 
+ white_now() { cat "$white_file" 2>/dev/null || echo "$REFERENCE_X $REFERENCE_Y"; }
+ 
++# The built-in panel is lit (its connector enabled). While it is off nothing is written: the driver may
++# have powered the display down, and the next lit poll moves to the white the room has then.
++panel_on() {
++  local f
++  for f in $panel_glob; do
++    [[ -r $f ]] || return 0
++    [[ $(<"$f") == enabled ]]
++    return
++  done
++  return 0
++}
++
+ as_root() { if (( EUID == 0 )); then "$@"; else sudo "$@"; fi; }
+ 
+ case ${1:-run} in
+@@ -150,6 +163,7 @@ read -r cx cy < <(white_now)
+ move_to() { # x y: run the ramp, then remember the white
+   local l
+   while read -r l; do
++    panel_on || return 1
+     printf '%s\n' "$l" >"$out" 2>/dev/null || return 1
+     [[ $frame_sleep == 0 ]] || sleep "$frame_sleep"
+   done < <(ramp_lines "$cx" "$cy" "$1" "$2")
+@@ -160,7 +174,9 @@ move_to() { # x y: run the ramp, then remember the white
+ far() { awk -v a="$1" -v b="$2" -v c="$3" -v d="$4" -v e="$DEADBAND_XY" 'BEGIN { exit !((a - c)^2 + (b - d)^2 > e^2) }'; }
+ 
+ while :; do
+-  if [[ -e $off_file ]]; then
++  if ! panel_on; then
++    :
++  elif [[ -e $off_file ]]; then
+     far "$cx" "$cy" "$REFERENCE_X" "$REFERENCE_Y" && move_to "$REFERENCE_X" "$REFERENCE_Y"
+   else
+     lux=$(<"$dir/in_illuminance_input") 2>/dev/null || lux=""
+diff --git a/omarchy-mac/test/truetone-test.sh b/omarchy-mac/test/truetone-test.sh
+index cd380f1..aba47d9 100644
+--- a/omarchy-mac/test/truetone-test.sh
++++ b/omarchy-mac/test/truetone-test.sh
+@@ -17,6 +17,7 @@ run() { # lux kelvin-of-room [args]
+     OMARCHY_MAC_TRUETONE_DIR="$root/share/omarchy-mac/truetone" OMARCHY_MAC_IIO_ROOT="$t/iio" \
+     OMARCHY_MAC_DT_COMPATIBLE="$t/compatible" OMARCHY_MAC_PANEL_ADAPTATION="$t/dcp/panel_adaptation" \
+     OMARCHY_MAC_TRUETONE_OFF="$t/etc/truetone-off" OMARCHY_MAC_TRUETONE_WHITE="$t/white" \
++    OMARCHY_MAC_PANEL_CONNECTOR="$t/eDP-1-enabled" \
+     bash "$root/bin/omarchy-mac-truetone" "${@:3}"
+ }
+ m() { cat "$t/dcp/panel_adaptation"; }
+@@ -61,6 +62,14 @@ run 150 2700; [[ $(m) == "$id" ]] || fail "off moved with the room: $(m)"
+ rm "$t/etc/truetone-off"; run 150 3000
+ w=$(diff9 "$want"); awk -v w="$w" 'BEGIN { exit !(w <= 0.0002) }' || fail "on did not resume: $w"
+ 
++# Panel off (its connector disabled; the driver may have powered the display down): nothing is
++# written. Lit again, the next poll moves to the room's white.
++echo "$id" >"$t/dcp/panel_adaptation"; rm -f "$t/white"; echo disabled >"$t/eDP-1-enabled"
++run 150 3000; [[ $(m) == "$id" ]] || fail "wrote while the panel was off: $(m)"
++echo enabled >"$t/eDP-1-enabled"; run 150 3000
++w=$(diff9 "$want"); awk -v w="$w" 'BEGIN { exit !(w <= 0.0002) }' || fail "lit again did not move: $w"
++rm "$t/eDP-1-enabled"
++
+ # Night light is not touched: the script never calls hyprsunset/hyprctl.
+ ! grep -q -E 'hyprctl|hyprsunset' "$root/bin/omarchy-mac-truetone" || fail "True Tone still drives hyprsunset"
+ 
