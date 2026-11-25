@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 24 Nov 2026 04:40:37 +0000
+Subject: [PATCH] media: apple: prores: Advance the job ring by the
+ size of each job
+
+The engine reads one shared descriptor ring. Encode jobs are 0x180
+bytes and decode jobs are 0x100 bytes, so the head must move by the
+size of the job just queued, and the wrap check must use that size.
+
+Add apr_ring_advance() and split the ring write into reserve and
+publish steps. Encode jobs produce the same head, wrap toggle and
+bytes as before; a KUnit case checks that, and a second case checks
+a mixed encode and decode sequence across the ring end.
+---
+ .../platform/apple/prores/apple-prores-desc.c | 20 +++++
+ .../platform/apple/prores/apple-prores-drv.c  | 48 +++++++---
+ .../platform/apple/prores/apple-prores-test.c | 90 +++++++++++++++++++
+ .../platform/apple/prores/apple-prores.h      |  1 +
+ 4 files changed, 145 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/media/platform/apple/prores/apple-prores-desc.c b/drivers/media/platform/apple/prores/apple-prores-desc.c
+index 331a9ec3085..e88884007ce 100644
+--- a/drivers/media/platform/apple/prores/apple-prores-desc.c
++++ b/drivers/media/platform/apple/prores/apple-prores-desc.c
+@@ -606,3 +606,23 @@ int apr_check_output(const u8 *out, size_t capacity, u32 *frame_bytes)
+ 	return 0;
+ }
+ EXPORT_SYMBOL_IF_KUNIT(apr_check_output);
++
++/*
++ * Ring slot for one descriptor of @size bytes at producer offset @head.
++ * Returns the new producer offset; the slot is the @size bytes before it.
++ * Encode slots are APR_DESC_BYTES (0x180) and decode slots APR_DEC_DESC_BYTES
++ * (0x100); both are multiples of 128, the unit of the head register (offset
++ * in bits 23:7), and mixed sizes share the ring as in the macOS driver.
++ *
++ * The driver does not use the engine's wrap toggle. A slot that would reach
++ * the end of the ring sets *restart: the engine is reprogrammed and the slot
++ * starts at 0. Reaching the end exactly also restarts, so the head register
++ * never holds the ring size; encode alone never lands there (0x20000 is not a
++ * multiple of 0x180), so encode placement is unchanged.
++ */
++u32 apr_ring_advance(u32 head, u32 size, u32 ring_bytes, bool *restart)
++{
++	*restart = head + size >= ring_bytes;
++	return (*restart ? 0 : head) + size;
++}
++EXPORT_SYMBOL_IF_KUNIT(apr_ring_advance);
+diff --git a/drivers/media/platform/apple/prores/apple-prores-drv.c b/drivers/media/platform/apple/prores/apple-prores-drv.c
+index c15c38106cb..e1cda094df1 100644
+--- a/drivers/media/platform/apple/prores/apple-prores-drv.c
++++ b/drivers/media/platform/apple/prores/apple-prores-drv.c
+@@ -918,6 +918,35 @@ static void apr_watchdog(struct work_struct *work)
+ 	apr_finish_job(apr, ctx, -ETIMEDOUT);
+ }
+ 
++/*
++ * Reserve the next descriptor slot of @size bytes. Called with hw_lock held,
++ * engine idle. Returns the producer offset after the slot; the slot is the
++ * @size bytes before it.
++ */
++static u32 apr_ring_reserve(struct apr_dev *apr, u32 size)
++{
++	bool restart;
++	u32 next;
++
++	if (!apr->ring_ready)
++		apr_hw_init(apr);
++	next = apr_ring_advance(apr->head, size, apr->variant->ring_bytes, &restart);
++	if (restart)
++		apr_hw_init(apr);
++	return next;
++}
++
++/* Start the job whose descriptor ends at @next. Called with hw_lock held. */
++static void apr_ring_publish(struct apr_dev *apr, struct apr_ctx *ctx, u32 next)
++{
++	apr->head = next;
++	apr->active = ctx;
++	apr->started = jiffies;
++	/* Descriptor and buffers must be visible before the head moves. */
++	dma_wmb();
++	writel(apr->head, apr->regs + APR_REG_RING_HEAD);
++}
++
+ static void apr_device_run(void *priv)
+ {
+ 	struct apr_ctx *ctx = priv;
+@@ -925,6 +954,7 @@ static void apr_device_run(void *priv)
+ 	struct vb2_v4l2_buffer *src, *dst;
+ 	struct apr_frame f;
+ 	unsigned long flags;
++	u32 size, next;
+ 	void *out;
+ 	int ret;
+ 
+@@ -952,25 +982,15 @@ static void apr_device_run(void *priv)
+ 		apr_finish_job(apr, ctx, -EIO);
+ 		return;
+ 	}
+-	/*
+-	 * The engine's ring wrap protocol is not known, so start again at the
+-	 * beginning of the ring instead of wrapping. The engine is idle here.
+-	 */
+-	if (!apr->ring_ready ||
+-	    apr->head + apr->variant->desc_bytes > apr->variant->ring_bytes)
+-		apr_hw_init(apr);
+-	ret = apr->variant->build_desc(&f, apr->ring + apr->head);
++	size = apr->variant->desc_bytes;
++	next = apr_ring_reserve(apr, size);
++	ret = apr->variant->build_desc(&f, apr->ring + next - size);
+ 	if (ret) {
+ 		spin_unlock_irqrestore(&apr->hw_lock, flags);
+ 		apr_finish_job(apr, ctx, ret);
+ 		return;
+ 	}
+-	apr->head += apr->variant->desc_bytes;
+-	apr->active = ctx;
+-	apr->started = jiffies;
+-	/* Descriptor and buffers must be visible before the head moves. */
+-	dma_wmb();
+-	writel(apr->head, apr->regs + APR_REG_RING_HEAD);
++	apr_ring_publish(apr, ctx, next);
+ 	spin_unlock_irqrestore(&apr->hw_lock, flags);
+ 	schedule_delayed_work(&apr->watchdog, msecs_to_jiffies(APR_POLL_MS));
+ }
+diff --git a/drivers/media/platform/apple/prores/apple-prores-test.c b/drivers/media/platform/apple/prores/apple-prores-test.c
+index d4c9c9e3d3e..2cb97a631ad 100644
+--- a/drivers/media/platform/apple/prores/apple-prores-test.c
++++ b/drivers/media/platform/apple/prores/apple-prores-test.c
+@@ -691,6 +691,94 @@ static void apr_test_frame_header(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, apr_parse_frame_header(b, 0x200, &fi), -EINVAL);
+ }
+ 
++/*
++ * Patch 0003 must not move one encode byte. The rule before it (restart when
++ * head + 0x180 passes the ring end, slot at head, head += 0x180) and
++ * apr_ring_advance() place 700 real encode descriptors into two ring images;
++ * the images, the head writes and the restarts must all match.
++ */
++static void apr_test_ring_encode_same(struct kunit *test)
++{
++	u8 *old_ring = kunit_kzalloc(test, APR_RING_BYTES, GFP_KERNEL);
++	u8 *new_ring = kunit_kzalloc(test, APR_RING_BYTES, GFP_KERNEL);
++	u32 old_head = 0, new_head = 0;
++	unsigned int i, restarts = 0;
++
++	KUNIT_ASSERT_NOT_NULL(test, old_ring);
++	KUNIT_ASSERT_NOT_NULL(test, new_ring);
++	for (i = 0; i < 700; i++) {
++		struct apr_frame f = apr_test_frame();
++		int (*build)(const struct apr_frame *, u8 *) =
++			i & 1 ? apr_build_desc_v0 : apr_build_desc;
++		bool old_restart, restart;
++
++		f.luma += (u64)i << 24;
++		f.chroma += (u64)i << 24;
++		f.output += (u64)i << 24;
++		old_restart = old_head + APR_DESC_BYTES > APR_RING_BYTES;
++		if (old_restart)
++			old_head = 0;
++		KUNIT_ASSERT_EQ(test, build(&f, old_ring + old_head), 0);
++		old_head += APR_DESC_BYTES;
++
++		new_head = apr_ring_advance(new_head, APR_DESC_BYTES,
++					    APR_RING_BYTES, &restart);
++		KUNIT_ASSERT_EQ(test, build(&f, new_ring + new_head - APR_DESC_BYTES), 0);
++		KUNIT_EXPECT_EQ(test, restart, old_restart);
++		KUNIT_EXPECT_EQ(test, new_head, old_head);
++		restarts += restart;
++	}
++	/* 341 slots of 0x180 fit in 128 KiB: jobs 341 and 682 restart. */
++	KUNIT_EXPECT_EQ(test, restarts, 2);
++	KUNIT_EXPECT_EQ(test, memcmp(old_ring, new_ring, APR_RING_BYTES), 0);
++}
++
++/* Decode (0x100) and encode (0x180) slots share one ring. */
++static void apr_test_ring_mixed(struct kunit *test)
++{
++	static const u32 sizes[] = {
++		APR_DEC_DESC_BYTES, APR_DESC_BYTES, APR_DEC_DESC_BYTES,
++		APR_DEC_DESC_BYTES, APR_DESC_BYTES,
++	};
++	unsigned int i, restarts = 0;
++	u32 head, next;
++	bool restart;
++
++	head = apr_ring_advance(0, APR_DEC_DESC_BYTES, APR_RING_BYTES, &restart);
++	KUNIT_EXPECT_EQ(test, head, 0x100);
++	KUNIT_EXPECT_FALSE(test, restart);
++	head = apr_ring_advance(head, APR_DESC_BYTES, APR_RING_BYTES, &restart);
++	KUNIT_EXPECT_EQ(test, head, 0x280);
++	head = apr_ring_advance(head, APR_DEC_DESC_BYTES, APR_RING_BYTES, &restart);
++	KUNIT_EXPECT_EQ(test, head, 0x380);
++	/* Reaching the end exactly restarts; one slot short does not. */
++	KUNIT_EXPECT_EQ(test, apr_ring_advance(APR_RING_BYTES - 0x200, 0x100,
++					       APR_RING_BYTES, &restart),
++			APR_RING_BYTES - 0x100);
++	KUNIT_EXPECT_FALSE(test, restart);
++	KUNIT_EXPECT_EQ(test, apr_ring_advance(APR_RING_BYTES - 0x100, 0x100,
++					       APR_RING_BYTES, &restart), 0x100);
++	KUNIT_EXPECT_TRUE(test, restart);
++	KUNIT_EXPECT_EQ(test, apr_ring_advance(APR_RING_BYTES - 0x100, 0x180,
++					       APR_RING_BYTES, &restart), 0x180);
++	KUNIT_EXPECT_TRUE(test, restart);
++
++	head = 0;
++	for (i = 0; i < 5000; i++) {
++		u32 size = sizes[i % ARRAY_SIZE(sizes)];
++
++		next = apr_ring_advance(head, size, APR_RING_BYTES, &restart);
++		KUNIT_EXPECT_EQ(test, restart, head + size >= APR_RING_BYTES);
++		KUNIT_EXPECT_EQ(test, next % 128, 0);
++		KUNIT_EXPECT_LT(test, next, APR_RING_BYTES);
++		KUNIT_EXPECT_EQ(test, next & ~APR_RING_PTR_MASK, 0);
++		restarts += restart;
++		head = next;
++	}
++	/* 5000 jobs, 0x500 bytes per 5: 1280000 bytes, so at least 9 restarts. */
++	KUNIT_EXPECT_GE(test, restarts, 9);
++}
++
+ static struct kunit_case apr_test_cases[] = {
+ 	KUNIT_CASE(apr_test_qmat_regs),
+ 	KUNIT_CASE(apr_test_dc_scale),
+@@ -703,6 +791,8 @@ static struct kunit_case apr_test_cases[] = {
+ 	KUNIT_CASE(apr_test_dec_desc),
+ 	KUNIT_CASE(apr_test_dec_desc_rejects),
+ 	KUNIT_CASE(apr_test_frame_header),
++	KUNIT_CASE(apr_test_ring_encode_same),
++	KUNIT_CASE(apr_test_ring_mixed),
+ 	KUNIT_CASE(apr_test_budgets),
+ 	KUNIT_CASE(apr_test_slices),
+ 	KUNIT_CASE(apr_test_output),
+diff --git a/drivers/media/platform/apple/prores/apple-prores.h b/drivers/media/platform/apple/prores/apple-prores.h
+index b514eeebe42..48e93c5f64d 100644
+--- a/drivers/media/platform/apple/prores/apple-prores.h
++++ b/drivers/media/platform/apple/prores/apple-prores.h
+@@ -196,6 +196,7 @@ int apr_build_desc_v0(const struct apr_frame *f, u8 *desc);
+ int apr_build_decode_desc(const struct apr_dec_frame *f, u8 *desc);
+ int apr_parse_frame_header(const u8 *buf, size_t len, struct apr_frame_info *info);
+ int apr_check_output(const u8 *out, size_t capacity, u32 *frame_bytes);
++u32 apr_ring_advance(u32 head, u32 size, u32 ring_bytes, bool *restart);
+ extern const struct apri_layout apri_t6041;
+ extern const struct apri_layout apri_t6050;
+ extern const struct apri_layout apri_t8132;
+-- 
+2.43.0
+

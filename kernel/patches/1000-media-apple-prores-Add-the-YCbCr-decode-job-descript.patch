@@ -1,0 +1,266 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 24 Nov 2026 03:45:58 +0000
+Subject: [PATCH] media: apple: prores: Add the YCbCr decode job
+ descriptor
+
+The T8132 ProRes engine also decodes. Add the 0x100-byte YCbCr decode
+descriptor builder for full-size, progressive, alpha-less frames into the
+NV16, NV24, P216 and P416 layouts the encoder already takes. Nothing calls
+it yet; a decoder video node follows once the engine mode for decode jobs
+is known.
+---
+ .../platform/apple/prores/apple-prores-desc.c | 82 ++++++++++++++++
+ .../platform/apple/prores/apple-prores-test.c | 93 +++++++++++++++++++
+ .../platform/apple/prores/apple-prores.h      | 17 ++++
+ 3 files changed, 192 insertions(+)
+
+diff --git a/drivers/media/platform/apple/prores/apple-prores-desc.c b/drivers/media/platform/apple/prores/apple-prores-desc.c
+index 82abe6acce3..2cdb5a05314 100644
+--- a/drivers/media/platform/apple/prores/apple-prores-desc.c
++++ b/drivers/media/platform/apple/prores/apple-prores-desc.c
+@@ -14,6 +14,7 @@
+ #include <linux/unaligned.h>
+ 
+ #include <kunit/visibility.h>
++#include <linux/bitfield.h>
+ 
+ #include "apple-prores.h"
+ 
+@@ -473,6 +474,87 @@ int apr_build_desc_v0(const struct apr_frame *f, u8 *desc)
+ }
+ EXPORT_SYMBOL_IF_KUNIT(apr_build_desc_v0);
+ 
++/*
++ * Decode job descriptor (YCbCr decode, 0x100 bytes). Word 0 packs the job
++ * fields: fid 31:16, bff 14, two-raw 13, interrupt 12, decode mode 11:8,
++ * alpha 7, compressed output 6, downscale 5:4, chroma format 3:2 and output
++ * depth 1:0. Chroma format and depth use the encode encodings. The engine
++ * reads the quantisation matrices and slice table from the bitstream, so
++ * there is no header or rate-control block. Only full-size, progressive,
++ * alpha-less frames into linear planes are built here.
++ */
++#define DD_CMD			0x000
++#define  DD_CMD_FID		GENMASK(31, 16)
++#define  DD_CMD_INT		BIT(12)
++#define  DD_CMD_DEC		GENMASK(11, 8)
++#define  DD_CMD_DEC_YCBCR	2
++#define  DD_CMD_CFMT		GENMASK(3, 2)
++#define  DD_CMD_BD		GENMASK(1, 0)
++#define DD_INPUT		0x008
++#define DD_IN_OFFSET_X		0x010
++#define DD_IN_OFFSET_Y		0x012
++#define DD_IN_WIDTH		0x014
++#define DD_IN_HEIGHT		0x016
++#define DD_OUT_OFFSET_X		0x018
++#define DD_OUT_OFFSET_Y		0x01a
++#define DD_OUT_WIDTH		0x01c
++#define DD_OUT_HEIGHT		0x01e
++#define DD_LUMA_STRIDE		0x020	/* in units of 64 bytes */
++#define DD_CHROMA_STRIDE	0x022
++#define DD_ALPHA_STRIDE		0x024
++#define DD_LUMA			0x028
++#define DD_CHROMA		0x038
++#define DD_ALPHA		0x048
++#define DD_CRC			0x090
++
++int apr_build_decode_desc(const struct apr_dec_frame *f, u8 *desc)
++{
++	bool is444 = apr_input_is_444(f->output);
++	bool deep = f->output == APR_INPUT_422_16 ||
++		    f->output == APR_INPUT_444_16;
++	u32 min_luma, min_chroma, cmd;
++
++	if ((unsigned int)f->output > APR_INPUT_444_16 || f->interlaced)
++		return -EINVAL;
++	if (!f->width || !f->height || f->width > U16_MAX ||
++	    f->height > U16_MAX || f->width & 1)
++		return -EINVAL;
++	min_luma = f->width * (deep ? 2 : 1);
++	min_chroma = min_luma * (is444 ? 2 : 1);
++	if (f->luma_stride % 64 || f->chroma_stride % 64 ||
++	    f->luma_stride < min_luma || f->chroma_stride < min_chroma ||
++	    f->luma_stride / 64 > U16_MAX || f->chroma_stride / 64 > U16_MAX)
++		return -EINVAL;
++	if (!f->input || !f->luma || !f->chroma)
++		return -EINVAL;
++
++	memset(desc, 0, APR_DEC_DESC_BYTES);
++
++	cmd = FIELD_PREP(DD_CMD_FID, f->fid) | DD_CMD_INT |
++	      FIELD_PREP(DD_CMD_DEC, DD_CMD_DEC_YCBCR) |
++	      FIELD_PREP(DD_CMD_CFMT, is444 ? 3 : 2) |
++	      FIELD_PREP(DD_CMD_BD, deep ? 3 : 0);
++	put_unaligned_le32(cmd, desc + DD_CMD);
++	put_unaligned_le64(f->input, desc + DD_INPUT);
++	put_unaligned_le16(0, desc + DD_IN_OFFSET_X);
++	put_unaligned_le16(0, desc + DD_IN_OFFSET_Y);
++	put_unaligned_le16(f->width, desc + DD_IN_WIDTH);
++	put_unaligned_le16(f->height, desc + DD_IN_HEIGHT);
++	put_unaligned_le16(0, desc + DD_OUT_OFFSET_X);
++	put_unaligned_le16(0, desc + DD_OUT_OFFSET_Y);
++	put_unaligned_le16(f->width, desc + DD_OUT_WIDTH);
++	put_unaligned_le16(f->height, desc + DD_OUT_HEIGHT);
++	put_unaligned_le16(f->luma_stride / 64, desc + DD_LUMA_STRIDE);
++	put_unaligned_le16(f->chroma_stride / 64, desc + DD_CHROMA_STRIDE);
++	put_unaligned_le16(0, desc + DD_ALPHA_STRIDE);
++	put_unaligned_le64(f->luma, desc + DD_LUMA);
++	put_unaligned_le64(f->chroma, desc + DD_CHROMA);
++	put_unaligned_le64(0, desc + DD_ALPHA);
++	put_unaligned_le32(0, desc + DD_CRC);
++	return 0;
++}
++EXPORT_SYMBOL_IF_KUNIT(apr_build_decode_desc);
++
+ /*
+  * A finished frame starts with its big-endian length, which counts the whole
+  * frame, followed by the 'icpf' frame identifier.
+diff --git a/drivers/media/platform/apple/prores/apple-prores-test.c b/drivers/media/platform/apple/prores/apple-prores-test.c
+index 3b2d50eccd4..7bd8433ee39 100644
+--- a/drivers/media/platform/apple/prores/apple-prores-test.c
++++ b/drivers/media/platform/apple/prores/apple-prores-test.c
+@@ -561,6 +561,97 @@ static void apr_test_apri_row_rejects(struct kunit *test)
+ 	apr_test_apri_rows_reject(test, APRI_SYSTEM_BLOCK, 0, 8, 0x100);
+ }
+ 
++static struct apr_dec_frame apr_test_dec_frame(void)
++{
++	return (struct apr_dec_frame) {
++		.width = 3840,
++		.height = 2160,
++		.output = APR_INPUT_422_16,
++		.luma_stride = 7680,
++		.chroma_stride = 7680,
++		.input = 0x10000000,
++		.luma = 0x20000000,
++		.chroma = 0x21000000,
++		.fid = 0x2a,
++	};
++}
++
++static void apr_test_dec_desc(struct kunit *test)
++{
++	static const struct {
++		enum apr_input output;
++		u32 chroma_stride;
++		u32 cmd;
++	} cases[] = {
++		/* fid 0x2a, interrupt, decode mode 2, cfmt, depth */
++		{ APR_INPUT_422_16, 7680, 0x002a120b },
++		{ APR_INPUT_444_16, 15360, 0x002a120f },
++		{ APR_INPUT_422_8, 3840, 0x002a1208 },
++		{ APR_INPUT_444_8, 7680, 0x002a120c },
++	};
++	u8 *d = kunit_kmalloc(test, APR_DEC_DESC_BYTES + 1, GFP_KERNEL);
++	unsigned int i, j;
++
++	KUNIT_ASSERT_NOT_NULL(test, d);
++	for (i = 0; i < ARRAY_SIZE(cases); i++) {
++		struct apr_dec_frame f = apr_test_dec_frame();
++		bool deep = cases[i].output == APR_INPUT_422_16 ||
++			    cases[i].output == APR_INPUT_444_16;
++
++		f.output = cases[i].output;
++		f.luma_stride = deep ? 7680 : 3840;
++		f.chroma_stride = cases[i].chroma_stride;
++		memset(d, 0xa5, APR_DEC_DESC_BYTES + 1);
++		KUNIT_ASSERT_EQ(test, apr_build_decode_desc(&f, d), 0);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d), cases[i].cmd);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x08), f.input);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 0x10), 0);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x14), 3840);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x16), 2160);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 0x18), 0);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x1c), 3840);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x1e), 2160);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x20),
++				f.luma_stride / 64);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x22),
++				f.chroma_stride / 64);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le16(d + 0x24), 0);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x28), f.luma);
++		KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x38), f.chroma);
++		/* Meta, alpha, second field and CRC control stay zero. */
++		KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x30), 0);
++		for (j = 0x40; j < APR_DEC_DESC_BYTES; j++)
++			KUNIT_EXPECT_EQ(test, d[j], 0);
++		KUNIT_EXPECT_EQ(test, d[APR_DEC_DESC_BYTES], 0xa5);
++	}
++}
++
++static void apr_test_dec_desc_rejects(struct kunit *test)
++{
++	u8 *d = kunit_kzalloc(test, APR_DEC_DESC_BYTES, GFP_KERNEL);
++	struct apr_dec_frame f;
++
++	KUNIT_ASSERT_NOT_NULL(test, d);
++	f = apr_test_dec_frame();
++	f.interlaced = true;
++	KUNIT_EXPECT_EQ(test, apr_build_decode_desc(&f, d), -EINVAL);
++	f = apr_test_dec_frame();
++	f.width = 3841;
++	KUNIT_EXPECT_EQ(test, apr_build_decode_desc(&f, d), -EINVAL);
++	f = apr_test_dec_frame();
++	f.luma_stride = 7700;			/* not a multiple of 64 */
++	KUNIT_EXPECT_EQ(test, apr_build_decode_desc(&f, d), -EINVAL);
++	f = apr_test_dec_frame();
++	f.output = APR_INPUT_444_16;		/* chroma row too short */
++	KUNIT_EXPECT_EQ(test, apr_build_decode_desc(&f, d), -EINVAL);
++	f = apr_test_dec_frame();
++	f.input = 0;
++	KUNIT_EXPECT_EQ(test, apr_build_decode_desc(&f, d), -EINVAL);
++	f = apr_test_dec_frame();
++	f.output = APR_INPUT_444_16 + 1;
++	KUNIT_EXPECT_EQ(test, apr_build_decode_desc(&f, d), -EINVAL);
++}
++
+ static struct kunit_case apr_test_cases[] = {
+ 	KUNIT_CASE(apr_test_qmat_regs),
+ 	KUNIT_CASE(apr_test_dc_scale),
+@@ -570,6 +661,8 @@ static struct kunit_case apr_test_cases[] = {
+ 	KUNIT_CASE(apr_test_desc_rejects),
+ 	KUNIT_CASE(apr_test_desc_v0),
+ 	KUNIT_CASE(apr_test_desc_v0_profiles),
++	KUNIT_CASE(apr_test_dec_desc),
++	KUNIT_CASE(apr_test_dec_desc_rejects),
+ 	KUNIT_CASE(apr_test_budgets),
+ 	KUNIT_CASE(apr_test_slices),
+ 	KUNIT_CASE(apr_test_output),
+diff --git a/drivers/media/platform/apple/prores/apple-prores.h b/drivers/media/platform/apple/prores/apple-prores.h
+index 56fdcfbf2d7..9042a84fc34 100644
+--- a/drivers/media/platform/apple/prores/apple-prores.h
++++ b/drivers/media/platform/apple/prores/apple-prores.h
+@@ -153,6 +153,22 @@ struct apr_frame {
+ 	u8 matrix;
+ };
+ 
++/* One progressive, alpha-less frame decoded into linear Y and CbCr planes. */
++#define APR_DEC_DESC_BYTES	0x100
++
++struct apr_dec_frame {
++	u32 width;		/* from the ProRes frame header */
++	u32 height;
++	enum apr_input output;	/* CAPTURE layout, same set as encode input */
++	u32 luma_stride;	/* bytes, multiple of 64 */
++	u32 chroma_stride;	/* bytes, multiple of 64 */
++	u64 input;		/* bitstream, starting at the frame size word */
++	u64 luma;
++	u64 chroma;
++	u16 fid;		/* job tag, echoed by the engine */
++	bool interlaced;	/* frame header interlace_mode != 0 */
++};
++
+ /* Matrices are 8x8 in raster order, as carried in the ProRes frame header. */
+ extern const u8 *const apr_qmat_luma[APR_QTABLES];
+ extern const u8 *const apr_qmat_chroma[APR_QTABLES];
+@@ -167,6 +183,7 @@ void apr_frame_budget(enum apr_profile profile, u32 width, u32 height,
+ u32 apr_slice_count(u32 width, u32 height, u32 log2_slice);
+ int apr_build_desc(const struct apr_frame *f, u8 *desc);
+ int apr_build_desc_v0(const struct apr_frame *f, u8 *desc);
++int apr_build_decode_desc(const struct apr_dec_frame *f, u8 *desc);
+ int apr_check_output(const u8 *out, size_t capacity, u32 *frame_bytes);
+ extern const struct apri_layout apri_t6041;
+ extern const struct apri_layout apri_t6050;
+-- 
+2.43.0
+

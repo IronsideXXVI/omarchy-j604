@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 24 Nov 2026 03:52:47 +0000
+Subject: [PATCH] media: apple: prores: Parse the ProRes frame header
+ for decode
+
+A decoder must size its CAPTURE planes and pick the descriptor fields
+before it queues a job. Read the frame size, dimensions, chroma format,
+interlace mode and alpha type from the bitstream, rejecting frames that
+do not fit the buffer.
+---
+ .../platform/apple/prores/apple-prores-desc.c | 34 ++++++++++++++++
+ .../platform/apple/prores/apple-prores-test.c | 40 +++++++++++++++++++
+ .../platform/apple/prores/apple-prores.h      | 11 +++++
+ 3 files changed, 85 insertions(+)
+
+diff --git a/drivers/media/platform/apple/prores/apple-prores-desc.c b/drivers/media/platform/apple/prores/apple-prores-desc.c
+index 2cdb5a05314..331a9ec3085 100644
+--- a/drivers/media/platform/apple/prores/apple-prores-desc.c
++++ b/drivers/media/platform/apple/prores/apple-prores-desc.c
+@@ -555,6 +555,40 @@ int apr_build_decode_desc(const struct apr_dec_frame *f, u8 *desc)
+ }
+ EXPORT_SYMBOL_IF_KUNIT(apr_build_decode_desc);
+ 
++/*
++ * ProRes frame: be32 frame size, 'icpf', then the frame header: be16 header
++ * size, be16 version, 4-byte creator, be16 width, be16 height, a flags byte
++ * (chroma_format 7:6, interlace_mode 3:2), aspect/rate, primaries, transfer,
++ * matrix, and a byte whose low nibble is alpha_channel_type.
++ */
++int apr_parse_frame_header(const u8 *buf, size_t len, struct apr_frame_info *info)
++{
++	u32 frame_bytes;
++	u16 hdr_bytes;
++	u8 chroma;
++
++	if (len < 28 || memcmp(buf + 4, "icpf", 4))
++		return -EINVAL;
++	frame_bytes = get_unaligned_be32(buf);
++	hdr_bytes = get_unaligned_be16(buf + 8);
++	if (frame_bytes < 8 + 20 || frame_bytes > len || hdr_bytes < 20 ||
++	    8 + hdr_bytes > frame_bytes)
++		return -EINVAL;
++	chroma = buf[20] >> 6;
++	if (chroma != 2 && chroma != 3)
++		return -EINVAL;
++	info->frame_bytes = frame_bytes;
++	info->width = get_unaligned_be16(buf + 16);
++	info->height = get_unaligned_be16(buf + 18);
++	info->is444 = chroma == 3;
++	info->interlace = (buf[20] >> 2) & 3;
++	info->alpha = buf[25] & 0xf;
++	if (!info->width || !info->height || info->interlace == 3)
++		return -EINVAL;
++	return 0;
++}
++EXPORT_SYMBOL_IF_KUNIT(apr_parse_frame_header);
++
+ /*
+  * A finished frame starts with its big-endian length, which counts the whole
+  * frame, followed by the 'icpf' frame identifier.
+diff --git a/drivers/media/platform/apple/prores/apple-prores-test.c b/drivers/media/platform/apple/prores/apple-prores-test.c
+index 7bd8433ee39..d4c9c9e3d3e 100644
+--- a/drivers/media/platform/apple/prores/apple-prores-test.c
++++ b/drivers/media/platform/apple/prores/apple-prores-test.c
+@@ -652,6 +652,45 @@ static void apr_test_dec_desc_rejects(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, apr_build_decode_desc(&f, d), -EINVAL);
+ }
+ 
++static void apr_test_frame_header(struct kunit *test)
++{
++	/* 3840x2160 4:2:2 progressive, no alpha, 0x94-byte header (ours). */
++	u8 *b = kunit_kzalloc(test, 0x200, GFP_KERNEL);
++	struct apr_frame_info fi;
++
++	KUNIT_ASSERT_NOT_NULL(test, b);
++	put_unaligned_be32(0x200, b);
++	memcpy(b + 4, "icpf", 4);
++	put_unaligned_be16(0x94, b + 8);
++	memcpy(b + 12, "aurr", 4);
++	put_unaligned_be16(3840, b + 16);
++	put_unaligned_be16(2160, b + 18);
++	b[20] = 2 << 6;
++	KUNIT_ASSERT_EQ(test, apr_parse_frame_header(b, 0x200, &fi), 0);
++	KUNIT_EXPECT_EQ(test, fi.frame_bytes, 0x200);
++	KUNIT_EXPECT_EQ(test, fi.width, 3840);
++	KUNIT_EXPECT_EQ(test, fi.height, 2160);
++	KUNIT_EXPECT_FALSE(test, fi.is444);
++	KUNIT_EXPECT_EQ(test, fi.interlace, 0);
++	KUNIT_EXPECT_EQ(test, fi.alpha, 0);
++	/* 4:4:4, bottom field first, 16-bit alpha. */
++	b[20] = 3 << 6 | 2 << 2;
++	b[25] = 2;
++	KUNIT_ASSERT_EQ(test, apr_parse_frame_header(b, 0x200, &fi), 0);
++	KUNIT_EXPECT_TRUE(test, fi.is444);
++	KUNIT_EXPECT_EQ(test, fi.interlace, 2);
++	KUNIT_EXPECT_EQ(test, fi.alpha, 2);
++	/* Rejects: short buffer, bad tag, frame past the buffer, bad chroma. */
++	b[20] = 2 << 6;
++	KUNIT_EXPECT_EQ(test, apr_parse_frame_header(b, 27, &fi), -EINVAL);
++	KUNIT_EXPECT_EQ(test, apr_parse_frame_header(b, 0x1ff, &fi), -EINVAL);
++	b[20] = 1 << 6;
++	KUNIT_EXPECT_EQ(test, apr_parse_frame_header(b, 0x200, &fi), -EINVAL);
++	b[20] = 2 << 6;
++	b[4] = 'x';
++	KUNIT_EXPECT_EQ(test, apr_parse_frame_header(b, 0x200, &fi), -EINVAL);
++}
++
+ static struct kunit_case apr_test_cases[] = {
+ 	KUNIT_CASE(apr_test_qmat_regs),
+ 	KUNIT_CASE(apr_test_dc_scale),
+@@ -663,6 +702,7 @@ static struct kunit_case apr_test_cases[] = {
+ 	KUNIT_CASE(apr_test_desc_v0_profiles),
+ 	KUNIT_CASE(apr_test_dec_desc),
+ 	KUNIT_CASE(apr_test_dec_desc_rejects),
++	KUNIT_CASE(apr_test_frame_header),
+ 	KUNIT_CASE(apr_test_budgets),
+ 	KUNIT_CASE(apr_test_slices),
+ 	KUNIT_CASE(apr_test_output),
+diff --git a/drivers/media/platform/apple/prores/apple-prores.h b/drivers/media/platform/apple/prores/apple-prores.h
+index 9042a84fc34..b514eeebe42 100644
+--- a/drivers/media/platform/apple/prores/apple-prores.h
++++ b/drivers/media/platform/apple/prores/apple-prores.h
+@@ -153,6 +153,16 @@ struct apr_frame {
+ 	u8 matrix;
+ };
+ 
++/* What the decoder needs from a ProRes frame header. */
++struct apr_frame_info {
++	u32 frame_bytes;	/* the whole frame, from its size word */
++	u16 width;
++	u16 height;
++	bool is444;		/* chroma_format 3; 2 is 4:2:2 */
++	u8 interlace;		/* 0 progressive, 1 top field first, 2 bottom */
++	u8 alpha;		/* alpha_channel_type, 0 = none */
++};
++
+ /* One progressive, alpha-less frame decoded into linear Y and CbCr planes. */
+ #define APR_DEC_DESC_BYTES	0x100
+ 
+@@ -184,6 +194,7 @@ u32 apr_slice_count(u32 width, u32 height, u32 log2_slice);
+ int apr_build_desc(const struct apr_frame *f, u8 *desc);
+ int apr_build_desc_v0(const struct apr_frame *f, u8 *desc);
+ int apr_build_decode_desc(const struct apr_dec_frame *f, u8 *desc);
++int apr_parse_frame_header(const u8 *buf, size_t len, struct apr_frame_info *info);
+ int apr_check_output(const u8 *out, size_t capacity, u32 *frame_bytes);
+ extern const struct apri_layout apri_t6041;
+ extern const struct apri_layout apri_t6050;
+-- 
+2.43.0
+

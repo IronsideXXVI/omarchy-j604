@@ -1437,3 +1437,7 @@ The base remains da8e1acf3656. Published 0001–0993 are unchanged. 0994 lets a 
 # Kernel patch numbers: 1.1289 to 1.1307
 
 The base remains da8e1acf3656. Published 0001–0996 are unchanged. 0997 starts a lazily backed parameter buffer at 16 blocks (2 MiB) and doubles a unit's backing when a render reports an overflow (`g16_pb_grow`, default 1); 0998 is a read-only probe of the render UMA pool (`g16_uma_probe`, default 0); 0999 makes the UMA pool seed a runtime switch (`g16_uma_seed_pages`, default 8192, so nothing changes). The patch files are the ones the installed build applied, with the series numbering taken out of their subject lines. Versions 1.1290 to 1.1306 were not released or published.
+
+# Kernel patch numbers: 1.1307 to 1.1348
+
+The base remains da8e1acf3656. Published 0001–0999 are unchanged. 1000–1003 add ProRes decoding on the Apple media engine (the YCbCr decode job, the frame-header parser, a job ring that advances by the size of each job, and the `apple-prores-dec` node beside the encoder); 1004 reverts 0765, the BCM4388-only 20 ms Wi-Fi sleep return, and 1005 sets it for the BCM4378 and BCM4388 together; 1006 keeps the HEVC decoder's line buffers while their size is unchanged. The kernel config turns on lazy RCU with every CPU offloaded (`CONFIG_RCU_NOCB_CPU_DEFAULT_ALL=y`, `CONFIG_RCU_LAZY=y`). The patch files are the ones the installed build applied, with the series numbering taken out of their subject lines. Versions 1.1308 to 1.1347 were not released or published.

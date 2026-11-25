@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Tue, 24 Nov 2026 22:03:35 +0000
+Subject: [PATCH] media: apple: avd: hevc: reuse line buffers of
+ unchanged size
+
+avd_hevc_alloc_scratch() runs for every picture and reallocates each
+per-bank line buffer with dma_alloc_coherent(), freeing the previous
+one. The sizes depend only on the SPS/PPS, so a steady stream gets the
+same allocations on every picture, and every map and unmap on the
+decoder's DART ends in a TLB flush.
+
+Keep a buffer while its size is unchanged and clear it for the new
+picture, as the AV1 path already does for its work buffers.
+
+On a 4K60 HEVC Main10 stream of 1500 frames this takes the DART flush
+pairs from 10.2 to 0.12 per frame and the scratch setup from 125.6 to
+3.3 us per frame. Decode wall time goes from 1394.0 to 1387.3 us per
+frame (medians of 4 interleaved runs each; HEVC Main 1382.7 to 1374.3),
+and the first 120 frames of both streams match a software decode.
+---
+ drivers/media/platform/apple/avd/avd-hevc.c | 61 +++++++++++++--------
+ 1 file changed, 39 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/media/platform/apple/avd/avd-hevc.c b/drivers/media/platform/apple/avd/avd-hevc.c
+index 5fdea31a904..0e332efc9f2 100644
+--- a/drivers/media/platform/apple/avd/avd-hevc.c
++++ b/drivers/media/platform/apple/avd/avd-hevc.c
+@@ -1261,6 +1261,23 @@ static void avd_hevc_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src_buf,
+ 	buf->bank = 0;
+ }
+ 
++/*
++ * The per-bank line buffers (ip/mv/lf/az above, lf/sw left) are sized from
++ * the SPS/PPS only, so a steady stream asks for the same sizes on every
++ * picture. Keep a buffer while its size is unchanged and clear it, which
++ * gives the hardware the zeroed contents a fresh dma_alloc_coherent()
++ * buffer had, without a DART map and unmap per buffer and picture.
++ */
++static int avd_hevc_scratch(struct avd_dev *avd, struct avd_buf *buf,
++			    size_t size)
++{
++	if (buf->cpu && buf->size == size) {
++		memset(buf->cpu, 0, size);
++		return 0;
++	}
++	return avd_buf_alloc(avd, buf, size);
++}
++
+ static int avd_hevc_alloc_scratch(struct avd_ctx *ctx, struct avd_hevc_run *run)
+ {
+ 	struct avd_hevc_ctx *hevc_ctx = ctx->priv;
+@@ -1296,52 +1313,52 @@ static int avd_hevc_alloc_scratch(struct avd_ctx *ctx, struct avd_hevc_run *run)
+ 				  tile_info->row_height[i] :
+ 				  max_row;
+ 
+-	ret = avd_buf_alloc(avd, &hevc_ctx->b->bufs.ip_above,
+-			    ((max_col * max_cu_width) / 4) * bit_depth);
++	ret = avd_hevc_scratch(avd, &hevc_ctx->b->bufs.ip_above,
++			       ((max_col * max_cu_width) / 4) * bit_depth);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = avd_buf_alloc(avd, &hevc_ctx->b->bufs.mv_above_info,
+-			    ((max_col * max_cu_width) / 16) * 20);
++	ret = avd_hevc_scratch(avd, &hevc_ctx->b->bufs.mv_above_info,
++			       ((max_col * max_cu_width) / 16) * 20);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = avd_buf_alloc(avd, &hevc_ctx->b->bufs.lf_above,
+-			    DIV_ROUND_UP(w, 16) * bit_depth * (10 + 6) +
+-				    (cols - 1) * 256);
++	ret = avd_hevc_scratch(avd, &hevc_ctx->b->bufs.lf_above,
++			       DIV_ROUND_UP(w, 16) * bit_depth * (10 + 6) +
++				       (cols - 1) * 256);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = avd_buf_alloc(avd, &hevc_ctx->b->bufs.lf_above_info,
+-			    DIV_ROUND_UP(w + 7, 16) * 36 + cols * 128);
++	ret = avd_hevc_scratch(avd, &hevc_ctx->b->bufs.lf_above_info,
++			       DIV_ROUND_UP(w + 7, 16) * 36 + cols * 128);
+ 	if (ret)
+ 		return ret;
+ 
+ 	if (pps->flags & V4L2_HEVC_PPS_FLAG_TILES_ENABLED) {
+-		ret = avd_buf_alloc(avd, &hevc_ctx->b->bufs.lf_left,
+-				    ((max_row * max_cu_width) / 4) * 36 +
+-					    144 /* why? */);
++		ret = avd_hevc_scratch(avd, &hevc_ctx->b->bufs.lf_left,
++				       ((max_row * max_cu_width) / 4) * 36 +
++					       144 /* why? */);
+ 		if (ret)
+ 			return ret;
+-		ret = avd_buf_alloc(avd, &hevc_ctx->b->bufs.lf_left_info,
+-				    ((max_row * max_cu_width) / 4) * 9);
++		ret = avd_hevc_scratch(avd, &hevc_ctx->b->bufs.lf_left_info,
++				       ((max_row * max_cu_width) / 4) * 9);
+ 		if (ret)
+ 			return ret;
+ 
+-		ret = avd_buf_alloc(avd, &hevc_ctx->b->bufs.az_above,
+-				    /* not sure if its cols or rows */
+-				    DIV_ROUND_UP(w, 64) * 144 +
+-					    (cols - 1) * 128);
++		ret = avd_hevc_scratch(avd, &hevc_ctx->b->bufs.az_above,
++				       /* not sure if its cols or rows */
++				       DIV_ROUND_UP(w, 64) * 144 +
++					       (cols - 1) * 128);
+ 		if (ret)
+ 			return ret;
+ 
+-		ret = avd_buf_alloc(avd, &hevc_ctx->b->bufs.sw_left,
+-				    ((max_row * max_cu_width) / 4) * 216);
++		ret = avd_hevc_scratch(avd, &hevc_ctx->b->bufs.sw_left,
++				       ((max_row * max_cu_width) / 4) * 216);
+ 		if (ret)
+ 			return ret;
+ 	} else {
+-		ret = avd_buf_alloc(avd, &hevc_ctx->b->bufs.az_above,
+-				    DIV_ROUND_UP(w + 7, 16) * 4 * bit_depth);
++		ret = avd_hevc_scratch(avd, &hevc_ctx->b->bufs.az_above,
++				       DIV_ROUND_UP(w + 7, 16) * 4 * bit_depth);
+ 		if (ret)
+ 			return ret;
+ 	}
+-- 
+2.43.0
+
