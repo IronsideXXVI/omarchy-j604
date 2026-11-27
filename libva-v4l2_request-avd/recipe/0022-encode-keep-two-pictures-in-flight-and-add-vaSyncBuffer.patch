@@ -1,0 +1,672 @@
+Subject: [PATCH] encode: keep two pictures in flight and add vaSyncBuffer
+
+EndPicture queued the input, waited for the coded picture and for the input
+to come back, so the encoder sat idle from the end of one picture until the
+client had read it, uploaded the next input and called EndPicture again.
+Queue the picture and return instead; collect it when the client syncs the
+coded buffer (new vaSyncBuffer, vaMapBuffer), syncs or reads the input
+surface, or when a later EndPicture needs its CAPTURE buffer (two in
+flight, one per CAPTURE buffer). FFmpeg switches to its async path (default
+async_depth 2) only when vaSyncBuffer is implemented.
+Rate control, forced key frames and a new geometry first collect what is
+queued. Contexts beyond the first 8 encoders keep one picture at a time.
+---
+--- a/src/api.c
++++ b/src/api.c
+@@ -44,6 +44,10 @@
+     (va, id, buffers, n))
+ LOCKED(EndPicture, (VADriverContextP va, VAContextID id), (va, id))
+ LOCKED(SyncSurface, (VADriverContextP va, VASurfaceID id), (va, id))
++#if VA_CHECK_VERSION(1, 9, 0)
++LOCKED(SyncBuffer, (VADriverContextP va, VABufferID id, uint64_t timeout),
++    (va, id, timeout))
++#endif
+ LOCKED(QuerySurfaceStatus, (VADriverContextP va, VASurfaceID id, VASurfaceStatus *status),
+     (va, id, status))
+ LOCKED(ExportSurfaceHandle, (VADriverContextP va, VASurfaceID id, uint32_t type,
+@@ -66,6 +70,9 @@
+     WRAP(RenderPicture);
+     WRAP(EndPicture);
+     WRAP(SyncSurface);
++#if VA_CHECK_VERSION(1, 9, 0)
++    WRAP(SyncBuffer);
++#endif
+     WRAP(QuerySurfaceStatus);
+     WRAP(ExportSurfaceHandle);
+     WRAP(DeriveImage);
+--- a/src/buffer.c
++++ b/src/buffer.c
+@@ -153,11 +153,29 @@
+ 	buffer = V4L2R_BUFFER_GET(drv, buf_id);
+ 	if (!buffer)
+ 		return VA_STATUS_ERROR_INVALID_BUFFER;
++	/* A coded buffer is written when its queued picture is collected. */
++	if (buffer->type == VAEncCodedBufferType) {
++		VAStatus status = v4l2r_enc_sync_coded(drv, buf_id,
++						       VA_TIMEOUT_INFINITE);
++
++		if (status != VA_STATUS_SUCCESS)
++			return status;
++	}
+ 
+ 	*pbuf = buffer->data;
+ 	return VA_STATUS_SUCCESS;
+ }
+ 
++#if VA_CHECK_VERSION(1, 9, 0)
++/* Encode: wait for the queued picture writing this coded buffer. Other
++ * buffers are always ready. */
++VAStatus v4l2r_SyncBuffer(VADriverContextP va_ctx, VABufferID buf_id,
++			  uint64_t timeout_ns)
++{
++	return v4l2r_enc_sync_coded(v4l2r_driver(va_ctx), buf_id, timeout_ns);
++}
++#endif
++
+ VAStatus v4l2r_UnmapBuffer(VADriverContextP va_ctx, VABufferID buf_id)
+ {
+ 	V4L2R_OVERLAP_UNLOCKED();
+@@ -177,6 +195,9 @@
+ 	struct v4l2r_driver *drv = v4l2r_driver(va_ctx);
+ 	struct v4l2r_buffer *buffer;
+ 
++	/* No queued picture may still write into it. */
++	v4l2r_enc_sync_coded(drv, buf_id, VA_TIMEOUT_INFINITE);
++
+ 	pthread_mutex_lock(&drv->mutex);
+ 	buffer = V4L2R_BUFFER(drv, buf_id);
+ 	if (!buffer || buffer->image_owned) {
+--- a/src/driver.c
++++ b/src/driver.c
+@@ -1077,6 +1077,9 @@
+ 	vtable->vaRenderPicture = v4l2r_RenderPicture;
+ 	vtable->vaEndPicture = v4l2r_EndPicture;
+ 	vtable->vaSyncSurface = v4l2r_SyncSurface;
++#if VA_CHECK_VERSION(1, 9, 0)
++	vtable->vaSyncBuffer = v4l2r_SyncBuffer;
++#endif
+ 	vtable->vaQuerySurfaceAttributes = v4l2r_QuerySurfaceAttributes;
+ 	vtable->vaQuerySurfaceStatus = v4l2r_QuerySurfaceStatus;
+ 	vtable->vaPutSurface = v4l2r_PutSurface;
+--- a/src/encode.c
++++ b/src/encode.c
+@@ -26,6 +26,7 @@
+ #include <poll.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <stdatomic.h>
+ #include <string.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+@@ -61,6 +62,19 @@
+ #define V4L2R_CID_H264_DEBLOCKING_CONTROL_PRESENT	(V4L2R_CID_AVE_BASE + 6)
+ #define V4L2R_CID_HEVC_SCALING_LIST_ENABLED	(V4L2R_CID_AVE_BASE + 7)
+ #define V4L2R_ENC_TIMEOUT_MS		2000
++#define V4L2R_ENC_TIMEOUT_NS		((uint64_t)V4L2R_ENC_TIMEOUT_MS * 1000000)
++
++/*
++ * Pictures in flight. EndPicture queues the input and returns; the coded
++ * data is collected when the client syncs the coded buffer (vaSyncBuffer,
++ * vaMapBuffer) or the input surface, or when a later EndPicture needs the
++ * slot. One per CAPTURE buffer, so the encoder starts the next picture
++ * while the client is still busy with the previous one.
++ */
++#define V4L2R_ENC_IN_FLIGHT		V4L2R_ENC_CAPTURE_BUFFERS
++/* Encoder contexts that may keep pictures queued (the others do one at a
++ * time, as before). */
++#define V4L2R_ENC_LIVE_MAX		8
+ 
+ struct v4l2r_enc {
+ 	int fd;
+@@ -95,7 +109,18 @@
+ 	ino_t out_ino[V4L2R_ENC_OUTPUT_BUFFERS];
+ 	uint64_t out_used[V4L2R_ENC_OUTPUT_BUFFERS];
+ 	unsigned int nb_outputs;
+-	uint64_t frames;
++	uint64_t frames;		/* pictures queued since the instance opened */
++
++	/* Queued pictures, oldest first. */
++	struct {
++		struct v4l2r_buffer *coded;
++		struct v4l2r_surface *input;
++		unsigned int out_index;
++		uint64_t frame;
++	} pend[V4L2R_ENC_IN_FLIGHT];
++	unsigned int npend;
++	/* Listed in enc_live: pictures may stay queued after EndPicture. */
++	bool queue;
+ 
+ 	/* The picture being assembled. */
+ 	struct v4l2r_surface *input;
+@@ -312,6 +337,49 @@
+ 
+ /* --- context --- */
+ 
++/* Pictures queued in all encoder contexts: a fast exit for the sync hooks. */
++static _Atomic unsigned int enc_inflight;
++static pthread_mutex_t enc_live_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct v4l2r_context *enc_live[V4L2R_ENC_LIVE_MAX];
++
++static VAStatus enc_drain(struct v4l2r_context *ctx);
++
++static bool enc_live_add(struct v4l2r_context *ctx)
++{
++	bool added = false;
++
++	pthread_mutex_lock(&enc_live_lock);
++	for (unsigned int i = 0; i < V4L2R_ENC_LIVE_MAX && !added; i++)
++		if (!enc_live[i]) {
++			enc_live[i] = ctx;
++			added = true;
++		}
++	pthread_mutex_unlock(&enc_live_lock);
++	return added;
++}
++
++static void enc_live_remove(struct v4l2r_context *ctx)
++{
++	pthread_mutex_lock(&enc_live_lock);
++	for (unsigned int i = 0; i < V4L2R_ENC_LIVE_MAX; i++)
++		if (enc_live[i] == ctx)
++			enc_live[i] = NULL;
++	pthread_mutex_unlock(&enc_live_lock);
++}
++
++/* A queued picture that will not complete: an empty coded buffer, and the
++ * input surface free again. */
++static void enc_fail_picture(struct v4l2r_buffer *coded,
++			     struct v4l2r_surface *input)
++{
++	VACodedBufferSegment *seg = coded->data;
++
++	memset(seg, 0, sizeof(*seg));
++	seg->buf = (uint8_t *)coded->data + sizeof(*seg);
++	input->status = VASurfaceReady;
++}
++
++
+ VAStatus v4l2r_enc_create(struct v4l2r_context *ctx,
+ 			  const struct v4l2r_config *config)
+ {
+@@ -339,6 +407,7 @@
+ 	enc->bitrate = 8000000;
+ 	enc->fps_num = 30;
+ 	enc->fps_den = 1;
++	enc->queue = enc_live_add(ctx);
+ 	ctx->enc = enc;
+ 	return VA_STATUS_SUCCESS;
+ }
+@@ -353,6 +422,10 @@
+ 	memset(enc->out_dev, 0, sizeof(enc->out_dev));
+ 	memset(enc->out_ino, 0, sizeof(enc->out_ino));
+ 	memset(enc->out_used, 0, sizeof(enc->out_used));
++	for (unsigned int i = 0; i < enc->npend; i++)
++		enc_fail_picture(enc->pend[i].coded, enc->pend[i].input);
++	atomic_fetch_sub(&enc_inflight, enc->npend);
++	enc->npend = 0;
+ 	if (enc->fd >= 0) {
+ 		close(enc->fd);
+ 		enc->fd = -1;
+@@ -364,6 +437,11 @@
+ {
+ 	if (!ctx->enc)
+ 		return;
++	/* Deliver what is still queued (a failure empties those buffers). */
++	pthread_mutex_lock(&ctx->mutex);
++	enc_drain(ctx);
++	pthread_mutex_unlock(&ctx->mutex);
++	enc_live_remove(ctx);
+ 	enc_teardown(ctx->enc);
+ 	free(ctx->enc);
+ 	ctx->enc = NULL;
+@@ -690,6 +768,16 @@
+ 	return ret;
+ }
+ 
++/* The open instance already takes this input as it is. */
++static bool enc_configured(const struct v4l2r_enc *enc,
++			   const struct v4l2r_frame_view *in,
++			   uint32_t vis_w, uint32_t vis_h)
++{
++	return enc->fd >= 0 && enc->width == in->width && enc->height == in->height &&
++	       enc->pitch == in->pitch && enc->pixelformat == in->pixelformat &&
++	       enc->crop_w == vis_w && enc->crop_h == vis_h;
++}
++
+ static VAStatus enc_configure(struct v4l2r_context *ctx,
+ 			      const struct v4l2r_frame_view *in,
+ 			      uint32_t vis_w, uint32_t vis_h)
+@@ -701,9 +789,7 @@
+ 	struct v4l2_streamparm parm = {0};
+ 	enum v4l2_buf_type type;
+ 
+-	if (enc->fd >= 0 && enc->width == in->width && enc->height == in->height &&
+-	    enc->pitch == in->pitch && enc->pixelformat == in->pixelformat &&
+-	    enc->crop_w == vis_w && enc->crop_h == vis_h)
++	if (enc_configured(enc, in, vis_w, vis_h))
+ 		return VA_STATUS_SUCCESS;
+ 
+ 	enc_teardown(enc);
+@@ -883,28 +969,44 @@
+ 	}
+ }
+ 
++static bool enc_output_queued(const struct v4l2r_enc *enc, unsigned int idx)
++{
++	for (unsigned int i = 0; i < enc->npend; i++)
++		if (enc->pend[i].out_index == idx)
++			return true;
++	return false;
++}
++
+ /*
+  * The OUTPUT index for an input dma-buf: the one it was last queued on, so
+  * vb2 reuses that attachment and mapping, else the least recently used.
+- * Only one OUTPUT buffer is ever queued (end_picture waits for it), so
+- * every index is free here.
++ * Indexes of queued pictures are skipped; end_picture keeps one free.
+  */
+ static unsigned int enc_output_index(struct v4l2r_enc *enc, int dmabuf_fd)
+ {
+-	unsigned int idx = 0;
++	unsigned int idx = enc->nb_outputs;
+ 	struct stat st;
+ 
+-	if (enc->nb_outputs <= 1 || fstat(dmabuf_fd, &st) < 0)
++	if (enc->nb_outputs <= 1)
+ 		return 0;
++	if (fstat(dmabuf_fd, &st) < 0) {
++		for (idx = 0; idx < enc->nb_outputs - 1 && enc_output_queued(enc, idx); idx++)
++			;
++		return idx;
++	}
+ 	for (unsigned int i = 0; i < enc->nb_outputs; i++) {
++		if (enc_output_queued(enc, i))
++			continue;
+ 		if (enc->out_used[i] && enc->out_dev[i] == st.st_dev &&
+ 		    enc->out_ino[i] == st.st_ino) {
+ 			idx = i;
+ 			goto found;
+ 		}
+-		if (enc->out_used[i] < enc->out_used[idx])
++		if (idx == enc->nb_outputs || enc->out_used[i] < enc->out_used[idx])
+ 			idx = i;
+ 	}
++	if (idx == enc->nb_outputs)
++		idx = 0;	/* not reached: npend < nb_outputs here */
+ 	enc->out_dev[idx] = st.st_dev;
+ 	enc->out_ino[idx] = st.st_ino;
+ found:
+@@ -912,20 +1014,181 @@
+ 	return idx;
+ }
+ 
++/*
++ * Collect the oldest queued picture: its coded data into its coded buffer,
++ * the CAPTURE buffer back to the encoder, then its input surface back.
++ * ctx->mutex held. With soft set, a deadline that passes before the coded
++ * picture is there returns VA_STATUS_ERROR_TIMEDOUT and leaves it queued.
++ * The m2m queue runs pictures in the order they were queued.
++ */
++static VAStatus enc_complete_one(struct v4l2r_context *ctx, uint64_t deadline,
++				 bool soft)
++{
++	struct v4l2r_enc *enc = ctx->enc;
++	struct v4l2r_buffer *coded;
++	VACodedBufferSegment *seg;
++	struct v4l2_plane plane;
++	struct v4l2_buffer b;
++	size_t capacity;
++	int ret;
++
++	if (!enc->npend)
++		return VA_STATUS_SUCCESS;
++	coded = enc->pend[0].coded;
++
++	memset(&plane, 0, sizeof(plane));
++	b = (struct v4l2_buffer) {
++		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
++		.memory = V4L2_MEMORY_MMAP,
++		.length = 1,
++		.m.planes = &plane,
++	};
++	ret = dqbuf_wait(enc->fd, &b, deadline);
++	if (ret == -ETIMEDOUT && soft)
++		return VA_STATUS_ERROR_TIMEDOUT;
++	if (ret < 0 || b.index >= enc->nb_captures || (b.flags & V4L2_BUF_FLAG_ERROR)) {
++		v4l2r_diag(ctx, V4L2R_DIAG_LEVEL_ERROR,
++			   ret == -ETIMEDOUT ? V4L2R_DIAG_TIMEOUT : V4L2R_DIAG_KERNEL,
++			   "enc-frame", ret, "no coded picture for frame %llu",
++			   (unsigned long long)enc->pend[0].frame);
++		return VA_STATUS_ERROR_OPERATION_FAILED;
++	}
++
++	/* Coded buffers are a VACodedBufferSegment followed by the data. */
++	seg = coded->data;
++	capacity = v4l2r_buffer_bytes(coded) - sizeof(*seg);
++	memset(seg, 0, sizeof(*seg));
++	seg->buf = (uint8_t *)coded->data + sizeof(*seg);
++	seg->size = plane.bytesused - plane.data_offset;
++	if (seg->size > capacity) {
++		seg->size = capacity;
++		seg->status = VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK;
++	}
++	memcpy(seg->buf, (uint8_t *)enc->cap_map[b.index] + plane.data_offset, seg->size);
++
++	/* Give the capture buffer back, then get the input surface back. */
++	plane.bytesused = 0;
++	ioctl(enc->fd, VIDIOC_QBUF, &b);
++	memset(&plane, 0, sizeof(plane));
++	b = (struct v4l2_buffer) {
++		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
++		.memory = V4L2_MEMORY_DMABUF,
++		.length = 1,
++		.m.planes = &plane,
++	};
++	if (dqbuf_wait(enc->fd, &b, v4l2r_now_ns() + V4L2R_ENC_TIMEOUT_NS) < 0)
++		return VA_STATUS_ERROR_OPERATION_FAILED;
++
++	enc->pend[0].input->status = VASurfaceReady;
++	enc->pend[0].input->decode_status = VA_STATUS_SUCCESS;
++	enc->npend--;
++	memmove(&enc->pend[0], &enc->pend[1], enc->npend * sizeof(enc->pend[0]));
++	atomic_fetch_sub(&enc_inflight, 1);
++	return VA_STATUS_SUCCESS;
++}
++
++/* Collect every queued picture. ctx->mutex held. */
++static VAStatus enc_drain(struct v4l2r_context *ctx)
++{
++	VAStatus status = VA_STATUS_SUCCESS;
++
++	while (ctx->enc && ctx->enc->npend && status == VA_STATUS_SUCCESS)
++		status = enc_complete_one(ctx, v4l2r_now_ns() + V4L2R_ENC_TIMEOUT_NS,
++					  false);
++	return status;
++}
++
++/* Whether a queued picture writes coded or reads input. */
++static bool enc_pending(const struct v4l2r_enc *enc,
++			const struct v4l2r_buffer *coded,
++			const struct v4l2r_surface *input)
++{
++	for (unsigned int i = 0; i < enc->npend; i++)
++		if ((coded && enc->pend[i].coded == coded) ||
++		    (input && enc->pend[i].input == input))
++			return true;
++	return false;
++}
++
++/*
++ * Collect queued pictures, oldest first, until none writes coded or reads
++ * input. A timeout under the hardware one is the client's: it may pass.
++ * ctx->mutex held.
++ */
++static VAStatus enc_sync_locked(struct v4l2r_context *ctx,
++				const struct v4l2r_buffer *coded,
++				const struct v4l2r_surface *input,
++				uint64_t timeout_ns)
++{
++	bool soft = timeout_ns < V4L2R_ENC_TIMEOUT_NS;
++	uint64_t deadline = soft ? v4l2r_now_ns() + timeout_ns : 0;
++	VAStatus status = VA_STATUS_SUCCESS;
++
++	while (ctx->enc && enc_pending(ctx->enc, coded, input)) {
++		status = enc_complete_one(ctx, soft ? deadline :
++					  v4l2r_now_ns() + V4L2R_ENC_TIMEOUT_NS, soft);
++		if (status != VA_STATUS_SUCCESS) {
++			if (status != VA_STATUS_ERROR_TIMEDOUT)
++				enc_teardown(ctx->enc);
++			break;
++		}
++	}
++	return status;
++}
++
++VAStatus v4l2r_enc_sync_surface(struct v4l2r_surface *surface,
++				uint64_t timeout_ns)
++{
++	struct v4l2r_context *live[V4L2R_ENC_LIVE_MAX];
++	VAStatus status = VA_STATUS_SUCCESS;
++
++	if (!atomic_load(&enc_inflight))
++		return VA_STATUS_SUCCESS;
++	pthread_mutex_lock(&enc_live_lock);
++	memcpy(live, enc_live, sizeof(live));
++	pthread_mutex_unlock(&enc_live_lock);
++	for (unsigned int i = 0; i < V4L2R_ENC_LIVE_MAX && status == VA_STATUS_SUCCESS; i++) {
++		if (!live[i])
++			continue;
++		pthread_mutex_lock(&live[i]->mutex);
++		status = enc_sync_locked(live[i], NULL, surface, timeout_ns);
++		pthread_mutex_unlock(&live[i]->mutex);
++	}
++	return status;
++}
++
++VAStatus v4l2r_enc_sync_coded(struct v4l2r_driver *drv, VABufferID buf_id,
++			      uint64_t timeout_ns)
++{
++	struct v4l2r_context *ctx;
++	struct v4l2r_buffer *coded;
++	VAStatus status;
++
++	coded = V4L2R_BUFFER_GET(drv, buf_id);
++	if (!coded)
++		return VA_STATUS_ERROR_INVALID_BUFFER;
++	if (coded->type != VAEncCodedBufferType || !atomic_load(&enc_inflight))
++		return VA_STATUS_SUCCESS;
++	ctx = V4L2R_CONTEXT_GET(drv, coded->context_id);
++	if (!ctx || !ctx->enc)
++		return VA_STATUS_SUCCESS;
++	pthread_mutex_lock(&ctx->mutex);
++	status = enc_sync_locked(ctx, coded, NULL, timeout_ns);
++	pthread_mutex_unlock(&ctx->mutex);
++	return status;
++}
++
+ VAStatus v4l2r_enc_end_picture(struct v4l2r_context *ctx)
+ {
+ 	struct v4l2r_enc *enc = ctx->enc;
+ 	struct v4l2r_driver *drv = ctx->drv;
+ 	struct v4l2r_frame_view view;
+ 	struct v4l2r_buffer *coded;
+-	VACodedBufferSegment *seg;
+ 	struct v4l2_plane plane;
+ 	struct v4l2_buffer b;
+-	uint64_t deadline;
+-	size_t capacity;
+-	uint32_t rows;
++	uint32_t rows, vis_w, vis_h;
++	bool force_key;
+ 	VAStatus status;
+-	int ret;
+ 
+ 	if (!enc->have_picture || !enc->input)
+ 		return VA_STATUS_ERROR_INVALID_PARAMETER;
+@@ -934,7 +1197,12 @@
+ 	if (!coded || coded->type != VAEncCodedBufferType ||
+ 	    coded->context_id != ctx->id)
+ 		return VA_STATUS_ERROR_INVALID_BUFFER;
++	/* A coded buffer reused before its last picture was collected. */
++	status = v4l2r_enc_sync_coded(drv, enc->coded_buf, VA_TIMEOUT_INFINITE);
++	if (status != VA_STATUS_SUCCESS)
++		return status;
+ 
++	/* Also collects a queued picture still reading this input. */
+ 	status = v4l2r_surface_ready(enc->input);
+ 	if (status != VA_STATUS_SUCCESS)
+ 		return status;
+@@ -943,25 +1211,45 @@
+ 		return status;
+ 	if (view.nb_planes != 1 || view.pixelformat != V4L2_PIX_FMT_NV12)
+ 		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
++	vis_w = enc->input->width && enc->input->width <= view.width ?
++		enc->input->width : view.width;
++	vis_h = enc->input->height && enc->input->height <= view.height ?
++		enc->input->height : view.height;
+ 
+ 	pthread_mutex_lock(&ctx->mutex);
+ 
+-	status = enc_configure(ctx, &view,
+-			       enc->input->width && enc->input->width <= view.width ?
+-				enc->input->width : view.width,
+-			       enc->input->height && enc->input->height <= view.height ?
+-				enc->input->height : view.height);
++	/* The encoder places its periodic IDRs itself; force the others. */
++	force_key = enc->idr && enc->frames &&
++		    (!enc->intra_period || enc->frames % enc->intra_period);
++	/* A new geometry, new rate control or a forced key frame must not
++	 * reach a picture that is already queued: collect those first. */
++	if (enc->npend && (enc->rc_dirty || force_key ||
++			   !enc_configured(enc, &view, vis_w, vis_h))) {
++		status = enc_drain(ctx);
++		if (status != VA_STATUS_SUCCESS)
++			goto done;
++	}
++
++	status = enc_configure(ctx, &view, vis_w, vis_h);
+ 	if (status != VA_STATUS_SUCCESS)
+ 		goto done;
+ 	if (enc->rc_dirty && enc_apply_rc(enc) < 0) {
+ 		status = VA_STATUS_ERROR_OPERATION_FAILED;
+ 		goto done;
+ 	}
+-	/* The encoder places its periodic IDRs itself; force the others. */
+-	if (enc->idr && enc->frames &&
+-	    (!enc->intra_period || enc->frames % enc->intra_period))
++	if (force_key && enc->frames)
+ 		set_ctrl(enc->fd, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 1);
+ 
++	/* A free CAPTURE buffer and OUTPUT index for this picture. */
++	while (enc->npend && (!enc->queue || enc->npend >= V4L2R_ENC_IN_FLIGHT ||
++			      enc->npend >= enc->nb_captures ||
++			      enc->npend >= enc->nb_outputs)) {
++		status = enc_complete_one(ctx, v4l2r_now_ns() + V4L2R_ENC_TIMEOUT_NS,
++					  false);
++		if (status != VA_STATUS_SUCCESS)
++			goto done;
++	}
++
+ 	/* Luma rows then chroma rows at the surface pitch: the encoder takes
+ 	 * the line size from the payload and repacks a different one. */
+ 	rows = view.height + (view.height + 1) / 2;
+@@ -983,55 +1271,17 @@
+ 		goto done;
+ 	}
+ 
+-	deadline = v4l2r_now_ns() + (uint64_t)V4L2R_ENC_TIMEOUT_MS * 1000000;
+-	memset(&plane, 0, sizeof(plane));
+-	b = (struct v4l2_buffer) {
+-		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+-		.memory = V4L2_MEMORY_MMAP,
+-		.length = 1,
+-		.m.planes = &plane,
+-	};
+-	ret = dqbuf_wait(enc->fd, &b, deadline);
+-	if (ret < 0 || b.index >= enc->nb_captures || (b.flags & V4L2_BUF_FLAG_ERROR)) {
+-		v4l2r_diag(ctx, V4L2R_DIAG_LEVEL_ERROR,
+-			   ret == -ETIMEDOUT ? V4L2R_DIAG_TIMEOUT : V4L2R_DIAG_KERNEL,
+-			   "enc-frame", ret, "no coded picture for frame %llu",
+-			   (unsigned long long)enc->frames);
+-		status = VA_STATUS_ERROR_OPERATION_FAILED;
+-		goto done;
+-	}
+-
+-	/* Coded buffers are a VACodedBufferSegment followed by the data. */
+-	seg = coded->data;
+-	capacity = v4l2r_buffer_bytes(coded) - sizeof(*seg);
+-	memset(seg, 0, sizeof(*seg));
+-	seg->buf = (uint8_t *)coded->data + sizeof(*seg);
+-	seg->size = plane.bytesused - plane.data_offset;
+-	if (seg->size > capacity) {
+-		seg->size = capacity;
+-		seg->status = VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK;
+-	}
+-	memcpy(seg->buf, (uint8_t *)enc->cap_map[b.index] + plane.data_offset, seg->size);
+-
+-	/* Give the capture buffer back, then get the input surface back. */
+-	plane.bytesused = 0;
+-	ioctl(enc->fd, VIDIOC_QBUF, &b);
+-	memset(&plane, 0, sizeof(plane));
+-	b = (struct v4l2_buffer) {
+-		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+-		.memory = V4L2_MEMORY_DMABUF,
+-		.length = 1,
+-		.m.planes = &plane,
+-	};
+-	if (dqbuf_wait(enc->fd, &b, deadline) < 0) {
+-		status = VA_STATUS_ERROR_OPERATION_FAILED;
+-		goto done;
+-	}
+-
++	enc->pend[enc->npend].coded = coded;
++	enc->pend[enc->npend].input = enc->input;
++	enc->pend[enc->npend].out_index = b.index;
++	enc->pend[enc->npend].frame = enc->frames;
++	enc->npend++;
++	atomic_fetch_add(&enc_inflight, 1);
+ 	enc->frames++;
+-	enc->input->status = VASurfaceReady;
+-	enc->input->decode_status = VA_STATUS_SUCCESS;
+-	status = VA_STATUS_SUCCESS;
++	enc->input->status = VASurfaceRendering;
++
++	/* Not listed in enc_live: one picture at a time, as before. */
++	status = enc->queue ? VA_STATUS_SUCCESS : enc_drain(ctx);
+ 
+ done:
+ 	if (status != VA_STATUS_SUCCESS)
+--- a/src/surface.c
++++ b/src/surface.c
+@@ -200,6 +200,11 @@
+ 		*status = VASurfaceRendering;
+ 		return VA_STATUS_SUCCESS;
+ 	}
++	/* Still read by a queued encode. */
++	if (v4l2r_enc_sync_surface(surface, 0) == VA_STATUS_ERROR_TIMEDOUT) {
++		*status = VASurfaceRendering;
++		return VA_STATUS_SUCCESS;
++	}
+ 	VAStatus flush_status = v4l2r_flush_surface(surface);
+ 	if (flush_status != VA_STATUS_SUCCESS)
+ 		return flush_status;
+@@ -333,6 +338,11 @@
+ 	    surface->ctx->pic.target == surface)
+ 		return VA_STATUS_ERROR_SURFACE_BUSY;
+ 
++	/* An encoder may still read it: EndPicture queues and returns. */
++	status = v4l2r_enc_sync_surface(surface, VA_TIMEOUT_INFINITE);
++	if (status != VA_STATUS_SUCCESS)
++		return status;
++
+ 	status = v4l2r_flush_surface(surface);
+ 	if (status != VA_STATUS_SUCCESS)
+ 		return status;
+--- a/src/v4l2_request.h
++++ b/src/v4l2_request.h
+@@ -926,6 +926,13 @@
+ VAStatus v4l2r_enc_render_buffer(struct v4l2r_context *ctx,
+ 				 struct v4l2r_buffer *buf);
+ VAStatus v4l2r_enc_end_picture(struct v4l2r_context *ctx);
++/* EndPicture queues the picture and returns. Wait up to timeout_ns for the
++ * queued encodes reading this input surface / writing this coded buffer;
++ * VA_STATUS_ERROR_TIMEDOUT when a client timeout passes first. */
++VAStatus v4l2r_enc_sync_surface(struct v4l2r_surface *surface,
++				uint64_t timeout_ns);
++VAStatus v4l2r_enc_sync_coded(struct v4l2r_driver *drv, VABufferID buf_id,
++			      uint64_t timeout_ns);
+ 
+ VAStatus v4l2r_vpp_create(struct v4l2r_context *ctx);
+ void v4l2r_vpp_destroy(struct v4l2r_context *ctx);
+@@ -1059,6 +1066,10 @@
+ 			    VABufferID *buf_id);
+ VAStatus v4l2r_BufferSetNumElements(VADriverContextP va_ctx, VABufferID buf_id,
+ 				    unsigned int num_elements);
++#if VA_CHECK_VERSION(1, 9, 0)
++VAStatus v4l2r_SyncBuffer(VADriverContextP va_ctx, VABufferID buf_id,
++			  uint64_t timeout_ns);
++#endif
+ VAStatus v4l2r_MapBuffer(VADriverContextP va_ctx, VABufferID buf_id,
+ 			 void **pbuf);
+ VAStatus v4l2r_UnmapBuffer(VADriverContextP va_ctx, VABufferID buf_id);

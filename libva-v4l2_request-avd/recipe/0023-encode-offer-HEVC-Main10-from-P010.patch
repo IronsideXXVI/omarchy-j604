@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dylan Ironside <dylan@dylanironside.io>
+Date: Thu, 26 Nov 2026 23:08:06 +0000
+Subject: [PATCH] encode: offer HEVC Main10 from P010
+
+The stateful encoder takes P010 on its OUTPUT queue and codes HEVC Main 10
+(hevc_profile MAIN_10), but the driver offered HEVC Main from NV12 only, so
+a 10-bit client found no hardware encoder.
+
+Offer VAProfileHEVCMain10 when the encoder picked for NV12 also lists P010
+on OUTPUT: RT format YUV420_10, the HEVC features, block sizes and size
+limits of Main, the HEVC coded format with the MAIN_10 profile control, and
+P010 input surfaces (luma then chroma rows at the surface pitch, as for
+NV12). Main 10 takes P010 only; the other profiles take NV12 only, as
+before.
+
+Every new branch tests VAProfileHEVCMain10, so H.264 and HEVC Main get the
+values they got before. The P010 flag follows the last encoder field of
+struct v4l2r_driver; no existing member moves.
+---
+ src/encode.c       | 41 +++++++++++++++++++++++++++++++----------
+ src/v4l2_request.h |  2 ++
+ 2 files changed, 33 insertions(+), 10 deletions(-)
+
+diff --git a/src/encode.c b/src/encode.c
+index 6feaac2..54551f2 100644
+--- a/src/encode.c
++++ b/src/encode.c
+@@ -63,6 +63,12 @@
+ #define V4L2R_CID_HEVC_SCALING_LIST_ENABLED	(V4L2R_CID_AVE_BASE + 7)
+ #define V4L2R_ENC_TIMEOUT_MS		2000
+ #define V4L2R_ENC_TIMEOUT_NS		((uint64_t)V4L2R_ENC_TIMEOUT_MS * 1000000)
++/* HEVC Main 10 input. Without the P010 UAPI the profile is not offered. */
++#if HAVE_V4L2_PIX_FMT_P010
++#define V4L2R_ENC_FMT_P010		V4L2_PIX_FMT_P010
++#else
++#define V4L2R_ENC_FMT_P010		0
++#endif
+ 
+ /*
+  * Pictures in flight. EndPicture queues the input and returns; the coded
+@@ -198,6 +204,9 @@ static void probe_encoder(struct v4l2r_driver *drv)
+ 					 "%s", cap.card);
+ 				drv->encoder.h264 = h264;
+ 				drv->encoder.hevc = hevc;
++				drv->encoder_hevc10 = hevc && V4L2R_ENC_FMT_P010 &&
++					fmt_listed(fd, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
++						   V4L2R_ENC_FMT_P010);
+ 				drv->encoder.sps_h264 = h264 &&
+ 					sps_ctrl_listed(fd, V4L2R_CID_H264_LOG2_MAX_FRAME_NUM_MINUS4) &&
+ 					sps_ctrl_listed(fd, V4L2R_CID_H264_POC_TYPE) &&
+@@ -244,6 +253,9 @@ bool v4l2r_encoder_supports(struct v4l2r_driver *drv, VAProfile profile)
+ 	case VAProfileHEVCMain:
+ 		ok = drv->has_encoder && drv->encoder.hevc;
+ 		break;
++	case VAProfileHEVCMain10:
++		ok = drv->has_encoder && drv->encoder_hevc10;
++		break;
+ 	default:
+ 		ok = false;
+ 		break;
+@@ -261,8 +273,8 @@ static bool encoder_client_sps(struct v4l2r_driver *drv, VAProfile profile)
+ 	if (!drv->encoder_probed)
+ 		probe_encoder(drv);
+ 	ok = drv->has_encoder &&
+-	     (profile == VAProfileHEVCMain ? drv->encoder.sps_hevc :
+-					    drv->encoder.sps_h264);
++	     (profile == VAProfileHEVCMain || profile == VAProfileHEVCMain10 ?
++		drv->encoder.sps_hevc : drv->encoder.sps_h264);
+ 	pthread_mutex_unlock(&drv->mutex);
+ 	return ok;
+ }
+@@ -272,7 +284,8 @@ uint32_t v4l2r_encoder_attribute(struct v4l2r_driver *drv, VAProfile profile,
+ {
+ 	switch (type) {
+ 	case VAConfigAttribRTFormat:
+-		return VA_RT_FORMAT_YUV420;
++		return profile == VAProfileHEVCMain10 ? VA_RT_FORMAT_YUV420_10 :
++							VA_RT_FORMAT_YUV420;
+ 	case VAConfigAttribRateControl:
+ 		return VA_RC_CQP | VA_RC_CBR | VA_RC_VBR;
+ 	case VAConfigAttribEncPackedHeaders:
+@@ -301,7 +314,7 @@ uint32_t v4l2r_encoder_attribute(struct v4l2r_driver *drv, VAProfile profile,
+ 		 */
+ 		VAConfigAttribValEncHEVCFeatures f = { .value = 0 };
+ 
+-		if (profile != VAProfileHEVCMain)
++		if (profile != VAProfileHEVCMain && profile != VAProfileHEVCMain10)
+ 			return VA_ATTRIB_NOT_SUPPORTED;
+ 		f.bits.sao = VA_FEATURE_REQUIRED;
+ 		f.bits.temporal_mvp = VA_FEATURE_REQUIRED;
+@@ -312,7 +325,7 @@ uint32_t v4l2r_encoder_attribute(struct v4l2r_driver *drv, VAProfile profile,
+ 		/* 32x32 CTBs, 8x8 minimum CBs, 4x4-32x32 TBs, depth 1 inter / 0 intra */
+ 		VAConfigAttribValEncHEVCBlockSizes b = { .value = 0 };
+ 
+-		if (profile != VAProfileHEVCMain)
++		if (profile != VAProfileHEVCMain && profile != VAProfileHEVCMain10)
+ 			return VA_ATTRIB_NOT_SUPPORTED;
+ 		b.bits.log2_max_coding_tree_block_size_minus3 = 2;
+ 		b.bits.log2_min_coding_tree_block_size_minus3 = 2;
+@@ -329,7 +342,8 @@ uint32_t v4l2r_encoder_attribute(struct v4l2r_driver *drv, VAProfile profile,
+ 	case VAConfigAttribMaxPictureWidth:
+ 		return 4096;
+ 	case VAConfigAttribMaxPictureHeight:
+-		return profile == VAProfileHEVCMain ? 2304 : 4096;
++		return profile == VAProfileHEVCMain ||
++		       profile == VAProfileHEVCMain10 ? 2304 : 4096;
+ 	default:
+ 		return VA_ATTRIB_NOT_SUPPORTED;
+ 	}
+@@ -390,8 +404,9 @@ VAStatus v4l2r_enc_create(struct v4l2r_context *ctx,
+ 		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+ 	enc->fd = -1;
+ 	enc->profile = config->profile;
+-	enc->coded = config->profile == VAProfileHEVCMain ? V4L2_PIX_FMT_HEVC :
+-							    V4L2_PIX_FMT_H264;
++	enc->coded = config->profile == VAProfileHEVCMain ||
++		     config->profile == VAProfileHEVCMain10 ? V4L2_PIX_FMT_HEVC :
++							      V4L2_PIX_FMT_H264;
+ 	enc->rc_mode = VA_RC_VBR;
+ 	for (int i = 0; i < config->nb_attributes; i++)
+ 		if (config->attributes[i].type == VAConfigAttribRateControl &&
+@@ -874,7 +889,9 @@ static VAStatus enc_configure(struct v4l2r_context *ctx,
+ 				V4L2_MPEG_VIDEO_H264_PROFILE_MAIN);
+ 	else
+ 		set_ctrl(enc->fd, V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
+-			 V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
++			 enc->profile == VAProfileHEVCMain10 ?
++				V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10 :
++				V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
+ 	if (enc_apply_rc(enc) < 0)
+ 		goto fail;
+ 
+@@ -1209,7 +1226,11 @@ VAStatus v4l2r_enc_end_picture(struct v4l2r_context *ctx)
+ 	status = v4l2r_surface_view(drv, enc->input, false, &view);
+ 	if (status != VA_STATUS_SUCCESS)
+ 		return status;
+-	if (view.nb_planes != 1 || view.pixelformat != V4L2_PIX_FMT_NV12)
++	/* NV12, or P010 for HEVC Main 10 (the same luma + chroma rows, two
++	 * bytes a sample; the pitch is in bytes). */
++	if (view.nb_planes != 1 ||
++	    view.pixelformat != (enc->profile == VAProfileHEVCMain10 ?
++				 V4L2R_ENC_FMT_P010 : V4L2_PIX_FMT_NV12))
+ 		return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+ 	vis_w = enc->input->width && enc->input->width <= view.width ?
+ 		enc->input->width : view.width;
+diff --git a/src/v4l2_request.h b/src/v4l2_request.h
+index 49a4a50..cdb8648 100644
+--- a/src/v4l2_request.h
++++ b/src/v4l2_request.h
+@@ -681,6 +681,8 @@ struct v4l2r_driver {
+ 	struct v4l2r_encoder encoder;
+ 	bool encoder_probed;
+ 	bool has_encoder;
++	/* The encoder also reads P010: HEVC Main 10 (see encode.c). */
++	bool encoder_hevc10;
+ };
+ 
+ void v4l2r_lock_surface_api(struct VADriverVTable *vtable);

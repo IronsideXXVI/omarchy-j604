@@ -1,0 +1,117 @@
+Subject: [PATCH] encode: keep one OUTPUT index per input dma-buf
+
+vb2 reuses an imported dma-buf attachment and its mapping only while the same
+buffer is queued again on the same index. With a single OUTPUT index every
+frame re-attached and re-mapped its 12 MiB 4K surface in the encoder DART,
+with the encoder idle. Request up to 8 OUTPUT buffers and give each input
+dma-buf the index it was last queued on (least recently used otherwise).
+Still one frame in flight; the submit order is unchanged.
+---
+--- a/src/encode.c
++++ b/src/encode.c
+@@ -29,6 +29,7 @@
+ #include <string.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ 
+ #include "v4l2_request.h"
+@@ -37,6 +38,13 @@
+ #include <va/va_enc_hevc.h>
+ 
+ #define V4L2R_ENC_CAPTURE_BUFFERS	2
++/*
++ * OUTPUT indices, one per input dma-buf seen (least recently used goes).
++ * vb2 keeps an imported dma-buf attached and mapped while the same buffer
++ * is queued again on the same index; a single index re-attached and
++ * re-mapped every frame's surface in the encoder's DART.
++ */
++#define V4L2R_ENC_OUTPUT_BUFFERS	8
+ 
+ /*
+  * apple-ave's sequence parameter set controls (drivers/media/platform/apple/
+@@ -82,6 +90,11 @@
+ 	void *cap_map[V4L2R_ENC_CAPTURE_BUFFERS];
+ 	size_t cap_len[V4L2R_ENC_CAPTURE_BUFFERS];
+ 	unsigned int nb_captures;
++	/* Input dma-buf (st_dev, st_ino) last queued on each OUTPUT index. */
++	dev_t out_dev[V4L2R_ENC_OUTPUT_BUFFERS];
++	ino_t out_ino[V4L2R_ENC_OUTPUT_BUFFERS];
++	uint64_t out_used[V4L2R_ENC_OUTPUT_BUFFERS];
++	unsigned int nb_outputs;
+ 	uint64_t frames;
+ 
+ 	/* The picture being assembled. */
+@@ -336,6 +349,10 @@
+ 		if (enc->cap_map[i] && enc->cap_map[i] != MAP_FAILED)
+ 			munmap(enc->cap_map[i], enc->cap_len[i]);
+ 	enc->nb_captures = 0;
++	enc->nb_outputs = 0;
++	memset(enc->out_dev, 0, sizeof(enc->out_dev));
++	memset(enc->out_ino, 0, sizeof(enc->out_ino));
++	memset(enc->out_used, 0, sizeof(enc->out_used));
+ 	if (enc->fd >= 0) {
+ 		close(enc->fd);
+ 		enc->fd = -1;
+@@ -776,12 +793,14 @@
+ 		goto fail;
+ 
+ 	rb = (struct v4l2_requestbuffers) {
+-		.count = 1,
++		.count = V4L2R_ENC_OUTPUT_BUFFERS,
+ 		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+ 		.memory = V4L2_MEMORY_DMABUF,
+ 	};
+ 	if (ioctl(enc->fd, VIDIOC_REQBUFS, &rb) < 0 || !rb.count)
+ 		goto fail;
++	enc->nb_outputs = rb.count < V4L2R_ENC_OUTPUT_BUFFERS ?
++			  rb.count : V4L2R_ENC_OUTPUT_BUFFERS;
+ 
+ 	rb = (struct v4l2_requestbuffers) {
+ 		.count = V4L2R_ENC_CAPTURE_BUFFERS,
+@@ -864,6 +883,35 @@
+ 	}
+ }
+ 
++/*
++ * The OUTPUT index for an input dma-buf: the one it was last queued on, so
++ * vb2 reuses that attachment and mapping, else the least recently used.
++ * Only one OUTPUT buffer is ever queued (end_picture waits for it), so
++ * every index is free here.
++ */
++static unsigned int enc_output_index(struct v4l2r_enc *enc, int dmabuf_fd)
++{
++	unsigned int idx = 0;
++	struct stat st;
++
++	if (enc->nb_outputs <= 1 || fstat(dmabuf_fd, &st) < 0)
++		return 0;
++	for (unsigned int i = 0; i < enc->nb_outputs; i++) {
++		if (enc->out_used[i] && enc->out_dev[i] == st.st_dev &&
++		    enc->out_ino[i] == st.st_ino) {
++			idx = i;
++			goto found;
++		}
++		if (enc->out_used[i] < enc->out_used[idx])
++			idx = i;
++	}
++	enc->out_dev[idx] = st.st_dev;
++	enc->out_ino[idx] = st.st_ino;
++found:
++	enc->out_used[idx] = enc->frames + 1;
++	return idx;
++}
++
+ VAStatus v4l2r_enc_end_picture(struct v4l2r_context *ctx)
+ {
+ 	struct v4l2r_enc *enc = ctx->enc;
+@@ -922,7 +970,7 @@
+ 	plane.length = view.plane_size[0];
+ 	plane.bytesused = view.pitch * rows;
+ 	b = (struct v4l2_buffer) {
+-		.index = 0,
++		.index = enc_output_index(enc, view.dmabuf_fd[0]),
+ 		.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+ 		.memory = V4L2_MEMORY_DMABUF,
+ 		.length = 1,
